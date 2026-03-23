@@ -52,6 +52,7 @@ fn key_hints_for_tab(tab: ResourceTab) -> Vec<(&'static str, &'static str)> {
             hints.insert(4, ("l", "logs"));
         }
         ResourceTab::Services => {}
+        ResourceTab::Crds | ResourceTab::DynamicResource => {}
         _ => {}
     }
     hints.push(("Space", "mark"));
@@ -100,8 +101,16 @@ fn draw_typed_table<T: Clone + KubeResource>(
     namespace: &str,
     filter_text: &str,
     theme: &Theme,
-    tick_count: usize,
+    _tick_count: usize,
 ) {
+    // Append loading indicator to title when still receiving initial data
+    let display_title = if table.loading {
+        format!("{} (loading...)", title)
+    } else {
+        title.to_string()
+    };
+    let title = &display_title;
+
     // When viewing a specific namespace (not "all"), hide the NAMESPACE column
     // since it's redundant. Cluster-scoped resources (nodes, namespaces, PVs,
     // storage classes, cluster roles, cluster role bindings) don't have a
@@ -124,16 +133,7 @@ fn draw_typed_table<T: Clone + KubeResource>(
             format!("No {} found.", title.to_lowercase())
         } else {
             // Never received data yet — show spinner
-            let spinner_frames = [
-                "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}",
-                "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
-                "\u{2807}", "\u{280f}",
-            ];
-            let spinner = spinner_frames[(tick_count / 2) % spinner_frames.len()];
-            format!(
-                "{} Loading...",
-                spinner,
-            )
+            crate::util::loading_bar("Loading...")
         };
         let loading_line = Line::from(Span::styled(loading_text, theme.info_value));
         // Draw the bordered block with title so it looks consistent
@@ -302,6 +302,12 @@ pub fn draw_resources(f: &mut Frame, app: &App, area: Rect) {
         ResourceTab::LimitRanges => draw_typed_table(f, table_area, "LimitRanges", &app.data.limit_ranges, ns, ft, theme, tc),
         ResourceTab::ResourceQuotas => draw_typed_table(f, table_area, "ResourceQuotas", &app.data.resource_quotas, ns, ft, theme, tc),
         ResourceTab::Pdb => draw_typed_table(f, table_area, "PDB", &app.data.pdb, ns, ft, theme, tc),
+        ResourceTab::Crds => draw_typed_table(f, table_area, "CRDs", &app.data.crds, ns, ft, theme, tc),
+        ResourceTab::DynamicResource => {
+            let title = &app.dynamic_resource_name;
+            let display_title = if title.is_empty() { "Dynamic" } else { title };
+            draw_typed_table(f, table_area, display_title, &app.data.dynamic_resources, ns, ft, theme, tc);
+        }
     }
 
     // 5. Breadcrumbs

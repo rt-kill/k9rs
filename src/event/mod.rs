@@ -3,6 +3,7 @@ pub mod handler;
 use crate::app::FlashMessage;
 use crate::kube::resources::{
     configmaps::KubeConfigMap,
+    crds::{KubeCrd, DynamicKubeResource},
     cronjobs::KubeCronJob,
     daemonsets::KubeDaemonSet,
     deployments::KubeDeployment,
@@ -75,6 +76,8 @@ pub enum ResourceUpdate {
     LimitRanges(Vec<KubeLimitRange>),
     ResourceQuotas(Vec<KubeResourceQuota>),
     Pdb(Vec<KubePdb>),
+    Crds(Vec<KubeCrd>),
+    DynamicResources(Vec<DynamicKubeResource>),
     Yaml(String),
     Describe(String),
     LogLine(String),

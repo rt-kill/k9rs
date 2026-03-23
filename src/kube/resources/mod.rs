@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 pub mod configmaps;
+pub mod crds;
 pub mod cronjobs;
 pub mod daemonsets;
 pub mod deployments;

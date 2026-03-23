@@ -121,13 +121,7 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(block, log_area);
         if inner.height > 0 && inner.width > 0 {
             let message = if logs.streaming {
-                let spinner_frames = [
-                    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}",
-                    "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
-                    "\u{2807}", "\u{280f}",
-                ];
-                let spinner = spinner_frames[(app.tick_count / 2) % spinner_frames.len()];
-                format!("{} Waiting for logs...", spinner)
+                crate::util::loading_bar("Waiting for logs...")
             } else {
                 "No logs.".to_string()
             };

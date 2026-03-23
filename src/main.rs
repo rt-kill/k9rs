@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode},
+    event::{Event as CtEvent, EventStream, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -156,6 +156,32 @@ async fn main() -> Result<()> {
     // Keep kube_client around for context switching; clone the Client for API calls
     let mut kube_client = kube_client;
 
+    // Discover CRDs in the background for command completion
+    {
+        let crd_client = kube_client.client().clone();
+        let crd_tx = event_tx.clone();
+        tokio::spawn(async move {
+            use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+            let api: ::kube::Api<CustomResourceDefinition> = ::kube::Api::all(crd_client);
+            if let Ok(list) = api.list(&Default::default()).await {
+                let crds: Vec<crate::kube::resources::crds::KubeCrd> = list.items.into_iter().map(|crd| {
+                    let meta = crd.metadata;
+                    let spec = crd.spec;
+                    let name = meta.name.unwrap_or_default();
+                    let group = spec.group;
+                    let version = spec.versions.first().map(|v| v.name.clone()).unwrap_or_default();
+                    let kind = spec.names.kind;
+                    let scope = format!("{:?}", spec.scope).trim_matches('"').to_string();
+                    let age = meta.creation_timestamp.map(|ts| ts.0);
+                    crate::kube::resources::crds::KubeCrd { name, group, version, kind, scope, age }
+                }).collect();
+                let _ = crd_tx.send(AppEvent::ResourceUpdate(
+                    crate::event::ResourceUpdate::Crds(crds)
+                )).await;
+            }
+        });
+    }
+
     // Track active log streaming task so we can cancel on Back
     let mut log_task: Option<JoinHandle<()>> = None;
 
@@ -166,7 +192,7 @@ async fn main() -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -183,6 +209,10 @@ async fn main() -> Result<()> {
         })?;
 
         tokio::select! {
+            // biased: always check key events first so user input (like disabling
+            // autoscroll) takes effect before processing queued data events.
+            biased;
+
             Some(Ok(ct_event)) = event_stream.next() => {
                 match ct_event {
                     CtEvent::Key(key) => {
@@ -243,10 +273,12 @@ async fn main() -> Result<()> {
                                                 app.filter.text.clear();
                                             }
                                         }
+                                        app.last_resource_tab = Some(app.resource_tab);
                                         app.resource_tab = tab;
                                         resource_watcher.switch_tab(tab).await;
                                     } else if let Some((tab, ns)) = parse_resource_ns_command(&cmd) {
                                         // :deploy kube-system — switch resource AND namespace
+                                        app.last_resource_tab = Some(app.resource_tab);
                                         app.resource_tab = tab;
                                         if ns != app.selected_ns {
                                             do_switch_namespace(&mut app, &mut resource_watcher, &ns).await;
@@ -262,6 +294,20 @@ async fn main() -> Result<()> {
                                         app.filter.text = filter.clone();
                                         app.filter.active = false;
                                         app.apply_filter(&filter);
+                                    } else if let Some(crd) = app.find_crd_by_name(&cmd) {
+                                        // Dynamic CRD instance browsing
+                                        app.dynamic_resource_name = crd.kind.clone();
+                                        app.data.dynamic_resources.clear_data();
+                                        app.resource_tab = ResourceTab::DynamicResource;
+                                        resource_watcher.watch_dynamic(
+                                            crd.group.clone(),
+                                            crd.version.clone(),
+                                            crd.kind.clone(),
+                                            crd.scope.clone(),
+                                        ).await;
+                                        app.flash = Some(crate::app::FlashMessage::info(
+                                            format!("Browsing CRD: {}", crd.kind)
+                                        ));
                                     } else {
                                         app.flash = Some(crate::app::FlashMessage::warn(format!("Unknown command: {}", cmd)));
                                     }
@@ -471,25 +517,38 @@ async fn main() -> Result<()> {
                                 ActionResult::Shell { pod, namespace, container, context } => {
                                     // Suspend TUI
                                     disable_raw_mode()?;
-                                    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                                     terminal.show_cursor()?;
 
-                                    // Run kubectl exec -it
+                                    // Clear screen and show connecting message
+                                    print!("\x1b[2J\x1b[H"); // clear screen + move cursor to top
+                                    println!("Connecting to {}/{}...\n", pod, container);
+
+                                    // Try bash first (for tab completion), fall back to sh
                                     let mut cmd = std::process::Command::new("kubectl");
                                     cmd.arg("exec").arg("-it").arg(&pod).arg("-n").arg(&namespace).arg("-c").arg(&container);
                                     if !context.is_empty() { cmd.arg("--context").arg(&context); }
-                                    cmd.arg("--").arg("/bin/sh");
-                                    let _ = cmd.status(); // blocks until shell exits
+                                    cmd.arg("--").arg("/bin/bash");
+                                    let status = cmd.status();
+
+                                    // If bash failed (not found), try sh
+                                    if status.is_err() || status.as_ref().map_or(false, |s| !s.success()) {
+                                        let mut cmd2 = std::process::Command::new("kubectl");
+                                        cmd2.arg("exec").arg("-it").arg(&pod).arg("-n").arg(&namespace).arg("-c").arg(&container);
+                                        if !context.is_empty() { cmd2.arg("--context").arg(&context); }
+                                        cmd2.arg("--").arg("/bin/sh");
+                                        let _ = cmd2.status();
+                                    }
 
                                     // Resume TUI
                                     enable_raw_mode()?;
-                                    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+                                    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                                     terminal.clear()?;
                                 }
                                 ActionResult::Edit { resource, name, namespace, context } => {
                                     // Suspend TUI
                                     disable_raw_mode()?;
-                                    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                                     terminal.show_cursor()?;
 
                                     // Run kubectl edit
@@ -504,7 +563,7 @@ async fn main() -> Result<()> {
 
                                     // Resume TUI
                                     enable_raw_mode()?;
-                                    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+                                    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                                     terminal.clear()?;
                                 }
                                 ActionResult::None => {}
@@ -519,10 +578,14 @@ async fn main() -> Result<()> {
             }
             Some(event) = event_rx.recv() => {
                 apply_event(&mut app, event);
-                // Drain all pending events before redrawing to avoid
-                // per-line redraws when many log lines arrive at once.
-                while let Ok(event) = event_rx.try_recv() {
-                    apply_event(&mut app, event);
+                // Drain pending events before redrawing to batch log lines,
+                // but cap at 200 to prevent UI freezes during massive bursts.
+                let mut drained = 0;
+                while drained < 200 {
+                    match event_rx.try_recv() {
+                        Ok(event) => { apply_event(&mut app, event); drained += 1; }
+                        Err(_) => break,
+                    }
                 }
             }
             _ = tick_interval.tick() => {
@@ -550,8 +613,7 @@ async fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+        LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
 
@@ -681,11 +743,9 @@ async fn handle_action(
         Action::PageDown => {
             match &app.route {
                 Route::Logs { .. } | Route::Shell { .. } => {
+                    app.logs.follow = false;
                     let max = app.logs.lines.len().saturating_sub(1);
                     app.logs.scroll = (app.logs.scroll + 40).min(max);
-                    if app.logs.scroll >= max {
-                        app.logs.follow = true;
-                    }
                 }
                 Route::Yaml { .. } => {
                     let max = app.yaml.content.lines().count().saturating_sub(1);
@@ -783,10 +843,14 @@ async fn handle_action(
                 ));
             }
         }
-        Action::Filter(text) => {
-            app.filter.text = text.clone();
+        Action::Filter(_) => {
+            // Pre-fill with existing per-table filter if any, so pressing /
+            // with a committed filter lets you edit it instead of clearing it.
+            let existing = app.active_filter_text().to_string();
+            if !existing.is_empty() && app.filter.text.is_empty() {
+                app.filter.text = existing;
+            }
             app.filter.active = true;
-            app.apply_filter(&text);
         }
         Action::ClearFilter => {
             app.filter.text.clear();
@@ -804,6 +868,19 @@ async fn handle_action(
         }
         Action::ToggleLogFollow => {
             app.logs.follow = !app.logs.follow;
+            if app.logs.follow {
+                app.logs.scroll = app.logs.lines.len().saturating_sub(1);
+            } else {
+                // Snapshot scroll to top-of-viewport so the view freezes
+                // immediately instead of drifting while new lines arrive.
+                // Use the terminal height as an approximation of the log
+                // viewport; the renderer clamps via min() anyway.
+                let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                // Subtract borders (2) + indicator bar (1) + keybinding bar (1)
+                let visible = (rows as usize).saturating_sub(4);
+                let total = app.logs.lines.len();
+                app.logs.scroll = total.saturating_sub(visible);
+            }
         }
         Action::ToggleLogWrap => {
             app.logs.wrap = !app.logs.wrap;
@@ -886,12 +963,9 @@ async fn handle_action(
             app.logs.scroll = app.logs.scroll.saturating_sub(n);
         }
         Action::ScrollDown(n) => {
+            app.logs.follow = false;
             let max = app.logs.lines.len().saturating_sub(1);
             app.logs.scroll = (app.logs.scroll + n).min(max);
-            // Re-enable follow if scrolled to the bottom
-            if app.logs.scroll >= max {
-                app.logs.follow = true;
-            }
         }
         Action::SwitchNamespace(ns) => {
             do_switch_namespace(app, resource_watcher, &ns).await;
@@ -1348,6 +1422,7 @@ async fn handle_enter(
         app.logs.follow = true;
         app.logs.wrap = false;
         app.logs.show_timestamps = true;
+        app.logs.since = None; // Reset time range for new pod
         app.logs.streaming = true;
         app.route = Route::Logs {
             pod: pod_name.clone(),
@@ -1406,8 +1481,13 @@ async fn handle_enter(
                 // Save current tab before switching
                 app.last_resource_tab = Some(app.resource_tab);
                 app.resource_tab = ResourceTab::Pods;
-                resource_watcher.switch_tab(ResourceTab::Pods).await;
-                let filter = format!("{}-", name);
+                // Use switch_tab_force — if we were already on Pods tab, switch_tab
+                // returns early without restarting the watcher, leaving an empty table.
+                resource_watcher.switch_tab_force(ResourceTab::Pods).await;
+                // Escape regex metacharacters so dots/brackets in names don't
+                // produce an invalid regex that silently matches nothing.
+                let filter = format!("{}-", regex::escape(&name));
+                app.data.pods.clear_data(); // Reset pods table so spinner shows while fresh data arrives
                 app.filter.text = filter.clone();
                 app.filter.active = false;
                 app.apply_filter(&filter);
@@ -1420,11 +1500,31 @@ async fn handle_enter(
             if !name.is_empty() {
                 app.last_resource_tab = Some(app.resource_tab);
                 app.resource_tab = ResourceTab::Pods;
-                resource_watcher.switch_tab(ResourceTab::Pods).await;
-                app.filter.text = name.clone();
+                resource_watcher.switch_tab_force(ResourceTab::Pods).await;
+                let filter = regex::escape(&name);
+                app.data.pods.clear_data(); // Reset pods table so spinner shows while fresh data arrives
+                app.filter.text = filter.clone();
                 app.filter.active = false;
-                app.apply_filter(&name);
+                app.apply_filter(&filter);
                 app.flash = Some(crate::app::FlashMessage::info(format!("Pods on node: {}", name)));
+            }
+        }
+        // CRDs: drill down to browse instances of the selected CRD.
+        ResourceTab::Crds => {
+            if let Some(crd) = app.data.crds.selected_item().cloned() {
+                app.last_resource_tab = Some(app.resource_tab);
+                app.dynamic_resource_name = crd.kind.clone();
+                app.data.dynamic_resources.clear_data();
+                app.resource_tab = ResourceTab::DynamicResource;
+                resource_watcher.watch_dynamic(
+                    crd.group.clone(),
+                    crd.version.clone(),
+                    crd.kind.clone(),
+                    crd.scope.clone(),
+                ).await;
+                app.flash = Some(crate::app::FlashMessage::info(
+                    format!("Browsing CRD: {}", crd.kind)
+                ));
             }
         }
         _ => {
@@ -1491,12 +1591,13 @@ fn handle_describe(
             }
             match cmd.output().await {
                 Ok(output) => {
-                    let content = if output.status.success() {
+                    let raw = if output.status.success() {
                         String::from_utf8_lossy(&output.stdout).to_string()
                     } else {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         format!("Error running kubectl describe:\n{}", stderr)
                     };
+                    let content = crate::util::strip_ansi(&raw);
                     if gen_check.load(Ordering::SeqCst) == gen {
                         let _ = tx
                             .send(AppEvent::ResourceUpdate(ResourceUpdate::Describe(content)))
@@ -1574,12 +1675,13 @@ fn handle_yaml(
             }
             match cmd.output().await {
                 Ok(output) => {
-                    let content = if output.status.success() {
+                    let raw = if output.status.success() {
                         String::from_utf8_lossy(&output.stdout).to_string()
                     } else {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         format!("Error fetching YAML:\n{}", stderr)
                     };
+                    let content = crate::util::strip_ansi(&raw);
                     if gen_check.load(Ordering::SeqCst) == gen {
                         let _ = tx
                             .send(AppEvent::ResourceUpdate(ResourceUpdate::Yaml(content)))
@@ -1669,9 +1771,10 @@ fn spawn_log_stream(
                         let reader = BufReader::new(stderr);
                         let mut lines = reader.lines();
                         while let Ok(Some(line)) = lines.next_line().await {
+                            let clean = crate::util::strip_ansi(&line);
                             let _ = stderr_tx
                                 .send(AppEvent::ResourceUpdate(ResourceUpdate::LogLine(
-                                    format!("[stderr] {}", line),
+                                    format!("[stderr] {}", clean),
                                 )))
                                 .await;
                         }
@@ -1681,8 +1784,9 @@ fn spawn_log_stream(
                     let reader = BufReader::new(stdout);
                     let mut lines = reader.lines();
                     while let Ok(Some(line)) = lines.next_line().await {
+                        let clean = crate::util::strip_ansi(&line);
                         if tx
-                            .send(AppEvent::ResourceUpdate(ResourceUpdate::LogLine(line)))
+                            .send(AppEvent::ResourceUpdate(ResourceUpdate::LogLine(clean)))
                             .await
                             .is_err()
                         {
@@ -1752,6 +1856,7 @@ fn handle_logs(
     app.logs.follow = true;
     app.logs.wrap = false;
     app.logs.show_timestamps = true;
+    app.logs.since = None; // Reset time range for new pod
     app.logs.streaming = true;
 
     // Build the kubectl target and container depending on the resource type.
@@ -1907,6 +2012,8 @@ fn build_table_dump(app: &App) -> String {
         ResourceTab::LimitRanges => dump_table!(app.data.limit_ranges, crate::kube::resources::limitranges::KubeLimitRange),
         ResourceTab::ResourceQuotas => dump_table!(app.data.resource_quotas, crate::kube::resources::resourcequotas::KubeResourceQuota),
         ResourceTab::Pdb => dump_table!(app.data.pdb, crate::kube::resources::pdb::KubePdb),
+        ResourceTab::Crds => dump_table!(app.data.crds, crate::kube::resources::crds::KubeCrd),
+        ResourceTab::DynamicResource => dump_table!(app.data.dynamic_resources, crate::kube::resources::crds::DynamicKubeResource),
     }
 }
 
@@ -1957,6 +2064,8 @@ fn get_selected_resource_info(app: &App) -> (String, String, String) {
         ResourceTab::LimitRanges => selected_info!(app.data.limit_ranges, "limitrange"),
         ResourceTab::ResourceQuotas => selected_info!(app.data.resource_quotas, "resourcequota"),
         ResourceTab::Pdb => selected_info!(app.data.pdb, "poddisruptionbudget"),
+        ResourceTab::Crds => selected_info!(app.data.crds, "customresourcedefinition"),
+        ResourceTab::DynamicResource => selected_info!(app.data.dynamic_resources, "dynamic"),
     }
     (String::new(), String::new(), String::new())
 }
@@ -2008,6 +2117,12 @@ fn apply_resource_update(app: &mut App, update: ResourceUpdate) {
         ResourceUpdate::LimitRanges(items) => app.data.limit_ranges.set_items_filtered(items),
         ResourceUpdate::ResourceQuotas(items) => app.data.resource_quotas.set_items_filtered(items),
         ResourceUpdate::Pdb(items) => app.data.pdb.set_items_filtered(items),
+        ResourceUpdate::Crds(items) => {
+            // Also update the discovered CRDs list for dynamic browsing
+            app.discovered_crds = items.clone();
+            app.data.crds.set_items_filtered(items);
+        }
+        ResourceUpdate::DynamicResources(items) => app.data.dynamic_resources.set_items_filtered(items),
         ResourceUpdate::Yaml(content) => {
             if let Some((r, n, ns)) = app.pending_yaml_key.take() {
                 app.kubectl_cache.insert(r, n, ns, "yaml", content.clone());
@@ -2037,12 +2152,13 @@ async fn do_switch_context(
             app.context = ctx_name.to_string();
             app.clear_data();
             app.kubectl_cache.clear();
+            app.discovered_crds.clear();
             app.route_stack.clear();
             app.route = crate::app::Route::Resources;
             app.filter.active = false;
             app.filter.text.clear();
             resource_watcher
-                .replace_client(new_client, app.selected_ns.clone())
+                .replace_client(new_client.clone(), app.selected_ns.clone())
                 .await;
             let updated: Vec<crate::app::KubeContext> = app
                 .contexts
@@ -2165,6 +2281,9 @@ fn parse_resource_command(cmd: &str) -> Option<ResourceTab> {
         "limits" | "limitrange" | "limitranges" => Some(ResourceTab::LimitRanges),
         "quota" | "resourcequota" | "resourcequotas" => Some(ResourceTab::ResourceQuotas),
         "pdb" | "poddisruptionbudget" | "poddisruptionbudgets" => Some(ResourceTab::Pdb),
+        "crd" | "crds" | "customresourcedefinition" | "customresourcedefinitions" => {
+            Some(ResourceTab::Crds)
+        }
         _ => None,
     }
 }

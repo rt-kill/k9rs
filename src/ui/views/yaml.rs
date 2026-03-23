@@ -56,13 +56,7 @@ pub fn draw_yaml(f: &mut Frame, app: &App, area: Rect) {
         let inner = block.inner(content_area);
         f.render_widget(block, content_area);
         if inner.height > 0 && inner.width > 0 {
-            let spinner_frames = [
-                "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}",
-                "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
-                "\u{2807}", "\u{280f}",
-            ];
-            let spinner = spinner_frames[(app.tick_count / 2) % spinner_frames.len()];
-            let loading_text = format!("{} Loading...", spinner);
+            let loading_text = crate::util::loading_bar("Loading...");
             let text_len = loading_text.len() as u16;
             let loading = Line::from(Span::styled(
                 loading_text,

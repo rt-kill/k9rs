@@ -1,6 +1,67 @@
 use chrono::{DateTime, Utc};
 use unicode_width::UnicodeWidthChar;
 
+/// Generates a snake-style loading bar string: `[  ===   ]`
+/// The snake is 3 chars wide sliding across an 8-char bar.
+pub fn loading_bar(label: &str) -> String {
+    let bar_width = 8usize;
+    let snake_len = 4usize;
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as usize;
+    let pos = (elapsed / 200) % (bar_width + snake_len);
+    let bar: String = (0..bar_width)
+        .map(|i| {
+            if i >= pos.saturating_sub(snake_len) && i < pos { '=' } else { ' ' }
+        })
+        .collect();
+    format!("[{}] {}", bar, label)
+}
+
+/// Strip ANSI escape sequences from a string.
+/// Handles CSI sequences (ESC[...m), OSC sequences (ESC]...BEL/ST), and simple ESC sequences.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // ESC character — consume the escape sequence
+            match chars.peek() {
+                Some('[') => {
+                    chars.next(); // consume '['
+                    // CSI sequence: consume until a letter (0x40-0x7E)
+                    while let Some(&nc) = chars.peek() {
+                        chars.next();
+                        if nc.is_ascii_alphabetic() || nc == '~' || nc == '@' {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next(); // consume ']'
+                    // OSC sequence: consume until BEL (\x07) or ST (ESC \)
+                    while let Some(&nc) = chars.peek() {
+                        chars.next();
+                        if nc == '\x07' { break; }
+                        if nc == '\x1b' {
+                            if chars.peek() == Some(&'\\') { chars.next(); }
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    // Simple ESC sequence — skip next char
+                    chars.next();
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Truncate a string to fit within `max_width` display columns.
 ///
 /// Uses `UnicodeWidthChar` so that multi-byte / wide characters (emoji, CJK)

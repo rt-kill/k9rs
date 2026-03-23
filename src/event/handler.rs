@@ -259,6 +259,9 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Mark/select rows.
         KeyCode::Char(' ') => Some(Action::ToggleMark),
 
+        // 0: switch to all namespaces (like k9s)
+        KeyCode::Char('0') => Some(Action::SwitchNamespace("all".to_string())),
+
         _ => None,
     }
 }

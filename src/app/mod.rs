@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::kube::resources::{
     KubeResource,
     configmaps::KubeConfigMap,
+    crds::{KubeCrd, DynamicKubeResource},
     cronjobs::KubeCronJob,
     daemonsets::KubeDaemonSet,
     deployments::KubeDeployment,
@@ -102,6 +103,8 @@ pub enum ResourceTab {
     LimitRanges,
     ResourceQuotas,
     Pdb,
+    Crds,
+    DynamicResource,
 }
 
 impl ResourceTab {
@@ -135,6 +138,8 @@ impl ResourceTab {
             Self::LimitRanges => "Limits",
             Self::ResourceQuotas => "Quota",
             Self::Pdb => "PDB",
+            Self::Crds => "CRDs",
+            Self::DynamicResource => "CRD",
         }
     }
 
@@ -168,10 +173,15 @@ impl ResourceTab {
             Self::LimitRanges,
             Self::ResourceQuotas,
             Self::Pdb,
+            Self::Crds,
         ]
     }
 
     pub fn index(&self) -> usize {
+        // DynamicResource is not in all(), so give it the same index as Crds
+        if *self == Self::DynamicResource {
+            return Self::Crds.index();
+        }
         Self::all().iter().position(|t| t == self).unwrap_or(0)
     }
 
@@ -441,6 +451,8 @@ pub struct AppData {
     pub limit_ranges: StatefulTable<KubeLimitRange>,
     pub resource_quotas: StatefulTable<KubeResourceQuota>,
     pub pdb: StatefulTable<KubePdb>,
+    pub crds: StatefulTable<KubeCrd>,
+    pub dynamic_resources: StatefulTable<DynamicKubeResource>,
     pub contexts: StatefulTable<KubeContext>,
 }
 
@@ -475,6 +487,8 @@ impl Default for AppData {
             limit_ranges: StatefulTable::new(),
             resource_quotas: StatefulTable::new(),
             pdb: StatefulTable::new(),
+            crds: StatefulTable::new(),
+            dynamic_resources: StatefulTable::new(),
             contexts: StatefulTable::new(),
         }
     }
@@ -539,6 +553,11 @@ pub struct App {
     /// Whether fault filter is active (show only unhealthy resources).
     pub fault_filter: bool,
 
+    /// Discovered CRDs from the cluster, used for dynamic resource browsing.
+    pub discovered_crds: Vec<KubeCrd>,
+    /// The CRD kind name being viewed in the dynamic resource view.
+    pub dynamic_resource_name: String,
+
     /// Cache for kubectl describe/yaml output (30s TTL).
     pub kubectl_cache: KubectlCache,
     /// Pending describe key for cache population when result arrives.
@@ -581,6 +600,8 @@ impl App {
             read_only,
             wide_mode: false,
             fault_filter: false,
+            discovered_crds: Vec::new(),
+            dynamic_resource_name: String::new(),
             kubectl_cache: KubectlCache::new(Duration::from_secs(30)),
             pending_describe_key: None,
             pending_yaml_key: None,
@@ -658,6 +679,8 @@ impl App {
         self.data.limit_ranges.clear_data();
         self.data.resource_quotas.clear_data();
         self.data.pdb.clear_data();
+        self.data.crds.clear_data();
+        self.data.dynamic_resources.clear_data();
     }
 
     pub fn next_tab(&mut self) {
@@ -703,6 +726,8 @@ impl App {
             ResourceTab::LimitRanges => f(&mut self.data.limit_ranges),
             ResourceTab::ResourceQuotas => f(&mut self.data.resource_quotas),
             ResourceTab::Pdb => f(&mut self.data.pdb),
+            ResourceTab::Crds => f(&mut self.data.crds),
+            ResourceTab::DynamicResource => f(&mut self.data.dynamic_resources),
         }
     }
 
@@ -802,6 +827,8 @@ impl App {
             ResourceTab::LimitRanges => apply!(self.data.limit_ranges),
             ResourceTab::ResourceQuotas => apply!(self.data.resource_quotas),
             ResourceTab::Pdb => apply!(self.data.pdb),
+            ResourceTab::Crds => apply!(self.data.crds),
+            ResourceTab::DynamicResource => apply!(self.data.dynamic_resources),
         }
     }
 
@@ -852,6 +879,8 @@ impl App {
             ResourceTab::LimitRanges => sort!(self.data.limit_ranges),
             ResourceTab::ResourceQuotas => sort!(self.data.resource_quotas),
             ResourceTab::Pdb => sort!(self.data.pdb),
+            ResourceTab::Crds => sort!(self.data.crds),
+            ResourceTab::DynamicResource => sort!(self.data.dynamic_resources),
         }
     }
 
@@ -893,6 +922,8 @@ impl App {
             ResourceTab::LimitRanges => resort!(self.data.limit_ranges),
             ResourceTab::ResourceQuotas => resort!(self.data.resource_quotas),
             ResourceTab::Pdb => resort!(self.data.pdb),
+            ResourceTab::Crds => resort!(self.data.crds),
+            ResourceTab::DynamicResource => resort!(self.data.dynamic_resources),
         }
     }
 
@@ -923,6 +954,7 @@ impl App {
         "limits", "limitrange", "limitranges",
         "quota", "resourcequota", "resourcequotas",
         "pdb", "poddisruptionbudget", "poddisruptionbudgets",
+        "crd", "crds", "customresourcedefinition", "customresourcedefinitions",
         "alias", "aliases", "a",
     ];
 
@@ -980,6 +1012,14 @@ impl App {
             .filter(|s| s.starts_with(input.as_str()))
             .collect();
 
+        // Add discovered CRD kind names as completions
+        for crd in &self.discovered_crds {
+            let kind_lower = crd.kind.to_lowercase();
+            if kind_lower.starts_with(input.as_str()) {
+                completions.push(kind_lower);
+            }
+        }
+
         completions.sort();
         completions.dedup();
         completions
@@ -1029,6 +1069,8 @@ impl App {
             ResourceTab::LimitRanges => (self.data.limit_ranges.len(), self.data.limit_ranges.total()),
             ResourceTab::ResourceQuotas => (self.data.resource_quotas.len(), self.data.resource_quotas.total()),
             ResourceTab::Pdb => (self.data.pdb.len(), self.data.pdb.total()),
+            ResourceTab::Crds => (self.data.crds.len(), self.data.crds.total()),
+            ResourceTab::DynamicResource => (self.data.dynamic_resources.len(), self.data.dynamic_resources.total()),
         }
     }
 
@@ -1063,7 +1105,20 @@ impl App {
             ResourceTab::LimitRanges => &self.data.limit_ranges.filter_text,
             ResourceTab::ResourceQuotas => &self.data.resource_quotas.filter_text,
             ResourceTab::Pdb => &self.data.pdb.filter_text,
+            ResourceTab::Crds => &self.data.crds.filter_text,
+            ResourceTab::DynamicResource => &self.data.dynamic_resources.filter_text,
         }
+    }
+
+    /// Find a discovered CRD by its kind name (case-insensitive).
+    pub fn find_crd_by_name(&self, cmd: &str) -> Option<KubeCrd> {
+        let lower = cmd.to_lowercase();
+        self.discovered_crds.iter().find(|crd| {
+            crd.kind.to_lowercase() == lower
+                || crd.name.to_lowercase() == lower
+                // Also match plural forms (kind + "s")
+                || format!("{}s", crd.kind.to_lowercase()) == lower
+        }).cloned()
     }
 }
 
@@ -1119,9 +1174,12 @@ pub struct StatefulTable<T: Clone> {
     pub sort_ascending: bool,
     pub page_size: usize,
     pub filter_text: String,
-    /// Whether this table has ever received non-empty data from the watcher.
-    /// Used to distinguish "loading" from "empty" in the UI.
+    /// Whether this table has received any response from the watcher.
+    /// Used to distinguish "loading" (false) from "empty" (true + no items) in the UI.
     pub has_data: bool,
+    /// Whether the initial list is still streaming in (InitApply phase).
+    /// When true, the title shows a loading indicator alongside the count.
+    pub loading: bool,
     /// Set of marked/selected row indices (real indices into `items`).
     pub marked: HashSet<usize>,
 }
@@ -1138,6 +1196,7 @@ impl<T: Clone> Default for StatefulTable<T> {
             page_size: 40,
             filter_text: String::new(),
             has_data: false,
+            loading: false,
             marked: HashSet::new(),
         }
     }
@@ -1187,9 +1246,7 @@ impl<T: Clone> StatefulTable<T> {
     }
 
     pub fn set_items(&mut self, items: Vec<T>) {
-        if !items.is_empty() {
-            self.has_data = true;
-        }
+        self.has_data = true;
         self.items = items;
         self.marked.clear();
         self.filtered_indices = (0..self.items.len()).collect();
@@ -1223,6 +1280,7 @@ impl<T: Clone> StatefulTable<T> {
         self.selected = 0;
         self.offset = 0;
         self.has_data = false;
+        self.loading = false;
         self.marked.clear();
     }
 
@@ -1319,22 +1377,35 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
     /// Preserves selection by resource identity (name + namespace) rather than
     /// by index, so the user's selection doesn't jump when items reorder.
     pub fn set_items_filtered(&mut self, items: Vec<T>) {
-        // Guard: don't replace populated data with an empty snapshot
-        // (happens during watcher re-init between Init and InitDone)
-        if items.is_empty() && self.has_data && !self.items.is_empty() {
-            return;
-        }
-
         // Save current selection identity
         let prev_selection = self.selected_item().map(|item| {
             (item.name().to_string(), item.namespace().to_string())
         });
 
-        if !items.is_empty() {
-            self.has_data = true;
-        }
+        // Any watcher response (even empty) means the initial sync completed.
+        self.has_data = true;
+        // Track if item count is growing (still loading from initial LIST)
+        let prev_count = self.items.len();
+        self.loading = !items.is_empty() && items.len() > prev_count;
+
+        // Preserve marks by identity (name+namespace) across data refreshes
+        let prev_marks: Vec<(String, String)> = self.marked.iter()
+            .filter_map(|&idx| self.items.get(idx).map(|item| {
+                (item.name().to_string(), item.namespace().to_string())
+            }))
+            .collect();
+
         self.items = items;
+
+        // Restore marks by finding items with same identity in new data
         self.marked.clear();
+        for (mark_name, mark_ns) in &prev_marks {
+            if let Some(pos) = self.items.iter().position(|item| {
+                item.name() == mark_name && item.namespace() == mark_ns
+            }) {
+                self.marked.insert(pos);
+            }
+        }
 
         // Re-apply filter (supports regex)
         if !self.filter_text.is_empty() {
