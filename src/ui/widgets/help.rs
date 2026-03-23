@@ -1,6 +1,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Block, Clear, Padding, Widget},
 };
@@ -110,20 +111,25 @@ impl<'a> HelpOverlay<'a> {
                         key: "Space",
                         description: "Mark / select row",
                     },
+                ],
+            },
+            HelpSection {
+                title: "Sorting",
+                entries: vec![
                     HelpEntry {
-                        key: "O",
-                        description: "Sort (toggle direction)",
+                        key: "Shift-O",
+                        description: "Sort / toggle direction",
                     },
                     HelpEntry {
-                        key: "N",
+                        key: "Shift-N",
                         description: "Sort by name",
                     },
                     HelpEntry {
-                        key: "A",
+                        key: "Shift-A",
                         description: "Sort by age",
                     },
                     HelpEntry {
-                        key: "S",
+                        key: "Shift-S",
                         description: "Sort by status (pods)",
                     },
                 ],
@@ -293,17 +299,56 @@ impl<'a> HelpOverlay<'a> {
 
 impl Widget for HelpOverlay<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let dialog_area = Self::centered_rect(area, 70, 80);
+        let dialog_area = Self::centered_rect(area, 55, 85);
 
-        // Clear background
+        // Clear background fully so table doesn't bleed through
         Clear.render(dialog_area, buf);
 
+        // Build all lines first to know total count
+        let sections = Self::sections();
+        let mut all_lines: Vec<Line<'_>> = Vec::new();
+
+        for (si, section) in sections.iter().enumerate() {
+            // Section title — highlighted
+            all_lines.push(Line::from(Span::styled(
+                format!("  {} ", section.title),
+                self.theme.title.add_modifier(Modifier::BOLD),
+            )));
+
+            // Single-column layout — one entry per line, easy to read top-to-bottom
+            for entry in &section.entries {
+                all_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<14} ", entry.key),
+                        self.theme.help_key,
+                    ),
+                    Span::styled(entry.description, self.theme.help_desc),
+                ]));
+            }
+
+            // Blank line between sections
+            if si + 1 < sections.len() {
+                all_lines.push(Line::raw(""));
+            }
+        }
+
+        let total = all_lines.len();
+
+        // Build title with scroll indicator
+        let visible_height = dialog_area.height.saturating_sub(4) as usize; // borders + padding
+        let has_more = total > visible_height;
+        let title = if has_more {
+            format!(" Help [j/k to scroll] [{}/{}] ", self.scroll + 1, total)
+        } else {
+            " Help — press ? or Esc to close ".to_string()
+        };
+
         let block = Block::bordered()
-            .title(" Help - Press ? or Esc to close ")
+            .title(title)
             .title_style(self.theme.title)
             .border_style(self.theme.border)
             .style(self.theme.dialog_bg)
-            .padding(Padding::new(2, 2, 1, 1));
+            .padding(Padding::new(1, 1, 1, 0));
 
         let inner = block.inner(dialog_area);
         block.render(dialog_area, buf);
@@ -312,77 +357,35 @@ impl Widget for HelpOverlay<'_> {
             return;
         }
 
-        let sections = Self::sections();
         let max_y = inner.y + inner.height;
-
-        // Pre-build all logical lines for scroll support
-        let mut all_lines: Vec<(Line<'_>, Option<(Line<'_>, u16)>)> = Vec::new();
-        let col_width = inner.width / 2;
-
-        for (si, section) in sections.iter().enumerate() {
-            // Section title
-            let title_line = Line::from(Span::styled(
-                format!("--- {} ---", section.title),
-                self.theme.title,
-            ));
-            all_lines.push((title_line, None));
-
-            // Two-column layout
-            let entries_per_col = (section.entries.len() + 1) / 2;
-            for row in 0..entries_per_col {
-                let left = if row < section.entries.len() {
-                    let entry = &section.entries[row];
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{:<14}", entry.key),
-                            self.theme.help_key,
-                        ),
-                        Span::styled(entry.description, self.theme.help_desc),
-                    ])
-                } else {
-                    Line::raw("")
-                };
-
-                let right = {
-                    let right_idx = row + entries_per_col;
-                    if right_idx < section.entries.len() {
-                        let entry = &section.entries[right_idx];
-                        Some((Line::from(vec![
-                            Span::styled(
-                                format!("{:<14}", entry.key),
-                                self.theme.help_key,
-                            ),
-                            Span::styled(entry.description, self.theme.help_desc),
-                        ]), col_width))
-                    } else {
-                        None
-                    }
-                };
-
-                all_lines.push((left, right));
-            }
-
-            // Blank line between sections (except after last)
-            if si + 1 < sections.len() {
-                all_lines.push((Line::raw(""), None));
-            }
-        }
-
-        // Clamp scroll
-        let total = all_lines.len();
         let visible = inner.height as usize;
         let scroll = self.scroll.min(total.saturating_sub(visible.max(1)));
 
         let mut y = inner.y;
-        for (left, right) in all_lines.iter().skip(scroll) {
+        for line in all_lines.iter().skip(scroll) {
             if y >= max_y {
                 break;
             }
-            buf.set_line(inner.x, y, left, col_width);
-            if let Some((ref r, cw)) = right {
-                buf.set_line(inner.x + *cw, y, r, *cw);
-            }
+            buf.set_line(inner.x, y, line, inner.width);
             y += 1;
+        }
+
+        // Show scroll indicator arrows at the edges
+        if scroll > 0 {
+            buf.set_string(
+                inner.x + inner.width.saturating_sub(3),
+                inner.y,
+                " ▲ ",
+                self.theme.title,
+            );
+        }
+        if scroll + visible < total {
+            buf.set_string(
+                inner.x + inner.width.saturating_sub(3),
+                max_y.saturating_sub(1),
+                " ▼ ",
+                self.theme.title,
+            );
         }
     }
 }

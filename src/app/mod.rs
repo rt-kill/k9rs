@@ -1433,9 +1433,9 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
         }
 
         // Restore selection by identity
-        if let Some((prev_name, prev_ns)) = prev_selection {
+        if let Some((ref prev_name, ref prev_ns)) = prev_selection {
             if let Some(pos) = self.filtered_indices.iter().position(|&i| {
-                self.items[i].name() == prev_name && self.items[i].namespace() == prev_ns
+                self.items[i].name() == prev_name.as_str() && self.items[i].namespace() == prev_ns.as_str()
             }) {
                 self.selected = pos;
             } else {
@@ -1453,6 +1453,50 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
                 self.offset = 0;
             } else if self.selected >= self.filtered_indices.len() {
                 self.selected = self.filtered_indices.len() - 1;
+            }
+        }
+
+        // Re-apply user's sort if they've changed the column from default.
+        // The watcher pre-sorts by namespace+name, so sort_column 0 (default)
+        // doesn't need re-sorting. Any other column needs explicit re-sort.
+        if self.sort_column != 0 && !self.items.is_empty() {
+            let col = self.sort_column;
+            let asc = self.sort_ascending;
+            // Sort items in place
+            self.items.sort_by(|a, b| {
+                let a_row = a.row();
+                let b_row = b.row();
+                let a_val = a_row.get(col).map(|c| c.as_ref()).unwrap_or("");
+                let b_val = b_row.get(col).map(|c| c.as_ref()).unwrap_or("");
+                if let (Ok(an), Ok(bn)) = (a_val.parse::<f64>(), b_val.parse::<f64>()) {
+                    let ord = an.partial_cmp(&bn).unwrap_or(std::cmp::Ordering::Equal);
+                    return if asc { ord } else { ord.reverse() };
+                }
+                let ord = a_val.cmp(b_val);
+                if asc { ord } else { ord.reverse() }
+            });
+            // Rebuild filtered indices after re-sort
+            if !self.filter_text.is_empty() {
+                let t = self.filter_text.to_lowercase();
+                let re = regex::Regex::new(&t).ok();
+                self.filtered_indices = self.items.iter().enumerate()
+                    .filter(|(_, item)| {
+                        item.row().iter().any(|cell| {
+                            let lower = cell.to_lowercase();
+                            re.as_ref().map_or(lower.contains(&t), |r| r.is_match(&lower))
+                        })
+                    })
+                    .map(|(i, _)| i).collect();
+            } else {
+                self.filtered_indices = (0..self.items.len()).collect();
+            }
+            // Re-find selection after resort
+            if let Some((prev_name, prev_ns)) = prev_selection {
+                if let Some(pos) = self.filtered_indices.iter().position(|&i| {
+                    self.items[i].name() == prev_name && self.items[i].namespace() == prev_ns
+                }) {
+                    self.selected = pos;
+                }
             }
         }
 
