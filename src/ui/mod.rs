@@ -1,0 +1,298 @@
+pub mod header;
+pub mod theme;
+pub mod views;
+pub mod widgets;
+
+use ratatui::layout::Rect;
+use ratatui::style::Modifier;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, Widget};
+use ratatui::Frame;
+
+use crate::app::{App, Route};
+use crate::ui::theme::Theme;
+use crate::ui::widgets::{ConfirmDialogWidget, FilterBar, FlashWidget, HelpOverlay};
+
+/// Main UI draw function.
+///
+/// Routes to the correct view based on `app.route`, then overlays flash messages,
+/// help screen, and confirmation dialogs as needed.
+pub fn draw(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+
+    match &app.route {
+        Route::Resources => {
+            views::resource::draw_resources(f, app, area);
+        }
+        Route::Yaml { .. } => {
+            views::yaml::draw_yaml(f, app, area);
+        }
+        Route::Describe { .. } => {
+            views::describe::draw_describe(f, app, area);
+        }
+        Route::Logs { .. } => {
+            views::log::draw_logs(f, app, area);
+        }
+        Route::Shell { .. } => {
+            // Shell view -- handled externally; draw resource view underneath
+            views::resource::draw_resources(f, app, area);
+        }
+        Route::Help => {
+            // Draw resource view underneath the help overlay
+            views::resource::draw_resources(f, app, area);
+            draw_help_overlay(f, app);
+        }
+        Route::Contexts => {
+            views::context::draw_contexts(f, app, area);
+        }
+        Route::ContainerSelect { ref pod, ref namespace } => {
+            // Draw resource view underneath with a container list overlay
+            views::resource::draw_resources(f, app, area);
+            draw_container_select(f, app, pod, namespace);
+        }
+        Route::Aliases => {
+            // Reuse the describe view to show alias content
+            views::describe::draw_describe(f, app, area);
+        }
+    }
+
+    // Draw command prompt overlay on top of any view when command mode is active.
+    // In resource/context views this is handled inline, but for sub-views
+    // (logs, describe, yaml) we need to draw it as an overlay so the user can
+    // see what they're typing.
+    if !matches!(app.route, Route::Resources | Route::Contexts) {
+        if app.command_mode || app.scale_mode {
+            draw_command_overlay(f, app);
+        }
+        if app.filter.active {
+            draw_filter_overlay(f, app);
+        }
+    }
+
+    // Draw flash messages on top of everything
+    draw_flash(f, app);
+
+    // Draw confirmation dialog if present
+    draw_confirm_dialog(f, app);
+}
+
+/// Resolve the theme from the application state.
+fn app_theme(app: &App) -> &Theme {
+    &app.theme
+}
+
+/// Draw the help overlay on top of the current view.
+fn draw_help_overlay(f: &mut Frame, app: &App) {
+    let theme = app_theme(app);
+    let help = HelpOverlay::new(theme, app.help_scroll);
+    f.render_widget(help, f.area());
+}
+
+/// Draw flash messages at the bottom of the screen (k9s style).
+fn draw_flash(f: &mut Frame, app: &App) {
+    if let Some(ref flash) = app.flash {
+        if flash.is_expired() {
+            return;
+        }
+
+        let theme = app_theme(app);
+        let area = f.area();
+
+        // Position flash at the very bottom line
+        if area.height < 1 {
+            return;
+        }
+        let flash_area = ratatui::layout::Rect::new(
+            area.x,
+            area.y + area.height.saturating_sub(1),
+            area.width,
+            1,
+        );
+
+        let flash_widget = FlashWidget::new(flash, theme);
+        f.render_widget(flash_widget, flash_area);
+    }
+}
+
+/// Draw the container selection overlay for multi-container pods.
+fn draw_container_select(f: &mut Frame, app: &App, pod: &str, namespace: &str) {
+    use ratatui::layout::{Constraint, Layout, Rect};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Clear};
+
+    let theme = app_theme(app);
+    let area = f.area();
+
+    // Find the pod's containers
+    let containers: Vec<String> = app.data.pods.items.iter()
+        .find(|p| p.name == pod && p.namespace == namespace)
+        .map(|p| p.containers.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+
+    if containers.is_empty() {
+        return;
+    }
+
+    // Size the dialog
+    let max_name_len = containers.iter().map(|c| c.len()).max().unwrap_or(10);
+    let dialog_width = (max_name_len as u16 + 6).max(30).min(60).min(area.width.saturating_sub(4));
+    let dialog_height = (containers.len() as u16 + 4).min(area.height.saturating_sub(4));
+
+    // Center the dialog
+    let vert = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(dialog_height),
+        Constraint::Fill(1),
+    ]).split(area);
+    let horiz = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(dialog_width),
+        Constraint::Fill(1),
+    ]).split(vert[1]);
+    let dialog_area = horiz[1];
+
+    Clear.render(dialog_area, f.buffer_mut());
+
+    let block = Block::bordered()
+        .title(format!(" Select Container ({}) ", pod))
+        .title_style(theme.title)
+        .border_style(theme.border)
+        .style(theme.dialog_bg);
+
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Render container list
+    let selected_idx = app.container_select_index;
+    for (i, container) in containers.iter().enumerate() {
+        if i as u16 >= inner.height.saturating_sub(1) {
+            break;
+        }
+        let y = inner.y + i as u16;
+        let is_selected = i == selected_idx;
+        let style = if is_selected { theme.selected } else { theme.row_normal };
+
+        // Fill background for selected item
+        if is_selected {
+            for dx in 0..inner.width {
+                f.buffer_mut().set_string(inner.x + dx, y, " ", theme.selected);
+            }
+        }
+
+        let line = Line::from(Span::styled(format!("  {}", container), style));
+        f.render_widget(line, Rect::new(inner.x, y, inner.width, 1));
+    }
+
+    // Hint at bottom
+    let hint_y = inner.y + inner.height.saturating_sub(1);
+    let hint = Line::from(vec![
+        Span::styled(" <Enter>", theme.status_bar_key),
+        Span::styled(" select  ", theme.help_desc),
+        Span::styled("<Esc>", theme.status_bar_key),
+        Span::styled(" back", theme.help_desc),
+    ]);
+    f.render_widget(hint, Rect::new(inner.x, hint_y, inner.width, 1));
+}
+
+/// Draw the confirmation dialog overlay.
+fn draw_confirm_dialog(f: &mut Frame, app: &App) {
+    if let Some(ref dialog) = app.confirm_dialog {
+        let theme = app_theme(app);
+        let dialog_widget = ConfirmDialogWidget::new(dialog, theme);
+        f.render_widget(dialog_widget, f.area());
+    }
+}
+
+/// Draw the command prompt as an overlay at the bottom of the screen.
+/// Used for sub-views (logs, describe, yaml) where the resource view's
+/// inline command prompt is not available.
+fn draw_command_overlay(f: &mut Frame, app: &App) {
+    let area = f.area();
+    if area.height < 5 {
+        return;
+    }
+    let theme = app_theme(app);
+
+    // 3-line box at the bottom, above the last 2 lines (indicator/flash)
+    let overlay_y = area.y + area.height.saturating_sub(5);
+    let overlay_area = Rect::new(area.x, overlay_y, area.width, 3);
+
+    // Clear the area underneath
+    Clear.render(overlay_area, f.buffer_mut());
+
+    let block = Block::bordered()
+        .border_style(theme.border_focused);
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let input = &app.command_input;
+    let ghost = app.best_completion()
+        .and_then(|c| {
+            if c.len() > input.len() {
+                Some(c[input.len()..].to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    let prefix = if app.scale_mode { "Replicas: " } else { ":" };
+    let prefix_len: u16 = prefix.len() as u16;
+    let typed_len = input.len() as u16;
+
+    let mut spans = vec![
+        Span::styled(prefix, theme.command.add_modifier(Modifier::BOLD)),
+        Span::styled(input, theme.command),
+    ];
+
+    if !ghost.is_empty() && !app.scale_mode {
+        spans.push(Span::styled(
+            ghost,
+            theme.command_suggestion.add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ));
+    }
+
+    let line = Line::from(spans);
+    f.render_widget(line, inner);
+
+    // Place terminal cursor
+    let cursor_x = inner.x + prefix_len + typed_len;
+    let cursor_y = inner.y;
+    if cursor_x < inner.x + inner.width {
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+/// Draw the filter bar as an overlay at the bottom of the screen.
+/// Used for sub-views where the resource view's inline filter bar is not available.
+fn draw_filter_overlay(f: &mut Frame, app: &App) {
+    let area = f.area();
+    if area.height < 5 {
+        return;
+    }
+    let theme = app_theme(app);
+
+    let overlay_y = area.y + area.height.saturating_sub(5);
+    let overlay_area = Rect::new(area.x, overlay_y, area.width, 3);
+
+    Clear.render(overlay_area, f.buffer_mut());
+
+    let (filtered, total) = app.active_table_items_count();
+    let match_count = if app.filter.text.is_empty() { total } else { filtered };
+    let filter_bar = FilterBar::new(
+        app.filter.active,
+        &app.filter.text,
+        match_count,
+        total,
+        theme,
+    );
+    f.render_widget(filter_bar, overlay_area);
+}
