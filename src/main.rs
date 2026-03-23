@@ -744,7 +744,9 @@ async fn handle_action(
             match &app.route {
                 Route::Logs { .. } | Route::Shell { .. } => {
                     app.logs.follow = false;
-                    let max = app.logs.lines.len().saturating_sub(1);
+                    let total = app.logs.lines.len();
+                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24).saturating_sub(5);
+                    let max = total.saturating_sub(visible);
                     app.logs.scroll = (app.logs.scroll + 40).min(max);
                 }
                 Route::Yaml { .. } => {
@@ -776,7 +778,9 @@ async fn handle_action(
         Action::End => {
             match &app.route {
                 Route::Logs { .. } | Route::Shell { .. } => {
-                    app.logs.scroll = app.logs.lines.len().saturating_sub(1);
+                    let total = app.logs.lines.len();
+                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24).saturating_sub(5);
+                    app.logs.scroll = total.saturating_sub(visible);
                     app.logs.follow = true;
                 }
                 Route::Yaml { .. } => {
@@ -964,7 +968,12 @@ async fn handle_action(
         }
         Action::ScrollDown(n) => {
             app.logs.follow = false;
-            let max = app.logs.lines.len().saturating_sub(1);
+            // Clamp to last valid viewport position (total - visible_height),
+            // not total - 1. Otherwise scroll can overshoot and the render
+            // path's min() causes a "catch-up" scroll effect as new lines arrive.
+            let total = app.logs.lines.len();
+            let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24).saturating_sub(5);
+            let max = total.saturating_sub(visible);
             app.logs.scroll = (app.logs.scroll + n).min(max);
         }
         Action::SwitchNamespace(ns) => {

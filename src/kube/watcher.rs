@@ -699,6 +699,7 @@ where
     let mut store: HashMap<ObjKey, T> = HashMap::new();
     let dirty = Arc::new(AtomicBool::new(false));
     let mut init_apply_count: usize = 0;
+    let mut next_flush_at: usize = 100; // First flush after 100 items, then exponentially growing
 
     // Shared channel to pass snapshots from the debounce task.
     let (snap_tx, mut snap_rx) = mpsc::channel::<()>(1);
@@ -735,17 +736,19 @@ where
                                 let key = obj_key(&obj);
                                 store.insert(key, convert(obj));
                                 init_apply_count += 1;
-                                // Only mark dirty every 500 items during init to avoid
-                                // O(n²) cost of repeatedly cloning growing snapshots.
-                                // With 8000 pods this gives ~16 progressive updates
-                                // instead of one every 100ms.
-                                if init_apply_count % 500 == 0 {
+                                // Exponentially growing flush thresholds:
+                                // 100, 200, 400, 800, 1600, 3200, 6400, ...
+                                // First batch shows fast (~100 items), total snapshots
+                                // stays O(log n) instead of O(n/500).
+                                if init_apply_count >= next_flush_at {
                                     dirty.store(true, Ordering::Release);
+                                    next_flush_at = (next_flush_at * 2).max(next_flush_at + 100);
                                 }
                             }
                             WatcherEvent::InitDone => {
                                 debug!("initial list complete, {} items", store.len());
                                 init_apply_count = 0;
+                                next_flush_at = 100;
                                 dirty.store(true, Ordering::Release);
                             }
                             WatcherEvent::Apply(obj) => {

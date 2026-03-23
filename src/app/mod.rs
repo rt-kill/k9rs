@@ -281,13 +281,17 @@ impl LogState {
     pub fn push(&mut self, line: String) {
         if self.lines.len() >= self.max_lines {
             self.lines.pop_front();
-            // Adjust scroll to account for removed line
-            self.scroll = self.scroll.saturating_sub(1);
+            // Adjust scroll to account for removed line so the viewport
+            // doesn't drift when the ring buffer evicts old entries.
+            if !self.follow {
+                self.scroll = self.scroll.saturating_sub(1);
+            }
         }
         self.lines.push_back(line);
-        if self.follow {
-            self.scroll = self.lines.len().saturating_sub(1);
-        }
+        // Don't update scroll here — the render path handles follow mode
+        // by computing the correct viewport position from total line count.
+        // Setting scroll in push() causes a mismatch that produces a
+        // "catch-up" scroll effect when follow is later disabled.
     }
     pub fn clear(&mut self) {
         self.lines.clear();
