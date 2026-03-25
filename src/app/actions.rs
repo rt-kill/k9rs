@@ -1,5 +1,3 @@
-use super::ResourceTab;
-
 /// Represents every discrete user action that the application can handle.
 /// Actions are produced by the event handler (key/mouse -> Action mapping)
 /// and consumed by the application state machine.
@@ -15,8 +13,6 @@ pub enum Action {
     NextTab,
     /// Switch to the previous resource tab.
     PrevTab,
-    /// Jump directly to a specific resource tab.
-    GotoTab(ResourceTab),
     /// Select the next item in the current list.
     NextItem,
     /// Select the previous item in the current list.
@@ -71,6 +67,8 @@ pub enum Action {
     PortForward,
     /// Toggle the header row visibility.
     ToggleHeader,
+    /// Toggle full-fetch mode (wait for complete list vs incremental loading).
+    ToggleFullFetch,
     /// Force-refresh the current resource data.
     Refresh,
     /// Copy the selected item or content to the system clipboard.
@@ -117,4 +115,6 @@ pub enum Action {
     ToggleWide,
     /// Toggle fault filter (show only unhealthy resources).
     ToggleFaultFilter,
+    /// Show an informational flash message to the user.
+    FlashInfo(String),
 }

@@ -6,16 +6,19 @@ use k8s_openapi::api::core::v1::Pod;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeContainer {
+    /// Display name (e.g. "init:install-udf" for init containers, "app" for regular)
     pub name: String,
+    /// Actual container name for kubectl commands (always without prefix)
+    pub real_name: String,
     pub image: String,
     pub ready: bool,
     pub state: String,
     pub restarts: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubePod {
     pub namespace: String,
     pub name: String,
@@ -101,7 +104,35 @@ impl From<Pod> for KubePod {
 
         let restarts: i32 = container_statuses.iter().map(|cs| cs.restart_count).sum();
 
-        let containers: Vec<KubeContainer> = container_statuses
+        let init_containers: Vec<KubeContainer> = init_container_statuses
+            .iter()
+            .map(|cs| {
+                let state = if let Some(ref s) = cs.state {
+                    if s.running.is_some() {
+                        "Running".to_string()
+                    } else if let Some(ref w) = s.waiting {
+                        w.reason.clone().unwrap_or_else(|| "Waiting".to_string())
+                    } else if let Some(ref t) = s.terminated {
+                        t.reason.clone().unwrap_or_else(|| "Terminated".to_string())
+                    } else {
+                        "Unknown".to_string()
+                    }
+                } else {
+                    "Unknown".to_string()
+                };
+
+                KubeContainer {
+                    name: format!("init:{}", cs.name),
+                    real_name: cs.name.clone(),
+                    image: cs.image.clone(),
+                    ready: cs.ready,
+                    state,
+                    restarts: cs.restart_count,
+                }
+            })
+            .collect();
+
+        let regular_containers: Vec<KubeContainer> = container_statuses
             .iter()
             .map(|cs| {
                 let state = if let Some(ref s) = cs.state {
@@ -120,6 +151,7 @@ impl From<Pod> for KubePod {
 
                 KubeContainer {
                     name: cs.name.clone(),
+                    real_name: cs.name.clone(),
                     image: cs.image.clone(),
                     ready: cs.ready,
                     state,
@@ -127,6 +159,9 @@ impl From<Pod> for KubePod {
                 }
             })
             .collect();
+
+        let mut containers = init_containers;
+        containers.extend(regular_containers);
 
         KubePod {
             namespace,
@@ -202,9 +237,11 @@ fn compute_pod_status(
                         continue;
                     }
                 }
-                if terminated.signal != Some(0) && terminated.signal.is_some() {
-                    status_str = format!("Signal:{}", terminated.signal.unwrap());
-                    continue;
+                if let Some(sig) = terminated.signal {
+                    if sig != 0 {
+                        status_str = format!("Signal:{}", sig);
+                        continue;
+                    }
                 }
                 status_str = format!("ExitCode:{}", terminated.exit_code);
                 continue;

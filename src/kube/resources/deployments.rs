@@ -6,7 +6,7 @@ use k8s_openapi::api::apps::v1::Deployment;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeDeployment {
     pub namespace: String,
     pub name: String,

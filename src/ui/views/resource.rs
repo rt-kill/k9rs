@@ -217,7 +217,7 @@ pub fn draw_resources(f: &mut Frame, app: &App, area: Rect) {
 
     // Determine dynamic section heights
     let header_height: u16 = if app.show_header { 7 } else { 0 };
-    let command_height: u16 = if app.command_mode || app.scale_mode { 3 } else { 0 };
+    let command_height: u16 = if app.command_mode || app.scale_mode || app.port_forward_mode { 3 } else { 0 };
     // Only show the filter bar box while actively typing; when committed
     // (inactive but text non-empty), the table title shows `</:filter_text>`.
     let filter_visible = app.filter.active;
@@ -249,7 +249,7 @@ pub fn draw_resources(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // 2. Command prompt (only when command mode active)
-    if app.command_mode || app.scale_mode {
+    if app.command_mode || app.scale_mode || app.port_forward_mode {
         draw_command_prompt(f, app, command_area, theme);
     }
 
@@ -366,7 +366,7 @@ fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     // Fish-style rendering: typed text (bright) followed immediately by ghost
     // text (dim/italic) with no block cursor in between. The terminal cursor
     // is placed right after the typed text via set_cursor_position.
-    let prefix = if app.scale_mode { "Replicas: " } else { ":" };
+    let prefix = if app.scale_mode { "Replicas: " } else if app.port_forward_mode { "Ports: " } else { ":" };
     let prefix_len: u16 = prefix.len() as u16;
     let typed_len = input.len() as u16;
 
@@ -375,7 +375,7 @@ fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         Span::styled(input, theme.command),
     ];
 
-    if !ghost.is_empty() && !app.scale_mode {
+    if !ghost.is_empty() && !app.scale_mode && !app.port_forward_mode {
         spans.push(Span::styled(
             ghost,
             theme.command_suggestion.add_modifier(Modifier::DIM | Modifier::ITALIC),

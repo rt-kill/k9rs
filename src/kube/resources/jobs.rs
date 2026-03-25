@@ -5,7 +5,7 @@ use k8s_openapi::api::batch::v1::Job;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeJob {
     pub namespace: String,
     pub name: String,

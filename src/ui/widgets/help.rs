@@ -66,6 +66,10 @@ impl<'a> HelpOverlay<'a> {
                         key: "-",
                         description: "Toggle last view",
                     },
+                    HelpEntry {
+                        key: "0",
+                        description: "All namespaces",
+                    },
                 ],
             },
             HelpSection {
@@ -208,6 +212,10 @@ impl<'a> HelpOverlay<'a> {
                         description: "Show aliases",
                     },
                     HelpEntry {
+                        key: "Ctrl-l",
+                        description: "Toggle full-fetch mode",
+                    },
+                    HelpEntry {
                         key: "?",
                         description: "Help",
                     },
@@ -299,7 +307,7 @@ impl<'a> HelpOverlay<'a> {
 
 impl Widget for HelpOverlay<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let dialog_area = Self::centered_rect(area, 55, 85);
+        let dialog_area = Self::centered_rect(area, 42, 85);
 
         // Clear background fully so table doesn't bleed through
         Clear.render(dialog_area, buf);

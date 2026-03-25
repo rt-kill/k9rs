@@ -9,18 +9,20 @@ use super::KubeResource;
 pub struct KubeLimitRange {
     pub namespace: String,
     pub name: String,
+    pub types: String,
     pub age: Option<DateTime<Utc>>,
 }
 
 impl KubeResource for KubeLimitRange {
     fn headers() -> &'static [&'static str] {
-        &["NAMESPACE", "NAME", "AGE"]
+        &["NAMESPACE", "NAME", "TYPE", "AGE"]
     }
 
     fn row(&self) -> Vec<Cow<'_, str>> {
         vec![
             Cow::Borrowed(&self.namespace),
             Cow::Borrowed(&self.name),
+            Cow::Borrowed(&self.types),
             Cow::Owned(crate::util::format_age(self.age)),
         ]
     }
@@ -45,9 +47,26 @@ impl From<LimitRange> for KubeLimitRange {
         let name = metadata.name.unwrap_or_default();
         let age = metadata.creation_timestamp.map(|t| t.0);
 
+        let types = lr
+            .spec
+            .and_then(|spec| {
+                let items: Vec<String> = spec
+                    .limits
+                    .iter()
+                    .map(|item| item.type_.clone())
+                    .collect();
+                if items.is_empty() {
+                    None
+                } else {
+                    Some(items.join(", "))
+                }
+            })
+            .unwrap_or_default();
+
         KubeLimitRange {
             namespace,
             name,
+            types,
             age,
         }
     }

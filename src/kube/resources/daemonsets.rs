@@ -5,7 +5,7 @@ use k8s_openapi::api::apps::v1::DaemonSet;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeDaemonSet {
     pub namespace: String,
     pub name: String,

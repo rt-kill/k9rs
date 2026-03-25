@@ -12,6 +12,7 @@ pub struct KubeCrd {
     pub group: String,       // e.g. "cert-manager.io"
     pub version: String,     // e.g. "v1"
     pub kind: String,        // e.g. "Certificate"
+    pub plural: String,      // e.g. "certificates" (from spec.names.plural)
     pub scope: String,       // "Namespaced" or "Cluster"
     pub age: Option<DateTime<Utc>>,
 }
@@ -52,13 +53,17 @@ pub struct DynamicKubeResource {
 
 impl KubeResource for DynamicKubeResource {
     fn headers() -> &'static [&'static str] {
-        &["NAMESPACE", "NAME", "AGE"]
+        &["NAMESPACE", "NAME", "STATUS", "AGE"]
     }
 
     fn row(&self) -> Vec<Cow<'_, str>> {
+        let status = self.data.get("status")
+            .map(|s| Cow::Owned(s.clone()))
+            .unwrap_or(Cow::Borrowed(""));
         vec![
             Cow::Borrowed(&self.namespace),
             Cow::Borrowed(&self.name),
+            status,
             Cow::Owned(crate::util::format_age(self.age)),
         ]
     }

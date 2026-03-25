@@ -6,7 +6,7 @@ use k8s_openapi::api::core::v1::Node;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeNode {
     pub name: String,
     pub status: String,

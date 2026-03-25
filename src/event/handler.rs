@@ -113,6 +113,11 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(Action::ToggleFaultFilter);
     }
 
+    // Ctrl-L: toggle full-fetch mode.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+        return Some(Action::ToggleFullFetch);
+    }
+
     match key.code {
         // `q` is NOT global quit — it is context-sensitive (handled per-view).
         KeyCode::Char(':') => Some(Action::CommandMode),
@@ -131,18 +136,21 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
 fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
     // Ctrl-D: delete with confirmation.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
-        if !app.read_only {
-            return Some(Action::Delete);
+        if app.read_only {
+            return Some(Action::FlashInfo("Read-only mode".to_string()));
         }
-        return None;
+        return Some(Action::Delete);
     }
 
     // Ctrl-K: force-kill pod.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
-        if app.resource_tab == ResourceTab::Pods && !app.read_only {
-            return Some(Action::ForceKill);
+        if app.read_only {
+            return Some(Action::FlashInfo("Read-only mode".to_string()));
         }
-        return None;
+        if app.resource_tab != ResourceTab::Pods {
+            return Some(Action::FlashInfo("Force-kill is only available on Pods".to_string()));
+        }
+        return Some(Action::ForceKill);
     }
 
     match key.code {
@@ -179,7 +187,13 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Detail views.
         KeyCode::Char('d') => Some(Action::Describe),
         KeyCode::Char('y') => Some(Action::Yaml),
-        KeyCode::Char('e') if !app.read_only => Some(Action::Edit),
+        KeyCode::Char('e') => {
+            if app.read_only {
+                Some(Action::FlashInfo("Read-only mode".to_string()))
+            } else {
+                Some(Action::Edit)
+            }
+        }
 
         // Logs: available on pods and workload types (like k9s).
         // Services are excluded because kubectl logs doesn't work on services.
@@ -188,17 +202,25 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
                 ResourceTab::Pods | ResourceTab::Deployments | ResourceTab::StatefulSets
                 | ResourceTab::DaemonSets | ResourceTab::ReplicaSets
                 | ResourceTab::Jobs | ResourceTab::CronJobs => Some(Action::Logs),
-                _ => None,
+                _ => Some(Action::FlashInfo("Logs not available for this resource type".to_string())),
             }
         }
         KeyCode::Char('s') => {
-            if app.resource_tab == ResourceTab::Pods && !app.read_only {
-                Some(Action::Shell)
+            if app.resource_tab == ResourceTab::Pods {
+                if app.read_only {
+                    Some(Action::FlashInfo("Read-only mode".to_string()))
+                } else {
+                    Some(Action::Shell)
+                }
             } else if matches!(
                 app.resource_tab,
                 ResourceTab::Deployments | ResourceTab::StatefulSets | ResourceTab::ReplicaSets
-            ) && !app.read_only {
-                Some(Action::Scale)
+            ) {
+                if app.read_only {
+                    Some(Action::FlashInfo("Read-only mode".to_string()))
+                } else {
+                    Some(Action::Scale)
+                }
             } else {
                 None
             }
@@ -209,15 +231,25 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
             if matches!(
                 app.resource_tab,
                 ResourceTab::Deployments | ResourceTab::StatefulSets | ResourceTab::DaemonSets
-            ) && !app.read_only {
-                Some(Action::Restart)
+            ) {
+                if app.read_only {
+                    Some(Action::FlashInfo("Read-only mode".to_string()))
+                } else {
+                    Some(Action::Restart)
+                }
             } else {
                 None
             }
         }
 
         // Port-forward (pods only — the implementation only handles pods).
-        KeyCode::Char('f') if app.resource_tab == ResourceTab::Pods => Some(Action::PortForward),
+        KeyCode::Char('f') => {
+            if app.resource_tab == ResourceTab::Pods {
+                Some(Action::PortForward)
+            } else {
+                Some(Action::FlashInfo("Port-forward is only available on Pods".to_string()))
+            }
+        }
 
         // Previous logs: available on pods and workload types.
         KeyCode::Char('p') => {
@@ -225,7 +257,7 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
                 ResourceTab::Pods | ResourceTab::Deployments | ResourceTab::StatefulSets
                 | ResourceTab::DaemonSets | ResourceTab::ReplicaSets
                 | ResourceTab::Jobs | ResourceTab::CronJobs => Some(Action::PreviousLogs),
-                _ => None,
+                _ => Some(Action::FlashInfo("Logs not available for this resource type".to_string())),
             }
         }
 
@@ -234,7 +266,7 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
             if app.resource_tab == ResourceTab::Pods {
                 Some(Action::ShowNode)
             } else {
-                None
+                Some(Action::FlashInfo("Show node is only available on Pods".to_string()))
             }
         }
 
@@ -524,7 +556,8 @@ mod tests {
 
     #[test]
     fn test_non_workload_no_logs() {
-        // Non-workload resource tabs should NOT support logs.
+        // Non-workload resource tabs should NOT produce a Logs action.
+        // Instead they produce a FlashInfo message.
         for tab in [
             ResourceTab::Services,
             ResourceTab::Nodes,
@@ -535,7 +568,7 @@ mod tests {
             let mut app = App::new(String::new(), Vec::new(), String::new());
             app.resource_tab = tab;
             assert!(
-                handle_key_event(&app, make_key(KeyCode::Char('l'))).is_none(),
+                !matches!(handle_key_event(&app, make_key(KeyCode::Char('l'))), Some(Action::Logs)),
                 "Expected no Logs action for {:?}",
                 tab,
             );
@@ -559,14 +592,6 @@ mod tests {
             handle_key_event(&app, make_key(KeyCode::Char('n'))),
             Some(Action::Cancel)
         ));
-    }
-
-    #[test]
-    fn test_number_keys_do_not_switch_tabs() {
-        let app = App::new(String::new(), Vec::new(), String::new());
-        // Number keys should NOT produce GotoTab actions.
-        let action = handle_key_event(&app, make_key(KeyCode::Char('1')));
-        assert!(!matches!(action, Some(Action::GotoTab(_))));
     }
 
     #[test]

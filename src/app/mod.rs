@@ -3,6 +3,24 @@ pub mod actions;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+/// Parse a formatted age string like "5m", "2h3m", "3d5h" to total seconds.
+/// Used for correct age-column sorting (lexicographic comparison gets it wrong).
+fn parse_age_seconds(s: &str) -> u64 {
+    let mut total: u64 = 0;
+    let mut num: u64 = 0;
+    for c in s.chars() {
+        match c {
+            '0'..='9' => num = num * 10 + (c as u64 - '0' as u64),
+            'd' => { total += num * 86400; num = 0; }
+            'h' => { total += num * 3600; num = 0; }
+            'm' => { total += num * 60; num = 0; }
+            's' => { total += num; num = 0; }
+            _ => {}
+        }
+    }
+    total + num // handle trailing number without suffix
+}
+
 use crate::kube::resources::{
     KubeResource,
     configmaps::KubeConfigMap,
@@ -375,14 +393,18 @@ pub type DescribeState = ContentViewState;
 
 pub struct KubectlCache {
     entries: HashMap<(String, String, String, &'static str), (String, Instant)>,
+    insertion_order: Vec<(String, String, String, &'static str)>,
     ttl: Duration,
+    max_capacity: usize,
 }
 
 impl KubectlCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
             entries: HashMap::new(),
+            insertion_order: Vec::new(),
             ttl,
+            max_capacity: 100,
         }
     }
 
@@ -406,12 +428,26 @@ impl KubectlCache {
         kind: &'static str,
         content: String,
     ) {
-        self.entries
-            .insert((resource, name, namespace, kind), (content, Instant::now()));
+        let key = (resource, name, namespace, kind);
+        // If the key already exists, just update the value (no change to insertion order).
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key, (content, Instant::now()));
+            return;
+        }
+        // Evict the oldest entry if at capacity.
+        if self.entries.len() >= self.max_capacity {
+            if let Some(oldest_key) = self.insertion_order.first().cloned() {
+                self.entries.remove(&oldest_key);
+                self.insertion_order.remove(0);
+            }
+        }
+        self.insertion_order.push(key.clone());
+        self.entries.insert(key, (content, Instant::now()));
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.insertion_order.clear();
     }
 }
 
@@ -510,6 +546,8 @@ pub struct App {
     pub last_resource_tab: Option<ResourceTab>,
 
     pub context: String,
+    pub cluster: String,
+    pub user: String,
     pub selected_ns: String,
     pub contexts: Vec<String>,
 
@@ -533,7 +571,27 @@ pub struct App {
     /// The (resource_type, name, namespace) target of the pending scale operation.
     pub scale_target: (String, String, String),
 
+    /// When true, the command prompt is used for entering port-forward ports.
+    pub port_forward_mode: bool,
+    /// The (pod_name, namespace) target of the pending port-forward operation.
+    pub port_forward_target: (String, String),
+
+    /// Pending batch delete targets: Vec of (resource_type, name, namespace).
+    pub pending_batch_delete: Vec<(String, String, String)>,
+    /// Pending batch restart targets: Vec of (resource_type, name, namespace).
+    pub pending_batch_restart: Vec<(String, String, String)>,
+    /// Pending batch force-kill targets: Vec of (resource_type, name, namespace).
+    pub pending_batch_force_kill: Vec<(String, String, String)>,
+
+    /// When true, the watcher waits for InitDone before sending data
+    /// (no incremental loading). Useful for drill-downs where you need all pods.
+    pub full_fetch_mode: bool,
+
     pub container_select_index: usize,
+    /// When true, ContainerSelect Enter opens a shell instead of logs.
+    pub shell_mode_container_select: bool,
+    /// Pending shell request from ContainerSelect: (pod, namespace, container).
+    pub pending_shell: Option<(String, String, String)>,
 
     pub help_scroll: usize,
 
@@ -559,8 +617,11 @@ pub struct App {
 
     /// Discovered CRDs from the cluster, used for dynamic resource browsing.
     pub discovered_crds: Vec<KubeCrd>,
-    /// The CRD kind name being viewed in the dynamic resource view.
+    /// The CRD kind name being viewed in the dynamic resource view (for display).
     pub dynamic_resource_name: String,
+    /// The full CRD API resource name (e.g. "clickhouseinstallations.clickhouse.altinity.com")
+    /// used for kubectl commands on dynamic resource instances.
+    pub dynamic_resource_api_resource: String,
 
     /// Cache for kubectl describe/yaml output (30s TTL).
     pub kubectl_cache: KubectlCache,
@@ -568,11 +629,17 @@ pub struct App {
     pub pending_describe_key: Option<(String, String, String)>,
     /// Pending yaml key for cache population when result arrives.
     pub pending_yaml_key: Option<(String, String, String)>,
+
+    /// Pod metrics from metrics-server: (namespace, pod_name) -> (cpu, mem).
+    pub pod_metrics: HashMap<(String, String), (String, String)>,
+    /// Node metrics from metrics-server: node_name -> (cpu, mem).
+    pub node_metrics: HashMap<String, (String, String)>,
 }
 
 impl App {
     pub fn new(context: String, contexts: Vec<String>, namespace: String) -> Self {
         let (no_exit_on_ctrl_c, read_only) = Self::load_k9s_config();
+        let (cluster, user) = crate::kube::KubeClient::context_info(&context);
         Self {
             should_quit: false,
             route: Route::Resources,
@@ -580,6 +647,8 @@ impl App {
             resource_tab: ResourceTab::Pods,
             last_resource_tab: None,
             context,
+            cluster,
+            user,
             selected_ns: namespace,
             contexts,
             data: AppData::default(),
@@ -594,7 +663,15 @@ impl App {
             command_input: String::new(),
             scale_mode: false,
             scale_target: (String::new(), String::new(), String::new()),
+            port_forward_mode: false,
+            port_forward_target: (String::new(), String::new()),
+            pending_batch_delete: Vec::new(),
+            pending_batch_restart: Vec::new(),
+            pending_batch_force_kill: Vec::new(),
+            full_fetch_mode: false,
             container_select_index: 0,
+            shell_mode_container_select: false,
+            pending_shell: None,
             help_scroll: 0,
             show_header: true,
             tick_count: 0,
@@ -606,9 +683,12 @@ impl App {
             fault_filter: false,
             discovered_crds: Vec::new(),
             dynamic_resource_name: String::new(),
+            dynamic_resource_api_resource: String::new(),
             kubectl_cache: KubectlCache::new(Duration::from_secs(30)),
             pending_describe_key: None,
             pending_yaml_key: None,
+            pod_metrics: HashMap::new(),
+            node_metrics: HashMap::new(),
         }
     }
 
@@ -650,6 +730,26 @@ impl App {
             self.route_stack.remove(0);
         }
         self.route_stack.push(route);
+    }
+
+    /// Apply stored pod metrics to all current pod items.
+    pub fn apply_pod_metrics(&mut self) {
+        for pod in &mut self.data.pods.items {
+            if let Some((cpu, mem)) = self.pod_metrics.get(&(pod.namespace.clone(), pod.name.clone())) {
+                pod.cpu = cpu.clone();
+                pod.mem = mem.clone();
+            }
+        }
+    }
+
+    /// Apply stored node metrics to all current node items.
+    pub fn apply_node_metrics(&mut self) {
+        for node in &mut self.data.nodes.items {
+            if let Some((cpu, mem)) = self.node_metrics.get(&node.name) {
+                node.cpu_usage = cpu.clone();
+                node.mem_usage = mem.clone();
+            }
+        }
     }
 
     /// Clear all resource table data. Used when switching namespaces so stale
@@ -785,11 +885,12 @@ impl App {
 
     pub fn apply_filter(&mut self, text: &str) {
         let t = text.to_lowercase();
-        // Try to compile as regex; fall back to substring match
+        // Compile regex once and cache it on the table
         let re = regex::Regex::new(&t).ok();
         macro_rules! apply {
             ($table:expr) => {{
                 $table.filter_text = text.to_string();
+                $table.cached_filter_regex = re.clone();
                 $table.apply_filter(|item| {
                     item.row().iter().any(|cell| {
                         let lower = cell.to_lowercase();
@@ -838,6 +939,45 @@ impl App {
 
     pub fn clear_filter(&mut self) {
         self.with_active_table(|t| t.nav_clear_filter());
+    }
+
+    /// Clear marks on the currently active table.
+    pub fn clear_marks(&mut self) {
+        macro_rules! clear {
+            ($table:expr) => { $table.marked.clear() };
+        }
+        match self.resource_tab {
+            ResourceTab::Pods => clear!(self.data.pods),
+            ResourceTab::Deployments => clear!(self.data.deployments),
+            ResourceTab::Services => clear!(self.data.services),
+            ResourceTab::Nodes => clear!(self.data.nodes),
+            ResourceTab::Namespaces => clear!(self.data.namespaces),
+            ResourceTab::ConfigMaps => clear!(self.data.configmaps),
+            ResourceTab::Secrets => clear!(self.data.secrets),
+            ResourceTab::StatefulSets => clear!(self.data.statefulsets),
+            ResourceTab::DaemonSets => clear!(self.data.daemonsets),
+            ResourceTab::Jobs => clear!(self.data.jobs),
+            ResourceTab::CronJobs => clear!(self.data.cronjobs),
+            ResourceTab::ReplicaSets => clear!(self.data.replicasets),
+            ResourceTab::Ingresses => clear!(self.data.ingresses),
+            ResourceTab::NetworkPolicies => clear!(self.data.network_policies),
+            ResourceTab::ServiceAccounts => clear!(self.data.service_accounts),
+            ResourceTab::StorageClasses => clear!(self.data.storage_classes),
+            ResourceTab::Pvs => clear!(self.data.pvs),
+            ResourceTab::Pvcs => clear!(self.data.pvcs),
+            ResourceTab::Events => clear!(self.data.events),
+            ResourceTab::Roles => clear!(self.data.roles),
+            ResourceTab::ClusterRoles => clear!(self.data.cluster_roles),
+            ResourceTab::RoleBindings => clear!(self.data.role_bindings),
+            ResourceTab::ClusterRoleBindings => clear!(self.data.cluster_role_bindings),
+            ResourceTab::Hpa => clear!(self.data.hpa),
+            ResourceTab::Endpoints => clear!(self.data.endpoints),
+            ResourceTab::LimitRanges => clear!(self.data.limit_ranges),
+            ResourceTab::ResourceQuotas => clear!(self.data.resource_quotas),
+            ResourceTab::Pdb => clear!(self.data.pdb),
+            ResourceTab::Crds => clear!(self.data.crds),
+            ResourceTab::DynamicResource => clear!(self.data.dynamic_resources),
+        }
     }
 
     /// Reset only the active table's data so the UI shows "Loading..." while
@@ -931,12 +1071,59 @@ impl App {
         }
     }
 
-    pub fn tick(&mut self) {
+    /// Advance tick counter, expire flash messages, etc.
+    /// Returns `true` if the UI should be redrawn (e.g. flash expired, loading animation).
+    pub fn tick(&mut self) -> bool {
         self.tick_count = self.tick_count.wrapping_add(1);
+        let mut changed = false;
         if let Some(ref flash) = self.flash {
             if flash.is_expired() {
                 self.flash = None;
+                changed = true;
             }
+        }
+        // Redraw on tick while a loading animation is visible (the loading bar
+        // is time-based and advances every ~200ms).
+        if !self.active_table_has_data() {
+            changed = true;
+        }
+        changed
+    }
+
+    /// Returns `true` if the currently-visible resource table has received data.
+    /// When `false`, a loading animation is shown and needs continuous redraws.
+    fn active_table_has_data(&self) -> bool {
+        match self.resource_tab {
+            ResourceTab::Pods => self.data.pods.has_data,
+            ResourceTab::Deployments => self.data.deployments.has_data,
+            ResourceTab::Services => self.data.services.has_data,
+            ResourceTab::Nodes => self.data.nodes.has_data,
+            ResourceTab::Namespaces => self.data.namespaces.has_data,
+            ResourceTab::ConfigMaps => self.data.configmaps.has_data,
+            ResourceTab::Secrets => self.data.secrets.has_data,
+            ResourceTab::StatefulSets => self.data.statefulsets.has_data,
+            ResourceTab::DaemonSets => self.data.daemonsets.has_data,
+            ResourceTab::Jobs => self.data.jobs.has_data,
+            ResourceTab::CronJobs => self.data.cronjobs.has_data,
+            ResourceTab::ReplicaSets => self.data.replicasets.has_data,
+            ResourceTab::Ingresses => self.data.ingresses.has_data,
+            ResourceTab::NetworkPolicies => self.data.network_policies.has_data,
+            ResourceTab::ServiceAccounts => self.data.service_accounts.has_data,
+            ResourceTab::StorageClasses => self.data.storage_classes.has_data,
+            ResourceTab::Pvs => self.data.pvs.has_data,
+            ResourceTab::Pvcs => self.data.pvcs.has_data,
+            ResourceTab::Events => self.data.events.has_data,
+            ResourceTab::Roles => self.data.roles.has_data,
+            ResourceTab::ClusterRoles => self.data.cluster_roles.has_data,
+            ResourceTab::RoleBindings => self.data.role_bindings.has_data,
+            ResourceTab::ClusterRoleBindings => self.data.cluster_role_bindings.has_data,
+            ResourceTab::Hpa => self.data.hpa.has_data,
+            ResourceTab::Endpoints => self.data.endpoints.has_data,
+            ResourceTab::LimitRanges => self.data.limit_ranges.has_data,
+            ResourceTab::ResourceQuotas => self.data.resource_quotas.has_data,
+            ResourceTab::Pdb => self.data.pdb.has_data,
+            ResourceTab::Crds => self.data.crds.has_data,
+            ResourceTab::DynamicResource => self.data.dynamic_resources.has_data,
         }
     }
 
@@ -963,15 +1150,16 @@ impl App {
     ];
 
     /// Build completion candidates dynamically based on command input.
+    /// Matching is case-insensitive since commands are lowercased on submit.
     pub fn command_completions(&self) -> Vec<String> {
-        let input = &self.command_input;
+        let input_lower = self.command_input.to_lowercase();
 
         // If input starts with "ns " or "namespace ", complete namespace names
-        if input.starts_with("ns ") || input.starts_with("namespace ") {
-            let cmd_prefix = if input.starts_with("ns ") { "ns " } else { "namespace " };
+        if input_lower.starts_with("ns ") || input_lower.starts_with("namespace ") {
+            let cmd_prefix = if input_lower.starts_with("ns ") { "ns " } else { "namespace " };
             let mut completions: Vec<String> = self.data.namespaces.items.iter()
                 .map(|ns| format!("{}{}", cmd_prefix, ns.name()))
-                .filter(|s| s.starts_with(input.as_str()))
+                .filter(|s| s.to_lowercase().starts_with(&input_lower))
                 .collect();
             completions.sort();
             completions.dedup();
@@ -979,11 +1167,11 @@ impl App {
         }
 
         // If input starts with "ctx " or "context ", complete context names
-        if input.starts_with("ctx ") || input.starts_with("context ") {
-            let cmd_prefix = if input.starts_with("ctx ") { "ctx " } else { "context " };
+        if input_lower.starts_with("ctx ") || input_lower.starts_with("context ") {
+            let cmd_prefix = if input_lower.starts_with("ctx ") { "ctx " } else { "context " };
             let mut completions: Vec<String> = self.contexts.iter()
                 .map(|c| format!("{}{}", cmd_prefix, c))
-                .filter(|s| s.starts_with(input.as_str()))
+                .filter(|s| s.to_lowercase().starts_with(&input_lower))
                 .collect();
             completions.sort();
             completions.dedup();
@@ -991,15 +1179,22 @@ impl App {
         }
 
         // If input contains a space, the first word might be a resource type
-        // and the second word is a namespace: "deploy kube-system"
-        if let Some(space_pos) = input.find(' ') {
-            let resource_part = &input[..space_pos];
-            // Check if the resource part is a valid resource command
-            if Self::RESOURCE_COMMANDS.iter().any(|&r| r == resource_part) {
+        // and the second word is a namespace: "deploy kube-system" or "clickhouseinstallation prod"
+        if let Some(space_pos) = input_lower.find(' ') {
+            let resource_part = &input_lower[..space_pos];
+            // Check if it's a built-in resource command OR a discovered CRD name
+            let is_builtin = Self::RESOURCE_COMMANDS.iter().any(|&r| r == resource_part);
+            let is_crd = !is_builtin && self.discovered_crds.iter().any(|crd| {
+                let kind = crd.kind.to_lowercase();
+                let plural = crd.plural.to_lowercase();
+                let short = crd.name.split('.').next().unwrap_or("").to_lowercase();
+                resource_part == kind || resource_part == plural || resource_part == short
+            });
+            if is_builtin || is_crd {
                 // Complete with namespace names
                 let mut completions: Vec<String> = self.data.namespaces.items.iter()
                     .map(|ns| format!("{} {}", resource_part, ns.name()))
-                    .filter(|s| s.starts_with(input.as_str()))
+                    .filter(|s| s.to_lowercase().starts_with(&input_lower))
                     .collect();
                 completions.sort();
                 completions.dedup();
@@ -1013,14 +1208,19 @@ impl App {
 
         let mut completions: Vec<String> = all_commands.iter()
             .map(|s| String::from(*s))
-            .filter(|s| s.starts_with(input.as_str()))
+            .filter(|s| s.starts_with(&input_lower))
             .collect();
 
-        // Add discovered CRD kind names as completions
+        // Add discovered CRD names as completions using the actual plural field
         for crd in &self.discovered_crds {
             let kind_lower = crd.kind.to_lowercase();
-            if kind_lower.starts_with(input.as_str()) {
-                completions.push(kind_lower);
+            let plural_lower = crd.plural.to_lowercase();
+            // Also extract the short plural from the CRD name (before the dot)
+            let short_plural = crd.name.split('.').next().unwrap_or("").to_lowercase();
+            for candidate in [&kind_lower, &plural_lower, &short_plural] {
+                if !candidate.is_empty() && candidate.starts_with(&input_lower) {
+                    completions.push(candidate.clone());
+                }
             }
         }
 
@@ -1118,10 +1318,16 @@ impl App {
     pub fn find_crd_by_name(&self, cmd: &str) -> Option<KubeCrd> {
         let lower = cmd.to_lowercase();
         self.discovered_crds.iter().find(|crd| {
-            crd.kind.to_lowercase() == lower
-                || crd.name.to_lowercase() == lower
-                // Also match plural forms (kind + "s")
-                || format!("{}s", crd.kind.to_lowercase()) == lower
+            let kind_lower = crd.kind.to_lowercase();
+            let name_lower = crd.name.to_lowercase();
+            let plural_lower = crd.plural.to_lowercase();
+            // Match by: kind, plural, full CRD name, kind+"s", or the
+            // short plural from the CRD name (before the first dot).
+            kind_lower == lower
+                || plural_lower == lower
+                || name_lower == lower
+                || format!("{}s", kind_lower) == lower
+                || name_lower.split('.').next().map_or(false, |short| short == lower)
         }).cloned()
     }
 }
@@ -1152,7 +1358,7 @@ impl<T: Clone> TableNav for StatefulTable<T> {
     fn nav_clear_filter(&mut self) { self.clear_filter(); }
     fn nav_reset(&mut self) { self.clear_data(); }
     fn nav_toggle_mark(&mut self) {
-        if !self.filtered_indices.is_empty() {
+        if !self.filtered_indices.is_empty() && self.selected < self.filtered_indices.len() {
             let real_idx = self.filtered_indices[self.selected];
             if self.marked.contains(&real_idx) {
                 self.marked.remove(&real_idx);
@@ -1178,12 +1384,16 @@ pub struct StatefulTable<T: Clone> {
     pub sort_ascending: bool,
     pub page_size: usize,
     pub filter_text: String,
+    /// Cached compiled regex for the current filter_text (avoids recompiling on every data update).
+    cached_filter_regex: Option<regex::Regex>,
     /// Whether this table has received any response from the watcher.
     /// Used to distinguish "loading" (false) from "empty" (true + no items) in the UI.
     pub has_data: bool,
     /// Whether the initial list is still streaming in (InitApply phase).
     /// When true, the title shows a loading indicator alongside the count.
     pub loading: bool,
+    /// Previous item count — used to detect when initial loading completes.
+    prev_item_count: usize,
     /// Set of marked/selected row indices (real indices into `items`).
     pub marked: HashSet<usize>,
 }
@@ -1199,8 +1409,10 @@ impl<T: Clone> Default for StatefulTable<T> {
             sort_ascending: true,
             page_size: 40,
             filter_text: String::new(),
+            cached_filter_regex: None,
             has_data: false,
             loading: false,
+            prev_item_count: 0,
             marked: HashSet::new(),
         }
     }
@@ -1285,11 +1497,13 @@ impl<T: Clone> StatefulTable<T> {
         self.offset = 0;
         self.has_data = false;
         self.loading = false;
+        self.prev_item_count = 0;
         self.marked.clear();
     }
 
     pub fn clear_filter(&mut self) {
         self.filter_text.clear();
+        self.cached_filter_regex = None;
         self.filtered_indices = (0..self.items.len()).collect();
         if self.selected >= self.filtered_indices.len() && !self.filtered_indices.is_empty() {
             self.selected = self.filtered_indices.len() - 1;
@@ -1329,24 +1543,34 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
     /// If already sorted by this column, toggle ascending/descending.
     /// Tries numeric comparison first, falls back to lexicographic.
     pub fn sort_by_column(&mut self, col: usize) {
-        if self.sort_column == col {
+        // Resolve usize::MAX sentinel to actual last column
+        let actual_col = if col == usize::MAX {
+            T::headers().len().saturating_sub(1)
+        } else {
+            col
+        };
+        if self.sort_column == actual_col {
             self.sort_ascending = !self.sort_ascending;
         } else {
-            self.sort_column = col;
+            self.sort_column = actual_col;
             self.sort_ascending = true;
         }
         let asc = self.sort_ascending;
+        // Check if sorting by an AGE column
+        let is_age_col = T::headers().get(actual_col).map_or(false, |h| *h == "AGE");
         self.items.sort_by(|a, b| {
             let a_row = a.row();
             let b_row = b.row();
-            let a_val = a_row.get(col).map(|c| c.as_ref()).unwrap_or("");
-            let b_val = b_row.get(col).map(|c| c.as_ref()).unwrap_or("");
-            // Try numeric comparison first
-            if let (Ok(a_num), Ok(b_num)) = (a_val.parse::<f64>(), b_val.parse::<f64>()) {
-                let ord = a_num.partial_cmp(&b_num).unwrap_or(std::cmp::Ordering::Equal);
-                return if asc { ord } else { ord.reverse() };
-            }
-            let ord = a_val.cmp(b_val);
+            let a_val = a_row.get(actual_col).map(|c| c.as_ref()).unwrap_or("");
+            let b_val = b_row.get(actual_col).map(|c| c.as_ref()).unwrap_or("");
+            let ord = if is_age_col {
+                // Parse age strings to seconds for correct ordering
+                parse_age_seconds(a_val).cmp(&parse_age_seconds(b_val))
+            } else if let (Ok(a_num), Ok(b_num)) = (a_val.parse::<f64>(), b_val.parse::<f64>()) {
+                a_num.partial_cmp(&b_num).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                a_val.cmp(b_val)
+            };
             if asc { ord } else { ord.reverse() }
         });
 
@@ -1386,11 +1610,20 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
             (item.name().to_string(), item.namespace().to_string())
         });
 
-        // Any watcher response (even empty) means the initial sync completed.
+        // Loading indicator: shows during the initial LIST when items are
+        // streaming in (count keeps growing). Once count stops growing,
+        // loading turns off permanently until clear_data resets it.
+        let new_count = items.len();
+        if self.loading {
+            if new_count <= self.prev_item_count {
+                self.loading = false;
+            }
+        } else if self.prev_item_count == 0 && new_count > 0 {
+            // First batch arriving — start showing loading
+            self.loading = true;
+        }
+        self.prev_item_count = new_count;
         self.has_data = true;
-        // Track if item count is growing (still loading from initial LIST)
-        let prev_count = self.items.len();
-        self.loading = !items.is_empty() && items.len() > prev_count;
 
         // Preserve marks by identity (name+namespace) across data refreshes
         let prev_marks: Vec<(String, String)> = self.marked.iter()
@@ -1411,25 +1644,21 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
             }
         }
 
-        // Re-apply filter (supports regex)
+        // Re-apply filter using cached regex (avoids recompilation on every data update).
+        self.filtered_indices.clear();
         if !self.filter_text.is_empty() {
             let t = self.filter_text.to_lowercase();
-            let re = regex::Regex::new(&t).ok();
-            self.filtered_indices = self.items.iter().enumerate()
-                .filter(|(_, item)| {
-                    item.row().iter().any(|cell| {
-                        let lower = cell.to_lowercase();
-                        if let Some(ref re) = re {
-                            re.is_match(&lower)
-                        } else {
-                            lower.contains(&t)
-                        }
-                    })
-                })
-                .map(|(i, _)| i)
-                .collect();
+            let re = &self.cached_filter_regex;
+            for (i, item) in self.items.iter().enumerate() {
+                if item.row().iter().any(|cell| {
+                    let lower = cell.to_lowercase();
+                    re.as_ref().map_or(lower.contains(&t), |r| r.is_match(&lower))
+                }) {
+                    self.filtered_indices.push(i);
+                }
+            }
         } else {
-            self.filtered_indices = (0..self.items.len()).collect();
+            self.filtered_indices.extend(0..self.items.len());
         }
 
         // Restore selection by identity
@@ -1462,23 +1691,25 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
         if self.sort_column != 0 && !self.items.is_empty() {
             let col = self.sort_column;
             let asc = self.sort_ascending;
-            // Sort items in place
+            let is_age_col = T::headers().get(col).map_or(false, |h| *h == "AGE");
             self.items.sort_by(|a, b| {
                 let a_row = a.row();
                 let b_row = b.row();
                 let a_val = a_row.get(col).map(|c| c.as_ref()).unwrap_or("");
                 let b_val = b_row.get(col).map(|c| c.as_ref()).unwrap_or("");
-                if let (Ok(an), Ok(bn)) = (a_val.parse::<f64>(), b_val.parse::<f64>()) {
-                    let ord = an.partial_cmp(&bn).unwrap_or(std::cmp::Ordering::Equal);
-                    return if asc { ord } else { ord.reverse() };
-                }
-                let ord = a_val.cmp(b_val);
+                let ord = if is_age_col {
+                    parse_age_seconds(a_val).cmp(&parse_age_seconds(b_val))
+                } else if let (Ok(an), Ok(bn)) = (a_val.parse::<f64>(), b_val.parse::<f64>()) {
+                    an.partial_cmp(&bn).unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    a_val.cmp(b_val)
+                };
                 if asc { ord } else { ord.reverse() }
             });
-            // Rebuild filtered indices after re-sort
+            // Rebuild filtered indices after re-sort using cached regex
             if !self.filter_text.is_empty() {
                 let t = self.filter_text.to_lowercase();
-                let re = regex::Regex::new(&t).ok();
+                let re = &self.cached_filter_regex;
                 self.filtered_indices = self.items.iter().enumerate()
                     .filter(|(_, item)| {
                         item.row().iter().any(|cell| {

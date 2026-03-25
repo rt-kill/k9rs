@@ -127,10 +127,10 @@ fn resource_type_for_tab(tab: ResourceTab) -> ResourceType {
 }
 
 /// Always-watched resource types that provide essential context.
+/// Events excluded — can be huge on active clusters, lazy-loaded on tab switch.
 const ALWAYS_WATCHED: &[ResourceType] = &[
     ResourceType::Namespaces,
     ResourceType::Nodes,
-    ResourceType::Events,
 ];
 
 /// Manages background watcher tasks for Kubernetes resource types.
@@ -150,8 +150,13 @@ pub struct ResourceWatcher {
     tab_handles: Vec<JoinHandle<()>>,
     /// The resource type currently being watched for the active tab.
     active_tab_type: Option<ResourceType>,
+    /// When true, watchers skip incremental flushing during InitApply
+    /// and wait for InitDone to send the complete snapshot at once.
+    pub full_fetch: Arc<AtomicBool>,
     /// The GVK for dynamic CRD instance browsing, if any.
     dynamic_gvk: Option<GroupVersionKind>,
+    /// The plural resource name from the CRD spec (e.g. "certificates").
+    dynamic_plural: String,
     /// The scope of the dynamic CRD ("Namespaced" or "Cluster").
     dynamic_scope: String,
 }
@@ -177,7 +182,9 @@ impl ResourceWatcher {
             core_handles: Vec::new(),
             tab_handles: Vec::new(),
             active_tab_type: None,
+            full_fetch: Arc::new(AtomicBool::new(false)),
             dynamic_gvk: None,
+            dynamic_plural: String::new(),
             dynamic_scope: String::new(),
         };
 
@@ -195,7 +202,22 @@ impl ResourceWatcher {
         self.spawn_core_watchers();
         // Re-watch the previously active tab type.
         if let Some(rt) = self.active_tab_type {
-            self.watch_resource_types(&[rt]);
+            if rt == ResourceType::DynamicResource {
+                // Dynamic resources need special handling — reconstruct from stored GVK.
+                if let Some(ref gvk) = self.dynamic_gvk.clone() {
+                    let plural = self.dynamic_plural.clone();
+                    let scope = self.dynamic_scope.clone();
+                    let client = self.client.clone();
+                    let ns = self.namespace.clone();
+                    let tx = self.tx.clone();
+                    let handle = tokio::spawn(Self::watch_dynamic_resource(
+                        client, ns, tx, gvk.clone(), plural, scope,
+                    ));
+                    self.tab_handles.push(handle);
+                }
+            } else {
+                self.watch_resource_types(&[rt]);
+            }
         }
     }
 
@@ -219,17 +241,18 @@ impl ResourceWatcher {
     }
 
     /// Start watching a dynamic CRD resource type.
-    pub async fn watch_dynamic(&mut self, group: String, version: String, kind: String, scope: String) {
+    pub async fn watch_dynamic(&mut self, group: String, version: String, kind: String, plural: String, scope: String) {
         self.stop_tab_watchers().await;
         let gvk = GroupVersionKind::gvk(&group, &version, &kind);
         self.dynamic_gvk = Some(gvk.clone());
+        self.dynamic_plural = plural.clone();
         self.dynamic_scope = scope.clone();
         self.active_tab_type = Some(ResourceType::DynamicResource);
 
         let client = self.client.clone();
         let ns = self.namespace.clone();
         let tx = self.tx.clone();
-        let handle = tokio::spawn(Self::watch_dynamic_resource(client, ns, tx, gvk, scope));
+        let handle = tokio::spawn(Self::watch_dynamic_resource(client, ns, tx, gvk, plural, scope));
         self.tab_handles.push(handle);
     }
 
@@ -273,16 +296,19 @@ impl ResourceWatcher {
         self.core_handles.push(tokio::spawn(Self::watch_namespaces(
             client.clone(),
             tx.clone(),
+            self.full_fetch.clone(),
         )));
         self.core_handles.push(tokio::spawn(Self::watch_nodes(
             client.clone(),
             tx.clone(),
+            self.full_fetch.clone(),
         )));
         // Events are namespace-scoped.
         self.core_handles.push(tokio::spawn(Self::watch_events(
             client.clone(),
             ns,
             tx.clone(),
+            self.full_fetch.clone(),
         )));
     }
 
@@ -301,89 +327,89 @@ impl ResourceWatcher {
 
             let handle = match rt {
                 ResourceType::Pods => {
-                    tokio::spawn(Self::watch_pods(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_pods(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Deployments => {
-                    tokio::spawn(Self::watch_deployments(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_deployments(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Services => {
-                    tokio::spawn(Self::watch_services(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_services(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::StatefulSets => {
-                    tokio::spawn(Self::watch_stateful_sets(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_stateful_sets(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::DaemonSets => {
-                    tokio::spawn(Self::watch_daemon_sets(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_daemon_sets(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Jobs => {
-                    tokio::spawn(Self::watch_jobs(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_jobs(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::CronJobs => {
-                    tokio::spawn(Self::watch_cron_jobs(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_cron_jobs(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::ConfigMaps => {
-                    tokio::spawn(Self::watch_config_maps(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_config_maps(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Secrets => {
-                    tokio::spawn(Self::watch_secrets(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_secrets(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Ingresses => {
-                    tokio::spawn(Self::watch_ingresses(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_ingresses(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::ReplicaSets => {
-                    tokio::spawn(Self::watch_replica_sets(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_replica_sets(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Pvs => {
-                    tokio::spawn(Self::watch_pvs(client.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_pvs(client.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Pvcs => {
-                    tokio::spawn(Self::watch_pvcs(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_pvcs(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::StorageClasses => {
-                    tokio::spawn(Self::watch_storage_classes(client.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_storage_classes(client.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::ServiceAccounts => {
-                    tokio::spawn(Self::watch_service_accounts(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_service_accounts(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::NetworkPolicies => {
-                    tokio::spawn(Self::watch_network_policies(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_network_policies(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Roles => {
-                    tokio::spawn(Self::watch_roles(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_roles(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::ClusterRoles => {
-                    tokio::spawn(Self::watch_cluster_roles(client.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_cluster_roles(client.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::RoleBindings => {
-                    tokio::spawn(Self::watch_role_bindings(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_role_bindings(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::ClusterRoleBindings => {
-                    tokio::spawn(Self::watch_cluster_role_bindings(client.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_cluster_role_bindings(client.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Hpa => {
-                    tokio::spawn(Self::watch_hpa(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_hpa(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Endpoints => {
-                    tokio::spawn(Self::watch_endpoints(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_endpoints(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::LimitRanges => {
-                    tokio::spawn(Self::watch_limit_ranges(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_limit_ranges(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::ResourceQuotas => {
-                    tokio::spawn(Self::watch_resource_quotas(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_resource_quotas(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Pdb => {
-                    tokio::spawn(Self::watch_pdb(client.clone(), ns.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_pdb(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::Crds => {
-                    tokio::spawn(Self::watch_crds(client.clone(), tx.clone()))
+                    tokio::spawn(Self::watch_crds(client.clone(), tx.clone(), self.full_fetch.clone()))
                 }
                 ResourceType::DynamicResource => {
                     // Dynamic resource requires a GVK; if not set, skip.
                     if let Some(ref gvk) = self.dynamic_gvk {
                         tokio::spawn(Self::watch_dynamic_resource(
                             client.clone(), ns.clone(), tx.clone(),
-                            gvk.clone(), self.dynamic_scope.clone(),
+                            gvk.clone(), self.dynamic_plural.clone(), self.dynamic_scope.clone(),
                         ))
                     } else {
                         continue;
@@ -407,107 +433,107 @@ impl ResourceWatcher {
 
     // ── Cluster-scoped watchers ───────────────────────────────────────────────
 
-    async fn watch_nodes(client: Client, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_nodes(client: Client, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<Node> = Api::all(client);
-        run_watcher(api, tx, KubeNode::from, |items| ResourceUpdate::Nodes(items))
+        run_watcher(api, tx, KubeNode::from, |items| ResourceUpdate::Nodes(items), full_fetch)
         .await;
     }
 
-    async fn watch_namespaces(client: Client, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_namespaces(client: Client, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<Namespace> = Api::all(client);
-        run_watcher(api, tx, KubeNamespace::from, |items| ResourceUpdate::Namespaces(items))
+        run_watcher(api, tx, KubeNamespace::from, |items| ResourceUpdate::Namespaces(items), full_fetch)
         .await;
     }
 
-    async fn watch_pvs(client: Client, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_pvs(client: Client, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<PersistentVolume> = Api::all(client);
-        run_watcher(api, tx, KubePv::from, |items| ResourceUpdate::Pvs(items))
+        run_watcher(api, tx, KubePv::from, |items| ResourceUpdate::Pvs(items), full_fetch)
         .await;
     }
 
-    async fn watch_storage_classes(client: Client, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_storage_classes(client: Client, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<StorageClass> = Api::all(client);
-        run_watcher(api, tx, KubeStorageClass::from, |items| ResourceUpdate::StorageClasses(items))
+        run_watcher(api, tx, KubeStorageClass::from, |items| ResourceUpdate::StorageClasses(items), full_fetch)
         .await;
     }
 
-    async fn watch_cluster_roles(client: Client, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_cluster_roles(client: Client, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<ClusterRole> = Api::all(client);
-        run_watcher(api, tx, KubeClusterRole::from, |items| ResourceUpdate::ClusterRoles(items))
+        run_watcher(api, tx, KubeClusterRole::from, |items| ResourceUpdate::ClusterRoles(items), full_fetch)
         .await;
     }
 
-    async fn watch_cluster_role_bindings(client: Client, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_cluster_role_bindings(client: Client, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<ClusterRoleBinding> = Api::all(client);
-        run_watcher(api, tx, KubeClusterRoleBinding::from, |items| ResourceUpdate::ClusterRoleBindings(items))
+        run_watcher(api, tx, KubeClusterRoleBinding::from, |items| ResourceUpdate::ClusterRoleBindings(items), full_fetch)
         .await;
     }
 
     // ── Namespace-scoped watchers ─────────────────────────────────────────────
 
-    async fn watch_pods(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_pods(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<Pod> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubePod::from, |items| ResourceUpdate::Pods(items))
+        run_watcher(api, tx, KubePod::from, |items| ResourceUpdate::Pods(items), full_fetch)
         .await;
     }
 
-    async fn watch_deployments(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_deployments(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<Deployment> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeDeployment::from, |items| ResourceUpdate::Deployments(items))
+        run_watcher(api, tx, KubeDeployment::from, |items| ResourceUpdate::Deployments(items), full_fetch)
         .await;
     }
 
-    async fn watch_services(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_services(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<Service> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeService::from, |items| ResourceUpdate::Services(items))
+        run_watcher(api, tx, KubeService::from, |items| ResourceUpdate::Services(items), full_fetch)
         .await;
     }
 
-    async fn watch_config_maps(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_config_maps(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<ConfigMap> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeConfigMap::from, |items| ResourceUpdate::ConfigMaps(items))
+        run_watcher(api, tx, KubeConfigMap::from, |items| ResourceUpdate::ConfigMaps(items), full_fetch)
         .await;
     }
 
-    async fn watch_secrets(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_secrets(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<Secret> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeSecret::from, |items| ResourceUpdate::Secrets(items))
+        run_watcher(api, tx, KubeSecret::from, |items| ResourceUpdate::Secrets(items), full_fetch)
         .await;
     }
 
-    async fn watch_stateful_sets(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_stateful_sets(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<StatefulSet> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeStatefulSet::from, |items| ResourceUpdate::StatefulSets(items))
+        run_watcher(api, tx, KubeStatefulSet::from, |items| ResourceUpdate::StatefulSets(items), full_fetch)
         .await;
     }
 
-    async fn watch_daemon_sets(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_daemon_sets(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<DaemonSet> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeDaemonSet::from, |items| ResourceUpdate::DaemonSets(items))
+        run_watcher(api, tx, KubeDaemonSet::from, |items| ResourceUpdate::DaemonSets(items), full_fetch)
         .await;
     }
 
-    async fn watch_jobs(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_jobs(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<Job> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeJob::from, |items| ResourceUpdate::Jobs(items))
+        run_watcher(api, tx, KubeJob::from, |items| ResourceUpdate::Jobs(items), full_fetch)
         .await;
     }
 
-    async fn watch_cron_jobs(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_cron_jobs(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<CronJob> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeCronJob::from, |items| ResourceUpdate::CronJobs(items))
+        run_watcher(api, tx, KubeCronJob::from, |items| ResourceUpdate::CronJobs(items), full_fetch)
         .await;
     }
 
-    async fn watch_replica_sets(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_replica_sets(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<ReplicaSet> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeReplicaSet::from, |items| ResourceUpdate::ReplicaSets(items))
+        run_watcher(api, tx, KubeReplicaSet::from, |items| ResourceUpdate::ReplicaSets(items), full_fetch)
         .await;
     }
 
-    async fn watch_ingresses(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_ingresses(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<Ingress> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeIngress::from, |items| ResourceUpdate::Ingresses(items))
+        run_watcher(api, tx, KubeIngress::from, |items| ResourceUpdate::Ingresses(items), full_fetch)
         .await;
     }
 
@@ -515,9 +541,10 @@ impl ResourceWatcher {
         client: Client,
         ns: String,
         tx: mpsc::Sender<ResourceUpdate>,
+        full_fetch: Arc<AtomicBool>,
     ) {
         let api: Api<NetworkPolicy> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeNetworkPolicy::from, |items| ResourceUpdate::NetworkPolicies(items))
+        run_watcher(api, tx, KubeNetworkPolicy::from, |items| ResourceUpdate::NetworkPolicies(items), full_fetch)
         .await;
     }
 
@@ -525,100 +552,81 @@ impl ResourceWatcher {
         client: Client,
         ns: String,
         tx: mpsc::Sender<ResourceUpdate>,
+        full_fetch: Arc<AtomicBool>,
     ) {
         let api: Api<ServiceAccount> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeServiceAccount::from, |items| ResourceUpdate::ServiceAccounts(items))
+        run_watcher(api, tx, KubeServiceAccount::from, |items| ResourceUpdate::ServiceAccounts(items), full_fetch)
         .await;
     }
 
-    async fn watch_pvcs(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_pvcs(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<PersistentVolumeClaim> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubePvc::from, |items| ResourceUpdate::Pvcs(items))
+        run_watcher(api, tx, KubePvc::from, |items| ResourceUpdate::Pvcs(items), full_fetch)
         .await;
     }
 
-    async fn watch_events(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_events(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<Event> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeEvent::from, |items| ResourceUpdate::Events(items))
+        run_watcher(api, tx, KubeEvent::from, |items| ResourceUpdate::Events(items), full_fetch)
         .await;
     }
 
-    async fn watch_roles(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_roles(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<Role> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeRole::from, |items| ResourceUpdate::Roles(items))
+        run_watcher(api, tx, KubeRole::from, |items| ResourceUpdate::Roles(items), full_fetch)
         .await;
     }
 
-    async fn watch_role_bindings(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_role_bindings(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<RoleBinding> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeRoleBinding::from, |items| ResourceUpdate::RoleBindings(items))
+        run_watcher(api, tx, KubeRoleBinding::from, |items| ResourceUpdate::RoleBindings(items), full_fetch)
         .await;
     }
 
-    async fn watch_hpa(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_hpa(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<HorizontalPodAutoscaler> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeHpa::from, |items| ResourceUpdate::Hpa(items))
+        run_watcher(api, tx, KubeHpa::from, |items| ResourceUpdate::Hpa(items), full_fetch)
         .await;
     }
 
-    async fn watch_endpoints(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_endpoints(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<Endpoints> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeEndpoints::from, |items| ResourceUpdate::Endpoints(items))
+        run_watcher(api, tx, KubeEndpoints::from, |items| ResourceUpdate::Endpoints(items), full_fetch)
         .await;
     }
 
-    async fn watch_limit_ranges(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_limit_ranges(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<LimitRange> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeLimitRange::from, |items| ResourceUpdate::LimitRanges(items))
+        run_watcher(api, tx, KubeLimitRange::from, |items| ResourceUpdate::LimitRanges(items), full_fetch)
         .await;
     }
 
-    async fn watch_resource_quotas(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_resource_quotas(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<ResourceQuota> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubeResourceQuota::from, |items| ResourceUpdate::ResourceQuotas(items))
+        run_watcher(api, tx, KubeResourceQuota::from, |items| ResourceUpdate::ResourceQuotas(items), full_fetch)
         .await;
     }
 
-    async fn watch_pdb(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_pdb(client: Client, ns: String, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<PodDisruptionBudget> = ns_api(&client, &ns);
-        run_watcher(api, tx, KubePdb::from, |items| ResourceUpdate::Pdb(items))
+        run_watcher(api, tx, KubePdb::from, |items| ResourceUpdate::Pdb(items), full_fetch)
         .await;
     }
 
-    async fn watch_crds(client: Client, tx: mpsc::Sender<ResourceUpdate>) {
+    async fn watch_crds(client: Client, tx: mpsc::Sender<ResourceUpdate>, full_fetch: Arc<AtomicBool>) {
         let api: Api<CustomResourceDefinition> = Api::all(client);
-        run_watcher(api, tx, |crd: CustomResourceDefinition| crd, |items| {
-            ResourceUpdate::Crds(
-                items
-                    .into_iter()
-                    .map(|crd| {
-                        let meta = crd.metadata;
-                        let spec = crd.spec;
-                        let name = meta.name.unwrap_or_default();
-                        let group = spec.group;
-                        // Use the first served version (or the stored version)
-                        let version = spec
-                            .versions
-                            .first()
-                            .map(|v| v.name.clone())
-                            .unwrap_or_default();
-                        let kind = spec.names.kind;
-                        let scope = format!("{:?}", spec.scope);
-                        // Clean up the scope string from the Debug format
-                        let scope = scope.trim_matches('"').to_string();
-                        let age = meta.creation_timestamp.map(|ts| ts.0);
-                        KubeCrd {
-                            name,
-                            group,
-                            version,
-                            kind,
-                            scope,
-                            age,
-                        }
-                    })
-                    .collect(),
-            )
-        })
+        run_watcher(api, tx, |crd: CustomResourceDefinition| {
+            let meta = crd.metadata;
+            let spec = crd.spec;
+            let name = meta.name.unwrap_or_default();
+            let group = spec.group;
+            let version = spec.versions.first().map(|v| v.name.clone()).unwrap_or_default();
+            let kind = spec.names.kind;
+            let plural = spec.names.plural;
+            let scope = format!("{:?}", spec.scope).trim_matches('"').to_string();
+            let age = meta.creation_timestamp.map(|ts| ts.0);
+            KubeCrd { name, group, version, kind, plural, scope, age }
+        }, |items| ResourceUpdate::Crds(items), full_fetch)
         .await;
     }
 
@@ -627,9 +635,16 @@ impl ResourceWatcher {
         ns: String,
         tx: mpsc::Sender<ResourceUpdate>,
         gvk: GroupVersionKind,
+        plural: String,
         scope: String,
     ) {
-        let ar = ApiResource::from_gvk(&gvk);
+        // Use from_gvk_with_plural to get the correct API endpoint.
+        // from_gvk() guesses the plural (kind + "s") which is wrong for many CRDs.
+        let ar = if plural.is_empty() {
+            ApiResource::from_gvk(&gvk)
+        } else {
+            ApiResource::from_gvk_with_plural(&gvk, &plural)
+        };
         let api: Api<DynamicObject> = if scope == "Namespaced" {
             if ns.is_empty() || ns == "all" {
                 Api::all_with(client, &ar)
@@ -677,7 +692,13 @@ fn obj_key<K: Resource<DynamicType = ()>>(obj: &K) -> ObjKey {
 ///
 /// Events are debounced: after any change, a "dirty" flag is set and a background
 /// timer sends at most one snapshot every 100ms, avoiding a flood of updates.
-async fn run_watcher<K, T, C, F>(api: Api<K>, tx: mpsc::Sender<ResourceUpdate>, convert: C, make_update: F)
+async fn run_watcher<K, T, C, F>(
+    api: Api<K>,
+    tx: mpsc::Sender<ResourceUpdate>,
+    convert: C,
+    make_update: F,
+    full_fetch: Arc<AtomicBool>,
+)
 where
     K: Resource<DynamicType = ()>
         + Clone
@@ -686,7 +707,7 @@ where
         + Sync
         + serde::de::DeserializeOwned
         + 'static,
-    T: Clone + Send + 'static,
+    T: Clone + Send + 'static + crate::kube::resources::KubeResource,
     C: Fn(K) -> T + Send + 'static,
     F: Fn(Vec<T>) -> ResourceUpdate + Send + 'static,
 {
@@ -694,27 +715,25 @@ where
     let mut stream = watcher::watcher(api, watcher_config).boxed();
 
     // Store converted (lightweight) types instead of raw k8s objects.
-    // This makes snapshot cloning much cheaper (e.g., ~400 bytes per KubePod
-    // instead of ~8KB per raw Pod).
     let mut store: HashMap<ObjKey, T> = HashMap::new();
-    let dirty = Arc::new(AtomicBool::new(false));
     let mut init_apply_count: usize = 0;
-    let mut next_flush_at: usize = 100; // First flush after 100 items, then exponentially growing
+    let mut next_flush_at: usize = 50;
 
-    // Shared channel to pass snapshots from the debounce task.
-    let (snap_tx, mut snap_rx) = mpsc::channel::<()>(1);
+    // Channel for sending snapshots — both the debounce timer and immediate
+    // flushes use this to signal the snapshot builder below.
+    let (snap_tx, mut snap_rx) = mpsc::channel::<()>(2);
 
-    // Spawn the debounce flusher: checks every 100ms, sends if dirty.
-    let dirty_flag = dirty.clone();
+    // Debounce timer: only used during InitApply bursts (large initial lists).
+    // For Apply/Delete/InitDone, we send immediately — no reason to delay.
+    let debounce_dirty = Arc::new(AtomicBool::new(false));
+    let dirty_flag = debounce_dirty.clone();
+    let debounce_snap_tx = snap_tx.clone();
     let debounce_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             interval.tick().await;
-            // Signal the main loop to flush if dirty.
             if dirty_flag.swap(false, Ordering::AcqRel) {
-                // Send a unit as a "flush" signal; the main loop
-                // will use its own store to build the actual snapshot.
-                if snap_tx.send(()).await.is_err() {
+                if debounce_snap_tx.send(()).await.is_err() {
                     break;
                 }
             }
@@ -729,37 +748,37 @@ where
                         match event {
                             WatcherEvent::Init => {
                                 store.clear();
-                                // Don't mark dirty — wait for InitDone to avoid
-                                // flushing an empty snapshot before items arrive.
                             }
                             WatcherEvent::InitApply(obj) => {
                                 let key = obj_key(&obj);
                                 store.insert(key, convert(obj));
-                                init_apply_count += 1;
-                                // Exponentially growing flush thresholds:
-                                // 100, 200, 400, 800, 1600, 3200, 6400, ...
-                                // First batch shows fast (~100 items), total snapshots
-                                // stays O(log n) instead of O(n/500).
-                                if init_apply_count >= next_flush_at {
-                                    dirty.store(true, Ordering::Release);
-                                    next_flush_at = (next_flush_at * 2).max(next_flush_at + 100);
+                                // Batch InitApply via debounce — large lists would
+                                // flood the UI with partial snapshots otherwise.
+                                if !full_fetch.load(Ordering::Acquire) {
+                                    init_apply_count += 1;
+                                    if init_apply_count >= next_flush_at {
+                                        debounce_dirty.store(true, Ordering::Release);
+                                        next_flush_at += 100;
+                                    }
                                 }
                             }
                             WatcherEvent::InitDone => {
                                 debug!("initial list complete, {} items", store.len());
                                 init_apply_count = 0;
-                                next_flush_at = 100;
-                                dirty.store(true, Ordering::Release);
+                                next_flush_at = 50;
+                                // Send snapshot IMMEDIATELY — no debounce delay
+                                let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Apply(obj) => {
                                 let key = obj_key(&obj);
                                 store.insert(key, convert(obj));
-                                dirty.store(true, Ordering::Release);
+                                // Immediate flush for live updates
+                                let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Delete(obj) => {
                                 let key = obj_key(&obj);
                                 store.remove(&key);
-                                dirty.store(true, Ordering::Release);
+                                let _ = snap_tx.try_send(());
                             }
                         }
                     }
@@ -776,7 +795,15 @@ where
                 // Debounce timer fired and store is dirty — send a snapshot.
                 // Items are already converted to lightweight types at insert time,
                 // so this clone is cheap (~400 bytes per item, not ~8KB).
-                let items: Vec<T> = store.values().cloned().collect();
+                let mut items: Vec<T> = store.values().cloned().collect();
+                // Sort by namespace+name for stable, deterministic ordering.
+                // Without this, HashMap iteration order is random and the
+                // table rows would jump around on every update.
+                items.sort_by(|a, b| {
+                    let key_a = (a.namespace(), a.name());
+                    let key_b = (b.namespace(), b.name());
+                    key_a.cmp(&key_b)
+                });
                 let update = make_update(items);
                 if tx.send(update).await.is_err() {
                     debug!("channel closed, stopping watcher");
@@ -800,21 +827,10 @@ async fn run_dynamic_watcher(
     let mut stream = watcher::watcher(api, watcher_config).boxed();
 
     let mut store: HashMap<ObjKey, DynamicObject> = HashMap::new();
-    let dirty = Arc::new(AtomicBool::new(false));
-    let (snap_tx, mut snap_rx) = mpsc::channel::<()>(1);
+    let (snap_tx, mut snap_rx) = mpsc::channel::<()>(2);
 
-    let dirty_flag = dirty.clone();
-    let debounce_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-        loop {
-            interval.tick().await;
-            if dirty_flag.swap(false, Ordering::AcqRel) {
-                if snap_tx.send(()).await.is_err() {
-                    break;
-                }
-            }
-        }
-    });
+    // No debounce for dynamic watcher — lists are typically small.
+    // Send snapshot immediately on any change.
 
     loop {
         tokio::select! {
@@ -831,17 +847,17 @@ async fn run_dynamic_watcher(
                             }
                             WatcherEvent::InitDone => {
                                 debug!("dynamic watcher initial list complete, {} items", store.len());
-                                dirty.store(true, Ordering::Release);
+                                let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Apply(obj) => {
                                 let key = dyn_obj_key(&obj);
                                 store.insert(key, obj);
-                                dirty.store(true, Ordering::Release);
+                                let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Delete(obj) => {
                                 let key = dyn_obj_key(&obj);
                                 store.remove(&key);
-                                dirty.store(true, Ordering::Release);
+                                let _ = snap_tx.try_send(());
                             }
                         }
                     }
@@ -889,8 +905,6 @@ async fn run_dynamic_watcher(
             }
         }
     }
-
-    debounce_handle.abort();
 }
 
 /// Extracts the `(namespace, name)` key from a DynamicObject.

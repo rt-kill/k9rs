@@ -6,7 +6,7 @@ use k8s_openapi::api::batch::v1::CronJob;
 use crate::util::format_age;
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeCronJob {
     pub namespace: String,
     pub name: String,

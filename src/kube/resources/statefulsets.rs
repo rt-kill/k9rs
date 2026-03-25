@@ -5,7 +5,7 @@ use k8s_openapi::api::apps::v1::StatefulSet;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeStatefulSet {
     pub namespace: String,
     pub name: String,

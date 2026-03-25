@@ -1,6 +1,9 @@
 pub mod handler;
 
+use std::collections::HashMap;
+
 use crate::app::FlashMessage;
+use crate::kube::cache::CachedCrd;
 use crate::kube::resources::{
     configmaps::KubeConfigMap,
     crds::{KubeCrd, DynamicKubeResource},
@@ -35,7 +38,6 @@ use crate::kube::resources::{
 /// Input events (key, mouse, tick) are handled directly by the main event loop
 /// via crossterm's `EventStream`. Only resource updates, errors, and flash
 /// messages flow through this channel.
-#[derive(Debug)]
 pub enum AppEvent {
     /// An update to a Kubernetes resource list or content view.
     ResourceUpdate(ResourceUpdate),
@@ -43,6 +45,26 @@ pub enum AppEvent {
     Error(String),
     /// A temporary flash message shown in the status bar.
     Flash(FlashMessage),
+    /// Result of a background context switch. Contains (context_name, new_client)
+    /// on success, or an error string on failure.
+    ContextSwitchResult {
+        context: String,
+        result: Result<::kube::Client, String>,
+    },
+    /// Fresh cache data polled from the daemon (populated by another instance).
+    DaemonCacheUpdate {
+        namespaces: Vec<String>,
+        crds: Vec<CachedCrd>,
+    },
+    /// Pod metrics from the metrics-server: HashMap<(namespace, pod_name), (cpu, mem)>.
+    PodMetrics(HashMap<(String, String), (String, String)>),
+    /// Node metrics from the metrics-server: HashMap<node_name, (cpu, mem)>.
+    NodeMetrics(HashMap<String, (String, String)>),
+    /// Cached resource data loaded from the daemon for instant tab display.
+    CachedResources {
+        resource_type: String,
+        data: String,
+    },
 }
 
 /// An update to a particular Kubernetes resource type.

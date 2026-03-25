@@ -4,6 +4,7 @@ pub mod kube;
 pub mod ui;
 pub mod util;
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
+    cursor::SetCursorStyle,
     event::{Event as CtEvent, EventStream, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -68,11 +70,33 @@ struct Cli {
     /// Start on a specific resource view
     #[arg(short, long)]
     command: Option<String>,
+
+    /// Run as cache daemon (background process for shared cache)
+    #[arg(long, hide = true)]
+    daemon: bool,
+
+    /// Query the cache daemon: get <context>, put, ping, status, contexts
+    #[arg(long, value_name = "COMMAND")]
+    cache: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Daemon mode: run the cache daemon and exit
+    if cli.daemon {
+        if let Err(e) = crate::kube::daemon::run_daemon().await {
+            eprintln!("Daemon error: {}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // Cache CLI: query the daemon from the command line
+    if let Some(ref cache_cmd) = cli.cache {
+        return cache_cli(cache_cmd).await;
+    }
 
     // Setup logging
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -90,10 +114,108 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    // Initialize kubernetes client with a graceful error message
-    let kube_client = match crate::kube::KubeClient::new(cli.context.as_deref()).await {
+    // Read kubeconfig ONCE for all early init (contexts list, cluster/user info)
+    let kubeconfig = ::kube::config::Kubeconfig::read().ok();
+    let contexts: Vec<String> = kubeconfig.as_ref()
+        .map(|kc| kc.contexts.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    let current_context = cli.context.clone().or_else(|| {
+        kubeconfig.as_ref().and_then(|kc| kc.current_context.clone())
+    }).unwrap_or_else(|| "in-cluster".to_string());
+
+    // Initialize app state and show TUI IMMEDIATELY — data loads in background
+    let namespace = cli.namespace.unwrap_or_else(|| "all".to_string());
+    let mut app = App::new(
+        current_context.clone(),
+        contexts.clone(),
+        namespace,
+    );
+
+    // Populate contexts table from the single kubeconfig read
+    if let Some(ref kc) = kubeconfig {
+        let mut ctx_map = std::collections::HashMap::new();
+        for named_ctx in &kc.contexts {
+            if let Some(ref ctx) = named_ctx.context {
+                ctx_map.insert(named_ctx.name.as_str(), (ctx.cluster.as_str(), ctx.user.as_deref().unwrap_or("")));
+            }
+        }
+        let kube_contexts: Vec<crate::app::KubeContext> = contexts.iter().map(|name: &String| {
+            let (cluster, _user) = ctx_map.get(name.as_str()).unwrap_or(&("", ""));
+            crate::app::KubeContext {
+                name: name.clone(),
+                cluster: cluster.to_string(),
+                is_current: name == &current_context,
+            }
+        }).collect();
+        // Also set cluster/user on app from the same read
+        if let Some(&(cluster, user)) = ctx_map.get(current_context.as_str()) {
+            app.cluster = cluster.to_string();
+            app.user = user.to_string();
+        }
+        app.data.contexts.set_items(kube_contexts);
+    }
+
+    // Load cached data for instant autocompletion of namespaces and CRDs.
+    // Try daemon first (shared across instances), fall back to file cache.
+    let mut daemon_client = crate::kube::daemon::DaemonClient::connect_or_spawn().await;
+    if let Some(ref mut dc) = daemon_client {
+        if let Some((namespaces, crds)) = dc.get(&current_context).await {
+            if !namespaces.is_empty() {
+                let ns_items = crate::kube::cache::cached_namespaces_to_domain(&namespaces);
+                app.data.namespaces.set_items(ns_items);
+            }
+            if !crds.is_empty() {
+                app.discovered_crds = crate::kube::cache::cached_crds_to_domain(&crds);
+            }
+        }
+    } else if let Some(cache) = crate::kube::cache::load_cache(&current_context) {
+        // Fallback to file cache if daemon unavailable
+        if !cache.namespaces.is_empty() {
+            let ns_items = crate::kube::cache::cached_namespaces_to_domain(&cache.namespaces);
+            app.data.namespaces.set_items(ns_items);
+        }
+        if !cache.crds.is_empty() {
+            app.discovered_crds = crate::kube::cache::cached_crds_to_domain(&cache.crds);
+        }
+    }
+
+    // Parse initial command/resource
+    if let Some(ref cmd) = cli.command {
+        if let Some(tab) = parse_resource_command(cmd) {
+            app.resource_tab = tab;
+        }
+    }
+
+    // Setup terminal FIRST — show TUI before any network IO
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    // Create event channel
+    let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(500);
+
+    // Track active log streaming task so we can cancel on Back
+    let mut log_task: Option<JoinHandle<()>> = None;
+
+    // Generation counters to prevent stale describe/yaml results from overwriting newer ones
+    let describe_generation = Arc::new(AtomicU64::new(0));
+    let yaml_generation = Arc::new(AtomicU64::new(0));
+
+    // Now create the kube client — this may be slow (TLS, API validation)
+    // but the TUI is already visible and showing a loading state.
+    app.flash = Some(crate::app::FlashMessage::info("Connecting to cluster..."));
+    // Render one frame so the user sees the TUI immediately
+    terminal.draw(|f| crate::ui::draw(f, &mut app))?;
+
+    let kube_client = match crate::kube::KubeClient::new(cli.context.as_deref(), kubeconfig).await {
         Ok(client) => client,
         Err(e) => {
+            // Clean up terminal before printing error
+            disable_raw_mode()?;
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
             eprintln!(
                 "Error: Unable to connect to Kubernetes cluster.\n\n\
                  {}\n\n\
@@ -107,36 +229,8 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
-    let contexts = crate::kube::KubeClient::list_contexts().await.unwrap_or_default();
 
-    // Initialize app state
-    let mut app = App::new(
-        kube_client.context().to_string(),
-        contexts.clone(),
-        cli.namespace.unwrap_or_else(|| "all".to_string()),
-    );
-
-    // Populate contexts table with actual kubeconfig contexts
-    let kube_contexts: Vec<crate::app::KubeContext> = contexts.iter().map(|name| {
-        crate::app::KubeContext {
-            name: name.clone(),
-            cluster: String::new(), // could be enriched later
-            is_current: name == kube_client.context(),
-        }
-    }).collect();
-    app.data.contexts.set_items(kube_contexts);
-
-    // Parse initial command/resource
-    if let Some(ref cmd) = cli.command {
-        if let Some(tab) = parse_resource_command(cmd) {
-            app.resource_tab = tab;
-        }
-    }
-
-    // Create event channel
-    let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(500);
-
-    // Spawn resource watcher with a forwarding channel
+    // Spawn resource watcher
     let (resource_tx, mut resource_rx) = mpsc::channel::<ResourceUpdate>(500);
     let forward_tx = event_tx.clone();
     tokio::spawn(async move {
@@ -153,8 +247,12 @@ async fn main() -> Result<()> {
         crate::kube::watcher::ResourceWatcher::start(watcher_client, resource_tx, watcher_ns, initial_tab)
             .await;
 
-    // Keep kube_client around for context switching; clone the Client for API calls
     let mut kube_client = kube_client;
+    app.flash = None; // Clear "Connecting..." now that we're connected
+
+    // Preload cached data for the initial tab (e.g., Pods) from daemon
+    // so data appears instantly while the watcher does its first LIST.
+    preload_cached_resources(&app, app.resource_tab, &event_tx);
 
     // Discover CRDs in the background for command completion
     {
@@ -171,9 +269,10 @@ async fn main() -> Result<()> {
                     let group = spec.group;
                     let version = spec.versions.first().map(|v| v.name.clone()).unwrap_or_default();
                     let kind = spec.names.kind;
+                    let plural = spec.names.plural;
                     let scope = format!("{:?}", spec.scope).trim_matches('"').to_string();
                     let age = meta.creation_timestamp.map(|ts| ts.0);
-                    crate::kube::resources::crds::KubeCrd { name, group, version, kind, scope, age }
+                    crate::kube::resources::crds::KubeCrd { name, group, version, kind, plural, scope, age }
                 }).collect();
                 let _ = crd_tx.send(AppEvent::ResourceUpdate(
                     crate::event::ResourceUpdate::Crds(crds)
@@ -182,31 +281,60 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Track active log streaming task so we can cancel on Back
-    let mut log_task: Option<JoinHandle<()>> = None;
+    // Poll daemon for fresh data from other instances for the first 30 seconds.
+    // If another k9rs instance has already loaded namespaces/CRDs from the cluster
+    // and pushed them to the daemon, this lets us pick them up before our own
+    // watchers finish.
+    {
+        let poll_ctx = app.context.clone();
+        let poll_tx = event_tx.clone();
+        tokio::spawn(async move {
+            for _ in 0..15 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if let Some(mut dc) = crate::kube::daemon::DaemonClient::connect().await {
+                    if let Some((ns, crds)) = dc.get(&poll_ctx).await {
+                        let _ = poll_tx
+                            .send(AppEvent::DaemonCacheUpdate {
+                                namespaces: ns,
+                                crds,
+                            })
+                            .await;
+                    }
+                }
+            }
+        });
+    }
 
-    // Generation counters to prevent stale describe/yaml results from overwriting newer ones
-    let describe_generation = Arc::new(AtomicU64::new(0));
-    let yaml_generation = Arc::new(AtomicU64::new(0));
-
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    // Spawn metrics polling task (fetches pod/node metrics every 30s)
+    let mut metrics_task: Option<JoinHandle<()>> = Some(spawn_metrics_poller(
+        kube_client.client().clone(),
+        event_tx.clone(),
+    ));
 
     // Async event stream from crossterm (replaces blocking poll/read thread)
     let mut event_stream = EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(cli.tick_rate));
 
-    // Main event loop
+    // Main event loop — only redraw when state changes
+    let mut needs_redraw = true; // draw the first frame immediately
     loop {
-        // Draw
-        terminal.draw(|f| {
-            crate::ui::draw(f, &mut app);
-        })?;
+        if needs_redraw {
+            terminal.draw(|f| {
+                crate::ui::draw(f, &mut app);
+            })?;
+
+            // Set cursor style based on input mode: bar for text input, block otherwise
+            let in_input_mode = app.command_mode || app.scale_mode || app.port_forward_mode
+                || app.filter.active
+                || app.yaml.search_input_active || app.describe.search_input_active;
+            if in_input_mode {
+                execute!(terminal.backend_mut(), SetCursorStyle::SteadyBar)?;
+            } else {
+                execute!(terminal.backend_mut(), SetCursorStyle::SteadyBlock)?;
+            }
+
+            needs_redraw = false;
+        }
 
         tokio::select! {
             // biased: always check key events first so user input (like disabling
@@ -257,7 +385,7 @@ async fn main() -> Result<()> {
                                     } else if cmd.starts_with("ctx ") || cmd.starts_with("context ") {
                                         let prefix_len = if cmd.starts_with("ctx ") { 4 } else { 8 };
                                         let ctx_name = cmd[prefix_len..].trim().to_string();
-                                        do_switch_context(&mut app, &mut kube_client, &mut resource_watcher, &ctx_name).await;
+                                        begin_context_switch(&mut app, &event_tx, &ctx_name);
                                     } else if cmd.starts_with("ns ") || cmd.starts_with("namespace ") {
                                         let prefix_len = if cmd.starts_with("ns ") { 3 } else { 10 };
                                         let ns = cmd[prefix_len..].trim().to_string();
@@ -275,6 +403,7 @@ async fn main() -> Result<()> {
                                         }
                                         app.last_resource_tab = Some(app.resource_tab);
                                         app.resource_tab = tab;
+                                        preload_cached_resources(&app, tab, &event_tx);
                                         resource_watcher.switch_tab(tab).await;
                                     } else if let Some((tab, ns)) = parse_resource_ns_command(&cmd) {
                                         // :deploy kube-system — switch resource AND namespace
@@ -283,6 +412,7 @@ async fn main() -> Result<()> {
                                         if ns != app.selected_ns {
                                             do_switch_namespace(&mut app, &mut resource_watcher, &ns).await;
                                         }
+                                        preload_cached_resources(&app, tab, &event_tx);
                                         resource_watcher.switch_tab(tab).await;
                                         app.flash = Some(crate::app::FlashMessage::info(format!(
                                             "{}({})", tab.label(), ns
@@ -290,19 +420,39 @@ async fn main() -> Result<()> {
                                     } else if let Some((tab, filter)) = parse_resource_filter_command(&cmd) {
                                         // :deploy /nginx — switch resource AND apply filter
                                         app.resource_tab = tab;
+                                        preload_cached_resources(&app, tab, &event_tx);
                                         resource_watcher.switch_tab(tab).await;
                                         app.filter.text = filter.clone();
                                         app.filter.active = false;
                                         app.apply_filter(&filter);
-                                    } else if let Some(crd) = app.find_crd_by_name(&cmd) {
-                                        // Dynamic CRD instance browsing
+                                    } else if let Some((crd, ns)) = parse_crd_ns_command(&cmd, &app) {
+                                        // :clickhouseinstallation prod — CRD + namespace
+                                        if ns != app.selected_ns {
+                                            do_switch_namespace(&mut app, &mut resource_watcher, &ns).await;
+                                        }
                                         app.dynamic_resource_name = crd.kind.clone();
-                                        app.data.dynamic_resources.clear_data();
+                                        app.dynamic_resource_api_resource = crd.name.clone();
                                         app.resource_tab = ResourceTab::DynamicResource;
                                         resource_watcher.watch_dynamic(
                                             crd.group.clone(),
                                             crd.version.clone(),
                                             crd.kind.clone(),
+                                            crd.plural.clone(),
+                                            crd.scope.clone(),
+                                        ).await;
+                                        app.flash = Some(crate::app::FlashMessage::info(
+                                            format!("Browsing CRD: {}({})", crd.kind, ns)
+                                        ));
+                                    } else if let Some(crd) = app.find_crd_by_name(&cmd) {
+                                        // Dynamic CRD instance browsing (no namespace)
+                                        app.dynamic_resource_name = crd.kind.clone();
+                                        app.dynamic_resource_api_resource = crd.name.clone();
+                                        app.resource_tab = ResourceTab::DynamicResource;
+                                        resource_watcher.watch_dynamic(
+                                            crd.group.clone(),
+                                            crd.version.clone(),
+                                            crd.kind.clone(),
+                                            crd.plural.clone(),
                                             crd.scope.clone(),
                                         ).await;
                                         app.flash = Some(crate::app::FlashMessage::info(
@@ -344,6 +494,7 @@ async fn main() -> Result<()> {
                                 }
                                 _ => {}
                             }
+                            needs_redraw = true;
                             continue; // skip normal key handling
                         }
 
@@ -365,30 +516,30 @@ async fn main() -> Result<()> {
                                     if let Ok(replicas) = replica_str.parse::<u32>() {
                                         app.kubectl_cache.clear();
                                         let (resource, name, namespace) = target;
-                                        let context = app.context.clone();
+                                        let kube_cl = kube_client.client().clone();
                                         let tx = event_tx.clone();
                                         tokio::spawn(async move {
-                                            let mut cmd = tokio::process::Command::new("kubectl");
-                                            cmd.arg("scale")
-                                                .arg(format!("{}/{}", resource, name))
-                                                .arg(format!("--replicas={}", replicas));
-                                            if !namespace.is_empty() { cmd.arg("-n").arg(&namespace); }
-                                            if !context.is_empty() { cmd.arg("--context").arg(&context); }
-                                            match cmd.output().await {
-                                                Ok(output) if output.status.success() => {
+                                            use ::kube::api::{Api, DynamicObject, Patch, PatchParams};
+                                            let result = async {
+                                                let (ar, scope) = resolve_api_resource(&kube_cl, &resource).await?;
+                                                let api: Api<DynamicObject> = if namespace.is_empty() || scope == "Cluster" {
+                                                    Api::all_with(kube_cl.clone(), &ar)
+                                                } else {
+                                                    Api::namespaced_with(kube_cl.clone(), &namespace, &ar)
+                                                };
+                                                let patch = serde_json::json!({"spec": {"replicas": replicas}});
+                                                api.patch(&name, &PatchParams::apply("k9rs"), &Patch::Merge(&patch)).await?;
+                                                Ok::<(), anyhow::Error>(())
+                                            }.await;
+                                            match result {
+                                                Ok(()) => {
                                                     let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(
                                                         format!("Scaled {}/{} to {} replicas", resource, name, replicas)
                                                     ))).await;
                                                 }
-                                                Ok(output) => {
-                                                    let err = String::from_utf8_lossy(&output.stderr);
-                                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(
-                                                        format!("Scale failed: {}", err)
-                                                    ))).await;
-                                                }
                                                 Err(e) => {
                                                     let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(
-                                                        format!("Failed to run kubectl: {}", e)
+                                                        format!("Scale failed: {}", e)
                                                     ))).await;
                                                 }
                                             }
@@ -407,6 +558,71 @@ async fn main() -> Result<()> {
                                 }
                                 _ => {} // Ignore non-digit input in scale mode
                             }
+                            needs_redraw = true;
+                            continue;
+                        }
+
+                        // Port-forward mode: capture port input (local:remote)
+                        if app.port_forward_mode {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.port_forward_mode = false;
+                                    app.command_input.clear();
+                                    app.port_forward_target = (String::new(), String::new());
+                                }
+                                KeyCode::Enter => {
+                                    let ports_str = app.command_input.trim().to_string();
+                                    let (pod_name, pod_ns) = app.port_forward_target.clone();
+                                    app.port_forward_mode = false;
+                                    app.command_input.clear();
+                                    app.port_forward_target = (String::new(), String::new());
+
+                                    // Validate format: should contain a colon separating local:remote
+                                    let parts: Vec<&str> = ports_str.split(':').collect();
+                                    if parts.len() == 2
+                                        && parts[0].parse::<u16>().is_ok()
+                                        && parts[1].parse::<u16>().is_ok()
+                                    {
+                                        let context = app.context.clone();
+                                        let tx = event_tx.clone();
+                                        let ports = ports_str.clone();
+                                        let pn = pod_name.clone();
+                                        tokio::spawn(async move {
+                                            let mut cmd = tokio::process::Command::new("kubectl");
+                                            cmd.arg("port-forward").arg(&pn).arg(&ports);
+                                            if !pod_ns.is_empty() { cmd.arg("-n").arg(&pod_ns); }
+                                            if !context.is_empty() { cmd.arg("--context").arg(&context); }
+                                            match cmd.output().await {
+                                                Ok(_) => {
+                                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(
+                                                        format!("Port-forward ended for {}", pn)
+                                                    ))).await;
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(
+                                                        format!("Port-forward failed: {}", e)
+                                                    ))).await;
+                                                }
+                                            }
+                                        });
+                                        app.flash = Some(crate::app::FlashMessage::info(
+                                            format!("Port-forwarding pod/{} on {}", pod_name, ports_str)
+                                        ));
+                                    } else {
+                                        app.flash = Some(crate::app::FlashMessage::warn(
+                                            format!("Invalid port format: {} (expected local:remote, e.g. 8080:80)", ports_str)
+                                        ));
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    app.command_input.pop();
+                                }
+                                KeyCode::Char(c) if c.is_ascii_digit() || c == ':' => {
+                                    app.command_input.push(c);
+                                }
+                                _ => {} // Ignore non-port input in port-forward mode
+                            }
+                            needs_redraw = true;
                             continue;
                         }
 
@@ -433,6 +649,7 @@ async fn main() -> Result<()> {
                                 }
                                 _ => {}
                             }
+                            needs_redraw = true;
                             continue;
                         }
 
@@ -467,6 +684,7 @@ async fn main() -> Result<()> {
                                 }
                                 _ => {}
                             }
+                            needs_redraw = true;
                             continue;
                         }
                         if app.describe.search_input_active && matches!(app.route, crate::app::Route::Describe { .. } | crate::app::Route::Aliases) {
@@ -499,9 +717,11 @@ async fn main() -> Result<()> {
                                 }
                                 _ => {}
                             }
+                            needs_redraw = true;
                             continue;
                         }
 
+                        needs_redraw = true;
                         if let Some(action) = crate::event::handler::handle_key_event(&app, key) {
                             let result = handle_action(
                                 &mut app,
@@ -537,7 +757,12 @@ async fn main() -> Result<()> {
                                         cmd2.arg("exec").arg("-it").arg(&pod).arg("-n").arg(&namespace).arg("-c").arg(&container);
                                         if !context.is_empty() { cmd2.arg("--context").arg(&context); }
                                         cmd2.arg("--").arg("/bin/sh");
-                                        let _ = cmd2.status();
+                                        let sh_status = cmd2.status();
+                                        if sh_status.is_err() || sh_status.as_ref().map_or(false, |s| !s.success()) {
+                                            app.flash = Some(crate::app::FlashMessage::error(
+                                                format!("Shell failed for {}/{} — no bash or sh available", pod, container),
+                                            ));
+                                        }
                                     }
 
                                     // Resume TUI
@@ -566,35 +791,135 @@ async fn main() -> Result<()> {
                                     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                                     terminal.clear()?;
                                 }
-                                ActionResult::None => {}
+                                ActionResult::None => {
+                                    // Check for pending shell from ContainerSelect
+                                    if let Some((pod, ns, container)) = app.pending_shell.take() {
+                                        disable_raw_mode()?;
+                                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                                        terminal.show_cursor()?;
+
+                                        print!("\x1b[2J\x1b[H");
+                                        println!("Connecting to {}/{}...\n", pod, container);
+
+                                        let mut cmd = std::process::Command::new("kubectl");
+                                        cmd.arg("exec").arg("-it").arg(&pod).arg("-n").arg(&ns).arg("-c").arg(&container);
+                                        if !app.context.is_empty() { cmd.arg("--context").arg(&app.context); }
+                                        cmd.arg("--").arg("/bin/bash");
+                                        let status = cmd.status();
+
+                                        if status.is_err() || status.as_ref().map_or(false, |s| !s.success()) {
+                                            let mut cmd2 = std::process::Command::new("kubectl");
+                                            cmd2.arg("exec").arg("-it").arg(&pod).arg("-n").arg(&ns).arg("-c").arg(&container);
+                                            if !app.context.is_empty() { cmd2.arg("--context").arg(&app.context); }
+                                            cmd2.arg("--").arg("/bin/sh");
+                                            let sh_status = cmd2.status();
+                                            if sh_status.is_err() || sh_status.as_ref().map_or(false, |s| !s.success()) {
+                                                app.flash = Some(crate::app::FlashMessage::error(
+                                                    format!("Shell failed for {}/{} — no bash or sh available", pod, container),
+                                                ));
+                                            }
+                                        }
+
+                                        enable_raw_mode()?;
+                                        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                                        terminal.clear()?;
+                                    }
+                                }
                             }
                         }
                     }
                     CtEvent::Mouse(_mouse) => {
                         // TODO: mouse handling
                     }
+                    CtEvent::Resize(_, _) => {
+                        needs_redraw = true;
+                    }
                     _ => {}
                 }
             }
             Some(event) = event_rx.recv() => {
-                apply_event(&mut app, event);
+                let mut cache_flags = CacheUpdateFlags::default();
+                // Context switch results need &mut kube_client and &mut resource_watcher
+                if let AppEvent::ContextSwitchResult { context, result } = event {
+                    apply_context_switch_result(
+                        &mut app, &mut kube_client, &mut resource_watcher,
+                        &context, result,
+                    ).await;
+                    // Restart metrics poller with new client
+                    if let Some(h) = metrics_task.take() { h.abort(); }
+                    app.pod_metrics.clear();
+                    app.node_metrics.clear();
+                    metrics_task = Some(spawn_metrics_poller(
+                        kube_client.client().clone(),
+                        event_tx.clone(),
+                    ));
+                } else {
+                    cache_flags.merge(apply_event(&mut app, event));
+                }
                 // Drain pending events before redrawing to batch log lines,
                 // but cap at 200 to prevent UI freezes during massive bursts.
                 let mut drained = 0;
                 while drained < 200 {
                     match event_rx.try_recv() {
-                        Ok(event) => { apply_event(&mut app, event); drained += 1; }
+                        Ok(event) => {
+                            if let AppEvent::ContextSwitchResult { context, result } = event {
+                                apply_context_switch_result(
+                                    &mut app, &mut kube_client, &mut resource_watcher,
+                                    &context, result,
+                                ).await;
+                                // Restart metrics poller with new client
+                                if let Some(h) = metrics_task.take() { h.abort(); }
+                                app.pod_metrics.clear();
+                                app.node_metrics.clear();
+                                metrics_task = Some(spawn_metrics_poller(
+                                    kube_client.client().clone(),
+                                    event_tx.clone(),
+                                ));
+                            } else {
+                                cache_flags.merge(apply_event(&mut app, event));
+                            }
+                            drained += 1;
+                        }
                         Err(_) => break,
                     }
                 }
+                // Persist discovery cache when namespaces or CRDs are updated.
+                // Send to daemon (shared) and save to disk (fallback).
+                if cache_flags.namespaces || cache_flags.crds {
+                    let ns_names: Vec<String> = app.data.namespaces.items
+                        .iter()
+                        .map(|ns| ns.name.clone())
+                        .collect();
+                    let cached_crds = crate::kube::cache::domain_crds_to_cached(&app.discovered_crds);
+                    let ctx = app.context.clone();
+                    let cache = crate::kube::cache::build_cache(
+                        &ctx,
+                        &ns_names,
+                        &cached_crds,
+                    );
+                    let ns_for_daemon = ns_names.clone();
+                    let crds_for_daemon = cached_crds.clone();
+                    tokio::spawn(async move {
+                        // Send to daemon (best-effort)
+                        if let Some(mut dc) = crate::kube::daemon::DaemonClient::connect().await {
+                            dc.put(&ctx, &ns_for_daemon, &crds_for_daemon).await;
+                        }
+                        // Also persist to disk as fallback
+                        crate::kube::cache::save_cache(&cache).await;
+                    });
+                }
+                needs_redraw = true;
             }
             _ = tick_interval.tick() => {
-                app.tick();
+                if app.tick() {
+                    needs_redraw = true;
+                }
                 // Check if the log streaming task has finished
                 if let Some(ref handle) = log_task {
                     if handle.is_finished() {
                         log_task.take();
                         app.logs.streaming = false;
+                        needs_redraw = true;
                     }
                 }
             }
@@ -609,10 +934,14 @@ async fn main() -> Result<()> {
     if let Some(handle) = log_task.take() {
         handle.abort();
     }
+    if let Some(handle) = metrics_task.take() {
+        handle.abort();
+    }
     resource_watcher.stop().await;
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        SetCursorStyle::DefaultUserShape,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -676,17 +1005,14 @@ async fn handle_action(
         Action::NextTab => {
             app.last_resource_tab = Some(app.resource_tab);
             app.next_tab();
+            preload_cached_resources(app, app.resource_tab, event_tx);
             resource_watcher.switch_tab(app.resource_tab).await;
         }
         Action::PrevTab => {
             app.last_resource_tab = Some(app.resource_tab);
             app.prev_tab();
+            preload_cached_resources(app, app.resource_tab, event_tx);
             resource_watcher.switch_tab(app.resource_tab).await;
-        }
-        Action::GotoTab(tab) => {
-            app.last_resource_tab = Some(app.resource_tab);
-            app.resource_tab = tab;
-            resource_watcher.switch_tab(tab).await;
         }
         Action::NextItem => {
             match &app.route {
@@ -802,26 +1128,52 @@ async fn handle_action(
         Action::Shell => {
             if app.resource_tab == ResourceTab::Pods {
                 if let Some(pod) = app.data.pods.selected_item() {
-                    let pod_name = pod.name.clone();
-                    let pod_ns = pod.namespace.clone();
-                    let container = pod.containers.first().map(|c| c.name.clone()).unwrap_or_default();
-                    let context = app.context.clone();
-                    return ActionResult::Shell {
-                        pod: pod_name,
-                        namespace: pod_ns,
-                        container,
-                        context,
-                    };
+                    if pod.containers.len() > 1 {
+                        // Multi-container pod: show container selector
+                        let pod_name = pod.name.clone();
+                        let pod_ns = pod.namespace.clone();
+                        app.container_select_index = 0;
+                        app.push_route(app.route.clone());
+                        app.route = Route::ContainerSelect {
+                            pod: pod_name,
+                            namespace: pod_ns,
+                        };
+                        // Store a flag so ContainerSelect Enter knows to shell, not log
+                        app.shell_mode_container_select = true;
+                    } else {
+                        let pod_name = pod.name.clone();
+                        let pod_ns = pod.namespace.clone();
+                        let container = pod.containers.first().map(|c| c.real_name.clone()).unwrap_or_default();
+                        let context = app.context.clone();
+                        return ActionResult::Shell {
+                            pod: pod_name,
+                            namespace: pod_ns,
+                            container,
+                            context,
+                        };
+                    }
                 }
             }
         }
         Action::Delete => {
-            let (resource, name, _namespace) = get_selected_resource_info(app);
-            app.confirm_dialog = Some(crate::app::ConfirmDialog {
-                message: format!("Delete {}/{}?", resource, name),
-                action: Action::Delete,
-                yes_selected: false,
-            });
+            let marked = get_marked_resource_infos(app);
+            if !marked.is_empty() {
+                let count = marked.len();
+                let resource = marked[0].0.clone();
+                app.pending_batch_delete = marked;
+                app.confirm_dialog = Some(crate::app::ConfirmDialog {
+                    message: format!("Delete {} {}s?", count, resource),
+                    action: Action::Delete,
+                    yes_selected: false,
+                });
+            } else {
+                let (resource, name, _namespace) = get_selected_resource_info(app);
+                app.confirm_dialog = Some(crate::app::ConfirmDialog {
+                    message: format!("Delete {}/{}?", resource, name),
+                    action: Action::Delete,
+                    yes_selected: false,
+                });
+            }
         }
         Action::Edit => {
             let (resource, name, namespace) = get_selected_resource_info(app);
@@ -866,6 +1218,7 @@ async fn handle_action(
                 if app.resource_tab == ResourceTab::Pods && last_tab != ResourceTab::Pods {
                     app.resource_tab = last_tab;
                     app.last_resource_tab = None;
+                    preload_cached_resources(app, last_tab, event_tx);
                     resource_watcher.switch_tab(last_tab).await;
                 }
             }
@@ -900,35 +1253,46 @@ async fn handle_action(
             app.flash = Some(crate::app::FlashMessage::info("Logs cleared"));
         }
         Action::Restart => {
-            app.kubectl_cache.clear();
-            let (resource, name, namespace) = get_selected_resource_info(app);
-            if !name.is_empty() {
-                let context = app.context.clone();
-                let tx = event_tx.clone();
-                tokio::spawn(async move {
-                    let mut cmd = tokio::process::Command::new("kubectl");
-                    cmd.arg("rollout").arg("restart").arg(format!("{}/{}", resource, name));
-                    if !namespace.is_empty() { cmd.arg("-n").arg(&namespace); }
-                    if !context.is_empty() { cmd.arg("--context").arg(&context); }
-                    match cmd.output().await {
-                        Ok(output) if output.status.success() => {
-                            let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(
-                                format!("Restarted {}/{}", resource, name)
-                            ))).await;
-                        }
-                        Ok(output) => {
-                            let err = String::from_utf8_lossy(&output.stderr);
-                            let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(
-                                format!("Restart failed: {}", err)
-                            ))).await;
-                        }
-                        Err(e) => {
-                            let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(
-                                format!("Failed to run kubectl: {}", e)
-                            ))).await;
-                        }
-                    }
+            let marked = get_marked_resource_infos(app);
+            if !marked.is_empty() {
+                let count = marked.len();
+                let resource = marked[0].0.clone();
+                app.pending_batch_restart = marked;
+                app.confirm_dialog = Some(crate::app::ConfirmDialog {
+                    message: format!("Restart {} {}s?", count, resource),
+                    action: Action::Restart,
+                    yes_selected: false,
                 });
+            } else {
+                let (resource, name, _namespace) = get_selected_resource_info(app);
+                if !name.is_empty() {
+                    app.confirm_dialog = Some(crate::app::ConfirmDialog {
+                        message: format!("Restart {}/{}?", resource, name),
+                        action: Action::Restart,
+                        yes_selected: false,
+                    });
+                }
+            }
+        }
+        Action::ForceKill => {
+            let marked = get_marked_resource_infos(app);
+            if !marked.is_empty() {
+                let count = marked.len();
+                app.pending_batch_force_kill = marked;
+                app.confirm_dialog = Some(crate::app::ConfirmDialog {
+                    message: format!("Force-kill {} pods?", count),
+                    action: Action::ForceKill,
+                    yes_selected: false,
+                });
+            } else {
+                let (resource, name, _namespace) = get_selected_resource_info(app);
+                if !name.is_empty() {
+                    app.confirm_dialog = Some(crate::app::ConfirmDialog {
+                        message: format!("Force-kill {}/{}?", resource, name),
+                        action: Action::ForceKill,
+                        yes_selected: false,
+                    });
+                }
             }
         }
         Action::PortForward => {
@@ -936,24 +1300,13 @@ async fn handle_action(
                 if let Some(pod) = app.data.pods.selected_item() {
                     let pod_name = pod.name.clone();
                     let pod_ns = pod.namespace.clone();
-                    let context = app.context.clone();
-                    // Use a default port (8080:8080) — in k9s this shows a dialog
-                    let tx = event_tx.clone();
-                    tokio::spawn(async move {
-                        let mut cmd = tokio::process::Command::new("kubectl");
-                        cmd.arg("port-forward").arg(&pod_name).arg("8080:8080");
-                        if !pod_ns.is_empty() { cmd.arg("-n").arg(&pod_ns); }
-                        if !context.is_empty() { cmd.arg("--context").arg(&context); }
-                        match cmd.output().await {
-                            Ok(_) => {
-                                let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(format!("Port-forward ended for {}", pod_name)))).await;
-                            }
-                            Err(e) => {
-                                let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(format!("Port-forward failed: {}", e)))).await;
-                            }
-                        }
-                    });
-                    app.flash = Some(crate::app::FlashMessage::info(format!("Port-forwarding pod/{} on 8080:8080", pod.name)));
+                    // Enter port-forward mode: show a prompt for the ports
+                    app.port_forward_mode = true;
+                    app.port_forward_target = (pod_name.clone(), pod_ns);
+                    app.command_input = "8080:8080".to_string();
+                    app.flash = Some(crate::app::FlashMessage::info(
+                        format!("Port-forward pod/{} - enter local:remote ports:", pod_name)
+                    ));
                 }
             } else {
                 app.flash = Some(crate::app::FlashMessage::info("Port-forward: select a pod first"));
@@ -961,6 +1314,14 @@ async fn handle_action(
         }
         Action::ToggleHeader => {
             app.show_header = !app.show_header;
+        }
+        Action::ToggleFullFetch => {
+            app.full_fetch_mode = !app.full_fetch_mode;
+            resource_watcher.full_fetch.store(app.full_fetch_mode, std::sync::atomic::Ordering::Release);
+            app.flash = Some(crate::app::FlashMessage::info(
+                if app.full_fetch_mode { "Full-fetch mode ON (wait for complete list)" }
+                else { "Full-fetch mode OFF (incremental loading)" }
+            ));
         }
         Action::ScrollUp(n) => {
             app.logs.follow = false;
@@ -980,17 +1341,54 @@ async fn handle_action(
             do_switch_namespace(app, resource_watcher, &ns).await;
         }
         Action::SwitchContext(ctx) => {
-            do_switch_context(app, kube_client, resource_watcher, &ctx).await;
+            begin_context_switch(app, event_tx, &ctx);
         }
         Action::Refresh => {
             resource_watcher.switch_tab_force(app.resource_tab).await;
             app.flash = Some(crate::app::FlashMessage::info("Refreshed"));
         }
         Action::Copy => {
-            let (_, name, _) = get_selected_resource_info(app);
-            if !name.is_empty() {
-                if try_copy_to_clipboard(&name) {
-                    app.flash = Some(crate::app::FlashMessage::info(format!("Copied: {}", name)));
+            let (text, label) = match &app.route {
+                Route::Yaml { .. } => {
+                    let c = &app.yaml.content;
+                    if c.is_empty() {
+                        (String::new(), String::new())
+                    } else {
+                        let lines = c.lines().count();
+                        (c.clone(), format!("Copied {} lines to clipboard", lines))
+                    }
+                }
+                Route::Describe { .. } => {
+                    let c = &app.describe.content;
+                    if c.is_empty() {
+                        (String::new(), String::new())
+                    } else {
+                        let lines = c.lines().count();
+                        (c.clone(), format!("Copied {} lines to clipboard", lines))
+                    }
+                }
+                Route::Logs { .. } => {
+                    if app.logs.lines.is_empty() {
+                        (String::new(), String::new())
+                    } else {
+                        let joined: String = app.logs.lines.iter().cloned().collect::<Vec<_>>().join("\n");
+                        let count = app.logs.lines.len();
+                        (joined, format!("Copied {} lines to clipboard", count))
+                    }
+                }
+                _ => {
+                    let (_, name, _) = get_selected_resource_info(app);
+                    if name.is_empty() {
+                        (String::new(), String::new())
+                    } else {
+                        let label = format!("Copied: {}", name);
+                        (name, label)
+                    }
+                }
+            };
+            if !text.is_empty() {
+                if try_copy_to_clipboard(&text) {
+                    app.flash = Some(crate::app::FlashMessage::info(label));
                 } else {
                     app.flash = Some(crate::app::FlashMessage::warn(
                         "No clipboard tool found (install xclip, xsel, wl-copy, or pbcopy)"
@@ -999,41 +1397,180 @@ async fn handle_action(
             }
         }
         Action::Confirm => {
-            // Perform the actual delete if the confirm dialog was for a delete
-            let was_delete = app.confirm_dialog.as_ref().map_or(false, |d| {
-                matches!(d.action, Action::Delete)
-            });
+            let confirmed_action = app.confirm_dialog.as_ref().map(|d| d.action.clone());
             app.confirm_dialog = None;
 
-            if was_delete {
-                // Execute the actual delete via kube API
+            if matches!(confirmed_action, Some(Action::Restart)) {
                 app.kubectl_cache.clear();
-                let (resource, name, namespace) = get_selected_resource_info(app);
-                if !name.is_empty() {
-                    let client = client.clone();
-                    let event_tx = event_tx.clone();
-                    let resource_kind = resource.clone();
-                    let res_name = name.clone();
-                    let res_ns = namespace.clone();
+                let batch = std::mem::take(&mut app.pending_batch_restart);
+                if !batch.is_empty() {
+                    // Batch restart: iterate through all marked items
+                    let count = batch.len();
+                    app.clear_marks();
+                    let kube_cl = client.clone();
+                    let tx = event_tx.clone();
                     tokio::spawn(async move {
-                        let result = execute_delete(&client, &resource_kind, &res_name, &res_ns).await;
-                        match result {
-                            Ok(()) => {
-                                let _ = event_tx
-                                    .send(AppEvent::Flash(crate::app::FlashMessage::info(
-                                        format!("Deleted {}/{}", resource_kind, res_name),
-                                    )))
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = event_tx
-                                    .send(AppEvent::Flash(crate::app::FlashMessage::error(
-                                        format!("Delete failed: {}", e),
-                                    )))
-                                    .await;
+                        let mut ok_count = 0usize;
+                        let mut last_err = String::new();
+                        for (resource, name, namespace) in &batch {
+                            match restart_via_patch(&kube_cl, resource, name, namespace).await {
+                                Ok(()) => { ok_count += 1; }
+                                Err(e) => { last_err = e.to_string(); }
                             }
                         }
+                        if ok_count == count {
+                            let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(
+                                format!("Restarted {} resources", count)
+                            ))).await;
+                        } else {
+                            let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(
+                                format!("Restarted {}/{}, last error: {}", ok_count, count, last_err)
+                            ))).await;
+                        }
                     });
+                } else {
+                    // Single restart
+                    let (resource, name, namespace) = get_selected_resource_info(app);
+                    if !name.is_empty() {
+                        let kube_cl = client.clone();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            match restart_via_patch(&kube_cl, &resource, &name, &namespace).await {
+                                Ok(()) => {
+                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(
+                                        format!("Restarted {}/{}", resource, name)
+                                    ))).await;
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(
+                                        format!("Restart failed: {}", e)
+                                    ))).await;
+                                }
+                            }
+                        });
+                    }
+                }
+            } else if matches!(confirmed_action, Some(Action::ForceKill)) {
+                app.kubectl_cache.clear();
+                let batch = std::mem::take(&mut app.pending_batch_force_kill);
+                if !batch.is_empty() {
+                    // Batch force-kill: iterate through all marked items
+                    let count = batch.len();
+                    app.clear_marks();
+                    let context = app.context.clone();
+                    let tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let mut ok_count = 0usize;
+                        let mut last_err = String::new();
+                        for (_resource, name, namespace) in &batch {
+                            let mut cmd = tokio::process::Command::new("kubectl");
+                            cmd.arg("delete").arg("pod").arg(name).arg("--force").arg("--grace-period=0");
+                            if !namespace.is_empty() { cmd.arg("-n").arg(namespace); }
+                            if !context.is_empty() { cmd.arg("--context").arg(&context); }
+                            match cmd.output().await {
+                                Ok(o) if o.status.success() => { ok_count += 1; }
+                                Ok(o) => { last_err = String::from_utf8_lossy(&o.stderr).to_string(); }
+                                Err(e) => { last_err = e.to_string(); }
+                            }
+                        }
+                        if ok_count == count {
+                            let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(
+                                format!("Force-killed {} pods", count)
+                            ))).await;
+                        } else {
+                            let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(
+                                format!("Force-killed {}/{}, last error: {}", ok_count, count, last_err)
+                            ))).await;
+                        }
+                    });
+                } else {
+                    // Single force-kill
+                    let (_resource, name, namespace) = get_selected_resource_info(app);
+                    if !name.is_empty() {
+                        let context = app.context.clone();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let mut cmd = tokio::process::Command::new("kubectl");
+                            cmd.arg("delete").arg("pod").arg(&name).arg("--force").arg("--grace-period=0");
+                            if !namespace.is_empty() { cmd.arg("-n").arg(&namespace); }
+                            if !context.is_empty() { cmd.arg("--context").arg(&context); }
+                            match cmd.output().await {
+                                Ok(o) if o.status.success() => {
+                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(format!("Force-killed pod/{}", name)))).await;
+                                }
+                                Ok(o) => {
+                                    let err = String::from_utf8_lossy(&o.stderr);
+                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(format!("Force-kill failed: {}", err)))).await;
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(format!("Failed: {}", e)))).await;
+                                }
+                            }
+                        });
+                    }
+                }
+            } else if matches!(confirmed_action, Some(Action::Delete)) {
+                // Execute the actual delete via kube API
+                app.kubectl_cache.clear();
+                let batch = std::mem::take(&mut app.pending_batch_delete);
+                if !batch.is_empty() {
+                    // Batch delete: iterate through all marked items
+                    let count = batch.len();
+                    app.clear_marks();
+                    let client = client.clone();
+                    let event_tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let mut ok_count = 0usize;
+                        let mut last_err = String::new();
+                        for (resource_kind, res_name, res_ns) in &batch {
+                            match execute_delete(&client, resource_kind, res_name, res_ns).await {
+                                Ok(()) => { ok_count += 1; }
+                                Err(e) => { last_err = e.to_string(); }
+                            }
+                        }
+                        if ok_count == count {
+                            let _ = event_tx
+                                .send(AppEvent::Flash(crate::app::FlashMessage::info(
+                                    format!("Deleted {} resources", count),
+                                )))
+                                .await;
+                        } else {
+                            let _ = event_tx
+                                .send(AppEvent::Flash(crate::app::FlashMessage::error(
+                                    format!("Deleted {}/{}, last error: {}", ok_count, count, last_err),
+                                )))
+                                .await;
+                        }
+                    });
+                } else {
+                    // Single delete
+                    let (resource, name, namespace) = get_selected_resource_info(app);
+                    if !name.is_empty() {
+                        let client = client.clone();
+                        let event_tx = event_tx.clone();
+                        let resource_kind = resource.clone();
+                        let res_name = name.clone();
+                        let res_ns = namespace.clone();
+                        tokio::spawn(async move {
+                            let result = execute_delete(&client, &resource_kind, &res_name, &res_ns).await;
+                            match result {
+                                Ok(()) => {
+                                    let _ = event_tx
+                                        .send(AppEvent::Flash(crate::app::FlashMessage::info(
+                                            format!("Deleted {}/{}", resource_kind, res_name),
+                                        )))
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let _ = event_tx
+                                        .send(AppEvent::Flash(crate::app::FlashMessage::error(
+                                            format!("Delete failed: {}", e),
+                                        )))
+                                        .await;
+                                }
+                            }
+                        });
+                    }
                 }
             } else {
                 app.flash = Some(crate::app::FlashMessage::info("Confirmed"));
@@ -1041,6 +1578,9 @@ async fn handle_action(
         }
         Action::Cancel => {
             app.confirm_dialog = None;
+            app.pending_batch_delete.clear();
+            app.pending_batch_restart.clear();
+            app.pending_batch_force_kill.clear();
         }
         Action::CommandMode => {
             app.command_mode = true;
@@ -1120,34 +1660,6 @@ async fn handle_action(
         Action::PreviousLogs => {
             handle_previous_logs(app, event_tx, log_task);
         }
-        Action::ForceKill => {
-            app.kubectl_cache.clear();
-            if app.resource_tab == ResourceTab::Pods {
-                let (_resource, name, namespace) = get_selected_resource_info(app);
-                if !name.is_empty() {
-                    let context = app.context.clone();
-                    let tx = event_tx.clone();
-                    tokio::spawn(async move {
-                        let mut cmd = tokio::process::Command::new("kubectl");
-                        cmd.arg("delete").arg("pod").arg(&name).arg("--force").arg("--grace-period=0");
-                        if !namespace.is_empty() { cmd.arg("-n").arg(&namespace); }
-                        if !context.is_empty() { cmd.arg("--context").arg(&context); }
-                        match cmd.output().await {
-                            Ok(o) if o.status.success() => {
-                                let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(format!("Force-killed pod/{}", name)))).await;
-                            }
-                            Ok(o) => {
-                                let err = String::from_utf8_lossy(&o.stderr);
-                                let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(format!("Force-kill failed: {}", err)))).await;
-                            }
-                            Err(e) => {
-                                let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(format!("Failed: {}", e)))).await;
-                            }
-                        }
-                    });
-                }
-            }
-        }
         Action::ShowNode => {
             if app.resource_tab == ResourceTab::Pods {
                 if let Some(pod) = app.data.pods.selected_item() {
@@ -1155,6 +1667,7 @@ async fn handle_action(
                     if !node.is_empty() {
                         app.last_resource_tab = Some(app.resource_tab);
                         app.resource_tab = ResourceTab::Nodes;
+                        preload_cached_resources(app, ResourceTab::Nodes, event_tx);
                         resource_watcher.switch_tab(ResourceTab::Nodes).await;
                         app.filter.text = node.clone();
                         app.filter.active = false;
@@ -1168,6 +1681,7 @@ async fn handle_action(
                 let current = app.resource_tab;
                 app.resource_tab = last;
                 app.last_resource_tab = Some(current);
+                preload_cached_resources(app, app.resource_tab, event_tx);
                 resource_watcher.switch_tab(app.resource_tab).await;
             }
         }
@@ -1217,6 +1731,10 @@ async fn handle_action(
                 ("crb/clusterrolebinding/clusterrolebindings", "ClusterRoleBindings"),
                 ("hpa/horizontalpodautoscaler", "HorizontalPodAutoscalers"),
                 ("ep/endpoints", "Endpoints"),
+                ("limits/limitrange/limitranges", "LimitRanges"),
+                ("quota/resourcequota/resourcequotas", "ResourceQuotas"),
+                ("pdb/poddisruptionbudget/pdb", "PodDisruptionBudgets"),
+                ("crd/crds/customresourcedefinition", "CustomResourceDefinitions"),
             ];
             let mut content = String::from("Resource Aliases\n================\n\n");
             content.push_str(&format!("  {:<45} {}\n", "ALIAS", "RESOURCE"));
@@ -1285,6 +1803,9 @@ async fn handle_action(
                 app.flash = Some(crate::app::FlashMessage::info("Fault filter OFF"));
             }
         }
+        Action::FlashInfo(msg) => {
+            app.flash = Some(crate::app::FlashMessage::info(msg));
+        }
     }
     ActionResult::None
 }
@@ -1332,15 +1853,18 @@ async fn execute_delete(
 ) -> anyhow::Result<()> {
     use k8s_openapi::api::{
         apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet},
+        autoscaling::v1::HorizontalPodAutoscaler,
         batch::v1::{CronJob, Job},
         core::v1::{
-            ConfigMap, Namespace, Node, PersistentVolume, PersistentVolumeClaim, Pod, Secret,
-            Service, ServiceAccount,
+            ConfigMap, Endpoints, LimitRange, Namespace, Node, PersistentVolume,
+            PersistentVolumeClaim, Pod, ResourceQuota, Secret, Service, ServiceAccount,
         },
         networking::v1::{Ingress, NetworkPolicy},
+        policy::v1::PodDisruptionBudget,
         rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding},
         storage::v1::StorageClass,
     };
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
     use ::kube::api::DeleteParams;
     use ::kube::Api;
 
@@ -1381,15 +1905,30 @@ async fn execute_delete(
         "pvc" => delete_namespaced!(PersistentVolumeClaim),
         "role" => delete_namespaced!(Role),
         "rolebinding" => delete_namespaced!(RoleBinding),
+        "hpa" => delete_namespaced!(HorizontalPodAutoscaler),
+        "endpoints" => delete_namespaced!(Endpoints),
+        "limitrange" => delete_namespaced!(LimitRange),
+        "resourcequota" => delete_namespaced!(ResourceQuota),
+        "poddisruptionbudget" => delete_namespaced!(PodDisruptionBudget),
         "namespace" => delete_cluster!(Namespace),
         "node" => delete_cluster!(Node),
         "pv" => delete_cluster!(PersistentVolume),
         "storageclass" => delete_cluster!(StorageClass),
         "clusterrole" => delete_cluster!(ClusterRole),
         "clusterrolebinding" => delete_cluster!(ClusterRoleBinding),
+        "customresourcedefinition" => delete_cluster!(CustomResourceDefinition),
         "event" => delete_namespaced!(k8s_openapi::api::core::v1::Event),
         other => {
-            return Err(anyhow::anyhow!("Unknown resource type: {}", other));
+            // Dynamic CRD resources: use kubectl delete as fallback since we
+            // can't construct typed Api objects for arbitrary CRDs.
+            let mut cmd = tokio::process::Command::new("kubectl");
+            cmd.arg("delete").arg(other).arg(name);
+            if !namespace.is_empty() { cmd.arg("-n").arg(namespace); }
+            let output = cmd.output().await?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow::anyhow!("{}", stderr.trim()));
+            }
         }
     }
 
@@ -1411,20 +1950,28 @@ async fn handle_enter(
     if matches!(app.route, Route::Contexts) {
         if let Some(ctx) = app.data.contexts.selected_item() {
             let ctx_name = ctx.name.clone();
-            do_switch_context(app, kube_client, resource_watcher, &ctx_name).await;
+            begin_context_switch(app, event_tx, &ctx_name);
         }
         return;
     }
 
-    // Handle ContainerSelect: open logs for the selected container.
+    // Handle ContainerSelect: open logs or shell for the selected container.
     if let Route::ContainerSelect { ref pod, ref namespace } = app.route {
         let pod_name = pod.clone();
         let pod_ns = namespace.clone();
         let idx = app.container_select_index;
         let container_name = app.data.pods.items.iter()
             .find(|p| p.name == pod_name && p.namespace == pod_ns)
-            .and_then(|p| p.containers.get(idx).map(|c| c.name.clone()))
+            .and_then(|p| p.containers.get(idx).map(|c| c.real_name.clone()))
             .unwrap_or_default();
+
+        if app.shell_mode_container_select {
+            // Shell mode: set pending shell info, the main loop will pick it up
+            app.shell_mode_container_select = false;
+            app.pending_shell = Some((pod_name, pod_ns, container_name));
+            app.route = app.route_stack.pop().unwrap_or(Route::Resources);
+            return;
+        }
 
         app.push_route(app.route.clone());
         app.logs.clear();
@@ -1490,13 +2037,13 @@ async fn handle_enter(
                 // Save current tab before switching
                 app.last_resource_tab = Some(app.resource_tab);
                 app.resource_tab = ResourceTab::Pods;
+                preload_cached_resources(app, ResourceTab::Pods, event_tx);
                 // Use switch_tab_force — if we were already on Pods tab, switch_tab
                 // returns early without restarting the watcher, leaving an empty table.
                 resource_watcher.switch_tab_force(ResourceTab::Pods).await;
                 // Escape regex metacharacters so dots/brackets in names don't
                 // produce an invalid regex that silently matches nothing.
                 let filter = format!("{}-", regex::escape(&name));
-                app.data.pods.clear_data(); // Reset pods table so spinner shows while fresh data arrives
                 app.filter.text = filter.clone();
                 app.filter.active = false;
                 app.apply_filter(&filter);
@@ -1509,9 +2056,9 @@ async fn handle_enter(
             if !name.is_empty() {
                 app.last_resource_tab = Some(app.resource_tab);
                 app.resource_tab = ResourceTab::Pods;
+                preload_cached_resources(app, ResourceTab::Pods, event_tx);
                 resource_watcher.switch_tab_force(ResourceTab::Pods).await;
-                let filter = regex::escape(&name);
-                app.data.pods.clear_data(); // Reset pods table so spinner shows while fresh data arrives
+                let filter = name.clone();
                 app.filter.text = filter.clone();
                 app.filter.active = false;
                 app.apply_filter(&filter);
@@ -1523,12 +2070,13 @@ async fn handle_enter(
             if let Some(crd) = app.data.crds.selected_item().cloned() {
                 app.last_resource_tab = Some(app.resource_tab);
                 app.dynamic_resource_name = crd.kind.clone();
-                app.data.dynamic_resources.clear_data();
+                app.dynamic_resource_api_resource = crd.name.clone();
                 app.resource_tab = ResourceTab::DynamicResource;
                 resource_watcher.watch_dynamic(
                     crd.group.clone(),
                     crd.version.clone(),
                     crd.kind.clone(),
+                    crd.plural.clone(),
                     crd.scope.clone(),
                 ).await;
                 app.flash = Some(crate::app::FlashMessage::info(
@@ -1546,7 +2094,7 @@ async fn handle_enter(
 fn handle_describe(
     app: &mut App,
     event_tx: &mpsc::Sender<AppEvent>,
-    _client: &::kube::Client,
+    client: &::kube::Client,
     describe_generation: &Arc<AtomicU64>,
 ) {
     use crate::app::Route;
@@ -1583,54 +2131,592 @@ fn handle_describe(
         let gen = describe_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let gen_check = describe_generation.clone();
 
-        // Spawn kubectl describe via tokio::process::Command
+        // Fetch describe natively via kube-rs (reuses existing connection -- much faster
+        // than spawning kubectl which re-reads kubeconfig + does TLS from scratch).
+        // Falls back to kubectl for resource types that fail native fetch.
         let tx = event_tx.clone();
+        let kube_client = client.clone();
         let context = app.context.clone();
         let res = resource;
         let n = name;
         let ns = namespace;
         tokio::spawn(async move {
-            let mut cmd = tokio::process::Command::new("kubectl");
-            cmd.arg("describe").arg(&res).arg(&n);
-            if !context.is_empty() {
-                cmd.arg("--context").arg(&context);
-            }
-            if !ns.is_empty() {
-                cmd.arg("-n").arg(&ns);
-            }
-            match cmd.output().await {
-                Ok(output) => {
-                    let raw = if output.status.success() {
-                        String::from_utf8_lossy(&output.stdout).to_string()
-                    } else {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        format!("Error running kubectl describe:\n{}", stderr)
-                    };
-                    let content = crate::util::strip_ansi(&raw);
-                    if gen_check.load(Ordering::SeqCst) == gen {
-                        let _ = tx
-                            .send(AppEvent::ResourceUpdate(ResourceUpdate::Describe(content)))
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    if gen_check.load(Ordering::SeqCst) == gen {
-                        let _ = tx
-                            .send(AppEvent::ResourceUpdate(ResourceUpdate::Describe(
-                                format!("Failed to run kubectl: {}", e),
-                            )))
-                            .await;
-                    }
-                }
+            let content = fetch_describe_native(&kube_client, &res, &n, &ns, &context).await;
+            if gen_check.load(Ordering::SeqCst) == gen {
+                let _ = tx
+                    .send(AppEvent::ResourceUpdate(ResourceUpdate::Describe(content)))
+                    .await;
             }
         });
     }
 }
 
+/// Fetch a describe-like view for a resource using the kube-rs client directly.
+/// Falls back to kubectl describe for resource types that fail native fetch.
+async fn fetch_describe_native(
+    client: &::kube::Client,
+    resource: &str,
+    name: &str,
+    namespace: &str,
+    context: &str,
+) -> String {
+    match fetch_describe_via_api(client, resource, name, namespace).await {
+        Ok(describe) => describe,
+        Err(_) => {
+            // Fallback to kubectl describe for complex/unknown resource types
+            fetch_describe_via_kubectl(resource, name, namespace, context).await
+        }
+    }
+}
+
+/// Build a describe-like output from a DynamicObject fetched via kube-rs.
+async fn fetch_describe_via_api(
+    client: &::kube::Client,
+    resource: &str,
+    name: &str,
+    namespace: &str,
+) -> anyhow::Result<String> {
+    use ::kube::api::{Api, DynamicObject};
+
+    let (ar, scope) = resolve_api_resource(client, resource).await?;
+
+    let api: Api<DynamicObject> = if namespace.is_empty() || scope == "Cluster" {
+        Api::all_with(client.clone(), &ar)
+    } else {
+        Api::namespaced_with(client.clone(), namespace, &ar)
+    };
+
+    let obj = api.get(name).await?;
+    let val = serde_json::to_value(&obj)?;
+    Ok(format_describe_output(&val, resource))
+}
+
+/// Format a JSON object into a human-readable describe-like output.
+fn format_describe_output(val: &serde_json::Value, resource: &str) -> String {
+    let mut out = String::new();
+
+    // Name
+    if let Some(name) = val.pointer("/metadata/name").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Name:         {}\n", name));
+    }
+
+    // Namespace
+    if let Some(ns) = val.pointer("/metadata/namespace").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Namespace:    {}\n", ns));
+    }
+
+    // Creation timestamp
+    if let Some(ts) = val.pointer("/metadata/creationTimestamp").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Created:      {}\n", ts));
+    }
+
+    // Labels
+    if let Some(labels) = val.pointer("/metadata/labels").and_then(|v| v.as_object()) {
+        out.push_str("Labels:\n");
+        for (k, v) in labels {
+            out.push_str(&format!("              {}={}\n", k, v.as_str().unwrap_or("")));
+        }
+    } else {
+        out.push_str("Labels:       <none>\n");
+    }
+
+    // Annotations
+    if let Some(annotations) = val.pointer("/metadata/annotations").and_then(|v| v.as_object()) {
+        out.push_str("Annotations:\n");
+        for (k, v) in annotations {
+            out.push_str(&format!("              {}={}\n", k, v.as_str().unwrap_or("")));
+        }
+    } else {
+        out.push_str("Annotations:  <none>\n");
+    }
+
+    out.push('\n');
+
+    // Resource-specific sections
+    match resource {
+        "pod" => format_describe_pod(val, &mut out),
+        "deployment" => format_describe_deployment(val, &mut out),
+        "service" => format_describe_service(val, &mut out),
+        "node" => format_describe_node(val, &mut out),
+        _ => format_describe_generic(val, &mut out),
+    }
+
+    out
+}
+
+fn format_describe_pod(val: &serde_json::Value, out: &mut String) {
+    // Status
+    if let Some(phase) = val.pointer("/status/phase").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Status:       {}\n", phase));
+    }
+
+    // Node
+    if let Some(node) = val.pointer("/spec/nodeName").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Node:         {}\n", node));
+    }
+
+    // IP
+    if let Some(ip) = val.pointer("/status/podIP").and_then(|v| v.as_str()) {
+        out.push_str(&format!("IP:           {}\n", ip));
+    }
+
+    // Service Account
+    if let Some(sa) = val.pointer("/spec/serviceAccountName").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Service Account: {}\n", sa));
+    }
+
+    out.push('\n');
+
+    // Containers
+    if let Some(containers) = val.pointer("/spec/containers").and_then(|v| v.as_array()) {
+        out.push_str("Containers:\n");
+        let statuses = val.pointer("/status/containerStatuses").and_then(|v| v.as_array());
+        for container in containers {
+            let cname = container.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let image = container.get("image").and_then(|v| v.as_str()).unwrap_or("?");
+            out.push_str(&format!("  {}:\n", cname));
+            out.push_str(&format!("    Image:    {}\n", image));
+
+            // Ports
+            if let Some(ports) = container.get("ports").and_then(|v| v.as_array()) {
+                let port_strs: Vec<String> = ports.iter().map(|p| {
+                    let port = p.get("containerPort").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let proto = p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
+                    format!("{}/{}", port, proto)
+                }).collect();
+                out.push_str(&format!("    Ports:    {}\n", port_strs.join(", ")));
+            }
+
+            // Resource requests/limits
+            if let Some(resources) = container.get("resources") {
+                if let Some(limits) = resources.get("limits").and_then(|v| v.as_object()) {
+                    let parts: Vec<String> = limits.iter().map(|(k, v)| {
+                        format!("{}={}", k, v.as_str().unwrap_or(""))
+                    }).collect();
+                    out.push_str(&format!("    Limits:   {}\n", parts.join(", ")));
+                }
+                if let Some(requests) = resources.get("requests").and_then(|v| v.as_object()) {
+                    let parts: Vec<String> = requests.iter().map(|(k, v)| {
+                        format!("{}={}", k, v.as_str().unwrap_or(""))
+                    }).collect();
+                    out.push_str(&format!("    Requests: {}\n", parts.join(", ")));
+                }
+            }
+
+            // Container status from status.containerStatuses
+            if let Some(statuses) = statuses {
+                if let Some(status) = statuses.iter().find(|s| {
+                    s.get("name").and_then(|v| v.as_str()) == Some(cname)
+                }) {
+                    let ready = status.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let restart_count = status.get("restartCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                    out.push_str(&format!("    Ready:    {}\n", ready));
+                    out.push_str(&format!("    Restarts: {}\n", restart_count));
+
+                    // State
+                    if let Some(state) = status.get("state").and_then(|v| v.as_object()) {
+                        for (state_name, state_detail) in state {
+                            out.push_str(&format!("    State:    {}\n", state_name));
+                            if let Some(detail_obj) = state_detail.as_object() {
+                                for (dk, dv) in detail_obj {
+                                    out.push_str(&format!("      {}:  {}\n", dk, format_json_value_inline(dv)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Init containers
+    if let Some(init_containers) = val.pointer("/spec/initContainers").and_then(|v| v.as_array()) {
+        if !init_containers.is_empty() {
+            out.push_str("\nInit Containers:\n");
+            for container in init_containers {
+                let cname = container.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let image = container.get("image").and_then(|v| v.as_str()).unwrap_or("?");
+                out.push_str(&format!("  {}:\n", cname));
+                out.push_str(&format!("    Image:    {}\n", image));
+            }
+        }
+    }
+
+    out.push('\n');
+
+    // Conditions
+    if let Some(conditions) = val.pointer("/status/conditions").and_then(|v| v.as_array()) {
+        out.push_str("Conditions:\n");
+        out.push_str("  Type                 Status\n");
+        out.push_str("  ----                 ------\n");
+        for cond in conditions {
+            let ctype = cond.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+            let status = cond.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+            out.push_str(&format!("  {:<22}{}\n", ctype, status));
+        }
+    }
+
+    // Volumes
+    if let Some(volumes) = val.pointer("/spec/volumes").and_then(|v| v.as_array()) {
+        out.push_str("\nVolumes:\n");
+        for vol in volumes {
+            let vname = vol.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            out.push_str(&format!("  {}:\n", vname));
+            // Show volume type (first non-name key)
+            if let Some(obj) = vol.as_object() {
+                for (k, v) in obj {
+                    if k != "name" {
+                        out.push_str(&format!("    Type: {}\n", k));
+                        if let Some(inner) = v.as_object() {
+                            for (ik, iv) in inner {
+                                out.push_str(&format!("    {}:  {}\n", ik, format_json_value_inline(iv)));
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Tolerations
+    if let Some(tolerations) = val.pointer("/spec/tolerations").and_then(|v| v.as_array()) {
+        out.push_str("\nTolerations:\n");
+        for tol in tolerations {
+            let key = tol.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let op = tol.get("operator").and_then(|v| v.as_str()).unwrap_or("Equal");
+            let effect = tol.get("effect").and_then(|v| v.as_str()).unwrap_or("");
+            let value = tol.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            if key.is_empty() {
+                out.push_str(&format!("  op={}\n", op));
+            } else if value.is_empty() {
+                out.push_str(&format!("  {}:{} for {}\n", key, op, if effect.is_empty() { "NoSchedule" } else { effect }));
+            } else {
+                out.push_str(&format!("  {}={}:{}\n", key, value, if effect.is_empty() { "NoSchedule" } else { effect }));
+            }
+        }
+    }
+}
+
+fn format_describe_deployment(val: &serde_json::Value, out: &mut String) {
+    // Replicas
+    if let Some(spec_replicas) = val.pointer("/spec/replicas").and_then(|v| v.as_u64()) {
+        let ready = val.pointer("/status/readyReplicas").and_then(|v| v.as_u64()).unwrap_or(0);
+        let available = val.pointer("/status/availableReplicas").and_then(|v| v.as_u64()).unwrap_or(0);
+        let updated = val.pointer("/status/updatedReplicas").and_then(|v| v.as_u64()).unwrap_or(0);
+        out.push_str(&format!("Replicas:     {} desired | {} updated | {} total | {} available | {} ready\n",
+            spec_replicas, updated, spec_replicas, available, ready));
+    }
+
+    // Strategy
+    if let Some(strategy) = val.pointer("/spec/strategy/type").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Strategy:     {}\n", strategy));
+    }
+
+    // Selector
+    if let Some(match_labels) = val.pointer("/spec/selector/matchLabels").and_then(|v| v.as_object()) {
+        let parts: Vec<String> = match_labels.iter().map(|(k, v)| {
+            format!("{}={}", k, v.as_str().unwrap_or(""))
+        }).collect();
+        out.push_str(&format!("Selector:     {}\n", parts.join(",")));
+    }
+
+    out.push('\n');
+
+    // Pod template containers
+    if let Some(containers) = val.pointer("/spec/template/spec/containers").and_then(|v| v.as_array()) {
+        out.push_str("Pod Template:\n");
+        for container in containers {
+            let cname = container.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let image = container.get("image").and_then(|v| v.as_str()).unwrap_or("?");
+            out.push_str(&format!("  {}:\n", cname));
+            out.push_str(&format!("    Image:    {}\n", image));
+
+            if let Some(ports) = container.get("ports").and_then(|v| v.as_array()) {
+                let port_strs: Vec<String> = ports.iter().map(|p| {
+                    let port = p.get("containerPort").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let proto = p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
+                    format!("{}/{}", port, proto)
+                }).collect();
+                out.push_str(&format!("    Ports:    {}\n", port_strs.join(", ")));
+            }
+
+            if let Some(env) = container.get("env").and_then(|v| v.as_array()) {
+                out.push_str("    Environment:\n");
+                for e in env {
+                    let ename = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    if let Some(value) = e.get("value").and_then(|v| v.as_str()) {
+                        out.push_str(&format!("      {}={}\n", ename, value));
+                    } else if e.get("valueFrom").is_some() {
+                        out.push_str(&format!("      {} (from ref)\n", ename));
+                    }
+                }
+            }
+        }
+    }
+
+    out.push('\n');
+
+    // Conditions
+    if let Some(conditions) = val.pointer("/status/conditions").and_then(|v| v.as_array()) {
+        out.push_str("Conditions:\n");
+        out.push_str("  Type                 Status  Reason\n");
+        out.push_str("  ----                 ------  ------\n");
+        for cond in conditions {
+            let ctype = cond.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+            let status = cond.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+            let reason = cond.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            out.push_str(&format!("  {:<22}{:<8}{}\n", ctype, status, reason));
+        }
+    }
+}
+
+fn format_describe_service(val: &serde_json::Value, out: &mut String) {
+    if let Some(svc_type) = val.pointer("/spec/type").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Type:         {}\n", svc_type));
+    }
+    if let Some(cluster_ip) = val.pointer("/spec/clusterIP").and_then(|v| v.as_str()) {
+        out.push_str(&format!("ClusterIP:    {}\n", cluster_ip));
+    }
+    if let Some(external_ips) = val.pointer("/spec/externalIPs").and_then(|v| v.as_array()) {
+        let ips: Vec<&str> = external_ips.iter().filter_map(|v| v.as_str()).collect();
+        out.push_str(&format!("ExternalIPs:  {}\n", ips.join(", ")));
+    }
+    if let Some(lb_ip) = val.pointer("/status/loadBalancer/ingress").and_then(|v| v.as_array()) {
+        let ips: Vec<String> = lb_ip.iter().map(|i| {
+            i.get("ip").or(i.get("hostname")).and_then(|v| v.as_str()).unwrap_or("").to_string()
+        }).collect();
+        if !ips.is_empty() {
+            out.push_str(&format!("LoadBalancer: {}\n", ips.join(", ")));
+        }
+    }
+
+    // Selector
+    if let Some(selector) = val.pointer("/spec/selector").and_then(|v| v.as_object()) {
+        let parts: Vec<String> = selector.iter().map(|(k, v)| {
+            format!("{}={}", k, v.as_str().unwrap_or(""))
+        }).collect();
+        out.push_str(&format!("Selector:     {}\n", parts.join(",")));
+    }
+
+    // Ports
+    if let Some(ports) = val.pointer("/spec/ports").and_then(|v| v.as_array()) {
+        out.push_str("\nPorts:\n");
+        for port in ports {
+            let pname = port.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
+            let p = port.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+            let tp = port.get("targetPort");
+            let proto = port.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
+            let target_str = match tp {
+                Some(serde_json::Value::Number(n)) => n.to_string(),
+                Some(serde_json::Value::String(s)) => s.clone(),
+                _ => "?".to_string(),
+            };
+            out.push_str(&format!("  {} {}/{} -> {}\n", pname, p, proto, target_str));
+        }
+    }
+
+    // Session affinity
+    if let Some(affinity) = val.pointer("/spec/sessionAffinity").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Session Affinity: {}\n", affinity));
+    }
+}
+
+fn format_describe_node(val: &serde_json::Value, out: &mut String) {
+    // Roles (from labels)
+    if let Some(labels) = val.pointer("/metadata/labels").and_then(|v| v.as_object()) {
+        let roles: Vec<&str> = labels.keys()
+            .filter_map(|k| k.strip_prefix("node-role.kubernetes.io/"))
+            .collect();
+        if !roles.is_empty() {
+            out.push_str(&format!("Roles:        {}\n", roles.join(", ")));
+        }
+    }
+
+    // Addresses
+    if let Some(addresses) = val.pointer("/status/addresses").and_then(|v| v.as_array()) {
+        out.push_str("Addresses:\n");
+        for addr in addresses {
+            let atype = addr.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+            let address = addr.get("address").and_then(|v| v.as_str()).unwrap_or("?");
+            out.push_str(&format!("  {}: {}\n", atype, address));
+        }
+    }
+
+    // Capacity
+    if let Some(capacity) = val.pointer("/status/capacity").and_then(|v| v.as_object()) {
+        out.push_str("Capacity:\n");
+        for (k, v) in capacity {
+            out.push_str(&format!("  {}: {}\n", k, v.as_str().unwrap_or("")));
+        }
+    }
+
+    // Allocatable
+    if let Some(allocatable) = val.pointer("/status/allocatable").and_then(|v| v.as_object()) {
+        out.push_str("Allocatable:\n");
+        for (k, v) in allocatable {
+            out.push_str(&format!("  {}: {}\n", k, v.as_str().unwrap_or("")));
+        }
+    }
+
+    // System info
+    if let Some(info) = val.pointer("/status/nodeInfo").and_then(|v| v.as_object()) {
+        out.push_str("\nSystem Info:\n");
+        let fields = ["kubeletVersion", "containerRuntimeVersion", "osImage", "architecture", "operatingSystem", "kernelVersion"];
+        for field in &fields {
+            if let Some(v) = info.get(*field).and_then(|v| v.as_str()) {
+                out.push_str(&format!("  {}: {}\n", field, v));
+            }
+        }
+    }
+
+    out.push('\n');
+
+    // Conditions
+    if let Some(conditions) = val.pointer("/status/conditions").and_then(|v| v.as_array()) {
+        out.push_str("Conditions:\n");
+        out.push_str("  Type                   Status  Reason                   Message\n");
+        out.push_str("  ----                   ------  ------                   -------\n");
+        for cond in conditions {
+            let ctype = cond.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+            let status = cond.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+            let reason = cond.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            let message = cond.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            out.push_str(&format!("  {:<24}{:<8}{:<25}{}\n", ctype, status, reason, message));
+        }
+    }
+}
+
+fn format_describe_generic(val: &serde_json::Value, out: &mut String) {
+    // For any resource type, print spec and status as indented key-value pairs
+    if let Some(spec) = val.get("spec") {
+        out.push_str("Spec:\n");
+        format_json_indented(spec, out, 2);
+        out.push('\n');
+    }
+
+    if let Some(status) = val.get("status") {
+        out.push_str("Status:\n");
+        format_json_indented(status, out, 2);
+        out.push('\n');
+    }
+}
+
+/// Format a JSON value as indented key-value lines (describe-style).
+fn format_json_indented(val: &serde_json::Value, out: &mut String, indent: usize) {
+    let prefix = " ".repeat(indent);
+    match val {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                match v {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        out.push_str(&format!("{}{}:\n", prefix, k));
+                        format_json_indented(v, out, indent + 2);
+                    }
+                    _ => {
+                        out.push_str(&format!("{}{}: {}\n", prefix, k, format_json_value_inline(v)));
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (i, item) in arr.iter().enumerate() {
+                match item {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        out.push_str(&format!("{}- [{}]:\n", prefix, i));
+                        format_json_indented(item, out, indent + 2);
+                    }
+                    _ => {
+                        out.push_str(&format!("{}- {}\n", prefix, format_json_value_inline(item)));
+                    }
+                }
+            }
+        }
+        _ => {
+            out.push_str(&format!("{}{}\n", prefix, format_json_value_inline(val)));
+        }
+    }
+}
+
+/// Format a simple JSON value for inline display.
+fn format_json_value_inline(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "<none>".to_string(),
+        other => other.to_string(),
+    }
+}
+
+async fn fetch_describe_via_kubectl(
+    resource: &str,
+    name: &str,
+    namespace: &str,
+    context: &str,
+) -> String {
+    let mut cmd = tokio::process::Command::new("kubectl");
+    cmd.arg("describe").arg(resource).arg(name);
+    if !context.is_empty() {
+        cmd.arg("--context").arg(context);
+    }
+    if !namespace.is_empty() {
+        cmd.arg("-n").arg(namespace);
+    }
+    match cmd.output().await {
+        Ok(output) => {
+            if output.status.success() {
+                let raw = String::from_utf8_lossy(&output.stdout).to_string();
+                crate::util::strip_ansi(&raw)
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                format!("Error running kubectl describe:\n{}", stderr)
+            }
+        }
+        Err(e) => format!("Failed to run kubectl: {}", e),
+    }
+}
+
+/// Perform a rollout restart by patching the pod template annotation with the
+/// current timestamp. This is exactly what `kubectl rollout restart` does under
+/// the hood, but avoids spawning a subprocess (reuses the existing kube-rs
+/// client and TLS connection).
+async fn restart_via_patch(
+    client: &::kube::Client,
+    resource: &str,
+    name: &str,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    use ::kube::api::{Api, DynamicObject, Patch, PatchParams};
+
+    let (ar, scope) = resolve_api_resource(client, resource).await?;
+
+    let api: Api<DynamicObject> = if namespace.is_empty() || scope == "Cluster" {
+        Api::all_with(client.clone(), &ar)
+    } else {
+        Api::namespaced_with(client.clone(), namespace, &ar)
+    };
+
+    let patch = serde_json::json!({
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": chrono::Utc::now().to_rfc3339()
+                    }
+                }
+            }
+        }
+    });
+
+    api.patch(name, &PatchParams::apply("k9rs"), &Patch::Merge(&patch)).await?;
+    Ok(())
+}
+
 fn handle_yaml(
     app: &mut App,
     event_tx: &mpsc::Sender<AppEvent>,
-    _client: &::kube::Client,
+    client: &::kube::Client,
     yaml_generation: &Arc<AtomicU64>,
 ) {
     use crate::app::Route;
@@ -1667,50 +2753,161 @@ fn handle_yaml(
         let gen = yaml_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let gen_check = yaml_generation.clone();
 
-        // Spawn a task to fetch the YAML via kubectl (works for any resource type)
+        // Fetch YAML natively via kube-rs (reuses existing connection — much faster
+        // than spawning kubectl which re-reads kubeconfig + does TLS from scratch).
+        // Falls back to kubectl for resource types that need special handling.
         let tx = event_tx.clone();
-        let context = app.context.clone();
+        let kube_client = client.clone();
         let res = resource;
         let n = name;
         let ns = namespace;
+        let context = app.context.clone();
         tokio::spawn(async move {
-            let mut cmd = tokio::process::Command::new("kubectl");
-            cmd.arg("get").arg(&res).arg(&n).arg("-o").arg("yaml");
-            if !context.is_empty() {
-                cmd.arg("--context").arg(&context);
-            }
-            if !ns.is_empty() {
-                cmd.arg("-n").arg(&ns);
-            }
-            match cmd.output().await {
-                Ok(output) => {
-                    let raw = if output.status.success() {
-                        String::from_utf8_lossy(&output.stdout).to_string()
-                    } else {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        format!("Error fetching YAML:\n{}", stderr)
-                    };
-                    let content = crate::util::strip_ansi(&raw);
-                    if gen_check.load(Ordering::SeqCst) == gen {
-                        let _ = tx
-                            .send(AppEvent::ResourceUpdate(ResourceUpdate::Yaml(content)))
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    if gen_check.load(Ordering::SeqCst) == gen {
-                        let _ = tx
-                            .send(AppEvent::ResourceUpdate(ResourceUpdate::Yaml(format!(
-                                "Failed to run kubectl: {}",
-                                e
-                            ))))
-                            .await;
-                    }
-                }
+            let content = fetch_yaml_native(&kube_client, &res, &n, &ns, &context).await;
+            if gen_check.load(Ordering::SeqCst) == gen {
+                let _ = tx
+                    .send(AppEvent::ResourceUpdate(ResourceUpdate::Yaml(content)))
+                    .await;
             }
         });
     }
 }
+
+/// Fetch YAML for a resource using the kube-rs client directly.
+/// Falls back to kubectl for complex resource types.
+async fn fetch_yaml_native(
+    client: &::kube::Client,
+    resource: &str,
+    name: &str,
+    namespace: &str,
+    context: &str,
+) -> String {
+    // Try native kube-rs fetch first
+    match fetch_yaml_via_discovery(client, resource, name, namespace).await {
+        Ok(yaml) => yaml,
+        Err(_) => {
+            // Fallback to kubectl for complex/unknown resource types
+            fetch_yaml_via_kubectl(resource, name, namespace, context).await
+        }
+    }
+}
+
+async fn fetch_yaml_via_discovery(
+    client: &::kube::Client,
+    resource: &str,
+    name: &str,
+    namespace: &str,
+) -> anyhow::Result<String> {
+    use ::kube::api::{Api, DynamicObject};
+
+    // Map common resource type strings to their API group/version/plural
+    let (ar, scope) = resolve_api_resource(client, resource).await?;
+
+    let api: Api<DynamicObject> = if namespace.is_empty() || scope == "Cluster" {
+        Api::all_with(client.clone(), &ar)
+    } else {
+        Api::namespaced_with(client.clone(), namespace, &ar)
+    };
+
+    let obj = api.get(name).await?;
+    let yaml = serde_yaml::to_string(&obj)?;
+    Ok(yaml)
+}
+
+/// Resolve a resource type string (e.g. "pod", "deployment", "service") to an ApiResource.
+async fn resolve_api_resource(
+    client: &::kube::Client,
+    resource: &str,
+) -> anyhow::Result<(::kube::api::ApiResource, String)> {
+    use ::kube::api::ApiResource;
+    use ::kube::discovery::{self, Scope};
+
+    // Common built-in resources — avoid discovery roundtrip
+    let (group, version, kind, plural, scope) = match resource {
+        "pod" => ("", "v1", "Pod", "pods", "Namespaced"),
+        "deployment" => ("apps", "v1", "Deployment", "deployments", "Namespaced"),
+        "service" => ("", "v1", "Service", "services", "Namespaced"),
+        "configmap" => ("", "v1", "ConfigMap", "configmaps", "Namespaced"),
+        "secret" => ("", "v1", "Secret", "secrets", "Namespaced"),
+        "statefulset" => ("apps", "v1", "StatefulSet", "statefulsets", "Namespaced"),
+        "daemonset" => ("apps", "v1", "DaemonSet", "daemonsets", "Namespaced"),
+        "job" => ("batch", "v1", "Job", "jobs", "Namespaced"),
+        "cronjob" => ("batch", "v1", "CronJob", "cronjobs", "Namespaced"),
+        "replicaset" => ("apps", "v1", "ReplicaSet", "replicasets", "Namespaced"),
+        "ingress" => ("networking.k8s.io", "v1", "Ingress", "ingresses", "Namespaced"),
+        "networkpolicy" => ("networking.k8s.io", "v1", "NetworkPolicy", "networkpolicies", "Namespaced"),
+        "serviceaccount" => ("", "v1", "ServiceAccount", "serviceaccounts", "Namespaced"),
+        "namespace" => ("", "v1", "Namespace", "namespaces", "Cluster"),
+        "node" => ("", "v1", "Node", "nodes", "Cluster"),
+        "pv" => ("", "v1", "PersistentVolume", "persistentvolumes", "Cluster"),
+        "pvc" => ("", "v1", "PersistentVolumeClaim", "persistentvolumeclaims", "Namespaced"),
+        "storageclass" => ("storage.k8s.io", "v1", "StorageClass", "storageclasses", "Cluster"),
+        "role" => ("rbac.authorization.k8s.io", "v1", "Role", "roles", "Namespaced"),
+        "clusterrole" => ("rbac.authorization.k8s.io", "v1", "ClusterRole", "clusterroles", "Cluster"),
+        "rolebinding" => ("rbac.authorization.k8s.io", "v1", "RoleBinding", "rolebindings", "Namespaced"),
+        "clusterrolebinding" => ("rbac.authorization.k8s.io", "v1", "ClusterRoleBinding", "clusterrolebindings", "Cluster"),
+        "hpa" => ("autoscaling", "v1", "HorizontalPodAutoscaler", "horizontalpodautoscalers", "Namespaced"),
+        "endpoints" => ("", "v1", "Endpoints", "endpoints", "Namespaced"),
+        "limitrange" => ("", "v1", "LimitRange", "limitranges", "Namespaced"),
+        "resourcequota" => ("", "v1", "ResourceQuota", "resourcequotas", "Namespaced"),
+        "poddisruptionbudget" => ("policy", "v1", "PodDisruptionBudget", "poddisruptionbudgets", "Namespaced"),
+        "event" => ("", "v1", "Event", "events", "Namespaced"),
+        "customresourcedefinition" => ("apiextensions.k8s.io", "v1", "CustomResourceDefinition", "customresourcedefinitions", "Cluster"),
+        _ => {
+            // CRD or unknown — resource string is already "plural.group" format
+            // e.g. "clickhouseinstallations.clickhouse.altinity.com"
+            if resource.contains('.') {
+                let parts: Vec<&str> = resource.splitn(2, '.').collect();
+                let plural = parts[0];
+                let group = parts.get(1).unwrap_or(&"");
+                // Use discovery to find the version
+                let discovery = discovery::Discovery::new(client.clone()).run().await?;
+                for api_group in discovery.groups() {
+                    for (ar, caps) in api_group.recommended_resources() {
+                        if ar.plural == plural && ar.group == *group {
+                            let scope = if caps.scope == Scope::Cluster { "Cluster" } else { "Namespaced" };
+                            return Ok((ar, scope.to_string()));
+                        }
+                    }
+                }
+                return Err(anyhow::anyhow!("Resource not found: {}", resource));
+            }
+            return Err(anyhow::anyhow!("Unknown resource type: {}", resource));
+        }
+    };
+
+    let gvk = ::kube::api::GroupVersionKind::gvk(group, version, kind);
+    let ar = ApiResource::from_gvk_with_plural(&gvk, plural);
+    Ok((ar, scope.to_string()))
+}
+
+async fn fetch_yaml_via_kubectl(
+    resource: &str,
+    name: &str,
+    namespace: &str,
+    context: &str,
+) -> String {
+    let mut cmd = tokio::process::Command::new("kubectl");
+    cmd.arg("get").arg(resource).arg(name).arg("-o").arg("yaml");
+    if !context.is_empty() {
+        cmd.arg("--context").arg(context);
+    }
+    if !namespace.is_empty() {
+        cmd.arg("-n").arg(namespace);
+    }
+    match cmd.output().await {
+        Ok(output) => {
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).to_string()
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                format!("Error fetching YAML:\n{}", stderr)
+            }
+        }
+        Err(e) => format!("Failed to run kubectl: {}", e),
+    }
+}
+
 
 /// Spawn a kubectl logs streaming task, returning a `JoinHandle` that can be
 /// cancelled to stop the stream.  This centralises the command-building logic
@@ -1874,7 +3071,7 @@ fn handle_logs(
     let (log_target, route_pod, route_container) = match app.resource_tab {
         ResourceTab::Pods => {
             let container = app.data.pods.selected_item()
-                .and_then(|p| p.containers.first().map(|c| c.name.clone()))
+                .and_then(|p| p.containers.first().map(|c| c.real_name.clone()))
                 .unwrap_or_default();
             (name.clone(), name.clone(), container)
         }
@@ -1936,7 +3133,7 @@ fn handle_previous_logs(
     let (log_target, route_pod, route_container) = match app.resource_tab {
         ResourceTab::Pods => {
             let container = app.data.pods.selected_item()
-                .and_then(|p| p.containers.first().map(|c| c.name.clone()))
+                .and_then(|p| p.containers.first().map(|c| c.real_name.clone()))
                 .unwrap_or_default();
             (name.clone(), name.clone(), container)
         }
@@ -2074,39 +3271,245 @@ fn get_selected_resource_info(app: &App) -> (String, String, String) {
         ResourceTab::ResourceQuotas => selected_info!(app.data.resource_quotas, "resourcequota"),
         ResourceTab::Pdb => selected_info!(app.data.pdb, "poddisruptionbudget"),
         ResourceTab::Crds => selected_info!(app.data.crds, "customresourcedefinition"),
-        ResourceTab::DynamicResource => selected_info!(app.data.dynamic_resources, "dynamic"),
+        ResourceTab::DynamicResource => {
+            if let Some(item) = app.data.dynamic_resources.selected_item() {
+                // Use the full CRD API resource name (e.g. "clickhouseinstallations.clickhouse.altinity.com")
+                // so kubectl describe/get/delete commands work correctly.
+                let resource_type = if app.dynamic_resource_api_resource.is_empty() {
+                    app.dynamic_resource_name.to_lowercase()
+                } else {
+                    app.dynamic_resource_api_resource.clone()
+                };
+                return (
+                    resource_type,
+                    item.name().to_string(),
+                    item.namespace().to_string(),
+                );
+            }
+        }
     }
     (String::new(), String::new(), String::new())
 }
 
-/// Handle a single AppEvent (resource update, error, or flash).
-fn apply_event(app: &mut App, event: AppEvent) {
-    match event {
-        AppEvent::ResourceUpdate(update) => {
-            apply_resource_update(app, update);
-        }
-        AppEvent::Error(msg) => {
-            app.flash = Some(crate::app::FlashMessage::error(msg));
-        }
-        AppEvent::Flash(flash) => {
-            app.flash = Some(flash);
+/// Get resource info for all marked items in the active table.
+/// Returns a Vec of (resource_type, name, namespace) tuples.
+/// Returns empty Vec if no items are marked.
+fn get_marked_resource_infos(app: &App) -> Vec<(String, String, String)> {
+    use crate::kube::resources::KubeResource;
+
+    macro_rules! marked_infos {
+        ($table:expr, $kind:expr) => {{
+            let mut result = Vec::new();
+            for &idx in &$table.marked {
+                if let Some(item) = $table.items.get(idx) {
+                    result.push((
+                        $kind.to_string(),
+                        item.name().to_string(),
+                        item.namespace().to_string(),
+                    ));
+                }
+            }
+            return result;
+        }};
+    }
+
+    match app.resource_tab {
+        ResourceTab::Pods => marked_infos!(app.data.pods, "pod"),
+        ResourceTab::Deployments => marked_infos!(app.data.deployments, "deployment"),
+        ResourceTab::Services => marked_infos!(app.data.services, "service"),
+        ResourceTab::Nodes => marked_infos!(app.data.nodes, "node"),
+        ResourceTab::Namespaces => marked_infos!(app.data.namespaces, "namespace"),
+        ResourceTab::ConfigMaps => marked_infos!(app.data.configmaps, "configmap"),
+        ResourceTab::Secrets => marked_infos!(app.data.secrets, "secret"),
+        ResourceTab::StatefulSets => marked_infos!(app.data.statefulsets, "statefulset"),
+        ResourceTab::DaemonSets => marked_infos!(app.data.daemonsets, "daemonset"),
+        ResourceTab::Jobs => marked_infos!(app.data.jobs, "job"),
+        ResourceTab::CronJobs => marked_infos!(app.data.cronjobs, "cronjob"),
+        ResourceTab::ReplicaSets => marked_infos!(app.data.replicasets, "replicaset"),
+        ResourceTab::Ingresses => marked_infos!(app.data.ingresses, "ingress"),
+        ResourceTab::Events => marked_infos!(app.data.events, "event"),
+        ResourceTab::Pvs => marked_infos!(app.data.pvs, "pv"),
+        ResourceTab::Pvcs => marked_infos!(app.data.pvcs, "pvc"),
+        ResourceTab::StorageClasses => marked_infos!(app.data.storage_classes, "storageclass"),
+        ResourceTab::NetworkPolicies => marked_infos!(app.data.network_policies, "networkpolicy"),
+        ResourceTab::ServiceAccounts => marked_infos!(app.data.service_accounts, "serviceaccount"),
+        ResourceTab::Roles => marked_infos!(app.data.roles, "role"),
+        ResourceTab::ClusterRoles => marked_infos!(app.data.cluster_roles, "clusterrole"),
+        ResourceTab::RoleBindings => marked_infos!(app.data.role_bindings, "rolebinding"),
+        ResourceTab::ClusterRoleBindings => marked_infos!(app.data.cluster_role_bindings, "clusterrolebinding"),
+        ResourceTab::Hpa => marked_infos!(app.data.hpa, "hpa"),
+        ResourceTab::Endpoints => marked_infos!(app.data.endpoints, "endpoints"),
+        ResourceTab::LimitRanges => marked_infos!(app.data.limit_ranges, "limitrange"),
+        ResourceTab::ResourceQuotas => marked_infos!(app.data.resource_quotas, "resourcequota"),
+        ResourceTab::Pdb => marked_infos!(app.data.pdb, "poddisruptionbudget"),
+        ResourceTab::Crds => marked_infos!(app.data.crds, "customresourcedefinition"),
+        ResourceTab::DynamicResource => {
+            let mut result = Vec::new();
+            let kind = if app.dynamic_resource_api_resource.is_empty() {
+                app.dynamic_resource_name.to_lowercase()
+            } else {
+                app.dynamic_resource_api_resource.clone()
+            };
+            for &idx in &app.data.dynamic_resources.marked {
+                if let Some(item) = app.data.dynamic_resources.items.get(idx) {
+                    result.push((
+                        kind.clone(),
+                        item.name().to_string(),
+                        item.namespace().to_string(),
+                    ));
+                }
+            }
+            result
         }
     }
 }
 
-fn apply_resource_update(app: &mut App, update: ResourceUpdate) {
+/// Flags indicating which cacheable data was updated by a resource update.
+/// Try loading cached resource data from the daemon for instant tab display.
+/// Spawns in background; if data arrives it's sent as a CachedResources event.
+fn preload_cached_resources(app: &App, tab: ResourceTab, event_tx: &mpsc::Sender<AppEvent>) {
+    let ctx = app.context.clone();
+    let ns = app.selected_ns.clone();
+    let rt = tab.label().to_string();
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        if let Some(mut dc) = crate::kube::daemon::DaemonClient::connect().await {
+            if let Some(json) = dc.get_resources(&ctx, &ns, &rt).await {
+                let _ = tx.send(AppEvent::CachedResources {
+                    resource_type: rt,
+                    data: json,
+                }).await;
+            }
+        }
+    });
+}
+
+#[derive(Default)]
+struct CacheUpdateFlags {
+    namespaces: bool,
+    crds: bool,
+}
+
+impl CacheUpdateFlags {
+    fn merge(&mut self, other: CacheUpdateFlags) {
+        self.namespaces |= other.namespaces;
+        self.crds |= other.crds;
+    }
+}
+
+/// Handle a single AppEvent (resource update, error, or flash).
+fn apply_event(app: &mut App, event: AppEvent) -> CacheUpdateFlags {
+    match event {
+        AppEvent::ResourceUpdate(update) => apply_resource_update(app, update),
+        AppEvent::Error(msg) => {
+            app.flash = Some(crate::app::FlashMessage::error(msg));
+            CacheUpdateFlags::default()
+        }
+        AppEvent::Flash(flash) => {
+            app.flash = Some(flash);
+            CacheUpdateFlags::default()
+        }
+        // ContextSwitchResult is handled in the main event loop before apply_event
+        AppEvent::ContextSwitchResult { .. } => CacheUpdateFlags::default(),
+        AppEvent::PodMetrics(metrics) => {
+            app.pod_metrics = metrics;
+            app.apply_pod_metrics();
+            CacheUpdateFlags::default()
+        }
+        AppEvent::NodeMetrics(metrics) => {
+            app.node_metrics = metrics;
+            app.apply_node_metrics();
+            CacheUpdateFlags::default()
+        }
+        // Daemon polling: only apply if the daemon has MORE data than we currently
+        // have (i.e. another instance loaded it). Once our own watchers return
+        // richer data, the daemon data stops being applied.
+        AppEvent::DaemonCacheUpdate { namespaces, crds } => {
+            if namespaces.len() > app.data.namespaces.items.len() && !namespaces.is_empty() {
+                let ns_items = crate::kube::cache::cached_namespaces_to_domain(&namespaces);
+                app.data.namespaces.set_items(ns_items);
+            }
+            if crds.len() > app.discovered_crds.len() && !crds.is_empty() {
+                app.discovered_crds = crate::kube::cache::cached_crds_to_domain(&crds);
+            }
+            CacheUpdateFlags::default()
+        }
+        // Cached resource data from daemon — only apply if table is currently empty
+        // (don't overwrite live watcher data that may have arrived first).
+        AppEvent::CachedResources { resource_type, data } => {
+            apply_cached_resources(app, &resource_type, &data);
+            CacheUpdateFlags::default()
+        }
+    }
+}
+
+/// Push serialized resource data to the daemon cache in the background.
+macro_rules! cache_resource_update {
+    ($app:expr, $items:expr, $resource_type:expr) => {
+        {
+            let json_result = serde_json::to_string(&$items);
+            match json_result {
+                Ok(json) => {
+                    let ctx = $app.context.clone();
+                    let ns = $app.selected_ns.clone();
+                    let rt = $resource_type.to_string();
+                    tokio::spawn(async move {
+                        if let Some(mut dc) = crate::kube::daemon::DaemonClient::connect().await {
+                            dc.put_resources(&ctx, &ns, &rt, &json).await;
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::debug!("cache_resource_update: {} serialize failed: {}", $resource_type, e);
+                }
+            }
+        }
+    };
+}
+
+fn apply_resource_update(app: &mut App, update: ResourceUpdate) -> CacheUpdateFlags {
+    let mut flags = CacheUpdateFlags::default();
     match update {
-        ResourceUpdate::Pods(items) => app.data.pods.set_items_filtered(items),
-        ResourceUpdate::Deployments(items) => app.data.deployments.set_items_filtered(items),
-        ResourceUpdate::Services(items) => app.data.services.set_items_filtered(items),
-        ResourceUpdate::Nodes(items) => app.data.nodes.set_items_filtered(items),
-        ResourceUpdate::Namespaces(items) => app.data.namespaces.set_items_filtered(items),
+        ResourceUpdate::Pods(items) => {
+            cache_resource_update!(app, items, "Pods");
+            app.data.pods.set_items_filtered(items);
+            app.apply_pod_metrics();
+        }
+        ResourceUpdate::Deployments(items) => {
+            cache_resource_update!(app, items, "Deploy");
+            app.data.deployments.set_items_filtered(items);
+        }
+        ResourceUpdate::Services(items) => {
+            cache_resource_update!(app, items, "Svc");
+            app.data.services.set_items_filtered(items);
+        }
+        ResourceUpdate::Nodes(items) => {
+            cache_resource_update!(app, items, "Nodes");
+            app.data.nodes.set_items_filtered(items);
+            app.apply_node_metrics();
+        }
+        ResourceUpdate::Namespaces(items) => {
+            app.data.namespaces.set_items_filtered(items);
+            flags.namespaces = true;
+        }
         ResourceUpdate::ConfigMaps(items) => app.data.configmaps.set_items_filtered(items),
         ResourceUpdate::Secrets(items) => app.data.secrets.set_items_filtered(items),
-        ResourceUpdate::StatefulSets(items) => app.data.statefulsets.set_items_filtered(items),
-        ResourceUpdate::DaemonSets(items) => app.data.daemonsets.set_items_filtered(items),
-        ResourceUpdate::Jobs(items) => app.data.jobs.set_items_filtered(items),
-        ResourceUpdate::CronJobs(items) => app.data.cronjobs.set_items_filtered(items),
+        ResourceUpdate::StatefulSets(items) => {
+            cache_resource_update!(app, items, "STS");
+            app.data.statefulsets.set_items_filtered(items);
+        }
+        ResourceUpdate::DaemonSets(items) => {
+            cache_resource_update!(app, items, "DS");
+            app.data.daemonsets.set_items_filtered(items);
+        }
+        ResourceUpdate::Jobs(items) => {
+            cache_resource_update!(app, items, "Jobs");
+            app.data.jobs.set_items_filtered(items);
+        }
+        ResourceUpdate::CronJobs(items) => {
+            cache_resource_update!(app, items, "CronJobs");
+            app.data.cronjobs.set_items_filtered(items);
+        }
         ResourceUpdate::ReplicaSets(items) => app.data.replicasets.set_items_filtered(items),
         ResourceUpdate::Ingresses(items) => app.data.ingresses.set_items_filtered(items),
         ResourceUpdate::NetworkPolicies(items) => app.data.network_policies.set_items_filtered(items),
@@ -2130,6 +3533,7 @@ fn apply_resource_update(app: &mut App, update: ResourceUpdate) {
             // Also update the discovered CRDs list for dynamic browsing
             app.discovered_crds = items.clone();
             app.data.crds.set_items_filtered(items);
+            flags.crds = true;
         }
         ResourceUpdate::DynamicResources(items) => app.data.dynamic_resources.set_items_filtered(items),
         ResourceUpdate::Yaml(content) => {
@@ -2146,36 +3550,117 @@ fn apply_resource_update(app: &mut App, update: ResourceUpdate) {
         }
         ResourceUpdate::LogLine(line) => app.logs.push(line),
     }
+    flags
+}
+
+/// Apply cached resource data from the daemon. Only populates a table if it is
+/// currently empty (has_data == false), so live watcher data is never overwritten.
+fn apply_cached_resources(app: &mut App, resource_type: &str, data: &str) {
+    use crate::kube::resources::{
+        pods::KubePod, deployments::KubeDeployment, services::KubeService,
+        statefulsets::KubeStatefulSet, daemonsets::KubeDaemonSet, jobs::KubeJob,
+        cronjobs::KubeCronJob, nodes::KubeNode,
+    };
+
+    macro_rules! apply_if_empty {
+        ($table:expr, $ty:ty, $data:expr) => {
+            // Apply cached data if the table is currently empty.
+            // This covers: first launch, tab switch (watcher restarting),
+            // context/namespace switch (data cleared).
+            // Once the live watcher sends data, the table is non-empty
+            // and the cache won't overwrite it.
+            if $table.items.is_empty() {
+                if let Ok(items) = serde_json::from_str::<Vec<$ty>>($data) {
+                    if !items.is_empty() {
+                        $table.set_items_filtered(items);
+                    }
+                }
+            }
+        };
+    }
+
+    match resource_type {
+        "Pods" => apply_if_empty!(app.data.pods, KubePod, data),
+        "Deploy" => apply_if_empty!(app.data.deployments, KubeDeployment, data),
+        "Svc" => apply_if_empty!(app.data.services, KubeService, data),
+        "STS" => apply_if_empty!(app.data.statefulsets, KubeStatefulSet, data),
+        "DS" => apply_if_empty!(app.data.daemonsets, KubeDaemonSet, data),
+        "Jobs" => apply_if_empty!(app.data.jobs, KubeJob, data),
+        "CronJobs" => apply_if_empty!(app.data.cronjobs, KubeCronJob, data),
+        "Nodes" => apply_if_empty!(app.data.nodes, KubeNode, data),
+        _ => {} // Unknown resource type, ignore
+    }
 }
 
 /// Perform a context switch: update app state, clear data, replace the watcher client.
 /// Returns `true` on success, `false` on failure (with a flash message set).
-async fn do_switch_context(
+/// Begin a context switch. Immediately clears UI state and shows a flash message,
+/// then spawns the slow client creation in a background task. The result arrives
+/// via `AppEvent::ContextSwitchResult` and is applied by `apply_context_switch_result`.
+fn begin_context_switch(
+    app: &mut App,
+    event_tx: &mpsc::Sender<AppEvent>,
+    ctx_name: &str,
+) {
+    // Immediate: clear data and show feedback — keeps TUI responsive
+    app.context = ctx_name.to_string();
+    app.clear_data();
+    app.kubectl_cache.clear();
+    app.discovered_crds.clear();
+    app.route_stack.clear();
+    app.route = crate::app::Route::Resources;
+    app.filter.active = false;
+    app.filter.text.clear();
+    app.flash = Some(crate::app::FlashMessage::info(format!(
+        "Switching to context: {}...",
+        ctx_name
+    )));
+
+    // Spawn slow client creation in background
+    let ctx = ctx_name.to_string();
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        let result = crate::kube::KubeClient::create_client_for_context(&ctx).await;
+        let _ = tx
+            .send(AppEvent::ContextSwitchResult {
+                context: ctx,
+                result: result.map_err(|e| e.to_string()),
+            })
+            .await;
+    });
+}
+
+/// Apply the result of a background context switch.
+async fn apply_context_switch_result(
     app: &mut App,
     kube_client: &mut crate::kube::KubeClient,
     resource_watcher: &mut crate::kube::watcher::ResourceWatcher,
     ctx_name: &str,
-) -> bool {
-    match kube_client.switch_context(ctx_name).await {
+    result: Result<::kube::Client, String>,
+) {
+    match result {
         Ok(new_client) => {
-            app.context = ctx_name.to_string();
-            app.clear_data();
-            app.kubectl_cache.clear();
-            app.discovered_crds.clear();
-            app.route_stack.clear();
-            app.route = crate::app::Route::Resources;
-            app.filter.active = false;
-            app.filter.text.clear();
+            kube_client.set_client(new_client.clone(), ctx_name);
+            let (cluster, user) = crate::kube::KubeClient::context_info(ctx_name);
+            app.cluster = cluster;
+            app.user = user;
             resource_watcher
-                .replace_client(new_client.clone(), app.selected_ns.clone())
+                .replace_client(new_client, app.selected_ns.clone())
                 .await;
+            // Read kubeconfig once for all contexts
+            let contexts_info = crate::kube::KubeClient::all_context_info();
             let updated: Vec<crate::app::KubeContext> = app
                 .contexts
                 .iter()
-                .map(|name| crate::app::KubeContext {
-                    name: name.clone(),
-                    cluster: String::new(),
-                    is_current: name == ctx_name,
+                .map(|name| {
+                    let cluster = contexts_info.get(name.as_str())
+                        .map(|(c, _)| c.clone())
+                        .unwrap_or_default();
+                    crate::app::KubeContext {
+                        name: name.clone(),
+                        cluster,
+                        is_current: name == ctx_name,
+                    }
                 })
                 .collect();
             app.data.contexts.set_items(updated);
@@ -2183,14 +3668,12 @@ async fn do_switch_context(
                 "Switched to context: {}",
                 ctx_name
             )));
-            true
         }
         Err(e) => {
             app.flash = Some(crate::app::FlashMessage::error(format!(
                 "Context switch failed: {}",
                 e
             )));
-            false
         }
     }
 }
@@ -2235,6 +3718,25 @@ fn parse_resource_filter_command(cmd: &str) -> Option<(ResourceTab, String)> {
 /// Parse commands like "deploy kube-system" → (Deployments, "kube-system")
 /// Returns None for cluster-scoped resources (nodes, pvs, storageclasses, clusterroles, etc.)
 /// since they don't belong to a namespace.
+/// Parse a CRD command with optional namespace: "clickhouseinstallation prod"
+fn parse_crd_ns_command(cmd: &str, app: &App) -> Option<(crate::kube::resources::crds::KubeCrd, String)> {
+    let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let crd_part = parts[0].trim();
+    let ns = parts[1].trim();
+    if ns.is_empty() {
+        return None;
+    }
+    let crd = app.find_crd_by_name(crd_part)?;
+    // Cluster-scoped CRDs don't take namespace
+    if crd.scope == "Cluster" {
+        return None;
+    }
+    Some((crd, ns.to_string()))
+}
+
 fn parse_resource_ns_command(cmd: &str) -> Option<(ResourceTab, String)> {
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
     if parts.len() != 2 {
@@ -2295,4 +3797,261 @@ fn parse_resource_command(cmd: &str) -> Option<ResourceTab> {
         }
         _ => None,
     }
+}
+
+/// Spawns a background task that periodically fetches pod and node metrics
+/// from the Kubernetes metrics-server API (metrics.k8s.io/v1beta1).
+/// Sends `AppEvent::PodMetrics` and `AppEvent::NodeMetrics` every 30 seconds.
+fn spawn_metrics_poller(
+    client: ::kube::Client,
+    tx: mpsc::Sender<AppEvent>,
+) -> JoinHandle<()> {
+    use ::kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams};
+    use ::kube::Api;
+
+    tokio::spawn(async move {
+        // Small initial delay to let core watchers get data first
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        loop {
+            // Fetch pod metrics
+            let pod_ar = ApiResource::from_gvk_with_plural(
+                &GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics"),
+                "pods",
+            );
+            let pod_api: Api<DynamicObject> = Api::all_with(client.clone(), &pod_ar);
+            if let Ok(list) = pod_api.list(&ListParams::default()).await {
+                let mut metrics: HashMap<(String, String), (String, String)> = HashMap::new();
+                for item in &list.items {
+                    let ns = item.metadata.namespace.clone().unwrap_or_default();
+                    let name = item.metadata.name.clone().unwrap_or_default();
+                    let (cpu, mem) = parse_pod_metrics_usage(&item.data);
+                    metrics.insert((ns, name), (cpu, mem));
+                }
+                let _ = tx.send(AppEvent::PodMetrics(metrics)).await;
+            }
+
+            // Fetch node metrics
+            let node_ar = ApiResource::from_gvk_with_plural(
+                &GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "NodeMetrics"),
+                "nodes",
+            );
+            let node_api: Api<DynamicObject> = Api::all_with(client.clone(), &node_ar);
+            if let Ok(list) = node_api.list(&ListParams::default()).await {
+                let mut metrics: HashMap<String, (String, String)> = HashMap::new();
+                for item in &list.items {
+                    let name = item.metadata.name.clone().unwrap_or_default();
+                    let (cpu, mem) = parse_node_metrics_usage(&item.data);
+                    metrics.insert(name, (cpu, mem));
+                }
+                let _ = tx.send(AppEvent::NodeMetrics(metrics)).await;
+            }
+
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    })
+}
+
+/// Parse the `usage` field from a PodMetrics DynamicObject.
+/// PodMetrics has `containers: [{name, usage: {cpu, memory}}]`.
+/// Sums CPU and memory across all containers.
+fn parse_pod_metrics_usage(data: &serde_json::Value) -> (String, String) {
+    let containers = match data.get("containers").and_then(|c| c.as_array()) {
+        Some(c) => c,
+        None => return ("n/a".to_string(), "n/a".to_string()),
+    };
+
+    let mut total_cpu_nano: u64 = 0;
+    let mut total_mem_bytes: u64 = 0;
+
+    for container in containers {
+        if let Some(usage) = container.get("usage") {
+            if let Some(cpu_str) = usage.get("cpu").and_then(|v| v.as_str()) {
+                total_cpu_nano += parse_cpu_to_nano(cpu_str);
+            }
+            if let Some(mem_str) = usage.get("memory").and_then(|v| v.as_str()) {
+                total_mem_bytes += parse_mem_to_bytes(mem_str);
+            }
+        }
+    }
+
+    let cpu = crate::util::format_cpu(&format!("{}n", total_cpu_nano));
+    let mem = crate::util::format_mem(&total_mem_bytes.to_string());
+    (cpu, mem)
+}
+
+/// Parse the `usage` field from a NodeMetrics DynamicObject.
+/// NodeMetrics has `usage: {cpu, memory}` directly.
+fn parse_node_metrics_usage(data: &serde_json::Value) -> (String, String) {
+    let usage = match data.get("usage") {
+        Some(u) => u,
+        None => return ("n/a".to_string(), "n/a".to_string()),
+    };
+
+    let cpu = usage
+        .get("cpu")
+        .and_then(|v| v.as_str())
+        .map(|s| crate::util::format_cpu(s))
+        .unwrap_or_else(|| "n/a".to_string());
+
+    let mem = usage
+        .get("memory")
+        .and_then(|v| v.as_str())
+        .map(|s| crate::util::format_mem(s))
+        .unwrap_or_else(|| "n/a".to_string());
+
+    (cpu, mem)
+}
+
+/// Parse a CPU string (e.g. "250000000n", "500m", "2") to nanocores.
+fn parse_cpu_to_nano(s: &str) -> u64 {
+    let s = s.trim();
+    if let Some(nano_str) = s.strip_suffix('n') {
+        nano_str.parse::<u64>().unwrap_or(0)
+    } else if let Some(milli_str) = s.strip_suffix('m') {
+        milli_str.parse::<u64>().unwrap_or(0) * 1_000_000
+    } else if let Ok(cores) = s.parse::<f64>() {
+        (cores * 1_000_000_000.0) as u64
+    } else {
+        0
+    }
+}
+
+/// Parse a memory string (e.g. "131072Ki", "256Mi", "1073741824") to bytes.
+fn parse_mem_to_bytes(s: &str) -> u64 {
+    let s = s.trim();
+    if let Some(val) = s.strip_suffix("Ti") {
+        val.parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024 * 1024
+    } else if let Some(val) = s.strip_suffix("Gi") {
+        val.parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024
+    } else if let Some(val) = s.strip_suffix("Mi") {
+        val.parse::<u64>().unwrap_or(0) * 1024 * 1024
+    } else if let Some(val) = s.strip_suffix("Ki") {
+        val.parse::<u64>().unwrap_or(0) * 1024
+    } else {
+        s.parse::<u64>().unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cache CLI — query the daemon from the command line
+// ---------------------------------------------------------------------------
+
+async fn cache_cli(cmd: &str) -> Result<()> {
+    let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+    let subcmd = parts[0];
+    let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+    match subcmd {
+        "ping" => {
+            match crate::kube::daemon::DaemonClient::connect().await {
+                Some(mut dc) => {
+                    let req = serde_json::json!({"op": "ping"});
+                    if dc.send_raw(&req).await.is_some() {
+                        println!("Daemon is alive at {:?}", crate::kube::daemon::socket_path());
+                    } else {
+                        eprintln!("Daemon connected but not responding");
+                        std::process::exit(1);
+                    }
+                }
+                None => {
+                    eprintln!("Daemon not running (socket: {:?})", crate::kube::daemon::socket_path());
+                    std::process::exit(1);
+                }
+            }
+        }
+        "status" => {
+            let path = crate::kube::daemon::socket_path();
+            match crate::kube::daemon::DaemonClient::connect().await {
+                Some(_) => {
+                    println!("Daemon: running");
+                    println!("Socket: {:?}", path);
+                    // List cached contexts from disk
+                    if let Some(cache_dir) = crate::kube::cache::cache_dir() {
+                        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+                            let contexts: Vec<String> = entries.flatten()
+                                .filter(|e| e.path().extension().map_or(false, |x| x == "json"))
+                                .filter_map(|e| {
+                                    e.path().file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .map(|s| s.to_string())
+                                })
+                                .collect();
+                            println!("Cached contexts: {}", if contexts.is_empty() { "none".to_string() } else { contexts.join(", ") });
+                        }
+                    }
+                }
+                None => {
+                    println!("Daemon: not running");
+                    println!("Socket: {:?} (not found)", path);
+                }
+            }
+        }
+        "get" => {
+            if arg.is_empty() {
+                eprintln!("Usage: k9rs --cache 'get <context>'");
+                std::process::exit(1);
+            }
+            match crate::kube::daemon::DaemonClient::connect().await {
+                Some(mut dc) => {
+                    match dc.get(arg).await {
+                        Some((ns, crds)) => {
+                            println!("Context: {}", arg);
+                            println!("Namespaces ({}): {}", ns.len(),
+                                if ns.len() <= 10 { ns.join(", ") }
+                                else { format!("{}, ... (+{} more)", ns[..10].join(", "), ns.len() - 10) }
+                            );
+                            println!("CRDs ({}): {}", crds.len(),
+                                if crds.len() <= 10 {
+                                    crds.iter().map(|c| c.kind.as_str()).collect::<Vec<_>>().join(", ")
+                                } else {
+                                    let first: Vec<&str> = crds[..10].iter().map(|c| c.kind.as_str()).collect();
+                                    format!("{}, ... (+{} more)", first.join(", "), crds.len() - 10)
+                                }
+                            );
+                        }
+                        None => {
+                            println!("No data cached for context '{}'", arg);
+                        }
+                    }
+                }
+                None => {
+                    eprintln!("Daemon not running");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "contexts" => {
+            match crate::kube::daemon::DaemonClient::connect().await {
+                Some(_) => {
+                    // Read contexts from disk cache files
+                    if let Some(cache_dir) = crate::kube::cache::cache_dir() {
+                        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+                            for entry in entries.flatten() {
+                                if entry.path().extension().map_or(false, |x| x == "json") {
+                                    if let Ok(data) = std::fs::read_to_string(entry.path()) {
+                                        if let Ok(dc) = serde_json::from_str::<crate::kube::cache::DiscoveryCache>(&data) {
+                                            println!("{}: {} namespaces, {} crds (updated {})",
+                                                dc.context, dc.namespaces.len(), dc.crds.len(),
+                                                dc.updated_at.format("%Y-%m-%d %H:%M:%S UTC"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    eprintln!("Daemon not running");
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => {
+            eprintln!("Unknown cache command: {}", subcmd);
+            eprintln!("Available: ping, status, get <context>, contexts");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
 }

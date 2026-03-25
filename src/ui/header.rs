@@ -67,11 +67,19 @@ pub fn draw_cluster_info(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         ]),
         Line::from(vec![
             Span::styled(" Cluster:   ", theme.info_label),
-            Span::styled(&app.context, theme.info_value),
+            if app.cluster.is_empty() {
+                Span::styled("n/a", theme.info_na)
+            } else {
+                Span::styled(&app.cluster, theme.info_value)
+            },
         ]),
         Line::from(vec![
             Span::styled(" User:      ", theme.info_label),
-            Span::styled("n/a", theme.info_na),
+            if app.user.is_empty() {
+                Span::styled("n/a", theme.info_na)
+            } else {
+                Span::styled(&app.user, theme.info_value)
+            },
         ]),
         Line::from(vec![
             Span::styled(" K9rs Rev:  ", theme.info_label),
