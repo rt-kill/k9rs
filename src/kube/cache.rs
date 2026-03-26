@@ -49,12 +49,25 @@ fn dirs_or_home() -> Option<PathBuf> {
         })
 }
 
+/// Build a compound cache key from a context name and cluster name.
+///
+/// Using just the context name causes collisions when different kubeconfig files
+/// (e.g. via KUBECONFIG env var) share context names like "dev" or "default"
+/// but point to different clusters. Including the cluster name disambiguates.
+pub fn cache_key(context: &str, cluster: &str) -> String {
+    if cluster.is_empty() {
+        context.to_string()
+    } else {
+        format!("{}@{}", context, cluster)
+    }
+}
+
 /// Returns the cache file path for a given context.
-fn cache_path(context: &str) -> Option<PathBuf> {
+pub fn cache_path(context: &str) -> Option<PathBuf> {
     // Sanitize context name for use as a filename (replace / and other unsafe chars)
     let safe_name: String = context
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@' { c } else { '_' })
         .collect();
     cache_dir().map(|d| d.join(format!("{}.json", safe_name)))
 }
@@ -90,9 +103,10 @@ pub async fn save_cache(cache: &DiscoveryCache) {
             return;
         }
     }
-    // Atomic write: write to temp file, then rename. Prevents corruption
-    // if two processes save simultaneously or the process is killed mid-write.
-    let tmp_path = path.with_extension("tmp");
+    // Atomic write: write to uniquely-named temp file, then rename.
+    // Random suffix prevents corruption when multiple concurrent saves target
+    // the same context (e.g., daemon Put handler spawning overlapping tasks).
+    let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), rand::random::<u32>()));
     if let Err(e) = tokio::fs::write(&tmp_path, json.as_bytes()).await {
         debug!("Failed to write cache temp file {:?}: {}", tmp_path, e);
         return;

@@ -2,76 +2,25 @@
 //!
 //! moka::Cache is a concurrent, lock-free cache with TTL and eviction.
 //! Connection handlers read/write the cache directly — no actor, no channels,
-//! no mutexes. Idle tracking via atomic counter.
+//! no mutexes.
 //!
-//! - `k9rs --daemon` starts the daemon (auto-exits after idle timeout)
+//! - Start with `k9rs --daemon` (stays running until killed / Ctrl-C / SIGTERM)
 //! - Normal k9rs instances connect as clients
 //! - Falls back to direct file cache if daemon is unavailable
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use moka::future::Cache;
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use super::cache::{self, CachedCrd, DiscoveryCache};
-
-// ---------------------------------------------------------------------------
-// Protocol
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "op")]
-enum Request {
-    #[serde(rename = "ping")]
-    Ping,
-    #[serde(rename = "get")]
-    Get { context: String },
-    #[serde(rename = "put")]
-    Put {
-        context: String,
-        #[serde(default)]
-        namespaces: Vec<String>,
-        #[serde(default)]
-        crds: Vec<CachedCrd>,
-    },
-    #[serde(rename = "get_resources")]
-    GetResources {
-        context: String,
-        namespace: String,
-        resource_type: String,
-    },
-    #[serde(rename = "put_resources")]
-    PutResources {
-        context: String,
-        namespace: String,
-        resource_type: String,
-        data: String,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Response {
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<CachePayload>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    /// Serialized resource list data (for get_resources/put_resources).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resource_data: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CachePayload {
-    namespaces: Vec<String>,
-    crds: Vec<CachedCrd>,
-}
+use super::protocol::*;
 
 // ---------------------------------------------------------------------------
 // Socket path
@@ -96,16 +45,8 @@ pub fn socket_path() -> PathBuf {
 // Daemon server
 // ---------------------------------------------------------------------------
 
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-/// Run the cache daemon. moka handles all concurrency — no locks.
+/// Run the cache daemon. Stays alive until killed (Ctrl-C / SIGTERM).
+/// moka handles all concurrency — no locks.
 pub async fn run_daemon() -> anyhow::Result<()> {
     let path = socket_path();
 
@@ -125,46 +66,39 @@ pub async fn run_daemon() -> anyhow::Result<()> {
     };
     info!("k9rs cache daemon listening on {:?}", path);
 
-    // Signal handler for clean shutdown
-    let signal_path = path.clone();
-    tokio::spawn(async move {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ).expect("SIGTERM handler");
-        let mut sigint = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::interrupt(),
-        ).expect("SIGINT handler");
-        tokio::select! {
-            _ = sigterm.recv() => {}
-            _ = sigint.recv() => {}
-        }
-        info!("Daemon signal — cleaning up");
-        let _ = std::fs::remove_file(&signal_path);
-        std::process::exit(0);
+    // Signal handlers for clean shutdown
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    )?;
+    let mut sigint = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::interrupt(),
+    )?;
+
+    // Daemon state: caches + session tracking
+    let state = Arc::new(DaemonState {
+        started_at: Instant::now(),
+        discovery_store: Cache::builder()
+            .max_capacity(1000)
+            .time_to_idle(Duration::from_secs(3600))
+            .build(),
+        resource_store: Cache::builder()
+            .max_capacity(500)
+            .time_to_idle(Duration::from_secs(600))
+            .support_invalidation_closures()
+            .build(),
+        sessions: RwLock::new(HashMap::new()),
+        socket_path: path.display().to_string(),
+        shutdown: tokio::sync::Notify::new(),
     });
 
-    // moka cache: lock-free, concurrent, TTL-based eviction
-    // 1 hour TTL per entry, max 1000 contexts
-    let store: Cache<String, DiscoveryCache> = Cache::builder()
-        .max_capacity(1000)
-        .time_to_idle(Duration::from_secs(3600))
-        .build();
-
-    // Resource list cache: stores serialized resource data for instant tab switches
-    // Key: "context:namespace:resource_type", Value: JSON string
-    let resource_store: Cache<String, String> = Cache::builder()
-        .max_capacity(500)
-        .time_to_idle(Duration::from_secs(600)) // 10 min TTL
-        .build();
-
-    // Seed cache from disk
+    // Seed discovery cache from disk
     if let Some(cache_dir) = cache::cache_dir() {
         if let Ok(entries) = std::fs::read_dir(&cache_dir) {
             for entry in entries.flatten() {
                 if entry.path().extension().map_or(false, |e| e == "json") {
                     if let Ok(data) = std::fs::read_to_string(entry.path()) {
                         if let Ok(dc) = serde_json::from_str::<DiscoveryCache>(&data) {
-                            store.insert(dc.context.clone(), dc).await;
+                            state.discovery_store.insert(dc.context.clone(), dc).await;
                         }
                     }
                 }
@@ -172,58 +106,59 @@ pub async fn run_daemon() -> anyhow::Result<()> {
         }
     }
 
-    let last_activity = Arc::new(AtomicU64::new(now_millis()));
-
-    // Idle timeout
-    let idle_activity = last_activity.clone();
-    let idle_path = path.clone();
-    let shutdown = Arc::new(tokio::sync::Notify::new());
-    let shutdown_listen = shutdown.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            let last = idle_activity.load(Ordering::Relaxed);
-            let now = now_millis();
-            if now.saturating_sub(last) > IDLE_TIMEOUT.as_millis() as u64 {
-                info!("Daemon idle timeout — shutting down");
-                let _ = std::fs::remove_file(&idle_path);
-                shutdown.notify_one();
-                return;
-            }
-        }
-    });
-
-    // Accept loop — each connection handler reads/writes moka directly
+    // Accept loop — exits on signal or shutdown request
     loop {
         tokio::select! {
-            accept_result = listener.accept() => {
-                let (stream, _) = accept_result?;
-                last_activity.store(now_millis(), Ordering::Relaxed);
-                let conn_store = store.clone();
-                let conn_res_store = resource_store.clone();
-                let conn_activity = last_activity.clone();
+            result = listener.accept() => {
+                let (stream, _) = result?;
+                let conn_state = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, conn_store, conn_res_store, conn_activity).await {
+                    if let Err(e) = handle_connection(stream, conn_state).await {
                         debug!("Connection error: {}", e);
                     }
                 });
             }
-            _ = shutdown_listen.notified() => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let _ = std::fs::remove_file(&path);
-                return Ok(());
+            _ = sigterm.recv() => {
+                info!("Daemon received SIGTERM — shutting down");
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("Daemon received SIGINT — shutting down");
+                break;
+            }
+            _ = state.shutdown.notified() => {
+                info!("Daemon received shutdown request — shutting down");
+                break;
             }
         }
     }
+
+    // Clean shutdown: remove socket, let tokio drain in-flight tasks
+    let _ = std::fs::remove_file(&path);
+    info!("Daemon stopped");
+    Ok(())
 }
 
-/// Handle a single connection. Reads/writes moka cache directly — no
-/// indirection, no channels, no locks.
+// ---------------------------------------------------------------------------
+// Daemon state
+// ---------------------------------------------------------------------------
+
+pub struct DaemonState {
+    pub started_at: Instant,
+    pub discovery_store: Cache<String, DiscoveryCache>,
+    pub resource_store: Cache<String, String>,
+    pub sessions: RwLock<HashMap<String, SessionInfo>>,
+    pub socket_path: String,
+    pub shutdown: tokio::sync::Notify,
+}
+
+// ---------------------------------------------------------------------------
+// Connection handler
+// ---------------------------------------------------------------------------
+
 async fn handle_connection(
     stream: UnixStream,
-    store: Cache<String, DiscoveryCache>,
-    resource_store: Cache<String, String>,
-    last_activity: Arc<AtomicU64>,
+    state: Arc<DaemonState>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -232,65 +167,147 @@ async fn handle_connection(
         let request: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = Response {
-                    ok: false,
-                    data: None,
-                    error: Some(format!("Invalid request: {}", e)),
-                    resource_data: None,
-                };
-                write_response(&mut writer, &resp).await?;
+                write_response(&mut writer, &Response::error(format!("Invalid request: {}", e))).await?;
                 continue;
             }
         };
 
-        last_activity.store(now_millis(), Ordering::Relaxed);
-
-        let resp = match request {
-            Request::Ping => Response { ok: true, data: None, error: None, resource_data: None },
-
-            Request::Get { context } => {
-                let payload = store.get(&context).await.map(|dc| CachePayload {
-                    namespaces: dc.namespaces.clone(),
-                    crds: dc.crds.clone(),
-                }).unwrap_or(CachePayload {
-                    namespaces: vec![],
-                    crds: vec![],
-                });
-                Response { ok: true, data: Some(payload), error: None, resource_data: None }
-            }
-
-            Request::Put { context, namespaces, crds } => {
-                let dc = cache::build_cache(&context, &namespaces, &crds);
-                let dc_for_disk = dc.clone();
-                store.insert(context, dc).await;
-                // Persist to disk in background (atomic write)
-                tokio::spawn(async move {
-                    cache::save_cache(&dc_for_disk).await;
-                });
-                Response { ok: true, data: None, error: None, resource_data: None }
-            }
-
-            Request::GetResources { context, namespace, resource_type } => {
-                let key = format!("{}:{}:{}", context, namespace, resource_type);
-                Response {
-                    ok: true,
-                    data: None,
-                    error: None,
-                    resource_data: resource_store.get(&key).await,
-                }
-            }
-
-            Request::PutResources { context, namespace, resource_type, data } => {
-                let key = format!("{}:{}:{}", context, namespace, resource_type);
-                resource_store.insert(key, data).await;
-                Response { ok: true, data: None, error: None, resource_data: None }
-            }
-        };
-
+        let resp = handle_request(&state, request).await;
         write_response(&mut writer, &resp).await?;
     }
 
     Ok(())
+}
+
+async fn handle_request(state: &DaemonState, request: Request) -> Response {
+    match request {
+        Request::Ping => Response::ok(),
+
+        Request::Get { context } => {
+            let payload = state.discovery_store.get(&context).await.map(|dc| CachePayload {
+                namespaces: dc.namespaces.clone(),
+                crds: dc.crds.clone(),
+            }).unwrap_or(CachePayload {
+                namespaces: vec![],
+                crds: vec![],
+            });
+            let mut resp = Response::ok();
+            resp.data = Some(payload);
+            resp
+        }
+
+        Request::Put { context, namespaces, crds } => {
+            let dc = cache::build_cache(&context, &namespaces, &crds);
+            let dc_for_disk = dc.clone();
+            state.discovery_store.insert(context, dc).await;
+            tokio::spawn(async move {
+                cache::save_cache(&dc_for_disk).await;
+            });
+            Response::ok()
+        }
+
+        Request::GetResources { context, namespace, resource_type } => {
+            let key = format!("{}:{}:{}", context, namespace, resource_type);
+            let mut resp = Response::ok();
+            resp.resource_data = state.resource_store.get(&key).await;
+            resp
+        }
+
+        Request::PutResources { context, namespace, resource_type, data } => {
+            let key = format!("{}:{}:{}", context, namespace, resource_type);
+            state.resource_store.insert(key, data).await;
+            Response::ok()
+        }
+
+        Request::Status => {
+            let sessions = state.sessions.read().await;
+            let mut resp = Response::ok();
+            resp.status = Some(DaemonStatus {
+                pid: std::process::id(),
+                uptime_secs: state.started_at.elapsed().as_secs(),
+                socket_path: state.socket_path.clone(),
+                session_count: sessions.len(),
+                discovery_entries: state.discovery_store.entry_count(),
+                resource_entries: state.resource_store.entry_count(),
+            });
+            resp
+        }
+
+        Request::Stats => {
+            let mut resp = Response::ok();
+            resp.stats = Some(CacheStats {
+                discovery_entry_count: state.discovery_store.entry_count(),
+                discovery_max_capacity: state.discovery_store.policy().max_capacity().unwrap_or(0),
+                resource_entry_count: state.resource_store.entry_count(),
+                resource_max_capacity: state.resource_store.policy().max_capacity().unwrap_or(0),
+            });
+            resp
+        }
+
+        Request::Shutdown => {
+            state.shutdown.notify_one();
+            Response::ok()
+        }
+
+        Request::Clear { context } => {
+            match context {
+                Some(ctx) => {
+                    state.discovery_store.remove(&ctx).await;
+                    // Clear all resource entries for this context (prefix match)
+                    // moka doesn't support prefix delete, so we invalidate matching entries
+                    state.resource_store.invalidate_entries_if(move |key, _| {
+                        key.starts_with(&format!("{}:", ctx))
+                    }).ok();
+                }
+                None => {
+                    state.discovery_store.invalidate_all();
+                    state.resource_store.invalidate_all();
+                }
+            }
+            Response::ok()
+        }
+
+        Request::RegisterSession { pid, context, namespace } => {
+            let session_id = format!("{:x}", rand::random::<u64>());
+            let info = SessionInfo {
+                session_id: session_id.clone(),
+                pid,
+                context,
+                namespace,
+                connected_at: chrono::Utc::now().to_rfc3339(),
+            };
+            state.sessions.write().await.insert(session_id.clone(), info);
+            let mut resp = Response::ok();
+            resp.session_id = Some(session_id);
+            resp
+        }
+
+        Request::DeregisterSession { session_id } => {
+            state.sessions.write().await.remove(&session_id);
+            Response::ok()
+        }
+
+        Request::UpdateSession { session_id, context, namespace } => {
+            let mut sessions = state.sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.context = context;
+                session.namespace = namespace;
+            }
+            Response::ok()
+        }
+
+        Request::ListSessions => {
+            let sessions = state.sessions.read().await;
+            let mut resp = Response::ok();
+            resp.sessions = Some(sessions.values().cloned().collect());
+            resp
+        }
+
+        Request::ListWatchers => {
+            // Placeholder — watchers will be daemon-managed in a future phase
+            Response::ok()
+        }
+    }
 }
 
 async fn write_response(
@@ -307,50 +324,29 @@ async fn write_response(
 // Client
 // ---------------------------------------------------------------------------
 
+use tokio::io::BufWriter;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
 pub struct DaemonClient {
-    stream: Option<UnixStream>,
+    reader: BufReader<OwnedReadHalf>,
+    writer: BufWriter<OwnedWriteHalf>,
 }
 
 impl DaemonClient {
+    /// Connect to the daemon. Returns None if the daemon isn't running.
     pub async fn connect() -> Option<Self> {
         let path = socket_path();
-        match UnixStream::connect(&path).await {
-            Ok(stream) => Some(Self { stream: Some(stream) }),
-            Err(_) => None,
-        }
-    }
-
-    pub async fn connect_or_spawn() -> Option<Self> {
-        if let Some(client) = Self::connect().await {
-            return Some(client);
-        }
-
-        let exe = std::env::current_exe().ok()?;
-        let child = std::process::Command::new(&exe)
-            .arg("--daemon")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-
-        if child.is_err() {
-            debug!("Failed to spawn daemon");
-            return None;
-        }
-
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if let Some(client) = Self::connect().await {
-                return Some(client);
-            }
-        }
-        debug!("Daemon started but connection timed out");
-        None
+        let stream = UnixStream::connect(&path).await.ok()?;
+        let (read_half, write_half) = stream.into_split();
+        Some(Self {
+            reader: BufReader::new(read_half),
+            writer: BufWriter::new(write_half),
+        })
     }
 
     pub async fn get(&mut self, context: &str) -> Option<(Vec<String>, Vec<CachedCrd>)> {
-        let req = serde_json::json!({"op": "get", "context": context});
-        let resp = self.send_request(&req).await?;
+        let req = Request::Get { context: context.to_string() };
+        let resp = self.request(&req).await?;
         if resp.ok {
             resp.data.map(|d| (d.namespaces, d.crds))
         } else {
@@ -358,26 +354,10 @@ impl DaemonClient {
         }
     }
 
-    /// Send a raw JSON request and get the raw response. Used by CLI.
-    pub async fn send_raw(&mut self, req: &serde_json::Value) -> Option<serde_json::Value> {
-        let stream = self.stream.as_mut()?;
-        let mut buf = serde_json::to_string(req).ok()?;
-        buf.push('\n');
-        stream.write_all(buf.as_bytes()).await.ok()?;
-
-        let mut resp_buf = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            match stream.try_read(&mut byte) {
-                Ok(0) => return None,
-                Ok(1) => {
-                    if byte[0] == b'\n' { break; }
-                    resp_buf.push(byte[0]);
-                }
-                _ => { stream.readable().await.ok()?; }
-            }
-        }
-        serde_json::from_slice(&resp_buf).ok()
+    /// Send a typed `Request` and get a typed `Response`.
+    pub async fn request(&mut self, req: &Request) -> Option<Response> {
+        let line = self.send_and_read(req).await?;
+        serde_json::from_str(&line).ok()
     }
 
     pub async fn put(
@@ -386,13 +366,12 @@ impl DaemonClient {
         namespaces: &[String],
         crds: &[CachedCrd],
     ) -> bool {
-        let req = serde_json::json!({
-            "op": "put",
-            "context": context,
-            "namespaces": namespaces,
-            "crds": crds,
-        });
-        self.send_request(&req).await.map_or(false, |r| r.ok)
+        let req = Request::Put {
+            context: context.to_string(),
+            namespaces: namespaces.to_vec(),
+            crds: crds.to_vec(),
+        };
+        self.request(&req).await.map_or(false, |r| r.ok)
     }
 
     pub async fn get_resources(
@@ -401,18 +380,13 @@ impl DaemonClient {
         namespace: &str,
         resource_type: &str,
     ) -> Option<String> {
-        let req = serde_json::json!({
-            "op": "get_resources",
-            "context": context,
-            "namespace": namespace,
-            "resource_type": resource_type,
-        });
-        let resp = self.send_request(&req).await?;
-        if resp.ok {
-            resp.resource_data
-        } else {
-            None
-        }
+        let req = Request::GetResources {
+            context: context.to_string(),
+            namespace: namespace.to_string(),
+            resource_type: resource_type.to_string(),
+        };
+        let resp = self.request(&req).await?;
+        if resp.ok { resp.resource_data } else { None }
     }
 
     pub async fn put_resources(
@@ -422,38 +396,42 @@ impl DaemonClient {
         resource_type: &str,
         data: &str,
     ) -> bool {
-        let req = serde_json::json!({
-            "op": "put_resources",
-            "context": context,
-            "namespace": namespace,
-            "resource_type": resource_type,
-            "data": data,
-        });
-        self.send_request(&req).await.map_or(false, |r| r.ok)
+        let req = Request::PutResources {
+            context: context.to_string(),
+            namespace: namespace.to_string(),
+            resource_type: resource_type.to_string(),
+            data: data.to_string(),
+        };
+        self.request(&req).await.map_or(false, |r| r.ok)
     }
 
-    async fn send_request(&mut self, req: &serde_json::Value) -> Option<Response> {
-        let stream = self.stream.as_mut()?;
+    /// Core I/O: write a JSON request line, read a JSON response line.
+    /// Uses buffered I/O (not byte-at-a-time) and a 5-second timeout
+    /// to prevent hanging on a dead daemon.
+    async fn send_and_read(&mut self, req: &impl serde::Serialize) -> Option<String> {
+        use tokio::io::AsyncWriteExt as _;
+
         let mut buf = serde_json::to_string(req).ok()?;
         buf.push('\n');
-        stream.write_all(buf.as_bytes()).await.ok()?;
+        self.writer.write_all(buf.as_bytes()).await.ok()?;
+        self.writer.flush().await.ok()?;
 
-        let mut resp_buf = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            match stream.try_read(&mut byte) {
-                Ok(0) => return None,
-                Ok(1) => {
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                    resp_buf.push(byte[0]);
+        let mut resp_line = String::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.reader.read_line(&mut resp_line),
+        ).await;
+
+        match result {
+            Ok(Ok(0)) => None,          // EOF
+            Ok(Ok(_)) => {
+                if resp_line.ends_with('\n') {
+                    resp_line.pop();
                 }
-                _ => {
-                    stream.readable().await.ok()?;
-                }
+                Some(resp_line)
             }
+            Ok(Err(_)) => None,         // I/O error
+            Err(_) => None,             // timeout
         }
-        serde_json::from_slice(&resp_buf).ok()
     }
 }

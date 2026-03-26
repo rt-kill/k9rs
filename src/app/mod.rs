@@ -835,6 +835,45 @@ impl App {
         }
     }
 
+    // Delegate read-only operations to the currently active table
+    fn with_active_table_ref<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&dyn TableNav) -> R,
+    {
+        match self.resource_tab {
+            ResourceTab::Pods => f(&self.data.pods),
+            ResourceTab::Deployments => f(&self.data.deployments),
+            ResourceTab::Services => f(&self.data.services),
+            ResourceTab::Nodes => f(&self.data.nodes),
+            ResourceTab::Namespaces => f(&self.data.namespaces),
+            ResourceTab::ConfigMaps => f(&self.data.configmaps),
+            ResourceTab::Secrets => f(&self.data.secrets),
+            ResourceTab::StatefulSets => f(&self.data.statefulsets),
+            ResourceTab::DaemonSets => f(&self.data.daemonsets),
+            ResourceTab::Jobs => f(&self.data.jobs),
+            ResourceTab::CronJobs => f(&self.data.cronjobs),
+            ResourceTab::ReplicaSets => f(&self.data.replicasets),
+            ResourceTab::Ingresses => f(&self.data.ingresses),
+            ResourceTab::NetworkPolicies => f(&self.data.network_policies),
+            ResourceTab::ServiceAccounts => f(&self.data.service_accounts),
+            ResourceTab::StorageClasses => f(&self.data.storage_classes),
+            ResourceTab::Pvs => f(&self.data.pvs),
+            ResourceTab::Pvcs => f(&self.data.pvcs),
+            ResourceTab::Events => f(&self.data.events),
+            ResourceTab::Roles => f(&self.data.roles),
+            ResourceTab::ClusterRoles => f(&self.data.cluster_roles),
+            ResourceTab::RoleBindings => f(&self.data.role_bindings),
+            ResourceTab::ClusterRoleBindings => f(&self.data.cluster_role_bindings),
+            ResourceTab::Hpa => f(&self.data.hpa),
+            ResourceTab::Endpoints => f(&self.data.endpoints),
+            ResourceTab::LimitRanges => f(&self.data.limit_ranges),
+            ResourceTab::ResourceQuotas => f(&self.data.resource_quotas),
+            ResourceTab::Pdb => f(&self.data.pdb),
+            ResourceTab::Crds => f(&self.data.crds),
+            ResourceTab::DynamicResource => f(&self.data.dynamic_resources),
+        }
+    }
+
     pub fn select_next(&mut self) {
         if self.route == Route::Contexts {
             self.data.contexts.next();
@@ -943,41 +982,7 @@ impl App {
 
     /// Clear marks on the currently active table.
     pub fn clear_marks(&mut self) {
-        macro_rules! clear {
-            ($table:expr) => { $table.marked.clear() };
-        }
-        match self.resource_tab {
-            ResourceTab::Pods => clear!(self.data.pods),
-            ResourceTab::Deployments => clear!(self.data.deployments),
-            ResourceTab::Services => clear!(self.data.services),
-            ResourceTab::Nodes => clear!(self.data.nodes),
-            ResourceTab::Namespaces => clear!(self.data.namespaces),
-            ResourceTab::ConfigMaps => clear!(self.data.configmaps),
-            ResourceTab::Secrets => clear!(self.data.secrets),
-            ResourceTab::StatefulSets => clear!(self.data.statefulsets),
-            ResourceTab::DaemonSets => clear!(self.data.daemonsets),
-            ResourceTab::Jobs => clear!(self.data.jobs),
-            ResourceTab::CronJobs => clear!(self.data.cronjobs),
-            ResourceTab::ReplicaSets => clear!(self.data.replicasets),
-            ResourceTab::Ingresses => clear!(self.data.ingresses),
-            ResourceTab::NetworkPolicies => clear!(self.data.network_policies),
-            ResourceTab::ServiceAccounts => clear!(self.data.service_accounts),
-            ResourceTab::StorageClasses => clear!(self.data.storage_classes),
-            ResourceTab::Pvs => clear!(self.data.pvs),
-            ResourceTab::Pvcs => clear!(self.data.pvcs),
-            ResourceTab::Events => clear!(self.data.events),
-            ResourceTab::Roles => clear!(self.data.roles),
-            ResourceTab::ClusterRoles => clear!(self.data.cluster_roles),
-            ResourceTab::RoleBindings => clear!(self.data.role_bindings),
-            ResourceTab::ClusterRoleBindings => clear!(self.data.cluster_role_bindings),
-            ResourceTab::Hpa => clear!(self.data.hpa),
-            ResourceTab::Endpoints => clear!(self.data.endpoints),
-            ResourceTab::LimitRanges => clear!(self.data.limit_ranges),
-            ResourceTab::ResourceQuotas => clear!(self.data.resource_quotas),
-            ResourceTab::Pdb => clear!(self.data.pdb),
-            ResourceTab::Crds => clear!(self.data.crds),
-            ResourceTab::DynamicResource => clear!(self.data.dynamic_resources),
-        }
+        self.with_active_table(|t| t.nav_clear_marks());
     }
 
     /// Reset only the active table's data so the UI shows "Loading..." while
@@ -989,86 +994,13 @@ impl App {
     /// Sort the active resource table by the given column index.
     /// If already sorted by this column, toggles ascending/descending.
     pub fn sort_by(&mut self, col: usize) {
-        macro_rules! sort {
-            ($table:expr) => {{
-                $table.sort_by_column(col);
-            }};
-        }
-        match self.resource_tab {
-            ResourceTab::Pods => sort!(self.data.pods),
-            ResourceTab::Deployments => sort!(self.data.deployments),
-            ResourceTab::Services => sort!(self.data.services),
-            ResourceTab::Nodes => sort!(self.data.nodes),
-            ResourceTab::Namespaces => sort!(self.data.namespaces),
-            ResourceTab::ConfigMaps => sort!(self.data.configmaps),
-            ResourceTab::Secrets => sort!(self.data.secrets),
-            ResourceTab::StatefulSets => sort!(self.data.statefulsets),
-            ResourceTab::DaemonSets => sort!(self.data.daemonsets),
-            ResourceTab::Jobs => sort!(self.data.jobs),
-            ResourceTab::CronJobs => sort!(self.data.cronjobs),
-            ResourceTab::ReplicaSets => sort!(self.data.replicasets),
-            ResourceTab::Ingresses => sort!(self.data.ingresses),
-            ResourceTab::NetworkPolicies => sort!(self.data.network_policies),
-            ResourceTab::ServiceAccounts => sort!(self.data.service_accounts),
-            ResourceTab::StorageClasses => sort!(self.data.storage_classes),
-            ResourceTab::Pvs => sort!(self.data.pvs),
-            ResourceTab::Pvcs => sort!(self.data.pvcs),
-            ResourceTab::Events => sort!(self.data.events),
-            ResourceTab::Roles => sort!(self.data.roles),
-            ResourceTab::ClusterRoles => sort!(self.data.cluster_roles),
-            ResourceTab::RoleBindings => sort!(self.data.role_bindings),
-            ResourceTab::ClusterRoleBindings => sort!(self.data.cluster_role_bindings),
-            ResourceTab::Hpa => sort!(self.data.hpa),
-            ResourceTab::Endpoints => sort!(self.data.endpoints),
-            ResourceTab::LimitRanges => sort!(self.data.limit_ranges),
-            ResourceTab::ResourceQuotas => sort!(self.data.resource_quotas),
-            ResourceTab::Pdb => sort!(self.data.pdb),
-            ResourceTab::Crds => sort!(self.data.crds),
-            ResourceTab::DynamicResource => sort!(self.data.dynamic_resources),
-        }
+        self.with_active_table(|t| t.nav_sort_by(col));
     }
 
     /// Toggle the sort direction on the active table's current sort column.
     /// Re-sorts with the same column index, which toggles asc/desc.
     pub fn toggle_sort_direction(&mut self) {
-        macro_rules! resort {
-            ($table:expr) => {{
-                let col = $table.sort_column;
-                $table.sort_by_column(col);
-            }};
-        }
-        match self.resource_tab {
-            ResourceTab::Pods => resort!(self.data.pods),
-            ResourceTab::Deployments => resort!(self.data.deployments),
-            ResourceTab::Services => resort!(self.data.services),
-            ResourceTab::Nodes => resort!(self.data.nodes),
-            ResourceTab::Namespaces => resort!(self.data.namespaces),
-            ResourceTab::ConfigMaps => resort!(self.data.configmaps),
-            ResourceTab::Secrets => resort!(self.data.secrets),
-            ResourceTab::StatefulSets => resort!(self.data.statefulsets),
-            ResourceTab::DaemonSets => resort!(self.data.daemonsets),
-            ResourceTab::Jobs => resort!(self.data.jobs),
-            ResourceTab::CronJobs => resort!(self.data.cronjobs),
-            ResourceTab::ReplicaSets => resort!(self.data.replicasets),
-            ResourceTab::Ingresses => resort!(self.data.ingresses),
-            ResourceTab::NetworkPolicies => resort!(self.data.network_policies),
-            ResourceTab::ServiceAccounts => resort!(self.data.service_accounts),
-            ResourceTab::StorageClasses => resort!(self.data.storage_classes),
-            ResourceTab::Pvs => resort!(self.data.pvs),
-            ResourceTab::Pvcs => resort!(self.data.pvcs),
-            ResourceTab::Events => resort!(self.data.events),
-            ResourceTab::Roles => resort!(self.data.roles),
-            ResourceTab::ClusterRoles => resort!(self.data.cluster_roles),
-            ResourceTab::RoleBindings => resort!(self.data.role_bindings),
-            ResourceTab::ClusterRoleBindings => resort!(self.data.cluster_role_bindings),
-            ResourceTab::Hpa => resort!(self.data.hpa),
-            ResourceTab::Endpoints => resort!(self.data.endpoints),
-            ResourceTab::LimitRanges => resort!(self.data.limit_ranges),
-            ResourceTab::ResourceQuotas => resort!(self.data.resource_quotas),
-            ResourceTab::Pdb => resort!(self.data.pdb),
-            ResourceTab::Crds => resort!(self.data.crds),
-            ResourceTab::DynamicResource => resort!(self.data.dynamic_resources),
-        }
+        self.with_active_table(|t| t.nav_toggle_sort());
     }
 
     /// Advance tick counter, expire flash messages, etc.
@@ -1093,38 +1025,7 @@ impl App {
     /// Returns `true` if the currently-visible resource table has received data.
     /// When `false`, a loading animation is shown and needs continuous redraws.
     fn active_table_has_data(&self) -> bool {
-        match self.resource_tab {
-            ResourceTab::Pods => self.data.pods.has_data,
-            ResourceTab::Deployments => self.data.deployments.has_data,
-            ResourceTab::Services => self.data.services.has_data,
-            ResourceTab::Nodes => self.data.nodes.has_data,
-            ResourceTab::Namespaces => self.data.namespaces.has_data,
-            ResourceTab::ConfigMaps => self.data.configmaps.has_data,
-            ResourceTab::Secrets => self.data.secrets.has_data,
-            ResourceTab::StatefulSets => self.data.statefulsets.has_data,
-            ResourceTab::DaemonSets => self.data.daemonsets.has_data,
-            ResourceTab::Jobs => self.data.jobs.has_data,
-            ResourceTab::CronJobs => self.data.cronjobs.has_data,
-            ResourceTab::ReplicaSets => self.data.replicasets.has_data,
-            ResourceTab::Ingresses => self.data.ingresses.has_data,
-            ResourceTab::NetworkPolicies => self.data.network_policies.has_data,
-            ResourceTab::ServiceAccounts => self.data.service_accounts.has_data,
-            ResourceTab::StorageClasses => self.data.storage_classes.has_data,
-            ResourceTab::Pvs => self.data.pvs.has_data,
-            ResourceTab::Pvcs => self.data.pvcs.has_data,
-            ResourceTab::Events => self.data.events.has_data,
-            ResourceTab::Roles => self.data.roles.has_data,
-            ResourceTab::ClusterRoles => self.data.cluster_roles.has_data,
-            ResourceTab::RoleBindings => self.data.role_bindings.has_data,
-            ResourceTab::ClusterRoleBindings => self.data.cluster_role_bindings.has_data,
-            ResourceTab::Hpa => self.data.hpa.has_data,
-            ResourceTab::Endpoints => self.data.endpoints.has_data,
-            ResourceTab::LimitRanges => self.data.limit_ranges.has_data,
-            ResourceTab::ResourceQuotas => self.data.resource_quotas.has_data,
-            ResourceTab::Pdb => self.data.pdb.has_data,
-            ResourceTab::Crds => self.data.crds.has_data,
-            ResourceTab::DynamicResource => self.data.dynamic_resources.has_data,
-        }
+        self.with_active_table_ref(|t| t.nav_has_data())
     }
 
     /// All known resource command aliases.
@@ -1244,38 +1145,7 @@ impl App {
 
     /// Returns (filtered_count, total_count) for the currently active resource table.
     pub fn active_table_items_count(&self) -> (usize, usize) {
-        match self.resource_tab {
-            ResourceTab::Pods => (self.data.pods.len(), self.data.pods.total()),
-            ResourceTab::Deployments => (self.data.deployments.len(), self.data.deployments.total()),
-            ResourceTab::Services => (self.data.services.len(), self.data.services.total()),
-            ResourceTab::Nodes => (self.data.nodes.len(), self.data.nodes.total()),
-            ResourceTab::Namespaces => (self.data.namespaces.len(), self.data.namespaces.total()),
-            ResourceTab::ConfigMaps => (self.data.configmaps.len(), self.data.configmaps.total()),
-            ResourceTab::Secrets => (self.data.secrets.len(), self.data.secrets.total()),
-            ResourceTab::StatefulSets => (self.data.statefulsets.len(), self.data.statefulsets.total()),
-            ResourceTab::DaemonSets => (self.data.daemonsets.len(), self.data.daemonsets.total()),
-            ResourceTab::Jobs => (self.data.jobs.len(), self.data.jobs.total()),
-            ResourceTab::CronJobs => (self.data.cronjobs.len(), self.data.cronjobs.total()),
-            ResourceTab::ReplicaSets => (self.data.replicasets.len(), self.data.replicasets.total()),
-            ResourceTab::Ingresses => (self.data.ingresses.len(), self.data.ingresses.total()),
-            ResourceTab::NetworkPolicies => (self.data.network_policies.len(), self.data.network_policies.total()),
-            ResourceTab::ServiceAccounts => (self.data.service_accounts.len(), self.data.service_accounts.total()),
-            ResourceTab::StorageClasses => (self.data.storage_classes.len(), self.data.storage_classes.total()),
-            ResourceTab::Pvs => (self.data.pvs.len(), self.data.pvs.total()),
-            ResourceTab::Pvcs => (self.data.pvcs.len(), self.data.pvcs.total()),
-            ResourceTab::Events => (self.data.events.len(), self.data.events.total()),
-            ResourceTab::Roles => (self.data.roles.len(), self.data.roles.total()),
-            ResourceTab::ClusterRoles => (self.data.cluster_roles.len(), self.data.cluster_roles.total()),
-            ResourceTab::RoleBindings => (self.data.role_bindings.len(), self.data.role_bindings.total()),
-            ResourceTab::ClusterRoleBindings => (self.data.cluster_role_bindings.len(), self.data.cluster_role_bindings.total()),
-            ResourceTab::Hpa => (self.data.hpa.len(), self.data.hpa.total()),
-            ResourceTab::Endpoints => (self.data.endpoints.len(), self.data.endpoints.total()),
-            ResourceTab::LimitRanges => (self.data.limit_ranges.len(), self.data.limit_ranges.total()),
-            ResourceTab::ResourceQuotas => (self.data.resource_quotas.len(), self.data.resource_quotas.total()),
-            ResourceTab::Pdb => (self.data.pdb.len(), self.data.pdb.total()),
-            ResourceTab::Crds => (self.data.crds.len(), self.data.crds.total()),
-            ResourceTab::DynamicResource => (self.data.dynamic_resources.len(), self.data.dynamic_resources.total()),
-        }
+        self.with_active_table_ref(|t| t.nav_items_count())
     }
 
     /// Returns the active filter text for the currently active resource table.
@@ -1346,9 +1216,14 @@ trait TableNav {
     fn nav_clear_filter(&mut self);
     fn nav_reset(&mut self);
     fn nav_toggle_mark(&mut self);
+    fn nav_sort_by(&mut self, col: usize);
+    fn nav_toggle_sort(&mut self);
+    fn nav_has_data(&self) -> bool;
+    fn nav_items_count(&self) -> (usize, usize);
+    fn nav_clear_marks(&mut self);
 }
 
-impl<T: Clone> TableNav for StatefulTable<T> {
+impl<T: Clone + crate::kube::resources::KubeResource> TableNav for StatefulTable<T> {
     fn nav_next(&mut self) { self.next(); }
     fn nav_prev(&mut self) { self.previous(); }
     fn nav_page_up(&mut self) { self.page_up(); }
@@ -1368,6 +1243,14 @@ impl<T: Clone> TableNav for StatefulTable<T> {
             self.next(); // move to next row after marking (like k9s)
         }
     }
+    fn nav_sort_by(&mut self, col: usize) { self.sort_by_column(col); }
+    fn nav_toggle_sort(&mut self) {
+        let col = self.sort_column;
+        self.sort_by_column(col);
+    }
+    fn nav_has_data(&self) -> bool { self.has_data }
+    fn nav_items_count(&self) -> (usize, usize) { (self.len(), self.total()) }
+    fn nav_clear_marks(&mut self) { self.marked.clear(); }
 }
 
 // ---------------------------------------------------------------------------

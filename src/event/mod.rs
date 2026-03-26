@@ -3,7 +3,6 @@ pub mod handler;
 use std::collections::HashMap;
 
 use crate::app::FlashMessage;
-use crate::kube::cache::CachedCrd;
 use crate::kube::resources::{
     configmaps::KubeConfigMap,
     crds::{KubeCrd, DynamicKubeResource},
@@ -51,19 +50,19 @@ pub enum AppEvent {
         context: String,
         result: Result<::kube::Client, String>,
     },
-    /// Fresh cache data polled from the daemon (populated by another instance).
-    DaemonCacheUpdate {
-        namespaces: Vec<String>,
-        crds: Vec<CachedCrd>,
-    },
     /// Pod metrics from the metrics-server: HashMap<(namespace, pod_name), (cpu, mem)>.
     PodMetrics(HashMap<(String, String), (String, String)>),
     /// Node metrics from the metrics-server: HashMap<node_name, (cpu, mem)>.
     NodeMetrics(HashMap<String, (String, String)>),
     /// Cached resource data loaded from the daemon for instant tab display.
+    /// Includes the context and namespace it was fetched for, so stale data
+    /// from a pre-switch request is rejected if the user changed context/namespace
+    /// before the daemon response arrived.
     CachedResources {
         resource_type: String,
         data: String,
+        context: String,
+        namespace: String,
     },
 }
 

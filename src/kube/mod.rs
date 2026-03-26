@@ -1,5 +1,10 @@
+pub mod backend;
 pub mod cache;
 pub mod daemon;
+pub mod describe;
+pub mod metrics;
+pub mod ops;
+pub mod protocol;
 pub mod resources;
 pub mod watcher;
 
@@ -63,17 +68,6 @@ impl KubeClient {
         })
     }
 
-    /// Switches to a different kubeconfig context, replacing the internal client.
-    ///
-    /// Returns the new `Client` so the caller can restart watchers with it.
-    pub async fn switch_context(&mut self, context: &str) -> anyhow::Result<Client> {
-        let config = Self::config_for_context(context).await?;
-        let new_client = Client::try_from(config)?;
-        self.client = new_client.clone();
-        self.context = context.to_string();
-        Ok(new_client)
-    }
-
     /// Returns a reference to the underlying kube-rs Client.
     pub fn client(&self) -> &Client {
         &self.client
@@ -82,25 +76,6 @@ impl KubeClient {
     /// Returns the name of the currently active context.
     pub fn context(&self) -> &str {
         &self.context
-    }
-
-    /// Lists all available context names from the default kubeconfig.
-    pub async fn list_contexts() -> anyhow::Result<Vec<String>> {
-        let kubeconfig = Kubeconfig::read()?;
-        let names: Vec<String> = kubeconfig
-            .contexts
-            .iter()
-            .filter_map(|c| c.name.clone().into())
-            .collect();
-        Ok(names)
-    }
-
-    /// Returns the current-context name from the default kubeconfig.
-    pub async fn current_context() -> anyhow::Result<String> {
-        let kubeconfig = Kubeconfig::read()?;
-        kubeconfig
-            .current_context
-            .ok_or_else(|| anyhow::anyhow!("no current-context set in kubeconfig"))
     }
 
     /// Builds a `Config` from the default kubeconfig for the given context name.
@@ -167,61 +142,3 @@ impl KubeClient {
     }
 }
 
-/// Discovers all Custom Resource Definitions (CRDs) available in the cluster.
-///
-/// Returns a list of `(group, version, kind)` tuples for each discovered custom
-/// resource. This is basic infrastructure for future CRD support in the UI.
-pub async fn discover_crds(client: &Client) -> Vec<(String, String, String)> {
-    use kube::discovery::Discovery;
-
-    let discovery = match Discovery::new(client.clone()).run().await {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut crds = Vec::new();
-
-    for group in discovery.groups() {
-        // Skip core Kubernetes API groups — only collect custom resources.
-        let group_name = group.name();
-        if is_builtin_api_group(group_name) {
-            continue;
-        }
-
-        for (ar, _caps) in group.recommended_resources() {
-            crds.push((
-                ar.group.clone(),
-                ar.version.clone(),
-                ar.kind.clone(),
-            ));
-        }
-    }
-
-    crds
-}
-
-/// Returns true for well-known built-in Kubernetes API groups.
-fn is_builtin_api_group(group: &str) -> bool {
-    matches!(
-        group,
-        "" | "admissionregistration.k8s.io"
-            | "apiextensions.k8s.io"
-            | "apiregistration.k8s.io"
-            | "apps"
-            | "authentication.k8s.io"
-            | "authorization.k8s.io"
-            | "autoscaling"
-            | "batch"
-            | "certificates.k8s.io"
-            | "coordination.k8s.io"
-            | "discovery.k8s.io"
-            | "events.k8s.io"
-            | "flowcontrol.apiserver.k8s.io"
-            | "networking.k8s.io"
-            | "node.k8s.io"
-            | "policy"
-            | "rbac.authorization.k8s.io"
-            | "scheduling.k8s.io"
-            | "storage.k8s.io"
-    )
-}

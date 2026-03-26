@@ -1,10 +1,10 @@
 pub mod app;
+pub mod cli;
 pub mod event;
 pub mod kube;
 pub mod ui;
 pub mod util;
 
-use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -71,31 +71,25 @@ struct Cli {
     #[arg(short, long)]
     command: Option<String>,
 
-    /// Run as cache daemon (background process for shared cache)
-    #[arg(long, hide = true)]
-    daemon: bool,
+    /// Run without the cache daemon (local watchers, file cache only)
+    #[arg(long)]
+    no_daemon: bool,
 
-    /// Query the cache daemon: get <context>, put, ping, status, contexts
-    #[arg(long, value_name = "COMMAND")]
-    cache: Option<String>,
+    /// Read-only mode: disables all destructive actions (delete, edit, scale, restart, shell)
+    #[arg(long)]
+    readonly: bool,
+
+    #[command(subcommand)]
+    subcmd: Option<crate::cli::Command>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Daemon mode: run the cache daemon and exit
-    if cli.daemon {
-        if let Err(e) = crate::kube::daemon::run_daemon().await {
-            eprintln!("Daemon error: {}", e);
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-
-    // Cache CLI: query the daemon from the command line
-    if let Some(ref cache_cmd) = cli.cache {
-        return cache_cli(cache_cmd).await;
+    // Subcommand dispatch: daemon, ctl, get, contexts
+    if let Some(subcmd) = cli.subcmd {
+        return crate::cli::dispatch(subcmd).await;
     }
 
     // Setup logging
@@ -130,6 +124,9 @@ async fn main() -> Result<()> {
         contexts.clone(),
         namespace,
     );
+    if cli.readonly {
+        app.read_only = true;
+    }
 
     // Populate contexts table from the single kubeconfig read
     if let Some(ref kc) = kubeconfig {
@@ -155,27 +152,25 @@ async fn main() -> Result<()> {
         app.data.contexts.set_items(kube_contexts);
     }
 
-    // Load cached data for instant autocompletion of namespaces and CRDs.
-    // Try daemon first (shared across instances), fall back to file cache.
-    let mut daemon_client = crate::kube::daemon::DaemonClient::connect_or_spawn().await;
-    if let Some(ref mut dc) = daemon_client {
-        if let Some((namespaces, crds)) = dc.get(&current_context).await {
-            if !namespaces.is_empty() {
-                let ns_items = crate::kube::cache::cached_namespaces_to_domain(&namespaces);
-                app.data.namespaces.set_items(ns_items);
-            }
-            if !crds.is_empty() {
-                app.discovered_crds = crate::kube::cache::cached_crds_to_domain(&crds);
-            }
-        }
-    } else if let Some(cache) = crate::kube::cache::load_cache(&current_context) {
-        // Fallback to file cache if daemon unavailable
-        if !cache.namespaces.is_empty() {
-            let ns_items = crate::kube::cache::cached_namespaces_to_domain(&cache.namespaces);
+    // Connect to the cache daemon (or run in local mode with --no-daemon).
+    let startup_cache_key = crate::kube::cache::cache_key(&current_context, &app.cluster);
+    let mut data_backend = crate::kube::backend::DataBackend::connect(cli.no_daemon).await;
+    if !cli.no_daemon && !data_backend.is_daemon() {
+        eprintln!(
+            "Cache daemon is not running.\n\n\
+             Start it with:  k9rs daemon\n\
+             Or run without:  k9rs --no-daemon\n"
+        );
+        std::process::exit(1);
+    }
+    let session_id = data_backend.register_session(&current_context, &app.selected_ns).await;
+    if let Some((namespaces, crds)) = data_backend.get_discovery(&startup_cache_key).await {
+        if !namespaces.is_empty() {
+            let ns_items = crate::kube::cache::cached_namespaces_to_domain(&namespaces);
             app.data.namespaces.set_items(ns_items);
         }
-        if !cache.crds.is_empty() {
-            app.discovered_crds = crate::kube::cache::cached_crds_to_domain(&cache.crds);
+        if !crds.is_empty() {
+            app.discovered_crds = crate::kube::cache::cached_crds_to_domain(&crds);
         }
     }
 
@@ -281,32 +276,10 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Poll daemon for fresh data from other instances for the first 30 seconds.
-    // If another k9rs instance has already loaded namespaces/CRDs from the cluster
-    // and pushed them to the daemon, this lets us pick them up before our own
-    // watchers finish.
-    {
-        let poll_ctx = app.context.clone();
-        let poll_tx = event_tx.clone();
-        tokio::spawn(async move {
-            for _ in 0..15 {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                if let Some(mut dc) = crate::kube::daemon::DaemonClient::connect().await {
-                    if let Some((ns, crds)) = dc.get(&poll_ctx).await {
-                        let _ = poll_tx
-                            .send(AppEvent::DaemonCacheUpdate {
-                                namespaces: ns,
-                                crds,
-                            })
-                            .await;
-                    }
-                }
-            }
-        });
-    }
+
 
     // Spawn metrics polling task (fetches pod/node metrics every 30s)
-    let mut metrics_task: Option<JoinHandle<()>> = Some(spawn_metrics_poller(
+    let mut metrics_task: Option<JoinHandle<()>> = Some(crate::kube::metrics::spawn_metrics_poller(
         kube_client.client().clone(),
         event_tx.clone(),
     ));
@@ -385,7 +358,7 @@ async fn main() -> Result<()> {
                                     } else if cmd.starts_with("ctx ") || cmd.starts_with("context ") {
                                         let prefix_len = if cmd.starts_with("ctx ") { 4 } else { 8 };
                                         let ctx_name = cmd[prefix_len..].trim().to_string();
-                                        begin_context_switch(&mut app, &event_tx, &ctx_name);
+                                        begin_context_switch(&mut app, &event_tx, &ctx_name, &mut log_task);
                                     } else if cmd.starts_with("ns ") || cmd.starts_with("namespace ") {
                                         let prefix_len = if cmd.starts_with("ns ") { 3 } else { 10 };
                                         let ns = cmd[prefix_len..].trim().to_string();
@@ -521,7 +494,7 @@ async fn main() -> Result<()> {
                                         tokio::spawn(async move {
                                             use ::kube::api::{Api, DynamicObject, Patch, PatchParams};
                                             let result = async {
-                                                let (ar, scope) = resolve_api_resource(&kube_cl, &resource).await?;
+                                                let (ar, scope) = crate::kube::describe::resolve_api_resource(&kube_cl, &resource).await?;
                                                 let api: Api<DynamicObject> = if namespace.is_empty() || scope == "Cluster" {
                                                     Api::all_with(kube_cl.clone(), &ar)
                                                 } else {
@@ -592,11 +565,23 @@ async fn main() -> Result<()> {
                                             cmd.arg("port-forward").arg(&pn).arg(&ports);
                                             if !pod_ns.is_empty() { cmd.arg("-n").arg(&pod_ns); }
                                             if !context.is_empty() { cmd.arg("--context").arg(&context); }
-                                            match cmd.output().await {
-                                                Ok(_) => {
-                                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(
-                                                        format!("Port-forward ended for {}", pn)
-                                                    ))).await;
+                                            // Use spawn + wait instead of output() because
+                                            // kubectl port-forward runs indefinitely and
+                                            // output() buffers all stdout/stderr into memory.
+                                            match cmd.kill_on_drop(true).spawn() {
+                                                Ok(mut child) => {
+                                                    match child.wait().await {
+                                                        Ok(_) => {
+                                                            let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(
+                                                                format!("Port-forward ended for {}", pn)
+                                                            ))).await;
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(
+                                                                format!("Port-forward failed: {}", e)
+                                                            ))).await;
+                                                        }
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(
@@ -849,7 +834,7 @@ async fn main() -> Result<()> {
                     if let Some(h) = metrics_task.take() { h.abort(); }
                     app.pod_metrics.clear();
                     app.node_metrics.clear();
-                    metrics_task = Some(spawn_metrics_poller(
+                    metrics_task = Some(crate::kube::metrics::spawn_metrics_poller(
                         kube_client.client().clone(),
                         event_tx.clone(),
                     ));
@@ -871,7 +856,7 @@ async fn main() -> Result<()> {
                                 if let Some(h) = metrics_task.take() { h.abort(); }
                                 app.pod_metrics.clear();
                                 app.node_metrics.clear();
-                                metrics_task = Some(spawn_metrics_poller(
+                                metrics_task = Some(crate::kube::metrics::spawn_metrics_poller(
                                     kube_client.client().clone(),
                                     event_tx.clone(),
                                 ));
@@ -891,7 +876,7 @@ async fn main() -> Result<()> {
                         .map(|ns| ns.name.clone())
                         .collect();
                     let cached_crds = crate::kube::cache::domain_crds_to_cached(&app.discovered_crds);
-                    let ctx = app.context.clone();
+                    let ctx = crate::kube::cache::cache_key(&app.context, &app.cluster);
                     let cache = crate::kube::cache::build_cache(
                         &ctx,
                         &ns_names,
@@ -900,12 +885,16 @@ async fn main() -> Result<()> {
                     let ns_for_daemon = ns_names.clone();
                     let crds_for_daemon = cached_crds.clone();
                     tokio::spawn(async move {
-                        // Send to daemon (best-effort)
-                        if let Some(mut dc) = crate::kube::daemon::DaemonClient::connect().await {
-                            dc.put(&ctx, &ns_for_daemon, &crds_for_daemon).await;
+                        // Send to daemon — it handles disk persistence internally.
+                        // Fall back to direct disk save only if daemon is unavailable.
+                        let daemon_ok = if let Some(mut dc) = crate::kube::daemon::DaemonClient::connect().await {
+                            dc.put(&ctx, &ns_for_daemon, &crds_for_daemon).await
+                        } else {
+                            false
+                        };
+                        if !daemon_ok {
+                            crate::kube::cache::save_cache(&cache).await;
                         }
-                        // Also persist to disk as fallback
-                        crate::kube::cache::save_cache(&cache).await;
                     });
                 }
                 needs_redraw = true;
@@ -931,6 +920,9 @@ async fn main() -> Result<()> {
     }
 
     // Cleanup
+    if let Some(ref sid) = session_id {
+        data_backend.deregister_session(sid).await;
+    }
     if let Some(handle) = log_task.take() {
         handle.abort();
     }
@@ -1341,7 +1333,7 @@ async fn handle_action(
             do_switch_namespace(app, resource_watcher, &ns).await;
         }
         Action::SwitchContext(ctx) => {
-            begin_context_switch(app, event_tx, &ctx);
+            begin_context_switch(app, event_tx, &ctx, log_task);
         }
         Action::Refresh => {
             resource_watcher.switch_tab_force(app.resource_tab).await;
@@ -1387,7 +1379,7 @@ async fn handle_action(
                 }
             };
             if !text.is_empty() {
-                if try_copy_to_clipboard(&text) {
+                if crate::kube::ops::try_copy_to_clipboard(&text) {
                     app.flash = Some(crate::app::FlashMessage::info(label));
                 } else {
                     app.flash = Some(crate::app::FlashMessage::warn(
@@ -1413,7 +1405,7 @@ async fn handle_action(
                         let mut ok_count = 0usize;
                         let mut last_err = String::new();
                         for (resource, name, namespace) in &batch {
-                            match restart_via_patch(&kube_cl, resource, name, namespace).await {
+                            match crate::kube::ops::restart_via_patch(&kube_cl, resource, name, namespace).await {
                                 Ok(()) => { ok_count += 1; }
                                 Err(e) => { last_err = e.to_string(); }
                             }
@@ -1435,7 +1427,7 @@ async fn handle_action(
                         let kube_cl = client.clone();
                         let tx = event_tx.clone();
                         tokio::spawn(async move {
-                            match restart_via_patch(&kube_cl, &resource, &name, &namespace).await {
+                            match crate::kube::ops::restart_via_patch(&kube_cl, &resource, &name, &namespace).await {
                                 Ok(()) => {
                                     let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(
                                         format!("Restarted {}/{}", resource, name)
@@ -1523,7 +1515,7 @@ async fn handle_action(
                         let mut ok_count = 0usize;
                         let mut last_err = String::new();
                         for (resource_kind, res_name, res_ns) in &batch {
-                            match execute_delete(&client, resource_kind, res_name, res_ns).await {
+                            match crate::kube::ops::execute_delete(&client, resource_kind, res_name, res_ns).await {
                                 Ok(()) => { ok_count += 1; }
                                 Err(e) => { last_err = e.to_string(); }
                             }
@@ -1552,7 +1544,7 @@ async fn handle_action(
                         let res_name = name.clone();
                         let res_ns = namespace.clone();
                         tokio::spawn(async move {
-                            let result = execute_delete(&client, &resource_kind, &res_name, &res_ns).await;
+                            let result = crate::kube::ops::execute_delete(&client, &resource_kind, &res_name, &res_ns).await;
                             match result {
                                 Ok(()) => {
                                     let _ = event_tx
@@ -1772,7 +1764,7 @@ async fn handle_action(
             // Restart with new since/tail parameter
             if let Route::Logs { ref pod, ref container, ref namespace } = app.route {
                 let tail = if since.is_none() { Some(app.logs.tail_lines) } else { None };
-                let handle = spawn_log_stream(
+                let handle = crate::kube::ops::spawn_log_stream(
                     event_tx.clone(),
                     pod.clone(),
                     namespace.clone(),
@@ -1810,131 +1802,6 @@ async fn handle_action(
     ActionResult::None
 }
 
-/// Attempt to copy `text` to the system clipboard using available tools.
-/// Tries xclip, xsel, wl-copy, and pbcopy in order. Returns true on success.
-fn try_copy_to_clipboard(text: &str) -> bool {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let tools: &[(&str, &[&str])] = &[
-        ("xclip", &["-selection", "clipboard"]),
-        ("xsel", &["--clipboard", "--input"]),
-        ("wl-copy", &[]),
-        ("pbcopy", &[]),
-    ];
-
-    for (tool, args) in tools {
-        if let Ok(mut child) = Command::new(tool)
-            .args(*args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            if let Ok(status) = child.wait() {
-                if status.success() {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Execute a delete API call for the given resource.
-async fn execute_delete(
-    client: &::kube::Client,
-    resource: &str,
-    name: &str,
-    namespace: &str,
-) -> anyhow::Result<()> {
-    use k8s_openapi::api::{
-        apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet},
-        autoscaling::v1::HorizontalPodAutoscaler,
-        batch::v1::{CronJob, Job},
-        core::v1::{
-            ConfigMap, Endpoints, LimitRange, Namespace, Node, PersistentVolume,
-            PersistentVolumeClaim, Pod, ResourceQuota, Secret, Service, ServiceAccount,
-        },
-        networking::v1::{Ingress, NetworkPolicy},
-        policy::v1::PodDisruptionBudget,
-        rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding},
-        storage::v1::StorageClass,
-    };
-    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-    use ::kube::api::DeleteParams;
-    use ::kube::Api;
-
-    let dp = DeleteParams::default();
-
-    macro_rules! delete_namespaced {
-        ($k8s_type:ty) => {{
-            let api: Api<$k8s_type> = if namespace.is_empty() {
-                Api::default_namespaced(client.clone())
-            } else {
-                Api::namespaced(client.clone(), namespace)
-            };
-            api.delete(name, &dp).await?;
-        }};
-    }
-
-    macro_rules! delete_cluster {
-        ($k8s_type:ty) => {{
-            let api: Api<$k8s_type> = Api::all(client.clone());
-            api.delete(name, &dp).await?;
-        }};
-    }
-
-    match resource {
-        "pod" => delete_namespaced!(Pod),
-        "deployment" => delete_namespaced!(Deployment),
-        "service" => delete_namespaced!(Service),
-        "configmap" => delete_namespaced!(ConfigMap),
-        "secret" => delete_namespaced!(Secret),
-        "statefulset" => delete_namespaced!(StatefulSet),
-        "daemonset" => delete_namespaced!(DaemonSet),
-        "job" => delete_namespaced!(Job),
-        "cronjob" => delete_namespaced!(CronJob),
-        "replicaset" => delete_namespaced!(ReplicaSet),
-        "ingress" => delete_namespaced!(Ingress),
-        "networkpolicy" => delete_namespaced!(NetworkPolicy),
-        "serviceaccount" => delete_namespaced!(ServiceAccount),
-        "pvc" => delete_namespaced!(PersistentVolumeClaim),
-        "role" => delete_namespaced!(Role),
-        "rolebinding" => delete_namespaced!(RoleBinding),
-        "hpa" => delete_namespaced!(HorizontalPodAutoscaler),
-        "endpoints" => delete_namespaced!(Endpoints),
-        "limitrange" => delete_namespaced!(LimitRange),
-        "resourcequota" => delete_namespaced!(ResourceQuota),
-        "poddisruptionbudget" => delete_namespaced!(PodDisruptionBudget),
-        "namespace" => delete_cluster!(Namespace),
-        "node" => delete_cluster!(Node),
-        "pv" => delete_cluster!(PersistentVolume),
-        "storageclass" => delete_cluster!(StorageClass),
-        "clusterrole" => delete_cluster!(ClusterRole),
-        "clusterrolebinding" => delete_cluster!(ClusterRoleBinding),
-        "customresourcedefinition" => delete_cluster!(CustomResourceDefinition),
-        "event" => delete_namespaced!(k8s_openapi::api::core::v1::Event),
-        other => {
-            // Dynamic CRD resources: use kubectl delete as fallback since we
-            // can't construct typed Api objects for arbitrary CRDs.
-            let mut cmd = tokio::process::Command::new("kubectl");
-            cmd.arg("delete").arg(other).arg(name);
-            if !namespace.is_empty() { cmd.arg("-n").arg(namespace); }
-            let output = cmd.output().await?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(anyhow::anyhow!("{}", stderr.trim()));
-            }
-        }
-    }
-
-    Ok(())
-}
-
 async fn handle_enter(
     app: &mut App,
     resource_watcher: &mut crate::kube::watcher::ResourceWatcher,
@@ -1950,7 +1817,7 @@ async fn handle_enter(
     if matches!(app.route, Route::Contexts) {
         if let Some(ctx) = app.data.contexts.selected_item() {
             let ctx_name = ctx.name.clone();
-            begin_context_switch(app, event_tx, &ctx_name);
+            begin_context_switch(app, event_tx, &ctx_name, log_task);
         }
         return;
     }
@@ -1994,7 +1861,7 @@ async fn handle_enter(
         app.logs.streaming = true;
 
         let tail = if app.logs.since.is_none() { Some(app.logs.tail_lines) } else { None };
-        let handle = spawn_log_stream(
+        let handle = crate::kube::ops::spawn_log_stream(
             event_tx.clone(),
             pod_name,
             pod_ns,
@@ -2141,7 +2008,7 @@ fn handle_describe(
         let n = name;
         let ns = namespace;
         tokio::spawn(async move {
-            let content = fetch_describe_native(&kube_client, &res, &n, &ns, &context).await;
+            let content = crate::kube::describe::fetch_describe_native(&kube_client, &res, &n, &ns, &context).await;
             if gen_check.load(Ordering::SeqCst) == gen {
                 let _ = tx
                     .send(AppEvent::ResourceUpdate(ResourceUpdate::Describe(content)))
@@ -2149,568 +2016,6 @@ fn handle_describe(
             }
         });
     }
-}
-
-/// Fetch a describe-like view for a resource using the kube-rs client directly.
-/// Falls back to kubectl describe for resource types that fail native fetch.
-async fn fetch_describe_native(
-    client: &::kube::Client,
-    resource: &str,
-    name: &str,
-    namespace: &str,
-    context: &str,
-) -> String {
-    match fetch_describe_via_api(client, resource, name, namespace).await {
-        Ok(describe) => describe,
-        Err(_) => {
-            // Fallback to kubectl describe for complex/unknown resource types
-            fetch_describe_via_kubectl(resource, name, namespace, context).await
-        }
-    }
-}
-
-/// Build a describe-like output from a DynamicObject fetched via kube-rs.
-async fn fetch_describe_via_api(
-    client: &::kube::Client,
-    resource: &str,
-    name: &str,
-    namespace: &str,
-) -> anyhow::Result<String> {
-    use ::kube::api::{Api, DynamicObject};
-
-    let (ar, scope) = resolve_api_resource(client, resource).await?;
-
-    let api: Api<DynamicObject> = if namespace.is_empty() || scope == "Cluster" {
-        Api::all_with(client.clone(), &ar)
-    } else {
-        Api::namespaced_with(client.clone(), namespace, &ar)
-    };
-
-    let obj = api.get(name).await?;
-    let val = serde_json::to_value(&obj)?;
-    Ok(format_describe_output(&val, resource))
-}
-
-/// Format a JSON object into a human-readable describe-like output.
-fn format_describe_output(val: &serde_json::Value, resource: &str) -> String {
-    let mut out = String::new();
-
-    // Name
-    if let Some(name) = val.pointer("/metadata/name").and_then(|v| v.as_str()) {
-        out.push_str(&format!("Name:         {}\n", name));
-    }
-
-    // Namespace
-    if let Some(ns) = val.pointer("/metadata/namespace").and_then(|v| v.as_str()) {
-        out.push_str(&format!("Namespace:    {}\n", ns));
-    }
-
-    // Creation timestamp
-    if let Some(ts) = val.pointer("/metadata/creationTimestamp").and_then(|v| v.as_str()) {
-        out.push_str(&format!("Created:      {}\n", ts));
-    }
-
-    // Labels
-    if let Some(labels) = val.pointer("/metadata/labels").and_then(|v| v.as_object()) {
-        out.push_str("Labels:\n");
-        for (k, v) in labels {
-            out.push_str(&format!("              {}={}\n", k, v.as_str().unwrap_or("")));
-        }
-    } else {
-        out.push_str("Labels:       <none>\n");
-    }
-
-    // Annotations
-    if let Some(annotations) = val.pointer("/metadata/annotations").and_then(|v| v.as_object()) {
-        out.push_str("Annotations:\n");
-        for (k, v) in annotations {
-            out.push_str(&format!("              {}={}\n", k, v.as_str().unwrap_or("")));
-        }
-    } else {
-        out.push_str("Annotations:  <none>\n");
-    }
-
-    out.push('\n');
-
-    // Resource-specific sections
-    match resource {
-        "pod" => format_describe_pod(val, &mut out),
-        "deployment" => format_describe_deployment(val, &mut out),
-        "service" => format_describe_service(val, &mut out),
-        "node" => format_describe_node(val, &mut out),
-        _ => format_describe_generic(val, &mut out),
-    }
-
-    out
-}
-
-fn format_describe_pod(val: &serde_json::Value, out: &mut String) {
-    // Status
-    if let Some(phase) = val.pointer("/status/phase").and_then(|v| v.as_str()) {
-        out.push_str(&format!("Status:       {}\n", phase));
-    }
-
-    // Node
-    if let Some(node) = val.pointer("/spec/nodeName").and_then(|v| v.as_str()) {
-        out.push_str(&format!("Node:         {}\n", node));
-    }
-
-    // IP
-    if let Some(ip) = val.pointer("/status/podIP").and_then(|v| v.as_str()) {
-        out.push_str(&format!("IP:           {}\n", ip));
-    }
-
-    // Service Account
-    if let Some(sa) = val.pointer("/spec/serviceAccountName").and_then(|v| v.as_str()) {
-        out.push_str(&format!("Service Account: {}\n", sa));
-    }
-
-    out.push('\n');
-
-    // Containers
-    if let Some(containers) = val.pointer("/spec/containers").and_then(|v| v.as_array()) {
-        out.push_str("Containers:\n");
-        let statuses = val.pointer("/status/containerStatuses").and_then(|v| v.as_array());
-        for container in containers {
-            let cname = container.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let image = container.get("image").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("  {}:\n", cname));
-            out.push_str(&format!("    Image:    {}\n", image));
-
-            // Ports
-            if let Some(ports) = container.get("ports").and_then(|v| v.as_array()) {
-                let port_strs: Vec<String> = ports.iter().map(|p| {
-                    let port = p.get("containerPort").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let proto = p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
-                    format!("{}/{}", port, proto)
-                }).collect();
-                out.push_str(&format!("    Ports:    {}\n", port_strs.join(", ")));
-            }
-
-            // Resource requests/limits
-            if let Some(resources) = container.get("resources") {
-                if let Some(limits) = resources.get("limits").and_then(|v| v.as_object()) {
-                    let parts: Vec<String> = limits.iter().map(|(k, v)| {
-                        format!("{}={}", k, v.as_str().unwrap_or(""))
-                    }).collect();
-                    out.push_str(&format!("    Limits:   {}\n", parts.join(", ")));
-                }
-                if let Some(requests) = resources.get("requests").and_then(|v| v.as_object()) {
-                    let parts: Vec<String> = requests.iter().map(|(k, v)| {
-                        format!("{}={}", k, v.as_str().unwrap_or(""))
-                    }).collect();
-                    out.push_str(&format!("    Requests: {}\n", parts.join(", ")));
-                }
-            }
-
-            // Container status from status.containerStatuses
-            if let Some(statuses) = statuses {
-                if let Some(status) = statuses.iter().find(|s| {
-                    s.get("name").and_then(|v| v.as_str()) == Some(cname)
-                }) {
-                    let ready = status.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let restart_count = status.get("restartCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                    out.push_str(&format!("    Ready:    {}\n", ready));
-                    out.push_str(&format!("    Restarts: {}\n", restart_count));
-
-                    // State
-                    if let Some(state) = status.get("state").and_then(|v| v.as_object()) {
-                        for (state_name, state_detail) in state {
-                            out.push_str(&format!("    State:    {}\n", state_name));
-                            if let Some(detail_obj) = state_detail.as_object() {
-                                for (dk, dv) in detail_obj {
-                                    out.push_str(&format!("      {}:  {}\n", dk, format_json_value_inline(dv)));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Init containers
-    if let Some(init_containers) = val.pointer("/spec/initContainers").and_then(|v| v.as_array()) {
-        if !init_containers.is_empty() {
-            out.push_str("\nInit Containers:\n");
-            for container in init_containers {
-                let cname = container.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let image = container.get("image").and_then(|v| v.as_str()).unwrap_or("?");
-                out.push_str(&format!("  {}:\n", cname));
-                out.push_str(&format!("    Image:    {}\n", image));
-            }
-        }
-    }
-
-    out.push('\n');
-
-    // Conditions
-    if let Some(conditions) = val.pointer("/status/conditions").and_then(|v| v.as_array()) {
-        out.push_str("Conditions:\n");
-        out.push_str("  Type                 Status\n");
-        out.push_str("  ----                 ------\n");
-        for cond in conditions {
-            let ctype = cond.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-            let status = cond.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("  {:<22}{}\n", ctype, status));
-        }
-    }
-
-    // Volumes
-    if let Some(volumes) = val.pointer("/spec/volumes").and_then(|v| v.as_array()) {
-        out.push_str("\nVolumes:\n");
-        for vol in volumes {
-            let vname = vol.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("  {}:\n", vname));
-            // Show volume type (first non-name key)
-            if let Some(obj) = vol.as_object() {
-                for (k, v) in obj {
-                    if k != "name" {
-                        out.push_str(&format!("    Type: {}\n", k));
-                        if let Some(inner) = v.as_object() {
-                            for (ik, iv) in inner {
-                                out.push_str(&format!("    {}:  {}\n", ik, format_json_value_inline(iv)));
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Tolerations
-    if let Some(tolerations) = val.pointer("/spec/tolerations").and_then(|v| v.as_array()) {
-        out.push_str("\nTolerations:\n");
-        for tol in tolerations {
-            let key = tol.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            let op = tol.get("operator").and_then(|v| v.as_str()).unwrap_or("Equal");
-            let effect = tol.get("effect").and_then(|v| v.as_str()).unwrap_or("");
-            let value = tol.get("value").and_then(|v| v.as_str()).unwrap_or("");
-            if key.is_empty() {
-                out.push_str(&format!("  op={}\n", op));
-            } else if value.is_empty() {
-                out.push_str(&format!("  {}:{} for {}\n", key, op, if effect.is_empty() { "NoSchedule" } else { effect }));
-            } else {
-                out.push_str(&format!("  {}={}:{}\n", key, value, if effect.is_empty() { "NoSchedule" } else { effect }));
-            }
-        }
-    }
-}
-
-fn format_describe_deployment(val: &serde_json::Value, out: &mut String) {
-    // Replicas
-    if let Some(spec_replicas) = val.pointer("/spec/replicas").and_then(|v| v.as_u64()) {
-        let ready = val.pointer("/status/readyReplicas").and_then(|v| v.as_u64()).unwrap_or(0);
-        let available = val.pointer("/status/availableReplicas").and_then(|v| v.as_u64()).unwrap_or(0);
-        let updated = val.pointer("/status/updatedReplicas").and_then(|v| v.as_u64()).unwrap_or(0);
-        out.push_str(&format!("Replicas:     {} desired | {} updated | {} total | {} available | {} ready\n",
-            spec_replicas, updated, spec_replicas, available, ready));
-    }
-
-    // Strategy
-    if let Some(strategy) = val.pointer("/spec/strategy/type").and_then(|v| v.as_str()) {
-        out.push_str(&format!("Strategy:     {}\n", strategy));
-    }
-
-    // Selector
-    if let Some(match_labels) = val.pointer("/spec/selector/matchLabels").and_then(|v| v.as_object()) {
-        let parts: Vec<String> = match_labels.iter().map(|(k, v)| {
-            format!("{}={}", k, v.as_str().unwrap_or(""))
-        }).collect();
-        out.push_str(&format!("Selector:     {}\n", parts.join(",")));
-    }
-
-    out.push('\n');
-
-    // Pod template containers
-    if let Some(containers) = val.pointer("/spec/template/spec/containers").and_then(|v| v.as_array()) {
-        out.push_str("Pod Template:\n");
-        for container in containers {
-            let cname = container.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let image = container.get("image").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("  {}:\n", cname));
-            out.push_str(&format!("    Image:    {}\n", image));
-
-            if let Some(ports) = container.get("ports").and_then(|v| v.as_array()) {
-                let port_strs: Vec<String> = ports.iter().map(|p| {
-                    let port = p.get("containerPort").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let proto = p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
-                    format!("{}/{}", port, proto)
-                }).collect();
-                out.push_str(&format!("    Ports:    {}\n", port_strs.join(", ")));
-            }
-
-            if let Some(env) = container.get("env").and_then(|v| v.as_array()) {
-                out.push_str("    Environment:\n");
-                for e in env {
-                    let ename = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    if let Some(value) = e.get("value").and_then(|v| v.as_str()) {
-                        out.push_str(&format!("      {}={}\n", ename, value));
-                    } else if e.get("valueFrom").is_some() {
-                        out.push_str(&format!("      {} (from ref)\n", ename));
-                    }
-                }
-            }
-        }
-    }
-
-    out.push('\n');
-
-    // Conditions
-    if let Some(conditions) = val.pointer("/status/conditions").and_then(|v| v.as_array()) {
-        out.push_str("Conditions:\n");
-        out.push_str("  Type                 Status  Reason\n");
-        out.push_str("  ----                 ------  ------\n");
-        for cond in conditions {
-            let ctype = cond.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-            let status = cond.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-            let reason = cond.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            out.push_str(&format!("  {:<22}{:<8}{}\n", ctype, status, reason));
-        }
-    }
-}
-
-fn format_describe_service(val: &serde_json::Value, out: &mut String) {
-    if let Some(svc_type) = val.pointer("/spec/type").and_then(|v| v.as_str()) {
-        out.push_str(&format!("Type:         {}\n", svc_type));
-    }
-    if let Some(cluster_ip) = val.pointer("/spec/clusterIP").and_then(|v| v.as_str()) {
-        out.push_str(&format!("ClusterIP:    {}\n", cluster_ip));
-    }
-    if let Some(external_ips) = val.pointer("/spec/externalIPs").and_then(|v| v.as_array()) {
-        let ips: Vec<&str> = external_ips.iter().filter_map(|v| v.as_str()).collect();
-        out.push_str(&format!("ExternalIPs:  {}\n", ips.join(", ")));
-    }
-    if let Some(lb_ip) = val.pointer("/status/loadBalancer/ingress").and_then(|v| v.as_array()) {
-        let ips: Vec<String> = lb_ip.iter().map(|i| {
-            i.get("ip").or(i.get("hostname")).and_then(|v| v.as_str()).unwrap_or("").to_string()
-        }).collect();
-        if !ips.is_empty() {
-            out.push_str(&format!("LoadBalancer: {}\n", ips.join(", ")));
-        }
-    }
-
-    // Selector
-    if let Some(selector) = val.pointer("/spec/selector").and_then(|v| v.as_object()) {
-        let parts: Vec<String> = selector.iter().map(|(k, v)| {
-            format!("{}={}", k, v.as_str().unwrap_or(""))
-        }).collect();
-        out.push_str(&format!("Selector:     {}\n", parts.join(",")));
-    }
-
-    // Ports
-    if let Some(ports) = val.pointer("/spec/ports").and_then(|v| v.as_array()) {
-        out.push_str("\nPorts:\n");
-        for port in ports {
-            let pname = port.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
-            let p = port.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
-            let tp = port.get("targetPort");
-            let proto = port.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
-            let target_str = match tp {
-                Some(serde_json::Value::Number(n)) => n.to_string(),
-                Some(serde_json::Value::String(s)) => s.clone(),
-                _ => "?".to_string(),
-            };
-            out.push_str(&format!("  {} {}/{} -> {}\n", pname, p, proto, target_str));
-        }
-    }
-
-    // Session affinity
-    if let Some(affinity) = val.pointer("/spec/sessionAffinity").and_then(|v| v.as_str()) {
-        out.push_str(&format!("Session Affinity: {}\n", affinity));
-    }
-}
-
-fn format_describe_node(val: &serde_json::Value, out: &mut String) {
-    // Roles (from labels)
-    if let Some(labels) = val.pointer("/metadata/labels").and_then(|v| v.as_object()) {
-        let roles: Vec<&str> = labels.keys()
-            .filter_map(|k| k.strip_prefix("node-role.kubernetes.io/"))
-            .collect();
-        if !roles.is_empty() {
-            out.push_str(&format!("Roles:        {}\n", roles.join(", ")));
-        }
-    }
-
-    // Addresses
-    if let Some(addresses) = val.pointer("/status/addresses").and_then(|v| v.as_array()) {
-        out.push_str("Addresses:\n");
-        for addr in addresses {
-            let atype = addr.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-            let address = addr.get("address").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("  {}: {}\n", atype, address));
-        }
-    }
-
-    // Capacity
-    if let Some(capacity) = val.pointer("/status/capacity").and_then(|v| v.as_object()) {
-        out.push_str("Capacity:\n");
-        for (k, v) in capacity {
-            out.push_str(&format!("  {}: {}\n", k, v.as_str().unwrap_or("")));
-        }
-    }
-
-    // Allocatable
-    if let Some(allocatable) = val.pointer("/status/allocatable").and_then(|v| v.as_object()) {
-        out.push_str("Allocatable:\n");
-        for (k, v) in allocatable {
-            out.push_str(&format!("  {}: {}\n", k, v.as_str().unwrap_or("")));
-        }
-    }
-
-    // System info
-    if let Some(info) = val.pointer("/status/nodeInfo").and_then(|v| v.as_object()) {
-        out.push_str("\nSystem Info:\n");
-        let fields = ["kubeletVersion", "containerRuntimeVersion", "osImage", "architecture", "operatingSystem", "kernelVersion"];
-        for field in &fields {
-            if let Some(v) = info.get(*field).and_then(|v| v.as_str()) {
-                out.push_str(&format!("  {}: {}\n", field, v));
-            }
-        }
-    }
-
-    out.push('\n');
-
-    // Conditions
-    if let Some(conditions) = val.pointer("/status/conditions").and_then(|v| v.as_array()) {
-        out.push_str("Conditions:\n");
-        out.push_str("  Type                   Status  Reason                   Message\n");
-        out.push_str("  ----                   ------  ------                   -------\n");
-        for cond in conditions {
-            let ctype = cond.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-            let status = cond.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-            let reason = cond.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            let message = cond.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            out.push_str(&format!("  {:<24}{:<8}{:<25}{}\n", ctype, status, reason, message));
-        }
-    }
-}
-
-fn format_describe_generic(val: &serde_json::Value, out: &mut String) {
-    // For any resource type, print spec and status as indented key-value pairs
-    if let Some(spec) = val.get("spec") {
-        out.push_str("Spec:\n");
-        format_json_indented(spec, out, 2);
-        out.push('\n');
-    }
-
-    if let Some(status) = val.get("status") {
-        out.push_str("Status:\n");
-        format_json_indented(status, out, 2);
-        out.push('\n');
-    }
-}
-
-/// Format a JSON value as indented key-value lines (describe-style).
-fn format_json_indented(val: &serde_json::Value, out: &mut String, indent: usize) {
-    let prefix = " ".repeat(indent);
-    match val {
-        serde_json::Value::Object(map) => {
-            for (k, v) in map {
-                match v {
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        out.push_str(&format!("{}{}:\n", prefix, k));
-                        format_json_indented(v, out, indent + 2);
-                    }
-                    _ => {
-                        out.push_str(&format!("{}{}: {}\n", prefix, k, format_json_value_inline(v)));
-                    }
-                }
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for (i, item) in arr.iter().enumerate() {
-                match item {
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        out.push_str(&format!("{}- [{}]:\n", prefix, i));
-                        format_json_indented(item, out, indent + 2);
-                    }
-                    _ => {
-                        out.push_str(&format!("{}- {}\n", prefix, format_json_value_inline(item)));
-                    }
-                }
-            }
-        }
-        _ => {
-            out.push_str(&format!("{}{}\n", prefix, format_json_value_inline(val)));
-        }
-    }
-}
-
-/// Format a simple JSON value for inline display.
-fn format_json_value_inline(val: &serde_json::Value) -> String {
-    match val {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => "<none>".to_string(),
-        other => other.to_string(),
-    }
-}
-
-async fn fetch_describe_via_kubectl(
-    resource: &str,
-    name: &str,
-    namespace: &str,
-    context: &str,
-) -> String {
-    let mut cmd = tokio::process::Command::new("kubectl");
-    cmd.arg("describe").arg(resource).arg(name);
-    if !context.is_empty() {
-        cmd.arg("--context").arg(context);
-    }
-    if !namespace.is_empty() {
-        cmd.arg("-n").arg(namespace);
-    }
-    match cmd.output().await {
-        Ok(output) => {
-            if output.status.success() {
-                let raw = String::from_utf8_lossy(&output.stdout).to_string();
-                crate::util::strip_ansi(&raw)
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                format!("Error running kubectl describe:\n{}", stderr)
-            }
-        }
-        Err(e) => format!("Failed to run kubectl: {}", e),
-    }
-}
-
-/// Perform a rollout restart by patching the pod template annotation with the
-/// current timestamp. This is exactly what `kubectl rollout restart` does under
-/// the hood, but avoids spawning a subprocess (reuses the existing kube-rs
-/// client and TLS connection).
-async fn restart_via_patch(
-    client: &::kube::Client,
-    resource: &str,
-    name: &str,
-    namespace: &str,
-) -> anyhow::Result<()> {
-    use ::kube::api::{Api, DynamicObject, Patch, PatchParams};
-
-    let (ar, scope) = resolve_api_resource(client, resource).await?;
-
-    let api: Api<DynamicObject> = if namespace.is_empty() || scope == "Cluster" {
-        Api::all_with(client.clone(), &ar)
-    } else {
-        Api::namespaced_with(client.clone(), namespace, &ar)
-    };
-
-    let patch = serde_json::json!({
-        "spec": {
-            "template": {
-                "metadata": {
-                    "annotations": {
-                        "kubectl.kubernetes.io/restartedAt": chrono::Utc::now().to_rfc3339()
-                    }
-                }
-            }
-        }
-    });
-
-    api.patch(name, &PatchParams::apply("k9rs"), &Patch::Merge(&patch)).await?;
-    Ok(())
 }
 
 fn handle_yaml(
@@ -2763,7 +2068,7 @@ fn handle_yaml(
         let ns = namespace;
         let context = app.context.clone();
         tokio::spawn(async move {
-            let content = fetch_yaml_native(&kube_client, &res, &n, &ns, &context).await;
+            let content = crate::kube::describe::fetch_yaml_native(&kube_client, &res, &n, &ns, &context).await;
             if gen_check.load(Ordering::SeqCst) == gen {
                 let _ = tx
                     .send(AppEvent::ResourceUpdate(ResourceUpdate::Yaml(content)))
@@ -2773,248 +2078,7 @@ fn handle_yaml(
     }
 }
 
-/// Fetch YAML for a resource using the kube-rs client directly.
-/// Falls back to kubectl for complex resource types.
-async fn fetch_yaml_native(
-    client: &::kube::Client,
-    resource: &str,
-    name: &str,
-    namespace: &str,
-    context: &str,
-) -> String {
-    // Try native kube-rs fetch first
-    match fetch_yaml_via_discovery(client, resource, name, namespace).await {
-        Ok(yaml) => yaml,
-        Err(_) => {
-            // Fallback to kubectl for complex/unknown resource types
-            fetch_yaml_via_kubectl(resource, name, namespace, context).await
-        }
-    }
-}
 
-async fn fetch_yaml_via_discovery(
-    client: &::kube::Client,
-    resource: &str,
-    name: &str,
-    namespace: &str,
-) -> anyhow::Result<String> {
-    use ::kube::api::{Api, DynamicObject};
-
-    // Map common resource type strings to their API group/version/plural
-    let (ar, scope) = resolve_api_resource(client, resource).await?;
-
-    let api: Api<DynamicObject> = if namespace.is_empty() || scope == "Cluster" {
-        Api::all_with(client.clone(), &ar)
-    } else {
-        Api::namespaced_with(client.clone(), namespace, &ar)
-    };
-
-    let obj = api.get(name).await?;
-    let yaml = serde_yaml::to_string(&obj)?;
-    Ok(yaml)
-}
-
-/// Resolve a resource type string (e.g. "pod", "deployment", "service") to an ApiResource.
-async fn resolve_api_resource(
-    client: &::kube::Client,
-    resource: &str,
-) -> anyhow::Result<(::kube::api::ApiResource, String)> {
-    use ::kube::api::ApiResource;
-    use ::kube::discovery::{self, Scope};
-
-    // Common built-in resources — avoid discovery roundtrip
-    let (group, version, kind, plural, scope) = match resource {
-        "pod" => ("", "v1", "Pod", "pods", "Namespaced"),
-        "deployment" => ("apps", "v1", "Deployment", "deployments", "Namespaced"),
-        "service" => ("", "v1", "Service", "services", "Namespaced"),
-        "configmap" => ("", "v1", "ConfigMap", "configmaps", "Namespaced"),
-        "secret" => ("", "v1", "Secret", "secrets", "Namespaced"),
-        "statefulset" => ("apps", "v1", "StatefulSet", "statefulsets", "Namespaced"),
-        "daemonset" => ("apps", "v1", "DaemonSet", "daemonsets", "Namespaced"),
-        "job" => ("batch", "v1", "Job", "jobs", "Namespaced"),
-        "cronjob" => ("batch", "v1", "CronJob", "cronjobs", "Namespaced"),
-        "replicaset" => ("apps", "v1", "ReplicaSet", "replicasets", "Namespaced"),
-        "ingress" => ("networking.k8s.io", "v1", "Ingress", "ingresses", "Namespaced"),
-        "networkpolicy" => ("networking.k8s.io", "v1", "NetworkPolicy", "networkpolicies", "Namespaced"),
-        "serviceaccount" => ("", "v1", "ServiceAccount", "serviceaccounts", "Namespaced"),
-        "namespace" => ("", "v1", "Namespace", "namespaces", "Cluster"),
-        "node" => ("", "v1", "Node", "nodes", "Cluster"),
-        "pv" => ("", "v1", "PersistentVolume", "persistentvolumes", "Cluster"),
-        "pvc" => ("", "v1", "PersistentVolumeClaim", "persistentvolumeclaims", "Namespaced"),
-        "storageclass" => ("storage.k8s.io", "v1", "StorageClass", "storageclasses", "Cluster"),
-        "role" => ("rbac.authorization.k8s.io", "v1", "Role", "roles", "Namespaced"),
-        "clusterrole" => ("rbac.authorization.k8s.io", "v1", "ClusterRole", "clusterroles", "Cluster"),
-        "rolebinding" => ("rbac.authorization.k8s.io", "v1", "RoleBinding", "rolebindings", "Namespaced"),
-        "clusterrolebinding" => ("rbac.authorization.k8s.io", "v1", "ClusterRoleBinding", "clusterrolebindings", "Cluster"),
-        "hpa" => ("autoscaling", "v1", "HorizontalPodAutoscaler", "horizontalpodautoscalers", "Namespaced"),
-        "endpoints" => ("", "v1", "Endpoints", "endpoints", "Namespaced"),
-        "limitrange" => ("", "v1", "LimitRange", "limitranges", "Namespaced"),
-        "resourcequota" => ("", "v1", "ResourceQuota", "resourcequotas", "Namespaced"),
-        "poddisruptionbudget" => ("policy", "v1", "PodDisruptionBudget", "poddisruptionbudgets", "Namespaced"),
-        "event" => ("", "v1", "Event", "events", "Namespaced"),
-        "customresourcedefinition" => ("apiextensions.k8s.io", "v1", "CustomResourceDefinition", "customresourcedefinitions", "Cluster"),
-        _ => {
-            // CRD or unknown — resource string is already "plural.group" format
-            // e.g. "clickhouseinstallations.clickhouse.altinity.com"
-            if resource.contains('.') {
-                let parts: Vec<&str> = resource.splitn(2, '.').collect();
-                let plural = parts[0];
-                let group = parts.get(1).unwrap_or(&"");
-                // Use discovery to find the version
-                let discovery = discovery::Discovery::new(client.clone()).run().await?;
-                for api_group in discovery.groups() {
-                    for (ar, caps) in api_group.recommended_resources() {
-                        if ar.plural == plural && ar.group == *group {
-                            let scope = if caps.scope == Scope::Cluster { "Cluster" } else { "Namespaced" };
-                            return Ok((ar, scope.to_string()));
-                        }
-                    }
-                }
-                return Err(anyhow::anyhow!("Resource not found: {}", resource));
-            }
-            return Err(anyhow::anyhow!("Unknown resource type: {}", resource));
-        }
-    };
-
-    let gvk = ::kube::api::GroupVersionKind::gvk(group, version, kind);
-    let ar = ApiResource::from_gvk_with_plural(&gvk, plural);
-    Ok((ar, scope.to_string()))
-}
-
-async fn fetch_yaml_via_kubectl(
-    resource: &str,
-    name: &str,
-    namespace: &str,
-    context: &str,
-) -> String {
-    let mut cmd = tokio::process::Command::new("kubectl");
-    cmd.arg("get").arg(resource).arg(name).arg("-o").arg("yaml");
-    if !context.is_empty() {
-        cmd.arg("--context").arg(context);
-    }
-    if !namespace.is_empty() {
-        cmd.arg("-n").arg(namespace);
-    }
-    match cmd.output().await {
-        Ok(output) => {
-            if output.status.success() {
-                String::from_utf8_lossy(&output.stdout).to_string()
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                format!("Error fetching YAML:\n{}", stderr)
-            }
-        }
-        Err(e) => format!("Failed to run kubectl: {}", e),
-    }
-}
-
-
-/// Spawn a kubectl logs streaming task, returning a `JoinHandle` that can be
-/// cancelled to stop the stream.  This centralises the command-building logic
-/// that was previously duplicated across four call-sites.
-fn spawn_log_stream(
-    tx: mpsc::Sender<AppEvent>,
-    target: String,
-    namespace: String,
-    container: String,
-    context: String,
-    follow: bool,
-    tail: Option<u64>,
-    since: Option<String>,
-    previous: bool,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        use tokio::process::Command;
-
-        let mut cmd = Command::new("kubectl");
-        cmd.arg("logs");
-
-        if follow {
-            cmd.arg("-f");
-        }
-        if previous {
-            cmd.arg("--previous");
-        }
-
-        cmd.arg(&target);
-
-        if !namespace.is_empty() {
-            cmd.arg("-n").arg(&namespace);
-        }
-
-        if !container.is_empty() && container != "all" {
-            cmd.arg("-c").arg(&container);
-        } else if container == "all" {
-            cmd.arg("--all-containers=true");
-        }
-
-        if let Some(ref s) = since {
-            cmd.arg(format!("--since={}", s));
-        } else if let Some(t) = tail {
-            cmd.arg("--tail").arg(t.to_string());
-        }
-
-        if !context.is_empty() {
-            cmd.arg("--context").arg(&context);
-        }
-
-        cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        let end_label = if previous {
-            "--- Previous logs ended ---"
-        } else {
-            "--- Stream ended ---"
-        };
-
-        match cmd.spawn() {
-            Ok(mut child) => {
-                // Read stderr in a separate task so errors appear in the UI
-                if let Some(stderr) = child.stderr.take() {
-                    let stderr_tx = tx.clone();
-                    tokio::spawn(async move {
-                        let reader = BufReader::new(stderr);
-                        let mut lines = reader.lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            let clean = crate::util::strip_ansi(&line);
-                            let _ = stderr_tx
-                                .send(AppEvent::ResourceUpdate(ResourceUpdate::LogLine(
-                                    format!("[stderr] {}", clean),
-                                )))
-                                .await;
-                        }
-                    });
-                }
-                if let Some(stdout) = child.stdout.take() {
-                    let reader = BufReader::new(stdout);
-                    let mut lines = reader.lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        let clean = crate::util::strip_ansi(&line);
-                        if tx
-                            .send(AppEvent::ResourceUpdate(ResourceUpdate::LogLine(clean)))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-                let _ = tx.send(AppEvent::ResourceUpdate(ResourceUpdate::LogLine(
-                    end_label.to_string()
-                ))).await;
-                let _ = child.kill().await;
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(AppEvent::ResourceUpdate(ResourceUpdate::LogLine(
-                        format!("Failed to start kubectl logs: {}", e),
-                    )))
-                    .await;
-            }
-        }
-    })
-}
 
 fn handle_logs(
     app: &mut App,
@@ -3095,7 +2159,7 @@ fn handle_logs(
     app.logs.streaming = true;
 
     let tail = if app.logs.since.is_none() { Some(app.logs.tail_lines) } else { None };
-    let handle = spawn_log_stream(
+    let handle = crate::kube::ops::spawn_log_stream(
         event_tx.clone(),
         log_target,
         namespace,
@@ -3156,7 +2220,7 @@ fn handle_previous_logs(
 
     app.logs.streaming = true;
 
-    let handle = spawn_log_stream(
+    let handle = crate::kube::ops::spawn_log_stream(
         event_tx.clone(),
         log_target,
         namespace,
@@ -3368,16 +2432,19 @@ fn get_marked_resource_infos(app: &App) -> Vec<(String, String, String)> {
 /// Try loading cached resource data from the daemon for instant tab display.
 /// Spawns in background; if data arrives it's sent as a CachedResources event.
 fn preload_cached_resources(app: &App, tab: ResourceTab, event_tx: &mpsc::Sender<AppEvent>) {
+    let cache_ctx = crate::kube::cache::cache_key(&app.context, &app.cluster);
     let ctx = app.context.clone();
     let ns = app.selected_ns.clone();
     let rt = tab.label().to_string();
     let tx = event_tx.clone();
     tokio::spawn(async move {
         if let Some(mut dc) = crate::kube::daemon::DaemonClient::connect().await {
-            if let Some(json) = dc.get_resources(&ctx, &ns, &rt).await {
+            if let Some(json) = dc.get_resources(&cache_ctx, &ns, &rt).await {
                 let _ = tx.send(AppEvent::CachedResources {
                     resource_type: rt,
                     data: json,
+                    context: ctx.clone(),
+                    namespace: ns.clone(),
                 }).await;
             }
         }
@@ -3421,23 +2488,14 @@ fn apply_event(app: &mut App, event: AppEvent) -> CacheUpdateFlags {
             app.apply_node_metrics();
             CacheUpdateFlags::default()
         }
-        // Daemon polling: only apply if the daemon has MORE data than we currently
-        // have (i.e. another instance loaded it). Once our own watchers return
-        // richer data, the daemon data stops being applied.
-        AppEvent::DaemonCacheUpdate { namespaces, crds } => {
-            if namespaces.len() > app.data.namespaces.items.len() && !namespaces.is_empty() {
-                let ns_items = crate::kube::cache::cached_namespaces_to_domain(&namespaces);
-                app.data.namespaces.set_items(ns_items);
-            }
-            if crds.len() > app.discovered_crds.len() && !crds.is_empty() {
-                app.discovered_crds = crate::kube::cache::cached_crds_to_domain(&crds);
-            }
-            CacheUpdateFlags::default()
-        }
         // Cached resource data from daemon — only apply if table is currently empty
         // (don't overwrite live watcher data that may have arrived first).
-        AppEvent::CachedResources { resource_type, data } => {
-            apply_cached_resources(app, &resource_type, &data);
+        // Also reject stale data from a pre-switch request if the user changed
+        // context or namespace before the daemon response arrived.
+        AppEvent::CachedResources { resource_type, data, context, namespace } => {
+            if context == app.context && namespace == app.selected_ns {
+                apply_cached_resources(app, &resource_type, &data);
+            }
             CacheUpdateFlags::default()
         }
     }
@@ -3450,7 +2508,7 @@ macro_rules! cache_resource_update {
             let json_result = serde_json::to_string(&$items);
             match json_result {
                 Ok(json) => {
-                    let ctx = $app.context.clone();
+                    let ctx = crate::kube::cache::cache_key(&$app.context, &$app.cluster);
                     let ns = $app.selected_ns.clone();
                     let rt = $resource_type.to_string();
                     tokio::spawn(async move {
@@ -3530,9 +2588,11 @@ fn apply_resource_update(app: &mut App, update: ResourceUpdate) -> CacheUpdateFl
         ResourceUpdate::ResourceQuotas(items) => app.data.resource_quotas.set_items_filtered(items),
         ResourceUpdate::Pdb(items) => app.data.pdb.set_items_filtered(items),
         ResourceUpdate::Crds(items) => {
-            // Also update the discovered CRDs list for dynamic browsing
-            app.discovered_crds = items.clone();
-            app.data.crds.set_items_filtered(items);
+            // Clone for the table; move the original into discovered_crds
+            // to avoid cloning the larger Vec twice.
+            let for_table = items.clone();
+            app.discovered_crds = items;
+            app.data.crds.set_items_filtered(for_table);
             flags.crds = true;
         }
         ResourceUpdate::DynamicResources(items) => app.data.dynamic_resources.set_items_filtered(items),
@@ -3601,9 +2661,20 @@ fn begin_context_switch(
     app: &mut App,
     event_tx: &mpsc::Sender<AppEvent>,
     ctx_name: &str,
+    log_task: &mut Option<JoinHandle<()>>,
 ) {
-    // Immediate: clear data and show feedback — keeps TUI responsive
+    // Cancel any active log stream — it belongs to the old context
+    if let Some(handle) = log_task.take() {
+        handle.abort();
+        app.logs.streaming = false;
+    }
+    // Immediate: clear data and show feedback — keeps TUI responsive.
+    // Set both context AND cluster atomically so cache_resource_update!
+    // computes the correct cache key during the transition window.
     app.context = ctx_name.to_string();
+    let (cluster, user) = crate::kube::KubeClient::context_info(ctx_name);
+    app.cluster = cluster;
+    app.user = user;
     app.clear_data();
     app.kubectl_cache.clear();
     app.discovered_crds.clear();
@@ -3638,6 +2709,10 @@ async fn apply_context_switch_result(
     ctx_name: &str,
     result: Result<::kube::Client, String>,
 ) {
+    // Discard stale result if user already switched to a different context
+    if ctx_name != app.context {
+        return;
+    }
     match result {
         Ok(new_client) => {
             kube_client.set_client(new_client.clone(), ctx_name);
@@ -3670,6 +2745,13 @@ async fn apply_context_switch_result(
             )));
         }
         Err(e) => {
+            // Restore context/cluster to match the still-running kube_client,
+            // so the app state is consistent with the actual active client.
+            let active_ctx = kube_client.context().to_string();
+            let (cluster, user) = crate::kube::KubeClient::context_info(&active_ctx);
+            app.context = active_ctx;
+            app.cluster = cluster;
+            app.user = user;
             app.flash = Some(crate::app::FlashMessage::error(format!(
                 "Context switch failed: {}",
                 e
@@ -3799,259 +2881,4 @@ fn parse_resource_command(cmd: &str) -> Option<ResourceTab> {
     }
 }
 
-/// Spawns a background task that periodically fetches pod and node metrics
-/// from the Kubernetes metrics-server API (metrics.k8s.io/v1beta1).
-/// Sends `AppEvent::PodMetrics` and `AppEvent::NodeMetrics` every 30 seconds.
-fn spawn_metrics_poller(
-    client: ::kube::Client,
-    tx: mpsc::Sender<AppEvent>,
-) -> JoinHandle<()> {
-    use ::kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams};
-    use ::kube::Api;
 
-    tokio::spawn(async move {
-        // Small initial delay to let core watchers get data first
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        loop {
-            // Fetch pod metrics
-            let pod_ar = ApiResource::from_gvk_with_plural(
-                &GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics"),
-                "pods",
-            );
-            let pod_api: Api<DynamicObject> = Api::all_with(client.clone(), &pod_ar);
-            if let Ok(list) = pod_api.list(&ListParams::default()).await {
-                let mut metrics: HashMap<(String, String), (String, String)> = HashMap::new();
-                for item in &list.items {
-                    let ns = item.metadata.namespace.clone().unwrap_or_default();
-                    let name = item.metadata.name.clone().unwrap_or_default();
-                    let (cpu, mem) = parse_pod_metrics_usage(&item.data);
-                    metrics.insert((ns, name), (cpu, mem));
-                }
-                let _ = tx.send(AppEvent::PodMetrics(metrics)).await;
-            }
-
-            // Fetch node metrics
-            let node_ar = ApiResource::from_gvk_with_plural(
-                &GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "NodeMetrics"),
-                "nodes",
-            );
-            let node_api: Api<DynamicObject> = Api::all_with(client.clone(), &node_ar);
-            if let Ok(list) = node_api.list(&ListParams::default()).await {
-                let mut metrics: HashMap<String, (String, String)> = HashMap::new();
-                for item in &list.items {
-                    let name = item.metadata.name.clone().unwrap_or_default();
-                    let (cpu, mem) = parse_node_metrics_usage(&item.data);
-                    metrics.insert(name, (cpu, mem));
-                }
-                let _ = tx.send(AppEvent::NodeMetrics(metrics)).await;
-            }
-
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        }
-    })
-}
-
-/// Parse the `usage` field from a PodMetrics DynamicObject.
-/// PodMetrics has `containers: [{name, usage: {cpu, memory}}]`.
-/// Sums CPU and memory across all containers.
-fn parse_pod_metrics_usage(data: &serde_json::Value) -> (String, String) {
-    let containers = match data.get("containers").and_then(|c| c.as_array()) {
-        Some(c) => c,
-        None => return ("n/a".to_string(), "n/a".to_string()),
-    };
-
-    let mut total_cpu_nano: u64 = 0;
-    let mut total_mem_bytes: u64 = 0;
-
-    for container in containers {
-        if let Some(usage) = container.get("usage") {
-            if let Some(cpu_str) = usage.get("cpu").and_then(|v| v.as_str()) {
-                total_cpu_nano += parse_cpu_to_nano(cpu_str);
-            }
-            if let Some(mem_str) = usage.get("memory").and_then(|v| v.as_str()) {
-                total_mem_bytes += parse_mem_to_bytes(mem_str);
-            }
-        }
-    }
-
-    let cpu = crate::util::format_cpu(&format!("{}n", total_cpu_nano));
-    let mem = crate::util::format_mem(&total_mem_bytes.to_string());
-    (cpu, mem)
-}
-
-/// Parse the `usage` field from a NodeMetrics DynamicObject.
-/// NodeMetrics has `usage: {cpu, memory}` directly.
-fn parse_node_metrics_usage(data: &serde_json::Value) -> (String, String) {
-    let usage = match data.get("usage") {
-        Some(u) => u,
-        None => return ("n/a".to_string(), "n/a".to_string()),
-    };
-
-    let cpu = usage
-        .get("cpu")
-        .and_then(|v| v.as_str())
-        .map(|s| crate::util::format_cpu(s))
-        .unwrap_or_else(|| "n/a".to_string());
-
-    let mem = usage
-        .get("memory")
-        .and_then(|v| v.as_str())
-        .map(|s| crate::util::format_mem(s))
-        .unwrap_or_else(|| "n/a".to_string());
-
-    (cpu, mem)
-}
-
-/// Parse a CPU string (e.g. "250000000n", "500m", "2") to nanocores.
-fn parse_cpu_to_nano(s: &str) -> u64 {
-    let s = s.trim();
-    if let Some(nano_str) = s.strip_suffix('n') {
-        nano_str.parse::<u64>().unwrap_or(0)
-    } else if let Some(milli_str) = s.strip_suffix('m') {
-        milli_str.parse::<u64>().unwrap_or(0) * 1_000_000
-    } else if let Ok(cores) = s.parse::<f64>() {
-        (cores * 1_000_000_000.0) as u64
-    } else {
-        0
-    }
-}
-
-/// Parse a memory string (e.g. "131072Ki", "256Mi", "1073741824") to bytes.
-fn parse_mem_to_bytes(s: &str) -> u64 {
-    let s = s.trim();
-    if let Some(val) = s.strip_suffix("Ti") {
-        val.parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024 * 1024
-    } else if let Some(val) = s.strip_suffix("Gi") {
-        val.parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024
-    } else if let Some(val) = s.strip_suffix("Mi") {
-        val.parse::<u64>().unwrap_or(0) * 1024 * 1024
-    } else if let Some(val) = s.strip_suffix("Ki") {
-        val.parse::<u64>().unwrap_or(0) * 1024
-    } else {
-        s.parse::<u64>().unwrap_or(0)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Cache CLI — query the daemon from the command line
-// ---------------------------------------------------------------------------
-
-async fn cache_cli(cmd: &str) -> Result<()> {
-    let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
-    let subcmd = parts[0];
-    let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
-
-    match subcmd {
-        "ping" => {
-            match crate::kube::daemon::DaemonClient::connect().await {
-                Some(mut dc) => {
-                    let req = serde_json::json!({"op": "ping"});
-                    if dc.send_raw(&req).await.is_some() {
-                        println!("Daemon is alive at {:?}", crate::kube::daemon::socket_path());
-                    } else {
-                        eprintln!("Daemon connected but not responding");
-                        std::process::exit(1);
-                    }
-                }
-                None => {
-                    eprintln!("Daemon not running (socket: {:?})", crate::kube::daemon::socket_path());
-                    std::process::exit(1);
-                }
-            }
-        }
-        "status" => {
-            let path = crate::kube::daemon::socket_path();
-            match crate::kube::daemon::DaemonClient::connect().await {
-                Some(_) => {
-                    println!("Daemon: running");
-                    println!("Socket: {:?}", path);
-                    // List cached contexts from disk
-                    if let Some(cache_dir) = crate::kube::cache::cache_dir() {
-                        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-                            let contexts: Vec<String> = entries.flatten()
-                                .filter(|e| e.path().extension().map_or(false, |x| x == "json"))
-                                .filter_map(|e| {
-                                    e.path().file_stem()
-                                        .and_then(|s| s.to_str())
-                                        .map(|s| s.to_string())
-                                })
-                                .collect();
-                            println!("Cached contexts: {}", if contexts.is_empty() { "none".to_string() } else { contexts.join(", ") });
-                        }
-                    }
-                }
-                None => {
-                    println!("Daemon: not running");
-                    println!("Socket: {:?} (not found)", path);
-                }
-            }
-        }
-        "get" => {
-            if arg.is_empty() {
-                eprintln!("Usage: k9rs --cache 'get <context>'");
-                std::process::exit(1);
-            }
-            match crate::kube::daemon::DaemonClient::connect().await {
-                Some(mut dc) => {
-                    match dc.get(arg).await {
-                        Some((ns, crds)) => {
-                            println!("Context: {}", arg);
-                            println!("Namespaces ({}): {}", ns.len(),
-                                if ns.len() <= 10 { ns.join(", ") }
-                                else { format!("{}, ... (+{} more)", ns[..10].join(", "), ns.len() - 10) }
-                            );
-                            println!("CRDs ({}): {}", crds.len(),
-                                if crds.len() <= 10 {
-                                    crds.iter().map(|c| c.kind.as_str()).collect::<Vec<_>>().join(", ")
-                                } else {
-                                    let first: Vec<&str> = crds[..10].iter().map(|c| c.kind.as_str()).collect();
-                                    format!("{}, ... (+{} more)", first.join(", "), crds.len() - 10)
-                                }
-                            );
-                        }
-                        None => {
-                            println!("No data cached for context '{}'", arg);
-                        }
-                    }
-                }
-                None => {
-                    eprintln!("Daemon not running");
-                    std::process::exit(1);
-                }
-            }
-        }
-        "contexts" => {
-            match crate::kube::daemon::DaemonClient::connect().await {
-                Some(_) => {
-                    // Read contexts from disk cache files
-                    if let Some(cache_dir) = crate::kube::cache::cache_dir() {
-                        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-                            for entry in entries.flatten() {
-                                if entry.path().extension().map_or(false, |x| x == "json") {
-                                    if let Ok(data) = std::fs::read_to_string(entry.path()) {
-                                        if let Ok(dc) = serde_json::from_str::<crate::kube::cache::DiscoveryCache>(&data) {
-                                            println!("{}: {} namespaces, {} crds (updated {})",
-                                                dc.context, dc.namespaces.len(), dc.crds.len(),
-                                                dc.updated_at.format("%Y-%m-%d %H:%M:%S UTC"));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                None => {
-                    eprintln!("Daemon not running");
-                    std::process::exit(1);
-                }
-            }
-        }
-        _ => {
-            eprintln!("Unknown cache command: {}", subcmd);
-            eprintln!("Available: ping, status, get <context>, contexts");
-            std::process::exit(1);
-        }
-    }
-    Ok(())
-}

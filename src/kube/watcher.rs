@@ -138,13 +138,13 @@ const ALWAYS_WATCHED: &[ResourceType] = &[
 /// Spawns tokio tasks that use `kube::runtime::watcher` to stream resource events,
 /// convert them into the app's internal types, and send updates through a channel.
 ///
-/// Only watches the always-needed types (Namespaces, Nodes, Events) plus the
+/// Only watches the always-needed types (Namespaces, Nodes) plus the
 /// currently active tab's resource type, to avoid unnecessary API load.
 pub struct ResourceWatcher {
     client: Client,
     namespace: String,
     tx: mpsc::Sender<ResourceUpdate>,
-    /// Handles for always-running watchers (Namespaces, Nodes, Events).
+    /// Handles for always-running watchers (Namespaces, Nodes).
     core_handles: Vec<JoinHandle<()>>,
     /// Handles for the active tab's watcher(s).
     tab_handles: Vec<JoinHandle<()>>,
@@ -286,10 +286,9 @@ impl ResourceWatcher {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Spawn the always-on core watchers (Namespaces, Nodes, Events).
+    /// Spawn the always-on core watchers (Namespaces, Nodes).
     fn spawn_core_watchers(&mut self) {
         let client = self.client.clone();
-        let ns = self.namespace.clone();
         let tx = self.tx.clone();
 
         // Namespaces and Nodes are cluster-scoped.
@@ -303,13 +302,8 @@ impl ResourceWatcher {
             tx.clone(),
             self.full_fetch.clone(),
         )));
-        // Events are namespace-scoped.
-        self.core_handles.push(tokio::spawn(Self::watch_events(
-            client.clone(),
-            ns,
-            tx.clone(),
-            self.full_fetch.clone(),
-        )));
+        // Events are NOT always-watched — they can be huge on active clusters.
+        // They are lazy-loaded when the user switches to the Events tab.
     }
 
     /// Start watchers for the given resource types (used for tab switching).
@@ -404,6 +398,9 @@ impl ResourceWatcher {
                 ResourceType::Crds => {
                     tokio::spawn(Self::watch_crds(client.clone(), tx.clone(), self.full_fetch.clone()))
                 }
+                ResourceType::Events => {
+                    tokio::spawn(Self::watch_events(client.clone(), ns.clone(), tx.clone(), self.full_fetch.clone()))
+                }
                 ResourceType::DynamicResource => {
                     // Dynamic resource requires a GVK; if not set, skip.
                     if let Some(ref gvk) = self.dynamic_gvk {
@@ -415,8 +412,8 @@ impl ResourceWatcher {
                         continue;
                     }
                 }
-                // Core types are handled above; listed here for exhaustiveness.
-                ResourceType::Namespaces | ResourceType::Nodes | ResourceType::Events => continue,
+                // Core types are handled by spawn_core_watchers; skip here.
+                ResourceType::Namespaces | ResourceType::Nodes => continue,
             };
 
             self.tab_handles.push(handle);
@@ -788,6 +785,9 @@ where
                     }
                     Err(e) => {
                         warn!("watcher error: {}", e);
+                        // Back off to prevent tight error loops when the API
+                        // keeps returning errors (auth expired, network flap).
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                 }
             }
@@ -867,6 +867,7 @@ async fn run_dynamic_watcher(
                     }
                     Err(e) => {
                         warn!("dynamic watcher error: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                 }
             }
