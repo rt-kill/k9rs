@@ -46,6 +46,8 @@ enum ActionResult {
         namespace: String,
         context: String,
     },
+    /// Force a full terminal clear and redraw.
+    Redraw,
 }
 
 #[derive(Parser, Debug)]
@@ -775,6 +777,9 @@ async fn main() -> Result<()> {
                                     // Resume TUI
                                     enable_raw_mode()?;
                                     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                                    terminal.clear()?;
+                                }
+                                ActionResult::Redraw => {
                                     terminal.clear()?;
                                 }
                                 ActionResult::None => {
@@ -1798,6 +1803,9 @@ async fn handle_action(
         }
         Action::FlashInfo(msg) => {
             app.flash = Some(crate::app::FlashMessage::info(msg));
+        }
+        Action::Redraw => {
+            return ActionResult::Redraw;
         }
     }
     ActionResult::None
