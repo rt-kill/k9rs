@@ -118,6 +118,11 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(Action::ToggleFullFetch);
     }
 
+    // F7: force full terminal redraw (fixes corrupted screen).
+    if key.code == KeyCode::F(7) {
+        return Some(Action::Redraw);
+    }
+
     match key.code {
         // `q` is NOT global quit — it is context-sensitive (handled per-view).
         KeyCode::Char(':') => Some(Action::CommandMode),

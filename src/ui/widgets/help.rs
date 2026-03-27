@@ -216,6 +216,10 @@ impl<'a> HelpOverlay<'a> {
                         description: "Toggle full-fetch mode",
                     },
                     HelpEntry {
+                        key: "F7",
+                        description: "Redraw screen",
+                    },
+                    HelpEntry {
                         key: "?",
                         description: "Help",
                     },

@@ -46,6 +46,8 @@ enum ActionResult {
         namespace: String,
         context: String,
     },
+    /// Force a full terminal clear and redraw.
+    Redraw,
 }
 
 #[derive(Parser, Debug)]
@@ -565,9 +567,10 @@ async fn main() -> Result<()> {
                                             cmd.arg("port-forward").arg(&pn).arg(&ports);
                                             if !pod_ns.is_empty() { cmd.arg("-n").arg(&pod_ns); }
                                             if !context.is_empty() { cmd.arg("--context").arg(&context); }
-                                            // Use spawn + wait instead of output() because
-                                            // kubectl port-forward runs indefinitely and
-                                            // output() buffers all stdout/stderr into memory.
+                                            // Suppress stdout/stderr so kubectl output doesn't
+                                            // corrupt the TUI terminal.
+                                            cmd.stdout(std::process::Stdio::null());
+                                            cmd.stderr(std::process::Stdio::null());
                                             match cmd.kill_on_drop(true).spawn() {
                                                 Ok(mut child) => {
                                                     match child.wait().await {
@@ -774,6 +777,9 @@ async fn main() -> Result<()> {
                                     // Resume TUI
                                     enable_raw_mode()?;
                                     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                                    terminal.clear()?;
+                                }
+                                ActionResult::Redraw => {
                                     terminal.clear()?;
                                 }
                                 ActionResult::None => {
@@ -1797,6 +1803,9 @@ async fn handle_action(
         }
         Action::FlashInfo(msg) => {
             app.flash = Some(crate::app::FlashMessage::info(msg));
+        }
+        Action::Redraw => {
+            return ActionResult::Redraw;
         }
     }
     ActionResult::None

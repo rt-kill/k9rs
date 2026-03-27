@@ -117,4 +117,6 @@ pub enum Action {
     ToggleFaultFilter,
     /// Show an informational flash message to the user.
     FlashInfo(String),
+    /// Force a full terminal clear and redraw (fixes corrupted screen).
+    Redraw,
 }
