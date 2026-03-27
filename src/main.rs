@@ -565,9 +565,10 @@ async fn main() -> Result<()> {
                                             cmd.arg("port-forward").arg(&pn).arg(&ports);
                                             if !pod_ns.is_empty() { cmd.arg("-n").arg(&pod_ns); }
                                             if !context.is_empty() { cmd.arg("--context").arg(&context); }
-                                            // Use spawn + wait instead of output() because
-                                            // kubectl port-forward runs indefinitely and
-                                            // output() buffers all stdout/stderr into memory.
+                                            // Suppress stdout/stderr so kubectl output doesn't
+                                            // corrupt the TUI terminal.
+                                            cmd.stdout(std::process::Stdio::null());
+                                            cmd.stderr(std::process::Stdio::null());
                                             match cmd.kill_on_drop(true).spawn() {
                                                 Ok(mut child) => {
                                                     match child.wait().await {
