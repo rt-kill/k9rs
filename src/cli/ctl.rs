@@ -4,11 +4,11 @@ use anyhow::{bail, Result};
 use clap::Subcommand;
 
 use crate::kube::daemon::DaemonClient;
-use crate::kube::protocol::Request;
+use crate::kube::protocol::{Request, Response};
 
 #[derive(Subcommand, Debug)]
 pub enum CtlCommand {
-    /// Show daemon status (pid, uptime, cache entries)
+    /// Show daemon status (pid, uptime)
     Status,
 
     /// Ping the daemon and measure round-trip time
@@ -16,9 +16,6 @@ pub enum CtlCommand {
 
     /// Stop the daemon gracefully
     Stop,
-
-    /// Show cache statistics
-    Stats,
 
     /// Clear cached data
     Clear {
@@ -29,12 +26,6 @@ pub enum CtlCommand {
         #[arg(long)]
         disk: bool,
     },
-
-    /// List active TUI sessions
-    Sessions,
-
-    /// List active resource watchers (placeholder)
-    Watchers,
 }
 
 pub async fn run(cmd: CtlCommand) -> Result<()> {
@@ -42,10 +33,7 @@ pub async fn run(cmd: CtlCommand) -> Result<()> {
         CtlCommand::Status => cmd_status().await,
         CtlCommand::Ping => cmd_ping().await,
         CtlCommand::Stop => cmd_stop().await,
-        CtlCommand::Stats => cmd_stats().await,
         CtlCommand::Clear { context, disk } => cmd_clear(context, disk).await,
-        CtlCommand::Sessions => cmd_sessions().await,
-        CtlCommand::Watchers => cmd_watchers().await,
     }
 }
 
@@ -64,41 +52,14 @@ async fn connect_or_bail() -> Result<DaemonClient> {
 async fn cmd_status() -> Result<()> {
     let mut dc = connect_or_bail().await?;
     let resp = dc.request(&Request::Status).await;
-    match resp.and_then(|r| r.status) {
-        Some(status) => {
+    match resp {
+        Some(Response::Status(status)) => {
             let uptime = format_duration(status.uptime_secs);
             println!("Daemon:     running (pid {})", status.pid);
             println!("Socket:     {}", status.socket_path);
             println!("Uptime:     {}", uptime);
-            println!("Sessions:   {}", status.session_count);
-            println!("Discovery:  {} entries", status.discovery_entries);
-            println!("Resources:  {} entries", status.resource_entries);
-
-            // Also list cached contexts from disk
-            if let Some(cache_dir) = crate::kube::cache::cache_dir() {
-                if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-                    let contexts: Vec<String> = entries
-                        .flatten()
-                        .filter(|e| e.path().extension().map_or(false, |x| x == "json"))
-                        .filter_map(|e| {
-                            e.path()
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect();
-                    println!(
-                        "Disk cache: {}",
-                        if contexts.is_empty() {
-                            "none".to_string()
-                        } else {
-                            contexts.join(", ")
-                        }
-                    );
-                }
-            }
         }
-        None => {
+        _ => {
             println!("Daemon: not running");
             println!(
                 "Socket: {:?} (not found)",
@@ -115,7 +76,7 @@ async fn cmd_ping() -> Result<()> {
     let resp = dc.request(&Request::Ping).await;
     let elapsed = start.elapsed();
     match resp {
-        Some(r) if r.ok => {
+        Some(Response::Ok) => {
             println!(
                 "Daemon is alive at {:?} ({}ms)",
                 crate::kube::daemon::socket_path(),
@@ -133,31 +94,8 @@ async fn cmd_stop() -> Result<()> {
     let mut dc = connect_or_bail().await?;
     let resp = dc.request(&Request::Shutdown).await;
     match resp {
-        Some(r) if r.ok => println!("Daemon shutting down"),
+        Some(Response::Ok) => println!("Daemon shutting down"),
         _ => bail!("Failed to send shutdown request"),
-    }
-    Ok(())
-}
-
-async fn cmd_stats() -> Result<()> {
-    let mut dc = connect_or_bail().await?;
-    let resp = dc.request(&Request::Stats).await;
-    match resp.and_then(|r| r.stats) {
-        Some(stats) => {
-            println!("Discovery cache:");
-            println!(
-                "  Entries:  {}/{}",
-                stats.discovery_entry_count, stats.discovery_max_capacity
-            );
-            println!("Resource cache:");
-            println!(
-                "  Entries:  {}/{}",
-                stats.resource_entry_count, stats.resource_max_capacity
-            );
-        }
-        None => {
-            bail!("Failed to get stats from daemon");
-        }
     }
     Ok(())
 }
@@ -170,7 +108,7 @@ async fn cmd_clear(context: Option<String>, disk: bool) -> Result<()> {
         })
         .await;
     match resp {
-        Some(r) if r.ok => {
+        Some(Response::Ok) => {
             match &context {
                 Some(ctx) => println!("Cleared cache for context '{}'", ctx),
                 None => println!("Cleared all cache entries"),
@@ -205,46 +143,6 @@ async fn cmd_clear(context: Option<String>, disk: bool) -> Result<()> {
                     }
                 }
             }
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_sessions() -> Result<()> {
-    let mut dc = connect_or_bail().await?;
-    let resp = dc.request(&Request::ListSessions).await;
-    match resp.and_then(|r| r.sessions) {
-        Some(sessions) if sessions.is_empty() => {
-            println!("No active sessions");
-        }
-        Some(sessions) => {
-            println!(
-                "{:<18} {:<8} {:<24} {:<16} {}",
-                "SESSION", "PID", "CONTEXT", "NAMESPACE", "CONNECTED"
-            );
-            for s in &sessions {
-                println!(
-                    "{:<18} {:<8} {:<24} {:<16} {}",
-                    s.session_id, s.pid, s.context, s.namespace, s.connected_at
-                );
-            }
-        }
-        None => {
-            bail!("Failed to list sessions");
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_watchers() -> Result<()> {
-    let mut dc = connect_or_bail().await?;
-    let resp = dc.request(&Request::ListWatchers).await;
-    match resp {
-        Some(r) if r.ok => {
-            println!("Watcher listing not yet implemented in the daemon");
-        }
-        _ => {
-            bail!("Failed to query watchers");
         }
     }
     Ok(())

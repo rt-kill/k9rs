@@ -5,7 +5,7 @@ use k8s_openapi::api::core::v1::ServiceAccount;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeServiceAccount {
     pub namespace: String,
     pub name: String,

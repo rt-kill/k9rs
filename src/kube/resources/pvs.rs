@@ -5,7 +5,7 @@ use k8s_openapi::api::core::v1::PersistentVolume;
 
 use super::{access_mode_short, KubeResource};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubePv {
     pub name: String,
     pub capacity: String,

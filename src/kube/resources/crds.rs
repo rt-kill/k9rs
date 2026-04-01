@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use super::KubeResource;
 
 /// Represents a Custom Resource Definition (CRD) in the cluster.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeCrd {
     pub name: String,        // e.g. "certificates.cert-manager.io"
     pub group: String,       // e.g. "cert-manager.io"
@@ -43,7 +43,7 @@ impl KubeResource for KubeCrd {
 }
 
 /// Represents a dynamic/generic Kubernetes resource instance (a CRD instance).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DynamicKubeResource {
     pub namespace: String,
     pub name: String,

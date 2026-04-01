@@ -5,7 +5,7 @@ use k8s_openapi::api::storage::v1::StorageClass;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeStorageClass {
     pub name: String,
     pub provisioner: String,

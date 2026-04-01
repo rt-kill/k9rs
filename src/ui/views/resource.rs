@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Block,
     Frame,
@@ -160,6 +160,14 @@ fn draw_typed_table<T: Clone + KubeResource>(
         return;
     }
 
+    // TODO(perf): Only materialize visible rows instead of all filtered rows.
+    // Currently we build ALL rows and pass them to the table widget, which only
+    // renders the visible window. Pre-slicing to `offset..offset+visible_height`
+    // would avoid allocating off-screen rows, but the table widget also needs
+    // the total count for the scroll indicator and `compute_col_widths` needs
+    // all rows for accurate column sizing. Fixing this requires changing the
+    // ResourceTable API (e.g. accept total_count separately, or compute widths
+    // from a sampled subset).
     let rows: Vec<Vec<String>> = table
         .filtered_indices
         .iter()
@@ -220,7 +228,7 @@ pub fn draw_resources(f: &mut Frame, app: &App, area: Rect) {
     let command_height: u16 = if app.command_mode || app.scale_mode || app.port_forward_mode { 3 } else { 0 };
     // Only show the filter bar box while actively typing; when committed
     // (inactive but text non-empty), the table title shows `</:filter_text>`.
-    let filter_visible = app.filter.active;
+    let filter_visible = app.filter_input.active;
     let filter_height: u16 = if filter_visible { 3 } else { 0 };
 
     let chunks = Layout::vertical([
@@ -256,10 +264,10 @@ pub fn draw_resources(f: &mut Frame, app: &App, area: Rect) {
     // 3. Filter prompt
     if filter_visible {
         let (filtered, total) = app.active_table_items_count();
-        let match_count = if app.filter.text.is_empty() { total } else { filtered };
+        let match_count = if app.filter_input.text.is_empty() && !app.nav.is_drilled() { total } else { filtered };
         let filter_bar = FilterBar::new(
-            app.filter.active,
-            &app.filter.text,
+            app.filter_input.active,
+            &app.filter_input.text,
             match_count,
             total,
             theme,
@@ -269,9 +277,9 @@ pub fn draw_resources(f: &mut Frame, app: &App, area: Rect) {
 
     // 4. Resource table
     let ns = &app.selected_ns;
-    // Use the per-table filter text (not the global app.filter.text) so the
-    // filter indicator in the table title is correct after switching tabs.
-    let ft = app.active_filter_text();
+    // Use the nav breadcrumb as the filter indicator in the table title.
+    let breadcrumb = app.nav.breadcrumb();
+    let ft = breadcrumb.as_str();
     let tc = app.tick_count;
     match app.resource_tab {
         ResourceTab::Pods => draw_typed_table(f, table_area, "Pods", &app.data.pods, ns, ft, theme, tc),
@@ -310,11 +318,22 @@ pub fn draw_resources(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    // 5. Breadcrumbs
-    let all_tabs = ResourceTab::all();
-    let tab_bar = TabBar::new(all_tabs, app.resource_tab, 0, theme)
-        .namespace(&app.selected_ns);
-    f.render_widget(tab_bar, breadcrumb_area);
+    // 5. Breadcrumbs — show nav path when drilled down, tab bar otherwise
+    if app.nav.is_drilled() {
+        let bc = app.nav.breadcrumb();
+        let depth_indicator = format!(" [{}] {} ", app.nav.depth() - 1, bc);
+        let line = Line::from(vec![
+            Span::styled(" Esc", Style::default().fg(theme.title_filter_indicator.fg.unwrap_or(ratatui::style::Color::Yellow))),
+            Span::styled(" to go back ", Style::default().fg(ratatui::style::Color::DarkGray)),
+            Span::styled(depth_indicator, Style::default().fg(ratatui::style::Color::Cyan)),
+        ]);
+        f.render_widget(line, breadcrumb_area);
+    } else {
+        let all_tabs = ResourceTab::all();
+        let tab_bar = TabBar::new(all_tabs, app.resource_tab, 0, theme)
+            .namespace(&app.selected_ns);
+        f.render_widget(tab_bar, breadcrumb_area);
+    }
 
     // 6. Flash message area (handled by ui/mod.rs overlay, but we reserve the line)
     // Draw a subtle flash area background
@@ -338,7 +357,7 @@ fn draw_key_hints(f: &mut Frame, tab: ResourceTab, area: Rect, theme: &Theme) {
 // Command prompt
 // ---------------------------------------------------------------------------
 
-fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+pub fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     if area.height < 3 || area.width == 0 {
         return;
     }

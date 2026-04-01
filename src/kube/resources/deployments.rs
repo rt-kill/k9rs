@@ -17,6 +17,9 @@ pub struct KubeDeployment {
     pub age: Option<DateTime<Utc>>,
     pub labels: BTreeMap<String, String>,
     pub images: Vec<String>,
+    /// From spec.selector.matchLabels — used for drill-down to pods.
+    #[serde(default)]
+    pub selector_labels: BTreeMap<String, String>,
 }
 
 impl KubeResource for KubeDeployment {
@@ -66,6 +69,7 @@ impl From<Deployment> for KubeDeployment {
         let age = metadata.creation_timestamp.map(|t| t.0);
 
         let spec = dep.spec.unwrap_or_default();
+        let selector_labels = spec.selector.match_labels.clone().unwrap_or_default();
         let desired = spec.replicas.unwrap_or(0);
 
         let strategy = spec
@@ -101,6 +105,7 @@ impl From<Deployment> for KubeDeployment {
             age,
             labels,
             images,
+            selector_labels,
         }
     }
 }

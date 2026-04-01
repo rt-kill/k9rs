@@ -1,11 +1,12 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::ReplicaSet;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeReplicaSet {
     pub namespace: String,
     pub name: String,
@@ -13,6 +14,8 @@ pub struct KubeReplicaSet {
     pub current: i32,
     pub ready: i32,
     pub age: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub selector_labels: BTreeMap<String, String>,
 }
 
 impl KubeResource for KubeReplicaSet {
@@ -51,6 +54,10 @@ impl From<ReplicaSet> for KubeReplicaSet {
         let name = metadata.name.unwrap_or_default();
         let age = metadata.creation_timestamp.map(|t| t.0);
 
+        let selector_labels = rs.spec
+            .as_ref()
+            .and_then(|s| s.selector.match_labels.clone())
+            .unwrap_or_default();
         let desired = rs.spec.and_then(|s| s.replicas).unwrap_or(0);
         let status = rs.status.unwrap_or_default();
         let current = status.replicas;
@@ -63,6 +70,7 @@ impl From<ReplicaSet> for KubeReplicaSet {
             current,
             ready,
             age,
+            selector_labels,
         }
     }
 }

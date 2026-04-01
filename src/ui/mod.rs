@@ -21,6 +21,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
     match &app.route {
+        Route::Overview => {
+            views::overview::draw_overview(f, app, area);
+        }
         Route::Resources => {
             views::resource::draw_resources(f, app, area);
         }
@@ -64,7 +67,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if app.command_mode || app.scale_mode {
             draw_command_overlay(f, app);
         }
-        if app.filter.active {
+        if app.filter_input.active {
             draw_filter_overlay(f, app);
         }
     }
@@ -286,10 +289,10 @@ fn draw_filter_overlay(f: &mut Frame, app: &App) {
     Clear.render(overlay_area, f.buffer_mut());
 
     let (filtered, total) = app.active_table_items_count();
-    let match_count = if app.filter.text.is_empty() { total } else { filtered };
+    let match_count = if app.filter_input.text.is_empty() { total } else { filtered };
     let filter_bar = FilterBar::new(
-        app.filter.active,
-        &app.filter.text,
+        app.filter_input.active,
+        &app.filter_input.text,
         match_count,
         total,
         theme,

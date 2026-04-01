@@ -40,34 +40,27 @@ use crate::kube::resources::{
 pub enum AppEvent {
     /// An update to a Kubernetes resource list or content view.
     ResourceUpdate(ResourceUpdate),
-    /// An application-level error.
-    Error(String),
     /// A temporary flash message shown in the status bar.
     Flash(FlashMessage),
-    /// Result of a background context switch. Contains (context_name, new_client)
-    /// on success, or an error string on failure.
+    /// Result of a background context switch. Contains the context name and
+    /// success/failure. On success the server has already switched contexts
+    /// and the `ClientSession` will update its stored context info.
     ContextSwitchResult {
         context: String,
-        result: Result<::kube::Client, String>,
+        result: Result<(), String>,
     },
     /// Pod metrics from the metrics-server: HashMap<(namespace, pod_name), (cpu, mem)>.
     PodMetrics(HashMap<(String, String), (String, String)>),
     /// Node metrics from the metrics-server: HashMap<node_name, (cpu, mem)>.
     NodeMetrics(HashMap<String, (String, String)>),
-    /// Cached resource data loaded from the daemon for instant tab display.
-    /// Includes the context and namespace it was fetched for, so stale data
-    /// from a pre-switch request is rejected if the user changed context/namespace
-    /// before the daemon response arrived.
-    CachedResources {
-        resource_type: String,
-        data: String,
-        context: String,
-        namespace: String,
-    },
+    /// The log stream has ended (daemon mode). Resets the streaming flag.
+    LogStreamEnded,
+    /// The daemon connection was lost. TUI should exit gracefully.
+    DaemonDisconnected,
 }
 
 /// An update to a particular Kubernetes resource type.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ResourceUpdate {
     Pods(Vec<KubePod>),
     Deployments(Vec<KubeDeployment>),

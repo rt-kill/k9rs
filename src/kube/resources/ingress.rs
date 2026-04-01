@@ -5,7 +5,7 @@ use k8s_openapi::api::networking::v1::Ingress;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeIngress {
     pub namespace: String,
     pub name: String,

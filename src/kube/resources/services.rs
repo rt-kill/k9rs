@@ -16,6 +16,9 @@ pub struct KubeService {
     pub ports: String,
     pub age: Option<DateTime<Utc>>,
     pub labels: BTreeMap<String, String>,
+    /// From spec.selector — used for drill-down to pods.
+    #[serde(default)]
+    pub selector: BTreeMap<String, String>,
 }
 
 impl KubeResource for KubeService {
@@ -65,6 +68,7 @@ impl From<Service> for KubeService {
         let age = metadata.creation_timestamp.map(|t| t.0);
 
         let spec = svc.spec.unwrap_or_default();
+        let selector = spec.selector.clone().unwrap_or_default();
         let service_type = spec.type_.unwrap_or_else(|| "ClusterIP".to_string());
         let cluster_ip = spec.cluster_ip.unwrap_or_else(|| "<none>".to_string());
 
@@ -121,6 +125,7 @@ impl From<Service> for KubeService {
             ports,
             age,
             labels,
+            selector,
         }
     }
 }

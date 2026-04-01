@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 /// List cached contexts from disk cache files at `~/.cache/k9rs/*.json`.
-pub async fn run() -> Result<()> {
+pub fn run() -> Result<()> {
     let cache_dir = match crate::kube::cache::cache_dir() {
         Some(d) => d,
         None => {

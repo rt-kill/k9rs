@@ -5,7 +5,7 @@ use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubePdb {
     pub namespace: String,
     pub name: String,

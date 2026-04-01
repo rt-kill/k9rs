@@ -7,7 +7,7 @@ description = "A fast Kubernetes TUI, inspired by k9s, built in Rust"
 [dependencies]
 # TUI
 ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.28", features = ["event-stream", "serde"] }
 
 # Kubernetes
 kube = { version = "0.98", features = ["client", "runtime", "derive", "ws"] }
@@ -17,7 +17,6 @@ k8s-openapi = { version = "0.24", features = ["latest"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
-async-trait = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -29,22 +28,19 @@ clap = { version = "4", features = ["derive"] }
 
 # Error handling
 anyhow = "1"
-thiserror = "1"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 
 # Misc
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 unicode-width = "0.2"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-base64 = "0.22"
 rand = "0.9"
 libc = "0.2"
-moka = { version = "0.12", features = ["future"] }
+dashmap = "6"
 
 [profile.release]
 opt-level = 3

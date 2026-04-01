@@ -9,7 +9,7 @@ use super::KubeResource;
 
 // ── Role ──────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeRole {
     pub namespace: String,
     pub name: String,
@@ -63,7 +63,7 @@ impl From<Role> for KubeRole {
 
 // ── ClusterRole ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeClusterRole {
     pub name: String,
     pub rules_count: usize,
@@ -109,7 +109,7 @@ impl From<ClusterRole> for KubeClusterRole {
 
 // ── RoleBinding ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeRoleBinding {
     pub namespace: String,
     pub name: String,
@@ -181,7 +181,7 @@ impl From<RoleBinding> for KubeRoleBinding {
 
 // ── ClusterRoleBinding ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeClusterRoleBinding {
     pub name: String,
     pub role_ref: String,

@@ -1,26 +1,31 @@
-//! Lock-free cache daemon for k9rs, powered by moka.
+//! Daemon process for k9rs.
 //!
-//! moka::Cache is a concurrent, lock-free cache with TTL and eviction.
-//! Connection handlers read/write the cache directly — no actor, no channels,
-//! no mutexes.
+//! Accepts TUI connections and spawns a ServerSession per client. Holds shared
+//! state (WatcherCache via DashMap) that sessions interact with for watcher
+//! sharing. The daemon itself has no k8s knowledge — all k8s logic lives in
+//! ServerSession.
 //!
-//! - Start with `k9rs --daemon` (stays running until killed / Ctrl-C / SIGTERM)
-//! - Normal k9rs instances connect as clients
-//! - Falls back to direct file cache if daemon is unavailable
+//! - Start with `k9rs daemon` (stays running until killed / Ctrl-C / SIGTERM)
+//! - TUI clients connect via Unix socket, send kubeconfig + env vars
+//! - Management CLI (`k9rs ctl`) connects for status/ping/shutdown
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use moka::future::Cache;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::info;
 
-use super::cache::{self, CachedCrd, DiscoveryCache};
-use super::protocol::*;
+use super::protocol::{DaemonStatus, Request, Response};
+use super::server_session::{ServerSession, SessionSharedState};
+
+// ---------------------------------------------------------------------------
+// Daemon configuration constants
+// ---------------------------------------------------------------------------
+
+/// Timeout for reading a response from the daemon (seconds).
+const CLIENT_READ_TIMEOUT_SECS: u64 = 5;
 
 // ---------------------------------------------------------------------------
 // Socket path
@@ -46,7 +51,6 @@ pub fn socket_path() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Run the cache daemon. Stays alive until killed (Ctrl-C / SIGTERM).
-/// moka handles all concurrency — no locks.
 pub async fn run_daemon() -> anyhow::Result<()> {
     let path = socket_path();
 
@@ -74,47 +78,24 @@ pub async fn run_daemon() -> anyhow::Result<()> {
         tokio::signal::unix::SignalKind::interrupt(),
     )?;
 
-    // Daemon state: caches + session tracking
+    // Daemon state
     let state = Arc::new(DaemonState {
         started_at: Instant::now(),
-        discovery_store: Cache::builder()
-            .max_capacity(1000)
-            .time_to_idle(Duration::from_secs(3600))
-            .build(),
-        resource_store: Cache::builder()
-            .max_capacity(500)
-            .time_to_idle(Duration::from_secs(600))
-            .support_invalidation_closures()
-            .build(),
-        sessions: RwLock::new(HashMap::new()),
         socket_path: path.display().to_string(),
         shutdown: tokio::sync::Notify::new(),
+        session_shared: Arc::new(SessionSharedState::new()),
     });
-
-    // Seed discovery cache from disk
-    if let Some(cache_dir) = cache::cache_dir() {
-        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-            for entry in entries.flatten() {
-                if entry.path().extension().map_or(false, |e| e == "json") {
-                    if let Ok(data) = std::fs::read_to_string(entry.path()) {
-                        if let Ok(dc) = serde_json::from_str::<DiscoveryCache>(&data) {
-                            state.discovery_store.insert(dc.context.clone(), dc).await;
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // Accept loop — exits on signal or shutdown request
     loop {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, _) = result?;
+                info!("New connection accepted");
                 let conn_state = state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(stream, conn_state).await {
-                        debug!("Connection error: {}", e);
+                        info!("Connection ended: {}", e);
                     }
                 });
             }
@@ -143,13 +124,13 @@ pub async fn run_daemon() -> anyhow::Result<()> {
 // Daemon state
 // ---------------------------------------------------------------------------
 
-pub struct DaemonState {
-    pub started_at: Instant,
-    pub discovery_store: Cache<String, DiscoveryCache>,
-    pub resource_store: Cache<String, String>,
-    pub sessions: RwLock<HashMap<String, SessionInfo>>,
-    pub socket_path: String,
-    pub shutdown: tokio::sync::Notify,
+struct DaemonState {
+    started_at: Instant,
+    socket_path: String,
+    shutdown: tokio::sync::Notify,
+    /// Shared state for all ServerSessions (watcher cache + client pool).
+    /// The daemon holds this opaquely — it never accesses the fields.
+    session_shared: Arc<SessionSharedState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,14 +141,65 @@ async fn handle_connection(
     stream: UnixStream,
     state: Arc<DaemonState>,
 ) -> anyhow::Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let (reader, writer) = stream.into_split();
+    let mut buf_reader = BufReader::new(reader);
 
+    // Read the first line to determine connection type:
+    //   - `"cmd":` => session connection (hand off to ServerSession)
+    //   - `"op":`  => management connection (handle here)
+    let mut first_line = String::new();
+    let n = buf_reader.read_line(&mut first_line).await?;
+    if n == 0 {
+        return Ok(()); // EOF immediately
+    }
+    let first_line = first_line.trim_end().to_string();
+
+    if !first_line.contains("\"op\"") {
+        info!("Routing connection as TUI session");
+        // Session connection — hand off entirely to ServerSession.
+        // The daemon does NOT parse SessionCommand or construct SessionEvent.
+        // Box the buf_reader directly (it already has an internal buffer and
+        // implements AsyncRead, preserving any read-ahead data after first_line).
+        let boxed_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(buf_reader);
+        let boxed_reader = BufReader::with_capacity(256 * 1024, boxed_reader);
+        let boxed_writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(writer);
+        ServerSession::init_and_run(
+            first_line,
+            boxed_reader,
+            boxed_writer,
+            state.session_shared.clone(),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Management connection — process with Request/Response protocol.
+    let mut writer = writer;
+
+    // Process the first line as a Request.
+    match serde_json::from_str::<Request>(&first_line) {
+        Ok(request) => {
+            let resp = handle_request(&state, request).await;
+            write_response(&mut writer, &resp).await?;
+        }
+        Err(e) => {
+            write_response(
+                &mut writer,
+                &Response::Error {
+                    message: format!("Invalid request: {}", e),
+                },
+            )
+            .await?;
+        }
+    }
+
+    // Continue processing management requests on this connection.
+    let mut lines = buf_reader.lines();
     while let Some(line) = lines.next_line().await? {
         let request: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                write_response(&mut writer, &Response::error(format!("Invalid request: {}", e))).await?;
+                write_response(&mut writer, &Response::Error { message: format!("Invalid request: {}", e) }).await?;
                 continue;
             }
         };
@@ -181,131 +213,31 @@ async fn handle_connection(
 
 async fn handle_request(state: &DaemonState, request: Request) -> Response {
     match request {
-        Request::Ping => Response::ok(),
-
-        Request::Get { context } => {
-            let payload = state.discovery_store.get(&context).await.map(|dc| CachePayload {
-                namespaces: dc.namespaces.clone(),
-                crds: dc.crds.clone(),
-            }).unwrap_or(CachePayload {
-                namespaces: vec![],
-                crds: vec![],
-            });
-            let mut resp = Response::ok();
-            resp.data = Some(payload);
-            resp
-        }
-
-        Request::Put { context, namespaces, crds } => {
-            let dc = cache::build_cache(&context, &namespaces, &crds);
-            let dc_for_disk = dc.clone();
-            state.discovery_store.insert(context, dc).await;
-            tokio::spawn(async move {
-                cache::save_cache(&dc_for_disk).await;
-            });
-            Response::ok()
-        }
-
-        Request::GetResources { context, namespace, resource_type } => {
-            let key = format!("{}:{}:{}", context, namespace, resource_type);
-            let mut resp = Response::ok();
-            resp.resource_data = state.resource_store.get(&key).await;
-            resp
-        }
-
-        Request::PutResources { context, namespace, resource_type, data } => {
-            let key = format!("{}:{}:{}", context, namespace, resource_type);
-            state.resource_store.insert(key, data).await;
-            Response::ok()
-        }
+        Request::Ping => Response::Ok,
 
         Request::Status => {
-            let sessions = state.sessions.read().await;
-            let mut resp = Response::ok();
-            resp.status = Some(DaemonStatus {
+            Response::Status(DaemonStatus {
                 pid: std::process::id(),
                 uptime_secs: state.started_at.elapsed().as_secs(),
                 socket_path: state.socket_path.clone(),
-                session_count: sessions.len(),
-                discovery_entries: state.discovery_store.entry_count(),
-                resource_entries: state.resource_store.entry_count(),
-            });
-            resp
-        }
-
-        Request::Stats => {
-            let mut resp = Response::ok();
-            resp.stats = Some(CacheStats {
-                discovery_entry_count: state.discovery_store.entry_count(),
-                discovery_max_capacity: state.discovery_store.policy().max_capacity().unwrap_or(0),
-                resource_entry_count: state.resource_store.entry_count(),
-                resource_max_capacity: state.resource_store.policy().max_capacity().unwrap_or(0),
-            });
-            resp
+            })
         }
 
         Request::Shutdown => {
             state.shutdown.notify_one();
-            Response::ok()
+            Response::Ok
         }
 
         Request::Clear { context } => {
             match context {
                 Some(ctx) => {
-                    state.discovery_store.remove(&ctx).await;
-                    // Clear all resource entries for this context (prefix match)
-                    // moka doesn't support prefix delete, so we invalidate matching entries
-                    state.resource_store.invalidate_entries_if(move |key, _| {
-                        key.starts_with(&format!("{}:", ctx))
-                    }).ok();
+                    state.session_shared.discovery_cache.remove(&ctx);
                 }
                 None => {
-                    state.discovery_store.invalidate_all();
-                    state.resource_store.invalidate_all();
+                    state.session_shared.discovery_cache.clear();
                 }
             }
-            Response::ok()
-        }
-
-        Request::RegisterSession { pid, context, namespace } => {
-            let session_id = format!("{:x}", rand::random::<u64>());
-            let info = SessionInfo {
-                session_id: session_id.clone(),
-                pid,
-                context,
-                namespace,
-                connected_at: chrono::Utc::now().to_rfc3339(),
-            };
-            state.sessions.write().await.insert(session_id.clone(), info);
-            let mut resp = Response::ok();
-            resp.session_id = Some(session_id);
-            resp
-        }
-
-        Request::DeregisterSession { session_id } => {
-            state.sessions.write().await.remove(&session_id);
-            Response::ok()
-        }
-
-        Request::UpdateSession { session_id, context, namespace } => {
-            let mut sessions = state.sessions.write().await;
-            if let Some(session) = sessions.get_mut(&session_id) {
-                session.context = context;
-                session.namespace = namespace;
-            }
-            Response::ok()
-        }
-
-        Request::ListSessions => {
-            let sessions = state.sessions.read().await;
-            let mut resp = Response::ok();
-            resp.sessions = Some(sessions.values().cloned().collect());
-            resp
-        }
-
-        Request::ListWatchers => {
-            // Placeholder — watchers will be daemon-managed in a future phase
-            Response::ok()
+            Response::Ok
         }
     }
 }
@@ -324,7 +256,6 @@ async fn write_response(
 // Client
 // ---------------------------------------------------------------------------
 
-use tokio::io::BufWriter;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 pub struct DaemonClient {
@@ -344,65 +275,10 @@ impl DaemonClient {
         })
     }
 
-    pub async fn get(&mut self, context: &str) -> Option<(Vec<String>, Vec<CachedCrd>)> {
-        let req = Request::Get { context: context.to_string() };
-        let resp = self.request(&req).await?;
-        if resp.ok {
-            resp.data.map(|d| (d.namespaces, d.crds))
-        } else {
-            None
-        }
-    }
-
     /// Send a typed `Request` and get a typed `Response`.
     pub async fn request(&mut self, req: &Request) -> Option<Response> {
         let line = self.send_and_read(req).await?;
         serde_json::from_str(&line).ok()
-    }
-
-    pub async fn put(
-        &mut self,
-        context: &str,
-        namespaces: &[String],
-        crds: &[CachedCrd],
-    ) -> bool {
-        let req = Request::Put {
-            context: context.to_string(),
-            namespaces: namespaces.to_vec(),
-            crds: crds.to_vec(),
-        };
-        self.request(&req).await.map_or(false, |r| r.ok)
-    }
-
-    pub async fn get_resources(
-        &mut self,
-        context: &str,
-        namespace: &str,
-        resource_type: &str,
-    ) -> Option<String> {
-        let req = Request::GetResources {
-            context: context.to_string(),
-            namespace: namespace.to_string(),
-            resource_type: resource_type.to_string(),
-        };
-        let resp = self.request(&req).await?;
-        if resp.ok { resp.resource_data } else { None }
-    }
-
-    pub async fn put_resources(
-        &mut self,
-        context: &str,
-        namespace: &str,
-        resource_type: &str,
-        data: &str,
-    ) -> bool {
-        let req = Request::PutResources {
-            context: context.to_string(),
-            namespace: namespace.to_string(),
-            resource_type: resource_type.to_string(),
-            data: data.to_string(),
-        };
-        self.request(&req).await.map_or(false, |r| r.ok)
     }
 
     /// Core I/O: write a JSON request line, read a JSON response line.
@@ -418,7 +294,7 @@ impl DaemonClient {
 
         let mut resp_line = String::new();
         let result = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(CLIENT_READ_TIMEOUT_SECS),
             self.reader.read_line(&mut resp_line),
         ).await;
 
@@ -435,3 +311,4 @@ impl DaemonClient {
         }
     }
 }
+

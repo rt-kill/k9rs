@@ -37,6 +37,7 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     // Route-specific keys.
     // -----------------------------------------------------------------------
     match &app.route {
+        Route::Overview => handle_overview_keys(key),
         Route::Resources => handle_resource_view_keys(app, key),
         Route::Yaml { .. } | Route::Describe { .. } => handle_detail_view_keys(key),
         Route::Logs { .. } => handle_log_view_keys(key),
@@ -154,19 +155,18 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
     }
 
     match key.code {
-        // `q` in resource view: if filter is active, clear it. Otherwise quit
-        // (resource view is the root, so going back means quitting).
+        // `q` in resource view: if drilled/filtered, pop one level. Otherwise quit.
         KeyCode::Char('q') => {
-            if !app.active_filter_text().is_empty() {
+            if app.nav.is_drilled() {
                 Some(Action::ClearFilter)
             } else {
                 Some(Action::Quit)
             }
         }
 
-        // Esc in resource view: clear filter if active, otherwise no-op.
+        // Esc in resource view: pop one nav level if drilled, otherwise no-op.
         KeyCode::Esc => {
-            if !app.active_filter_text().is_empty() {
+            if app.nav.is_drilled() {
                 Some(Action::ClearFilter)
             } else {
                 None
@@ -276,8 +276,17 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Sort by current column (toggle direction).
         KeyCode::Char('O') => Some(Action::ToggleSortDirection),
 
-        // Sort by NAME (column 1, or 0 if no NS).
-        KeyCode::Char('N') => Some(Action::Sort(1)),
+        // Sort by NAME: column 1 for namespaced resources, column 0 for
+        // cluster-scoped resources (which have no NAMESPACE column).
+        KeyCode::Char('N') => {
+            let col = match app.resource_tab {
+                ResourceTab::Nodes | ResourceTab::Namespaces | ResourceTab::Pvs |
+                ResourceTab::StorageClasses | ResourceTab::ClusterRoles |
+                ResourceTab::ClusterRoleBindings => 0,
+                _ => 1,
+            };
+            Some(Action::Sort(col))
+        }
 
         // Sort by AGE (last column — sentinel value usize::MAX).
         KeyCode::Char('A') => Some(Action::Sort(usize::MAX)),
@@ -293,6 +302,10 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
 
         // 0: switch to all namespaces (like k9s)
         KeyCode::Char('0') => Some(Action::SwitchNamespace("all".to_string())),
+
+        // Tab cycling.
+        KeyCode::Tab => Some(Action::NextTab),
+        KeyCode::BackTab => Some(Action::PrevTab),
 
         _ => None,
     }
@@ -399,6 +412,16 @@ fn handle_help_view_keys(key: KeyEvent) -> Option<Action> {
 // Context selector
 // ---------------------------------------------------------------------------
 
+fn handle_overview_keys(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Char('q') => Some(Action::Quit),
+        // Tab goes to the first resource view
+        KeyCode::Tab => Some(Action::NextTab),
+        KeyCode::BackTab => Some(Action::PrevTab),
+        _ => None,
+    }
+}
+
 fn handle_contexts_view_keys(key: KeyEvent) -> Option<Action> {
     match key.code {
         // `q` or Esc in context view goes back.
@@ -452,6 +475,12 @@ mod tests {
         }
     }
 
+    fn make_resource_app() -> App {
+        let mut app = App::new(String::new(), Vec::new(), String::new());
+        app.route = Route::Resources;
+        app
+    }
+
     fn make_ctrl_key(code: KeyCode) -> KeyEvent {
         KeyEvent {
             code,
@@ -472,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_q_in_resource_view_quits_when_no_filter() {
-        let app = App::new(String::new(), Vec::new(), String::new());
+        let app = make_resource_app();
         // No active filter, so `q` should quit.
         let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
         assert!(matches!(action, Some(Action::Quit)));
@@ -480,21 +509,21 @@ mod tests {
 
     #[test]
     fn test_ctrl_c_quit() {
-        let app = App::new(String::new(), Vec::new(), String::new());
+        let app = make_resource_app();
         let action = handle_key_event(&app, make_ctrl_key(KeyCode::Char('c')));
         assert!(matches!(action, Some(Action::Quit)));
     }
 
     #[test]
     fn test_help_key() {
-        let app = App::new(String::new(), Vec::new(), String::new());
+        let app = make_resource_app();
         let action = handle_key_event(&app, make_key(KeyCode::Char('?')));
         assert!(matches!(action, Some(Action::Help)));
     }
 
     #[test]
     fn test_resource_view_navigation() {
-        let app = App::new(String::new(), Vec::new(), String::new());
+        let app = make_resource_app();
         assert!(matches!(
             handle_key_event(&app, make_key(KeyCode::Char('j'))),
             Some(Action::NextItem)
@@ -511,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_resource_view_describe_yaml() {
-        let app = App::new(String::new(), Vec::new(), String::new());
+        let app = make_resource_app();
         assert!(matches!(
             handle_key_event(&app, make_key(KeyCode::Char('d'))),
             Some(Action::Describe)
@@ -524,7 +553,7 @@ mod tests {
 
     #[test]
     fn test_pods_logs_key() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
+        let mut app = make_resource_app();
         app.resource_tab = ResourceTab::Pods;
         assert!(matches!(
             handle_key_event(&app, make_key(KeyCode::Char('l'))),
@@ -544,7 +573,7 @@ mod tests {
             ResourceTab::Jobs,
             ResourceTab::CronJobs,
         ] {
-            let mut app = App::new(String::new(), Vec::new(), String::new());
+            let mut app = make_resource_app();
             app.resource_tab = tab;
             assert!(
                 matches!(handle_key_event(&app, make_key(KeyCode::Char('l'))), Some(Action::Logs)),
@@ -565,7 +594,7 @@ mod tests {
             ResourceTab::ConfigMaps,
             ResourceTab::Secrets,
         ] {
-            let mut app = App::new(String::new(), Vec::new(), String::new());
+            let mut app = make_resource_app();
             app.resource_tab = tab;
             assert!(
                 !matches!(handle_key_event(&app, make_key(KeyCode::Char('l'))), Some(Action::Logs)),
@@ -596,28 +625,28 @@ mod tests {
 
     #[test]
     fn test_ctrl_d_delete() {
-        let app = App::new(String::new(), Vec::new(), String::new());
+        let app = make_resource_app();
         let action = handle_key_event(&app, make_ctrl_key(KeyCode::Char('d')));
         assert!(matches!(action, Some(Action::Delete)));
     }
 
     #[test]
     fn test_ctrl_r_refresh() {
-        let app = App::new(String::new(), Vec::new(), String::new());
+        let app = make_resource_app();
         let action = handle_key_event(&app, make_ctrl_key(KeyCode::Char('r')));
         assert!(matches!(action, Some(Action::Refresh)));
     }
 
     #[test]
     fn test_resource_view_port_forward() {
-        let app = App::new(String::new(), Vec::new(), String::new());
+        let app = make_resource_app();
         let action = handle_key_event(&app, make_key(KeyCode::Char('f')));
         assert!(matches!(action, Some(Action::PortForward)));
     }
 
     #[test]
     fn test_restart_on_deployments() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
+        let mut app = make_resource_app();
         app.resource_tab = ResourceTab::Deployments;
         let action = handle_key_event(&app, make_key(KeyCode::Char('r')));
         assert!(matches!(action, Some(Action::Restart)));
@@ -689,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_esc_noop_in_resource_view_no_filter() {
-        let app = App::new(String::new(), Vec::new(), String::new());
+        let app = make_resource_app();
         // No active filter, so Esc should be no-op.
         let action = handle_key_event(&app, make_key(KeyCode::Esc));
         assert!(action.is_none());

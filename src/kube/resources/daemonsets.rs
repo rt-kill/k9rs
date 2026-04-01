@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::DaemonSet;
@@ -15,6 +16,8 @@ pub struct KubeDaemonSet {
     pub up_to_date: i32,
     pub available: i32,
     pub age: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub selector_labels: BTreeMap<String, String>,
 }
 
 impl KubeResource for KubeDaemonSet {
@@ -64,6 +67,11 @@ impl From<DaemonSet> for KubeDaemonSet {
         let name = metadata.name.unwrap_or_default();
         let age = metadata.creation_timestamp.map(|t| t.0);
 
+        let selector_labels = ds.spec
+            .as_ref()
+            .and_then(|s| s.selector.match_labels.clone())
+            .unwrap_or_default();
+
         let status = ds.status.unwrap_or_default();
         let desired = status.desired_number_scheduled;
         let current = status.current_number_scheduled;
@@ -80,6 +88,7 @@ impl From<DaemonSet> for KubeDaemonSet {
             up_to_date,
             available,
             age,
+            selector_labels,
         }
     }
 }

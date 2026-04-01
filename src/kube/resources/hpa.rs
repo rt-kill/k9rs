@@ -5,7 +5,7 @@ use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeHpa {
     pub namespace: String,
     pub name: String,

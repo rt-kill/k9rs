@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod nav;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -57,6 +58,7 @@ use crate::kube::resources::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
+    Overview,
     Resources,
     Yaml {
         resource: String,
@@ -91,7 +93,7 @@ pub enum Route {
 // ResourceTab
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResourceTab {
     Pods,
     Deployments,
@@ -238,18 +240,6 @@ impl FlashMessage {
     }
     pub fn is_expired(&self) -> bool {
         self.created.elapsed().as_secs() >= 5
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct FilterState {
-    pub active: bool,
-    pub text: String,
-}
-
-impl Default for FilterState {
-    fn default() -> Self {
-        Self { active: false, text: String::new() }
     }
 }
 
@@ -455,6 +445,7 @@ impl KubectlCache {
 pub struct KubeContext {
     pub name: String,
     pub cluster: String,
+    pub user: String,
     pub is_current: bool,
 }
 
@@ -553,7 +544,10 @@ pub struct App {
 
     pub data: AppData,
 
-    pub filter: FilterState,
+    /// Stackable navigation state for drill-downs and grep filters.
+    pub nav: nav::NavStack,
+    /// Filter input widget state (while user is typing `/`).
+    pub filter_input: nav::FilterInputState,
     pub flash: Option<FlashMessage>,
     pub confirm_dialog: Option<ConfirmDialog>,
 
@@ -582,10 +576,6 @@ pub struct App {
     pub pending_batch_restart: Vec<(String, String, String)>,
     /// Pending batch force-kill targets: Vec of (resource_type, name, namespace).
     pub pending_batch_force_kill: Vec<(String, String, String)>,
-
-    /// When true, the watcher waits for InitDone before sending data
-    /// (no incremental loading). Useful for drill-downs where you need all pods.
-    pub full_fetch_mode: bool,
 
     pub container_select_index: usize,
     /// When true, ContainerSelect Enter opens a shell instead of logs.
@@ -639,20 +629,20 @@ pub struct App {
 impl App {
     pub fn new(context: String, contexts: Vec<String>, namespace: String) -> Self {
         let (no_exit_on_ctrl_c, read_only) = Self::load_k9s_config();
-        let (cluster, user) = crate::kube::KubeClient::context_info(&context);
         Self {
             should_quit: false,
-            route: Route::Resources,
+            route: Route::Overview,
             route_stack: Vec::new(),
             resource_tab: ResourceTab::Pods,
             last_resource_tab: None,
             context,
-            cluster,
-            user,
+            cluster: String::new(),
+            user: String::new(),
             selected_ns: namespace,
             contexts,
             data: AppData::default(),
-            filter: FilterState::default(),
+            nav: nav::NavStack::new(ResourceTab::Pods),
+            filter_input: nav::FilterInputState::default(),
             flash: None,
             confirm_dialog: None,
             logs: LogState::new(),
@@ -668,7 +658,6 @@ impl App {
             pending_batch_delete: Vec::new(),
             pending_batch_restart: Vec::new(),
             pending_batch_force_kill: Vec::new(),
-            full_fetch_mode: false,
             container_select_index: 0,
             shell_mode_container_select: false,
             pending_shell: None,
@@ -917,62 +906,169 @@ impl App {
         }
     }
 
+    /// Get the current selection index in the active table.
+    pub fn active_table_selected(&self) -> usize {
+        self.with_active_table_ref(|t| t.nav_selected())
+    }
+
+    /// Set the selection index on the active table (clamped to bounds).
+    pub fn select_in_active_table(&mut self, idx: usize) {
+        self.with_active_table(|t| t.nav_select(idx));
+    }
+
     /// Toggle mark on the currently selected row, then advance to the next row.
     pub fn toggle_mark(&mut self) {
         self.with_active_table(|t| t.nav_toggle_mark());
     }
 
-    pub fn apply_filter(&mut self, text: &str) {
-        let t = text.to_lowercase();
-        // Compile regex once and cache it on the table
-        let re = regex::Regex::new(&t).ok();
-        macro_rules! apply {
-            ($table:expr) => {{
-                $table.filter_text = text.to_string();
-                $table.cached_filter_regex = re.clone();
-                $table.apply_filter(|item| {
-                    item.row().iter().any(|cell| {
-                        let lower = cell.to_lowercase();
-                        if let Some(ref re) = re {
-                            re.is_match(&lower)
-                        } else {
-                            lower.contains(&t)
-                        }
-                    })
-                })
-            }};
+    /// Reapply all nav stack filters (plus any uncommitted filter_input text) to the current table.
+    /// Called after: snapshot arrival, nav push/pop, grep commit, filter input keystroke.
+    pub fn reapply_nav_filters(&mut self) {
+        use crate::app::nav::NavFilter;
+
+        let filters = self.nav.active_filters();
+        // Include uncommitted filter input text as a transient grep
+        let input_text = if !self.filter_input.text.is_empty() {
+            Some(self.filter_input.text.clone())
+        } else {
+            None
+        };
+
+        let has_filters = !filters.is_empty() || input_text.is_some();
+
+        if !has_filters {
+            self.clear_filter();
+            return;
         }
-        match self.resource_tab {
-            ResourceTab::Pods => apply!(self.data.pods),
-            ResourceTab::Deployments => apply!(self.data.deployments),
-            ResourceTab::Services => apply!(self.data.services),
-            ResourceTab::Nodes => apply!(self.data.nodes),
-            ResourceTab::Namespaces => apply!(self.data.namespaces),
-            ResourceTab::ConfigMaps => apply!(self.data.configmaps),
-            ResourceTab::Secrets => apply!(self.data.secrets),
-            ResourceTab::StatefulSets => apply!(self.data.statefulsets),
-            ResourceTab::DaemonSets => apply!(self.data.daemonsets),
-            ResourceTab::Jobs => apply!(self.data.jobs),
-            ResourceTab::CronJobs => apply!(self.data.cronjobs),
-            ResourceTab::ReplicaSets => apply!(self.data.replicasets),
-            ResourceTab::Ingresses => apply!(self.data.ingresses),
-            ResourceTab::NetworkPolicies => apply!(self.data.network_policies),
-            ResourceTab::ServiceAccounts => apply!(self.data.service_accounts),
-            ResourceTab::StorageClasses => apply!(self.data.storage_classes),
-            ResourceTab::Pvs => apply!(self.data.pvs),
-            ResourceTab::Pvcs => apply!(self.data.pvcs),
-            ResourceTab::Events => apply!(self.data.events),
-            ResourceTab::Roles => apply!(self.data.roles),
-            ResourceTab::ClusterRoles => apply!(self.data.cluster_roles),
-            ResourceTab::RoleBindings => apply!(self.data.role_bindings),
-            ResourceTab::ClusterRoleBindings => apply!(self.data.cluster_role_bindings),
-            ResourceTab::Hpa => apply!(self.data.hpa),
-            ResourceTab::Endpoints => apply!(self.data.endpoints),
-            ResourceTab::LimitRanges => apply!(self.data.limit_ranges),
-            ResourceTab::ResourceQuotas => apply!(self.data.resource_quotas),
-            ResourceTab::Pdb => apply!(self.data.pdb),
-            ResourceTab::Crds => apply!(self.data.crds),
-            ResourceTab::DynamicResource => apply!(self.data.dynamic_resources),
+
+        // Build a display string for the table title
+        // For Pods: apply Labels, Field, and Grep filters
+        // For everything else: only Grep filters apply (Labels/Field are pod-specific)
+        if self.resource_tab == ResourceTab::Pods {
+            // Clone the filter data we need before the closure borrows self
+            let filters_owned: Vec<NavFilter> = filters.iter().map(|f| (*f).clone()).collect();
+            let input = input_text.clone();
+            // Clear the table's own filter_text so set_items_filtered doesn't
+            // re-grep using the breadcrumb string on the next snapshot.
+            self.data.pods.filter_text.clear();
+            self.data.pods.cached_filter_regex = None;
+            self.data.pods.apply_filter(|pod| {
+                for f in &filters_owned {
+                    match f {
+                        NavFilter::Grep(text) => {
+                            let t = text.to_lowercase();
+                            let re = regex::Regex::new(&t).ok();
+                            if !pod.row().iter().any(|cell| {
+                                let lower = cell.to_lowercase();
+                                re.as_ref().map_or(lower.contains(&t), |r| r.is_match(&lower))
+                            }) {
+                                return false;
+                            }
+                        }
+                        NavFilter::Labels(selector) => {
+                            if !selector.iter().all(|(k, v)| {
+                                pod.labels.get(k).map_or(false, |lv| lv == v)
+                            }) {
+                                return false;
+                            }
+                        }
+                        NavFilter::Field { field, value } => {
+                            let matches = match field.as_str() {
+                                "node" => pod.node == *value,
+                                "namespace" => pod.namespace == *value,
+                                _ => false,
+                            };
+                            if !matches { return false; }
+                        }
+                    }
+                }
+                // Apply uncommitted input text
+                if let Some(ref text) = input {
+                    let t = text.to_lowercase();
+                    let re = regex::Regex::new(&t).ok();
+                    if !pod.row().iter().any(|cell| {
+                        let lower = cell.to_lowercase();
+                        re.as_ref().map_or(lower.contains(&t), |r| r.is_match(&lower))
+                    }) {
+                        return false;
+                    }
+                }
+                true
+            });
+        } else {
+            // Non-pod tables: collect all grep texts, apply as composite
+            let mut grep_texts: Vec<String> = Vec::new();
+            for f in &filters {
+                if let NavFilter::Grep(text) = f {
+                    grep_texts.push(text.to_lowercase());
+                }
+            }
+            if let Some(ref text) = input_text {
+                grep_texts.push(text.to_lowercase());
+            }
+
+            if grep_texts.is_empty() {
+                self.clear_filter();
+                return;
+            }
+
+            // Compile regexes
+            let regexes: Vec<Option<regex::Regex>> = grep_texts.iter()
+                .map(|t| regex::Regex::new(t).ok())
+                .collect();
+
+            macro_rules! apply_greps {
+                ($table:expr) => {{
+                    // Clear the table's own filter state so set_items_filtered
+                    // doesn't re-grep the breadcrumb string on the next snapshot.
+                    $table.filter_text.clear();
+                    $table.cached_filter_regex = None;
+                    $table.apply_filter(|item| {
+                        for (i, t) in grep_texts.iter().enumerate() {
+                            if !item.row().iter().any(|cell| {
+                                let lower = cell.to_lowercase();
+                                regexes[i].as_ref().map_or(lower.contains(t), |r| r.is_match(&lower))
+                            }) {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                }};
+            }
+
+            match self.resource_tab {
+                ResourceTab::Pods => unreachable!(), // handled above
+                ResourceTab::Deployments => apply_greps!(self.data.deployments),
+                ResourceTab::Services => apply_greps!(self.data.services),
+                ResourceTab::Nodes => apply_greps!(self.data.nodes),
+                ResourceTab::Namespaces => apply_greps!(self.data.namespaces),
+                ResourceTab::ConfigMaps => apply_greps!(self.data.configmaps),
+                ResourceTab::Secrets => apply_greps!(self.data.secrets),
+                ResourceTab::StatefulSets => apply_greps!(self.data.statefulsets),
+                ResourceTab::DaemonSets => apply_greps!(self.data.daemonsets),
+                ResourceTab::Jobs => apply_greps!(self.data.jobs),
+                ResourceTab::CronJobs => apply_greps!(self.data.cronjobs),
+                ResourceTab::ReplicaSets => apply_greps!(self.data.replicasets),
+                ResourceTab::Ingresses => apply_greps!(self.data.ingresses),
+                ResourceTab::NetworkPolicies => apply_greps!(self.data.network_policies),
+                ResourceTab::ServiceAccounts => apply_greps!(self.data.service_accounts),
+                ResourceTab::StorageClasses => apply_greps!(self.data.storage_classes),
+                ResourceTab::Pvs => apply_greps!(self.data.pvs),
+                ResourceTab::Pvcs => apply_greps!(self.data.pvcs),
+                ResourceTab::Events => apply_greps!(self.data.events),
+                ResourceTab::Roles => apply_greps!(self.data.roles),
+                ResourceTab::ClusterRoles => apply_greps!(self.data.cluster_roles),
+                ResourceTab::RoleBindings => apply_greps!(self.data.role_bindings),
+                ResourceTab::ClusterRoleBindings => apply_greps!(self.data.cluster_role_bindings),
+                ResourceTab::Hpa => apply_greps!(self.data.hpa),
+                ResourceTab::Endpoints => apply_greps!(self.data.endpoints),
+                ResourceTab::LimitRanges => apply_greps!(self.data.limit_ranges),
+                ResourceTab::ResourceQuotas => apply_greps!(self.data.resource_quotas),
+                ResourceTab::Pdb => apply_greps!(self.data.pdb),
+                ResourceTab::Crds => apply_greps!(self.data.crds),
+                ResourceTab::DynamicResource => apply_greps!(self.data.dynamic_resources),
+            }
         }
     }
 
@@ -1148,42 +1244,6 @@ impl App {
         self.with_active_table_ref(|t| t.nav_items_count())
     }
 
-    /// Returns the active filter text for the currently active resource table.
-    pub fn active_filter_text(&self) -> &str {
-        match self.resource_tab {
-            ResourceTab::Pods => &self.data.pods.filter_text,
-            ResourceTab::Deployments => &self.data.deployments.filter_text,
-            ResourceTab::Services => &self.data.services.filter_text,
-            ResourceTab::Nodes => &self.data.nodes.filter_text,
-            ResourceTab::Namespaces => &self.data.namespaces.filter_text,
-            ResourceTab::ConfigMaps => &self.data.configmaps.filter_text,
-            ResourceTab::Secrets => &self.data.secrets.filter_text,
-            ResourceTab::StatefulSets => &self.data.statefulsets.filter_text,
-            ResourceTab::DaemonSets => &self.data.daemonsets.filter_text,
-            ResourceTab::Jobs => &self.data.jobs.filter_text,
-            ResourceTab::CronJobs => &self.data.cronjobs.filter_text,
-            ResourceTab::ReplicaSets => &self.data.replicasets.filter_text,
-            ResourceTab::Ingresses => &self.data.ingresses.filter_text,
-            ResourceTab::NetworkPolicies => &self.data.network_policies.filter_text,
-            ResourceTab::ServiceAccounts => &self.data.service_accounts.filter_text,
-            ResourceTab::StorageClasses => &self.data.storage_classes.filter_text,
-            ResourceTab::Pvs => &self.data.pvs.filter_text,
-            ResourceTab::Pvcs => &self.data.pvcs.filter_text,
-            ResourceTab::Events => &self.data.events.filter_text,
-            ResourceTab::Roles => &self.data.roles.filter_text,
-            ResourceTab::ClusterRoles => &self.data.cluster_roles.filter_text,
-            ResourceTab::RoleBindings => &self.data.role_bindings.filter_text,
-            ResourceTab::ClusterRoleBindings => &self.data.cluster_role_bindings.filter_text,
-            ResourceTab::Hpa => &self.data.hpa.filter_text,
-            ResourceTab::Endpoints => &self.data.endpoints.filter_text,
-            ResourceTab::LimitRanges => &self.data.limit_ranges.filter_text,
-            ResourceTab::ResourceQuotas => &self.data.resource_quotas.filter_text,
-            ResourceTab::Pdb => &self.data.pdb.filter_text,
-            ResourceTab::Crds => &self.data.crds.filter_text,
-            ResourceTab::DynamicResource => &self.data.dynamic_resources.filter_text,
-        }
-    }
-
     /// Find a discovered CRD by its kind name (case-insensitive).
     pub fn find_crd_by_name(&self, cmd: &str) -> Option<KubeCrd> {
         let lower = cmd.to_lowercase();
@@ -1221,6 +1281,8 @@ trait TableNav {
     fn nav_has_data(&self) -> bool;
     fn nav_items_count(&self) -> (usize, usize);
     fn nav_clear_marks(&mut self);
+    fn nav_select(&mut self, idx: usize);
+    fn nav_selected(&self) -> usize;
 }
 
 impl<T: Clone + crate::kube::resources::KubeResource> TableNav for StatefulTable<T> {
@@ -1251,6 +1313,11 @@ impl<T: Clone + crate::kube::resources::KubeResource> TableNav for StatefulTable
     fn nav_has_data(&self) -> bool { self.has_data }
     fn nav_items_count(&self) -> (usize, usize) { (self.len(), self.total()) }
     fn nav_clear_marks(&mut self) { self.marked.clear(); }
+    fn nav_select(&mut self, idx: usize) {
+        self.selected = idx.min(self.filtered_indices.len().saturating_sub(1));
+        self.adjust_offset();
+    }
+    fn nav_selected(&self) -> usize { self.selected }
 }
 
 // ---------------------------------------------------------------------------
@@ -1474,6 +1541,10 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
             self.filtered_indices = (0..self.items.len()).collect();
         }
 
+        // Marks become stale after sort — indices shifted, so clear them.
+        // This matches k9s behavior (clearing marks on sort).
+        self.marked.clear();
+
         // Clamp selection
         if self.filtered_indices.is_empty() {
             self.selected = 0;
@@ -1610,6 +1681,18 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
                     self.items[i].name() == prev_name && self.items[i].namespace() == prev_ns
                 }) {
                     self.selected = pos;
+                }
+            }
+
+            // Re-resolve marks by identity after re-sort (indices shifted).
+            if !prev_marks.is_empty() {
+                self.marked.clear();
+                for (mark_name, mark_ns) in &prev_marks {
+                    if let Some(pos) = self.items.iter().position(|item| {
+                        item.name() == mark_name && item.namespace() == mark_ns
+                    }) {
+                        self.marked.insert(pos);
+                    }
                 }
             }
         }

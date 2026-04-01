@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::batch::v1::Job;
@@ -13,6 +14,8 @@ pub struct KubeJob {
     pub duration: String,
     pub status: String,
     pub age: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub selector_labels: BTreeMap<String, String>,
 }
 
 impl KubeResource for KubeJob {
@@ -52,6 +55,10 @@ impl From<Job> for KubeJob {
         let age = metadata.creation_timestamp.map(|t| t.0);
 
         let spec = job.spec.unwrap_or_default();
+        let selector_labels = spec.selector
+            .as_ref()
+            .and_then(|s| s.match_labels.clone())
+            .unwrap_or_default();
         let desired_completions = spec.completions.unwrap_or(1);
 
         let status_obj = job.status.unwrap_or_default();
@@ -100,6 +107,7 @@ impl From<Job> for KubeJob {
             duration,
             status,
             age,
+            selector_labels,
         }
     }
 }

@@ -1,6 +1,5 @@
 pub mod contexts;
 pub mod ctl;
-pub mod get;
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -16,24 +15,6 @@ pub enum Command {
         cmd: ctl::CtlCommand,
     },
 
-    /// Query cached resources from the daemon
-    Get {
-        /// Resource type (e.g. pods, deploy, svc)
-        resource: String,
-
-        /// Context to query (defaults to current kubeconfig context)
-        #[arg(long)]
-        context: Option<String>,
-
-        /// Namespace to query (defaults to "all")
-        #[arg(short, long)]
-        namespace: Option<String>,
-
-        /// Output format: table, json, yaml
-        #[arg(short, long, default_value = "table")]
-        output: String,
-    },
-
     /// List cached contexts from disk
     Contexts,
 }
@@ -41,16 +22,20 @@ pub enum Command {
 pub async fn dispatch(cmd: Command) -> Result<()> {
     match cmd {
         Command::Daemon => {
+            // Set up logging to stderr for the daemon process.
+            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
             crate::kube::daemon::run_daemon().await
         }
         Command::Ctl { cmd } => {
             ctl::run(cmd).await
         }
-        Command::Get { resource, context, namespace, output } => {
-            get::run(&resource, context.as_deref(), namespace.as_deref(), &output).await
-        }
         Command::Contexts => {
-            contexts::run().await
+            contexts::run()
         }
     }
 }

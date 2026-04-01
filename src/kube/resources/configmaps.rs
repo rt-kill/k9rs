@@ -5,7 +5,7 @@ use k8s_openapi::api::core::v1::ConfigMap;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeConfigMap {
     pub namespace: String,
     pub name: String,

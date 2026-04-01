@@ -5,7 +5,7 @@ use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 
 use super::{access_mode_short, KubeResource};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubePvc {
     pub namespace: String,
     pub name: String,

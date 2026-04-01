@@ -1,3 +1,5 @@
+use crate::kube::protocol::ResourceScope;
+
 /// Fetch a describe-like view for a resource using the kube-rs client directly.
 /// Falls back to kubectl describe for resource types that fail native fetch.
 pub async fn fetch_describe_native(
@@ -24,13 +26,12 @@ async fn fetch_describe_via_api(
     namespace: &str,
 ) -> anyhow::Result<String> {
     use ::kube::api::{Api, DynamicObject};
-
     let (ar, scope) = resolve_api_resource(client, resource).await?;
 
-    let api: Api<DynamicObject> = if namespace.is_empty() || scope == "Cluster" {
-        Api::all_with(client.clone(), &ar)
-    } else {
-        Api::namespaced_with(client.clone(), namespace, &ar)
+    let api: Api<DynamicObject> = match scope {
+        ResourceScope::Cluster => Api::all_with(client.clone(), &ar),
+        ResourceScope::Namespaced if namespace.is_empty() => Api::default_namespaced_with(client.clone(), &ar),
+        ResourceScope::Namespaced => Api::namespaced_with(client.clone(), namespace, &ar),
     };
 
     let obj = api.get(name).await?;
@@ -237,9 +238,9 @@ fn format_describe_pod(val: &serde_json::Value, out: &mut String) {
             if key.is_empty() {
                 out.push_str(&format!("  op={}\n", op));
             } else if value.is_empty() {
-                out.push_str(&format!("  {}:{} for {}\n", key, op, if effect.is_empty() { "NoSchedule" } else { effect }));
+                out.push_str(&format!("  {}:{} for {}\n", key, op, if effect.is_empty() { "*" } else { effect }));
             } else {
-                out.push_str(&format!("  {}={}:{}\n", key, value, if effect.is_empty() { "NoSchedule" } else { effect }));
+                out.push_str(&format!("  {}={}:{}\n", key, value, if effect.is_empty() { "*" } else { effect }));
             }
         }
     }
@@ -550,14 +551,15 @@ async fn fetch_yaml_via_discovery(
     namespace: &str,
 ) -> anyhow::Result<String> {
     use ::kube::api::{Api, DynamicObject};
+    use crate::kube::protocol::ResourceScope;
 
     // Map common resource type strings to their API group/version/plural
     let (ar, scope) = resolve_api_resource(client, resource).await?;
 
-    let api: Api<DynamicObject> = if namespace.is_empty() || scope == "Cluster" {
-        Api::all_with(client.clone(), &ar)
-    } else {
-        Api::namespaced_with(client.clone(), namespace, &ar)
+    let api: Api<DynamicObject> = match scope {
+        ResourceScope::Cluster => Api::all_with(client.clone(), &ar),
+        ResourceScope::Namespaced if namespace.is_empty() => Api::default_namespaced_with(client.clone(), &ar),
+        ResourceScope::Namespaced => Api::namespaced_with(client.clone(), namespace, &ar),
     };
 
     let obj = api.get(name).await?;
@@ -569,67 +571,38 @@ async fn fetch_yaml_via_discovery(
 pub async fn resolve_api_resource(
     client: &::kube::Client,
     resource: &str,
-) -> anyhow::Result<(::kube::api::ApiResource, String)> {
+) -> anyhow::Result<(::kube::api::ApiResource, ResourceScope)> {
     use ::kube::api::ApiResource;
     use ::kube::discovery::{self, Scope};
+    use ResourceScope::{Cluster, Namespaced};
 
-    // Common built-in resources — avoid discovery roundtrip
-    let (group, version, kind, plural, scope) = match resource {
-        "pod" => ("", "v1", "Pod", "pods", "Namespaced"),
-        "deployment" => ("apps", "v1", "Deployment", "deployments", "Namespaced"),
-        "service" => ("", "v1", "Service", "services", "Namespaced"),
-        "configmap" => ("", "v1", "ConfigMap", "configmaps", "Namespaced"),
-        "secret" => ("", "v1", "Secret", "secrets", "Namespaced"),
-        "statefulset" => ("apps", "v1", "StatefulSet", "statefulsets", "Namespaced"),
-        "daemonset" => ("apps", "v1", "DaemonSet", "daemonsets", "Namespaced"),
-        "job" => ("batch", "v1", "Job", "jobs", "Namespaced"),
-        "cronjob" => ("batch", "v1", "CronJob", "cronjobs", "Namespaced"),
-        "replicaset" => ("apps", "v1", "ReplicaSet", "replicasets", "Namespaced"),
-        "ingress" => ("networking.k8s.io", "v1", "Ingress", "ingresses", "Namespaced"),
-        "networkpolicy" => ("networking.k8s.io", "v1", "NetworkPolicy", "networkpolicies", "Namespaced"),
-        "serviceaccount" => ("", "v1", "ServiceAccount", "serviceaccounts", "Namespaced"),
-        "namespace" => ("", "v1", "Namespace", "namespaces", "Cluster"),
-        "node" => ("", "v1", "Node", "nodes", "Cluster"),
-        "pv" => ("", "v1", "PersistentVolume", "persistentvolumes", "Cluster"),
-        "pvc" => ("", "v1", "PersistentVolumeClaim", "persistentvolumeclaims", "Namespaced"),
-        "storageclass" => ("storage.k8s.io", "v1", "StorageClass", "storageclasses", "Cluster"),
-        "role" => ("rbac.authorization.k8s.io", "v1", "Role", "roles", "Namespaced"),
-        "clusterrole" => ("rbac.authorization.k8s.io", "v1", "ClusterRole", "clusterroles", "Cluster"),
-        "rolebinding" => ("rbac.authorization.k8s.io", "v1", "RoleBinding", "rolebindings", "Namespaced"),
-        "clusterrolebinding" => ("rbac.authorization.k8s.io", "v1", "ClusterRoleBinding", "clusterrolebindings", "Cluster"),
-        "hpa" => ("autoscaling", "v1", "HorizontalPodAutoscaler", "horizontalpodautoscalers", "Namespaced"),
-        "endpoints" => ("", "v1", "Endpoints", "endpoints", "Namespaced"),
-        "limitrange" => ("", "v1", "LimitRange", "limitranges", "Namespaced"),
-        "resourcequota" => ("", "v1", "ResourceQuota", "resourcequotas", "Namespaced"),
-        "poddisruptionbudget" => ("policy", "v1", "PodDisruptionBudget", "poddisruptionbudgets", "Namespaced"),
-        "event" => ("", "v1", "Event", "events", "Namespaced"),
-        "customresourcedefinition" => ("apiextensions.k8s.io", "v1", "CustomResourceDefinition", "customresourcedefinitions", "Cluster"),
-        _ => {
-            // CRD or unknown — resource string is already "plural.group" format
-            // e.g. "clickhouseinstallations.clickhouse.altinity.com"
-            if resource.contains('.') {
-                let parts: Vec<&str> = resource.splitn(2, '.').collect();
-                let plural = parts[0];
-                let group = parts.get(1).unwrap_or(&"");
-                // Use discovery to find the version
-                let discovery = discovery::Discovery::new(client.clone()).run().await?;
-                for api_group in discovery.groups() {
-                    for (ar, caps) in api_group.recommended_resources() {
-                        if ar.plural == plural && ar.group == *group {
-                            let scope = if caps.scope == Scope::Cluster { "Cluster" } else { "Namespaced" };
-                            return Ok((ar, scope.to_string()));
-                        }
-                    }
+    // Look up built-in resources from the central registry — avoid discovery roundtrip
+    if let Some(meta) = crate::kube::resource_types::find_by_name(resource) {
+        let gvk = ::kube::api::GroupVersionKind::gvk(meta.group, meta.version, meta.kind);
+        let ar = ApiResource::from_gvk_with_plural(&gvk, meta.plural);
+        return Ok((ar, meta.scope));
+    }
+
+    // CRD or unknown — resource string is already "plural.group" format
+    // e.g. "clickhouseinstallations.clickhouse.altinity.com"
+    if resource.contains('.') {
+        let parts: Vec<&str> = resource.splitn(2, '.').collect();
+        let plural = parts[0];
+        let group = parts.get(1).unwrap_or(&"");
+        // Use discovery to find the version
+        let discovery = discovery::Discovery::new(client.clone()).run().await?;
+        for api_group in discovery.groups() {
+            for (ar, caps) in api_group.recommended_resources() {
+                if ar.plural == plural && ar.group == *group {
+                    let scope = if caps.scope == Scope::Cluster { Cluster } else { Namespaced };
+                    return Ok((ar, scope));
                 }
-                return Err(anyhow::anyhow!("Resource not found: {}", resource));
             }
-            return Err(anyhow::anyhow!("Unknown resource type: {}", resource));
         }
-    };
+        return Err(anyhow::anyhow!("Resource not found: {}", resource));
+    }
 
-    let gvk = ::kube::api::GroupVersionKind::gvk(group, version, kind);
-    let ar = ApiResource::from_gvk_with_plural(&gvk, plural);
-    Ok((ar, scope.to_string()))
+    Err(anyhow::anyhow!("Unknown resource type: {}", resource))
 }
 
 async fn fetch_yaml_via_kubectl(

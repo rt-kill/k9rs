@@ -5,7 +5,7 @@ use k8s_openapi::api::networking::v1::NetworkPolicy;
 
 use super::KubeResource;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KubeNetworkPolicy {
     pub namespace: String,
     pub name: String,

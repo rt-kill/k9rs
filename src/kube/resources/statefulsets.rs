@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::StatefulSet;
@@ -11,6 +12,8 @@ pub struct KubeStatefulSet {
     pub name: String,
     pub ready: String,
     pub age: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub selector_labels: BTreeMap<String, String>,
 }
 
 impl KubeResource for KubeStatefulSet {
@@ -47,7 +50,9 @@ impl From<StatefulSet> for KubeStatefulSet {
         let name = metadata.name.unwrap_or_default();
         let age = metadata.creation_timestamp.map(|t| t.0);
 
-        let desired = sts.spec.and_then(|s| s.replicas).unwrap_or(0);
+        let spec = sts.spec.unwrap_or_default();
+        let selector_labels = spec.selector.match_labels.clone().unwrap_or_default();
+        let desired = spec.replicas.unwrap_or(0);
         let ready_replicas = sts.status.and_then(|s| s.ready_replicas).unwrap_or(0);
 
         let ready = format!("{}/{}", ready_replicas, desired);
@@ -57,6 +62,7 @@ impl From<StatefulSet> for KubeStatefulSet {
             name,
             ready,
             age,
+            selector_labels,
         }
     }
 }

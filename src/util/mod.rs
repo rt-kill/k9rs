@@ -1,6 +1,40 @@
 use chrono::{DateTime, Utc};
 use unicode_width::UnicodeWidthChar;
 
+/// Try to copy text to the system clipboard using available tools.
+/// Returns `true` on success.
+pub fn try_copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let tools: &[(&str, &[&str])] = &[
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("wl-copy", &[]),
+        ("pbcopy", &[]),
+    ];
+
+    for (tool, args) in tools {
+        if let Ok(mut child) = Command::new(tool)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if let Ok(status) = child.wait() {
+                if status.success() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Generates a snake-style loading bar string: `[  ===   ]`
 /// The snake is 3 chars wide sliding across an 8-char bar.
 pub fn loading_bar(label: &str) -> String {
