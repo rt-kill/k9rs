@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use clap::Subcommand;
 
 use crate::kube::daemon::DaemonClient;
-use crate::kube::protocol::{Request, Response};
+use crate::kube::protocol::{SessionCommand, SessionEvent};
 
 #[derive(Subcommand, Debug)]
 pub enum CtlCommand {
@@ -21,10 +21,6 @@ pub enum CtlCommand {
     Clear {
         /// Context to clear (clears all if omitted)
         context: Option<String>,
-
-        /// Also remove disk cache files
-        #[arg(long)]
-        disk: bool,
     },
 }
 
@@ -33,7 +29,7 @@ pub async fn run(cmd: CtlCommand) -> Result<()> {
         CtlCommand::Status => cmd_status().await,
         CtlCommand::Ping => cmd_ping().await,
         CtlCommand::Stop => cmd_stop().await,
-        CtlCommand::Clear { context, disk } => cmd_clear(context, disk).await,
+        CtlCommand::Clear { context } => cmd_clear(context).await,
     }
 }
 
@@ -51,9 +47,9 @@ async fn connect_or_bail() -> Result<DaemonClient> {
 
 async fn cmd_status() -> Result<()> {
     let mut dc = connect_or_bail().await?;
-    let resp = dc.request(&Request::Status).await;
+    let resp = dc.request(&SessionCommand::Status).await;
     match resp {
-        Some(Response::Status(status)) => {
+        Some(SessionEvent::DaemonStatus(status)) => {
             let uptime = format_duration(status.uptime_secs);
             println!("Daemon:     running (pid {})", status.pid);
             println!("Socket:     {}", status.socket_path);
@@ -73,10 +69,10 @@ async fn cmd_status() -> Result<()> {
 async fn cmd_ping() -> Result<()> {
     let mut dc = connect_or_bail().await?;
     let start = Instant::now();
-    let resp = dc.request(&Request::Ping).await;
+    let resp = dc.request(&SessionCommand::Ping).await;
     let elapsed = start.elapsed();
     match resp {
-        Some(Response::Ok) => {
+        Some(SessionEvent::CommandResult { ok: true, .. }) => {
             println!(
                 "Daemon is alive at {:?} ({}ms)",
                 crate::kube::daemon::socket_path(),
@@ -92,57 +88,23 @@ async fn cmd_ping() -> Result<()> {
 
 async fn cmd_stop() -> Result<()> {
     let mut dc = connect_or_bail().await?;
-    let resp = dc.request(&Request::Shutdown).await;
+    let resp = dc.request(&SessionCommand::Shutdown).await;
     match resp {
-        Some(Response::Ok) => println!("Daemon shutting down"),
+        Some(SessionEvent::CommandResult { ok: true, .. }) => println!("Daemon shutting down"),
         _ => bail!("Failed to send shutdown request"),
     }
     Ok(())
 }
 
-async fn cmd_clear(context: Option<String>, disk: bool) -> Result<()> {
+async fn cmd_clear(context: Option<String>) -> Result<()> {
     let mut dc = connect_or_bail().await?;
-    let resp = dc
-        .request(&Request::Clear {
-            context: context.clone(),
-        })
-        .await;
+    let resp = dc.request(&SessionCommand::Clear { context: context.clone() }).await;
     match resp {
-        Some(Response::Ok) => {
-            match &context {
-                Some(ctx) => println!("Cleared cache for context '{}'", ctx),
-                None => println!("Cleared all cache entries"),
-            }
+        Some(SessionEvent::CommandResult { ok: true, message }) => {
+            println!("{}", message);
         }
         _ => {
             bail!("Failed to clear cache");
-        }
-    }
-
-    if disk {
-        if let Some(cache_dir) = crate::kube::cache::cache_dir() {
-            match &context {
-                Some(ctx) => {
-                    if let Some(path) = crate::kube::cache::cache_path(ctx) {
-                        if path.exists() {
-                            std::fs::remove_file(&path)?;
-                            println!("Removed disk cache: {}", path.display());
-                        }
-                    }
-                }
-                None => {
-                    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-                        let mut count = 0;
-                        for entry in entries.flatten() {
-                            if entry.path().extension().map_or(false, |x| x == "json") {
-                                std::fs::remove_file(entry.path())?;
-                                count += 1;
-                            }
-                        }
-                        println!("Removed {} disk cache files", count);
-                    }
-                }
-            }
         }
     }
     Ok(())

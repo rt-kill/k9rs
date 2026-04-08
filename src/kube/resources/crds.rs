@@ -1,82 +1,37 @@
-use std::borrow::Cow;
-use std::collections::BTreeMap;
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 
-use chrono::{DateTime, Utc};
+use crate::kube::resources::row::{ExtraValue, ResourceRow};
 
-use super::KubeResource;
+/// Convert a k8s CustomResourceDefinition into a generic ResourceRow.
+/// Extra fields carry group/version/kind/plural/scope for CRD-instance drill-down.
+pub(crate) fn crd_to_row(crd: CustomResourceDefinition) -> ResourceRow {
+    let meta = crd.metadata;
+    let spec = crd.spec;
+    let name = meta.name.unwrap_or_default();
+    let group = spec.group;
+    let version = spec
+        .versions
+        .first()
+        .map(|v| v.name.clone())
+        .unwrap_or_default();
+    let kind = spec.names.kind;
+    let plural = spec.names.plural;
+    let scope = format!("{:?}", spec.scope).trim_matches('"').to_string();
+    let age = meta.creation_timestamp.map(|ts| ts.0);
 
-/// Represents a Custom Resource Definition (CRD) in the cluster.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct KubeCrd {
-    pub name: String,        // e.g. "certificates.cert-manager.io"
-    pub group: String,       // e.g. "cert-manager.io"
-    pub version: String,     // e.g. "v1"
-    pub kind: String,        // e.g. "Certificate"
-    pub plural: String,      // e.g. "certificates" (from spec.names.plural)
-    pub scope: String,       // "Namespaced" or "Cluster"
-    pub age: Option<DateTime<Utc>>,
-}
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert("group".into(), ExtraValue::Str(group.clone()));
+    extra.insert("version".into(), ExtraValue::Str(version.clone()));
+    extra.insert("kind".into(), ExtraValue::Str(kind.clone()));
+    extra.insert("plural".into(), ExtraValue::Str(plural.clone()));
+    extra.insert("scope".into(), ExtraValue::Str(scope.clone()));
 
-impl KubeResource for KubeCrd {
-    fn headers() -> &'static [&'static str] {
-        &["NAME", "GROUP", "VERSION", "KIND", "SCOPE", "AGE"]
-    }
-
-    fn row(&self) -> Vec<Cow<'_, str>> {
-        vec![
-            Cow::Borrowed(&self.name),
-            Cow::Borrowed(&self.group),
-            Cow::Borrowed(&self.version),
-            Cow::Borrowed(&self.kind),
-            Cow::Borrowed(&self.scope),
-            Cow::Owned(crate::util::format_age(self.age)),
-        ]
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind() -> &'static str {
-        "customresourcedefinition"
-    }
-}
-
-/// Represents a dynamic/generic Kubernetes resource instance (a CRD instance).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DynamicKubeResource {
-    pub namespace: String,
-    pub name: String,
-    pub data: BTreeMap<String, String>,
-    pub age: Option<DateTime<Utc>>,
-}
-
-impl KubeResource for DynamicKubeResource {
-    fn headers() -> &'static [&'static str] {
-        &["NAMESPACE", "NAME", "STATUS", "AGE"]
-    }
-
-    fn row(&self) -> Vec<Cow<'_, str>> {
-        let status = self.data.get("status")
-            .map(|s| Cow::Owned(s.clone()))
-            .unwrap_or(Cow::Borrowed(""));
-        vec![
-            Cow::Borrowed(&self.namespace),
-            Cow::Borrowed(&self.name),
-            status,
-            Cow::Owned(crate::util::format_age(self.age)),
-        ]
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn namespace(&self) -> &str {
-        &self.namespace
-    }
-
-    fn kind() -> &'static str {
-        "dynamic"
+    ResourceRow {
+        cells: vec![
+            name.clone(), group, version, kind, scope, crate::util::format_age(age),
+        ],
+        name,
+        namespace: String::new(),
+        extra,
     }
 }

@@ -7,7 +7,7 @@
 //! `WatcherCache` manages a per-process cache of live queries using `Weak`
 //! references so watchers die naturally when no `Subscription` holds them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use dashmap::DashMap;
@@ -27,7 +27,7 @@ use k8s_openapi::api::{
     storage::v1::StorageClass,
 };
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+use kube::api::GroupVersionKind;
 use kube::runtime::watcher::{self, Event as WatcherEvent};
 use kube::{Api, Client, Resource};
 use tokio::sync::{mpsc, watch};
@@ -35,47 +35,23 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::event::ResourceUpdate;
+use crate::kube::cache::PrinterColumn;
 use crate::kube::protocol::ResourceScope;
-use crate::kube::resources::{
-    configmaps::KubeConfigMap,
-    crds::{DynamicKubeResource, KubeCrd},
-    cronjobs::KubeCronJob,
-    daemonsets::KubeDaemonSet,
-    deployments::KubeDeployment,
-    endpoints::KubeEndpoints,
-    events::KubeEvent,
-    hpa::KubeHpa,
-    ingress::KubeIngress,
-    jobs::KubeJob,
-    limitranges::KubeLimitRange,
-    namespaces::KubeNamespace,
-    networkpolicies::KubeNetworkPolicy,
-    nodes::KubeNode,
-    pdb::KubePdb,
-    pods::KubePod,
-    pvcs::KubePvc,
-    pvs::KubePv,
-    rbac::{KubeClusterRole, KubeClusterRoleBinding, KubeRole, KubeRoleBinding},
-    replicasets::KubeReplicaSet,
-    resourcequotas::KubeResourceQuota,
-    secrets::KubeSecret,
-    serviceaccounts::KubeServiceAccount,
-    services::KubeService,
-    statefulsets::KubeStatefulSet,
-    storageclasses::KubeStorageClass,
-    KubeResource,
-};
+use crate::kube::resources::KubeResource;
+use crate::kube::resources::converters::*;
 
 // ---------------------------------------------------------------------------
 // QueryKey
 // ---------------------------------------------------------------------------
 
 /// Key for looking up a live query in the cache.
+/// Uses `ContextId` so watchers are shared by actual cluster endpoint,
+/// not by context name (which can collide across kubeconfig files).
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct QueryKey {
-    pub context: String,
-    pub namespace: String,
-    pub resource_type: String,
+    pub context: crate::kube::protocol::ContextId,
+    pub namespace: crate::kube::protocol::Namespace,
+    pub resource: crate::kube::protocol::ResourceId,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,18 +97,25 @@ const GRACE_PERIOD_SECS: u64 = 300;
 /// Page size for the initial LIST request. Each page is a single HTTP response;
 /// too large and the connection drops mid-transfer, too small and continue tokens
 /// expire before all pages are fetched. 1000 items ≈ 3MB per page.
-const WATCHER_PAGE_SIZE: u32 = 1000;
+pub(crate) const WATCHER_PAGE_SIZE: u32 = 1000;
 /// Interval for flushing intermediate snapshots during the initial list.
-const INIT_FLUSH_INTERVAL_MS: u64 = 200;
-/// Sleep duration between watcher retries on error (seconds).
-const RETRY_SLEEP_SECS: u64 = 1;
+pub(crate) const INIT_FLUSH_INTERVAL_MS: u64 = 200;
+/// Initial backoff duration for watcher retries (milliseconds).
+pub(crate) const INITIAL_BACKOFF_MS: u64 = 300;
+/// Maximum single-sleep backoff cap (milliseconds).
+pub(crate) const MAX_BACKOFF_MS: u64 = 30_000;
+/// Maximum total elapsed time before giving up on retries (milliseconds).
+pub(crate) const MAX_ELAPSED_MS: u64 = 120_000;
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        // Keep the watcher alive for a grace period after this subscriber drops.
-        // Arc handles refcounting — if other subscribers or grace tasks still hold
-        // clones, the watcher stays alive beyond this task's sleep. The watcher only
-        // dies when ALL strong refs (subscribers + grace tasks) are gone.
+        // Only keep the watcher alive via grace period if it's still running.
+        // Dead watchers should be dropped immediately so the cache entry is
+        // cleaned up and a fresh watcher can be created on next subscribe.
+        if self._keepalive.task.is_finished() {
+            // Watcher task already died — drop immediately, no grace period.
+            return;
+        }
         let arc = self._keepalive.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(GRACE_PERIOD_SECS)).await;
@@ -142,7 +125,7 @@ impl Drop for Subscription {
 }
 
 impl Subscription {
-    /// Get the current snapshot (None if no data yet).
+    /// Get the current snapshot (None if no data yet, or if the watcher died).
     pub fn current(&mut self) -> Option<ResourceUpdate> {
         self.snapshot_rx.borrow_and_update().clone()
     }
@@ -150,6 +133,17 @@ impl Subscription {
     /// Wait for the next snapshot update.
     pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         self.snapshot_rx.changed().await
+    }
+
+    /// Check if the underlying watcher task is still alive.
+    pub fn is_alive(&self) -> bool {
+        !self._keepalive.task.is_finished()
+    }
+
+    /// Eagerly drop the keepalive Arc without spawning a grace period task.
+    /// Use this when you know the watcher is dead or you want immediate cleanup.
+    pub fn eager_drop(self) {
+        // Just drops self without the grace period (Drop impl checks is_finished).
     }
 }
 
@@ -180,9 +174,13 @@ impl WatcherCache {
         let weak = self.entries.get(key)?;
         let arc = weak.upgrade()?;
         tracing::info!("WatcherCache: reusing existing watcher for {:?}", key);
+        // Create a new receiver. The receiver from subscribe() has the current
+        // value available via borrow(), so the bridge's current() call will
+        // return the latest snapshot without waiting for a new update.
+        let rx = arc.snapshot_tx.subscribe();
         Some(Subscription {
             key: key.clone(),
-            snapshot_rx: arc.snapshot_tx.subscribe(),
+            snapshot_rx: rx,
             _keepalive: arc,
         })
     }
@@ -195,6 +193,7 @@ impl WatcherCache {
         &self,
         key: QueryKey,
         client: &Client,
+        server_headers: Vec<String>,
     ) -> Subscription {
         // Atomic check-and-insert via DashMap entry API.
         use dashmap::mapref::entry::Entry;
@@ -225,13 +224,13 @@ impl WatcherCache {
                 }
                 // Dead Weak — replace with new watcher.
                 tracing::info!("WatcherCache: creating new watcher for {:?}", key);
-                let (live_query, snapshot_rx) = Self::create_watcher(&key, client);
+                let (live_query, snapshot_rx) = Self::create_watcher(&key, client, server_headers);
                 e.insert(Arc::downgrade(&live_query));
                 Subscription { key, snapshot_rx, _keepalive: live_query }
             }
             Entry::Vacant(e) => {
                 tracing::info!("WatcherCache: creating new watcher for {:?}", key);
-                let (live_query, snapshot_rx) = Self::create_watcher(&key, client);
+                let (live_query, snapshot_rx) = Self::create_watcher(&key, client, server_headers);
                 e.insert(Arc::downgrade(&live_query));
                 Subscription { key, snapshot_rx, _keepalive: live_query }
             }
@@ -239,13 +238,13 @@ impl WatcherCache {
     }
 
     /// Internal: spawn a watcher task and return the LiveQuery + initial receiver.
-    fn create_watcher(key: &QueryKey, client: &Client) -> (Arc<LiveQuery>, watch::Receiver<Option<ResourceUpdate>>) {
+    fn create_watcher(key: &QueryKey, client: &Client, server_headers: Vec<String>) -> (Arc<LiveQuery>, watch::Receiver<Option<ResourceUpdate>>) {
         let (snapshot_tx, snapshot_rx) = watch::channel(None);
         let task_client = client.clone();
         let task_key = key.clone();
         let task_tx = snapshot_tx.clone();
         let task = tokio::spawn(async move {
-            run_live_watcher(task_client, task_key, task_tx).await;
+            run_live_watcher(task_client, task_key, task_tx, server_headers).await;
         });
         let live_query = Arc::new(LiveQuery {
             snapshot_tx,
@@ -269,6 +268,7 @@ impl WatcherCache {
         &self,
         key: QueryKey,
         client: &Client,
+        server_headers: Vec<String>,
     ) -> Subscription {
         // Remove the existing (possibly still-alive) Weak entry so we
         // unconditionally create a fresh watcher below.
@@ -282,7 +282,7 @@ impl WatcherCache {
         let task_tx = snapshot_tx.clone();
 
         let task = tokio::spawn(async move {
-            run_live_watcher(task_client, task_key, task_tx).await;
+            run_live_watcher(task_client, task_key, task_tx, server_headers).await;
         });
 
         let live_query = Arc::new(LiveQuery {
@@ -305,119 +305,235 @@ impl WatcherCache {
 // run_live_watcher — dispatches on resource_type string
 // ---------------------------------------------------------------------------
 
-/// Generates a match that dispatches each resource type string to a typed
-/// `Api<K>` + `run_typed_watcher` call, then returns from the enclosing function.
-///
-/// - `ns`: namespaced resources — uses `ns_api` (handles "all" namespaces).
-/// - `cluster`: cluster-scoped resources — uses `Api::all`.
-///
-/// Each entry is `pattern => K8sType, DomainType, ResourceUpdate::Variant`.
-/// Patterns can include alternatives separated by `|`.
-macro_rules! watch_resource {
-    ($rt:expr, $client:expr, $ns:expr, $snapshot_tx:expr,
-     $(ns: $($np:pat_param)|+ => $nk:ty, $nd:ty, $nv:path),+,
-     $(cluster: $($cp:pat_param)|+ => $ck:ty, $cd:ty, $cv:path),+ $(,)?
-    ) => {
-        match $rt {
-            $(
-                $($np)|+ => {
-                    let api: Api<$nk> = ns_api(&$client, &$ns);
-                    run_typed_watcher(api, $snapshot_tx, <$nd>::from, $nv, $rt).await;
-                    return;
-                }
-            )+
-            $(
-                $($cp)|+ => {
-                    let api: Api<$ck> = Api::all($client);
-                    run_typed_watcher(api, $snapshot_tx, <$cd>::from, $cv, $rt).await;
-                    return;
-                }
-            )+
-            _ => {}
-        }
-    };
-}
-
 /// Dispatches to a typed watcher based on the `resource_type` in the query key.
+///
+/// `server_headers` are column headers fetched from the K8s Table API. If
+/// non-empty they are used instead of the hardcoded fallback headers. For
+/// resources with client-only columns (pods: CPU/MEM, nodes: CPU/MEMORY) the
+/// client columns are appended after the server columns.
 async fn run_live_watcher(
     client: Client,
     key: QueryKey,
     snapshot_tx: watch::Sender<Option<ResourceUpdate>>,
+    server_headers: Vec<String>,
 ) {
     let ns = &key.namespace;
-    let rt = key.resource_type.as_str();
+    let rt = key.resource.plural.as_str();
 
-    // CRDs have a custom conversion closure and can't use the simple From-based
-    // macro, so handle them separately.
-    if rt == "customresourcedefinitions" || rt == "crds" {
-        let api: Api<CustomResourceDefinition> = Api::all(client);
+    /// Pick server-provided headers if available, otherwise use the hardcoded fallback.
+    fn pick_headers(server: &[String], fallback: Vec<String>) -> Vec<String> {
+        if server.is_empty() { fallback } else { server.to_vec() }
+    }
+
+    /// Like `pick_headers` but appends client-only columns that the server
+    /// doesn't know about (e.g. CPU/MEM from metrics-server overlay).
+    fn pick_headers_with_extra(server: &[String], fallback: Vec<String>, extra: &[&str]) -> Vec<String> {
+        if server.is_empty() {
+            fallback
+        } else {
+            let mut h = server.to_vec();
+            for col in extra {
+                let upper = col.to_uppercase();
+                if !h.iter().any(|c| c == &upper) {
+                    h.push(upper);
+                }
+            }
+            h
+        }
+    }
+
+    // ConfigMaps: migrated to the unified ResourceRow model.
+    if rt == "configmaps" {
+        let api: Api<ConfigMap> = ns_api(&client, ns);
+        let resource_id = crate::kube::protocol::ResourceId::from_alias("configmaps").unwrap();
+        let headers = pick_headers(&server_headers,
+            vec!["NAMESPACE".into(), "NAME".into(), "DATA".into(), "LABELS".into(), "AGE".into()]);
         run_typed_watcher(
             api,
             snapshot_tx,
-            |crd: CustomResourceDefinition| {
-                let meta = crd.metadata;
-                let spec = crd.spec;
-                let name = meta.name.unwrap_or_default();
-                let group = spec.group;
-                let version = spec
-                    .versions
-                    .first()
-                    .map(|v| v.name.clone())
-                    .unwrap_or_default();
-                let kind = spec.names.kind;
-                let plural = spec.names.plural;
-                let scope = format!("{:?}", spec.scope).trim_matches('"').to_string();
-                let age = meta.creation_timestamp.map(|ts| ts.0);
-                KubeCrd {
-                    name,
-                    group,
-                    version,
-                    kind,
-                    plural,
-                    scope,
-                    age,
-                }
+            configmap_to_row,
+            move |rows| ResourceUpdate::Rows {
+                resource: resource_id.clone(),
+                headers: headers.clone(),
+                rows,
             },
-            ResourceUpdate::Crds,
             rt,
         )
         .await;
         return;
     }
 
-    // Each arm dispatches to run_typed_watcher and returns.
-    watch_resource!(rt, client, ns, snapshot_tx,
-        // Namespaced resources
-        ns: "pods"                                  => Pod, KubePod, ResourceUpdate::Pods,
-        ns: "deployments"                           => Deployment, KubeDeployment, ResourceUpdate::Deployments,
-        ns: "services"                              => Service, KubeService, ResourceUpdate::Services,
-        ns: "statefulsets"                          => StatefulSet, KubeStatefulSet, ResourceUpdate::StatefulSets,
-        ns: "daemonsets"                            => DaemonSet, KubeDaemonSet, ResourceUpdate::DaemonSets,
-        ns: "jobs"                                  => Job, KubeJob, ResourceUpdate::Jobs,
-        ns: "cronjobs"                              => CronJob, KubeCronJob, ResourceUpdate::CronJobs,
-        ns: "configmaps"                            => ConfigMap, KubeConfigMap, ResourceUpdate::ConfigMaps,
-        ns: "secrets"                               => Secret, KubeSecret, ResourceUpdate::Secrets,
-        ns: "ingresses"                             => Ingress, KubeIngress, ResourceUpdate::Ingresses,
-        ns: "replicasets"                           => ReplicaSet, KubeReplicaSet, ResourceUpdate::ReplicaSets,
-        ns: "persistentvolumeclaims" | "pvcs"       => PersistentVolumeClaim, KubePvc, ResourceUpdate::Pvcs,
-        ns: "serviceaccounts"                       => ServiceAccount, KubeServiceAccount, ResourceUpdate::ServiceAccounts,
-        ns: "networkpolicies"                       => NetworkPolicy, KubeNetworkPolicy, ResourceUpdate::NetworkPolicies,
-        ns: "events"                                => Event, KubeEvent, ResourceUpdate::Events,
-        ns: "roles"                                 => Role, KubeRole, ResourceUpdate::Roles,
-        ns: "rolebindings"                          => RoleBinding, KubeRoleBinding, ResourceUpdate::RoleBindings,
-        ns: "horizontalpodautoscalers" | "hpa"      => HorizontalPodAutoscaler, KubeHpa, ResourceUpdate::Hpa,
-        ns: "endpoints"                             => Endpoints, KubeEndpoints, ResourceUpdate::Endpoints,
-        ns: "limitranges"                           => LimitRange, KubeLimitRange, ResourceUpdate::LimitRanges,
-        ns: "resourcequotas"                        => ResourceQuota, KubeResourceQuota, ResourceUpdate::ResourceQuotas,
-        ns: "poddisruptionbudgets" | "pdb"          => PodDisruptionBudget, KubePdb, ResourceUpdate::Pdb,
-        // Cluster-scoped resources
-        cluster: "nodes"                            => Node, KubeNode, ResourceUpdate::Nodes,
-        cluster: "namespaces"                       => Namespace, KubeNamespace, ResourceUpdate::Namespaces,
-        cluster: "persistentvolumes" | "pvs"        => PersistentVolume, KubePv, ResourceUpdate::Pvs,
-        cluster: "storageclasses"                   => StorageClass, KubeStorageClass, ResourceUpdate::StorageClasses,
-        cluster: "clusterroles"                     => ClusterRole, KubeClusterRole, ResourceUpdate::ClusterRoles,
-        cluster: "clusterrolebindings"              => ClusterRoleBinding, KubeClusterRoleBinding, ResourceUpdate::ClusterRoleBindings,
-    );
+    // Unified ResourceRow migrations — namespaced resources.
+    // Each uses early return with run_typed_watcher + a _to_row converter.
+    macro_rules! unified_ns {
+        ($rt_match:expr, $alias:expr, $api_type:ty, $conv:expr, $fallback:expr) => {
+            if rt == $rt_match {
+                let api: Api<$api_type> = ns_api(&client, ns);
+                let resource_id = crate::kube::protocol::ResourceId::from_alias($alias).unwrap();
+                let headers = pick_headers(&server_headers, $fallback);
+                run_typed_watcher(api, snapshot_tx, $conv, move |rows| ResourceUpdate::Rows {
+                    resource: resource_id.clone(), headers: headers.clone(), rows,
+                }, rt).await;
+                return;
+            }
+        };
+    }
+    macro_rules! unified_cluster {
+        ($rt_match:expr, $alias:expr, $api_type:ty, $conv:expr, $fallback:expr) => {
+            if rt == $rt_match {
+                let api: Api<$api_type> = Api::all(client.clone());
+                let resource_id = crate::kube::protocol::ResourceId::from_alias($alias).unwrap();
+                let headers = pick_headers(&server_headers, $fallback);
+                run_typed_watcher(api, snapshot_tx, $conv, move |rows| ResourceUpdate::Rows {
+                    resource: resource_id.clone(), headers: headers.clone(), rows,
+                }, rt).await;
+                return;
+            }
+        };
+    }
+
+    unified_ns!("secrets", "secrets", Secret, secret_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "TYPE".into(), "DATA".into(), "LABELS".into(), "AGE".into()]);
+    unified_ns!("ingresses", "ingresses", Ingress, ingress_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "CLASS".into(), "HOSTS".into(), "ADDRESS".into(), "PORTS".into(), "LABELS".into(), "AGE".into()]);
+    unified_ns!("networkpolicies", "networkpolicies", NetworkPolicy, network_policy_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "POD-SELECTOR".into(), "POLICY TYPES".into(), "AGE".into()]);
+    unified_ns!("serviceaccounts", "serviceaccounts", ServiceAccount, service_account_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "SECRETS".into(), "AGE".into()]);
+    unified_ns!("persistentvolumeclaims", "persistentvolumeclaims", PersistentVolumeClaim, pvc_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "STATUS".into(), "VOLUME".into(), "CAPACITY".into(), "ACCESS MODES".into(), "STORAGECLASS".into(), "AGE".into()]);
+    if rt == "pvcs" {
+        let api: Api<PersistentVolumeClaim> = ns_api(&client, ns);
+        let resource_id = crate::kube::protocol::ResourceId::from_alias("persistentvolumeclaims").unwrap();
+        let headers = pick_headers(&server_headers,
+            vec!["NAMESPACE".into(), "NAME".into(), "STATUS".into(), "VOLUME".into(), "CAPACITY".into(), "ACCESS MODES".into(), "STORAGECLASS".into(), "AGE".into()]);
+        run_typed_watcher(api, snapshot_tx, pvc_to_row, move |rows| ResourceUpdate::Rows {
+            resource: resource_id.clone(),
+            headers: headers.clone(),
+            rows,
+        }, rt).await;
+        return;
+    }
+    unified_ns!("events", "events", Event, event_to_row,
+        vec!["NAMESPACE".into(), "TYPE".into(), "REASON".into(), "OBJECT".into(), "MESSAGE".into(), "SOURCE".into(), "COUNT".into(), "AGE".into()]);
+    unified_ns!("roles", "roles", Role, role_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "RULES".into(), "AGE".into()]);
+    unified_ns!("rolebindings", "rolebindings", RoleBinding, role_binding_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "ROLE".into(), "SUBJECTS".into(), "AGE".into()]);
+    unified_ns!("horizontalpodautoscalers", "horizontalpodautoscalers", HorizontalPodAutoscaler, hpa_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "REFERENCE".into(), "MIN".into(), "MAX".into(), "CURRENT".into(), "AGE".into()]);
+    if rt == "hpa" {
+        let api: Api<HorizontalPodAutoscaler> = ns_api(&client, ns);
+        let resource_id = crate::kube::protocol::ResourceId::from_alias("horizontalpodautoscalers").unwrap();
+        let headers = pick_headers(&server_headers,
+            vec!["NAMESPACE".into(), "NAME".into(), "REFERENCE".into(), "MIN".into(), "MAX".into(), "CURRENT".into(), "AGE".into()]);
+        run_typed_watcher(api, snapshot_tx, hpa_to_row, move |rows| ResourceUpdate::Rows {
+            resource: resource_id.clone(),
+            headers: headers.clone(),
+            rows,
+        }, rt).await;
+        return;
+    }
+    unified_ns!("endpoints", "endpoints", Endpoints, endpoints_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "ENDPOINTS".into(), "AGE".into()]);
+    unified_ns!("limitranges", "limitranges", LimitRange, limit_range_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "TYPE".into(), "AGE".into()]);
+    unified_ns!("resourcequotas", "resourcequotas", ResourceQuota, resource_quota_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "HARD".into(), "USED".into(), "AGE".into()]);
+    unified_ns!("poddisruptionbudgets", "poddisruptionbudgets", PodDisruptionBudget, pdb_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "MIN AVAILABLE".into(), "MAX UNAVAILABLE".into(), "ALLOWED DISRUPTIONS".into(), "AGE".into()]);
+    if rt == "pdb" {
+        let api: Api<PodDisruptionBudget> = ns_api(&client, ns);
+        let resource_id = crate::kube::protocol::ResourceId::from_alias("poddisruptionbudgets").unwrap();
+        let headers = pick_headers(&server_headers,
+            vec!["NAMESPACE".into(), "NAME".into(), "MIN AVAILABLE".into(), "MAX UNAVAILABLE".into(), "ALLOWED DISRUPTIONS".into(), "AGE".into()]);
+        run_typed_watcher(api, snapshot_tx, pdb_to_row, move |rows| ResourceUpdate::Rows {
+            resource: resource_id.clone(),
+            headers: headers.clone(),
+            rows,
+        }, rt).await;
+        return;
+    }
+
+    // Tier 2 workload resources — migrated to unified ResourceRow with extra metadata.
+    unified_ns!("deployments", "deployments", Deployment, deployment_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "READY".into(), "UP-TO-DATE".into(), "AVAILABLE".into(), "CONTAINERS".into(), "IMAGES".into(), "LABELS".into(), "AGE".into()]);
+    unified_ns!("statefulsets", "statefulsets", StatefulSet, statefulset_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "READY".into(), "SERVICE".into(), "CONTAINERS".into(), "IMAGES".into(), "LABELS".into(), "AGE".into()]);
+    unified_ns!("daemonsets", "daemonsets", DaemonSet, daemonset_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "DESIRED".into(), "CURRENT".into(), "READY".into(), "UP-TO-DATE".into(), "AVAILABLE".into(), "NODE SELECTOR".into(), "LABELS".into(), "AGE".into()]);
+    unified_ns!("replicasets", "replicasets", ReplicaSet, replicaset_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "DESIRED".into(), "CURRENT".into(), "READY".into(), "LABELS".into(), "AGE".into()]);
+    unified_ns!("jobs", "jobs", Job, job_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "COMPLETIONS".into(), "DURATION".into(), "CONTAINERS".into(), "IMAGES".into(), "LABELS".into(), "AGE".into()]);
+    unified_ns!("cronjobs", "cronjobs", CronJob, cronjob_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "SCHEDULE".into(), "SUSPEND".into(), "ACTIVE".into(), "LAST SCHEDULE".into(), "CONTAINERS".into(), "IMAGES".into(), "LABELS".into(), "AGE".into()]);
+    unified_ns!("services", "services", Service, service_to_row,
+        vec!["NAMESPACE".into(), "NAME".into(), "TYPE".into(), "CLUSTER-IP".into(), "EXTERNAL-IP".into(), "SELECTOR".into(), "PORT(S)".into(), "LABELS".into(), "AGE".into()]);
+
+    // Unified ResourceRow migrations — cluster-scoped resources.
+    unified_cluster!("storageclasses", "storageclasses", StorageClass, storage_class_to_row,
+        vec!["NAME".into(), "PROVISIONER".into(), "RECLAIM POLICY".into(), "VOLUME BINDING MODE".into(), "EXPANSION".into(), "AGE".into()]);
+    unified_cluster!("persistentvolumes", "persistentvolumes", PersistentVolume, pv_to_row,
+        vec!["NAME".into(), "CAPACITY".into(), "ACCESS MODES".into(), "RECLAIM POLICY".into(), "STATUS".into(), "CLAIM".into(), "STORAGECLASS".into(), "AGE".into()]);
+    if rt == "pvs" {
+        let api: Api<PersistentVolume> = Api::all(client.clone());
+        let resource_id = crate::kube::protocol::ResourceId::from_alias("persistentvolumes").unwrap();
+        let headers = pick_headers(&server_headers,
+            vec!["NAME".into(), "CAPACITY".into(), "ACCESS MODES".into(), "RECLAIM POLICY".into(), "STATUS".into(), "CLAIM".into(), "STORAGECLASS".into(), "AGE".into()]);
+        run_typed_watcher(api, snapshot_tx, pv_to_row, move |rows| ResourceUpdate::Rows {
+            resource: resource_id.clone(),
+            headers: headers.clone(),
+            rows,
+        }, rt).await;
+        return;
+    }
+    unified_cluster!("clusterroles", "clusterroles", ClusterRole, cluster_role_to_row,
+        vec!["NAME".into(), "RULES".into(), "AGE".into()]);
+    unified_cluster!("clusterrolebindings", "clusterrolebindings", ClusterRoleBinding, cluster_role_binding_to_row,
+        vec!["NAME".into(), "ROLE".into(), "SUBJECTS".into(), "AGE".into()]);
+    unified_cluster!("namespaces", "namespaces", Namespace, namespace_to_row,
+        vec!["NAME".into(), "STATUS".into(), "AGE".into()]);
+
+    // CRDs — migrated to unified ResourceRow with extra metadata for drill-down.
+    if rt == "customresourcedefinitions" || rt == "crds" {
+        let api: Api<CustomResourceDefinition> = Api::all(client);
+        let resource_id = crate::kube::protocol::ResourceId::from_alias("customresourcedefinitions").unwrap();
+        let headers = pick_headers(&server_headers,
+            vec!["NAME".into(), "GROUP".into(), "VERSION".into(), "KIND".into(), "SCOPE".into(), "AGE".into()]);
+        run_typed_watcher(api, snapshot_tx, crd_to_row, move |rows| ResourceUpdate::Rows {
+            resource: resource_id.clone(),
+            headers: headers.clone(),
+            rows,
+        }, rt).await;
+        return;
+    }
+
+    // Nodes — server columns + client-only CPU/MEMORY columns from metrics overlay.
+    if rt == "nodes" {
+        let api: Api<Node> = Api::all(client.clone());
+        let resource_id = crate::kube::protocol::ResourceId::from_alias("nodes").unwrap();
+        let headers = pick_headers_with_extra(&server_headers,
+            vec!["NAME".into(), "STATUS".into(), "ROLES".into(), "TAINTS".into(), "VERSION".into(), "INTERNAL-IP".into(), "EXTERNAL-IP".into(), "PODS".into(), "CPU%".into(), "MEM%".into(), "ARCH".into(), "LABELS".into(), "AGE".into()],
+            &["CPU%", "MEM%"]);
+        run_typed_watcher(api, snapshot_tx, node_to_row, move |rows| ResourceUpdate::Rows {
+            resource: resource_id.clone(), headers: headers.clone(), rows,
+        }, rt).await;
+        return;
+    }
+
+    // Pods — server columns + client-only CPU/MEM columns from metrics overlay.
+    if rt == "pods" {
+        let api: Api<Pod> = ns_api(&client, ns);
+        let resource_id = crate::kube::protocol::ResourceId::from_alias("pods").unwrap();
+        let headers = pick_headers_with_extra(&server_headers,
+            vec!["NAMESPACE".into(), "NAME".into(), "READY".into(), "STATUS".into(), "RESTARTS".into(), "LAST RESTART".into(), "CPU".into(), "MEM".into(), "IP".into(), "NODE".into(), "QOS".into(), "SERVICE-ACCOUNT".into(), "READINESS GATES".into(), "LABELS".into(), "AGE".into()],
+            &["CPU", "MEM"]);
+        run_typed_watcher(api, snapshot_tx, pod_to_row, move |rows| ResourceUpdate::Rows {
+            resource: resource_id.clone(), headers: headers.clone(), rows,
+        }, rt).await;
+        return;
+    }
 
     // Only reached if no arm matched.
     warn!("live_query: unknown resource type '{}', ignoring", rt);
@@ -439,6 +555,7 @@ impl WatcherCache {
         gvk: GroupVersionKind,
         plural: String,
         scope: ResourceScope,
+        printer_columns: Vec<PrinterColumn>,
     ) -> Subscription {
         use dashmap::mapref::entry::Entry;
 
@@ -467,13 +584,13 @@ impl WatcherCache {
                 }
                 // Dead Weak — replace with new dynamic watcher.
                 tracing::info!("WatcherCache: creating new dynamic watcher for {:?}", key);
-                let (live_query, snapshot_rx) = Self::create_dynamic_watcher(&key, client, gvk, plural, scope);
+                let (live_query, snapshot_rx) = Self::create_dynamic_watcher(&key, client, gvk, plural, scope, printer_columns);
                 e.insert(Arc::downgrade(&live_query));
                 Subscription { key, snapshot_rx, _keepalive: live_query }
             }
             Entry::Vacant(e) => {
                 tracing::info!("WatcherCache: creating new dynamic watcher for {:?}", key);
-                let (live_query, snapshot_rx) = Self::create_dynamic_watcher(&key, client, gvk, plural, scope);
+                let (live_query, snapshot_rx) = Self::create_dynamic_watcher(&key, client, gvk, plural, scope, printer_columns);
                 e.insert(Arc::downgrade(&live_query));
                 Subscription { key, snapshot_rx, _keepalive: live_query }
             }
@@ -487,13 +604,14 @@ impl WatcherCache {
         gvk: GroupVersionKind,
         plural: String,
         scope: ResourceScope,
+        printer_columns: Vec<PrinterColumn>,
     ) -> (Arc<LiveQuery>, watch::Receiver<Option<ResourceUpdate>>) {
         let (snapshot_tx, snapshot_rx) = watch::channel(None);
         let task_client = client.clone();
         let task_ns = key.namespace.clone();
         let task_tx = snapshot_tx.clone();
         let task = tokio::spawn(async move {
-            run_dynamic_live_watcher(task_client, task_ns, task_tx, gvk, plural, scope).await;
+            crate::kube::live_query_dynamic::run_dynamic_live_watcher(task_client, task_ns, task_tx, gvk, plural, scope, printer_columns).await;
         });
         let live_query = Arc::new(LiveQuery {
             snapshot_tx,
@@ -504,153 +622,19 @@ impl WatcherCache {
     }
 }
 
-/// Watcher loop for dynamic CRD instances (DynamicObject -> DynamicKubeResource).
-async fn run_dynamic_live_watcher(
-    client: Client,
-    ns: String,
-    snapshot_tx: watch::Sender<Option<ResourceUpdate>>,
-    gvk: GroupVersionKind,
-    plural: String,
-    scope: ResourceScope,
-) {
-    let ar = if plural.is_empty() {
-        ApiResource::from_gvk(&gvk)
-    } else {
-        ApiResource::from_gvk_with_plural(&gvk, &plural)
-    };
-    let api: Api<DynamicObject> = if scope == ResourceScope::Namespaced {
-        if ns.is_empty() || ns == "all" {
-            Api::all_with(client, &ar)
-        } else {
-            Api::namespaced_with(client, &ns, &ar)
-        }
-    } else {
-        Api::all_with(client, &ar)
-    };
-
-    let watcher_config = watcher::Config::default()
-        .page_size(WATCHER_PAGE_SIZE)
-        .any_semantic();      // serve from API server cache (resourceVersion=0), much faster
-    let mut stream = watcher::watcher(api, watcher_config).boxed();
-
-    type ObjKey = (String, String);
-    let mut store: HashMap<ObjKey, DynamicObject> = HashMap::new();
-    let mut error_count: u32 = 0;
-    let mut init_dirty = false;
-
-    let (snap_tx, mut snap_rx) = mpsc::channel::<()>(2);
-
-    let mut init_flush = tokio::time::interval(std::time::Duration::from_millis(INIT_FLUSH_INTERVAL_MS));
-    init_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            event_result = stream.try_next() => {
-                match event_result {
-                    Ok(Some(event)) => {
-                        match event {
-                            WatcherEvent::Init => {
-                                store.clear();
-                            }
-                            WatcherEvent::InitApply(obj) => {
-                                let key = dyn_obj_key(&obj);
-                                store.insert(key, obj);
-                                init_dirty = true;
-                            }
-                            WatcherEvent::InitDone => {
-                                error_count = 0;
-                                debug!("live_query dynamic: initial list complete, {} items", store.len());
-                                let _ = snap_tx.try_send(());
-                            }
-                            WatcherEvent::Apply(obj) => {
-                                error_count = 0;
-                                let key = dyn_obj_key(&obj);
-                                store.insert(key, obj);
-                                let _ = snap_tx.try_send(());
-                            }
-                            WatcherEvent::Delete(obj) => {
-                                error_count = 0;
-                                let key = dyn_obj_key(&obj);
-                                store.remove(&key);
-                                let _ = snap_tx.try_send(());
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        debug!("live_query dynamic: stream ended");
-                        break;
-                    }
-                    Err(e) => {
-                        error_count += 1;
-                        if error_count >= MAX_CONSECUTIVE_ERRORS {
-                            warn!("live_query dynamic: watcher failed {} times consecutively, giving up", error_count);
-                            break;
-                        }
-                        warn!("live_query dynamic: watcher error: {}", e);
-                        tokio::time::sleep(std::time::Duration::from_secs(RETRY_SLEEP_SECS)).await;
-                    }
-                }
-            }
-            _ = snap_rx.recv() => {
-                let items = build_dynamic_snapshot(&store);
-
-                // Update the watch channel with typed data. Ignore closed
-                // errors — means all subscribers dropped and we'll be
-                // aborted shortly.
-                let _ = snapshot_tx.send(Some(ResourceUpdate::DynamicResources(items)));
-            }
-            _ = init_flush.tick() => {
-                if init_dirty && !store.is_empty() {
-                    init_dirty = false;
-                    let items = build_dynamic_snapshot(&store);
-                    let _ = snapshot_tx.send(Some(ResourceUpdate::DynamicResources(items)));
-                }
-            }
-        }
-    }
-
-    // Signal that the watcher has died so the bridge detects it.
-    let _ = snapshot_tx.send(None);
-}
-
-/// Build a sorted snapshot of DynamicKubeResource from the store.
-fn build_dynamic_snapshot(store: &HashMap<(String, String), DynamicObject>) -> Vec<DynamicKubeResource> {
-    let mut items: Vec<DynamicKubeResource> = store
-        .values()
-        .map(|obj| {
-            let meta = &obj.metadata;
-            let namespace = meta.namespace.clone().unwrap_or_default();
-            let name = meta.name.clone().unwrap_or_default();
-            let age = meta.creation_timestamp.as_ref().map(|ts| ts.0);
-            let mut data = BTreeMap::new();
-            if let Some(status) = obj.data.get("status") {
-                if let Some(phase) = status.get("phase") {
-                    if let Some(s) = phase.as_str() {
-                        data.insert("status".to_string(), s.to_string());
-                    }
-                }
-            }
-            DynamicKubeResource { namespace, name, data, age }
-        })
-        .collect();
-    items.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
-    items
-}
-
 // ---------------------------------------------------------------------------
 // ns_api — namespaced or cluster-wide Api
 // ---------------------------------------------------------------------------
 
-/// Returns `Api::all()` when `ns` is empty or `"all"`, otherwise `Api::namespaced()`.
-fn ns_api<K>(client: &Client, ns: &str) -> Api<K>
+/// Returns `Api::all()` for `Namespace::All`, otherwise `Api::namespaced()`.
+fn ns_api<K>(client: &Client, ns: &crate::kube::protocol::Namespace) -> Api<K>
 where
     K: Resource<Scope = k8s_openapi::NamespaceResourceScope>,
     <K as Resource>::DynamicType: Default,
 {
-    if ns.is_empty() || ns == "all" {
-        Api::all(client.clone())
-    } else {
-        Api::namespaced(client.clone(), ns)
+    match ns {
+        crate::kube::protocol::Namespace::All => Api::all(client.clone()),
+        crate::kube::protocol::Namespace::Named(name) => Api::namespaced(client.clone(), name),
     }
 }
 
@@ -658,30 +642,18 @@ where
 // Generic typed watcher loop with debounce
 // ---------------------------------------------------------------------------
 
-/// Unique key for a Kubernetes object: (namespace, name).
-type ObjKey = (String, String);
+use crate::kube::protocol::ObjectKey;
 
-/// Extracts the `(namespace, name)` key from a Kubernetes resource.
-fn obj_key<K: Resource<DynamicType = ()>>(obj: &K) -> ObjKey {
+/// Extracts the `ObjectKey` from a Kubernetes resource.
+fn obj_key<K: Resource<DynamicType = ()>>(obj: &K) -> ObjectKey {
     let meta = obj.meta();
-    (
+    ObjectKey::new(
         meta.namespace.clone().unwrap_or_default(),
         meta.name.clone().unwrap_or_default(),
     )
 }
 
-/// Extracts the `(namespace, name)` key from a DynamicObject.
-fn dyn_obj_key(obj: &DynamicObject) -> ObjKey {
-    let meta = &obj.metadata;
-    (
-        meta.namespace.clone().unwrap_or_default(),
-        meta.name.clone().unwrap_or_default(),
-    )
-}
 
-/// Maximum consecutive watcher errors before giving up. With a 2-second sleep
-/// between retries this gives ~60 seconds of retries.
-const MAX_CONSECUTIVE_ERRORS: u32 = 30;
 
 /// Runs a typed `kube::runtime::watcher` stream, maintaining a local cache.
 ///
@@ -711,8 +683,9 @@ async fn run_typed_watcher<K, T, C, W>(
         .any_semantic();      // serve from API server cache (resourceVersion=0), much faster
     let mut stream = watcher::watcher(api, watcher_config).boxed();
 
-    let mut store: HashMap<ObjKey, T> = HashMap::new();
-    let mut error_count: u32 = 0;
+    let mut store: HashMap<ObjectKey, T> = HashMap::new();
+    let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
+    let backoff_start = std::time::Instant::now();
     let mut init_dirty = false; // tracks whether we have unsent InitApply items
 
     // Channel for signalling that a snapshot should be built.
@@ -741,18 +714,18 @@ async fn run_typed_watcher<K, T, C, W>(
                                 init_dirty = true;
                             }
                             WatcherEvent::InitDone => {
-                                error_count = 0;
+                                backoff_ms = INITIAL_BACKOFF_MS;
                                 info!("live_query: initial list complete for {}, {} items", rt, store.len());
                                 let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Apply(obj) => {
-                                error_count = 0;
+                                backoff_ms = INITIAL_BACKOFF_MS;
                                 let key = obj_key(&obj);
                                 store.insert(key, convert(obj));
                                 let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Delete(obj) => {
-                                error_count = 0;
+                                backoff_ms = INITIAL_BACKOFF_MS;
                                 let key = obj_key(&obj);
                                 store.remove(&key);
                                 let _ = snap_tx.try_send(());
@@ -764,13 +737,13 @@ async fn run_typed_watcher<K, T, C, W>(
                         break;
                     }
                     Err(e) => {
-                        error_count += 1;
-                        if error_count >= MAX_CONSECUTIVE_ERRORS {
-                            warn!("live_query: watcher for {} failed {} times consecutively, giving up", rt, error_count);
+                        if backoff_start.elapsed().as_millis() as u64 > MAX_ELAPSED_MS {
+                            warn!("live_query: watcher for {} failed for over 2 minutes, giving up", rt);
                             break;
                         }
-                        warn!("live_query: watcher error for {}: {}", rt, e);
-                        tokio::time::sleep(std::time::Duration::from_secs(RETRY_SLEEP_SECS)).await;
+                        warn!("live_query: watcher error for {}: {}, retrying in {}ms", rt, e, backoff_ms);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                     }
                 }
             }

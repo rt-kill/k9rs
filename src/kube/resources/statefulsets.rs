@@ -1,68 +1,49 @@
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::StatefulSet;
 
-use super::KubeResource;
+use crate::kube::resources::row::{ExtraValue, ResourceRow};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct KubeStatefulSet {
-    pub namespace: String,
-    pub name: String,
-    pub ready: String,
-    pub age: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub selector_labels: BTreeMap<String, String>,
-}
+/// Convert a k8s StatefulSet into a generic ResourceRow.
+pub(crate) fn statefulset_to_row(sts: StatefulSet) -> ResourceRow {
+    let metadata = sts.metadata;
+    let ns = metadata.namespace.unwrap_or_default();
+    let name = metadata.name.unwrap_or_default();
+    let uid = metadata.uid.unwrap_or_default();
+    let labels = metadata.labels.unwrap_or_default();
+    let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
+    let age = metadata.creation_timestamp.map(|t| t.0);
 
-impl KubeResource for KubeStatefulSet {
-    fn headers() -> &'static [&'static str] {
-        &["NAMESPACE", "NAME", "READY", "AGE"]
-    }
+    let spec = sts.spec.unwrap_or_default();
+    let selector_labels = spec.selector.match_labels.clone().unwrap_or_default();
+    let container_ports: Vec<u16> = spec.template.spec.as_ref()
+        .map(|ps| ps.containers.iter()
+            .flat_map(|c| c.ports.as_ref().into_iter().flatten())
+            .filter(|p| p.protocol.as_deref() != Some("UDP"))
+            .map(|p| p.container_port as u16)
+            .collect())
+        .unwrap_or_default();
+    let service_name = spec.service_name.clone();
+    let containers = spec.template.spec.as_ref()
+        .map(|ps| ps.containers.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    let images = spec.template.spec.as_ref()
+        .map(|ps| ps.containers.iter().map(|c| c.image.clone().unwrap_or_default()).collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
 
-    fn row(&self) -> Vec<Cow<'_, str>> {
-        vec![
-            Cow::Borrowed(&self.namespace),
-            Cow::Borrowed(&self.name),
-            Cow::Borrowed(&self.ready),
-            Cow::Owned(crate::util::format_age(self.age)),
-        ]
-    }
+    let desired = spec.replicas.unwrap_or(0);
+    let ready_replicas = sts.status.and_then(|s| s.ready_replicas).unwrap_or(0);
+    let ready = format!("{}/{}", ready_replicas, desired);
 
-    fn name(&self) -> &str {
-        &self.name
-    }
+    let mut extra = BTreeMap::new();
+    extra.insert("selector_labels".into(), ExtraValue::Map(selector_labels));
+    extra.insert("uid".into(), ExtraValue::Str(uid));
+    extra.insert("container_ports".into(), ExtraValue::Ports(container_ports));
 
-    fn namespace(&self) -> &str {
-        &self.namespace
-    }
-
-    fn kind() -> &'static str {
-        "statefulset"
-    }
-}
-
-impl From<StatefulSet> for KubeStatefulSet {
-    fn from(sts: StatefulSet) -> Self {
-        let metadata = sts.metadata;
-        let namespace = metadata.namespace.unwrap_or_default();
-        let name = metadata.name.unwrap_or_default();
-        let age = metadata.creation_timestamp.map(|t| t.0);
-
-        let spec = sts.spec.unwrap_or_default();
-        let selector_labels = spec.selector.match_labels.clone().unwrap_or_default();
-        let desired = spec.replicas.unwrap_or(0);
-        let ready_replicas = sts.status.and_then(|s| s.ready_replicas).unwrap_or(0);
-
-        let ready = format!("{}/{}", ready_replicas, desired);
-
-        KubeStatefulSet {
-            namespace,
-            name,
-            ready,
-            age,
-            selector_labels,
-        }
+    ResourceRow {
+        cells: vec![ns.clone(), name.clone(), ready, service_name, containers, images, labels_str, crate::util::format_age(age)],
+        name,
+        namespace: ns,
+        extra,
     }
 }

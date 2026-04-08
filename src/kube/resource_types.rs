@@ -20,8 +20,25 @@ pub struct ResourceTypeMeta {
     pub scope: ResourceScope,
     /// Short aliases used in command mode (e.g., &["po", "pod", "pods"])
     pub aliases: &'static [&'static str],
-    /// Cache label used by the daemon resource cache (e.g., "Pods", "Deploy"). None if not cached.
-    pub cache_label: Option<&'static str>,
+    /// Short UI label for tab bar/breadcrumbs (e.g., "Pods", "Deploy", "STS").
+    pub short_label: &'static str,
+    /// Whether this resource supports viewing logs (resolves to pods).
+    pub supports_logs: bool,
+    /// Whether this resource supports shell exec (must be a pod).
+    pub supports_shell: bool,
+    /// Whether this resource has a /scale subresource.
+    pub supports_scale: bool,
+    /// Whether this resource supports rollout restart.
+    pub supports_restart: bool,
+}
+
+impl ResourceTypeMeta {
+    /// Build a ResourceId from this metadata.
+    pub fn to_resource_id(&self) -> crate::kube::protocol::ResourceId {
+        crate::kube::protocol::ResourceId::new(
+            self.group, self.version, self.kind, self.plural, self.scope,
+        )
+    }
 }
 
 pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
@@ -33,7 +50,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "pods",
         scope: Namespaced,
         aliases: &["po", "pod", "pods"],
-        cache_label: Some("Pods"),
+        short_label: "Pods",
+        supports_logs: true,
+        supports_shell: true,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "deployment",
@@ -43,7 +64,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "deployments",
         scope: Namespaced,
         aliases: &["dp", "deploy", "deployment", "deployments"],
-        cache_label: Some("Deploy"),
+        short_label: "Deploy",
+        supports_logs: true,
+        supports_shell: false,
+        supports_scale: true,
+        supports_restart: true,
     },
     ResourceTypeMeta {
         name: "service",
@@ -53,7 +78,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "services",
         scope: Namespaced,
         aliases: &["svc", "service", "services"],
-        cache_label: Some("Svc"),
+        short_label: "Svc",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "configmap",
@@ -63,7 +92,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "configmaps",
         scope: Namespaced,
         aliases: &["cm", "configmap", "configmaps"],
-        cache_label: Some("CM"),
+        short_label: "CM",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "secret",
@@ -73,7 +106,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "secrets",
         scope: Namespaced,
         aliases: &["sec", "secret", "secrets"],
-        cache_label: Some("Secrets"),
+        short_label: "Secrets",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "statefulset",
@@ -83,7 +120,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "statefulsets",
         scope: Namespaced,
         aliases: &["sts", "statefulset", "statefulsets"],
-        cache_label: Some("STS"),
+        short_label: "STS",
+        supports_logs: true,
+        supports_shell: false,
+        supports_scale: true,
+        supports_restart: true,
     },
     ResourceTypeMeta {
         name: "daemonset",
@@ -93,7 +134,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "daemonsets",
         scope: Namespaced,
         aliases: &["ds", "daemonset", "daemonsets"],
-        cache_label: Some("DS"),
+        short_label: "DS",
+        supports_logs: true,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: true,
     },
     ResourceTypeMeta {
         name: "job",
@@ -103,7 +148,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "jobs",
         scope: Namespaced,
         aliases: &["job", "jobs"],
-        cache_label: Some("Jobs"),
+        short_label: "Jobs",
+        supports_logs: true,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "cronjob",
@@ -113,7 +162,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "cronjobs",
         scope: Namespaced,
         aliases: &["cj", "cronjob", "cronjobs"],
-        cache_label: Some("CronJobs"),
+        short_label: "CronJobs",
+        supports_logs: true,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "replicaset",
@@ -123,7 +176,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "replicasets",
         scope: Namespaced,
         aliases: &["rs", "replicaset", "replicasets"],
-        cache_label: Some("RS"),
+        short_label: "RS",
+        supports_logs: true,
+        supports_shell: false,
+        supports_scale: true,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "ingress",
@@ -133,7 +190,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "ingresses",
         scope: Namespaced,
         aliases: &["ing", "ingress", "ingresses"],
-        cache_label: Some("Ing"),
+        short_label: "Ing",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "networkpolicy",
@@ -143,7 +204,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "networkpolicies",
         scope: Namespaced,
         aliases: &["np", "networkpolicy", "networkpolicies"],
-        cache_label: Some("NetPol"),
+        short_label: "NetPol",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "serviceaccount",
@@ -153,7 +218,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "serviceaccounts",
         scope: Namespaced,
         aliases: &["sa", "serviceaccount", "serviceaccounts"],
-        cache_label: Some("SA"),
+        short_label: "SA",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "namespace",
@@ -163,7 +232,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "namespaces",
         scope: Cluster,
         aliases: &["ns", "namespace", "namespaces"],
-        cache_label: Some("NS"),
+        short_label: "NS",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "node",
@@ -173,7 +246,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "nodes",
         scope: Cluster,
         aliases: &["no", "node", "nodes"],
-        cache_label: Some("Nodes"),
+        short_label: "Nodes",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "pv",
@@ -183,7 +260,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "persistentvolumes",
         scope: Cluster,
         aliases: &["pv", "persistentvolume", "pvs"],
-        cache_label: Some("PV"),
+        short_label: "PV",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "pvc",
@@ -193,7 +274,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "persistentvolumeclaims",
         scope: Namespaced,
         aliases: &["pvc", "persistentvolumeclaim", "pvcs"],
-        cache_label: Some("PVC"),
+        short_label: "PVC",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "storageclass",
@@ -203,7 +288,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "storageclasses",
         scope: Cluster,
         aliases: &["sc", "storageclass", "storageclasses"],
-        cache_label: Some("SC"),
+        short_label: "SC",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "role",
@@ -213,7 +302,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "roles",
         scope: Namespaced,
         aliases: &["role", "roles"],
-        cache_label: Some("Roles"),
+        short_label: "Roles",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "clusterrole",
@@ -223,7 +316,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "clusterroles",
         scope: Cluster,
         aliases: &["cr", "clusterrole", "clusterroles"],
-        cache_label: Some("CRoles"),
+        short_label: "CRoles",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "rolebinding",
@@ -233,7 +330,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "rolebindings",
         scope: Namespaced,
         aliases: &["rb", "rolebinding", "rolebindings"],
-        cache_label: Some("RB"),
+        short_label: "RB",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "clusterrolebinding",
@@ -243,7 +344,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "clusterrolebindings",
         scope: Cluster,
         aliases: &["crb", "clusterrolebinding", "clusterrolebindings"],
-        cache_label: Some("CRB"),
+        short_label: "CRB",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "hpa",
@@ -253,7 +358,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "horizontalpodautoscalers",
         scope: Namespaced,
         aliases: &["hpa", "horizontalpodautoscaler"],
-        cache_label: Some("HPA"),
+        short_label: "HPA",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "endpoints",
@@ -263,7 +372,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "endpoints",
         scope: Namespaced,
         aliases: &["ep", "endpoints"],
-        cache_label: Some("EP"),
+        short_label: "EP",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "limitrange",
@@ -273,7 +386,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "limitranges",
         scope: Namespaced,
         aliases: &["limits", "limitrange", "limitranges"],
-        cache_label: Some("Limits"),
+        short_label: "Limits",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "resourcequota",
@@ -283,7 +400,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "resourcequotas",
         scope: Namespaced,
         aliases: &["quota", "resourcequota", "resourcequotas"],
-        cache_label: Some("Quota"),
+        short_label: "Quota",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "poddisruptionbudget",
@@ -293,7 +414,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "poddisruptionbudgets",
         scope: Namespaced,
         aliases: &["pdb", "poddisruptionbudget", "poddisruptionbudgets"],
-        cache_label: Some("PDB"),
+        short_label: "PDB",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "event",
@@ -303,7 +428,11 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "events",
         scope: Namespaced,
         aliases: &["ev", "event", "events"],
-        cache_label: Some("Events"),
+        short_label: "Events",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
     ResourceTypeMeta {
         name: "customresourcedefinition",
@@ -313,13 +442,22 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         plural: "customresourcedefinitions",
         scope: Cluster,
         aliases: &["crd", "crds", "customresourcedefinition", "customresourcedefinitions"],
-        cache_label: Some("CRDs"),
+        short_label: "CRDs",
+        supports_logs: false,
+        supports_shell: false,
+        supports_scale: false,
+        supports_restart: false,
     },
 ];
 
 /// Look up a resource type by its canonical name (e.g., "pod", "deployment").
 pub fn find_by_name(name: &str) -> Option<&'static ResourceTypeMeta> {
     RESOURCE_TYPES.iter().find(|r| r.name == name)
+}
+
+/// Look up a resource type by its plural API name (e.g., "pods", "deployments").
+pub fn find_by_plural(plural: &str) -> Option<&'static ResourceTypeMeta> {
+    RESOURCE_TYPES.iter().find(|r| r.plural == plural)
 }
 
 /// Look up a resource type by any alias (case-insensitive).

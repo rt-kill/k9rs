@@ -1,6 +1,100 @@
 use chrono::{DateTime, Utc};
 use unicode_width::UnicodeWidthChar;
 
+// ---------------------------------------------------------------------------
+// Smart search (vim-style smartcase + regex)
+// ---------------------------------------------------------------------------
+
+/// Compiled search pattern with vim-style smartcase:
+/// - If the pattern contains an uppercase letter → case-sensitive
+/// - Otherwise → case-insensitive
+/// - Treated as regex; falls back to literal match if regex is invalid
+#[derive(Debug, Clone)]
+pub struct SearchPattern {
+    regex: Option<regex::Regex>,
+    literal: String,
+    case_insensitive: bool,
+}
+
+impl SearchPattern {
+    /// Compile a search pattern with smartcase.
+    pub fn new(pattern: &str) -> Self {
+        let has_upper = pattern.chars().any(|c| c.is_uppercase());
+        let case_insensitive = !has_upper;
+
+        let regex_pattern = if case_insensitive {
+            format!("(?i){}", pattern)
+        } else {
+            pattern.to_string()
+        };
+
+        let regex = regex::Regex::new(&regex_pattern).ok();
+
+        Self {
+            regex,
+            literal: if case_insensitive { pattern.to_lowercase() } else { pattern.to_string() },
+            case_insensitive,
+        }
+    }
+
+    /// Check if a line matches the pattern.
+    pub fn is_match(&self, text: &str) -> bool {
+        if let Some(ref re) = self.regex {
+            re.is_match(text)
+        } else if self.case_insensitive {
+            text.to_lowercase().contains(&self.literal)
+        } else {
+            text.contains(&self.literal)
+        }
+    }
+
+    /// Find all (start, end) byte offsets of matches in the text.
+    /// Offsets are always into the original `text`, not a lowered copy.
+    pub fn find_all(&self, text: &str) -> Vec<(usize, usize)> {
+        if let Some(ref re) = self.regex {
+            re.find_iter(text).map(|m| (m.start(), m.end())).collect()
+        } else if self.case_insensitive {
+            // Case-insensitive literal search: scan char-by-char to find
+            // matches in the original text (avoids byte offset mismatch
+            // from to_lowercase() changing byte lengths for some Unicode).
+            let needle: Vec<char> = self.literal.chars().collect();
+            if needle.is_empty() { return vec![]; }
+            let chars: Vec<(usize, char)> = text.char_indices().collect();
+            let mut results = Vec::new();
+            'outer: for i in 0..chars.len() {
+                if i + needle.len() > chars.len() { break; }
+                for (j, &nc) in needle.iter().enumerate() {
+                    let tc = chars[i + j].1;
+                    if !tc.to_lowercase().eq(nc.to_lowercase()) {
+                        continue 'outer;
+                    }
+                }
+                let start = chars[i].0;
+                let end = if i + needle.len() < chars.len() {
+                    chars[i + needle.len()].0
+                } else {
+                    text.len()
+                };
+                results.push((start, end));
+            }
+            results
+        } else {
+            text.match_indices(&self.literal)
+                .map(|(start, s)| (start, start + s.len()))
+                .collect()
+        }
+    }
+
+    /// The raw pattern string.
+    pub fn pattern(&self) -> &str {
+        &self.literal
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.literal.is_empty()
+    }
+}
+
 /// Try to copy text to the system clipboard using available tools.
 /// Returns `true` on success.
 pub fn try_copy_to_clipboard(text: &str) -> bool {
@@ -44,7 +138,7 @@ pub fn loading_bar(label: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as usize;
-    let pos = (elapsed / 200) % (bar_width + snake_len);
+    let pos = (elapsed / 100) % (bar_width + snake_len);
     let bar: String = (0..bar_width)
         .map(|i| {
             if i >= pos.saturating_sub(snake_len) && i < pos { '=' } else { ' ' }

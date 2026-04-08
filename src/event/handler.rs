@@ -1,7 +1,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::actions::Action;
-use crate::app::{App, ResourceTab, Route};
+use crate::app::{App, Route};
+#[cfg(test)]
+use crate::app::nav::rid;
+#[cfg(test)]
+use crate::app::ContainerRef;
 
 /// Maps a `KeyEvent` to an `Action` based on the current application state.
 /// Returns `None` if the key has no binding in the current context.
@@ -18,9 +22,9 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     }
 
     // -----------------------------------------------------------------------
-    // Detail views override `/` to start search instead of filter.
+    // Detail views and log view override `/` to start search instead of filter.
     // -----------------------------------------------------------------------
-    if matches!(app.route, Route::Yaml { .. } | Route::Describe { .. } | Route::Aliases) {
+    if matches!(app.route, Route::Yaml { .. } | Route::Describe { .. } | Route::Aliases { .. } | Route::Logs { .. }) {
         if key.code == KeyCode::Char('/') {
             return Some(Action::SearchStart);
         }
@@ -40,12 +44,12 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
         Route::Overview => handle_overview_keys(key),
         Route::Resources => handle_resource_view_keys(app, key),
         Route::Yaml { .. } | Route::Describe { .. } => handle_detail_view_keys(key),
-        Route::Logs { .. } => handle_log_view_keys(key),
+        Route::Logs { .. } => handle_log_view_keys(app, key),
         Route::Help => handle_help_view_keys(key),
         Route::Contexts => handle_contexts_view_keys(key),
-        Route::Shell { .. } => handle_log_view_keys(key),
+        Route::Shell { .. } => handle_log_view_keys(app, key),
         Route::ContainerSelect { .. } => handle_container_select_keys(key),
-        Route::Aliases => handle_detail_view_keys(key),
+        Route::Aliases { .. } => handle_detail_view_keys(key),
     }
 }
 
@@ -109,6 +113,16 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(Action::ToggleWide);
     }
 
+    // Ctrl-Space: span-mark (select range).
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(' ') {
+        return Some(Action::SpanMark);
+    }
+
+    // Ctrl-\: clear all marks.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('\\') {
+        return Some(Action::ClearMarks);
+    }
+
     // Ctrl-Z: toggle fault filter.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
         return Some(Action::ToggleFaultFilter);
@@ -137,18 +151,12 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
 fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
     // Ctrl-D: delete with confirmation.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
-        if app.read_only {
-            return Some(Action::FlashInfo("Read-only mode".to_string()));
-        }
         return Some(Action::Delete);
     }
 
     // Ctrl-K: force-kill pod.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
-        if app.read_only {
-            return Some(Action::FlashInfo("Read-only mode".to_string()));
-        }
-        if app.resource_tab != ResourceTab::Pods {
+        if !app.nav.resource_id().supports_shell() {
             return Some(Action::FlashInfo("Force-kill is only available on Pods".to_string()));
         }
         return Some(Action::ForceKill);
@@ -165,6 +173,7 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         }
 
         // Esc in resource view: pop one nav level if drilled, otherwise no-op.
+        // Overview is only a startup page — `:overview` or `:home` to return.
         KeyCode::Esc => {
             if app.nav.is_drilled() {
                 Some(Action::ClearFilter)
@@ -187,83 +196,65 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Detail views.
         KeyCode::Char('d') => Some(Action::Describe),
         KeyCode::Char('y') => Some(Action::Yaml),
-        KeyCode::Char('e') => {
-            if app.read_only {
-                Some(Action::FlashInfo("Read-only mode".to_string()))
-            } else {
-                Some(Action::Edit)
-            }
-        }
+        KeyCode::Char('e') => Some(Action::Edit),
 
-        // Logs: available on pods and workload types (like k9s).
-        // Services are excluded because kubectl logs doesn't work on services.
+        // Logs: available on pods and workload types.
         KeyCode::Char('l') => {
-            match app.resource_tab {
-                ResourceTab::Pods | ResourceTab::Deployments | ResourceTab::StatefulSets
-                | ResourceTab::DaemonSets | ResourceTab::ReplicaSets
-                | ResourceTab::Jobs | ResourceTab::CronJobs => Some(Action::Logs),
-                _ => Some(Action::FlashInfo("Logs not available for this resource type".to_string())),
+            if app.nav.resource_id().supports_logs() {
+                Some(Action::Logs)
+            } else {
+                Some(Action::FlashInfo("Logs not available for this resource type".to_string()))
             }
         }
         KeyCode::Char('s') => {
-            if app.resource_tab == ResourceTab::Pods {
-                if app.read_only {
-                    Some(Action::FlashInfo("Read-only mode".to_string()))
-                } else {
-                    Some(Action::Shell)
-                }
-            } else if matches!(
-                app.resource_tab,
-                ResourceTab::Deployments | ResourceTab::StatefulSets | ResourceTab::ReplicaSets
-            ) {
-                if app.read_only {
-                    Some(Action::FlashInfo("Read-only mode".to_string()))
-                } else {
-                    Some(Action::Scale)
-                }
+            let rid = app.nav.resource_id();
+            if rid.supports_shell() {
+                Some(Action::Shell)
+            } else if rid.supports_scale() {
+                Some(Action::Scale)
+            } else if rid.plural == "cronjobs" {
+                Some(Action::SuspendCronJob)
             } else {
                 None
             }
         }
-
-        // Restart (deployments/statefulsets/daemonsets).
+        KeyCode::Char('x') => {
+            if app.nav.resource_id().plural == "secrets" {
+                Some(Action::DecodeSecret)
+            } else {
+                None
+            }
+        }
+        KeyCode::Char('t') => {
+            if app.nav.resource_id().plural == "cronjobs" {
+                Some(Action::TriggerCronJob)
+            } else {
+                None
+            }
+        }
         KeyCode::Char('r') => {
-            if matches!(
-                app.resource_tab,
-                ResourceTab::Deployments | ResourceTab::StatefulSets | ResourceTab::DaemonSets
-            ) {
-                if app.read_only {
-                    Some(Action::FlashInfo("Read-only mode".to_string()))
-                } else {
-                    Some(Action::Restart)
-                }
+            if app.nav.resource_id().supports_restart() {
+                Some(Action::Restart)
             } else {
                 None
             }
         }
 
-        // Port-forward (pods only — the implementation only handles pods).
-        KeyCode::Char('f') => {
-            if app.resource_tab == ResourceTab::Pods {
-                Some(Action::PortForward)
-            } else {
-                Some(Action::FlashInfo("Port-forward is only available on Pods".to_string()))
-            }
-        }
+        // Port-forward (resolves to pod from any workload/service).
+        KeyCode::Char('f') | KeyCode::Char('F') => Some(Action::PortForward),
 
         // Previous logs: available on pods and workload types.
         KeyCode::Char('p') => {
-            match app.resource_tab {
-                ResourceTab::Pods | ResourceTab::Deployments | ResourceTab::StatefulSets
-                | ResourceTab::DaemonSets | ResourceTab::ReplicaSets
-                | ResourceTab::Jobs | ResourceTab::CronJobs => Some(Action::PreviousLogs),
-                _ => Some(Action::FlashInfo("Logs not available for this resource type".to_string())),
+            if app.nav.resource_id().supports_logs() {
+                Some(Action::PreviousLogs)
+            } else {
+                Some(Action::FlashInfo("Logs not available for this resource type".to_string()))
             }
         }
 
         // Show node for a pod.
         KeyCode::Char('o') => {
-            if app.resource_tab == ResourceTab::Pods {
+            if app.nav.resource_id().supports_shell() {
                 Some(Action::ShowNode)
             } else {
                 Some(Action::FlashInfo("Show node is only available on Pods".to_string()))
@@ -276,15 +267,10 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Sort by current column (toggle direction).
         KeyCode::Char('O') => Some(Action::ToggleSortDirection),
 
-        // Sort by NAME: column 1 for namespaced resources, column 0 for
-        // cluster-scoped resources (which have no NAMESPACE column).
+        // Sort by NAME: column 0 for cluster-scoped (no NAMESPACE column),
+        // column 1 for namespaced resources.
         KeyCode::Char('N') => {
-            let col = match app.resource_tab {
-                ResourceTab::Nodes | ResourceTab::Namespaces | ResourceTab::Pvs |
-                ResourceTab::StorageClasses | ResourceTab::ClusterRoles |
-                ResourceTab::ClusterRoleBindings => 0,
-                _ => 1,
-            };
+            let col = if app.current_tab_is_cluster_scoped() { 0 } else { 1 };
             Some(Action::Sort(col))
         }
 
@@ -292,7 +278,7 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('A') => Some(Action::Sort(usize::MAX)),
 
         // Sort by STATUS (column 3, meaningful for Pods).
-        KeyCode::Char('S') if matches!(app.resource_tab, ResourceTab::Pods) => Some(Action::Sort(3)),
+        KeyCode::Char('S') if app.nav.resource_id().supports_shell() => Some(Action::Sort(3)),
 
         // Copy.
         KeyCode::Char('c') => Some(Action::Copy),
@@ -300,8 +286,8 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Mark/select rows.
         KeyCode::Char(' ') => Some(Action::ToggleMark),
 
-        // 0: switch to all namespaces (like k9s)
-        KeyCode::Char('0') => Some(Action::SwitchNamespace("all".to_string())),
+        // 0: switch to all namespaces
+        KeyCode::Char('0') => Some(Action::SwitchNamespace(crate::kube::protocol::Namespace::All)),
 
         // Tab cycling.
         KeyCode::Tab => Some(Action::NextTab),
@@ -352,15 +338,29 @@ fn handle_detail_view_keys(key: KeyEvent) -> Option<Action> {
 // Log view
 // ---------------------------------------------------------------------------
 
-fn handle_log_view_keys(key: KeyEvent) -> Option<Action> {
+fn handle_log_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
     // Shift-C: clear logs.
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Char('C') {
         return Some(Action::ClearLogs);
     }
 
     match key.code {
-        // `q` or Esc in log view goes back.
-        KeyCode::Char('q') | KeyCode::Esc => Some(Action::Back),
+        // `q` in log view goes back.
+        KeyCode::Char('q') => Some(Action::Back),
+        // Esc: if filtering, cancel draft or pop filter; otherwise go back.
+        KeyCode::Esc => {
+            let has_log_filters = match &app.route {
+                Route::Logs { ref state, .. } | Route::Shell { ref state, .. } => {
+                    state.is_filtering() || !state.filters.is_empty()
+                }
+                _ => false,
+            };
+            if has_log_filters {
+                Some(Action::ClearFilter)
+            } else {
+                Some(Action::Back)
+            }
+        }
 
         // Scrolling.
         KeyCode::Down | KeyCode::Char('j') => Some(Action::ScrollDown(1)),
@@ -374,6 +374,10 @@ fn handle_log_view_keys(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('s') => Some(Action::ToggleLogFollow),
         KeyCode::Char('w') => Some(Action::ToggleLogWrap),
         KeyCode::Char('t') => Some(Action::ToggleLogTimestamps),
+
+        // Search navigation.
+        KeyCode::Char('n') => Some(Action::SearchNext),
+        KeyCode::Char('N') => Some(Action::SearchPrev),
 
         // Copy.
         KeyCode::Char('c') => Some(Action::Copy),
@@ -457,357 +461,6 @@ fn handle_container_select_keys(key: KeyEvent) -> Option<Action> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-
-    fn make_key(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        }
-    }
-
-    fn make_resource_app() -> App {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Resources;
-        app
-    }
-
-    fn make_ctrl_key(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::CONTROL,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        }
-    }
-
-    fn make_shift_key(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::SHIFT,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        }
-    }
-
-    #[test]
-    fn test_q_in_resource_view_quits_when_no_filter() {
-        let app = make_resource_app();
-        // No active filter, so `q` should quit.
-        let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
-        assert!(matches!(action, Some(Action::Quit)));
-    }
-
-    #[test]
-    fn test_ctrl_c_quit() {
-        let app = make_resource_app();
-        let action = handle_key_event(&app, make_ctrl_key(KeyCode::Char('c')));
-        assert!(matches!(action, Some(Action::Quit)));
-    }
-
-    #[test]
-    fn test_help_key() {
-        let app = make_resource_app();
-        let action = handle_key_event(&app, make_key(KeyCode::Char('?')));
-        assert!(matches!(action, Some(Action::Help)));
-    }
-
-    #[test]
-    fn test_resource_view_navigation() {
-        let app = make_resource_app();
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Char('j'))),
-            Some(Action::NextItem)
-        ));
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Char('k'))),
-            Some(Action::PrevItem)
-        ));
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Enter)),
-            Some(Action::Enter)
-        ));
-    }
-
-    #[test]
-    fn test_resource_view_describe_yaml() {
-        let app = make_resource_app();
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Char('d'))),
-            Some(Action::Describe)
-        ));
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Char('y'))),
-            Some(Action::Yaml)
-        ));
-    }
-
-    #[test]
-    fn test_pods_logs_key() {
-        let mut app = make_resource_app();
-        app.resource_tab = ResourceTab::Pods;
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Char('l'))),
-            Some(Action::Logs)
-        ));
-    }
-
-    #[test]
-    fn test_workload_types_have_logs() {
-        // All workload-related resource tabs should support logs.
-        // Services are excluded because kubectl logs doesn't work on services.
-        for tab in [
-            ResourceTab::Deployments,
-            ResourceTab::StatefulSets,
-            ResourceTab::DaemonSets,
-            ResourceTab::ReplicaSets,
-            ResourceTab::Jobs,
-            ResourceTab::CronJobs,
-        ] {
-            let mut app = make_resource_app();
-            app.resource_tab = tab;
-            assert!(
-                matches!(handle_key_event(&app, make_key(KeyCode::Char('l'))), Some(Action::Logs)),
-                "Expected Logs action for {:?}",
-                tab,
-            );
-        }
-    }
-
-    #[test]
-    fn test_non_workload_no_logs() {
-        // Non-workload resource tabs should NOT produce a Logs action.
-        // Instead they produce a FlashInfo message.
-        for tab in [
-            ResourceTab::Services,
-            ResourceTab::Nodes,
-            ResourceTab::Namespaces,
-            ResourceTab::ConfigMaps,
-            ResourceTab::Secrets,
-        ] {
-            let mut app = make_resource_app();
-            app.resource_tab = tab;
-            assert!(
-                !matches!(handle_key_event(&app, make_key(KeyCode::Char('l'))), Some(Action::Logs)),
-                "Expected no Logs action for {:?}",
-                tab,
-            );
-        }
-    }
-
-    #[test]
-    fn test_confirm_dialog_keys() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.confirm_dialog = Some(crate::app::ConfirmDialog {
-            message: "Are you sure?".to_string(),
-            action: Action::Delete,
-            yes_selected: false,
-        });
-
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Char('y'))),
-            Some(Action::Confirm)
-        ));
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Char('n'))),
-            Some(Action::Cancel)
-        ));
-    }
-
-    #[test]
-    fn test_ctrl_d_delete() {
-        let app = make_resource_app();
-        let action = handle_key_event(&app, make_ctrl_key(KeyCode::Char('d')));
-        assert!(matches!(action, Some(Action::Delete)));
-    }
-
-    #[test]
-    fn test_ctrl_r_refresh() {
-        let app = make_resource_app();
-        let action = handle_key_event(&app, make_ctrl_key(KeyCode::Char('r')));
-        assert!(matches!(action, Some(Action::Refresh)));
-    }
-
-    #[test]
-    fn test_resource_view_port_forward() {
-        let app = make_resource_app();
-        let action = handle_key_event(&app, make_key(KeyCode::Char('f')));
-        assert!(matches!(action, Some(Action::PortForward)));
-    }
-
-    #[test]
-    fn test_restart_on_deployments() {
-        let mut app = make_resource_app();
-        app.resource_tab = ResourceTab::Deployments;
-        let action = handle_key_event(&app, make_key(KeyCode::Char('r')));
-        assert!(matches!(action, Some(Action::Restart)));
-    }
-
-    #[test]
-    fn test_q_goes_back_in_detail_view() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Yaml {
-            resource: String::new(),
-            name: String::new(),
-            namespace: String::new(),
-        };
-        let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
-        assert!(matches!(action, Some(Action::Back)));
-    }
-
-    #[test]
-    fn test_log_view_s_toggles_follow() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Logs {
-            pod: String::new(),
-            container: String::new(),
-            namespace: String::new(),
-        };
-        let action = handle_key_event(&app, make_key(KeyCode::Char('s')));
-        assert!(matches!(action, Some(Action::ToggleLogFollow)));
-    }
-
-    #[test]
-    fn test_log_view_t_toggles_timestamps() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Logs {
-            pod: String::new(),
-            container: String::new(),
-            namespace: String::new(),
-        };
-        let action = handle_key_event(&app, make_key(KeyCode::Char('t')));
-        assert!(matches!(action, Some(Action::ToggleLogTimestamps)));
-    }
-
-    #[test]
-    fn test_log_view_shift_c_clears_logs() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Logs {
-            pod: String::new(),
-            container: String::new(),
-            namespace: String::new(),
-        };
-        let action = handle_key_event(&app, make_shift_key(KeyCode::Char('C')));
-        assert!(matches!(action, Some(Action::ClearLogs)));
-    }
-
-    #[test]
-    fn test_q_goes_back_in_help_view() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Help;
-        let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
-        assert!(matches!(action, Some(Action::Back)));
-    }
-
-    #[test]
-    fn test_q_goes_back_in_contexts_view() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Contexts;
-        let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
-        assert!(matches!(action, Some(Action::Back)));
-    }
-
-    #[test]
-    fn test_esc_noop_in_resource_view_no_filter() {
-        let app = make_resource_app();
-        // No active filter, so Esc should be no-op.
-        let action = handle_key_event(&app, make_key(KeyCode::Esc));
-        assert!(action.is_none());
-    }
-
-    #[test]
-    fn test_esc_goes_back_in_detail_view() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Describe {
-            resource: String::new(),
-            name: String::new(),
-            namespace: String::new(),
-        };
-        let action = handle_key_event(&app, make_key(KeyCode::Esc));
-        assert!(matches!(action, Some(Action::Back)));
-    }
-
-    #[test]
-    fn test_esc_goes_back_in_log_view() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Logs {
-            pod: String::new(),
-            container: String::new(),
-            namespace: String::new(),
-        };
-        let action = handle_key_event(&app, make_key(KeyCode::Esc));
-        assert!(matches!(action, Some(Action::Back)));
-    }
-
-    #[test]
-    fn test_esc_goes_back_in_help_view() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Help;
-        let action = handle_key_event(&app, make_key(KeyCode::Esc));
-        assert!(matches!(action, Some(Action::Back)));
-    }
-
-    #[test]
-    fn test_esc_goes_back_in_contexts_view() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Contexts;
-        let action = handle_key_event(&app, make_key(KeyCode::Esc));
-        assert!(matches!(action, Some(Action::Back)));
-    }
-
-    #[test]
-    fn test_q_goes_back_in_container_select() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::ContainerSelect {
-            pod: String::new(),
-            namespace: String::new(),
-        };
-        let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
-        assert!(matches!(action, Some(Action::Back)));
-    }
-
-    #[test]
-    fn test_log_view_home_end() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Logs {
-            pod: String::new(),
-            container: String::new(),
-            namespace: String::new(),
-        };
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Char('g'))),
-            Some(Action::Home)
-        ));
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Char('G'))),
-            Some(Action::End)
-        ));
-    }
-
-    #[test]
-    fn test_detail_view_home_end() {
-        let mut app = App::new(String::new(), Vec::new(), String::new());
-        app.route = Route::Yaml {
-            resource: String::new(),
-            name: String::new(),
-            namespace: String::new(),
-        };
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Char('g'))),
-            Some(Action::Home)
-        ));
-        assert!(matches!(
-            handle_key_event(&app, make_key(KeyCode::Char('G'))),
-            Some(Action::End)
-        ));
-    }
-}
+#[path = "handler_tests.rs"]
+mod tests;

@@ -1,444 +1,28 @@
 pub mod actions;
 pub mod nav;
+pub mod table;
+pub mod types;
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+pub use table::*;
+pub use types::*;
 
-/// Parse a formatted age string like "5m", "2h3m", "3d5h" to total seconds.
-/// Used for correct age-column sorting (lexicographic comparison gets it wrong).
-fn parse_age_seconds(s: &str) -> u64 {
-    let mut total: u64 = 0;
-    let mut num: u64 = 0;
-    for c in s.chars() {
-        match c {
-            '0'..='9' => num = num * 10 + (c as u64 - '0' as u64),
-            'd' => { total += num * 86400; num = 0; }
-            'h' => { total += num * 3600; num = 0; }
-            'm' => { total += num * 60; num = 0; }
-            's' => { total += num; num = 0; }
-            _ => {}
-        }
-    }
-    total + num // handle trailing number without suffix
-}
+use std::collections::HashMap;
+use std::time::Duration;
 
-use crate::kube::resources::{
-    KubeResource,
-    configmaps::KubeConfigMap,
-    crds::{KubeCrd, DynamicKubeResource},
-    cronjobs::KubeCronJob,
-    daemonsets::KubeDaemonSet,
-    deployments::KubeDeployment,
-    endpoints::KubeEndpoints,
-    events::KubeEvent,
-    hpa::KubeHpa,
-    ingress::KubeIngress,
-    jobs::KubeJob,
-    limitranges::KubeLimitRange,
-    namespaces::KubeNamespace,
-    networkpolicies::KubeNetworkPolicy,
-    nodes::KubeNode,
-    pdb::KubePdb,
-    pods::KubePod,
-    pvcs::KubePvc,
-    pvs::KubePv,
-    rbac::{KubeClusterRole, KubeClusterRoleBinding, KubeRole, KubeRoleBinding},
-    replicasets::KubeReplicaSet,
-    resourcequotas::KubeResourceQuota,
-    secrets::KubeSecret,
-    serviceaccounts::KubeServiceAccount,
-    services::KubeService,
-    statefulsets::KubeStatefulSet,
-    storageclasses::KubeStorageClass,
-};
+use crate::kube::protocol::{ObjectKey, ResourceId};
+use crate::kube::resource_types::RESOURCE_TYPES;
+use crate::kube::resources::KubeResource;
+
+pub const CHANGE_HIGHLIGHT_SECS: u64 = 5;
 
 // ---------------------------------------------------------------------------
-// Route
+// Pinned resource list for tab cycling
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Route {
-    Overview,
-    Resources,
-    Yaml {
-        resource: String,
-        name: String,
-        namespace: String,
-    },
-    Describe {
-        resource: String,
-        name: String,
-        namespace: String,
-    },
-    Logs {
-        pod: String,
-        container: String,
-        namespace: String,
-    },
-    Shell {
-        pod: String,
-        container: String,
-        namespace: String,
-    },
-    Help,
-    Contexts,
-    ContainerSelect {
-        pod: String,
-        namespace: String,
-    },
-    Aliases,
-}
-
-// ---------------------------------------------------------------------------
-// ResourceTab
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ResourceTab {
-    Pods,
-    Deployments,
-    Services,
-    StatefulSets,
-    DaemonSets,
-    Jobs,
-    CronJobs,
-    ConfigMaps,
-    Secrets,
-    Nodes,
-    Namespaces,
-    Ingresses,
-    ReplicaSets,
-    Pvs,
-    Pvcs,
-    StorageClasses,
-    ServiceAccounts,
-    NetworkPolicies,
-    Events,
-    Roles,
-    ClusterRoles,
-    RoleBindings,
-    ClusterRoleBindings,
-    Hpa,
-    Endpoints,
-    LimitRanges,
-    ResourceQuotas,
-    Pdb,
-    Crds,
-    DynamicResource,
-}
-
-impl ResourceTab {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Pods => "Pods",
-            Self::Deployments => "Deploy",
-            Self::Services => "Svc",
-            Self::StatefulSets => "STS",
-            Self::DaemonSets => "DS",
-            Self::Jobs => "Jobs",
-            Self::CronJobs => "CronJobs",
-            Self::ConfigMaps => "CM",
-            Self::Secrets => "Secrets",
-            Self::Nodes => "Nodes",
-            Self::Namespaces => "NS",
-            Self::Ingresses => "Ing",
-            Self::ReplicaSets => "RS",
-            Self::Pvs => "PV",
-            Self::Pvcs => "PVC",
-            Self::StorageClasses => "SC",
-            Self::ServiceAccounts => "SA",
-            Self::NetworkPolicies => "NetPol",
-            Self::Events => "Events",
-            Self::Roles => "Roles",
-            Self::ClusterRoles => "CRoles",
-            Self::RoleBindings => "RB",
-            Self::ClusterRoleBindings => "CRB",
-            Self::Hpa => "HPA",
-            Self::Endpoints => "EP",
-            Self::LimitRanges => "Limits",
-            Self::ResourceQuotas => "Quota",
-            Self::Pdb => "PDB",
-            Self::Crds => "CRDs",
-            Self::DynamicResource => "CRD",
-        }
-    }
-
-    pub fn all() -> &'static [ResourceTab] {
-        &[
-            Self::Pods,
-            Self::Deployments,
-            Self::Services,
-            Self::StatefulSets,
-            Self::DaemonSets,
-            Self::Jobs,
-            Self::CronJobs,
-            Self::ConfigMaps,
-            Self::Secrets,
-            Self::Nodes,
-            Self::Namespaces,
-            Self::Ingresses,
-            Self::ReplicaSets,
-            Self::Pvs,
-            Self::Pvcs,
-            Self::StorageClasses,
-            Self::ServiceAccounts,
-            Self::NetworkPolicies,
-            Self::Events,
-            Self::Roles,
-            Self::ClusterRoles,
-            Self::RoleBindings,
-            Self::ClusterRoleBindings,
-            Self::Hpa,
-            Self::Endpoints,
-            Self::LimitRanges,
-            Self::ResourceQuotas,
-            Self::Pdb,
-            Self::Crds,
-        ]
-    }
-
-    pub fn index(&self) -> usize {
-        // DynamicResource is not in all(), so give it the same index as Crds
-        if *self == Self::DynamicResource {
-            return Self::Crds.index();
-        }
-        Self::all().iter().position(|t| t == self).unwrap_or(0)
-    }
-
-    pub fn from_index(i: usize) -> Self {
-        Self::all().get(i).copied().unwrap_or(Self::Pods)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Flash / Filter / Confirm / Log / Yaml / Describe state
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlashLevel {
-    Info,
-    Warn,
-    Error,
-}
-
-#[derive(Debug, Clone)]
-pub struct FlashMessage {
-    pub message: String,
-    pub level: FlashLevel,
-    pub created: Instant,
-}
-
-impl FlashMessage {
-    pub fn info(msg: impl Into<String>) -> Self {
-        Self { message: msg.into(), level: FlashLevel::Info, created: Instant::now() }
-    }
-    pub fn warn(msg: impl Into<String>) -> Self {
-        Self { message: msg.into(), level: FlashLevel::Warn, created: Instant::now() }
-    }
-    pub fn error(msg: impl Into<String>) -> Self {
-        Self { message: msg.into(), level: FlashLevel::Error, created: Instant::now() }
-    }
-    pub fn is_expired(&self) -> bool {
-        self.created.elapsed().as_secs() >= 5
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ConfirmDialog {
-    pub message: String,
-    pub action: actions::Action,
-    pub yes_selected: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct LogState {
-    pub lines: VecDeque<String>,
-    pub max_lines: usize,
-    pub scroll: usize,
-    pub follow: bool,
-    pub wrap: bool,
-    pub show_timestamps: bool,
-    /// Whether a log streaming task is currently running.
-    pub streaming: bool,
-    /// The --since time range for kubectl logs. None = use tail_lines instead.
-    pub since: Option<String>,
-    /// Number of recent log lines to fetch with --tail when since is None.
-    pub tail_lines: u64,
-}
-
-impl Default for LogState {
-    fn default() -> Self {
-        Self {
-            lines: VecDeque::new(),
-            max_lines: 50_000,
-            scroll: 0,
-            follow: false,
-            wrap: false,
-            show_timestamps: true,
-            streaming: false,
-            since: None,
-            tail_lines: 500,
-        }
-    }
-}
-
-impl LogState {
-    pub fn new() -> Self {
-        Self { follow: true, show_timestamps: true, streaming: false, ..Default::default() }
-    }
-    pub fn push(&mut self, line: String) {
-        if self.lines.len() >= self.max_lines {
-            self.lines.pop_front();
-            // Adjust scroll to account for removed line so the viewport
-            // doesn't drift when the ring buffer evicts old entries.
-            if !self.follow {
-                self.scroll = self.scroll.saturating_sub(1);
-            }
-        }
-        self.lines.push_back(line);
-        // Don't update scroll here — the render path handles follow mode
-        // by computing the correct viewport position from total line count.
-        // Setting scroll in push() causes a mismatch that produces a
-        // "catch-up" scroll effect when follow is later disabled.
-    }
-    pub fn clear(&mut self) {
-        self.lines.clear();
-        self.scroll = 0;
-    }
-}
-
-/// Shared state for YAML and Describe content views (previously duplicated as
-/// `YamlState` and `DescribeState`).
-#[derive(Debug, Clone, Default)]
-pub struct ContentViewState {
-    pub content: String,
-    pub scroll: usize,
-    pub search: Option<String>,
-    pub search_matches: Vec<usize>,
-    pub current_match: usize,
-    pub search_input_active: bool,
-    pub search_input: String,
-}
-
-impl ContentViewState {
-    /// Recompute search matches from current content and search term.
-    pub fn update_search(&mut self) {
-        self.search_matches.clear();
-        self.current_match = 0;
-        if let Some(ref term) = self.search {
-            if term.is_empty() {
-                return;
-            }
-            let lower_term = term.to_lowercase();
-            for (i, line) in self.content.lines().enumerate() {
-                if line.to_lowercase().contains(&lower_term) {
-                    self.search_matches.push(i);
-                }
-            }
-        }
-    }
-
-    /// Jump to the next search match, centering it in the viewport.
-    pub fn next_match(&mut self, visible: usize) {
-        if self.search_matches.is_empty() {
-            return;
-        }
-        self.current_match = (self.current_match + 1) % self.search_matches.len();
-        let target = self.search_matches[self.current_match];
-        self.scroll = target.saturating_sub(visible / 2);
-    }
-
-    /// Jump to the previous search match, centering it in the viewport.
-    pub fn prev_match(&mut self, visible: usize) {
-        if self.search_matches.is_empty() {
-            return;
-        }
-        self.current_match = if self.current_match == 0 {
-            self.search_matches.len() - 1
-        } else {
-            self.current_match - 1
-        };
-        let target = self.search_matches[self.current_match];
-        self.scroll = target.saturating_sub(visible / 2);
-    }
-
-    /// Clear search state.
-    pub fn clear_search(&mut self) {
-        self.search = None;
-        self.search_matches.clear();
-        self.current_match = 0;
-        self.search_input_active = false;
-        self.search_input.clear();
-    }
-}
-
-/// Type alias for backward compatibility.
-pub type YamlState = ContentViewState;
-/// Type alias for backward compatibility.
-pub type DescribeState = ContentViewState;
-
-// ---------------------------------------------------------------------------
-// KubectlCache — TTL cache for describe/yaml kubectl output
-// ---------------------------------------------------------------------------
-
-pub struct KubectlCache {
-    entries: HashMap<(String, String, String, &'static str), (String, Instant)>,
-    insertion_order: Vec<(String, String, String, &'static str)>,
-    ttl: Duration,
-    max_capacity: usize,
-}
-
-impl KubectlCache {
-    pub fn new(ttl: Duration) -> Self {
-        Self {
-            entries: HashMap::new(),
-            insertion_order: Vec::new(),
-            ttl,
-            max_capacity: 100,
-        }
-    }
-
-    pub fn get(&self, resource: &str, name: &str, namespace: &str, kind: &'static str) -> Option<&str> {
-        self.entries
-            .get(&(resource.to_string(), name.to_string(), namespace.to_string(), kind))
-            .and_then(|(content, ts)| {
-                if ts.elapsed() < self.ttl {
-                    Some(content.as_str())
-                } else {
-                    None
-                }
-            })
-    }
-
-    pub fn insert(
-        &mut self,
-        resource: String,
-        name: String,
-        namespace: String,
-        kind: &'static str,
-        content: String,
-    ) {
-        let key = (resource, name, namespace, kind);
-        // If the key already exists, just update the value (no change to insertion order).
-        if self.entries.contains_key(&key) {
-            self.entries.insert(key, (content, Instant::now()));
-            return;
-        }
-        // Evict the oldest entry if at capacity.
-        if self.entries.len() >= self.max_capacity {
-            if let Some(oldest_key) = self.insertion_order.first().cloned() {
-                self.entries.remove(&oldest_key);
-                self.insertion_order.remove(0);
-            }
-        }
-        self.insertion_order.push(key.clone());
-        self.entries.insert(key, (content, Instant::now()));
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.insertion_order.clear();
-    }
+/// The default ordered list of pinned resources for Tab/BackTab cycling.
+/// This replaces the old ResourceTab::all() enum.
+pub fn default_pinned_resources() -> Vec<ResourceId> {
+    RESOURCE_TYPES.iter().map(|m| m.to_resource_id()).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -453,73 +37,123 @@ pub struct KubeContext {
 // AppData — all resource tables
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Column visibility levels
+// ---------------------------------------------------------------------------
+
+/// Display level for table columns. Ordered — a column is visible when the
+/// app's current display level is >= the column's level.
+///
+/// Currently two levels; add more between or after without breaking anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum ColumnLevel {
+    /// Shown by default.
+    Default = 0,
+    /// Shown only when the user toggles extra columns on.
+    Extra = 1,
+}
+
+impl ColumnLevel {
+    /// Cycle to the next level, wrapping around.
+    pub fn next(self) -> Self {
+        match self {
+            ColumnLevel::Default => ColumnLevel::Extra,
+            ColumnLevel::Extra => ColumnLevel::Default,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColumnLevel::Default => "default",
+            ColumnLevel::Extra => "extra",
+        }
+    }
+}
+
+/// Columns that are hidden in the default view. Everything else is Default.
+/// Case-insensitive match against header names.
+const EXTRA_COLUMNS: &[&str] = &[
+    "LABELS",
+    "CONTAINERS",
+    "IMAGES",
+    "SELECTOR",
+    "QOS",
+    "SERVICE-ACCOUNT",
+    "READINESS GATES",
+    "LAST RESTART",
+    "NODE SELECTOR",
+    "INTERNAL-IP",
+    "EXTERNAL-IP",
+    "ARCH",
+    "TAINTS",
+    "CPU",
+    "MEM",
+    "CPU%",
+    "MEM%",
+];
+
+/// Look up the display level for a column by header name.
+pub fn column_level(name: &str) -> ColumnLevel {
+    if EXTRA_COLUMNS.iter().any(|&c| c.eq_ignore_ascii_case(name)) {
+        ColumnLevel::Extra
+    } else {
+        ColumnLevel::Default
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TableDescriptor — runtime column headers for a resource type
+// ---------------------------------------------------------------------------
+
+/// Runtime column headers for a resource type (from the server).
+#[derive(Debug, Clone, Default)]
+pub struct TableDescriptor {
+    pub headers: Vec<String>,
+}
+
+impl TableDescriptor {
+    /// Find the column index for a header name (case-insensitive).
+    /// Returns an index into the *full* cell array (not the visible subset).
+    pub fn col(&self, name: &str) -> Option<usize> {
+        self.headers.iter().position(|h| h.eq_ignore_ascii_case(name))
+    }
+
+    /// Return (data_index, header_name) pairs for columns visible at the
+    /// given display level. Optionally skips the NAMESPACE column when
+    /// viewing a single namespace.
+    pub fn visible_columns(&self, level: ColumnLevel, skip_namespace: bool) -> Vec<(usize, &str)> {
+        self.headers.iter().enumerate()
+            .filter(|(_, name)| {
+                if skip_namespace && name.eq_ignore_ascii_case("NAMESPACE") {
+                    return false;
+                }
+                column_level(name) <= level
+            })
+            .map(|(i, name)| (i, name.as_str()))
+            .collect()
+    }
+}
+
 pub struct AppData {
-    pub pods: StatefulTable<KubePod>,
-    pub deployments: StatefulTable<KubeDeployment>,
-    pub services: StatefulTable<KubeService>,
-    pub nodes: StatefulTable<KubeNode>,
-    pub namespaces: StatefulTable<KubeNamespace>,
-    pub configmaps: StatefulTable<KubeConfigMap>,
-    pub secrets: StatefulTable<KubeSecret>,
-    pub statefulsets: StatefulTable<KubeStatefulSet>,
-    pub daemonsets: StatefulTable<KubeDaemonSet>,
-    pub jobs: StatefulTable<KubeJob>,
-    pub cronjobs: StatefulTable<KubeCronJob>,
-    pub replicasets: StatefulTable<KubeReplicaSet>,
-    pub ingresses: StatefulTable<KubeIngress>,
-    pub network_policies: StatefulTable<KubeNetworkPolicy>,
-    pub service_accounts: StatefulTable<KubeServiceAccount>,
-    pub storage_classes: StatefulTable<KubeStorageClass>,
-    pub pvs: StatefulTable<KubePv>,
-    pub pvcs: StatefulTable<KubePvc>,
-    pub events: StatefulTable<KubeEvent>,
-    pub roles: StatefulTable<KubeRole>,
-    pub cluster_roles: StatefulTable<KubeClusterRole>,
-    pub role_bindings: StatefulTable<KubeRoleBinding>,
-    pub cluster_role_bindings: StatefulTable<KubeClusterRoleBinding>,
-    pub hpa: StatefulTable<KubeHpa>,
-    pub endpoints: StatefulTable<KubeEndpoints>,
-    pub limit_ranges: StatefulTable<KubeLimitRange>,
-    pub resource_quotas: StatefulTable<KubeResourceQuota>,
-    pub pdb: StatefulTable<KubePdb>,
-    pub crds: StatefulTable<KubeCrd>,
-    pub dynamic_resources: StatefulTable<DynamicKubeResource>,
+    /// Unified tables for all resources (keyed by ResourceId).
+    pub unified: std::collections::HashMap<ResourceId, StatefulTable<crate::kube::resources::row::ResourceRow>>,
+    /// Runtime column headers for unified tables.
+    pub descriptors: std::collections::HashMap<ResourceId, TableDescriptor>,
+
     pub contexts: StatefulTable<KubeContext>,
 }
 
 impl Default for AppData {
     fn default() -> Self {
+        let mut unified = std::collections::HashMap::new();
+        // Pre-populate entries for all known resource types.
+        for meta in RESOURCE_TYPES {
+            unified.insert(meta.to_resource_id(), StatefulTable::new());
+        }
         Self {
-            pods: StatefulTable::new(),
-            deployments: StatefulTable::new(),
-            services: StatefulTable::new(),
-            nodes: StatefulTable::new(),
-            namespaces: StatefulTable::new(),
-            configmaps: StatefulTable::new(),
-            secrets: StatefulTable::new(),
-            statefulsets: StatefulTable::new(),
-            daemonsets: StatefulTable::new(),
-            jobs: StatefulTable::new(),
-            cronjobs: StatefulTable::new(),
-            replicasets: StatefulTable::new(),
-            ingresses: StatefulTable::new(),
-            network_policies: StatefulTable::new(),
-            service_accounts: StatefulTable::new(),
-            storage_classes: StatefulTable::new(),
-            pvs: StatefulTable::new(),
-            pvcs: StatefulTable::new(),
-            events: StatefulTable::new(),
-            roles: StatefulTable::new(),
-            cluster_roles: StatefulTable::new(),
-            role_bindings: StatefulTable::new(),
-            cluster_role_bindings: StatefulTable::new(),
-            hpa: StatefulTable::new(),
-            endpoints: StatefulTable::new(),
-            limit_ranges: StatefulTable::new(),
-            resource_quotas: StatefulTable::new(),
-            pdb: StatefulTable::new(),
-            crds: StatefulTable::new(),
-            dynamic_resources: StatefulTable::new(),
+            unified,
+            descriptors: std::collections::HashMap::new(),
             contexts: StatefulTable::new(),
         }
     }
@@ -529,60 +163,40 @@ impl Default for AppData {
 // App — main application state
 // ---------------------------------------------------------------------------
 
+/// Why the TUI is exiting. Printed to stderr after terminal restoration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitReason {
+    /// User requested quit (q, :quit, Ctrl-C).
+    UserQuit,
+    /// Daemon connection was lost.
+    DaemonDisconnected,
+    /// An error occurred.
+    Error(String),
+}
+
 pub struct App {
     pub should_quit: bool,
+    pub exit_reason: Option<ExitReason>,
     pub route: Route,
     pub route_stack: Vec<Route>,
-    pub resource_tab: ResourceTab,
-    pub last_resource_tab: Option<ResourceTab>,
-
     pub context: String,
     pub cluster: String,
     pub user: String,
-    pub selected_ns: String,
+    pub selected_ns: crate::kube::protocol::Namespace,
     pub contexts: Vec<String>,
 
     pub data: AppData,
 
     /// Stackable navigation state for drill-downs and grep filters.
     pub nav: nav::NavStack,
-    /// Filter input widget state (while user is typing `/`).
-    pub filter_input: nav::FilterInputState,
+    /// Ordered list of pinned resources for Tab/BackTab cycling.
+    pub pinned_resources: Vec<ResourceId>,
     pub flash: Option<FlashMessage>,
     pub confirm_dialog: Option<ConfirmDialog>,
-
-    pub logs: LogState,
-    pub yaml: YamlState,
-    pub describe: DescribeState,
+    pub port_forward_dialog: Option<PortForwardDialog>,
 
     pub theme: crate::ui::theme::Theme,
-
-    pub command_mode: bool,
-    pub command_input: String,
-
-    /// When true, the command prompt is used for entering a replica count for scaling.
-    pub scale_mode: bool,
-    /// The (resource_type, name, namespace) target of the pending scale operation.
-    pub scale_target: (String, String, String),
-
-    /// When true, the command prompt is used for entering port-forward ports.
-    pub port_forward_mode: bool,
-    /// The (pod_name, namespace) target of the pending port-forward operation.
-    pub port_forward_target: (String, String),
-
-    /// Pending batch delete targets: Vec of (resource_type, name, namespace).
-    pub pending_batch_delete: Vec<(String, String, String)>,
-    /// Pending batch restart targets: Vec of (resource_type, name, namespace).
-    pub pending_batch_restart: Vec<(String, String, String)>,
-    /// Pending batch force-kill targets: Vec of (resource_type, name, namespace).
-    pub pending_batch_force_kill: Vec<(String, String, String)>,
-
-    pub container_select_index: usize,
-    /// When true, ContainerSelect Enter opens a shell instead of logs.
-    pub shell_mode_container_select: bool,
-    /// Pending shell request from ContainerSelect: (pod, namespace, container).
-    pub pending_shell: Option<(String, String, String)>,
-
+    pub input_mode: InputMode,
     pub help_scroll: usize,
 
     /// Whether the header (cluster info / key hints / logo) is visible.
@@ -592,121 +206,104 @@ pub struct App {
 
     /// Command history for `:` command mode (max 50 entries).
     pub command_history: Vec<String>,
-    /// Current index into command_history when navigating with Up/Down.
-    pub command_history_index: Option<usize>,
 
-    /// When true, Ctrl-C does not quit the application (k9s `noExitOnCtrlC` config).
+    /// When true, Ctrl-C does not quit the application (`noExitOnCtrlC` config).
     pub no_exit_on_ctrl_c: bool,
     /// When true, destructive actions (delete, edit, scale, restart, force-kill, shell) are disabled.
     pub read_only: bool,
 
-    /// Whether wide column mode is active (show additional columns).
-    pub wide_mode: bool,
-    /// Whether fault filter is active (show only unhealthy resources).
-    pub fault_filter: bool,
-
-    /// Discovered CRDs from the cluster, used for dynamic resource browsing.
-    pub discovered_crds: Vec<KubeCrd>,
-    /// The CRD kind name being viewed in the dynamic resource view (for display).
-    pub dynamic_resource_name: String,
-    /// The full CRD API resource name (e.g. "clickhouseinstallations.clickhouse.altinity.com")
-    /// used for kubectl commands on dynamic resource instances.
-    pub dynamic_resource_api_resource: String,
+    /// Current column display level — controls which columns are visible.
+    pub column_level: ColumnLevel,
 
     /// Cache for kubectl describe/yaml output (30s TTL).
     pub kubectl_cache: KubectlCache,
-    /// Pending describe key for cache population when result arrives.
-    pub pending_describe_key: Option<(String, String, String)>,
-    /// Pending yaml key for cache population when result arrives.
-    pub pending_yaml_key: Option<(String, String, String)>,
+    /// Pod metrics from metrics-server.
+    pub pod_metrics: HashMap<crate::kube::protocol::ObjectKey, crate::kube::protocol::MetricsUsage>,
+    /// Node metrics from metrics-server: node_name -> usage.
+    pub node_metrics: HashMap<String, crate::kube::protocol::MetricsUsage>,
 
-    /// Pod metrics from metrics-server: (namespace, pod_name) -> (cpu, mem).
-    pub pod_metrics: HashMap<(String, String), (String, String)>,
-    /// Node metrics from metrics-server: node_name -> (cpu, mem).
-    pub node_metrics: HashMap<String, (String, String)>,
+    /// Delta tracking: previous row data per resource.
+    pub prev_rows: HashMap<crate::kube::protocol::ObjectKey, Vec<String>>,
+    /// Delta tracking: rows that changed in the last update.
+    pub changed_rows: HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
+
+    /// Guard against rapid context switches: true while a switch is in flight.
+    pub context_switch_pending: bool,
 }
 
 impl App {
     pub fn new(context: String, contexts: Vec<String>, namespace: String) -> Self {
-        let (no_exit_on_ctrl_c, read_only) = Self::load_k9s_config();
+        let config = Self::load_config();
         Self {
             should_quit: false,
+            exit_reason: None,
             route: Route::Overview,
             route_stack: Vec::new(),
-            resource_tab: ResourceTab::Pods,
-            last_resource_tab: None,
             context,
             cluster: String::new(),
             user: String::new(),
-            selected_ns: namespace,
+            selected_ns: crate::kube::protocol::Namespace::from(namespace),
             contexts,
             data: AppData::default(),
-            nav: nav::NavStack::new(ResourceTab::Pods),
-            filter_input: nav::FilterInputState::default(),
+            nav: nav::NavStack::new(nav::rid("pods")),
+            pinned_resources: default_pinned_resources(),
             flash: None,
             confirm_dialog: None,
-            logs: LogState::new(),
-            yaml: YamlState::default(),
-            describe: DescribeState::default(),
+            port_forward_dialog: None,
             theme: crate::ui::theme::Theme::load(),
-            command_mode: false,
-            command_input: String::new(),
-            scale_mode: false,
-            scale_target: (String::new(), String::new(), String::new()),
-            port_forward_mode: false,
-            port_forward_target: (String::new(), String::new()),
-            pending_batch_delete: Vec::new(),
-            pending_batch_restart: Vec::new(),
-            pending_batch_force_kill: Vec::new(),
-            container_select_index: 0,
-            shell_mode_container_select: false,
-            pending_shell: None,
+            input_mode: InputMode::Normal,
             help_scroll: 0,
             show_header: true,
             tick_count: 0,
             command_history: Vec::new(),
-            command_history_index: None,
-            no_exit_on_ctrl_c,
-            read_only,
-            wide_mode: false,
-            fault_filter: false,
-            discovered_crds: Vec::new(),
-            dynamic_resource_name: String::new(),
-            dynamic_resource_api_resource: String::new(),
+            no_exit_on_ctrl_c: config.no_exit_on_ctrl_c,
+            read_only: config.read_only,
+            column_level: ColumnLevel::Default,
             kubectl_cache: KubectlCache::new(Duration::from_secs(30)),
-            pending_describe_key: None,
-            pending_yaml_key: None,
             pod_metrics: HashMap::new(),
             node_metrics: HashMap::new(),
+            prev_rows: HashMap::new(),
+            changed_rows: HashMap::new(),
+            context_switch_pending: false,
         }
     }
 
-    /// Load `noExitOnCtrlC` and `readOnly` settings from `~/.config/k9s/config.yaml`.
-    /// Returns `(no_exit_on_ctrl_c, read_only)`. Defaults to `(false, false)` on any error.
-    fn load_k9s_config() -> (bool, bool) {
+    /// Load settings from config file. Tries `~/.config/k9rs/config.yaml` first,
+    /// falls back to `~/.config/k9s/config.yaml` for compatibility.
+    fn load_config() -> AppConfig {
+        let default = AppConfig { no_exit_on_ctrl_c: false, read_only: false };
         let home = match std::env::var("HOME") {
             Ok(h) => h,
-            Err(_) => return (false, false),
+            Err(_) => return default,
         };
-        let config_path = std::path::Path::new(&home).join(".config/k9s/config.yaml");
-        let content = match std::fs::read_to_string(&config_path) {
-            Ok(c) => c,
-            Err(_) => return (false, false),
+        // Try k9rs config first, fall back to k9s config for compatibility.
+        let (content, key) = {
+            let k9rs_path = std::path::Path::new(&home).join(".config/k9rs/config.yaml");
+            if let Ok(c) = std::fs::read_to_string(&k9rs_path) {
+                (c, "k9rs")
+            } else {
+                let k9s_path = std::path::Path::new(&home).join(".config/k9s/config.yaml");
+                match std::fs::read_to_string(&k9s_path) {
+                    Ok(c) => (c, "k9s"),
+                    Err(_) => return default,
+                }
+            }
         };
         let yaml: serde_yaml::Value = match serde_yaml::from_str(&content) {
             Ok(v) => v,
-            Err(_) => return (false, false),
+            Err(_) => return default,
         };
-        let k9s = yaml.get("k9s");
-        let no_exit = k9s
-            .and_then(|v| v.get("noExitOnCtrlC"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let read_only = k9s
-            .and_then(|v| v.get("readOnly"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        (no_exit, read_only)
+        let section = yaml.get(key);
+        AppConfig {
+            no_exit_on_ctrl_c: section
+                .and_then(|v| v.get("noExitOnCtrlC"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            read_only: section
+                .and_then(|v| v.get("readOnly"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        }
     }
 
     /// Push a route onto the route stack, capping at 50 entries to prevent
@@ -723,143 +320,108 @@ impl App {
 
     /// Apply stored pod metrics to all current pod items.
     pub fn apply_pod_metrics(&mut self) {
-        for pod in &mut self.data.pods.items {
-            if let Some((cpu, mem)) = self.pod_metrics.get(&(pod.namespace.clone(), pod.name.clone())) {
-                pod.cpu = cpu.clone();
-                pod.mem = mem.clone();
+        let pods_rid = nav::rid("pods");
+        let desc = self.data.descriptors.get(&pods_rid);
+        let cpu_col = desc.and_then(|d| d.col("CPU"));
+        let mem_col = desc.and_then(|d| d.col("MEM"));
+        if cpu_col.is_none() && mem_col.is_none() { return; }
+        if let Some(table) = self.data.unified.get_mut(&pods_rid) {
+            for row in &mut table.items {
+                if let Some(usage) = self.pod_metrics.get(&ObjectKey::new(row.namespace.clone(), row.name.clone())) {
+                    if let Some(col) = cpu_col { row.set_cell(col, usage.cpu.clone()); }
+                    if let Some(col) = mem_col { row.set_cell(col, usage.mem.clone()); }
+                }
             }
         }
     }
 
     /// Apply stored node metrics to all current node items.
     pub fn apply_node_metrics(&mut self) {
-        for node in &mut self.data.nodes.items {
-            if let Some((cpu, mem)) = self.node_metrics.get(&node.name) {
-                node.cpu_usage = cpu.clone();
-                node.mem_usage = mem.clone();
+        let nodes_rid = nav::rid("nodes");
+        let desc = self.data.descriptors.get(&nodes_rid);
+        let cpu_col = desc.and_then(|d| d.col("CPU%"));
+        let mem_col = desc.and_then(|d| d.col("MEM%"));
+        if cpu_col.is_none() && mem_col.is_none() { return; }
+        if let Some(table) = self.data.unified.get_mut(&nodes_rid) {
+            for row in &mut table.items {
+                if let Some(usage) = self.node_metrics.get(&row.name) {
+                    if let Some(col) = cpu_col {
+                        if let Some(cap) = row.cells.get(col).and_then(|c| c.split('/').nth(1)).map(|s| s.to_string()) {
+                            row.set_cell(col, format!("{}/{}", usage.cpu, cap));
+                        }
+                    }
+                    if let Some(col) = mem_col {
+                        if let Some(cap) = row.cells.get(col).and_then(|c| c.split('/').nth(1)).map(|s| s.to_string()) {
+                            row.set_cell(col, format!("{}/{}", usage.mem, cap));
+                        }
+                    }
+                }
             }
         }
     }
 
-    /// Clear all resource table data. Used when switching namespaces so stale
-    /// data from the old namespace doesn't persist.
+    /// Clear ALL resource table data. Used for context switches where
+    /// everything is stale. Namespace switches should NOT call this — the
+    /// server only re-subscribes namespaced resources, and cluster-scoped
+    /// data (nodes, PVs, etc.) is preserved automatically.
     pub fn clear_data(&mut self) {
-        self.data.pods.clear_data();
-        self.data.deployments.clear_data();
-        self.data.services.clear_data();
-        self.data.nodes.clear_data();
-        self.data.namespaces.clear_data();
-        self.data.configmaps.clear_data();
-        self.data.secrets.clear_data();
-        self.data.statefulsets.clear_data();
-        self.data.daemonsets.clear_data();
-        self.data.jobs.clear_data();
-        self.data.cronjobs.clear_data();
-        self.data.replicasets.clear_data();
-        self.data.ingresses.clear_data();
-        self.data.network_policies.clear_data();
-        self.data.service_accounts.clear_data();
-        self.data.storage_classes.clear_data();
-        self.data.pvs.clear_data();
-        self.data.pvcs.clear_data();
-        self.data.events.clear_data();
-        self.data.roles.clear_data();
-        self.data.cluster_roles.clear_data();
-        self.data.role_bindings.clear_data();
-        self.data.cluster_role_bindings.clear_data();
-        self.data.hpa.clear_data();
-        self.data.endpoints.clear_data();
-        self.data.limit_ranges.clear_data();
-        self.data.resource_quotas.clear_data();
-        self.data.pdb.clear_data();
-        self.data.crds.clear_data();
-        self.data.dynamic_resources.clear_data();
+        // Clear all table data but keep entries so auto-subscribed resources
+        // (namespaces, nodes) can receive data from the new context.
+        for table in self.data.unified.values_mut() {
+            table.clear_data();
+        }
+        self.data.descriptors.clear();
     }
 
-    pub fn next_tab(&mut self) {
-        let tabs = ResourceTab::all();
-        let idx = self.resource_tab.index();
-        self.resource_tab = ResourceTab::from_index((idx + 1) % tabs.len());
+    /// Clear data for a specific resource so it shows "Loading..." until
+    /// fresh data arrives from the server.
+    pub fn clear_resource(&mut self, rid: &ResourceId) {
+        if let Some(table) = self.data.unified.get_mut(rid) {
+            table.clear_data();
+        }
     }
 
-    pub fn prev_tab(&mut self) {
-        let tabs = ResourceTab::all();
-        let idx = self.resource_tab.index();
-        self.resource_tab = ResourceTab::from_index(if idx == 0 { tabs.len() - 1 } else { idx - 1 });
+    pub fn next_tab(&mut self) -> ResourceId {
+        let pinned = &self.pinned_resources;
+        if pinned.is_empty() {
+            return nav::rid("pods");
+        }
+        let current = self.nav.resource_id();
+        let idx = pinned.iter().position(|r| r == current).unwrap_or(0);
+        pinned[(idx + 1) % pinned.len()].clone()
+    }
+
+    pub fn prev_tab(&mut self) -> ResourceId {
+        let pinned = &self.pinned_resources;
+        if pinned.is_empty() {
+            return nav::rid("pods");
+        }
+        let current = self.nav.resource_id();
+        let idx = pinned.iter().position(|r| r == current).unwrap_or(0);
+        pinned[if idx == 0 { pinned.len() - 1 } else { idx - 1 }].clone()
     }
 
     // Delegate navigation to the currently active table
-    fn with_active_table<F: FnOnce(&mut dyn TableNav)>(&mut self, f: F) {
-        match self.resource_tab {
-            ResourceTab::Pods => f(&mut self.data.pods),
-            ResourceTab::Deployments => f(&mut self.data.deployments),
-            ResourceTab::Services => f(&mut self.data.services),
-            ResourceTab::Nodes => f(&mut self.data.nodes),
-            ResourceTab::Namespaces => f(&mut self.data.namespaces),
-            ResourceTab::ConfigMaps => f(&mut self.data.configmaps),
-            ResourceTab::Secrets => f(&mut self.data.secrets),
-            ResourceTab::StatefulSets => f(&mut self.data.statefulsets),
-            ResourceTab::DaemonSets => f(&mut self.data.daemonsets),
-            ResourceTab::Jobs => f(&mut self.data.jobs),
-            ResourceTab::CronJobs => f(&mut self.data.cronjobs),
-            ResourceTab::ReplicaSets => f(&mut self.data.replicasets),
-            ResourceTab::Ingresses => f(&mut self.data.ingresses),
-            ResourceTab::NetworkPolicies => f(&mut self.data.network_policies),
-            ResourceTab::ServiceAccounts => f(&mut self.data.service_accounts),
-            ResourceTab::StorageClasses => f(&mut self.data.storage_classes),
-            ResourceTab::Pvs => f(&mut self.data.pvs),
-            ResourceTab::Pvcs => f(&mut self.data.pvcs),
-            ResourceTab::Events => f(&mut self.data.events),
-            ResourceTab::Roles => f(&mut self.data.roles),
-            ResourceTab::ClusterRoles => f(&mut self.data.cluster_roles),
-            ResourceTab::RoleBindings => f(&mut self.data.role_bindings),
-            ResourceTab::ClusterRoleBindings => f(&mut self.data.cluster_role_bindings),
-            ResourceTab::Hpa => f(&mut self.data.hpa),
-            ResourceTab::Endpoints => f(&mut self.data.endpoints),
-            ResourceTab::LimitRanges => f(&mut self.data.limit_ranges),
-            ResourceTab::ResourceQuotas => f(&mut self.data.resource_quotas),
-            ResourceTab::Pdb => f(&mut self.data.pdb),
-            ResourceTab::Crds => f(&mut self.data.crds),
-            ResourceTab::DynamicResource => f(&mut self.data.dynamic_resources),
+    fn with_active_table<F: FnOnce(&mut dyn table::TableNav)>(&mut self, f: F) {
+        let rid = self.nav.resource_id().clone();
+        if let Some(table) = self.data.unified.get_mut(&rid) {
+            f(table);
         }
     }
 
     // Delegate read-only operations to the currently active table
     fn with_active_table_ref<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&dyn TableNav) -> R,
+        F: FnOnce(&dyn table::TableNav) -> R,
     {
-        match self.resource_tab {
-            ResourceTab::Pods => f(&self.data.pods),
-            ResourceTab::Deployments => f(&self.data.deployments),
-            ResourceTab::Services => f(&self.data.services),
-            ResourceTab::Nodes => f(&self.data.nodes),
-            ResourceTab::Namespaces => f(&self.data.namespaces),
-            ResourceTab::ConfigMaps => f(&self.data.configmaps),
-            ResourceTab::Secrets => f(&self.data.secrets),
-            ResourceTab::StatefulSets => f(&self.data.statefulsets),
-            ResourceTab::DaemonSets => f(&self.data.daemonsets),
-            ResourceTab::Jobs => f(&self.data.jobs),
-            ResourceTab::CronJobs => f(&self.data.cronjobs),
-            ResourceTab::ReplicaSets => f(&self.data.replicasets),
-            ResourceTab::Ingresses => f(&self.data.ingresses),
-            ResourceTab::NetworkPolicies => f(&self.data.network_policies),
-            ResourceTab::ServiceAccounts => f(&self.data.service_accounts),
-            ResourceTab::StorageClasses => f(&self.data.storage_classes),
-            ResourceTab::Pvs => f(&self.data.pvs),
-            ResourceTab::Pvcs => f(&self.data.pvcs),
-            ResourceTab::Events => f(&self.data.events),
-            ResourceTab::Roles => f(&self.data.roles),
-            ResourceTab::ClusterRoles => f(&self.data.cluster_roles),
-            ResourceTab::RoleBindings => f(&self.data.role_bindings),
-            ResourceTab::ClusterRoleBindings => f(&self.data.cluster_role_bindings),
-            ResourceTab::Hpa => f(&self.data.hpa),
-            ResourceTab::Endpoints => f(&self.data.endpoints),
-            ResourceTab::LimitRanges => f(&self.data.limit_ranges),
-            ResourceTab::ResourceQuotas => f(&self.data.resource_quotas),
-            ResourceTab::Pdb => f(&self.data.pdb),
-            ResourceTab::Crds => f(&self.data.crds),
-            ResourceTab::DynamicResource => f(&self.data.dynamic_resources),
+        let rid = self.nav.resource_id();
+        if let Some(table) = self.data.unified.get(rid) {
+            f(table)
+        } else {
+            // Fallback for unknown CRDs — return default counts
+            static EMPTY: std::sync::LazyLock<StatefulTable<crate::kube::resources::row::ResourceRow>> =
+                std::sync::LazyLock::new(StatefulTable::new);
+            f(&*EMPTY)
         }
     }
 
@@ -921,6 +483,29 @@ impl App {
         self.with_active_table(|t| t.nav_toggle_mark());
     }
 
+    /// Span-mark: mark all rows from the last marked row to the current selection.
+    pub fn span_mark(&mut self) {
+        self.with_active_table(|t| t.nav_span_mark());
+    }
+
+    /// Clear all marks on the current table.
+    pub fn clear_marks(&mut self) {
+        self.with_active_table(|t| t.nav_clear_marks());
+    }
+
+    /// Check if a row matches a grep pattern (vim-style smartcase regex).
+    /// Handles `!pattern` for inverse matching.
+    fn grep_matches_row(text: &str, row: &[String]) -> bool {
+        let (pattern, invert) = if let Some(stripped) = text.strip_prefix('!') {
+            (stripped, true)
+        } else {
+            (text, false)
+        };
+        let pat = crate::util::SearchPattern::new(pattern);
+        let matches = row.iter().any(|cell| pat.is_match(cell));
+        if invert { !matches } else { matches }
+    }
+
     /// Reapply all nav stack filters (plus any uncommitted filter_input text) to the current table.
     /// Called after: snapshot arrival, nav push/pop, grep commit, filter input keystroke.
     pub fn reapply_nav_filters(&mut self) {
@@ -928,8 +513,8 @@ impl App {
 
         let filters = self.nav.active_filters();
         // Include uncommitted filter input text as a transient grep
-        let input_text = if !self.filter_input.text.is_empty() {
-            Some(self.filter_input.text.clone())
+        let input_text = if !self.nav.filter_input().text.is_empty() {
+            Some(self.nav.filter_input().text.clone())
         } else {
             None
         };
@@ -942,69 +527,70 @@ impl App {
         }
 
         // Build a display string for the table title
-        // For Pods: apply Labels, Field, and Grep filters
-        // For everything else: only Grep filters apply (Labels/Field are pod-specific)
-        if self.resource_tab == ResourceTab::Pods {
+        // For Pods: apply Labels, Field, OwnerChain, and Grep filters via extra bag.
+        // For everything else: only Grep filters apply (Labels/Field are pod-specific).
+        let is_pods = self.nav.resource_id().plural == "pods";
+        if is_pods {
+            let pods_rid = nav::rid("pods");
+            let empty_labels = std::collections::BTreeMap::new();
             // Clone the filter data we need before the closure borrows self
             let filters_owned: Vec<NavFilter> = filters.iter().map(|f| (*f).clone()).collect();
             let input = input_text.clone();
-            // Clear the table's own filter_text so set_items_filtered doesn't
-            // re-grep using the breadcrumb string on the next snapshot.
-            self.data.pods.filter_text.clear();
-            self.data.pods.cached_filter_regex = None;
-            self.data.pods.apply_filter(|pod| {
-                for f in &filters_owned {
-                    match f {
-                        NavFilter::Grep(text) => {
-                            let t = text.to_lowercase();
-                            let re = regex::Regex::new(&t).ok();
-                            if !pod.row().iter().any(|cell| {
-                                let lower = cell.to_lowercase();
-                                re.as_ref().map_or(lower.contains(&t), |r| r.is_match(&lower))
-                            }) {
-                                return false;
+            if let Some(table) = self.data.unified.get_mut(&pods_rid) {
+                // Mark as nav-managed so set_items_filtered skips its own filtering.
+                table.filter_text.clear();
+                table.nav_managed = true;
+                table.apply_filter(|row| {
+                    for f in &filters_owned {
+                        match f {
+                            NavFilter::Grep(text) => {
+                                if !Self::grep_matches_row(text, row.cells()) {
+                                    return false;
+                                }
+                            }
+                            NavFilter::Labels(selector) => {
+                                let labels = row.extra_map("labels").unwrap_or(&empty_labels);
+                                if !selector.iter().all(|(k, v)| {
+                                    labels.get(k).map_or(false, |lv| lv == v)
+                                }) {
+                                    return false;
+                                }
+                            }
+                            NavFilter::Field { field, value } => {
+                                let matches = match field.as_str() {
+                                    "node" => row.extra_str("node").unwrap_or("") == value.as_str(),
+                                    "namespace" => row.namespace == *value,
+                                    _ => false,
+                                };
+                                if !matches { return false; }
+                            }
+                            NavFilter::OwnerChain { uid, .. } => {
+                                let refs = row.extra_owner_refs().unwrap_or(&[]);
+                                if !refs.iter().any(|or| or.uid == *uid) {
+                                    return false;
+                                }
                             }
                         }
-                        NavFilter::Labels(selector) => {
-                            if !selector.iter().all(|(k, v)| {
-                                pod.labels.get(k).map_or(false, |lv| lv == v)
-                            }) {
-                                return false;
-                            }
-                        }
-                        NavFilter::Field { field, value } => {
-                            let matches = match field.as_str() {
-                                "node" => pod.node == *value,
-                                "namespace" => pod.namespace == *value,
-                                _ => false,
-                            };
-                            if !matches { return false; }
+                    }
+                    // Apply uncommitted input text
+                    if let Some(ref text) = input {
+                        if !Self::grep_matches_row(text, row.cells()) {
+                            return false;
                         }
                     }
-                }
-                // Apply uncommitted input text
-                if let Some(ref text) = input {
-                    let t = text.to_lowercase();
-                    let re = regex::Regex::new(&t).ok();
-                    if !pod.row().iter().any(|cell| {
-                        let lower = cell.to_lowercase();
-                        re.as_ref().map_or(lower.contains(&t), |r| r.is_match(&lower))
-                    }) {
-                        return false;
-                    }
-                }
-                true
-            });
+                    true
+                });
+            }
         } else {
             // Non-pod tables: collect all grep texts, apply as composite
             let mut grep_texts: Vec<String> = Vec::new();
             for f in &filters {
                 if let NavFilter::Grep(text) = f {
-                    grep_texts.push(text.to_lowercase());
+                    grep_texts.push(text.clone());
                 }
             }
             if let Some(ref text) = input_text {
-                grep_texts.push(text.to_lowercase());
+                grep_texts.push(text.clone());
             }
 
             if grep_texts.is_empty() {
@@ -1012,23 +598,14 @@ impl App {
                 return;
             }
 
-            // Compile regexes
-            let regexes: Vec<Option<regex::Regex>> = grep_texts.iter()
-                .map(|t| regex::Regex::new(t).ok())
-                .collect();
-
             macro_rules! apply_greps {
                 ($table:expr) => {{
-                    // Clear the table's own filter state so set_items_filtered
-                    // doesn't re-grep the breadcrumb string on the next snapshot.
+                    // Mark as nav-managed so set_items_filtered skips its own filtering.
                     $table.filter_text.clear();
-                    $table.cached_filter_regex = None;
+                    $table.nav_managed = true;
                     $table.apply_filter(|item| {
-                        for (i, t) in grep_texts.iter().enumerate() {
-                            if !item.row().iter().any(|cell| {
-                                let lower = cell.to_lowercase();
-                                regexes[i].as_ref().map_or(lower.contains(t), |r| r.is_match(&lower))
-                            }) {
+                        for t in &grep_texts {
+                            if !Self::grep_matches_row(t, item.cells()) {
                                 return false;
                             }
                         }
@@ -1037,48 +614,15 @@ impl App {
                 }};
             }
 
-            match self.resource_tab {
-                ResourceTab::Pods => unreachable!(), // handled above
-                ResourceTab::Deployments => apply_greps!(self.data.deployments),
-                ResourceTab::Services => apply_greps!(self.data.services),
-                ResourceTab::Nodes => apply_greps!(self.data.nodes),
-                ResourceTab::Namespaces => apply_greps!(self.data.namespaces),
-                ResourceTab::ConfigMaps => apply_greps!(self.data.configmaps),
-                ResourceTab::Secrets => apply_greps!(self.data.secrets),
-                ResourceTab::StatefulSets => apply_greps!(self.data.statefulsets),
-                ResourceTab::DaemonSets => apply_greps!(self.data.daemonsets),
-                ResourceTab::Jobs => apply_greps!(self.data.jobs),
-                ResourceTab::CronJobs => apply_greps!(self.data.cronjobs),
-                ResourceTab::ReplicaSets => apply_greps!(self.data.replicasets),
-                ResourceTab::Ingresses => apply_greps!(self.data.ingresses),
-                ResourceTab::NetworkPolicies => apply_greps!(self.data.network_policies),
-                ResourceTab::ServiceAccounts => apply_greps!(self.data.service_accounts),
-                ResourceTab::StorageClasses => apply_greps!(self.data.storage_classes),
-                ResourceTab::Pvs => apply_greps!(self.data.pvs),
-                ResourceTab::Pvcs => apply_greps!(self.data.pvcs),
-                ResourceTab::Events => apply_greps!(self.data.events),
-                ResourceTab::Roles => apply_greps!(self.data.roles),
-                ResourceTab::ClusterRoles => apply_greps!(self.data.cluster_roles),
-                ResourceTab::RoleBindings => apply_greps!(self.data.role_bindings),
-                ResourceTab::ClusterRoleBindings => apply_greps!(self.data.cluster_role_bindings),
-                ResourceTab::Hpa => apply_greps!(self.data.hpa),
-                ResourceTab::Endpoints => apply_greps!(self.data.endpoints),
-                ResourceTab::LimitRanges => apply_greps!(self.data.limit_ranges),
-                ResourceTab::ResourceQuotas => apply_greps!(self.data.resource_quotas),
-                ResourceTab::Pdb => apply_greps!(self.data.pdb),
-                ResourceTab::Crds => apply_greps!(self.data.crds),
-                ResourceTab::DynamicResource => apply_greps!(self.data.dynamic_resources),
+            let rid = self.nav.resource_id().clone();
+            if let Some(table) = self.data.unified.get_mut(&rid) {
+                apply_greps!(table);
             }
         }
     }
 
     pub fn clear_filter(&mut self) {
         self.with_active_table(|t| t.nav_clear_filter());
-    }
-
-    /// Clear marks on the currently active table.
-    pub fn clear_marks(&mut self) {
-        self.with_active_table(|t| t.nav_clear_marks());
     }
 
     /// Reset only the active table's data so the UI shows "Loading..." while
@@ -1104,24 +648,30 @@ impl App {
     pub fn tick(&mut self) -> bool {
         self.tick_count = self.tick_count.wrapping_add(1);
         let mut changed = false;
+        // Expire flash messages
         if let Some(ref flash) = self.flash {
             if flash.is_expired() {
                 self.flash = None;
                 changed = true;
             }
         }
-        // Redraw on tick while a loading animation is visible (the loading bar
-        // is time-based and advances every ~200ms).
-        if !self.active_table_has_data() {
+        // Expire change highlights
+        let now = std::time::Instant::now();
+        let before = self.changed_rows.len();
+        self.changed_rows.retain(|_, ts| now.duration_since(*ts).as_secs() < CHANGE_HIGHLIGHT_SECS);
+        if self.changed_rows.len() != before {
             changed = true;
         }
+        // Keep redrawing while a loading state is active (spinner animation).
+        if !changed {
+            let rid = self.nav.resource_id();
+            let table_loading = self.data.unified.get(rid)
+                .map_or(true, |t| t.items.is_empty() && !t.has_data);
+            if table_loading {
+                changed = true;
+            }
+        }
         changed
-    }
-
-    /// Returns `true` if the currently-visible resource table has received data.
-    /// When `false`, a loading animation is shown and needs continuous redraws.
-    fn active_table_has_data(&self) -> bool {
-        self.with_active_table_ref(|t| t.nav_has_data())
     }
 
     /// All known resource command aliases.
@@ -1149,12 +699,18 @@ impl App {
     /// Build completion candidates dynamically based on command input.
     /// Matching is case-insensitive since commands are lowercased on submit.
     pub fn command_completions(&self) -> Vec<String> {
-        let input_lower = self.command_input.to_lowercase();
+        let cmd_input = match &self.input_mode {
+            InputMode::Command { input, .. } => input.as_str(),
+            _ => return Vec::new(),
+        };
+        let input_lower = cmd_input.trim_start().to_lowercase();
 
         // If input starts with "ns " or "namespace ", complete namespace names
         if input_lower.starts_with("ns ") || input_lower.starts_with("namespace ") {
             let cmd_prefix = if input_lower.starts_with("ns ") { "ns " } else { "namespace " };
-            let mut completions: Vec<String> = self.data.namespaces.items.iter()
+            let ns_items = self.data.unified.get(&nav::rid("namespaces"))
+                .map(|t| &t.items[..]).unwrap_or(&[]);
+            let mut completions: Vec<String> = ns_items.iter()
                 .map(|ns| format!("{}{}", cmd_prefix, ns.name()))
                 .filter(|s| s.to_lowercase().starts_with(&input_lower))
                 .collect();
@@ -1181,15 +737,19 @@ impl App {
             let resource_part = &input_lower[..space_pos];
             // Check if it's a built-in resource command OR a discovered CRD name
             let is_builtin = Self::RESOURCE_COMMANDS.iter().any(|&r| r == resource_part);
-            let is_crd = !is_builtin && self.discovered_crds.iter().any(|crd| {
-                let kind = crd.kind.to_lowercase();
-                let plural = crd.plural.to_lowercase();
-                let short = crd.name.split('.').next().unwrap_or("").to_lowercase();
+            let crd_items = self.data.unified.get(&nav::rid("crds"))
+                .map(|t| &t.items[..]).unwrap_or(&[]);
+            let is_crd = !is_builtin && crd_items.iter().any(|row| {
+                let kind = row.extra_str("kind").unwrap_or("").to_lowercase();
+                let plural = row.extra_str("plural").unwrap_or("").to_lowercase();
+                let short = row.name.split('.').next().unwrap_or("").to_lowercase();
                 resource_part == kind || resource_part == plural || resource_part == short
             });
             if is_builtin || is_crd {
                 // Complete with namespace names
-                let mut completions: Vec<String> = self.data.namespaces.items.iter()
+                let ns_items = self.data.unified.get(&nav::rid("namespaces"))
+                    .map(|t| &t.items[..]).unwrap_or(&[]);
+                let mut completions: Vec<String> = ns_items.iter()
                     .map(|ns| format!("{} {}", resource_part, ns.name()))
                     .filter(|s| s.to_lowercase().starts_with(&input_lower))
                     .collect();
@@ -1209,11 +769,13 @@ impl App {
             .collect();
 
         // Add discovered CRD names as completions using the actual plural field
-        for crd in &self.discovered_crds {
-            let kind_lower = crd.kind.to_lowercase();
-            let plural_lower = crd.plural.to_lowercase();
+        let crd_items = self.data.unified.get(&nav::rid("crds"))
+            .map(|t| &t.items[..]).unwrap_or(&[]);
+        for row in crd_items {
+            let kind_lower = row.extra_str("kind").unwrap_or("").to_lowercase();
+            let plural_lower = row.extra_str("plural").unwrap_or("").to_lowercase();
             // Also extract the short plural from the CRD name (before the dot)
-            let short_plural = crd.name.split('.').next().unwrap_or("").to_lowercase();
+            let short_plural = row.name.split('.').next().unwrap_or("").to_lowercase();
             for candidate in [&kind_lower, &plural_lower, &short_plural] {
                 if !candidate.is_empty() && candidate.starts_with(&input_lower) {
                     completions.push(candidate.clone());
@@ -1228,475 +790,63 @@ impl App {
 
     /// Returns the best (first) completion match, if any.
     pub fn best_completion(&self) -> Option<String> {
-        if self.command_input.is_empty() { return None; }
-        self.command_completions().into_iter().next()
+        if let InputMode::Command { ref input, .. } = self.input_mode {
+            if input.trim().is_empty() { return None; }
+            self.command_completions().into_iter().next()
+        } else {
+            None
+        }
     }
 
     /// Accept the current ghost-text completion into the command input.
     pub fn accept_completion(&mut self) {
         if let Some(completion) = self.best_completion() {
-            self.command_input = completion;
+            if let InputMode::Command { ref mut input, .. } = self.input_mode {
+                *input = completion;
+            }
         }
     }
 
-    /// Returns (filtered_count, total_count) for the currently active resource table.
-    pub fn active_table_items_count(&self) -> (usize, usize) {
+    /// Returns filtered and total counts for the currently active resource table.
+    pub fn active_table_items_count(&self) -> ItemCounts {
         self.with_active_table_ref(|t| t.nav_items_count())
     }
 
+    /// Whether the current nav resource is cluster-scoped (no namespace).
+    pub fn current_tab_is_cluster_scoped(&self) -> bool {
+        self.nav.resource_id().is_cluster_scoped()
+    }
+
     /// Find a discovered CRD by its kind name (case-insensitive).
-    pub fn find_crd_by_name(&self, cmd: &str) -> Option<KubeCrd> {
+    /// Returns a lightweight CrdInfo extracted from the unified ResourceRow extra bag.
+    pub fn find_crd_by_name(&self, cmd: &str) -> Option<CrdInfo> {
         let lower = cmd.to_lowercase();
-        self.discovered_crds.iter().find(|crd| {
-            let kind_lower = crd.kind.to_lowercase();
-            let name_lower = crd.name.to_lowercase();
-            let plural_lower = crd.plural.to_lowercase();
+        let crds_rid = nav::rid("crds");
+        let table = self.data.unified.get(&crds_rid)?;
+        table.items.iter().find_map(|row| {
+            let kind = row.extra_str("kind").unwrap_or("");
+            let plural = row.extra_str("plural").unwrap_or("");
+            let kind_lower = kind.to_lowercase();
+            let name_lower = row.name.to_lowercase();
+            let plural_lower = plural.to_lowercase();
             // Match by: kind, plural, full CRD name, kind+"s", or the
             // short plural from the CRD name (before the first dot).
-            kind_lower == lower
+            if kind_lower == lower
                 || plural_lower == lower
                 || name_lower == lower
                 || format!("{}s", kind_lower) == lower
                 || name_lower.split('.').next().map_or(false, |short| short == lower)
-        }).cloned()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TableNav trait — allows App to dispatch navigation to any StatefulTable
-// ---------------------------------------------------------------------------
-
-trait TableNav {
-    fn nav_next(&mut self);
-    fn nav_prev(&mut self);
-    fn nav_page_up(&mut self);
-    fn nav_page_down(&mut self);
-    fn nav_home(&mut self);
-    fn nav_end(&mut self);
-    fn nav_clear_filter(&mut self);
-    fn nav_reset(&mut self);
-    fn nav_toggle_mark(&mut self);
-    fn nav_sort_by(&mut self, col: usize);
-    fn nav_toggle_sort(&mut self);
-    fn nav_has_data(&self) -> bool;
-    fn nav_items_count(&self) -> (usize, usize);
-    fn nav_clear_marks(&mut self);
-    fn nav_select(&mut self, idx: usize);
-    fn nav_selected(&self) -> usize;
-}
-
-impl<T: Clone + crate::kube::resources::KubeResource> TableNav for StatefulTable<T> {
-    fn nav_next(&mut self) { self.next(); }
-    fn nav_prev(&mut self) { self.previous(); }
-    fn nav_page_up(&mut self) { self.page_up(); }
-    fn nav_page_down(&mut self) { self.page_down(); }
-    fn nav_home(&mut self) { self.home(); }
-    fn nav_end(&mut self) { self.end(); }
-    fn nav_clear_filter(&mut self) { self.clear_filter(); }
-    fn nav_reset(&mut self) { self.clear_data(); }
-    fn nav_toggle_mark(&mut self) {
-        if !self.filtered_indices.is_empty() && self.selected < self.filtered_indices.len() {
-            let real_idx = self.filtered_indices[self.selected];
-            if self.marked.contains(&real_idx) {
-                self.marked.remove(&real_idx);
-            } else {
-                self.marked.insert(real_idx);
-            }
-            self.next(); // move to next row after marking (like k9s)
-        }
-    }
-    fn nav_sort_by(&mut self, col: usize) { self.sort_by_column(col); }
-    fn nav_toggle_sort(&mut self) {
-        let col = self.sort_column;
-        self.sort_by_column(col);
-    }
-    fn nav_has_data(&self) -> bool { self.has_data }
-    fn nav_items_count(&self) -> (usize, usize) { (self.len(), self.total()) }
-    fn nav_clear_marks(&mut self) { self.marked.clear(); }
-    fn nav_select(&mut self, idx: usize) {
-        self.selected = idx.min(self.filtered_indices.len().saturating_sub(1));
-        self.adjust_offset();
-    }
-    fn nav_selected(&self) -> usize { self.selected }
-}
-
-// ---------------------------------------------------------------------------
-// StatefulTable
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct StatefulTable<T: Clone> {
-    pub items: Vec<T>,
-    pub filtered_indices: Vec<usize>,
-    pub selected: usize,
-    pub offset: usize,
-    pub sort_column: usize,
-    pub sort_ascending: bool,
-    pub page_size: usize,
-    pub filter_text: String,
-    /// Cached compiled regex for the current filter_text (avoids recompiling on every data update).
-    cached_filter_regex: Option<regex::Regex>,
-    /// Whether this table has received any response from the watcher.
-    /// Used to distinguish "loading" (false) from "empty" (true + no items) in the UI.
-    pub has_data: bool,
-    /// Whether the initial list is still streaming in (InitApply phase).
-    /// When true, the title shows a loading indicator alongside the count.
-    pub loading: bool,
-    /// Previous item count — used to detect when initial loading completes.
-    prev_item_count: usize,
-    /// Set of marked/selected row indices (real indices into `items`).
-    pub marked: HashSet<usize>,
-}
-
-impl<T: Clone> Default for StatefulTable<T> {
-    fn default() -> Self {
-        Self {
-            items: Vec::new(),
-            filtered_indices: Vec::new(),
-            selected: 0,
-            offset: 0,
-            sort_column: 0,
-            sort_ascending: true,
-            page_size: 40,
-            filter_text: String::new(),
-            cached_filter_regex: None,
-            has_data: false,
-            loading: false,
-            prev_item_count: 0,
-            marked: HashSet::new(),
-        }
-    }
-}
-
-impl<T: Clone> StatefulTable<T> {
-    pub fn new() -> Self { Self::default() }
-
-    pub fn len(&self) -> usize { self.filtered_indices.len() }
-    pub fn is_empty(&self) -> bool { self.filtered_indices.is_empty() }
-    pub fn total(&self) -> usize { self.items.len() }
-
-    pub fn next(&mut self) {
-        if !self.filtered_indices.is_empty() && self.selected + 1 < self.filtered_indices.len() {
-            self.selected += 1;
-        }
-        self.adjust_offset();
-    }
-
-    pub fn previous(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-        self.adjust_offset();
-    }
-
-    pub fn page_up(&mut self) {
-        self.selected = self.selected.saturating_sub(self.page_size);
-        self.adjust_offset();
-    }
-
-    pub fn page_down(&mut self) {
-        if !self.filtered_indices.is_empty() {
-            self.selected = (self.selected + self.page_size).min(self.filtered_indices.len() - 1);
-        }
-        self.adjust_offset();
-    }
-
-    pub fn home(&mut self) {
-        self.selected = 0;
-        self.offset = 0;
-    }
-
-    pub fn end(&mut self) {
-        if !self.filtered_indices.is_empty() {
-            self.selected = self.filtered_indices.len() - 1;
-        }
-        self.adjust_offset();
-    }
-
-    pub fn set_items(&mut self, items: Vec<T>) {
-        self.has_data = true;
-        self.items = items;
-        self.marked.clear();
-        self.filtered_indices = (0..self.items.len()).collect();
-        if self.filtered_indices.is_empty() {
-            self.selected = 0;
-            self.offset = 0;
-        } else if self.selected >= self.filtered_indices.len() {
-            self.selected = self.filtered_indices.len() - 1;
-        }
-        self.adjust_offset();
-    }
-
-    pub fn apply_filter<F: Fn(&T) -> bool>(&mut self, pred: F) {
-        self.filtered_indices = self.items.iter().enumerate()
-            .filter(|(_, item)| pred(item))
-            .map(|(i, _)| i)
-            .collect();
-        if self.filtered_indices.is_empty() {
-            self.selected = 0;
-            self.offset = 0;
-        } else if self.selected >= self.filtered_indices.len() {
-            self.selected = self.filtered_indices.len() - 1;
-        }
-        self.adjust_offset();
-    }
-
-    /// Clear all data and reset `has_data` to false.
-    pub fn clear_data(&mut self) {
-        self.items.clear();
-        self.filtered_indices.clear();
-        self.selected = 0;
-        self.offset = 0;
-        self.has_data = false;
-        self.loading = false;
-        self.prev_item_count = 0;
-        self.marked.clear();
-    }
-
-    pub fn clear_filter(&mut self) {
-        self.filter_text.clear();
-        self.cached_filter_regex = None;
-        self.filtered_indices = (0..self.items.len()).collect();
-        if self.selected >= self.filtered_indices.len() && !self.filtered_indices.is_empty() {
-            self.selected = self.filtered_indices.len() - 1;
-        }
-        self.adjust_offset();
-    }
-
-    pub fn selected_item(&self) -> Option<&T> {
-        let idx = *self.filtered_indices.get(self.selected)?;
-        self.items.get(idx)
-    }
-
-    pub fn visible_items(&self) -> Vec<&T> {
-        let end = (self.offset + self.page_size).min(self.filtered_indices.len());
-        if self.offset >= self.filtered_indices.len() {
-            return Vec::new();
-        }
-        self.filtered_indices[self.offset..end]
-            .iter()
-            .filter_map(|&i| self.items.get(i))
-            .collect()
-    }
-
-    fn adjust_offset(&mut self) {
-        if self.page_size == 0 { return; }
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        }
-        if self.selected >= self.offset + self.page_size {
-            self.offset = self.selected - self.page_size + 1;
-        }
-    }
-}
-
-impl<T: Clone + KubeResource> StatefulTable<T> {
-    /// Sort items by the given column index.
-    /// If already sorted by this column, toggle ascending/descending.
-    /// Tries numeric comparison first, falls back to lexicographic.
-    pub fn sort_by_column(&mut self, col: usize) {
-        // Resolve usize::MAX sentinel to actual last column
-        let actual_col = if col == usize::MAX {
-            T::headers().len().saturating_sub(1)
-        } else {
-            col
-        };
-        if self.sort_column == actual_col {
-            self.sort_ascending = !self.sort_ascending;
-        } else {
-            self.sort_column = actual_col;
-            self.sort_ascending = true;
-        }
-        let asc = self.sort_ascending;
-        // Check if sorting by an AGE column
-        let is_age_col = T::headers().get(actual_col).map_or(false, |h| *h == "AGE");
-        self.items.sort_by(|a, b| {
-            let a_row = a.row();
-            let b_row = b.row();
-            let a_val = a_row.get(actual_col).map(|c| c.as_ref()).unwrap_or("");
-            let b_val = b_row.get(actual_col).map(|c| c.as_ref()).unwrap_or("");
-            let ord = if is_age_col {
-                // Parse age strings to seconds for correct ordering
-                parse_age_seconds(a_val).cmp(&parse_age_seconds(b_val))
-            } else if let (Ok(a_num), Ok(b_num)) = (a_val.parse::<f64>(), b_val.parse::<f64>()) {
-                a_num.partial_cmp(&b_num).unwrap_or(std::cmp::Ordering::Equal)
-            } else {
-                a_val.cmp(b_val)
-            };
-            if asc { ord } else { ord.reverse() }
-        });
-
-        // Rebuild filtered indices preserving filter
-        if !self.filter_text.is_empty() {
-            let t = self.filter_text.to_lowercase();
-            let re = regex::Regex::new(&t).ok();
-            self.filtered_indices = self.items.iter().enumerate()
-                .filter(|(_, item)| {
-                    item.row().iter().any(|cell| {
-                        let lower = cell.to_lowercase();
-                        re.as_ref().map_or(lower.contains(&t), |r| r.is_match(&lower))
-                    })
+            {
+                Some(CrdInfo {
+                    group: row.extra_str("group").unwrap_or("").to_string(),
+                    version: row.extra_str("version").unwrap_or("").to_string(),
+                    kind: kind.to_string(),
+                    plural: plural.to_string(),
+                    scope: crate::kube::protocol::ResourceScope::from_scope_str(row.extra_str("scope").unwrap_or("Namespaced")),
                 })
-                .map(|(i, _)| i)
-                .collect();
-        } else {
-            self.filtered_indices = (0..self.items.len()).collect();
-        }
-
-        // Marks become stale after sort — indices shifted, so clear them.
-        // This matches k9s behavior (clearing marks on sort).
-        self.marked.clear();
-
-        // Clamp selection
-        if self.filtered_indices.is_empty() {
-            self.selected = 0;
-            self.offset = 0;
-        } else if self.selected >= self.filtered_indices.len() {
-            self.selected = self.filtered_indices.len() - 1;
-        }
-        self.adjust_offset();
-    }
-
-    /// Sets items and re-applies the stored filter text if one is active.
-    /// Preserves selection by resource identity (name + namespace) rather than
-    /// by index, so the user's selection doesn't jump when items reorder.
-    pub fn set_items_filtered(&mut self, items: Vec<T>) {
-        // Save current selection identity
-        let prev_selection = self.selected_item().map(|item| {
-            (item.name().to_string(), item.namespace().to_string())
-        });
-
-        // Loading indicator: shows during the initial LIST when items are
-        // streaming in (count keeps growing). Once count stops growing,
-        // loading turns off permanently until clear_data resets it.
-        let new_count = items.len();
-        if self.loading {
-            if new_count <= self.prev_item_count {
-                self.loading = false;
-            }
-        } else if self.prev_item_count == 0 && new_count > 0 {
-            // First batch arriving — start showing loading
-            self.loading = true;
-        }
-        self.prev_item_count = new_count;
-        self.has_data = true;
-
-        // Preserve marks by identity (name+namespace) across data refreshes
-        let prev_marks: Vec<(String, String)> = self.marked.iter()
-            .filter_map(|&idx| self.items.get(idx).map(|item| {
-                (item.name().to_string(), item.namespace().to_string())
-            }))
-            .collect();
-
-        self.items = items;
-
-        // Restore marks by finding items with same identity in new data
-        self.marked.clear();
-        for (mark_name, mark_ns) in &prev_marks {
-            if let Some(pos) = self.items.iter().position(|item| {
-                item.name() == mark_name && item.namespace() == mark_ns
-            }) {
-                self.marked.insert(pos);
-            }
-        }
-
-        // Re-apply filter using cached regex (avoids recompilation on every data update).
-        self.filtered_indices.clear();
-        if !self.filter_text.is_empty() {
-            let t = self.filter_text.to_lowercase();
-            let re = &self.cached_filter_regex;
-            for (i, item) in self.items.iter().enumerate() {
-                if item.row().iter().any(|cell| {
-                    let lower = cell.to_lowercase();
-                    re.as_ref().map_or(lower.contains(&t), |r| r.is_match(&lower))
-                }) {
-                    self.filtered_indices.push(i);
-                }
-            }
-        } else {
-            self.filtered_indices.extend(0..self.items.len());
-        }
-
-        // Restore selection by identity
-        if let Some((ref prev_name, ref prev_ns)) = prev_selection {
-            if let Some(pos) = self.filtered_indices.iter().position(|&i| {
-                self.items[i].name() == prev_name.as_str() && self.items[i].namespace() == prev_ns.as_str()
-            }) {
-                self.selected = pos;
             } else {
-                // Item no longer exists, clamp
-                if self.filtered_indices.is_empty() {
-                    self.selected = 0;
-                    self.offset = 0;
-                } else if self.selected >= self.filtered_indices.len() {
-                    self.selected = self.filtered_indices.len() - 1;
-                }
+                None
             }
-        } else {
-            if self.filtered_indices.is_empty() {
-                self.selected = 0;
-                self.offset = 0;
-            } else if self.selected >= self.filtered_indices.len() {
-                self.selected = self.filtered_indices.len() - 1;
-            }
-        }
-
-        // Re-apply user's sort if they've changed the column from default.
-        // The watcher pre-sorts by namespace+name, so sort_column 0 (default)
-        // doesn't need re-sorting. Any other column needs explicit re-sort.
-        if self.sort_column != 0 && !self.items.is_empty() {
-            let col = self.sort_column;
-            let asc = self.sort_ascending;
-            let is_age_col = T::headers().get(col).map_or(false, |h| *h == "AGE");
-            self.items.sort_by(|a, b| {
-                let a_row = a.row();
-                let b_row = b.row();
-                let a_val = a_row.get(col).map(|c| c.as_ref()).unwrap_or("");
-                let b_val = b_row.get(col).map(|c| c.as_ref()).unwrap_or("");
-                let ord = if is_age_col {
-                    parse_age_seconds(a_val).cmp(&parse_age_seconds(b_val))
-                } else if let (Ok(an), Ok(bn)) = (a_val.parse::<f64>(), b_val.parse::<f64>()) {
-                    an.partial_cmp(&bn).unwrap_or(std::cmp::Ordering::Equal)
-                } else {
-                    a_val.cmp(b_val)
-                };
-                if asc { ord } else { ord.reverse() }
-            });
-            // Rebuild filtered indices after re-sort using cached regex
-            if !self.filter_text.is_empty() {
-                let t = self.filter_text.to_lowercase();
-                let re = &self.cached_filter_regex;
-                self.filtered_indices = self.items.iter().enumerate()
-                    .filter(|(_, item)| {
-                        item.row().iter().any(|cell| {
-                            let lower = cell.to_lowercase();
-                            re.as_ref().map_or(lower.contains(&t), |r| r.is_match(&lower))
-                        })
-                    })
-                    .map(|(i, _)| i).collect();
-            } else {
-                self.filtered_indices = (0..self.items.len()).collect();
-            }
-            // Re-find selection after resort
-            if let Some((prev_name, prev_ns)) = prev_selection {
-                if let Some(pos) = self.filtered_indices.iter().position(|&i| {
-                    self.items[i].name() == prev_name && self.items[i].namespace() == prev_ns
-                }) {
-                    self.selected = pos;
-                }
-            }
-
-            // Re-resolve marks by identity after re-sort (indices shifted).
-            if !prev_marks.is_empty() {
-                self.marked.clear();
-                for (mark_name, mark_ns) in &prev_marks {
-                    if let Some(pos) = self.items.iter().position(|item| {
-                        item.name() == mark_name && item.namespace() == mark_ns
-                    }) {
-                        self.marked.insert(pos);
-                    }
-                }
-            }
-        }
-
-        self.adjust_offset();
+        })
     }
 }

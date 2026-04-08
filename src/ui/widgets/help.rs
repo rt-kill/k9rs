@@ -20,7 +20,7 @@ struct HelpSection {
     entries: Vec<HelpEntry>,
 }
 
-/// Help overlay widget styled like k9s.
+/// Help overlay widget.
 /// Clean two-column layout: key in blue, description in white.
 /// Rendered as a modal overlay, dismissable with ? or Esc.
 pub struct HelpOverlay<'a> {

@@ -1,31 +1,20 @@
 //! Daemon process for k9rs.
 //!
-//! Accepts TUI connections and spawns a ServerSession per client. Holds shared
-//! state (WatcherCache via DashMap) that sessions interact with for watcher
-//! sharing. The daemon itself has no k8s knowledge — all k8s logic lives in
-//! ServerSession.
-//!
-//! - Start with `k9rs daemon` (stays running until killed / Ctrl-C / SIGTERM)
-//! - TUI clients connect via Unix socket, send kubeconfig + env vars
-//! - Management CLI (`k9rs ctl`) connects for status/ping/shutdown
+//! All connections use the same binary protocol (length-prefixed bincode).
+//! The first command determines connection type:
+//! - `Init` → long-lived TUI session (handed off to ServerSession)
+//! - `Ping`/`Status`/`Shutdown`/`Clear` → one-shot management request
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{BufReader, BufWriter};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::info;
 
-use super::protocol::{DaemonStatus, Request, Response};
+use super::protocol::{self, DaemonStatus, SessionCommand, SessionEvent};
 use super::server_session::{ServerSession, SessionSharedState};
-
-// ---------------------------------------------------------------------------
-// Daemon configuration constants
-// ---------------------------------------------------------------------------
-
-/// Timeout for reading a response from the daemon (seconds).
-const CLIENT_READ_TIMEOUT_SECS: u64 = 5;
 
 // ---------------------------------------------------------------------------
 // Socket path
@@ -62,7 +51,7 @@ pub async fn run_daemon() -> anyhow::Result<()> {
         Ok(l) => l,
         Err(_) => {
             if UnixStream::connect(&path).await.is_ok() {
-                anyhow::bail!("Daemon already running");
+                anyhow::bail!("Daemon already running at {}", path.display());
             }
             let _ = std::fs::remove_file(&path);
             UnixListener::bind(&path)?
@@ -70,7 +59,6 @@ pub async fn run_daemon() -> anyhow::Result<()> {
     };
     info!("k9rs cache daemon listening on {:?}", path);
 
-    // Signal handlers for clean shutdown
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
     )?;
@@ -78,7 +66,6 @@ pub async fn run_daemon() -> anyhow::Result<()> {
         tokio::signal::unix::SignalKind::interrupt(),
     )?;
 
-    // Daemon state
     let state = Arc::new(DaemonState {
         started_at: Instant::now(),
         socket_path: path.display().to_string(),
@@ -86,7 +73,6 @@ pub async fn run_daemon() -> anyhow::Result<()> {
         session_shared: Arc::new(SessionSharedState::new()),
     });
 
-    // Accept loop — exits on signal or shutdown request
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -114,7 +100,6 @@ pub async fn run_daemon() -> anyhow::Result<()> {
         }
     }
 
-    // Clean shutdown: remove socket, let tokio drain in-flight tasks
     let _ = std::fs::remove_file(&path);
     info!("Daemon stopped");
     Ok(())
@@ -128,13 +113,11 @@ struct DaemonState {
     started_at: Instant,
     socket_path: String,
     shutdown: tokio::sync::Notify,
-    /// Shared state for all ServerSessions (watcher cache + client pool).
-    /// The daemon holds this opaquely — it never accesses the fields.
     session_shared: Arc<SessionSharedState>,
 }
 
 // ---------------------------------------------------------------------------
-// Connection handler
+// Connection handler (unified binary protocol)
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(
@@ -142,125 +125,80 @@ async fn handle_connection(
     state: Arc<DaemonState>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = stream.into_split();
-    let mut buf_reader = BufReader::new(reader);
+    let mut reader = BufReader::with_capacity(protocol::IO_BUFFER_SIZE, reader);
+    let mut writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
 
-    // Read the first line to determine connection type:
-    //   - `"cmd":` => session connection (hand off to ServerSession)
-    //   - `"op":`  => management connection (handle here)
-    let mut first_line = String::new();
-    let n = buf_reader.read_line(&mut first_line).await?;
-    if n == 0 {
-        return Ok(()); // EOF immediately
-    }
-    let first_line = first_line.trim_end().to_string();
+    // Read the first command to determine connection type.
+    let first_cmd: SessionCommand = protocol::read_bincode(&mut reader).await?;
 
-    if !first_line.contains("\"op\"") {
-        info!("Routing connection as TUI session");
-        // Session connection — hand off entirely to ServerSession.
-        // The daemon does NOT parse SessionCommand or construct SessionEvent.
-        // Box the buf_reader directly (it already has an internal buffer and
-        // implements AsyncRead, preserving any read-ahead data after first_line).
-        let boxed_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(buf_reader);
-        let boxed_reader = BufReader::with_capacity(256 * 1024, boxed_reader);
-        let boxed_writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(writer);
-        ServerSession::init_and_run(
-            first_line,
-            boxed_reader,
-            boxed_writer,
-            state.session_shared.clone(),
-        )
-        .await;
-        return Ok(());
-    }
-
-    // Management connection — process with Request/Response protocol.
-    let mut writer = writer;
-
-    // Process the first line as a Request.
-    match serde_json::from_str::<Request>(&first_line) {
-        Ok(request) => {
-            let resp = handle_request(&state, request).await;
-            write_response(&mut writer, &resp).await?;
-        }
-        Err(e) => {
-            write_response(
-                &mut writer,
-                &Response::Error {
-                    message: format!("Invalid request: {}", e),
-                },
+    match first_cmd {
+        // Session connection — hand off to ServerSession.
+        SessionCommand::Init { .. } => {
+            info!("Routing connection as TUI session");
+            let boxed_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(reader);
+            let boxed_reader = BufReader::with_capacity(protocol::IO_BUFFER_SIZE, boxed_reader);
+            let boxed_writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(writer);
+            ServerSession::init_and_run_with_parsed(
+                first_cmd,
+                boxed_reader,
+                boxed_writer,
+                state.session_shared.clone(),
             )
-            .await?;
+            .await;
         }
-    }
 
-    // Continue processing management requests on this connection.
-    let mut lines = buf_reader.lines();
-    while let Some(line) = lines.next_line().await? {
-        let request: Request = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                write_response(&mut writer, &Response::Error { message: format!("Invalid request: {}", e) }).await?;
-                continue;
-            }
-        };
+        // Management: one-shot commands
+        SessionCommand::Ping => {
+            protocol::write_bincode(&mut writer, &SessionEvent::CommandResult {
+                ok: true,
+                message: "pong".to_string(),
+            }).await?;
+        }
 
-        let resp = handle_request(&state, request).await;
-        write_response(&mut writer, &resp).await?;
-    }
-
-    Ok(())
-}
-
-async fn handle_request(state: &DaemonState, request: Request) -> Response {
-    match request {
-        Request::Ping => Response::Ok,
-
-        Request::Status => {
-            Response::Status(DaemonStatus {
+        SessionCommand::Status => {
+            protocol::write_bincode(&mut writer, &SessionEvent::DaemonStatus(DaemonStatus {
                 pid: std::process::id(),
                 uptime_secs: state.started_at.elapsed().as_secs(),
                 socket_path: state.socket_path.clone(),
-            })
+            })).await?;
         }
 
-        Request::Shutdown => {
+        SessionCommand::Shutdown => {
+            protocol::write_bincode(&mut writer, &SessionEvent::CommandResult {
+                ok: true,
+                message: "shutting down".to_string(),
+            }).await?;
             state.shutdown.notify_one();
-            Response::Ok
         }
 
-        Request::Clear { context } => {
-            match context {
-                Some(ctx) => {
-                    state.session_shared.discovery_cache.remove(&ctx);
-                }
-                None => {
-                    state.session_shared.discovery_cache.clear();
-                }
+        SessionCommand::Clear { context } => {
+            match &context {
+                Some(_) => { state.session_shared.discovery_cache.clear(); }
+                None => { state.session_shared.discovery_cache.clear(); }
             }
-            Response::Ok
+            protocol::write_bincode(&mut writer, &SessionEvent::CommandResult {
+                ok: true,
+                message: "cache cleared".to_string(),
+            }).await?;
+        }
+
+        other => {
+            protocol::write_bincode(&mut writer, &SessionEvent::SessionError(
+                format!("Expected Init or management command, got: {:?}", other),
+            )).await?;
         }
     }
-}
 
-async fn write_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    resp: &Response,
-) -> anyhow::Result<()> {
-    let mut buf = serde_json::to_string(resp)?;
-    buf.push('\n');
-    writer.write_all(buf.as_bytes()).await?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Client
+// Client (unified binary protocol)
 // ---------------------------------------------------------------------------
 
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-
 pub struct DaemonClient {
-    reader: BufReader<OwnedReadHalf>,
-    writer: BufWriter<OwnedWriteHalf>,
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: BufWriter<tokio::net::unix::OwnedWriteHalf>,
 }
 
 impl DaemonClient {
@@ -275,40 +213,16 @@ impl DaemonClient {
         })
     }
 
-    /// Send a typed `Request` and get a typed `Response`.
-    pub async fn request(&mut self, req: &Request) -> Option<Response> {
-        let line = self.send_and_read(req).await?;
-        serde_json::from_str(&line).ok()
-    }
-
-    /// Core I/O: write a JSON request line, read a JSON response line.
-    /// Uses buffered I/O (not byte-at-a-time) and a 5-second timeout
-    /// to prevent hanging on a dead daemon.
-    async fn send_and_read(&mut self, req: &impl serde::Serialize) -> Option<String> {
-        use tokio::io::AsyncWriteExt as _;
-
-        let mut buf = serde_json::to_string(req).ok()?;
-        buf.push('\n');
-        self.writer.write_all(buf.as_bytes()).await.ok()?;
-        self.writer.flush().await.ok()?;
-
-        let mut resp_line = String::new();
+    /// Send a command and read the response (binary).
+    pub async fn request(&mut self, cmd: &SessionCommand) -> Option<SessionEvent> {
+        protocol::write_bincode(&mut self.writer, cmd).await.ok()?;
         let result = tokio::time::timeout(
-            Duration::from_secs(CLIENT_READ_TIMEOUT_SECS),
-            self.reader.read_line(&mut resp_line),
+            std::time::Duration::from_secs(5),
+            protocol::read_bincode::<_, SessionEvent>(&mut self.reader),
         ).await;
-
         match result {
-            Ok(Ok(0)) => None,          // EOF
-            Ok(Ok(_)) => {
-                if resp_line.ends_with('\n') {
-                    resp_line.pop();
-                }
-                Some(resp_line)
-            }
-            Ok(Err(_)) => None,         // I/O error
-            Err(_) => None,             // timeout
+            Ok(Ok(event)) => Some(event),
+            _ => None,
         }
     }
 }
-

@@ -1,94 +1,62 @@
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::DaemonSet;
 
-use super::KubeResource;
+use crate::kube::resources::row::{ExtraValue, ResourceRow};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct KubeDaemonSet {
-    pub namespace: String,
-    pub name: String,
-    pub desired: i32,
-    pub current: i32,
-    pub ready: i32,
-    pub up_to_date: i32,
-    pub available: i32,
-    pub age: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub selector_labels: BTreeMap<String, String>,
-}
+/// Convert a k8s DaemonSet into a generic ResourceRow.
+pub(crate) fn daemonset_to_row(ds: DaemonSet) -> ResourceRow {
+    let metadata = ds.metadata;
+    let ns = metadata.namespace.unwrap_or_default();
+    let name = metadata.name.unwrap_or_default();
+    let uid = metadata.uid.unwrap_or_default();
+    let labels = metadata.labels.unwrap_or_default();
+    let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
+    let age = metadata.creation_timestamp.map(|t| t.0);
 
-impl KubeResource for KubeDaemonSet {
-    fn headers() -> &'static [&'static str] {
-        &[
-            "NAMESPACE",
-            "NAME",
-            "DESIRED",
-            "CURRENT",
-            "READY",
-            "UP-TO-DATE",
-            "AVAILABLE",
-            "AGE",
-        ]
-    }
+    let selector_labels = ds.spec.as_ref()
+        .and_then(|s| s.selector.match_labels.clone())
+        .unwrap_or_default();
+    let container_ports: Vec<u16> = ds.spec.as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .map(|ps| ps.containers.iter()
+            .flat_map(|c| c.ports.as_ref().into_iter().flatten())
+            .filter(|p| p.protocol.as_deref() != Some("UDP"))
+            .map(|p| p.container_port as u16)
+            .collect())
+        .unwrap_or_default();
 
-    fn row(&self) -> Vec<Cow<'_, str>> {
-        vec![
-            Cow::Borrowed(&self.namespace),
-            Cow::Borrowed(&self.name),
-            Cow::Owned(self.desired.to_string()),
-            Cow::Owned(self.current.to_string()),
-            Cow::Owned(self.ready.to_string()),
-            Cow::Owned(self.up_to_date.to_string()),
-            Cow::Owned(self.available.to_string()),
-            Cow::Owned(crate::util::format_age(self.age)),
-        ]
-    }
+    let node_selector = ds.spec.as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|ps| ps.node_selector.as_ref())
+        .map(|ns| {
+            let pairs: Vec<String> = ns.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+            if pairs.is_empty() { "<none>".to_string() } else { pairs.join(",") }
+        })
+        .unwrap_or_else(|| "<none>".to_string());
 
-    fn name(&self) -> &str {
-        &self.name
-    }
+    let status = ds.status.unwrap_or_default();
+    let desired = status.desired_number_scheduled;
+    let current = status.current_number_scheduled;
+    let ready = status.number_ready;
+    let up_to_date = status.updated_number_scheduled.unwrap_or(0);
+    let available = status.number_available.unwrap_or(0);
 
-    fn namespace(&self) -> &str {
-        &self.namespace
-    }
+    let mut extra = BTreeMap::new();
+    extra.insert("selector_labels".into(), ExtraValue::Map(selector_labels));
+    extra.insert("uid".into(), ExtraValue::Str(uid));
+    extra.insert("container_ports".into(), ExtraValue::Ports(container_ports));
 
-    fn kind() -> &'static str {
-        "daemonset"
-    }
-}
-
-impl From<DaemonSet> for KubeDaemonSet {
-    fn from(ds: DaemonSet) -> Self {
-        let metadata = ds.metadata;
-        let namespace = metadata.namespace.unwrap_or_default();
-        let name = metadata.name.unwrap_or_default();
-        let age = metadata.creation_timestamp.map(|t| t.0);
-
-        let selector_labels = ds.spec
-            .as_ref()
-            .and_then(|s| s.selector.match_labels.clone())
-            .unwrap_or_default();
-
-        let status = ds.status.unwrap_or_default();
-        let desired = status.desired_number_scheduled;
-        let current = status.current_number_scheduled;
-        let ready = status.number_ready;
-        let up_to_date = status.updated_number_scheduled.unwrap_or(0);
-        let available = status.number_available.unwrap_or(0);
-
-        KubeDaemonSet {
-            namespace,
-            name,
-            desired,
-            current,
-            ready,
-            up_to_date,
-            available,
-            age,
-            selector_labels,
-        }
+    ResourceRow {
+        cells: vec![
+            ns.clone(), name.clone(), desired.to_string(), current.to_string(),
+            ready.to_string(), up_to_date.to_string(), available.to_string(),
+            node_selector,
+            labels_str,
+            crate::util::format_age(age),
+        ],
+        name,
+        namespace: ns,
+        extra,
     }
 }

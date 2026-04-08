@@ -3,15 +3,16 @@ pub mod theme;
 pub mod views;
 pub mod widgets;
 
+use unicode_width::UnicodeWidthStr;
+
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Widget};
 use ratatui::Frame;
 
-use crate::app::{App, Route};
-use crate::ui::theme::Theme;
-use crate::ui::widgets::{ConfirmDialogWidget, FilterBar, FlashWidget, HelpOverlay};
+use crate::app::{App, InputMode, Route};
+use crate::ui::widgets::{ConfirmDialogWidget, PortForwardDialogWidget, FilterBar, FlashWidget, HelpOverlay};
 
 /// Main UI draw function.
 ///
@@ -48,12 +49,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Route::Contexts => {
             views::context::draw_contexts(f, app, area);
         }
-        Route::ContainerSelect { ref pod, ref namespace } => {
-            // Draw resource view underneath with a container list overlay
+        Route::ContainerSelect { ref pod, ref namespace, selected, .. } => {
+            let pod = pod.clone();
+            let namespace = namespace.clone();
+            let sel = *selected;
             views::resource::draw_resources(f, app, area);
-            draw_container_select(f, app, pod, namespace);
+            draw_container_select(f, app, &pod, &namespace, sel);
         }
-        Route::Aliases => {
+        Route::Aliases { .. } => {
             // Reuse the describe view to show alias content
             views::describe::draw_describe(f, app, area);
         }
@@ -63,11 +66,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // In resource/context views this is handled inline, but for sub-views
     // (logs, describe, yaml) we need to draw it as an overlay so the user can
     // see what they're typing.
-    if !matches!(app.route, Route::Resources | Route::Contexts) {
-        if app.command_mode || app.scale_mode {
+    if !matches!(app.route, Route::Resources | Route::Contexts | Route::Overview) {
+        if app.input_mode.is_active() {
             draw_command_overlay(f, app);
         }
-        if app.filter_input.active {
+        if app.nav.filter_input().active {
             draw_filter_overlay(f, app);
         }
     }
@@ -77,28 +80,29 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // Draw confirmation dialog if present
     draw_confirm_dialog(f, app);
-}
 
-/// Resolve the theme from the application state.
-fn app_theme(app: &App) -> &Theme {
-    &app.theme
+    // Draw port-forward dialog if present
+    if let Some(ref dialog) = app.port_forward_dialog {
+        let widget = PortForwardDialogWidget::new(dialog, &app.theme);
+        f.render_widget(widget, f.area());
+    }
 }
 
 /// Draw the help overlay on top of the current view.
 fn draw_help_overlay(f: &mut Frame, app: &App) {
-    let theme = app_theme(app);
+    let theme = &app.theme;
     let help = HelpOverlay::new(theme, app.help_scroll);
     f.render_widget(help, f.area());
 }
 
-/// Draw flash messages at the bottom of the screen (k9s style).
+/// Draw flash messages at the bottom of the screen.
 fn draw_flash(f: &mut Frame, app: &App) {
     if let Some(ref flash) = app.flash {
         if flash.is_expired() {
             return;
         }
 
-        let theme = app_theme(app);
+        let theme = &app.theme;
         let area = f.area();
 
         // Position flash at the very bottom line
@@ -118,18 +122,19 @@ fn draw_flash(f: &mut Frame, app: &App) {
 }
 
 /// Draw the container selection overlay for multi-container pods.
-fn draw_container_select(f: &mut Frame, app: &App, pod: &str, namespace: &str) {
+fn draw_container_select(f: &mut Frame, app: &App, pod: &str, namespace: &str, selected_idx: usize) {
     use ratatui::layout::{Constraint, Layout, Rect};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Clear};
 
-    let theme = app_theme(app);
+    let theme = &app.theme;
     let area = f.area();
 
     // Find the pod's containers
-    let containers: Vec<String> = app.data.pods.items.iter()
-        .find(|p| p.name == pod && p.namespace == namespace)
-        .map(|p| p.containers.iter().map(|c| c.name.clone()).collect())
+    let containers: Vec<String> = app.data.unified.get(&crate::app::nav::rid("pods"))
+        .and_then(|t| t.items.iter().find(|p| p.name == pod && p.namespace == namespace))
+        .and_then(|p| p.extra_containers())
+        .map(|c| c.iter().map(|ci| ci.name.clone()).collect())
         .unwrap_or_default();
 
     if containers.is_empty() {
@@ -170,7 +175,6 @@ fn draw_container_select(f: &mut Frame, app: &App, pod: &str, namespace: &str) {
     }
 
     // Render container list
-    let selected_idx = app.container_select_index;
     for (i, container) in containers.iter().enumerate() {
         if i as u16 >= inner.height.saturating_sub(1) {
             break;
@@ -204,7 +208,7 @@ fn draw_container_select(f: &mut Frame, app: &App, pod: &str, namespace: &str) {
 /// Draw the confirmation dialog overlay.
 fn draw_confirm_dialog(f: &mut Frame, app: &App) {
     if let Some(ref dialog) = app.confirm_dialog {
-        let theme = app_theme(app);
+        let theme = &app.theme;
         let dialog_widget = ConfirmDialogWidget::new(dialog, theme);
         f.render_widget(dialog_widget, f.area());
     }
@@ -218,7 +222,7 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
     if area.height < 5 {
         return;
     }
-    let theme = app_theme(app);
+    let theme = &app.theme;
 
     // 3-line box at the bottom, above the last 2 lines (indicator/flash)
     let overlay_y = area.y + area.height.saturating_sub(5);
@@ -236,10 +240,11 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
         return;
     }
 
-    let input = &app.command_input;
-    let ghost = app.best_completion()
+    let input = app.input_mode.input().unwrap_or("");
+    let is_scale = matches!(app.input_mode, InputMode::Scale { .. });
+    let ghost: String = app.best_completion()
         .and_then(|c| {
-            if c.len() > input.len() {
+            if c.starts_with(input) {
                 Some(c[input.len()..].to_string())
             } else {
                 None
@@ -247,16 +252,16 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
         })
         .unwrap_or_default();
 
-    let prefix = if app.scale_mode { "Replicas: " } else { ":" };
-    let prefix_len: u16 = prefix.len() as u16;
-    let typed_len = input.len() as u16;
+    let prefix = app.input_mode.prompt();
+    let prefix_len: u16 = prefix.width() as u16;
+    let typed_len = input.width() as u16;
 
     let mut spans = vec![
         Span::styled(prefix, theme.command.add_modifier(Modifier::BOLD)),
         Span::styled(input, theme.command),
     ];
 
-    if !ghost.is_empty() && !app.scale_mode {
+    if !ghost.is_empty() && !is_scale {
         spans.push(Span::styled(
             ghost,
             theme.command_suggestion.add_modifier(Modifier::DIM | Modifier::ITALIC),
@@ -281,20 +286,20 @@ fn draw_filter_overlay(f: &mut Frame, app: &App) {
     if area.height < 5 {
         return;
     }
-    let theme = app_theme(app);
+    let theme = &app.theme;
 
     let overlay_y = area.y + area.height.saturating_sub(5);
     let overlay_area = Rect::new(area.x, overlay_y, area.width, 3);
 
     Clear.render(overlay_area, f.buffer_mut());
 
-    let (filtered, total) = app.active_table_items_count();
-    let match_count = if app.filter_input.text.is_empty() { total } else { filtered };
+    let counts = app.active_table_items_count();
+    let match_count = if app.nav.filter_input().text.is_empty() { counts.total } else { counts.filtered };
     let filter_bar = FilterBar::new(
-        app.filter_input.active,
-        &app.filter_input.text,
+        app.nav.filter_input().active,
+        &app.nav.filter_input().text,
         match_count,
-        total,
+        counts.total,
         theme,
     );
     f.render_widget(filter_bar, overlay_area);

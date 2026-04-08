@@ -2,35 +2,9 @@ pub mod handler;
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::app::FlashMessage;
-use crate::kube::resources::{
-    configmaps::KubeConfigMap,
-    crds::{KubeCrd, DynamicKubeResource},
-    cronjobs::KubeCronJob,
-    daemonsets::KubeDaemonSet,
-    deployments::KubeDeployment,
-    endpoints::KubeEndpoints,
-    events::KubeEvent,
-    hpa::KubeHpa,
-    ingress::KubeIngress,
-    jobs::KubeJob,
-    limitranges::KubeLimitRange,
-    namespaces::KubeNamespace,
-    networkpolicies::KubeNetworkPolicy,
-    nodes::KubeNode,
-    pdb::KubePdb,
-    pods::KubePod,
-    pvcs::KubePvc,
-    pvs::KubePv,
-    rbac::{KubeClusterRole, KubeClusterRoleBinding, KubeRole, KubeRoleBinding},
-    replicasets::KubeReplicaSet,
-    resourcequotas::KubeResourceQuota,
-    secrets::KubeSecret,
-    serviceaccounts::KubeServiceAccount,
-    services::KubeService,
-    statefulsets::KubeStatefulSet,
-    storageclasses::KubeStorageClass,
-};
 
 /// Top-level event type for the application event loop.
 ///
@@ -49,49 +23,36 @@ pub enum AppEvent {
         context: String,
         result: Result<(), String>,
     },
-    /// Pod metrics from the metrics-server: HashMap<(namespace, pod_name), (cpu, mem)>.
-    PodMetrics(HashMap<(String, String), (String, String)>),
-    /// Node metrics from the metrics-server: HashMap<node_name, (cpu, mem)>.
-    NodeMetrics(HashMap<String, (String, String)>),
+    /// Pod metrics from the metrics-server.
+    PodMetrics(HashMap<crate::kube::protocol::ObjectKey, crate::kube::protocol::MetricsUsage>),
+    /// Node metrics from the metrics-server.
+    NodeMetrics(HashMap<String, crate::kube::protocol::MetricsUsage>),
     /// The log stream has ended (daemon mode). Resets the streaming flag.
     LogStreamEnded,
+    /// The server resolved an unknown resource to its true identity.
+    /// The TUI should update its nav and table keys.
+    ResourceResolved {
+        original: crate::kube::protocol::ResourceId,
+        resolved: crate::kube::protocol::ResourceId,
+    },
+    /// A subscription failed for a specific resource (e.g., resource doesn't exist).
+    SubscriptionFailed {
+        resource: crate::kube::protocol::ResourceId,
+        message: String,
+    },
     /// The daemon connection was lost. TUI should exit gracefully.
     DaemonDisconnected,
 }
 
 /// An update to a particular Kubernetes resource type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResourceUpdate {
-    Pods(Vec<KubePod>),
-    Deployments(Vec<KubeDeployment>),
-    Services(Vec<KubeService>),
-    Nodes(Vec<KubeNode>),
-    Namespaces(Vec<KubeNamespace>),
-    ConfigMaps(Vec<KubeConfigMap>),
-    Secrets(Vec<KubeSecret>),
-    StatefulSets(Vec<KubeStatefulSet>),
-    DaemonSets(Vec<KubeDaemonSet>),
-    Jobs(Vec<KubeJob>),
-    CronJobs(Vec<KubeCronJob>),
-    ReplicaSets(Vec<KubeReplicaSet>),
-    Ingresses(Vec<KubeIngress>),
-    NetworkPolicies(Vec<KubeNetworkPolicy>),
-    ServiceAccounts(Vec<KubeServiceAccount>),
-    StorageClasses(Vec<KubeStorageClass>),
-    Pvs(Vec<KubePv>),
-    Pvcs(Vec<KubePvc>),
-    Events(Vec<KubeEvent>),
-    Roles(Vec<KubeRole>),
-    ClusterRoles(Vec<KubeClusterRole>),
-    RoleBindings(Vec<KubeRoleBinding>),
-    ClusterRoleBindings(Vec<KubeClusterRoleBinding>),
-    Hpa(Vec<KubeHpa>),
-    Endpoints(Vec<KubeEndpoints>),
-    LimitRanges(Vec<KubeLimitRange>),
-    ResourceQuotas(Vec<KubeResourceQuota>),
-    Pdb(Vec<KubePdb>),
-    Crds(Vec<KubeCrd>),
-    DynamicResources(Vec<DynamicKubeResource>),
+    /// Resource table snapshot — all resource types use this unified format.
+    Rows {
+        resource: crate::kube::protocol::ResourceId,
+        headers: Vec<String>,
+        rows: Vec<crate::kube::resources::row::ResourceRow>,
+    },
     Yaml(String),
     Describe(String),
     LogLine(String),

@@ -1,12 +1,62 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Paragraph, StatefulWidget, Widget, Wrap},
 };
 
 use crate::ui::theme::Theme;
 use crate::util::truncate_to_width;
+
+/// Parsed timestamp and content from a Kubernetes log line.
+struct LogTimestamp<'a> {
+    timestamp: &'a str,
+    content: &'a str,
+}
+
+/// Split a text line into spans, highlighting matches for all active filter
+/// patterns using SearchPattern (smartcase regex).
+fn highlight_filters<'a>(text: &'a str, patterns: &[String], normal: Style, highlight: Style) -> Line<'a> {
+    if patterns.is_empty() {
+        return Line::from(Span::styled(text, normal));
+    }
+    // Collect all match ranges from all patterns.
+    let mut all_matches: Vec<(usize, usize)> = Vec::new();
+    for term in patterns {
+        if term.is_empty() { continue; }
+        let pat = crate::util::SearchPattern::new(term);
+        all_matches.extend(pat.find_all(text));
+    }
+    if all_matches.is_empty() {
+        return Line::from(Span::styled(text, normal));
+    }
+    // Sort by start position, then merge overlapping ranges.
+    all_matches.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in all_matches {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    let mut spans = Vec::new();
+    let mut last = 0;
+    for (start, end) in merged {
+        if start > last {
+            spans.push(Span::styled(&text[last..start], normal));
+        }
+        spans.push(Span::styled(&text[start..end], highlight));
+        last = end;
+    }
+    if last < text.len() {
+        spans.push(Span::styled(&text[last..], normal));
+    }
+    Line::from(spans)
+}
 
 /// State for the log viewer widget.
 pub struct LogViewState {
@@ -19,6 +69,16 @@ pub struct LogViewState {
     /// scroll offset for accurate scrollbar rendering. If `None`, the widget
     /// uses `scroll` for the scrollbar.
     pub scroll_display: Option<usize>,
+    /// All active filter patterns (committed + draft) for highlighting.
+    pub active_patterns: Vec<String>,
+    /// Whether the filter input bar is active (draft being typed).
+    pub filter_input_active: bool,
+    /// Text being typed in the filter input bar.
+    pub filter_input: String,
+    /// Total number of visible lines after filtering.
+    pub visible_count: usize,
+    /// Number of committed (stacked) filters.
+    pub committed_filter_count: usize,
 }
 
 impl LogViewState {
@@ -30,6 +90,11 @@ impl LogViewState {
             show_timestamps: true,
             total_lines: 0,
             scroll_display: None,
+            active_patterns: Vec::new(),
+            filter_input_active: false,
+            filter_input: String::new(),
+            visible_count: 0,
+            committed_filter_count: 0,
         }
     }
 
@@ -113,7 +178,7 @@ impl<'a> LogViewer<'a> {
 
     /// Parse a log line to separate timestamp from content.
     /// Kubernetes log timestamps are typically in RFC3339 format at the start.
-    fn parse_timestamp(line: &str) -> Option<(&str, &str)> {
+    fn parse_timestamp(line: &str) -> Option<LogTimestamp<'_>> {
         // Typical format: "2024-01-15T10:30:00.123456789Z message..."
         // Timestamps are always ASCII, so check bytes directly to avoid
         // panicking on lines that start with multi-byte UTF-8 characters.
@@ -128,7 +193,10 @@ impl<'a> LogViewer<'a> {
             // Find the end of the timestamp (space after the Z or +offset)
             if let Some(space_pos) = line.find(' ') {
                 if space_pos <= 35 {
-                    return Some((&line[..space_pos], &line[space_pos + 1..]));
+                    return Some(LogTimestamp {
+                        timestamp: &line[..space_pos],
+                        content: &line[space_pos + 1..],
+                    });
                 }
             }
         }
@@ -189,7 +257,7 @@ impl StatefulWidget for LogViewer<'_> {
             for line_idx in start_line..self.lines.len() {
                 let line = self.lines[line_idx];
                 if state.show_timestamps {
-                    if let Some((ts, content)) = Self::parse_timestamp(line) {
+                    if let Some(LogTimestamp { timestamp: ts, content }) = Self::parse_timestamp(line) {
                         text_lines.push(Line::from(vec![
                             Span::styled(ts.to_string(), self.theme.log_timestamp),
                             Span::styled(" ", self.theme.log_text),
@@ -199,7 +267,7 @@ impl StatefulWidget for LogViewer<'_> {
                         text_lines.push(Line::from(Span::styled(line.to_string(), self.theme.log_text)));
                     }
                 } else {
-                    let content = if let Some((_, content)) = Self::parse_timestamp(line) {
+                    let content = if let Some(LogTimestamp { content, .. }) = Self::parse_timestamp(line) {
                         content
                     } else {
                         line
@@ -213,33 +281,39 @@ impl StatefulWidget for LogViewer<'_> {
                 .scroll((0, 0));
             paragraph.render(inner, buf);
         } else {
-            // No wrap: render each line individually, truncating to width
+            // No wrap: render each line individually, truncating to width.
+            let patterns = &state.active_patterns;
             let end = (state.scroll + visible_height).min(self.lines.len());
             for (vi, line_idx) in (state.scroll..end).enumerate() {
                 let y = inner.y + vi as u16;
                 let line = self.lines[line_idx];
 
-                if state.show_timestamps {
-                    if let Some((ts, content)) = Self::parse_timestamp(line) {
-                        let spans = vec![
-                            Span::styled(ts.to_string(), self.theme.log_timestamp),
-                            Span::styled(" ", self.theme.log_text),
-                            Span::styled(content.to_string(), self.theme.log_text),
-                        ];
+                let content = if state.show_timestamps {
+                    // Render timestamp prefix + content with filter highlighting.
+                    if let Some(LogTimestamp { timestamp: ts, content }) = Self::parse_timestamp(line) {
+                        let ts_span = Span::styled(format!("{} ", ts), self.theme.log_timestamp);
+                        let content_line = highlight_filters(content, patterns, self.theme.log_text, self.theme.search_match);
+                        let mut spans = vec![ts_span];
+                        spans.extend(content_line.spans);
                         let styled_line = Line::from(spans);
                         buf.set_line(inner.x, y, &styled_line, inner.width);
-                    } else {
-                        buf.set_string(inner.x, y, line, self.theme.log_text);
+                        continue;
                     }
+                    line
                 } else {
-                    let content = if let Some((_, content)) = Self::parse_timestamp(line) {
+                    if let Some(LogTimestamp { content, .. }) = Self::parse_timestamp(line) {
                         content
                     } else {
                         line
-                    };
-                    let max_w = inner.width as usize;
-                    let display = truncate_to_width(content, max_w);
+                    }
+                };
+                let max_w = inner.width as usize;
+                let display = truncate_to_width(content, max_w);
+                if patterns.is_empty() {
                     buf.set_string(inner.x, y, display, self.theme.log_text);
+                } else {
+                    let highlighted = highlight_filters(display, patterns, self.theme.log_text, self.theme.search_match);
+                    buf.set_line(inner.x, y, &highlighted, inner.width);
                 }
             }
         }
@@ -276,6 +350,37 @@ impl StatefulWidget for LogViewer<'_> {
                     buf.set_string(scrollbar_x, y, "\u{2591}", self.theme.border);
                 }
             }
+        }
+
+        // Filter bar at the bottom of the log area.
+        if state.filter_input_active || state.committed_filter_count > 0 {
+            let bar_y = inner.y + inner.height.saturating_sub(1);
+            // Clear the line.
+            for x in inner.x..inner.x + inner.width {
+                buf.set_string(x, bar_y, " ", self.theme.status_bar);
+            }
+            let mut spans = vec![Span::styled(" /", self.theme.status_bar_key)];
+            if state.filter_input_active {
+                spans.push(Span::styled(&state.filter_input, self.theme.filter));
+                spans.push(Span::styled("\u{2588}", self.theme.filter));
+                // Show live visible count while typing
+                spans.push(Span::styled(
+                    format!("  [{} visible]", state.visible_count),
+                    self.theme.title_counter,
+                ));
+            } else {
+                // Show committed filter stack summary
+                let label = state.active_patterns.join(" | ");
+                spans.push(Span::styled(label, self.theme.filter));
+                spans.push(Span::styled(
+                    format!("  [{} filter{}, {} visible]",
+                        state.committed_filter_count,
+                        if state.committed_filter_count == 1 { "" } else { "s" },
+                        state.visible_count),
+                    self.theme.title_counter,
+                ));
+            }
+            buf.set_line(inner.x, bar_y, &Line::from(spans), inner.width);
         }
     }
 }

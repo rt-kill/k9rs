@@ -1153,11 +1153,13 @@ name = "k9rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "chrono",
  "clap",
  "crossterm",
  "dashmap",
  "futures",
+ "http",
  "k8s-openapi",
  "kube",
  "libc",

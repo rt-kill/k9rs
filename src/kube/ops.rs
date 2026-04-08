@@ -1,3 +1,52 @@
+use serde::Serialize;
+
+// ---------------------------------------------------------------------------
+// Typed K8s API patch structs (used by ops and server_session)
+// ---------------------------------------------------------------------------
+
+/// Merge patch for scaling a resource.
+#[derive(Debug, Serialize)]
+pub(super) struct ScalePatch {
+    pub spec: ScalePatchSpec,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ScalePatchSpec {
+    pub replicas: u32,
+}
+
+/// Merge patch for suspending/resuming a CronJob.
+#[derive(Debug, Serialize)]
+pub(super) struct SuspendPatch {
+    pub spec: SuspendPatchSpec,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SuspendPatchSpec {
+    pub suspend: bool,
+}
+
+/// Merge patch for triggering a rolling restart via annotation.
+#[derive(Debug, Serialize)]
+pub(super) struct RestartPatch {
+    pub spec: RestartPatchSpec,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct RestartPatchSpec {
+    pub template: RestartPatchTemplate,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct RestartPatchTemplate {
+    pub metadata: RestartPatchMetadata,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct RestartPatchMetadata {
+    pub annotations: std::collections::BTreeMap<String, String>,
+}
+
 /// Execute a delete API call for the given resource.
 pub async fn execute_delete(
     client: &::kube::Client,
@@ -120,17 +169,18 @@ pub async fn restart_via_patch(
         ResourceScope::Namespaced => Api::namespaced_with(client.clone(), namespace, &ar),
     };
 
-    let patch = serde_json::json!({
-        "spec": {
-            "template": {
-                "metadata": {
-                    "annotations": {
-                        "kubectl.kubernetes.io/restartedAt": chrono::Utc::now().to_rfc3339()
-                    }
-                }
-            }
-        }
-    });
+    let mut annotations = std::collections::BTreeMap::new();
+    annotations.insert(
+        "kubectl.kubernetes.io/restartedAt".to_string(),
+        chrono::Utc::now().to_rfc3339(),
+    );
+    let patch = RestartPatch {
+        spec: RestartPatchSpec {
+            template: RestartPatchTemplate {
+                metadata: RestartPatchMetadata { annotations },
+            },
+        },
+    };
 
     api.patch(name, &PatchParams::default(), &Patch::Merge(&patch)).await?;
     Ok(())

@@ -7,6 +7,13 @@ use ratatui::{
 use crate::app::App;
 use crate::ui::theme::Theme;
 
+/// A keyboard shortcut hint for the UI.
+#[derive(Debug, Clone)]
+pub struct KeyHint {
+    pub key: &'static str,
+    pub description: &'static str,
+}
+
 // ---------------------------------------------------------------------------
 // k9rs ASCII art logo (rendered in orange)
 // ---------------------------------------------------------------------------
@@ -85,14 +92,6 @@ pub fn draw_cluster_info(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             Span::styled(" K9rs Rev:  ", theme.info_label),
             Span::styled(env!("CARGO_PKG_VERSION"), theme.info_value),
         ]),
-        Line::from(vec![
-            Span::styled(" CPU:       ", theme.info_label),
-            Span::styled("n/a", theme.info_na),
-        ]),
-        Line::from(vec![
-            Span::styled(" MEM:       ", theme.info_label),
-            Span::styled("n/a", theme.info_na),
-        ]),
     ];
 
     for (i, line) in lines.iter().enumerate() {
@@ -130,7 +129,7 @@ pub fn draw_logo(f: &mut Frame, area: Rect, theme: &Theme) {
 pub fn draw_key_hint_grid(
     f: &mut Frame,
     area: Rect,
-    hints: &[(&str, &str)],
+    hints: &[KeyHint],
     theme: &Theme,
 ) {
     if area.height == 0 || area.width == 0 {
@@ -148,10 +147,10 @@ pub fn draw_key_hint_grid(
 
         // Left column
         if row < hints.len() {
-            let (key, desc) = hints[row];
+            let hint = &hints[row];
             let line = Line::from(vec![
-                Span::styled(format!(" <{}>", key), theme.help_key),
-                Span::styled(format!(" {}", desc), theme.info_value),
+                Span::styled(format!(" <{}>", hint.key), theme.help_key),
+                Span::styled(format!(" {}", hint.description), theme.info_value),
             ]);
             f.render_widget(line, Rect::new(area.x, y, col_width, 1));
         }
@@ -159,12 +158,27 @@ pub fn draw_key_hint_grid(
         // Right column
         let right_idx = row + entries_per_col;
         if right_idx < hints.len() {
-            let (key, desc) = hints[right_idx];
+            let hint = &hints[right_idx];
             let line = Line::from(vec![
-                Span::styled(format!(" <{}>", key), theme.help_key),
-                Span::styled(format!(" {}", desc), theme.info_value),
+                Span::styled(format!(" <{}>", hint.key), theme.help_key),
+                Span::styled(format!(" {}", hint.description), theme.info_value),
             ]);
             f.render_widget(line, Rect::new(area.x + col_width, y, col_width, 1));
         }
     }
+}
+
+/// Build a keybinding bar `Line` from a list of `(key, description)` pairs.
+/// Used by describe, yaml, log, and context views for their bottom status bars.
+pub fn render_keybinding_bar(hints: &[(&str, &str)], theme: &Theme) -> Line<'static> {
+    let mut spans = Vec::new();
+    spans.push(Span::styled(" ", theme.status_bar));
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        spans.push(Span::styled(format!("<{}>", key), theme.status_bar_key));
+        spans.push(Span::styled(format!(" {} ", desc), theme.status_bar));
+        if i < hints.len() - 1 {
+            spans.push(Span::styled("\u{2502}", theme.status_bar));
+        }
+    }
+    Line::from(spans)
 }

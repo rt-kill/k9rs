@@ -1,7 +1,13 @@
 use std::collections::BTreeMap;
 
-use super::ResourceTab;
-use crate::kube::protocol::ResourceScope;
+use crate::kube::protocol::ResourceId;
+
+/// What subscription changes a nav operation requires.
+/// Returned by push/pop/reset so the session layer can subscribe/unsubscribe.
+pub struct NavChange {
+    pub unsubscribe: Option<ResourceId>,
+    pub subscribe: Option<ResourceId>,
+}
 
 // ---------------------------------------------------------------------------
 // NavFilter — the kinds of filters that can narrow a resource view
@@ -18,20 +24,17 @@ pub enum NavFilter {
     /// Field match: show only items where a named field equals a value.
     /// Used for node→pods (field="node", value="node-name").
     Field { field: String, value: String },
-}
-
-// ---------------------------------------------------------------------------
-// DynamicSpec — CRD metadata needed to re-subscribe on pop
-// ---------------------------------------------------------------------------
-
-/// Metadata for a dynamic CRD resource subscription.
-#[derive(Debug, Clone)]
-pub struct DynamicSpec {
-    pub group: String,
-    pub version: String,
-    pub kind: String,
-    pub plural: String,
-    pub scope: ResourceScope,
+    /// Owner reference chain: show pods owned (directly or transitively) by
+    /// the resource with this UID. Follows ownerReferences metadata for 100%
+    /// accurate drill-down (Pod → ReplicaSet → Deployment).
+    OwnerChain {
+        /// UID of the owner resource to match.
+        uid: String,
+        /// Kind of the owner (for display in breadcrumb).
+        kind: String,
+        /// Display name of the owner resource.
+        display_name: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -41,14 +44,14 @@ pub struct DynamicSpec {
 /// A single level in the navigation stack.
 #[derive(Debug, Clone)]
 pub struct NavStep {
-    /// What resource tab this step is viewing.
-    pub tab: ResourceTab,
+    /// What resource this step is viewing (universal identity).
+    pub resource: ResourceId,
     /// The filter applied at this level (if any).
     pub filter: Option<NavFilter>,
-    /// For DynamicResource tab: the CRD metadata needed to re-subscribe.
-    pub dynamic_spec: Option<DynamicSpec>,
     /// Saved table selection index so "back" restores cursor position.
     pub saved_selected: usize,
+    /// Uncommitted filter input for this frame.
+    pub filter_input: FilterInputState,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,18 +66,22 @@ pub struct NavStep {
 #[derive(Debug)]
 pub struct NavStack {
     steps: Vec<NavStep>,
+    /// The root resource before the last `reset()`, used for
+    /// "toggle last view" (Ctrl-^).
+    prev_root: Option<ResourceId>,
 }
 
 impl NavStack {
-    /// Create a new NavStack with a root step for the given tab.
-    pub fn new(tab: ResourceTab) -> Self {
+    /// Create a new NavStack with a root step for the given resource.
+    pub fn new(rid: ResourceId) -> Self {
         Self {
             steps: vec![NavStep {
-                tab,
+                resource: rid,
                 filter: None,
-                dynamic_spec: None,
                 saved_selected: 0,
+                filter_input: FilterInputState::default(),
             }],
+            prev_root: None,
         }
     }
 
@@ -83,83 +90,87 @@ impl NavStack {
         self.steps.last().expect("NavStack is never empty")
     }
 
-    /// The current resource tab.
-    pub fn tab(&self) -> ResourceTab {
-        self.current().tab
+    /// Mutable access to the current step.
+    pub fn current_mut(&mut self) -> &mut NavStep {
+        self.steps.last_mut().expect("NavStack is never empty")
     }
 
-    /// The root tab (bottom of the stack — what the user originally navigated to).
-    pub fn root_tab(&self) -> ResourceTab {
-        self.steps[0].tab
+    /// The current resource id.
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.current().resource
     }
 
-    /// Push a new step (grep or drill-down).
-    pub fn push(&mut self, step: NavStep) {
+    /// The root resource id (bottom of the stack).
+    pub fn root_resource_id(&self) -> &ResourceId {
+        &self.steps[0].resource
+    }
+
+    /// Push a new step (grep or drill-down). Returns subscription changes.
+    pub fn push(&mut self, step: NavStep) -> NavChange {
+        let old = self.resource_id().clone();
         self.steps.push(step);
+        let new = self.resource_id().clone();
+        if new != old {
+            NavChange { unsubscribe: Some(old), subscribe: Some(new) }
+        } else {
+            NavChange { unsubscribe: None, subscribe: None }
+        }
     }
 
-    /// Pop one step. Returns the popped step, or None if at root.
-    pub fn pop(&mut self) -> Option<NavStep> {
+    /// Pop one step. Returns (popped_step, subscription_changes).
+    pub fn pop(&mut self) -> Option<(NavStep, NavChange)> {
         if self.steps.len() <= 1 {
             return None;
         }
-        self.steps.pop()
+        let old = self.resource_id().clone();
+        let popped = self.steps.pop()?;
+        let new = self.resource_id().clone();
+        let change = if new != old {
+            NavChange { unsubscribe: Some(old), subscribe: Some(new) }
+        } else {
+            NavChange { unsubscribe: None, subscribe: None }
+        };
+        Some((popped, change))
     }
 
-    /// Replace the entire stack with a new root (`:command` or tab switch).
-    pub fn reset(&mut self, tab: ResourceTab) {
+    /// Replace the entire stack with a new root. Returns subscription changes.
+    pub fn reset(&mut self, rid: ResourceId) -> NavChange {
+        let old = self.resource_id().clone();
+        self.prev_root = Some(self.root_resource_id().clone());
         self.steps.clear();
         self.steps.push(NavStep {
-            tab,
+            resource: rid.clone(),
             filter: None,
-            dynamic_spec: None,
             saved_selected: 0,
+            filter_input: FilterInputState::default(),
         });
-    }
-
-    /// Reset with a dynamic resource root.
-    pub fn reset_dynamic(&mut self, spec: DynamicSpec) {
-        self.steps.clear();
-        self.steps.push(NavStep {
-            tab: ResourceTab::DynamicResource,
-            filter: None,
-            dynamic_spec: Some(spec),
-            saved_selected: 0,
-        });
+        if rid != old {
+            NavChange { unsubscribe: Some(old), subscribe: Some(rid) }
+        } else {
+            NavChange { unsubscribe: None, subscribe: None }
+        }
     }
 
     /// Collect all filters that apply to the current view.
-    /// Walks backward from the top of the stack, collecting filters from
-    /// consecutive steps that share the same tab as the current step.
     pub fn active_filters(&self) -> Vec<&NavFilter> {
-        let current_tab = self.tab();
+        let current_rid = self.resource_id();
         let mut filters = Vec::new();
         for step in self.steps.iter().rev() {
-            if step.tab != current_tab {
+            if step.resource != *current_rid {
                 break;
             }
             if let Some(ref f) = step.filter {
                 filters.push(f);
             }
         }
-        filters.reverse(); // oldest first — matches are AND'd in order
+        filters.reverse();
         filters
     }
 
-    /// The number of steps (for breadcrumb rendering).
-    pub fn depth(&self) -> usize {
-        self.steps.len()
-    }
+    pub fn depth(&self) -> usize { self.steps.len() }
+    pub fn is_drilled(&self) -> bool { self.steps.len() > 1 }
 
-    /// Whether we're deeper than root (any drill-down or grep active).
-    pub fn is_drilled(&self) -> bool {
-        self.steps.len() > 1
-    }
-
-    /// Pop steps from the top until we find and remove one whose grep filter
-    /// contains the given substring. Returns true if found and removed.
     pub fn pop_grep_containing(&mut self, needle: &str) -> bool {
-        // Search from the top for the matching step
         let mut found_idx = None;
         for i in (1..self.steps.len()).rev() {
             if let Some(NavFilter::Grep(ref text)) = self.steps[i].filter {
@@ -177,28 +188,41 @@ impl NavStack {
         }
     }
 
-    /// Save the current table selection into the topmost step.
+    pub fn has_fault_filter(&self) -> bool {
+        self.steps.iter().any(|s| {
+            matches!(&s.filter, Some(NavFilter::Grep(t)) if t.contains("crashloop"))
+        })
+    }
+
     pub fn save_selected(&mut self, selected: usize) {
         if let Some(step) = self.steps.last_mut() {
             step.saved_selected = selected;
         }
     }
 
-    /// Get the DynamicSpec from the current step (if any).
-    pub fn current_dynamic_spec(&self) -> Option<&DynamicSpec> {
-        self.current().dynamic_spec.as_ref()
+    pub fn prev_root(&self) -> Option<&ResourceId> {
+        self.prev_root.as_ref()
     }
 
-    /// Build a breadcrumb string for the table title.
-    /// Examples: "", "/nginx", "deploy/my-app", "deploy/my-app > /running"
+    /// The current step's filter input state.
+    pub fn filter_input(&self) -> &FilterInputState {
+        &self.current().filter_input
+    }
+
+    /// Mutable access to the current step's filter input state.
+    pub fn filter_input_mut(&mut self) -> &mut FilterInputState {
+        &mut self.current_mut().filter_input
+    }
+
     pub fn breadcrumb(&self) -> String {
-        if self.steps.len() <= 1 && self.steps[0].filter.is_none() {
+        if self.steps.is_empty() {
             return String::new();
         }
         let mut parts = Vec::new();
         for (i, step) in self.steps.iter().enumerate() {
             if i == 0 && step.filter.is_none() {
-                continue; // skip bare root
+                parts.push(step.resource.short_label().to_string());
+                continue;
             }
             match &step.filter {
                 Some(NavFilter::Grep(text)) => parts.push(format!("/{}", text)),
@@ -211,13 +235,11 @@ impl NavStack {
                 Some(NavFilter::Field { field, value }) => {
                     parts.push(format!("{}={}", field, value));
                 }
+                Some(NavFilter::OwnerChain { display_name, kind, .. }) => {
+                    parts.push(format!("{}/{}", kind, display_name));
+                }
                 None => {
-                    // Drill-down with no filter (e.g., CRD instances)
-                    if let Some(ref spec) = step.dynamic_spec {
-                        parts.push(spec.kind.clone());
-                    } else {
-                        parts.push(step.tab.label().to_string());
-                    }
+                    parts.push(step.resource.short_label().to_string());
                 }
             }
         }
@@ -236,4 +258,11 @@ pub struct FilterInputState {
     pub active: bool,
     /// The text being typed (not yet committed to NavStack).
     pub text: String,
+}
+
+/// Convenience helper: look up a ResourceId by alias, panicking on unknown aliases.
+/// Used for frequently-referenced built-in resources (pods, nodes, etc.).
+pub fn rid(alias: &str) -> ResourceId {
+    ResourceId::from_alias(alias)
+        .unwrap_or_else(|| panic!("Unknown resource alias: {}", alias))
 }

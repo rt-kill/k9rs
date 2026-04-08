@@ -27,26 +27,35 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     let indicator_area = chunks[1];
     let bar_area = chunks[2];
 
-    // Extract pod/container from route
-    let (pod_name, container_name) = match &app.route {
-        Route::Logs { pod, container, .. } => (pod.as_str(), container.as_str()),
-        _ => ("unknown", "unknown"),
+    // Extract pod/container and state from route
+    let (pod_name, container_name, logs) = match &app.route {
+        Route::Logs { ref target, ref state, .. } => (target.pod.as_str(), target.container.as_str(), state.as_ref()),
+        Route::Shell { ref target, ref state, .. } => (target.pod.as_str(), target.container.as_str(), state.as_ref()),
+        _ => return, // Not a log view — nothing to draw
     };
-
-    let logs = &app.logs;
     let since_label = logs.since.as_deref().unwrap_or("tail");
 
     // Only collect the visible window from the VecDeque to avoid allocating
     // a Vec for all 50k lines every frame.
-    if !logs.lines.is_empty() {
-        let total = logs.lines.len();
+    //
+    // When filters are active, iterate filtered_indices instead of raw lines.
+    let filtered = &logs.filtered_indices;
+    let is_filtered = !logs.filters.is_empty() || logs.draft_filter.is_some();
+    let effective_total = if is_filtered { filtered.len() } else { logs.lines.len() };
+
+    if effective_total > 0 {
+        let total = effective_total;
         let inner_height = log_area.height.saturating_sub(2) as usize; // account for border
         let height = if inner_height == 0 { 1 } else { inner_height };
 
         if logs.wrap {
-            // When wrap is enabled, pass all lines to the widget and let
+            // When wrap is enabled, pass all visible lines to the widget and let
             // ratatui's Paragraph handle wrapping and scrolling internally.
-            let all_lines: Vec<&str> = logs.lines.iter().map(|s| s.as_str()).collect();
+            let all_lines: Vec<&str> = if is_filtered {
+                filtered.iter().map(|&i| logs.lines[i].as_str()).collect()
+            } else {
+                logs.lines.iter().map(|s| s.as_str()).collect()
+            };
 
             let log_viewer = LogViewer::new(
                 &all_lines,
@@ -72,6 +81,11 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
                 show_timestamps: logs.show_timestamps,
                 total_lines: total,
                 scroll_display: None,
+                active_patterns: logs.active_patterns(),
+                filter_input_active: logs.is_filtering(),
+                filter_input: logs.draft_filter.clone().unwrap_or_default(),
+                visible_count: logs.visible_count(),
+                committed_filter_count: logs.filters.len(),
             };
 
             f.render_stateful_widget(log_viewer, log_area, &mut view_state);
@@ -85,7 +99,11 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             let start = scroll;
             let end = (start + height).min(total);
 
-            let visible_lines: Vec<&str> = logs.lines.range(start..end).map(|s| s.as_str()).collect();
+            let visible_lines: Vec<&str> = if is_filtered {
+                filtered[start..end].iter().map(|&i| logs.lines[i].as_str()).collect()
+            } else {
+                logs.lines.range(start..end).map(|s| s.as_str()).collect()
+            };
 
             let log_viewer = LogViewer::new(
                 &visible_lines,
@@ -96,12 +114,17 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             );
 
             let mut view_state = crate::ui::widgets::LogViewState {
-                scroll: 0, // lines are already windowed, widget renders from index 0
+                scroll: 0,
                 follow: logs.follow,
                 wrap: logs.wrap,
                 show_timestamps: logs.show_timestamps,
                 total_lines: total,
-                scroll_display: Some(scroll), // real scroll offset for scrollbar
+                scroll_display: Some(scroll),
+                active_patterns: logs.active_patterns(),
+                filter_input_active: logs.is_filtering(),
+                filter_input: logs.draft_filter.clone().unwrap_or_default(),
+                visible_count: logs.visible_count(),
+                committed_filter_count: logs.filters.len(),
             };
 
             f.render_stateful_widget(log_viewer, log_area, &mut view_state);
@@ -139,7 +162,7 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    // Indicator bar: show toggle states (k9s-style)
+    // Indicator bar: show toggle states
     let follow_state = if logs.follow { "On" } else { "Off" };
     let wrap_state = if logs.wrap { "On" } else { "Off" };
     let ts_state = if logs.show_timestamps { "On" } else { "Off" };
@@ -180,21 +203,11 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
         ("q", "back"),
     ];
 
-    let mut spans = Vec::new();
-    spans.push(Span::styled(" ", theme.status_bar));
-    for (i, (key, desc)) in hints.iter().enumerate() {
-        spans.push(Span::styled(format!("<{}>", key), theme.status_bar_key));
-        spans.push(Span::styled(format!(" {} ", desc), theme.status_bar));
-        if i < hints.len() - 1 {
-            spans.push(Span::styled("\u{2502}", theme.status_bar));
-        }
-    }
-
     // Fill background
     let bg = " ".repeat(bar_area.width as usize);
     let bg_line = Line::styled(bg, theme.status_bar);
     f.render_widget(bg_line, bar_area);
 
-    let line = Line::from(spans);
+    let line = crate::ui::header::render_keybinding_bar(&hints, theme);
     f.render_widget(line, bar_area);
 }

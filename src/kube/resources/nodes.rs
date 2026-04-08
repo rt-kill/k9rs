@@ -1,139 +1,115 @@
-use std::borrow::Cow;
-use std::collections::BTreeMap;
-
-use chrono::{DateTime, Utc};
 use k8s_openapi::api::core::v1::Node;
 
-use super::KubeResource;
+use crate::kube::resources::row::ResourceRow;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct KubeNode {
-    pub name: String,
-    pub status: String,
-    pub roles: String,
-    pub version: String,
-    pub cpu_usage: String,
-    pub mem_usage: String,
-    pub cpu_capacity: String,
-    pub mem_capacity: String,
-    pub pods: String,
-    pub age: Option<DateTime<Utc>>,
-    pub labels: BTreeMap<String, String>,
-}
+/// Convert a k8s Node into a generic ResourceRow.
+/// CPU and MEM cells are initially "n/a" and mutated in-place by `apply_node_metrics`.
+pub(crate) fn node_to_row(node: Node) -> ResourceRow {
+    let metadata = node.metadata;
+    let name = metadata.name.unwrap_or_default();
+    let labels = metadata.labels.clone().unwrap_or_default();
+    let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
+    let age = metadata.creation_timestamp.map(|t| t.0);
 
-impl KubeResource for KubeNode {
-    fn headers() -> &'static [&'static str] {
-        &[
-            "NAME", "STATUS", "ROLES", "VERSION", "CPU", "MEMORY", "PODS", "AGE",
-        ]
-    }
-
-    fn row(&self) -> Vec<Cow<'_, str>> {
-        vec![
-            Cow::Borrowed(&self.name),
-            Cow::Borrowed(&self.status),
-            Cow::Borrowed(&self.roles),
-            Cow::Borrowed(&self.version),
-            Cow::Owned(format!("{}/{}", self.cpu_usage, self.cpu_capacity)),
-            Cow::Owned(format!("{}/{}", self.mem_usage, self.mem_capacity)),
-            Cow::Borrowed(&self.pods),
-            Cow::Owned(crate::util::format_age(self.age)),
-        ]
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind() -> &'static str {
-        "node"
-    }
-}
-
-impl From<Node> for KubeNode {
-    fn from(node: Node) -> Self {
-        let metadata = node.metadata;
-        let name = metadata.name.unwrap_or_default();
-        let labels = metadata.labels.clone().unwrap_or_default();
-        let age = metadata.creation_timestamp.map(|t| t.0);
-
-        // Determine roles from labels
-        let roles = {
-            let mut role_list: Vec<String> = Vec::new();
-            for (key, value) in &labels {
-                if let Some(role) = key.strip_prefix("node-role.kubernetes.io/") {
-                    if role.is_empty() {
-                        // When the key suffix is empty, extract role info from value;
-                        // but when the value is also empty, skip pushing an empty string.
-                        if !value.is_empty() {
-                            role_list.push(value.clone());
-                        }
-                    } else {
-                        role_list.push(role.to_string());
+    // Determine roles from labels
+    let roles = {
+        let mut role_list: Vec<String> = Vec::new();
+        for (key, value) in &labels {
+            if let Some(role) = key.strip_prefix("node-role.kubernetes.io/") {
+                if role.is_empty() {
+                    if !value.is_empty() {
+                        role_list.push(value.clone());
                     }
+                } else {
+                    role_list.push(role.to_string());
                 }
             }
-            if role_list.is_empty() {
-                "<none>".to_string()
-            } else {
-                role_list.sort();
-                role_list.join(",")
+        }
+        if role_list.is_empty() {
+            "<none>".to_string()
+        } else {
+            role_list.sort();
+            role_list.join(",")
+        }
+    };
+
+    let spec = node.spec;
+
+    // Taint count
+    let taints = spec.as_ref()
+        .and_then(|s| s.taints.as_ref())
+        .map(|t| t.len())
+        .unwrap_or(0);
+
+    let status_val = node.status.unwrap_or_default();
+    let status = {
+        let conditions = status_val.conditions.unwrap_or_default();
+        let mut node_status = "NotReady".to_string();
+        for cond in &conditions {
+            if cond.type_ == "Ready" && cond.status == "True" {
+                node_status = "Ready".to_string();
+                break;
             }
-        };
+        }
+        if spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false) {
+            node_status = format!("{},SchedulingDisabled", node_status);
+        }
+        node_status
+    };
 
-        let spec = node.spec;
+    let node_info = status_val.node_info.as_ref();
+    let version = node_info
+        .map(|info| info.kubelet_version.clone())
+        .unwrap_or_default();
+    let arch = node_info
+        .map(|info| info.architecture.clone())
+        .unwrap_or_default();
 
-        let status_val = node.status.unwrap_or_default();
-        let status = {
-            let conditions = status_val.conditions.unwrap_or_default();
-            let mut node_status = "NotReady".to_string();
-            for cond in &conditions {
-                if cond.type_ == "Ready" && cond.status == "True" {
-                    node_status = "Ready".to_string();
-                    break;
-                }
-            }
+    // Addresses
+    let addresses = status_val.addresses.unwrap_or_default();
+    let internal_ip = addresses.iter()
+        .find(|a| a.type_ == "InternalIP")
+        .map(|a| a.address.clone())
+        .unwrap_or_else(|| "<none>".to_string());
+    let external_ip = addresses.iter()
+        .find(|a| a.type_ == "ExternalIP")
+        .map(|a| a.address.clone())
+        .unwrap_or_else(|| "<none>".to_string());
 
-            if spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false) {
-                node_status = format!("{},SchedulingDisabled", node_status);
-            }
+    // Capacity resources
+    let capacity = status_val.capacity.unwrap_or_default();
+    let cpu_capacity = capacity
+        .get("cpu")
+        .map(|q| q.0.clone())
+        .unwrap_or_default();
+    let mem_capacity = capacity
+        .get("memory")
+        .map(|q| q.0.clone())
+        .unwrap_or_default();
+    let pods_capacity = capacity
+        .get("pods")
+        .map(|q| q.0.clone())
+        .unwrap_or_default();
 
-            node_status
-        };
-
-        let version = status_val
-            .node_info
-            .as_ref()
-            .map(|info| info.kubelet_version.clone())
-            .unwrap_or_default();
-
-        // Capacity resources
-        let capacity = status_val.capacity.unwrap_or_default();
-        let cpu_capacity = capacity
-            .get("cpu")
-            .map(|q| q.0.clone())
-            .unwrap_or_default();
-        let mem_capacity = capacity
-            .get("memory")
-            .map(|q| q.0.clone())
-            .unwrap_or_default();
-        let pods_capacity = capacity
-            .get("pods")
-            .map(|q| q.0.clone())
-            .unwrap_or_default();
-
-        KubeNode {
-            name,
+    // CPU (col 8) and MEMORY (col 9) are initially n/a — mutated by apply_node_metrics.
+    ResourceRow {
+        cells: vec![
+            name.clone(),
             status,
             roles,
+            taints.to_string(),
             version,
-            cpu_usage: "n/a".to_string(),
-            mem_usage: "n/a".to_string(),
-            cpu_capacity,
-            mem_capacity,
-            pods: pods_capacity,
-            age,
-            labels,
-        }
+            internal_ip,
+            external_ip,
+            pods_capacity,
+            format!("n/a/{}", cpu_capacity),
+            format!("n/a/{}", mem_capacity),
+            arch,
+            labels_str,
+            crate::util::format_age(age),
+        ],
+        name,
+        namespace: String::new(),
+        extra: Default::default(),
     }
 }

@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::ui::theme::Theme;
 
-/// Filter input widget styled like k9s: bordered box with `/` prefix,
+/// Filter input widget: bordered box with `/` prefix,
 /// visible block cursor, and match count.
 pub struct FilterBar<'a> {
     active: bool,

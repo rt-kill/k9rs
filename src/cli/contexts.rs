@@ -1,45 +1,23 @@
 use anyhow::Result;
 
-/// List cached contexts from disk cache files at `~/.cache/k9rs/*.json`.
+/// List available contexts from kubeconfig.
 pub fn run() -> Result<()> {
-    let cache_dir = match crate::kube::cache::cache_dir() {
-        Some(d) => d,
-        None => {
-            println!("Cache directory not found");
-            return Ok(());
-        }
-    };
+    let kubeconfig = ::kube::config::Kubeconfig::read()
+        .map_err(|e| anyhow::anyhow!("Failed to read kubeconfig: {}", e))?;
 
-    let entries = match std::fs::read_dir(&cache_dir) {
-        Ok(e) => e,
-        Err(_) => {
-            println!("No cache directory at {}", cache_dir.display());
-            return Ok(());
-        }
-    };
+    let current = kubeconfig.current_context.as_deref().unwrap_or("");
 
-    let mut found = false;
-    for entry in entries.flatten() {
-        if entry.path().extension().map_or(false, |x| x == "json") {
-            if let Ok(data) = std::fs::read_to_string(entry.path()) {
-                if let Ok(dc) =
-                    serde_json::from_str::<crate::kube::cache::DiscoveryCache>(&data)
-                {
-                    println!(
-                        "{}: {} namespaces, {} crds (updated {})",
-                        dc.context,
-                        dc.namespaces.len(),
-                        dc.crds.len(),
-                        dc.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
-                    );
-                    found = true;
-                }
-            }
-        }
+    if kubeconfig.contexts.is_empty() {
+        println!("No contexts found in kubeconfig");
+        return Ok(());
     }
 
-    if !found {
-        println!("No cached contexts found in {}", cache_dir.display());
+    for named_ctx in &kubeconfig.contexts {
+        let marker = if named_ctx.name == current { "*" } else { " " };
+        let (cluster, user) = named_ctx.context.as_ref()
+            .map(|c| (c.cluster.as_str(), c.user.as_deref().unwrap_or("")))
+            .unwrap_or(("", ""));
+        println!("{} {:<30} cluster={:<30} user={}", marker, named_ctx.name, cluster, user);
     }
 
     Ok(())

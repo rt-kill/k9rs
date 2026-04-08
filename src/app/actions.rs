@@ -58,7 +58,7 @@ pub enum Action {
     /// Scroll down by N lines (log/detail view).
     ScrollDown(usize),
     /// Switch to a different namespace ("all" for all namespaces).
-    SwitchNamespace(String),
+    SwitchNamespace(crate::kube::protocol::Namespace),
     /// Switch to a different Kubernetes context.
     SwitchContext(String),
     /// Restart the selected deployment/statefulset/daemonset.
@@ -117,4 +117,33 @@ pub enum Action {
     ToggleFaultFilter,
     /// Show an informational flash message to the user.
     FlashInfo(String),
+    /// Decode a secret (base64 decode all values).
+    DecodeSecret,
+    /// Trigger a CronJob (create a Job from it).
+    TriggerCronJob,
+    /// Suspend/resume a CronJob.
+    SuspendCronJob,
+    /// Clear all marks on the current table.
+    ClearMarks,
+    /// Span-mark (select range from anchor to cursor).
+    SpanMark,
+}
+
+impl Action {
+    /// Whether this action mutates cluster state (requires write access).
+    pub fn is_mutating(&self) -> bool {
+        matches!(
+            self,
+            Action::Delete
+                | Action::Edit
+                | Action::Scale
+                | Action::Restart
+                | Action::ForceKill
+                | Action::Shell
+                | Action::PortForward
+                | Action::DecodeSecret
+                | Action::TriggerCronJob
+                | Action::SuspendCronJob
+        )
+    }
 }

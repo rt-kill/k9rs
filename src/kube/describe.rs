@@ -1,175 +1,253 @@
+use std::collections::BTreeMap;
+
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{Node, Pod, Service};
+use kube::api::{Api, DynamicObject, ObjectMeta};
+use kube::Resource;
+use serde::Deserialize;
+
 use crate::kube::protocol::ResourceScope;
 
-/// Fetch a describe-like view for a resource using the kube-rs client directly.
-/// Falls back to kubectl describe for resource types that fail native fetch.
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Fetch a describe-like view for a resource.
+/// Uses typed k8s-openapi structs for known types, DynamicObject for CRDs.
 pub async fn fetch_describe_native(
-    client: &::kube::Client,
+    client: &kube::Client,
     resource: &str,
     name: &str,
     namespace: &str,
     context: &str,
 ) -> String {
-    match fetch_describe_via_api(client, resource, name, namespace).await {
+    match fetch_describe_typed(client, resource, name, namespace).await {
         Ok(describe) => describe,
-        Err(_) => {
-            // Fallback to kubectl describe for complex/unknown resource types
-            fetch_describe_via_kubectl(resource, name, namespace, context).await
-        }
+        Err(_) => fetch_describe_via_kubectl(resource, name, namespace, context).await,
     }
 }
 
-/// Build a describe-like output from a DynamicObject fetched via kube-rs.
-async fn fetch_describe_via_api(
-    client: &::kube::Client,
+/// Fetch YAML for a resource.
+pub async fn fetch_yaml_native(
+    client: &kube::Client,
+    resource: &str,
+    name: &str,
+    namespace: &str,
+    context: &str,
+) -> String {
+    match fetch_yaml_via_discovery(client, resource, name, namespace).await {
+        Ok(yaml) => yaml,
+        Err(_) => fetch_yaml_via_kubectl(resource, name, namespace, context).await,
+    }
+}
+
+/// Resolve a resource type string to an ApiResource.
+pub async fn resolve_api_resource(
+    client: &kube::Client,
+    resource: &str,
+) -> anyhow::Result<(kube::api::ApiResource, ResourceScope)> {
+    use kube::api::ApiResource;
+    use kube::discovery::{self, Scope};
+    use ResourceScope::{Cluster, Namespaced};
+
+    if let Some(meta) = crate::kube::resource_types::find_by_name(resource) {
+        let gvk = kube::api::GroupVersionKind::gvk(meta.group, meta.version, meta.kind);
+        let ar = ApiResource::from_gvk_with_plural(&gvk, meta.plural);
+        return Ok((ar, meta.scope));
+    }
+
+    // Use API discovery to find the resource by plural name (with or without group).
+    let discovery = discovery::Discovery::new(client.clone()).run().await?;
+
+    if resource.contains('.') {
+        // "nodeclaims.karpenter.sh" → plural=nodeclaims, group=karpenter.sh
+        let parts: Vec<&str> = resource.splitn(2, '.').collect();
+        let plural = parts[0];
+        let group = parts.get(1).unwrap_or(&"");
+        for api_group in discovery.groups() {
+            for (ar, caps) in api_group.recommended_resources() {
+                if ar.plural == plural && ar.group == *group {
+                    let scope = if caps.scope == Scope::Cluster { Cluster } else { Namespaced };
+                    return Ok((ar, scope));
+                }
+            }
+        }
+    } else {
+        // "nodeclaims" → search all groups for a matching plural or kind
+        let lower = resource.to_lowercase();
+        for api_group in discovery.groups() {
+            for (ar, caps) in api_group.recommended_resources() {
+                if ar.plural.to_lowercase() == lower
+                    || ar.kind.to_lowercase() == lower
+                    || format!("{}s", ar.kind.to_lowercase()) == lower
+                {
+                    let scope = if caps.scope == Scope::Cluster { Cluster } else { Namespaced };
+                    return Ok((ar, scope));
+                }
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("Resource not found: {}", resource))
+}
+
+// ---------------------------------------------------------------------------
+// Typed describe: uses k8s-openapi structs for known types
+// ---------------------------------------------------------------------------
+
+async fn fetch_describe_typed(
+    client: &kube::Client,
     resource: &str,
     name: &str,
     namespace: &str,
 ) -> anyhow::Result<String> {
-    use ::kube::api::{Api, DynamicObject};
-    let (ar, scope) = resolve_api_resource(client, resource).await?;
-
-    let api: Api<DynamicObject> = match scope {
-        ResourceScope::Cluster => Api::all_with(client.clone(), &ar),
-        ResourceScope::Namespaced if namespace.is_empty() => Api::default_namespaced_with(client.clone(), &ar),
-        ResourceScope::Namespaced => Api::namespaced_with(client.clone(), namespace, &ar),
-    };
-
-    let obj = api.get(name).await?;
-    let val = serde_json::to_value(&obj)?;
-    Ok(format_describe_output(&val, resource))
+    match resource {
+        "pod" => {
+            let api = ns_api::<Pod>(client, namespace);
+            let pod = api.get(name).await?;
+            Ok(format_pod(&pod))
+        }
+        "deployment" => {
+            let api = ns_api::<Deployment>(client, namespace);
+            let dep = api.get(name).await?;
+            Ok(format_deployment(&dep))
+        }
+        "service" => {
+            let api = ns_api::<Service>(client, namespace);
+            let svc = api.get(name).await?;
+            Ok(format_service(&svc))
+        }
+        "node" => {
+            let api: Api<Node> = Api::all(client.clone());
+            let node = api.get(name).await?;
+            Ok(format_node(&node))
+        }
+        _ => {
+            // Unknown/CRD: fetch as DynamicObject, deserialize data into generic struct
+            let (ar, scope) = resolve_api_resource(client, resource).await?;
+            let api: Api<DynamicObject> = match scope {
+                ResourceScope::Cluster => Api::all_with(client.clone(), &ar),
+                ResourceScope::Namespaced if namespace.is_empty() => Api::default_namespaced_with(client.clone(), &ar),
+                ResourceScope::Namespaced => Api::namespaced_with(client.clone(), namespace, &ar),
+            };
+            let obj = api.get(name).await?;
+            Ok(format_generic(&obj))
+        }
+    }
 }
 
-/// Format a JSON object into a human-readable describe-like output.
-fn format_describe_output(val: &serde_json::Value, resource: &str) -> String {
-    let mut out = String::new();
+fn ns_api<K>(client: &kube::Client, namespace: &str) -> Api<K>
+where
+    K: Resource<Scope = k8s_openapi::NamespaceResourceScope>,
+    <K as Resource>::DynamicType: Default,
+{
+    if namespace.is_empty() {
+        Api::default_namespaced(client.clone())
+    } else {
+        Api::namespaced(client.clone(), namespace)
+    }
+}
 
-    // Name
-    if let Some(name) = val.pointer("/metadata/name").and_then(|v| v.as_str()) {
+// ---------------------------------------------------------------------------
+// Common metadata formatting
+// ---------------------------------------------------------------------------
+
+fn format_metadata(meta: &ObjectMeta, out: &mut String) {
+    if let Some(ref name) = meta.name {
         out.push_str(&format!("Name:         {}\n", name));
     }
-
-    // Namespace
-    if let Some(ns) = val.pointer("/metadata/namespace").and_then(|v| v.as_str()) {
+    if let Some(ref ns) = meta.namespace {
         out.push_str(&format!("Namespace:    {}\n", ns));
     }
-
-    // Creation timestamp
-    if let Some(ts) = val.pointer("/metadata/creationTimestamp").and_then(|v| v.as_str()) {
-        out.push_str(&format!("Created:      {}\n", ts));
+    if let Some(ref ts) = meta.creation_timestamp {
+        out.push_str(&format!("Created:      {}\n", ts.0.format("%Y-%m-%dT%H:%M:%SZ")));
     }
-
-    // Labels
-    if let Some(labels) = val.pointer("/metadata/labels").and_then(|v| v.as_object()) {
-        out.push_str("Labels:\n");
-        for (k, v) in labels {
-            out.push_str(&format!("              {}={}\n", k, v.as_str().unwrap_or("")));
-        }
-    } else {
-        out.push_str("Labels:       <none>\n");
-    }
-
-    // Annotations
-    if let Some(annotations) = val.pointer("/metadata/annotations").and_then(|v| v.as_object()) {
-        out.push_str("Annotations:\n");
-        for (k, v) in annotations {
-            out.push_str(&format!("              {}={}\n", k, v.as_str().unwrap_or("")));
-        }
-    } else {
-        out.push_str("Annotations:  <none>\n");
-    }
-
+    format_labels(meta.labels.as_ref(), out);
+    format_annotations(meta.annotations.as_ref(), out);
     out.push('\n');
-
-    // Resource-specific sections
-    match resource {
-        "pod" => format_describe_pod(val, &mut out),
-        "deployment" => format_describe_deployment(val, &mut out),
-        "service" => format_describe_service(val, &mut out),
-        "node" => format_describe_node(val, &mut out),
-        _ => format_describe_generic(val, &mut out),
-    }
-
-    out
 }
 
-fn format_describe_pod(val: &serde_json::Value, out: &mut String) {
-    // Status
-    if let Some(phase) = val.pointer("/status/phase").and_then(|v| v.as_str()) {
+fn format_labels(labels: Option<&BTreeMap<String, String>>, out: &mut String) {
+    match labels {
+        Some(l) if !l.is_empty() => {
+            out.push_str("Labels:\n");
+            for (k, v) in l { out.push_str(&format!("              {}={}\n", k, v)); }
+        }
+        _ => out.push_str("Labels:       <none>\n"),
+    }
+}
+
+fn format_annotations(annotations: Option<&BTreeMap<String, String>>, out: &mut String) {
+    match annotations {
+        Some(a) if !a.is_empty() => {
+            out.push_str("Annotations:\n");
+            for (k, v) in a { out.push_str(&format!("              {}={}\n", k, v)); }
+        }
+        _ => out.push_str("Annotations:  <none>\n"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pod describe (fully typed)
+// ---------------------------------------------------------------------------
+
+fn format_pod(pod: &Pod) -> String {
+    let mut out = String::new();
+    format_metadata(&pod.metadata, &mut out);
+
+    let status = pod.status.as_ref();
+    let spec = pod.spec.as_ref();
+
+    if let Some(phase) = status.and_then(|s| s.phase.as_deref()) {
         out.push_str(&format!("Status:       {}\n", phase));
     }
-
-    // Node
-    if let Some(node) = val.pointer("/spec/nodeName").and_then(|v| v.as_str()) {
+    if let Some(node) = spec.and_then(|s| s.node_name.as_deref()) {
         out.push_str(&format!("Node:         {}\n", node));
     }
-
-    // IP
-    if let Some(ip) = val.pointer("/status/podIP").and_then(|v| v.as_str()) {
+    if let Some(ip) = status.and_then(|s| s.pod_ip.as_deref()) {
         out.push_str(&format!("IP:           {}\n", ip));
     }
-
-    // Service Account
-    if let Some(sa) = val.pointer("/spec/serviceAccountName").and_then(|v| v.as_str()) {
+    if let Some(sa) = spec.and_then(|s| s.service_account_name.as_deref()) {
         out.push_str(&format!("Service Account: {}\n", sa));
     }
 
     out.push('\n');
 
     // Containers
-    if let Some(containers) = val.pointer("/spec/containers").and_then(|v| v.as_array()) {
+    if let Some(containers) = spec.map(|s| &s.containers) {
+        let statuses = status.and_then(|s| s.container_statuses.as_ref());
         out.push_str("Containers:\n");
-        let statuses = val.pointer("/status/containerStatuses").and_then(|v| v.as_array());
-        for container in containers {
-            let cname = container.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let image = container.get("image").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("  {}:\n", cname));
-            out.push_str(&format!("    Image:    {}\n", image));
-
-            // Ports
-            if let Some(ports) = container.get("ports").and_then(|v| v.as_array()) {
-                let port_strs: Vec<String> = ports.iter().map(|p| {
-                    let port = p.get("containerPort").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let proto = p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
-                    format!("{}/{}", port, proto)
+        for c in containers {
+            out.push_str(&format!("  {}:\n", c.name));
+            out.push_str(&format!("    Image:    {}\n", c.image.as_deref().unwrap_or("?")));
+            if let Some(ref ports) = c.ports {
+                let ps: Vec<String> = ports.iter().map(|p| {
+                    format!("{}/{}", p.container_port, p.protocol.as_deref().unwrap_or("TCP"))
                 }).collect();
-                out.push_str(&format!("    Ports:    {}\n", port_strs.join(", ")));
+                out.push_str(&format!("    Ports:    {}\n", ps.join(", ")));
             }
-
-            // Resource requests/limits
-            if let Some(resources) = container.get("resources") {
-                if let Some(limits) = resources.get("limits").and_then(|v| v.as_object()) {
-                    let parts: Vec<String> = limits.iter().map(|(k, v)| {
-                        format!("{}={}", k, v.as_str().unwrap_or(""))
-                    }).collect();
+            if let Some(ref res) = c.resources {
+                if let Some(ref limits) = res.limits {
+                    let parts: Vec<String> = limits.iter().map(|(k, v)| format!("{}={}", k, v.0)).collect();
                     out.push_str(&format!("    Limits:   {}\n", parts.join(", ")));
                 }
-                if let Some(requests) = resources.get("requests").and_then(|v| v.as_object()) {
-                    let parts: Vec<String> = requests.iter().map(|(k, v)| {
-                        format!("{}={}", k, v.as_str().unwrap_or(""))
-                    }).collect();
+                if let Some(ref requests) = res.requests {
+                    let parts: Vec<String> = requests.iter().map(|(k, v)| format!("{}={}", k, v.0)).collect();
                     out.push_str(&format!("    Requests: {}\n", parts.join(", ")));
                 }
             }
-
-            // Container status from status.containerStatuses
+            // Match container status by name
             if let Some(statuses) = statuses {
-                if let Some(status) = statuses.iter().find(|s| {
-                    s.get("name").and_then(|v| v.as_str()) == Some(cname)
-                }) {
-                    let ready = status.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let restart_count = status.get("restartCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                    out.push_str(&format!("    Ready:    {}\n", ready));
-                    out.push_str(&format!("    Restarts: {}\n", restart_count));
-
-                    // State
-                    if let Some(state) = status.get("state").and_then(|v| v.as_object()) {
-                        for (state_name, state_detail) in state {
-                            out.push_str(&format!("    State:    {}\n", state_name));
-                            if let Some(detail_obj) = state_detail.as_object() {
-                                for (dk, dv) in detail_obj {
-                                    out.push_str(&format!("      {}:  {}\n", dk, format_json_value_inline(dv)));
-                                }
-                            }
+                if let Some(cs) = statuses.iter().find(|s| s.name == c.name) {
+                    out.push_str(&format!("    Ready:    {}\n", cs.ready));
+                    out.push_str(&format!("    Restarts: {}\n", cs.restart_count));
+                    if let Some(ref state) = cs.state {
+                        if state.running.is_some() {
+                            out.push_str("    State:    Running\n");
+                        } else if let Some(ref w) = state.waiting {
+                            out.push_str(&format!("    State:    Waiting ({})\n", w.reason.as_deref().unwrap_or("?")));
+                        } else if let Some(ref t) = state.terminated {
+                            out.push_str(&format!("    State:    Terminated ({})\n", t.reason.as_deref().unwrap_or("?")));
                         }
                     }
                 }
@@ -178,14 +256,12 @@ fn format_describe_pod(val: &serde_json::Value, out: &mut String) {
     }
 
     // Init containers
-    if let Some(init_containers) = val.pointer("/spec/initContainers").and_then(|v| v.as_array()) {
+    if let Some(init_containers) = spec.and_then(|s| s.init_containers.as_ref()) {
         if !init_containers.is_empty() {
             out.push_str("\nInit Containers:\n");
-            for container in init_containers {
-                let cname = container.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let image = container.get("image").and_then(|v| v.as_str()).unwrap_or("?");
-                out.push_str(&format!("  {}:\n", cname));
-                out.push_str(&format!("    Image:    {}\n", image));
+            for c in init_containers {
+                out.push_str(&format!("  {}:\n", c.name));
+                out.push_str(&format!("    Image:    {}\n", c.image.as_deref().unwrap_or("?")));
             }
         }
     }
@@ -193,48 +269,39 @@ fn format_describe_pod(val: &serde_json::Value, out: &mut String) {
     out.push('\n');
 
     // Conditions
-    if let Some(conditions) = val.pointer("/status/conditions").and_then(|v| v.as_array()) {
+    if let Some(conditions) = status.and_then(|s| s.conditions.as_ref()) {
         out.push_str("Conditions:\n");
         out.push_str("  Type                 Status\n");
         out.push_str("  ----                 ------\n");
-        for cond in conditions {
-            let ctype = cond.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-            let status = cond.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("  {:<22}{}\n", ctype, status));
+        for c in conditions {
+            out.push_str(&format!("  {:<22}{}\n", c.type_, c.status));
         }
     }
 
     // Volumes
-    if let Some(volumes) = val.pointer("/spec/volumes").and_then(|v| v.as_array()) {
+    if let Some(volumes) = spec.and_then(|s| s.volumes.as_ref()) {
         out.push_str("\nVolumes:\n");
-        for vol in volumes {
-            let vname = vol.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("  {}:\n", vname));
-            // Show volume type (first non-name key)
-            if let Some(obj) = vol.as_object() {
-                for (k, v) in obj {
-                    if k != "name" {
-                        out.push_str(&format!("    Type: {}\n", k));
-                        if let Some(inner) = v.as_object() {
-                            for (ik, iv) in inner {
-                                out.push_str(&format!("    {}:  {}\n", ik, format_json_value_inline(iv)));
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
+        for v in volumes {
+            out.push_str(&format!("  {}:\n", v.name));
+            // Show the first volume source type
+            if v.config_map.is_some() { out.push_str("    Type: ConfigMap\n"); }
+            else if v.secret.is_some() { out.push_str("    Type: Secret\n"); }
+            else if v.empty_dir.is_some() { out.push_str("    Type: EmptyDir\n"); }
+            else if v.host_path.is_some() { out.push_str("    Type: HostPath\n"); }
+            else if v.persistent_volume_claim.is_some() { out.push_str("    Type: PVC\n"); }
+            else if v.projected.is_some() { out.push_str("    Type: Projected\n"); }
+            else if v.downward_api.is_some() { out.push_str("    Type: DownwardAPI\n"); }
         }
     }
 
     // Tolerations
-    if let Some(tolerations) = val.pointer("/spec/tolerations").and_then(|v| v.as_array()) {
+    if let Some(tolerations) = spec.and_then(|s| s.tolerations.as_ref()) {
         out.push_str("\nTolerations:\n");
-        for tol in tolerations {
-            let key = tol.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            let op = tol.get("operator").and_then(|v| v.as_str()).unwrap_or("Equal");
-            let effect = tol.get("effect").and_then(|v| v.as_str()).unwrap_or("");
-            let value = tol.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        for t in tolerations {
+            let key = t.key.as_deref().unwrap_or("");
+            let op = t.operator.as_deref().unwrap_or("Equal");
+            let effect = t.effect.as_deref().unwrap_or("");
+            let value = t.value.as_deref().unwrap_or("");
             if key.is_empty() {
                 out.push_str(&format!("  op={}\n", op));
             } else if value.is_empty() {
@@ -244,59 +311,59 @@ fn format_describe_pod(val: &serde_json::Value, out: &mut String) {
             }
         }
     }
+
+    out
 }
 
-fn format_describe_deployment(val: &serde_json::Value, out: &mut String) {
-    // Replicas
-    if let Some(spec_replicas) = val.pointer("/spec/replicas").and_then(|v| v.as_u64()) {
-        let ready = val.pointer("/status/readyReplicas").and_then(|v| v.as_u64()).unwrap_or(0);
-        let available = val.pointer("/status/availableReplicas").and_then(|v| v.as_u64()).unwrap_or(0);
-        let updated = val.pointer("/status/updatedReplicas").and_then(|v| v.as_u64()).unwrap_or(0);
+// ---------------------------------------------------------------------------
+// Deployment describe (fully typed)
+// ---------------------------------------------------------------------------
+
+fn format_deployment(dep: &Deployment) -> String {
+    let mut out = String::new();
+    format_metadata(&dep.metadata, &mut out);
+
+    let spec = dep.spec.as_ref();
+    let status = dep.status.as_ref();
+
+    if let Some(replicas) = spec.and_then(|s| s.replicas) {
+        let ready = status.and_then(|s| s.ready_replicas).unwrap_or(0);
+        let available = status.and_then(|s| s.available_replicas).unwrap_or(0);
+        let updated = status.and_then(|s| s.updated_replicas).unwrap_or(0);
         out.push_str(&format!("Replicas:     {} desired | {} updated | {} total | {} available | {} ready\n",
-            spec_replicas, updated, spec_replicas, available, ready));
+            replicas, updated, replicas, available, ready));
     }
 
-    // Strategy
-    if let Some(strategy) = val.pointer("/spec/strategy/type").and_then(|v| v.as_str()) {
+    if let Some(ref strategy) = spec.and_then(|s| s.strategy.as_ref()).and_then(|s| s.type_.as_ref()) {
         out.push_str(&format!("Strategy:     {}\n", strategy));
     }
 
-    // Selector
-    if let Some(match_labels) = val.pointer("/spec/selector/matchLabels").and_then(|v| v.as_object()) {
-        let parts: Vec<String> = match_labels.iter().map(|(k, v)| {
-            format!("{}={}", k, v.as_str().unwrap_or(""))
-        }).collect();
+    if let Some(ref match_labels) = spec.and_then(|s| s.selector.match_labels.as_ref()) {
+        let parts: Vec<String> = match_labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         out.push_str(&format!("Selector:     {}\n", parts.join(",")));
     }
 
     out.push('\n');
 
     // Pod template containers
-    if let Some(containers) = val.pointer("/spec/template/spec/containers").and_then(|v| v.as_array()) {
+    if let Some(containers) = spec.and_then(|s| s.template.spec.as_ref()).map(|s| &s.containers) {
         out.push_str("Pod Template:\n");
-        for container in containers {
-            let cname = container.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let image = container.get("image").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("  {}:\n", cname));
-            out.push_str(&format!("    Image:    {}\n", image));
-
-            if let Some(ports) = container.get("ports").and_then(|v| v.as_array()) {
-                let port_strs: Vec<String> = ports.iter().map(|p| {
-                    let port = p.get("containerPort").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let proto = p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
-                    format!("{}/{}", port, proto)
+        for c in containers {
+            out.push_str(&format!("  {}:\n", c.name));
+            out.push_str(&format!("    Image:    {}\n", c.image.as_deref().unwrap_or("?")));
+            if let Some(ref ports) = c.ports {
+                let ps: Vec<String> = ports.iter().map(|p| {
+                    format!("{}/{}", p.container_port, p.protocol.as_deref().unwrap_or("TCP"))
                 }).collect();
-                out.push_str(&format!("    Ports:    {}\n", port_strs.join(", ")));
+                out.push_str(&format!("    Ports:    {}\n", ps.join(", ")));
             }
-
-            if let Some(env) = container.get("env").and_then(|v| v.as_array()) {
+            if let Some(ref env) = c.env {
                 out.push_str("    Environment:\n");
                 for e in env {
-                    let ename = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    if let Some(value) = e.get("value").and_then(|v| v.as_str()) {
-                        out.push_str(&format!("      {}={}\n", ename, value));
-                    } else if e.get("valueFrom").is_some() {
-                        out.push_str(&format!("      {} (from ref)\n", ename));
+                    if let Some(ref value) = e.value {
+                        out.push_str(&format!("      {}={}\n", e.name, value));
+                    } else if e.value_from.is_some() {
+                        out.push_str(&format!("      {} (from ref)\n", e.name));
                     }
                 }
             }
@@ -305,74 +372,85 @@ fn format_describe_deployment(val: &serde_json::Value, out: &mut String) {
 
     out.push('\n');
 
-    // Conditions
-    if let Some(conditions) = val.pointer("/status/conditions").and_then(|v| v.as_array()) {
+    if let Some(conditions) = status.and_then(|s| s.conditions.as_ref()) {
         out.push_str("Conditions:\n");
         out.push_str("  Type                 Status  Reason\n");
         out.push_str("  ----                 ------  ------\n");
-        for cond in conditions {
-            let ctype = cond.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-            let status = cond.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-            let reason = cond.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            out.push_str(&format!("  {:<22}{:<8}{}\n", ctype, status, reason));
+        for c in conditions {
+            out.push_str(&format!("  {:<22}{:<8}{}\n", c.type_, c.status, c.reason.as_deref().unwrap_or("")));
         }
     }
+
+    out
 }
 
-fn format_describe_service(val: &serde_json::Value, out: &mut String) {
-    if let Some(svc_type) = val.pointer("/spec/type").and_then(|v| v.as_str()) {
+// ---------------------------------------------------------------------------
+// Service describe (fully typed)
+// ---------------------------------------------------------------------------
+
+fn format_service(svc: &Service) -> String {
+    let mut out = String::new();
+    format_metadata(&svc.metadata, &mut out);
+
+    let spec = svc.spec.as_ref();
+    let status = svc.status.as_ref();
+
+    if let Some(svc_type) = spec.and_then(|s| s.type_.as_deref()) {
         out.push_str(&format!("Type:         {}\n", svc_type));
     }
-    if let Some(cluster_ip) = val.pointer("/spec/clusterIP").and_then(|v| v.as_str()) {
+    if let Some(cluster_ip) = spec.and_then(|s| s.cluster_ip.as_deref()) {
         out.push_str(&format!("ClusterIP:    {}\n", cluster_ip));
     }
-    if let Some(external_ips) = val.pointer("/spec/externalIPs").and_then(|v| v.as_array()) {
-        let ips: Vec<&str> = external_ips.iter().filter_map(|v| v.as_str()).collect();
-        out.push_str(&format!("ExternalIPs:  {}\n", ips.join(", ")));
+    if let Some(ref external_ips) = spec.and_then(|s| s.external_ips.as_ref()) {
+        out.push_str(&format!("ExternalIPs:  {}\n", external_ips.join(", ")));
     }
-    if let Some(lb_ip) = val.pointer("/status/loadBalancer/ingress").and_then(|v| v.as_array()) {
-        let ips: Vec<String> = lb_ip.iter().map(|i| {
-            i.get("ip").or(i.get("hostname")).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    if let Some(ref ingress) = status.and_then(|s| s.load_balancer.as_ref()).and_then(|lb| lb.ingress.as_ref()) {
+        let ips: Vec<String> = ingress.iter().map(|i| {
+            i.ip.as_deref().or(i.hostname.as_deref()).unwrap_or("").to_string()
         }).collect();
         if !ips.is_empty() {
             out.push_str(&format!("LoadBalancer: {}\n", ips.join(", ")));
         }
     }
 
-    // Selector
-    if let Some(selector) = val.pointer("/spec/selector").and_then(|v| v.as_object()) {
-        let parts: Vec<String> = selector.iter().map(|(k, v)| {
-            format!("{}={}", k, v.as_str().unwrap_or(""))
-        }).collect();
+    if let Some(ref selector) = spec.and_then(|s| s.selector.as_ref()) {
+        let parts: Vec<String> = selector.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         out.push_str(&format!("Selector:     {}\n", parts.join(",")));
     }
 
-    // Ports
-    if let Some(ports) = val.pointer("/spec/ports").and_then(|v| v.as_array()) {
+    if let Some(ref ports) = spec.and_then(|s| s.ports.as_ref()) {
         out.push_str("\nPorts:\n");
-        for port in ports {
-            let pname = port.get("name").and_then(|v| v.as_str()).unwrap_or("<unnamed>");
-            let p = port.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
-            let tp = port.get("targetPort");
-            let proto = port.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
-            let target_str = match tp {
-                Some(serde_json::Value::Number(n)) => n.to_string(),
-                Some(serde_json::Value::String(s)) => s.clone(),
-                _ => "?".to_string(),
-            };
-            out.push_str(&format!("  {} {}/{} -> {}\n", pname, p, proto, target_str));
+        for p in *ports {
+            let name = p.name.as_deref().unwrap_or("<unnamed>");
+            let target = p.target_port.as_ref()
+                .map(|tp| match tp {
+                    k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(n) => n.to_string(),
+                    k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(s) => s.clone(),
+                })
+                .unwrap_or_else(|| "?".to_string());
+            out.push_str(&format!("  {} {}/{} -> {}\n", name, p.port, p.protocol.as_deref().unwrap_or("TCP"), target));
         }
     }
 
-    // Session affinity
-    if let Some(affinity) = val.pointer("/spec/sessionAffinity").and_then(|v| v.as_str()) {
+    if let Some(affinity) = spec.and_then(|s| s.session_affinity.as_deref()) {
         out.push_str(&format!("Session Affinity: {}\n", affinity));
     }
+
+    out
 }
 
-fn format_describe_node(val: &serde_json::Value, out: &mut String) {
-    // Roles (from labels)
-    if let Some(labels) = val.pointer("/metadata/labels").and_then(|v| v.as_object()) {
+// ---------------------------------------------------------------------------
+// Node describe (fully typed)
+// ---------------------------------------------------------------------------
+
+fn format_node(node: &Node) -> String {
+    let mut out = String::new();
+    format_metadata(&node.metadata, &mut out);
+
+    let status = node.status.as_ref();
+
+    // Roles from labels
+    if let Some(ref labels) = node.metadata.labels {
         let roles: Vec<&str> = labels.keys()
             .filter_map(|k| k.strip_prefix("node-role.kubernetes.io/"))
             .collect();
@@ -381,253 +459,139 @@ fn format_describe_node(val: &serde_json::Value, out: &mut String) {
         }
     }
 
-    // Addresses
-    if let Some(addresses) = val.pointer("/status/addresses").and_then(|v| v.as_array()) {
+    if let Some(ref addresses) = status.and_then(|s| s.addresses.as_ref()) {
         out.push_str("Addresses:\n");
-        for addr in addresses {
-            let atype = addr.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-            let address = addr.get("address").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("  {}: {}\n", atype, address));
+        for a in *addresses {
+            out.push_str(&format!("  {}: {}\n", a.type_, a.address));
         }
     }
 
-    // Capacity
-    if let Some(capacity) = val.pointer("/status/capacity").and_then(|v| v.as_object()) {
+    if let Some(capacity) = status.and_then(|s| s.capacity.as_ref()) {
         out.push_str("Capacity:\n");
-        for (k, v) in capacity {
-            out.push_str(&format!("  {}: {}\n", k, v.as_str().unwrap_or("")));
-        }
+        for (k, v) in capacity { out.push_str(&format!("  {}: {}\n", k, v.0)); }
     }
 
-    // Allocatable
-    if let Some(allocatable) = val.pointer("/status/allocatable").and_then(|v| v.as_object()) {
+    if let Some(allocatable) = status.and_then(|s| s.allocatable.as_ref()) {
         out.push_str("Allocatable:\n");
-        for (k, v) in allocatable {
-            out.push_str(&format!("  {}: {}\n", k, v.as_str().unwrap_or("")));
-        }
+        for (k, v) in allocatable { out.push_str(&format!("  {}: {}\n", k, v.0)); }
     }
 
-    // System info
-    if let Some(info) = val.pointer("/status/nodeInfo").and_then(|v| v.as_object()) {
+    if let Some(ref info) = status.and_then(|s| s.node_info.as_ref()) {
         out.push_str("\nSystem Info:\n");
-        let fields = ["kubeletVersion", "containerRuntimeVersion", "osImage", "architecture", "operatingSystem", "kernelVersion"];
-        for field in &fields {
-            if let Some(v) = info.get(*field).and_then(|v| v.as_str()) {
-                out.push_str(&format!("  {}: {}\n", field, v));
-            }
-        }
+        out.push_str(&format!("  kubeletVersion: {}\n", info.kubelet_version));
+        out.push_str(&format!("  containerRuntimeVersion: {}\n", info.container_runtime_version));
+        out.push_str(&format!("  osImage: {}\n", info.os_image));
+        out.push_str(&format!("  architecture: {}\n", info.architecture));
+        out.push_str(&format!("  operatingSystem: {}\n", info.operating_system));
+        out.push_str(&format!("  kernelVersion: {}\n", info.kernel_version));
     }
 
     out.push('\n');
 
-    // Conditions
-    if let Some(conditions) = val.pointer("/status/conditions").and_then(|v| v.as_array()) {
+    if let Some(ref conditions) = status.and_then(|s| s.conditions.as_ref()) {
         out.push_str("Conditions:\n");
         out.push_str("  Type                   Status  Reason                   Message\n");
         out.push_str("  ----                   ------  ------                   -------\n");
-        for cond in conditions {
-            let ctype = cond.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-            let status = cond.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-            let reason = cond.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-            let message = cond.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            out.push_str(&format!("  {:<24}{:<8}{:<25}{}\n", ctype, status, reason, message));
+        for c in *conditions {
+            out.push_str(&format!("  {:<24}{:<8}{:<25}{}\n",
+                c.type_, c.status, c.reason.as_deref().unwrap_or(""), c.message.as_deref().unwrap_or("")));
         }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Generic describe (DynamicObject — for CRDs and unknown resources)
+// ---------------------------------------------------------------------------
+
+/// Typed wrapper for common DynamicObject fields.
+#[derive(Deserialize, Default)]
+struct GenericResourceData {
+    #[serde(default)]
+    spec: Option<serde_yaml::Value>,
+    #[serde(default)]
+    status: Option<serde_yaml::Value>,
+}
+
+impl From<&serde_json::Value> for GenericResourceData {
+    fn from(data: &serde_json::Value) -> Self {
+        serde_json::from_value(data.clone()).unwrap_or_default()
     }
 }
 
-fn format_describe_generic(val: &serde_json::Value, out: &mut String) {
-    // For any resource type, print spec and status as indented key-value pairs
-    if let Some(spec) = val.get("spec") {
+fn format_generic(obj: &DynamicObject) -> String {
+    let mut out = String::new();
+    format_metadata(&obj.metadata, &mut out);
+
+    let data = GenericResourceData::from(&obj.data);
+
+    if let Some(ref spec) = data.spec {
         out.push_str("Spec:\n");
-        format_json_indented(spec, out, 2);
+        if let Ok(yaml) = serde_yaml::to_string(spec) {
+            for line in yaml.lines() {
+                out.push_str(&format!("  {}\n", line));
+            }
+        }
         out.push('\n');
     }
 
-    if let Some(status) = val.get("status") {
+    if let Some(ref status) = data.status {
         out.push_str("Status:\n");
-        format_json_indented(status, out, 2);
+        if let Ok(yaml) = serde_yaml::to_string(status) {
+            for line in yaml.lines() {
+                out.push_str(&format!("  {}\n", line));
+            }
+        }
         out.push('\n');
     }
+
+    out
 }
 
-/// Format a JSON value as indented key-value lines (describe-style).
-fn format_json_indented(val: &serde_json::Value, out: &mut String, indent: usize) {
-    let prefix = " ".repeat(indent);
-    match val {
-        serde_json::Value::Object(map) => {
-            for (k, v) in map {
-                match v {
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        out.push_str(&format!("{}{}:\n", prefix, k));
-                        format_json_indented(v, out, indent + 2);
-                    }
-                    _ => {
-                        out.push_str(&format!("{}{}: {}\n", prefix, k, format_json_value_inline(v)));
-                    }
-                }
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for (i, item) in arr.iter().enumerate() {
-                match item {
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        out.push_str(&format!("{}- [{}]:\n", prefix, i));
-                        format_json_indented(item, out, indent + 2);
-                    }
-                    _ => {
-                        out.push_str(&format!("{}- {}\n", prefix, format_json_value_inline(item)));
-                    }
-                }
-            }
-        }
-        _ => {
-            out.push_str(&format!("{}{}\n", prefix, format_json_value_inline(val)));
-        }
-    }
-}
-
-/// Format a simple JSON value for inline display.
-fn format_json_value_inline(val: &serde_json::Value) -> String {
-    match val {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => "<none>".to_string(),
-        other => other.to_string(),
-    }
-}
-
-async fn fetch_describe_via_kubectl(
-    resource: &str,
-    name: &str,
-    namespace: &str,
-    context: &str,
-) -> String {
-    let mut cmd = tokio::process::Command::new("kubectl");
-    cmd.arg("describe").arg(resource).arg(name);
-    if !context.is_empty() {
-        cmd.arg("--context").arg(context);
-    }
-    if !namespace.is_empty() {
-        cmd.arg("-n").arg(namespace);
-    }
-    match cmd.output().await {
-        Ok(output) => {
-            if output.status.success() {
-                let raw = String::from_utf8_lossy(&output.stdout).to_string();
-                crate::util::strip_ansi(&raw)
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                format!("Error running kubectl describe:\n{}", stderr)
-            }
-        }
-        Err(e) => format!("Failed to run kubectl: {}", e),
-    }
-}
-
-/// Fetch YAML for a resource using the kube-rs client directly.
-/// Falls back to kubectl for complex resource types.
-pub async fn fetch_yaml_native(
-    client: &::kube::Client,
-    resource: &str,
-    name: &str,
-    namespace: &str,
-    context: &str,
-) -> String {
-    // Try native kube-rs fetch first
-    match fetch_yaml_via_discovery(client, resource, name, namespace).await {
-        Ok(yaml) => yaml,
-        Err(_) => {
-            // Fallback to kubectl for complex/unknown resource types
-            fetch_yaml_via_kubectl(resource, name, namespace, context).await
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// kubectl fallbacks
+// ---------------------------------------------------------------------------
 
 async fn fetch_yaml_via_discovery(
-    client: &::kube::Client,
+    client: &kube::Client,
     resource: &str,
     name: &str,
     namespace: &str,
 ) -> anyhow::Result<String> {
-    use ::kube::api::{Api, DynamicObject};
-    use crate::kube::protocol::ResourceScope;
-
-    // Map common resource type strings to their API group/version/plural
     let (ar, scope) = resolve_api_resource(client, resource).await?;
-
     let api: Api<DynamicObject> = match scope {
         ResourceScope::Cluster => Api::all_with(client.clone(), &ar),
         ResourceScope::Namespaced if namespace.is_empty() => Api::default_namespaced_with(client.clone(), &ar),
         ResourceScope::Namespaced => Api::namespaced_with(client.clone(), namespace, &ar),
     };
-
     let obj = api.get(name).await?;
     let yaml = serde_yaml::to_string(&obj)?;
     Ok(yaml)
 }
 
-/// Resolve a resource type string (e.g. "pod", "deployment", "service") to an ApiResource.
-pub async fn resolve_api_resource(
-    client: &::kube::Client,
-    resource: &str,
-) -> anyhow::Result<(::kube::api::ApiResource, ResourceScope)> {
-    use ::kube::api::ApiResource;
-    use ::kube::discovery::{self, Scope};
-    use ResourceScope::{Cluster, Namespaced};
-
-    // Look up built-in resources from the central registry — avoid discovery roundtrip
-    if let Some(meta) = crate::kube::resource_types::find_by_name(resource) {
-        let gvk = ::kube::api::GroupVersionKind::gvk(meta.group, meta.version, meta.kind);
-        let ar = ApiResource::from_gvk_with_plural(&gvk, meta.plural);
-        return Ok((ar, meta.scope));
-    }
-
-    // CRD or unknown — resource string is already "plural.group" format
-    // e.g. "clickhouseinstallations.clickhouse.altinity.com"
-    if resource.contains('.') {
-        let parts: Vec<&str> = resource.splitn(2, '.').collect();
-        let plural = parts[0];
-        let group = parts.get(1).unwrap_or(&"");
-        // Use discovery to find the version
-        let discovery = discovery::Discovery::new(client.clone()).run().await?;
-        for api_group in discovery.groups() {
-            for (ar, caps) in api_group.recommended_resources() {
-                if ar.plural == plural && ar.group == *group {
-                    let scope = if caps.scope == Scope::Cluster { Cluster } else { Namespaced };
-                    return Ok((ar, scope));
-                }
-            }
+async fn fetch_describe_via_kubectl(resource: &str, name: &str, namespace: &str, context: &str) -> String {
+    let mut cmd = tokio::process::Command::new("kubectl");
+    cmd.arg("describe").arg(resource).arg(name);
+    if !context.is_empty() { cmd.arg("--context").arg(context); }
+    if !namespace.is_empty() { cmd.arg("-n").arg(namespace); }
+    match cmd.output().await {
+        Ok(output) if output.status.success() => {
+            crate::util::strip_ansi(&String::from_utf8_lossy(&output.stdout))
         }
-        return Err(anyhow::anyhow!("Resource not found: {}", resource));
+        Ok(output) => format!("Error running kubectl describe:\n{}", String::from_utf8_lossy(&output.stderr)),
+        Err(e) => format!("Failed to run kubectl: {}", e),
     }
-
-    Err(anyhow::anyhow!("Unknown resource type: {}", resource))
 }
 
-async fn fetch_yaml_via_kubectl(
-    resource: &str,
-    name: &str,
-    namespace: &str,
-    context: &str,
-) -> String {
+async fn fetch_yaml_via_kubectl(resource: &str, name: &str, namespace: &str, context: &str) -> String {
     let mut cmd = tokio::process::Command::new("kubectl");
     cmd.arg("get").arg(resource).arg(name).arg("-o").arg("yaml");
-    if !context.is_empty() {
-        cmd.arg("--context").arg(context);
-    }
-    if !namespace.is_empty() {
-        cmd.arg("-n").arg(namespace);
-    }
+    if !context.is_empty() { cmd.arg("--context").arg(context); }
+    if !namespace.is_empty() { cmd.arg("-n").arg(namespace); }
     match cmd.output().await {
-        Ok(output) => {
-            if output.status.success() {
-                String::from_utf8_lossy(&output.stdout).to_string()
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                format!("Error fetching YAML:\n{}", stderr)
-            }
-        }
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).to_string(),
+        Ok(output) => format!("Error fetching YAML:\n{}", String::from_utf8_lossy(&output.stderr)),
         Err(e) => format!("Failed to run kubectl: {}", e),
     }
 }

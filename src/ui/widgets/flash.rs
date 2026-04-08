@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{FlashLevel, FlashMessage};
 use crate::ui::theme::Theme;
 
-/// Flash message widget styled like k9s.
+/// Flash message widget.
 /// info=lawngreen bold, warn=darkorange bold, error=orangered bold.
 pub struct FlashWidget<'a> {
     message: &'a FlashMessage,

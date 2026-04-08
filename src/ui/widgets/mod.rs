@@ -7,7 +7,7 @@ pub mod table;
 pub mod tabs;
 pub mod yaml_view;
 
-pub use dialog::ConfirmDialogWidget;
+pub use dialog::{ConfirmDialogWidget, PortForwardDialogWidget};
 pub use filter::FilterBar;
 pub use flash::FlashWidget;
 pub use help::HelpOverlay;

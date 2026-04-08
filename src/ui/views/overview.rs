@@ -1,172 +1,141 @@
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::{Alignment, Constraint, Layout, Rect},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
 
-use crate::app::App;
+use crate::app::{App, InputMode};
+use crate::app::nav::rid;
 use crate::ui::header;
 use crate::ui::theme::Theme;
+use crate::ui::widgets::TabBar;
 
 /// Draw the cluster overview landing page.
 ///
-/// Shows cluster-level information from the always-on watchers (namespaces + nodes)
-/// without subscribing to any heavy resource types (pods, deployments, etc.).
+/// Uses the same layout as the resource view (header, content, tab bar, flash)
+/// so it feels like a natural part of the app. No heavy resource subscriptions.
 pub fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
 
     let header_height: u16 = if app.show_header { 7 } else { 0 };
-    let command_height: u16 = if app.command_mode { 3 } else { 0 };
+    let command_height: u16 = if matches!(app.input_mode, InputMode::Command { .. }) { 3 } else { 0 };
 
     let chunks = Layout::vertical([
-        Constraint::Length(header_height),
-        Constraint::Length(command_height),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(header_height),      // header
+        Constraint::Length(command_height),     // command prompt
+        Constraint::Fill(1),                   // content
+        Constraint::Length(1),                 // tab bar
+        Constraint::Length(1),                 // flash
     ])
     .split(area);
 
     let header_area = chunks[0];
     let command_area = chunks[1];
     let content_area = chunks[2];
-    let hints_area = chunks[3];
+    let tab_bar_area = chunks[3];
     let _flash_area = chunks[4];
 
-    // Header
+    // 1. Header (same as resource view)
     if app.show_header {
         header::draw_header(f, app, header_area, theme, |f, area, theme| {
-            draw_overview_key_hints(f, area, theme);
+            use crate::ui::header::KeyHint;
+            let hints = vec![
+                KeyHint { key: ":", description: "command" },
+                KeyHint { key: "Tab", description: "resources" },
+                KeyHint { key: "?", description: "help" },
+                KeyHint { key: "q", description: "quit" },
+            ];
+            header::draw_key_hint_grid(f, area, &hints, theme);
         });
     }
 
-    // Command prompt
-    if app.command_mode {
-        crate::ui::views::resource::draw_command_prompt(f, app, command_area, theme);
+    // 2. Command prompt (same as resource view)
+    if matches!(app.input_mode, InputMode::Command { .. }) {
+        super::resource::draw_command_prompt(f, app, command_area, theme);
     }
 
-    // Main content
-    draw_overview_content(f, app, content_area, theme);
+    // 3. Main content — cluster overview
+    draw_content(f, app, content_area, theme);
 
-    // Bottom hints
-    let hints = Line::from(vec![
-        Span::styled(" :", Style::default().fg(Color::Yellow)),
-        Span::styled("command ", Style::default().fg(Color::DarkGray)),
-        Span::styled(" ?", Style::default().fg(Color::Yellow)),
-        Span::styled("help ", Style::default().fg(Color::DarkGray)),
-        Span::styled(" q", Style::default().fg(Color::Yellow)),
-        Span::styled("quit", Style::default().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(hints, hints_area);
+    // 4. Tab bar (same as resource view — shows available resources)
+    let tab_bar = TabBar::new(app.nav.resource_id(), theme)
+        .namespace(app.selected_ns.display());
+    f.render_widget(tab_bar, tab_bar_area);
 }
 
-fn draw_overview_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
-    // Compute stats from always-on watchers
-    let node_count = app.data.nodes.items.len();
-    let node_ready = app.data.nodes.items.iter()
-        .filter(|n| n.status.contains("Ready") && !n.status.contains("NotReady"))
-        .count();
+fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let nodes_table = app.data.unified.get(&rid("nodes"));
+    let node_count = nodes_table.map(|t| t.items.len()).unwrap_or(0);
+    let node_ready = nodes_table.map(|t| t.items.iter()
+        .filter(|row| {
+            // STATUS is column 1 in the node row
+            row.cells.get(1).map_or(false, |s| s.contains("Ready") && !s.contains("NotReady"))
+        })
+        .count()).unwrap_or(0);
     let node_not_ready = node_count - node_ready;
-    let ns_count = app.data.namespaces.items.len();
+    let ns_count = app.data.unified.get(&rid("namespaces"))
+        .map(|t| t.items.len()).unwrap_or(0);
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Title
+    // Big centered title
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  k9rs", Style::default().fg(theme.logo.fg.unwrap_or(Color::Cyan)).add_modifier(Modifier::BOLD)),
-        Span::styled(" — Kubernetes TUI", Style::default().fg(Color::DarkGray)),
-    ]));
     lines.push(Line::from(""));
-
-    // Context info
-    lines.push(Line::from(vec![
-        Span::styled("  Context:   ", Style::default().fg(Color::DarkGray)),
-        Span::styled(&app.context, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  Cluster:   ", Style::default().fg(Color::DarkGray)),
-        Span::styled(&app.cluster, Style::default().fg(Color::White)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  User:      ", Style::default().fg(Color::DarkGray)),
-        Span::styled(&app.user, Style::default().fg(Color::White)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  Namespace: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(&app.selected_ns, Style::default().fg(Color::White)),
-    ]));
-
+    lines.push(Line::from(
+        Span::styled("k9rs", theme.title.add_modifier(Modifier::BOLD))
+    ).alignment(Alignment::Center));
+    lines.push(Line::from(
+        Span::styled("Kubernetes TUI", theme.info_label)
+    ).alignment(Alignment::Center));
+    lines.push(Line::from(""));
     lines.push(Line::from(""));
 
-    // Cluster stats
+    // Cluster info — centered block
+    let ctx_line = format!("Context: {}  |  Cluster: {}  |  User: {}", app.context, app.cluster, app.user);
+    lines.push(Line::from(
+        Span::styled(ctx_line, theme.info_value)
+    ).alignment(Alignment::Center));
+    lines.push(Line::from(""));
+
+    // Stats
     let node_status = if node_not_ready > 0 {
-        format!("{} ({} Ready, {} NotReady)", node_count, node_ready, node_not_ready)
+        format!("Nodes: {} ({} Ready, {} NotReady)", node_count, node_ready, node_not_ready)
     } else if node_count > 0 {
-        format!("{} (all Ready)", node_count)
+        format!("Nodes: {} (all Ready)", node_count)
     } else {
-        "loading...".to_string()
+        "Nodes: loading...".to_string()
     };
-
-    lines.push(Line::from(vec![
-        Span::styled("  Nodes:      ", Style::default().fg(Color::DarkGray)),
-        Span::styled(node_status, Style::default().fg(if node_not_ready > 0 { Color::Yellow } else { Color::Green })),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  Namespaces: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            if ns_count > 0 { ns_count.to_string() } else { "loading...".to_string() },
-            Style::default().fg(Color::Green),
-        ),
-    ]));
+    let ns_status = if ns_count > 0 {
+        format!("Namespaces: {}", ns_count)
+    } else {
+        "Namespaces: loading...".to_string()
+    };
+    let stats = format!("{}  |  {}", node_status, ns_status);
+    let stats_style = if node_not_ready > 0 { theme.status_pending } else { theme.status_running };
+    lines.push(Line::from(
+        Span::styled(stats, stats_style)
+    ).alignment(Alignment::Center));
 
     lines.push(Line::from(""));
     lines.push(Line::from(""));
 
-    // Quick navigation
+    // Hint
     lines.push(Line::from(vec![
-        Span::styled("  Quick Navigation", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(""));
-
-    let nav_rows: &[&[(&str, &str)]] = &[
-        &[(":pods", "po"), (":deploy", "dp"), (":svc", "svc"), (":nodes", "no")],
-        &[(":ns", "ns"), (":sts", "sts"), (":ds", "ds"), (":jobs", "job")],
-        &[(":secrets", "sec"), (":cm", "cm"), (":ing", "ing"), (":crd", "crd")],
-        &[(":ctx", "contexts"), (":pv", "pv"), (":pvc", "pvc"), (":sa", "sa")],
-    ];
-
-    for row in nav_rows {
-        let mut spans = vec![Span::raw("  ")];
-        for (cmd, label) in *row {
-            spans.push(Span::styled(format!("{:<14}", cmd), Style::default().fg(Color::Cyan)));
-            let _ = label; // label reserved for future tooltip
-        }
-        lines.push(Line::from(spans));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  Press ", Style::default().fg(Color::DarkGray)),
-        Span::styled(":", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(" to enter a command, or type a resource name directly", Style::default().fg(Color::DarkGray)),
-    ]));
+        Span::styled("Press ", theme.info_label),
+        Span::styled(":", theme.title.add_modifier(Modifier::BOLD)),
+        Span::styled(" to enter a command  |  ", theme.info_label),
+        Span::styled("Tab", theme.title.add_modifier(Modifier::BOLD)),
+        Span::styled(" to browse resources  |  ", theme.info_label),
+        Span::styled("?", theme.title.add_modifier(Modifier::BOLD)),
+        Span::styled(" help", theme.info_label),
+    ]).alignment(Alignment::Center));
 
     let block = Block::default()
         .borders(Borders::NONE)
-        .padding(Padding::new(1, 1, 0, 0));
+        .padding(Padding::new(0, 0, 0, 0));
 
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
-}
-
-fn draw_overview_key_hints(f: &mut Frame, area: Rect, theme: &Theme) {
-    let hints = vec![
-        (":", "command"),
-        ("?", "help"),
-        ("q", "quit"),
-    ];
-    header::draw_key_hint_grid(f, area, &hints, theme);
 }

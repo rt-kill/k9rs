@@ -5,6 +5,8 @@ use ratatui::{
     Frame,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::app::{App, Route};
 
 /// Draw the describe view showing kubectl describe output.
@@ -24,12 +26,11 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
     let content_area = chunks[0];
     let bar_area = chunks[1];
 
-    let describe = &app.describe;
-
-    // Extract resource type and name from route if available
-    let (resource_type, resource_name) = match &app.route {
-        Route::Describe { resource, name, .. } => (resource.as_str(), name.as_str()),
-        _ => ("unknown", "unknown"),
+    // Extract state and resource type/name from route
+    let (describe, resource_type, resource_name) = match &app.route {
+        Route::Describe { ref target, ref state, .. } => (state, target.resource.display_label(), target.name.as_str()),
+        Route::Aliases { ref state, .. } => (state, "aliases", ""),
+        _ => return, // Not a describe view — nothing to draw
     };
 
     if !describe.content.is_empty() {
@@ -142,7 +143,7 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(block, content_area);
         if inner.height > 0 && inner.width > 0 {
             let loading_text = crate::util::loading_bar("Loading...");
-            let text_len = loading_text.len() as u16;
+            let text_len = loading_text.width() as u16;
             let loading = Line::from(Span::styled(
                 loading_text,
                 theme.status_pending,
@@ -167,7 +168,7 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
         let line = Line::from(Span::styled(prompt, theme.filter));
         f.render_widget(line, bar_area);
         // Place cursor after the search input text
-        let cursor_x = bar_area.x + 2 + describe.search_input.len() as u16; // +2 for " /"
+        let cursor_x = bar_area.x + 2 + describe.search_input.width() as u16; // +2 for " /"
         let cursor_y = bar_area.y;
         if cursor_x < bar_area.x + bar_area.width {
             f.set_cursor_position((cursor_x, cursor_y));
@@ -183,17 +184,7 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
             ("Esc", "back"),
         ];
 
-        let mut spans = Vec::new();
-        spans.push(Span::styled(" ", theme.status_bar));
-        for (i, (key, desc)) in hints.iter().enumerate() {
-            spans.push(Span::styled(format!("<{}>", key), theme.status_bar_key));
-            spans.push(Span::styled(format!(" {} ", desc), theme.status_bar));
-            if i < hints.len() - 1 {
-                spans.push(Span::styled("\u{2502}", theme.status_bar));
-            }
-        }
-
-        let line = Line::from(spans);
+        let line = crate::ui::header::render_keybinding_bar(&hints, theme);
         f.render_widget(line, bar_area);
     }
 }

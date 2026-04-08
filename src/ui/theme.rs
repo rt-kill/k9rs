@@ -3,7 +3,7 @@ use std::path::Path;
 use ratatui::style::{Color, Modifier, Style};
 
 // ---------------------------------------------------------------------------
-// k9s stock color palette (approximate RGB values)
+// Default color palette (approximate RGB values)
 // ---------------------------------------------------------------------------
 
 /// DodgerBlue: #1E90FF
@@ -28,10 +28,10 @@ const DARK_ORANGE: Color = Color::Rgb(255, 140, 0);
 const CADET_BLUE: Color = Color::Rgb(95, 158, 160);
 
 // ---------------------------------------------------------------------------
-// Helpers to parse colors from k9s skin YAML
+// Helpers to parse colors from skin YAML
 // ---------------------------------------------------------------------------
 
-/// Parse a color string from a k9s skin YAML value.
+/// Parse a color string from a skin YAML value.
 /// Supports hex colors (#RRGGBB), named colors, and "default" (mapped to Reset).
 fn parse_color(s: &str) -> Option<Color> {
     let s = s.trim();
@@ -87,7 +87,7 @@ fn with_bg(style: Style, color: Option<Color>) -> Style {
 }
 
 /// Color scheme and styling for the k9rs TUI.
-/// Matches the k9s stock dark theme.
+/// Default dark theme.
 pub struct Theme {
     // Table
     pub header: Style,
@@ -167,6 +167,9 @@ pub struct Theme {
 
     // Marked/selected rows (gold/yellow text)
     pub marked_row: Style,
+
+    // Delta tracking: rows that changed since last update
+    pub delta_changed: Style,
 
     // Legacy aliases (kept for compat with other views)
     pub tab_active: Style,
@@ -333,6 +336,11 @@ impl Default for Theme {
                 .fg(Color::Rgb(255, 215, 0)) // Gold
                 .add_modifier(Modifier::BOLD),
 
+            // Delta changed rows: italic with a subtle color tint
+            delta_changed: Style::default()
+                .fg(Color::Rgb(135, 206, 250)) // LightSkyBlue
+                .add_modifier(Modifier::ITALIC),
+
             // Legacy tab styles (breadcrumbs now)
             tab_active: Style::default()
                 .fg(Color::Black)
@@ -345,10 +353,10 @@ impl Default for Theme {
 }
 
 impl Theme {
-    /// Try to load the user's k9s skin, falling back to the stock theme.
+    /// Try to load the user's skin, falling back to the stock theme.
     ///
-    /// 1. Read `~/.config/k9s/config.yaml` to find the skin name under `k9s.ui.skin`.
-    /// 2. Look for `~/.config/k9s/skins/<name>.yaml`.
+    /// 1. Read `~/.config/k9rs/config.yaml` to find the skin name under `k9rs.ui.skin`.
+    /// 2. Look for `~/.config/k9rs/skins/<name>.yaml`.
     /// 3. If found, parse it and override colors.
     /// 4. Fall back to `Theme::default()`.
     pub fn load() -> Self {
@@ -356,31 +364,49 @@ impl Theme {
             Ok(h) => h,
             Err(_) => return Self::default(),
         };
-        let config_path = Path::new(&home).join(".config/k9s/config.yaml");
-        let skin_name = Self::read_skin_name(&config_path).unwrap_or_default();
+        // Try k9rs config first, fall back to k9s for compatibility.
+        let (skin_name, base_dir) = Self::find_skin_config(&home)
+            .unwrap_or_default();
         if skin_name.is_empty() {
             return Self::default();
         }
-        let skin_path = Path::new(&home)
-            .join(".config/k9s/skins")
+        let skin_path = Path::new(&base_dir)
+            .join("skins")
             .join(format!("{}.yaml", skin_name));
-        Self::from_k9s_skin(&skin_path).unwrap_or_default()
+        Self::from_skin_file(&skin_path).unwrap_or_default()
     }
 
-    /// Read the skin name from a k9s config.yaml file.
-    fn read_skin_name(path: &Path) -> Option<String> {
+    /// Find skin name and config base directory, trying k9rs then k9s.
+    fn find_skin_config(home: &str) -> Option<(String, String)> {
+        // Try ~/.config/k9rs/ first
+        let k9rs_dir = Path::new(home).join(".config/k9rs");
+        let k9rs_config = k9rs_dir.join("config.yaml");
+        if let Some(name) = Self::read_skin_name(&k9rs_config, "k9rs") {
+            return Some((name, k9rs_dir.to_string_lossy().to_string()));
+        }
+        // Fall back to ~/.config/k9s/
+        let k9s_dir = Path::new(home).join(".config/k9s");
+        let k9s_config = k9s_dir.join("config.yaml");
+        if let Some(name) = Self::read_skin_name(&k9s_config, "k9s") {
+            return Some((name, k9s_dir.to_string_lossy().to_string()));
+        }
+        None
+    }
+
+    /// Read the skin name from a config.yaml file under the given YAML key.
+    fn read_skin_name(path: &Path, key: &str) -> Option<String> {
         let content = std::fs::read_to_string(path).ok()?;
         let yaml: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
-        yaml.get("k9s")?
+        yaml.get(key)?
             .get("ui")?
             .get("skin")?
             .as_str()
             .map(|s| s.to_string())
     }
 
-    /// Load a k9s skin YAML file and produce a Theme with overridden colors.
-    /// Returns `None` if the file cannot be read or parsed.
-    pub fn from_k9s_skin(path: &Path) -> Option<Self> {
+    /// Load a skin YAML file (compatible with k9s skin format) and produce a Theme
+    /// with overridden colors. Returns `None` if the file cannot be read or parsed.
+    pub fn from_skin_file(path: &Path) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
         let yaml: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
         let k9s = yaml.get("k9s")?;

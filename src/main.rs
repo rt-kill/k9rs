@@ -58,6 +58,25 @@ struct Cli {
     subcmd: Option<crate::cli::Command>,
 }
 
+/// RAII guard that restores the terminal on drop.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn new() -> Self { Self }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            crossterm::cursor::Show,
+            crossterm::cursor::SetCursorStyle::DefaultUserShape,
+            LeaveAlternateScreen
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -83,7 +102,7 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    // Read kubeconfig ONCE for all early init (contexts list, cluster/user info)
+    // Read kubeconfig ONCE for all early init
     let kubeconfig = ::kube::config::Kubeconfig::read().ok();
     let contexts: Vec<String> = kubeconfig.as_ref()
         .map(|kc| kc.contexts.iter().map(|c| c.name.clone()).collect())
@@ -92,7 +111,7 @@ async fn main() -> Result<()> {
         kubeconfig.as_ref().and_then(|kc| kc.current_context.clone())
     }).unwrap_or_else(|| "in-cluster".to_string());
 
-    // Initialize app state and show TUI IMMEDIATELY — data loads in background
+    // Initialize app state
     let namespace = cli.namespace.unwrap_or_else(|| "all".to_string());
     let mut app = App::new(
         current_context.clone(),
@@ -103,7 +122,7 @@ async fn main() -> Result<()> {
         app.read_only = true;
     }
 
-    // Populate contexts table from the single kubeconfig read
+    // Populate contexts table from kubeconfig
     if let Some(ref kc) = kubeconfig {
         let mut ctx_map = std::collections::HashMap::new();
         for named_ctx in &kc.contexts {
@@ -120,7 +139,6 @@ async fn main() -> Result<()> {
                 is_current: name == &current_context,
             }
         }).collect();
-        // Also set cluster/user on app from the same read
         if let Some(&(cluster, user)) = ctx_map.get(current_context.as_str()) {
             app.cluster = cluster.to_string();
             app.user = user.to_string();
@@ -128,141 +146,194 @@ async fn main() -> Result<()> {
         app.data.contexts.set_items(kube_contexts);
     }
 
-    // Pre-populate namespaces and CRDs from disk cache for instant autocomplete.
-    // The watcher will deliver fresh data shortly after connection, but this
-    // ensures completion works even before the first snapshot arrives.
-    if let Some(cached) = crate::kube::cache::load_cache(&current_context) {
-        if !cached.namespaces.is_empty() {
-            let ns_items = crate::kube::cache::cached_namespaces_to_domain(&cached.namespaces);
-            app.data.namespaces.set_items(ns_items);
-        }
-        if !cached.crds.is_empty() {
-            app.discovered_crds = crate::kube::cache::cached_crds_to_domain(&cached.crds);
-        }
-    }
-
-    // Parse initial command/resource — bypasses Overview, goes straight to Resources
+    // Parse initial command/resource
     if let Some(ref cmd) = cli.command {
-        if let Some(tab) = crate::kube::session::parse_resource_command(cmd) {
-            app.resource_tab = tab;
+        if let Some(tab) = crate::kube::session_commands::parse_resource_command(cmd) {
             app.nav.reset(tab);
             app.route = crate::app::Route::Resources;
         }
     }
 
-    // Install a panic hook that restores the terminal before printing the panic.
-    // Without this, a panic leaves raw mode on and the shell is garbled.
+    // -----------------------------------------------------------------------
+    // Connect to daemon BEFORE entering the TUI.
+    // If connection fails, print the error on the normal terminal and exit
+    // cleanly — no raw mode, no alternate screen, no terminal corruption.
+    // -----------------------------------------------------------------------
+
+    let (event_tx, event_rx) = mpsc::channel::<AppEvent>(500);
+
+    use crate::kube::client_session::ClientSession;
+
+    // In daemon mode: quick socket check BEFORE entering the TUI.
+    // This fails fast if the daemon isn't running, without touching the terminal.
+    // The full session handshake happens after the TUI is up.
+    if !cli.no_daemon {
+        let socket = crate::kube::daemon::socket_path();
+        if let Err(e) = tokio::net::UnixStream::connect(&socket).await {
+            eprintln!(
+                "Daemon not running or connection failed: {}\n\n\
+                 Start it with:  k9rs daemon\n\
+                 Or run locally:  k9rs --no-daemon\n",
+                e
+            );
+            std::process::exit(1);
+        }
+        // Socket is reachable — we'll do the full handshake after TUI starts.
+    }
+
+    // Connection happens AFTER TUI starts — the user sees "Connecting..." immediately.
+    // Both daemon and no-daemon modes use the same deferred pattern.
+
+    // -----------------------------------------------------------------------
+    // Connection succeeded — NOW enter the TUI.
+    // -----------------------------------------------------------------------
+
+    // Install panic hook that restores the terminal.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), crossterm::cursor::SetCursorStyle::DefaultUserShape, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), crossterm::cursor::Show, crossterm::cursor::SetCursorStyle::DefaultUserShape, LeaveAlternateScreen);
         original_hook(info);
     }));
 
-    // Setup terminal FIRST — show TUI before any network IO
     enable_raw_mode()?;
+    let _terminal_guard = TerminalGuard::new();
+
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    // Create event channel
-    let (event_tx, event_rx) = mpsc::channel::<AppEvent>(500);
-
     app.flash = Some(crate::app::FlashMessage::info("Connecting to cluster..."));
-    // Render one frame so the user sees the TUI immediately
+    // Draw first frame immediately so the TUI appears instantly.
     terminal.draw(|f| crate::ui::draw(f, &mut app))?;
 
-    use crate::kube::client_session::ClientSession;
+    // Spawn connection as a background task.
+    // The user sees "Connecting..." and can already interact (quit, help, etc.).
+    let connect_event_tx = event_tx.clone();
+    let connect_context = current_context.clone();
+    let connect_ns = app.selected_ns.clone();
+    let connect_readonly = cli.readonly;
+    let connect_no_daemon = cli.no_daemon;
+    let (connect_tx, mut connect_rx) = tokio::sync::oneshot::channel::<
+        anyhow::Result<(ClientSession, crate::kube::client_session::SessionReadyInfo)>
+    >();
+    tokio::spawn(async move {
+        let result = if connect_no_daemon {
+            ClientSession::connect_local(
+                Some(connect_context.as_str()),
+                connect_ns.as_option(),
+                connect_readonly,
+                connect_event_tx,
+            ).await
+        } else {
+            ClientSession::connect(
+                Some(connect_context.as_str()),
+                connect_ns.as_option(),
+                connect_readonly,
+                connect_event_tx,
+            ).await
+        };
+        let _ = connect_tx.send(result);
+    });
 
-    // Both modes now use ClientSession — daemon connects via Unix socket,
-    // --no-daemon spawns a local ServerSession over an in-memory duplex.
-    let connect_result = if !cli.no_daemon {
-        // ---- Daemon mode: connect via Unix socket ----
-        ClientSession::connect(
-            Some(current_context.as_str()),
-            Some(app.selected_ns.as_str()),
-            cli.readonly,
-            event_tx.clone(),
-        ).await
-    } else {
-        // ---- Local mode (--no-daemon): in-memory duplex + local ServerSession ----
-        ClientSession::connect_local(
-            Some(current_context.as_str()),
-            Some(app.selected_ns.as_str()),
-            cli.readonly,
-            event_tx.clone(),
-        ).await
-    };
-
-    let data_source = match connect_result {
-        Ok((cs, info)) => {
-            // Apply server-provided info to app state.
-            app.context = info.context.clone();
-            app.cluster = info.cluster.clone();
-            app.user = info.user.clone();
-            if !info.namespaces.is_empty() {
-                let ns_items = crate::kube::cache::cached_namespaces_to_domain(&info.namespaces);
-                app.data.namespaces.set_items(ns_items);
-            }
-            // Subscribe to the initial tab — but only if we're going straight
-            // to Resources (CLI --command flag). In Overview mode, defer all
-            // subscriptions until the user navigates to a resource view.
-            let mut ds = cs;
-            if app.route == crate::app::Route::Resources {
-                let initial_rt = crate::kube::client_session::tab_resource_type(app.resource_tab);
-                if initial_rt != "namespaces" && initial_rt != "nodes" {
-                    ds.switch_tab(app.resource_tab).await;
+    // Enter the event loop immediately — connection completes in the background.
+    // We pass connect_rx so session_main can pick up the ClientSession when ready.
+    // For now, create a placeholder that buffers commands until connected.
+    // Actually — we need the ClientSession before entering session_main.
+    // Simplest correct approach: poll connect_rx in a tight loop with terminal redraws.
+    let mut data_source;
+    loop {
+        terminal.draw(|f| crate::ui::draw(f, &mut app))?;
+        match connect_rx.try_recv() {
+            Ok(Ok((cs, info))) => {
+                app.context = info.context.clone();
+                app.cluster = info.cluster.clone();
+                app.user = info.user.clone();
+                if !info.namespaces.is_empty() {
+                    let ns_rows = crate::kube::cache::cached_namespaces_to_rows(&info.namespaces);
+                    let table = app.data.unified.entry(crate::app::nav::rid("namespaces"))
+                        .or_insert_with(crate::app::StatefulTable::new);
+                    table.set_items(ns_rows);
                 }
+                app.flash = None;
+                data_source = cs;
+                break;
             }
-            app.flash = None;
-            ds
-        }
-        Err(e) => {
-            // Clean up terminal before printing error
-            disable_raw_mode()?;
-            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-            if !cli.no_daemon {
-                eprintln!(
-                    "Daemon not running or connection failed: {}\n\n\
-                     Start it with:  k9rs daemon\n\
-                     Or run locally:  k9rs --no-daemon\n",
-                    e
-                );
-            } else {
-                eprintln!(
-                    "Error: Unable to connect to Kubernetes cluster.\n\n\
-                     {}\n\n\
-                     Make sure:\n  \
-                     - Your kubeconfig is valid (~/.kube/config)\n  \
-                     - The cluster is reachable\n  \
-                     - Your credentials haven't expired\n\n\
-                     Tip: Run 'kubectl cluster-info' to verify connectivity.",
-                    e
-                );
+            Ok(Err(e)) => {
+                drop(terminal);
+                drop(_terminal_guard);
+                eprintln!("Failed to connect: {}", e);
+                std::process::exit(1);
             }
-            std::process::exit(1);
+            Err(_) => {
+                // Not ready yet — sleep briefly then redraw (spinner animation)
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
-    };
+    }
+
+    // Subscribe to initial resource via apply_nav_change — the single subscription entry point.
+    if app.route == crate::app::Route::Resources {
+        let initial_rid = app.nav.resource_id().clone();
+        let plural = initial_rid.plural.as_str();
+        if plural != "namespaces" && plural != "nodes" {
+            let change = crate::app::nav::NavChange {
+                unsubscribe: None,
+                subscribe: Some(initial_rid),
+            };
+            crate::kube::session::apply_nav_change(&mut app, &mut data_source, change);
+        }
+    }
 
     let tick_rate = Duration::from_millis(cli.tick_rate);
 
-    // Bridge crossterm EventStream into an mpsc channel so session_main
-    // receives events through a uniform channel interface.
+    // Bridge crossterm EventStream into an mpsc channel.
     let (input_tx, input_rx) =
         mpsc::channel::<crossterm::event::Event>(100);
+    let (suspend_tx, mut suspend_rx) = tokio::sync::watch::channel(false);
+    let (suspend_ack_tx, suspend_ack_rx) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
         let mut event_stream = EventStream::new();
-        while let Some(Ok(ev)) = event_stream.next().await {
-            if input_tx.send(ev).await.is_err() {
-                break;
+        let mut suspended = false;
+        loop {
+            if suspended {
+                if suspend_rx.changed().await.is_err() { break; }
+                if !*suspend_rx.borrow() {
+                    suspended = false;
+                    event_stream = EventStream::new();
+                }
+                continue;
+            }
+            tokio::select! {
+                biased;
+                _ = suspend_rx.changed() => {
+                    if *suspend_rx.borrow() {
+                        suspended = true;
+                        drop(event_stream);
+                        let _ = suspend_ack_tx.send(()).await;
+                        event_stream = EventStream::new();
+                    }
+                }
+                event = event_stream.next() => {
+                    match event {
+                        Some(Ok(ev)) => {
+                            if input_tx.send(ev).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Err(_)) => continue,
+                        None => break,
+                    }
+                }
             }
         }
     });
 
-    // Run the TUI event loop (all logic lives in session.rs)
-    let result = crate::kube::session::session_main(
+    // Run the TUI event loop.
+    // TerminalGuard ensures cleanup even if this returns Err.
+    let exit_reason = crate::kube::session::session_main(
         app,
         data_source,
         terminal,
@@ -270,13 +341,27 @@ async fn main() -> Result<()> {
         event_rx,
         input_rx,
         tick_rate,
+        suspend_tx,
+        suspend_ack_rx,
     )
-    .await;
+    .await?;
 
-    // Ensure the terminal is always restored, even if session_main returned Err.
-    // (session_main also restores on success, but this catches error paths.)
-    let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), crossterm::cursor::SetCursorStyle::DefaultUserShape, LeaveAlternateScreen);
+    // TerminalGuard drops here, restoring the terminal.
+    // Print exit message AFTER terminal is restored.
+    drop(_terminal_guard);
 
-    result
+    match exit_reason {
+        Some(crate::app::ExitReason::DaemonDisconnected) => {
+            eprintln!("k9rs: lost connection to daemon");
+            std::process::exit(1);
+        }
+        Some(crate::app::ExitReason::Error(msg)) => {
+            eprintln!("k9rs: {}", msg);
+            std::process::exit(1);
+        }
+        Some(crate::app::ExitReason::UserQuit) | None => {
+            // Normal exit — no message needed.
+            Ok(())
+        }
+    }
 }

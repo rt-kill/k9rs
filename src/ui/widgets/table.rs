@@ -114,7 +114,7 @@ impl Default for ResourceTableState {
     }
 }
 
-/// A high-performance virtual scrolling table widget styled like k9s.
+/// A high-performance virtual scrolling table widget.
 ///
 /// Title format: `resource(namespace)[count]`
 /// Header row: white bold
@@ -131,6 +131,8 @@ pub struct ResourceTable<'a> {
     theme: &'a Theme,
     /// Set of row indices (in the filtered list) that are marked/selected.
     marked_rows: &'a HashSet<usize>,
+    /// Rows that changed recently: (namespace, name) -> when. Used for delta highlights.
+    changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
 }
 
 impl<'a> ResourceTable<'a> {
@@ -141,6 +143,7 @@ impl<'a> ResourceTable<'a> {
         theme: &'a Theme,
     ) -> Self {
         static EMPTY_SET: std::sync::LazyLock<HashSet<usize>> = std::sync::LazyLock::new(HashSet::new);
+        static EMPTY_MAP: std::sync::LazyLock<std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>> = std::sync::LazyLock::new(std::collections::HashMap::new);
         Self {
             headers,
             rows,
@@ -151,6 +154,7 @@ impl<'a> ResourceTable<'a> {
             sort_asc: true,
             theme,
             marked_rows: &EMPTY_SET,
+            changed_rows: &EMPTY_MAP,
         }
     }
 
@@ -172,6 +176,11 @@ impl<'a> ResourceTable<'a> {
 
     pub fn filter_text(mut self, text: &'a str) -> Self {
         self.filter_text = text;
+        self
+    }
+
+    pub fn changed_rows(mut self, changed: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>) -> Self {
+        self.changed_rows = changed;
         self
     }
 
@@ -204,41 +213,52 @@ impl<'a> ResourceTable<'a> {
             *w += 2; // 1 space padding each side
         }
 
-        // Fit columns into available width with proportional scaling
-        let total_needed: u16 = widths.iter().sum();
+        // Fit columns into available width with proportional scaling.
+        // Use u32 for intermediate sums to avoid u16 overflow with many/wide columns.
+        let total_needed: u32 = widths.iter().map(|w| *w as u32).sum();
         let usable = available_width;
+        let usable32 = usable as u32;
 
-        if total_needed <= usable {
-            // Distribute remaining space across all columns proportionally
-            let remaining = usable - total_needed;
+        if total_needed <= usable32 {
+            // Distribute remaining space across all columns proportionally.
+            let remaining = usable32 - total_needed;
             if !widths.is_empty() && total_needed > 0 {
-                let mut distributed: u16 = 0;
+                let mut distributed: u32 = 0;
                 let last = widths.len() - 1;
                 for i in 0..last {
-                    let share = ((widths[i] as f64 / total_needed as f64) * remaining as f64) as u16;
-                    widths[i] += share;
+                    let share = ((widths[i] as f64 / total_needed as f64) * remaining as f64) as u32;
+                    widths[i] = (widths[i] as u32 + share).min(usable32) as u16;
                     distributed += share;
                 }
-                // Give rounding remainder to the last column
-                widths[last] += remaining - distributed;
+                widths[last] = (widths[last] as u32 + remaining - distributed).min(usable32) as u16;
             }
         } else if usable > 0 {
-            // Scale down proportionally but give each column at least 4 chars
+            // Scale down proportionally but give each column at least 4 chars.
             let min_col: u16 = 4;
-            let min_total = min_col * num_cols as u16;
-            if usable <= min_total {
+            let num = num_cols as u16;
+            if num == 0 { return widths; }
+            if usable <= min_col.saturating_mul(num) {
                 for w in &mut widths {
-                    *w = usable / num_cols as u16;
+                    *w = usable / num;
                 }
             } else {
                 let scale = usable as f64 / total_needed as f64;
                 for w in &mut widths {
                     *w = ((*w as f64 * scale) as u16).max(min_col);
                 }
-                // Fix rounding errors
-                let actual_total: u16 = widths.iter().sum();
-                if actual_total < usable && !widths.is_empty() {
-                    widths[0] += usable - actual_total;
+                // Clamp total to exactly usable — fix both undershoot and overshoot.
+                let actual_total: u32 = widths.iter().map(|w| *w as u32).sum();
+                if actual_total < usable32 && !widths.is_empty() {
+                    widths[0] += (usable32 - actual_total) as u16;
+                } else if actual_total > usable32 && !widths.is_empty() {
+                    // Shrink columns from the right until we fit.
+                    let mut excess = actual_total - usable32;
+                    for w in widths.iter_mut().rev() {
+                        if excess == 0 { break; }
+                        let shrink = excess.min((*w as u32).saturating_sub(min_col as u32));
+                        *w -= shrink as u16;
+                        excess -= shrink;
+                    }
                 }
             }
         }
@@ -279,7 +299,7 @@ impl<'a> ResourceTable<'a> {
         buf.set_string(x, y, &content, style);
     }
 
-    /// Build the k9s-style title line as a sequence of styled spans.
+    /// Build the title line as a sequence of styled spans.
     fn build_title_spans(&self, row_count: usize) -> Line<'a> {
         let mut spans = Vec::new();
         // resource_name(namespace)[count]
@@ -303,7 +323,7 @@ impl<'a> ResourceTable<'a> {
         if !self.filter_text.is_empty() {
             spans.push(Span::styled(" ", self.theme.title));
             spans.push(Span::styled(
-                format!("</{}>", self.filter_text),
+                format!("<{}>", self.filter_text),
                 self.theme.title_filter_indicator,
             ));
         }
@@ -329,7 +349,7 @@ impl StatefulWidget for ResourceTable<'_> {
             state.selected = all_rows.len() - 1;
         }
 
-        // Build k9s-style title
+        // Build title
         let title_line = self.build_title_spans(all_rows.len());
 
         // Draw bordered block with title
@@ -403,11 +423,22 @@ impl StatefulWidget for ResourceTable<'_> {
             let is_selected = row_idx == state.selected;
             let is_marked = self.marked_rows.contains(&row_idx);
 
+            // Check if this row has recent changes (delta tracking).
+            // Rows typically have namespace in col 0 and name in col 1.
+            let is_changed = if row.len() >= 2 && !self.changed_rows.is_empty() {
+                let key = crate::kube::protocol::ObjectKey::new(&row[0], &row[1]);
+                self.changed_rows.contains_key(&key)
+            } else {
+                false
+            };
+
             // Determine row base style
             let row_style = if is_selected {
                 self.theme.selected
             } else if is_marked {
                 self.theme.marked_row
+            } else if is_changed {
+                self.theme.delta_changed
             } else {
                 self.theme.row_normal
             };

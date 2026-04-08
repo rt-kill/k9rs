@@ -14,7 +14,7 @@ use crate::util::truncate_to_width;
 
 /// Draw the context switcher view.
 ///
-/// Uses the same full k9s layout as the resource view: header, table area,
+/// Uses the same layout as the resource view: header, table area,
 /// breadcrumb bar, and flash line.  Enter to switch, Esc/q to go back.
 pub fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
@@ -59,11 +59,12 @@ pub fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_context_key_hints(f: &mut Frame, area: Rect, theme: &Theme) {
-    let hints: Vec<(&str, &str)> = vec![
-        ("j/k", "navigate"),
-        ("Enter", "switch"),
-        ("q/Esc", "back"),
-        ("?", "help"),
+    use crate::ui::header::KeyHint;
+    let hints = vec![
+        KeyHint { key: "j/k", description: "navigate" },
+        KeyHint { key: "Enter", description: "switch" },
+        KeyHint { key: "q/Esc", description: "back" },
+        KeyHint { key: "?", description: "help" },
     ];
     header::draw_key_hint_grid(f, area, &hints, theme);
 }
@@ -188,24 +189,21 @@ fn draw_context_breadcrumbs(f: &mut Frame, app: &App, area: Rect, theme: &Theme)
         ("q/Esc", "back"),
     ];
 
-    let mut spans = Vec::new();
-    spans.push(Span::styled(
-        ctx_label,
-        theme.status_bar.add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(" \u{2502} ", theme.status_bar));
-    for (i, (key, desc)) in hints.iter().enumerate() {
-        spans.push(Span::styled(format!("<{}>", key), theme.status_bar_key));
-        spans.push(Span::styled(format!(" {} ", desc), theme.status_bar));
-        if i < hints.len() - 1 {
-            spans.push(Span::styled("\u{2502}", theme.status_bar));
-        }
-    }
-
     // Fill background
     let bg = " ".repeat(area.width as usize);
     let bg_line = Line::styled(bg, theme.status_bar);
     f.render_widget(bg_line, area);
+
+    // Build the bar: prefix with context label, then shared keybinding hints
+    let keybinding_line = header::render_keybinding_bar(&hints, theme);
+    let mut spans = vec![
+        Span::styled(
+            ctx_label,
+            theme.status_bar.add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" \u{2502}", theme.status_bar),
+    ];
+    spans.extend(keybinding_line.spans);
 
     let line = Line::from(spans);
     f.render_widget(line, area);
