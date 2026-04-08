@@ -77,6 +77,54 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Wait for the background connection task to complete while keeping the TUI
+/// responsive (quit keys, resize, loading animation). Returns the connected
+/// `ClientSession` or exits on failure.
+async fn await_connection(
+    terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
+    app: &mut crate::app::App,
+    mut connect_rx: tokio::sync::oneshot::Receiver<
+        anyhow::Result<(crate::kube::client_session::ClientSession, crate::kube::client_session::SessionReadyInfo)>
+    >,
+) -> Result<crate::kube::client_session::ClientSession> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let mut event_stream = EventStream::new();
+    loop {
+        terminal.draw(|f| crate::ui::draw(f, app))?;
+        tokio::select! {
+            biased;
+            event = futures::StreamExt::next(&mut event_stream) => {
+                if let Some(Ok(crossterm::event::Event::Key(key))) = event {
+                    let quit = key.code == KeyCode::Char('q')
+                        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+                    if quit { std::process::exit(0); }
+                }
+            }
+            result = &mut connect_rx => {
+                match result {
+                    Ok(Ok((cs, info))) => {
+                        app.context = info.context.clone();
+                        app.cluster = info.cluster.clone();
+                        app.user = info.user.clone();
+                        if !info.namespaces.is_empty() {
+                            let ns_rows = crate::kube::cache::cached_namespaces_to_rows(&info.namespaces);
+                            let table = app.data.unified.entry(crate::app::nav::rid("namespaces"))
+                                .or_insert_with(crate::app::StatefulTable::new);
+                            table.set_items(ns_rows);
+                        }
+                        app.flash = None;
+                        return Ok(cs);
+                    }
+                    Ok(Err(e)) => anyhow::bail!("Failed to connect: {}", e),
+                    Err(_) => anyhow::bail!("Connection task cancelled"),
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -216,7 +264,7 @@ async fn main() -> Result<()> {
     let connect_ns = app.selected_ns.clone();
     let connect_readonly = cli.readonly;
     let connect_no_daemon = cli.no_daemon;
-    let (connect_tx, mut connect_rx) = tokio::sync::oneshot::channel::<
+    let (connect_tx, connect_rx) = tokio::sync::oneshot::channel::<
         anyhow::Result<(ClientSession, crate::kube::client_session::SessionReadyInfo)>
     >();
     tokio::spawn(async move {
@@ -238,41 +286,7 @@ async fn main() -> Result<()> {
         let _ = connect_tx.send(result);
     });
 
-    // Enter the event loop immediately — connection completes in the background.
-    // We pass connect_rx so session_main can pick up the ClientSession when ready.
-    // For now, create a placeholder that buffers commands until connected.
-    // Actually — we need the ClientSession before entering session_main.
-    // Simplest correct approach: poll connect_rx in a tight loop with terminal redraws.
-    let mut data_source;
-    loop {
-        terminal.draw(|f| crate::ui::draw(f, &mut app))?;
-        match connect_rx.try_recv() {
-            Ok(Ok((cs, info))) => {
-                app.context = info.context.clone();
-                app.cluster = info.cluster.clone();
-                app.user = info.user.clone();
-                if !info.namespaces.is_empty() {
-                    let ns_rows = crate::kube::cache::cached_namespaces_to_rows(&info.namespaces);
-                    let table = app.data.unified.entry(crate::app::nav::rid("namespaces"))
-                        .or_insert_with(crate::app::StatefulTable::new);
-                    table.set_items(ns_rows);
-                }
-                app.flash = None;
-                data_source = cs;
-                break;
-            }
-            Ok(Err(e)) => {
-                drop(terminal);
-                drop(_terminal_guard);
-                eprintln!("Failed to connect: {}", e);
-                std::process::exit(1);
-            }
-            Err(_) => {
-                // Not ready yet — sleep briefly then redraw (spinner animation)
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
+    let mut data_source = await_connection(&mut terminal, &mut app, connect_rx).await?;
 
     // Subscribe to initial resource via apply_nav_change — the single subscription entry point.
     if app.route == crate::app::Route::Resources {

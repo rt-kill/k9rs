@@ -342,6 +342,8 @@ async fn run_live_watcher(
         }
     }
 
+    let ns_str = ns.display();
+
     // ConfigMaps: migrated to the unified ResourceRow model.
     if rt == "configmaps" {
         let api: Api<ConfigMap> = ns_api(&client, ns);
@@ -349,22 +351,15 @@ async fn run_live_watcher(
         let headers = pick_headers(&server_headers,
             vec!["NAMESPACE".into(), "NAME".into(), "DATA".into(), "LABELS".into(), "AGE".into()]);
         run_typed_watcher(
-            api,
-            snapshot_tx,
-            configmap_to_row,
+            api, snapshot_tx, configmap_to_row,
             move |rows| ResourceUpdate::Rows {
-                resource: resource_id.clone(),
-                headers: headers.clone(),
-                rows,
+                resource: resource_id.clone(), headers: headers.clone(), rows,
             },
-            rt,
-        )
-        .await;
+            rt, ns_str,
+        ).await;
         return;
     }
 
-    // Unified ResourceRow migrations — namespaced resources.
-    // Each uses early return with run_typed_watcher + a _to_row converter.
     macro_rules! unified_ns {
         ($rt_match:expr, $alias:expr, $api_type:ty, $conv:expr, $fallback:expr) => {
             if rt == $rt_match {
@@ -373,7 +368,7 @@ async fn run_live_watcher(
                 let headers = pick_headers(&server_headers, $fallback);
                 run_typed_watcher(api, snapshot_tx, $conv, move |rows| ResourceUpdate::Rows {
                     resource: resource_id.clone(), headers: headers.clone(), rows,
-                }, rt).await;
+                }, rt, ns_str).await;
                 return;
             }
         };
@@ -386,7 +381,7 @@ async fn run_live_watcher(
                 let headers = pick_headers(&server_headers, $fallback);
                 run_typed_watcher(api, snapshot_tx, $conv, move |rows| ResourceUpdate::Rows {
                     resource: resource_id.clone(), headers: headers.clone(), rows,
-                }, rt).await;
+                }, rt, "all").await;
                 return;
             }
         };
@@ -411,7 +406,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt).await;
+        }, rt, ns_str).await;
         return;
     }
     unified_ns!("events", "events", Event, event_to_row,
@@ -431,7 +426,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt).await;
+        }, rt, ns_str).await;
         return;
     }
     unified_ns!("endpoints", "endpoints", Endpoints, endpoints_to_row,
@@ -451,7 +446,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt).await;
+        }, rt, ns_str).await;
         return;
     }
 
@@ -485,7 +480,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt).await;
+        }, rt, ns_str).await;
         return;
     }
     unified_cluster!("clusterroles", "clusterroles", ClusterRole, cluster_role_to_row,
@@ -505,7 +500,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt).await;
+        }, rt, ns_str).await;
         return;
     }
 
@@ -518,7 +513,7 @@ async fn run_live_watcher(
             &["CPU%", "MEM%"]);
         run_typed_watcher(api, snapshot_tx, node_to_row, move |rows| ResourceUpdate::Rows {
             resource: resource_id.clone(), headers: headers.clone(), rows,
-        }, rt).await;
+        }, rt, ns_str).await;
         return;
     }
 
@@ -531,7 +526,7 @@ async fn run_live_watcher(
             &["CPU", "MEM"]);
         run_typed_watcher(api, snapshot_tx, pod_to_row, move |rows| ResourceUpdate::Rows {
             resource: resource_id.clone(), headers: headers.clone(), rows,
-        }, rt).await;
+        }, rt, ns_str).await;
         return;
     }
 
@@ -666,6 +661,7 @@ async fn run_typed_watcher<K, T, C, W>(
     convert: C,
     wrap: W,
     resource_type: &str,
+    namespace: &str,
 ) where
     K: Resource<DynamicType = ()>
         + Clone
@@ -697,6 +693,11 @@ async fn run_typed_watcher<K, T, C, W>(
     init_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let rt = resource_type.to_string();
+    let ns_label = if namespace.is_empty() || namespace == "all" {
+        "all".to_string()
+    } else {
+        namespace.to_string()
+    };
 
     loop {
         tokio::select! {
@@ -706,7 +707,7 @@ async fn run_typed_watcher<K, T, C, W>(
                         match event {
                             WatcherEvent::Init => {
                                 store.clear();
-                                info!("live_query: starting initial list for {}", rt);
+                                info!("live_query: starting initial list for {}({})", rt, ns_label);
                             }
                             WatcherEvent::InitApply(obj) => {
                                 let key = obj_key(&obj);
@@ -715,7 +716,7 @@ async fn run_typed_watcher<K, T, C, W>(
                             }
                             WatcherEvent::InitDone => {
                                 backoff_ms = INITIAL_BACKOFF_MS;
-                                info!("live_query: initial list complete for {}, {} items", rt, store.len());
+                                info!("live_query: initial list complete for {}({}), {} items", rt, ns_label, store.len());
                                 let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Apply(obj) => {
@@ -763,7 +764,7 @@ async fn run_typed_watcher<K, T, C, W>(
                 // Flush intermediate snapshots during initial list so data
                 // appears progressively instead of waiting for InitDone.
                 if init_dirty && !store.is_empty() {
-                    info!("live_query: flushing intermediate snapshot for {} ({} items)", rt, store.len());
+                    info!("live_query: flushing intermediate snapshot for {}({}) ({} items)", rt, ns_label, store.len());
                     init_dirty = false;
                     let mut items: Vec<T> = store.values().cloned().collect();
                     items.sort_by(|a, b| {

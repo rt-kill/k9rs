@@ -664,11 +664,20 @@ impl App {
         }
         // Keep redrawing while a loading state is active (spinner animation).
         if !changed {
+            // Resource table loading
             let rid = self.nav.resource_id();
             let table_loading = self.data.unified.get(rid)
                 .map_or(true, |t| t.items.is_empty() && !t.has_data);
             if table_loading {
                 changed = true;
+            }
+            // Log view: animate while streaming with no lines yet
+            if !changed {
+                if let Route::Logs { ref state, .. } | Route::Shell { ref state, .. } = self.route {
+                    if state.streaming && state.lines.is_empty() {
+                        changed = true;
+                    }
+                }
             }
         }
         changed

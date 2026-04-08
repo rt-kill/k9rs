@@ -261,7 +261,11 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
     /// Cursor stays at its screen index.
     pub fn sort_by_column(&mut self, col: usize) {
         let actual_col = if col == usize::MAX {
-            T::headers().len().saturating_sub(1)
+            // Resolve sentinel to last column using actual data width,
+            // not the static trait fallback (which is meaningless for ResourceRow).
+            self.items.first()
+                .map(|item| item.cells().len().saturating_sub(1))
+                .unwrap_or(0)
         } else {
             col
         };
@@ -307,7 +311,17 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
         if self.items.is_empty() { return; }
         let col = self.sort_column;
         let asc = self.sort_ascending;
-        let is_age_col = T::headers().get(col).map_or(false, |h| *h == "AGE");
+        // Detect whether this column contains age-formatted values (e.g. "3d5h",
+        // "10m") by sampling the first non-empty cell. This avoids depending on
+        // header names (which ResourceRow doesn't expose via the trait).
+        let is_age_col = self.items.iter()
+            .find_map(|item| {
+                let val = item.cells().get(col)?.as_str();
+                if val.is_empty() || val == "<unknown>" { return None; }
+                Some(val.chars().all(|c| c.is_ascii_digit() || matches!(c, 'd' | 'h' | 'm' | 's'))
+                    && val.chars().any(|c| matches!(c, 'd' | 'h' | 'm' | 's')))
+            })
+            .unwrap_or(false);
         self.items.sort_by(|a, b| {
             let a_cells = a.cells();
             let b_cells = b.cells();

@@ -194,15 +194,17 @@ pub(crate) fn apply_context_switch_result(
                 .collect();
             app.data.contexts.set_items(updated);
 
-            // Re-subscribe to the nav's current resource so data is ready
-            // when the user navigates from Overview to a resource view.
-            // Keep the route as Overview (set by begin_context_switch).
-            let rid = app.nav.resource_id().clone();
-            let change = crate::app::nav::NavChange {
-                unsubscribe: None,
-                subscribe: Some(rid),
-            };
-            super::session::apply_nav_change(app, data_source, change);
+            // Only re-subscribe if the user was on a resource view.
+            // Overview has no subscription; namespaces and nodes are
+            // auto-subscribed by the server session init.
+            if app.route == crate::app::Route::Resources {
+                let rid = app.nav.resource_id().clone();
+                let change = crate::app::nav::NavChange {
+                    unsubscribe: None,
+                    subscribe: Some(rid),
+                };
+                super::session::apply_nav_change(app, data_source, change);
+            }
 
             app.flash = Some(crate::app::FlashMessage::info(format!(
                 "Switched to context: {}",
