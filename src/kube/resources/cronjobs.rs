@@ -1,8 +1,7 @@
-use std::collections::BTreeMap;
 
 use k8s_openapi::api::batch::v1::CronJob;
 
-use crate::kube::resources::row::{ExtraValue, ResourceRow};
+use crate::kube::resources::row::ResourceRow;
 
 /// Convert a k8s CronJob into a generic ResourceRow.
 pub(crate) fn cronjob_to_row(cj: CronJob) -> ResourceRow {
@@ -19,7 +18,7 @@ pub(crate) fn cronjob_to_row(cj: CronJob) -> ResourceRow {
 
     let job_template_containers = spec.job_template.spec.as_ref()
         .and_then(|js| js.template.spec.as_ref());
-    let containers = job_template_containers
+    let container_names = job_template_containers
         .map(|ps| ps.containers.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(","))
         .unwrap_or_default();
     let images = job_template_containers
@@ -30,19 +29,21 @@ pub(crate) fn cronjob_to_row(cj: CronJob) -> ResourceRow {
     let active = status.active.as_ref().map(|a| a.len() as i32).unwrap_or(0);
     let last_schedule = status.last_schedule_time.map(|t| t.0);
 
-    let mut extra = BTreeMap::new();
-    extra.insert("suspend".into(), ExtraValue::Str(suspend.to_string()));
-
     ResourceRow {
         cells: vec![
             ns.clone(), name.clone(), schedule, suspend.to_string(),
             active.to_string(), crate::util::format_age(last_schedule),
-            containers, images,
+            container_names, images,
             labels_str,
             crate::util::format_age(age),
         ],
         name,
         namespace: ns,
-        extra,
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: Vec::new(),
+        node: None,
+        crd_info: None,
+        drill_target: None,
     }
 }

@@ -93,7 +93,10 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     lines.push(Line::from(""));
 
     // Cluster info — centered block
-    let ctx_line = format!("Context: {}  |  Cluster: {}  |  User: {}", app.context, app.cluster, app.user);
+    let ctx_display = if app.context.is_empty() { "connecting…" } else { &app.context };
+    let cluster_display = if app.cluster.is_empty() { "n/a" } else { &app.cluster };
+    let user_display = if app.user.is_empty() { "n/a" } else { &app.user };
+    let ctx_line = format!("Context: {}  |  Cluster: {}  |  User: {}", ctx_display, cluster_display, user_display);
     lines.push(Line::from(
         Span::styled(ctx_line, theme.info_value)
     ).alignment(Alignment::Center));

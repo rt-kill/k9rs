@@ -4,7 +4,7 @@
 //! communication — both TUI sessions and management commands (k9rs ctl).
 //! No JSON on the wire.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 
 use super::cache::CachedCrd;
@@ -14,6 +14,11 @@ use crate::event::ResourceUpdate;
 /// This is the unified representation — no distinction between "built-in" and "dynamic".
 /// Every K8s resource type (including CRDs) is just a GVR.
 ///
+/// Sentinel group for daemon-owned "local" resources (port-forwards, saved
+/// queries, etc.). Distinct from every real K8s API group so identity checks
+/// are unambiguous. See `crate::kube::local` for the abstraction.
+pub const LOCAL_GROUP: &str = "k9rs.local";
+
 /// Identity (Hash/Eq) is determined by `(group, version, plural)` only.
 /// `kind` and `scope` are properties of the resource, not part of its identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,15 +68,22 @@ impl ResourceId {
         }
     }
 
-    /// Look up a built-in resource by any alias (e.g., "po", "deploy", "svc", "namespaces").
+    /// Look up a built-in resource by any alias (e.g., "po", "deploy", "svc", "namespaces", "pf").
+    /// Consults both the K8s RESOURCE_TYPES table and the local LOCAL_RESOURCE_TYPES table.
     pub fn from_alias(alias: &str) -> Option<Self> {
-        crate::kube::resource_types::find_by_alias(alias).map(|meta| Self {
-            group: meta.group.to_string(),
-            version: meta.version.to_string(),
-            kind: meta.kind.to_string(),
-            plural: meta.plural.to_string(),
-            scope: meta.scope,
-        })
+        if let Some(meta) = crate::kube::resource_types::find_by_alias(alias) {
+            return Some(Self {
+                group: meta.group.to_string(),
+                version: meta.version.to_string(),
+                kind: meta.kind.to_string(),
+                plural: meta.plural.to_string(),
+                scope: meta.scope,
+            });
+        }
+        if let Some(local) = crate::kube::local::find_by_alias(alias) {
+            return Some(local.to_resource_id());
+        }
+        None
     }
 
     /// Display label (the kind name).
@@ -79,9 +91,15 @@ impl ResourceId {
         &self.kind
     }
 
-    /// Short UI label for tab bar/breadcrumbs (e.g., "Deploy", "STS").
+    /// Short UI label for tab bar/breadcrumbs (e.g., "Deploy", "STS", "PF").
     /// Falls back to kind for unknown/CRD resource types.
     pub fn short_label(&self) -> &str {
+        if self.is_local() {
+            if let Some(m) = crate::kube::local::find_by_plural(&self.plural) {
+                return m.short_label;
+            }
+            return &self.kind;
+        }
         crate::kube::resource_types::find_by_plural(&self.plural)
             .map(|m| m.short_label)
             .unwrap_or(&self.kind)
@@ -115,6 +133,12 @@ impl ResourceId {
     /// Whether this resource is cluster-scoped.
     pub fn is_cluster_scoped(&self) -> bool {
         self.scope == ResourceScope::Cluster
+    }
+
+    /// Whether this resource is a daemon-owned local resource (not from K8s API).
+    /// Local resources use the sentinel group `"k9rs.local"`.
+    pub fn is_local(&self) -> bool {
+        self.group == LOCAL_GROUP
     }
 
     /// The plural name used in API URLs and watcher keys.
@@ -278,19 +302,6 @@ impl ObjectRef {
             namespace,
         }
     }
-
-    /// Convenience constructor from a resource type string (alias or plural name).
-    /// Uses `ResourceId::from_alias` with a fallback for unknown types.
-    pub fn from_parts(resource_type: &str, name: impl Into<String>, namespace: Namespace) -> Self {
-        let resource = ResourceId::from_alias(resource_type).unwrap_or_else(|| {
-            ResourceId::new("", "", resource_type, resource_type, ResourceScope::Namespaced)
-        });
-        Self {
-            resource,
-            name: name.into(),
-            namespace,
-        }
-    }
 }
 
 /// Key identifying a Kubernetes object by namespace + name.
@@ -312,6 +323,128 @@ impl ObjectKey {
 pub struct MetricsUsage {
     pub cpu: String,
     pub mem: String,
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities — typed declarative manifest of operations a resource supports
+// ---------------------------------------------------------------------------
+//
+// The server sends a `ResourceCapabilities` after a successful subscription.
+// It declares *what operations exist on this resource type* and *what input
+// shape each operation needs*. The TUI maps user input (keystrokes) to
+// `OperationKind`s purely client-side; the server never sees a key.
+//
+// Wire commands stay strongly typed (`SessionCommand::PortForward { .. }`,
+// etc.). The schema describes how to *gather* the values for that command;
+// it doesn't dispatch generically.
+
+/// One specific operation the user might want to perform on a row. Each kind
+/// corresponds to either a `SessionCommand` variant or a purely client-side
+/// action that nonetheless requires server-known facts (like "this row is a
+/// pod, you can `kubectl exec` into it").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OperationKind {
+    // Always-on (the server can satisfy these for any K8s row, plus locals
+    // that opt in).
+    Describe,
+    Yaml,
+    Delete,
+
+    // Workload operations.
+    Restart,
+    Scale,
+    StreamLogs,
+    PreviousLogs,
+    PortForward,
+
+    // Pod-specific.
+    Shell,
+    ShowNode,
+    ForceKill,
+
+    // Special-purpose K8s resources.
+    DecodeSecret,
+    TriggerCronJob,
+    ToggleSuspendCronJob,
+}
+
+/// A field in an `InputSchema::Form`. Names are stable identifiers the
+/// dialog widget keys its values map by; labels are user-facing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormField {
+    pub name: String,
+    pub label: String,
+    pub kind: FieldKind,
+}
+
+/// Type-narrowing for a single form field. The dialog widget renders the
+/// appropriate input control based on this discriminator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FieldKind {
+    /// Free-form text. `max_len` is advisory; the widget may enforce it.
+    Text { max_len: Option<usize> },
+    /// Integer with explicit bounds.
+    Number { min: i64, max: i64 },
+    /// Network port (1..=65535) — convenience for the common case.
+    Port,
+    /// One of a fixed set of choices. Each entry is `(value, display_label)`.
+    Select { options: Vec<(String, String)> },
+}
+
+/// A value submitted for a `FormField`. The dialog widget produces these
+/// when the user submits; the per-`OperationKind` mapper converts them into
+/// the typed `SessionCommand` payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FieldValue {
+    Text(String),
+    Number(i64),
+    Selection(String),
+}
+
+/// What input the operation needs from the user before it can be dispatched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InputSchema {
+    /// No input — the action runs immediately (modulo `requires_confirm`).
+    None,
+    /// Render a form with these fields and collect a value for each.
+    Form(Vec<FormField>),
+}
+
+/// One operation declared on a resource type. The triple `(kind, input,
+/// requires_confirm)` is enough for the TUI to gate keys, render any input
+/// dialog, and emit the typed wire command on submit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationDescriptor {
+    pub kind: OperationKind,
+    /// Short user-facing label. The TUI may show it in help text or hint
+    /// bars; never used to dispatch.
+    pub label: String,
+    /// What input the operation needs (None for one-shot actions).
+    pub input: InputSchema,
+    /// If true, the TUI shows a confirm dialog before dispatching. The
+    /// confirm message is built client-side from the kind + row context.
+    pub requires_confirm: bool,
+}
+
+/// The full set of operations a resource type supports. Sent from the server
+/// to the TUI after a successful subscription. Empty `operations` means the
+/// resource is read-only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceCapabilities {
+    pub operations: Vec<OperationDescriptor>,
+}
+
+impl ResourceCapabilities {
+    /// True if any declared operation has the given kind.
+    pub fn supports(&self, kind: OperationKind) -> bool {
+        self.operations.iter().any(|op| op.kind == kind)
+    }
+
+    /// Look up the descriptor for an operation, if declared. Use this when
+    /// you need the input schema or the label, not just a boolean.
+    pub fn get(&self, kind: OperationKind) -> Option<&OperationDescriptor> {
+        self.operations.iter().find(|op| op.kind == kind)
+    }
 }
 
 /// Maximum bincode message size: 64 MiB. Protects against corrupted frames.
@@ -389,6 +522,27 @@ pub struct DaemonStatus {
 // Unified command type: Client -> Daemon (bincode)
 // ---------------------------------------------------------------------------
 
+/// Filter applied to a resource subscription at the server/watcher level.
+/// Labels and fields are pushed to the K8s API (server-side filtering).
+/// OwnerUid is applied as a post-filter on the server before sending to the client
+/// (K8s API doesn't support filtering by ownerReference).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SubscriptionFilter {
+    /// Label selector: only return resources matching all key=value pairs.
+    Labels(BTreeMap<String, String>),
+    /// Field selector string: e.g., "spec.nodeName=node01".
+    Field(String),
+    /// Owner UID: only return resources owned by this UID (post-filtered server-side).
+    OwnerUid(String),
+}
+
+impl SubscriptionFilter {
+    /// Convert a label map to the K8s API label selector string format.
+    pub fn labels_to_selector(labels: &BTreeMap<String, String>) -> String {
+        labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",")
+    }
+}
+
 /// All commands from any client (TUI session or management CLI).
 /// The first command on a connection determines the connection type:
 /// - `Init` → long-lived TUI session
@@ -410,7 +564,10 @@ pub enum SessionCommand {
 
     // --- Resource subscriptions ---
 
-    Subscribe(ResourceId),
+    Subscribe {
+        resource: ResourceId,
+        filter: Option<SubscriptionFilter>,
+    },
     Unsubscribe(ResourceId),
     SwitchNamespace { namespace: Namespace },
     SwitchContext {
@@ -440,9 +597,23 @@ pub enum SessionCommand {
     Refresh(ResourceId),
     StopLogs,
     GetDiscovery,
-    DecodeSecret { name: String, namespace: Namespace },
-    TriggerCronJob { name: String, namespace: Namespace },
-    SuspendCronJob { name: String, namespace: Namespace, suspend: bool },
+    /// Decode a Secret's data and return it as a describe-style view.
+    /// Carries the full `ObjectRef` rather than `(name, namespace)` so the
+    /// daemon (and any future filtering layer) gets the typed rid for free.
+    DecodeSecret(ObjectRef),
+    /// Manually trigger a CronJob (creates a one-shot Job from its template).
+    TriggerCronJob(ObjectRef),
+    /// Toggle the suspend state of a CronJob. The server reads the current
+    /// state from K8s and flips it — the client doesn't need to know.
+    /// Toggle a CronJob's `spec.suspend` flag (server reads + flips).
+    ToggleSuspendCronJob(ObjectRef),
+
+    // --- Port-forwarding ---
+
+    /// Create a new port-forward. The server delegates to the shared
+    /// `PortForwardSource`; state transitions flow through the regular
+    /// Subscribe/Snapshot pipeline for the port-forward table.
+    PortForward { target: ObjectRef, local_port: u16, container_port: u16 },
 
     // --- Daemon management (one-shot, no session needed) ---
 
@@ -497,6 +668,13 @@ pub enum SessionEvent {
     },
     PodMetrics(HashMap<ObjectKey, MetricsUsage>),
     NodeMetrics(HashMap<String, MetricsUsage>),
+    /// Capabilities of a resource type (which operations it supports).
+    /// Sent after a successful subscription so the TUI can enable/disable
+    /// keybindings without hardcoded K8s knowledge.
+    ResourceCapabilities {
+        resource: ResourceId,
+        capabilities: ResourceCapabilities,
+    },
 
     // --- Management responses ---
 
@@ -507,8 +685,7 @@ pub enum SessionEvent {
 mod tests {
     use super::*;
     use crate::event::ResourceUpdate;
-    use crate::kube::resources::row::{ResourceRow, ExtraValue, ContainerInfo, OwnerRefInfo};
-    use std::collections::BTreeMap;
+    use crate::kube::resources::row::ResourceRow;
 
     #[test]
     fn test_resource_row_bincode_roundtrip() {
@@ -516,53 +693,17 @@ mod tests {
             cells: vec!["default".into(), "test-pod".into(), "1/1".into(), "Running".into()],
             name: "test-pod".into(),
             namespace: "default".into(),
-            extra: BTreeMap::new(),
+            containers: Vec::new(),
+            owner_refs: Vec::new(),
+            pf_ports: Vec::new(),
+            node: None,
+            crd_info: None,
+            drill_target: None,
         };
         let bytes = bincode::serialize(&row).unwrap();
         let decoded: ResourceRow = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.name, "test-pod");
         assert_eq!(decoded.cells.len(), 4);
-    }
-
-    #[test]
-    fn test_resource_row_with_extra_bincode_roundtrip() {
-        let mut extra = BTreeMap::new();
-        extra.insert("uid".into(), ExtraValue::Str("abc-123".into()));
-        extra.insert("labels".into(), ExtraValue::Map({
-            let mut m = BTreeMap::new();
-            m.insert("app".into(), "test".into());
-            m
-        }));
-        extra.insert("containers".into(), ExtraValue::Containers(vec![
-            ContainerInfo {
-                name: "main".into(),
-                real_name: "main".into(),
-                image: "nginx:latest".into(),
-                ready: true,
-                state: "Running".into(),
-                restarts: 0,
-                ports: vec![80, 443],
-            },
-        ]));
-        extra.insert("owner_references".into(), ExtraValue::OwnerRefs(vec![
-            OwnerRefInfo {
-                api_version: "apps/v1".into(),
-                kind: "ReplicaSet".into(),
-                name: "test-rs".into(),
-                uid: "uid-456".into(),
-            },
-        ]));
-        let row = ResourceRow {
-            cells: vec!["default".into(), "test-pod".into()],
-            name: "test-pod".into(),
-            namespace: "default".into(),
-            extra,
-        };
-        let bytes = bincode::serialize(&row).unwrap();
-        let decoded: ResourceRow = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(decoded.extra_str("uid"), Some("abc-123"));
-        assert_eq!(decoded.extra_containers().unwrap().len(), 1);
-        assert_eq!(decoded.extra_owner_refs().unwrap().len(), 1);
     }
 
     #[test]
@@ -572,7 +713,12 @@ mod tests {
             cells: vec!["default".into(), "test".into()],
             name: "test".into(),
             namespace: "default".into(),
-            extra: BTreeMap::new(),
+            containers: Vec::new(),
+            owner_refs: Vec::new(),
+            pf_ports: Vec::new(),
+            node: None,
+            crd_info: None,
+            drill_target: None,
         };
         let update = ResourceUpdate::Rows {
             resource: rid.clone(),
@@ -601,7 +747,12 @@ mod tests {
                 cells: vec!["prod".into(), "web".into(), "3/3".into()],
                 name: "web".into(),
                 namespace: "prod".into(),
-                extra: BTreeMap::new(),
+                containers: Vec::new(),
+                owner_refs: Vec::new(),
+                pf_ports: Vec::new(),
+                node: None,
+                crd_info: None,
+                drill_target: None,
             }],
         };
         let event = SessionEvent::Snapshot(update);
@@ -618,11 +769,11 @@ mod tests {
     #[test]
     fn test_subscribe_command_bincode_roundtrip() {
         let rid = ResourceId::new("", "v1", "Pod", "pods", ResourceScope::Namespaced);
-        let cmd = SessionCommand::Subscribe(rid);
+        let cmd = SessionCommand::Subscribe { resource: rid, filter: None };
         let bytes = bincode::serialize(&cmd).unwrap();
         let decoded: SessionCommand = bincode::deserialize(&bytes).unwrap();
         match decoded {
-            SessionCommand::Subscribe(r) => assert_eq!(r.plural, "pods"),
+            SessionCommand::Subscribe { resource: r, .. } => assert_eq!(r.plural, "pods"),
             _ => panic!("Wrong command"),
         }
     }

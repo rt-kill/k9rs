@@ -52,6 +52,9 @@ pub struct QueryKey {
     pub context: crate::kube::protocol::ContextId,
     pub namespace: crate::kube::protocol::Namespace,
     pub resource: crate::kube::protocol::ResourceId,
+    /// Server-side filter. A filtered subscription creates a separate watcher
+    /// from an unfiltered one (different API queries to K8s).
+    pub filter: Option<crate::kube::protocol::SubscriptionFilter>,
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +322,7 @@ async fn run_live_watcher(
 ) {
     let ns = &key.namespace;
     let rt = key.resource.plural.as_str();
+    let watcher_filter = key.filter.clone();
 
     /// Pick server-provided headers if available, otherwise use the hardcoded fallback.
     fn pick_headers(server: &[String], fallback: Vec<String>) -> Vec<String> {
@@ -355,7 +359,7 @@ async fn run_live_watcher(
             move |rows| ResourceUpdate::Rows {
                 resource: resource_id.clone(), headers: headers.clone(), rows,
             },
-            rt, ns_str,
+            rt, ns_str, watcher_filter.clone(),
         ).await;
         return;
     }
@@ -368,7 +372,7 @@ async fn run_live_watcher(
                 let headers = pick_headers(&server_headers, $fallback);
                 run_typed_watcher(api, snapshot_tx, $conv, move |rows| ResourceUpdate::Rows {
                     resource: resource_id.clone(), headers: headers.clone(), rows,
-                }, rt, ns_str).await;
+                }, rt, ns_str, watcher_filter.clone()).await;
                 return;
             }
         };
@@ -381,7 +385,7 @@ async fn run_live_watcher(
                 let headers = pick_headers(&server_headers, $fallback);
                 run_typed_watcher(api, snapshot_tx, $conv, move |rows| ResourceUpdate::Rows {
                     resource: resource_id.clone(), headers: headers.clone(), rows,
-                }, rt, "all").await;
+                }, rt, "all", watcher_filter.clone()).await;
                 return;
             }
         };
@@ -406,7 +410,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt, ns_str).await;
+        }, rt, ns_str, watcher_filter.clone()).await;
         return;
     }
     unified_ns!("events", "events", Event, event_to_row,
@@ -426,7 +430,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt, ns_str).await;
+        }, rt, ns_str, watcher_filter.clone()).await;
         return;
     }
     unified_ns!("endpoints", "endpoints", Endpoints, endpoints_to_row,
@@ -446,7 +450,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt, ns_str).await;
+        }, rt, ns_str, watcher_filter.clone()).await;
         return;
     }
 
@@ -480,7 +484,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt, ns_str).await;
+        }, rt, ns_str, watcher_filter.clone()).await;
         return;
     }
     unified_cluster!("clusterroles", "clusterroles", ClusterRole, cluster_role_to_row,
@@ -500,7 +504,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt, ns_str).await;
+        }, rt, ns_str, watcher_filter.clone()).await;
         return;
     }
 
@@ -513,7 +517,7 @@ async fn run_live_watcher(
             &["CPU%", "MEM%"]);
         run_typed_watcher(api, snapshot_tx, node_to_row, move |rows| ResourceUpdate::Rows {
             resource: resource_id.clone(), headers: headers.clone(), rows,
-        }, rt, ns_str).await;
+        }, rt, ns_str, watcher_filter.clone()).await;
         return;
     }
 
@@ -526,7 +530,7 @@ async fn run_live_watcher(
             &["CPU", "MEM"]);
         run_typed_watcher(api, snapshot_tx, pod_to_row, move |rows| ResourceUpdate::Rows {
             resource: resource_id.clone(), headers: headers.clone(), rows,
-        }, rt, ns_str).await;
+        }, rt, ns_str, watcher_filter.clone()).await;
         return;
     }
 
@@ -662,6 +666,7 @@ async fn run_typed_watcher<K, T, C, W>(
     wrap: W,
     resource_type: &str,
     namespace: &str,
+    filter: Option<crate::kube::protocol::SubscriptionFilter>,
 ) where
     K: Resource<DynamicType = ()>
         + Clone
@@ -674,14 +679,27 @@ async fn run_typed_watcher<K, T, C, W>(
     C: Fn(K) -> T + Send + 'static,
     W: Fn(Vec<T>) -> ResourceUpdate + Send + 'static,
 {
-    let watcher_config = watcher::Config::default()
+    let mut watcher_config = watcher::Config::default()
         .page_size(WATCHER_PAGE_SIZE)
         .any_semantic();      // serve from API server cache (resourceVersion=0), much faster
+    // Apply server-side filters to the watcher (pushed to K8s API).
+    // OwnerUid is NOT applied here — it's post-filtered after snapshot creation
+    // because the K8s API doesn't support filtering by ownerReference.
+    match &filter {
+        Some(crate::kube::protocol::SubscriptionFilter::Labels(map)) => {
+            let sel = crate::kube::protocol::SubscriptionFilter::labels_to_selector(map);
+            watcher_config = watcher_config.labels(&sel);
+        }
+        Some(crate::kube::protocol::SubscriptionFilter::Field(f)) => {
+            watcher_config = watcher_config.fields(f);
+        }
+        Some(crate::kube::protocol::SubscriptionFilter::OwnerUid(_)) | None => {}
+    }
     let mut stream = watcher::watcher(api, watcher_config).boxed();
 
     let mut store: HashMap<ObjectKey, T> = HashMap::new();
     let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
-    let backoff_start = std::time::Instant::now();
+    let mut backoff_start = std::time::Instant::now();
     let mut init_dirty = false; // tracks whether we have unsent InitApply items
 
     // Channel for signalling that a snapshot should be built.
@@ -716,17 +734,20 @@ async fn run_typed_watcher<K, T, C, W>(
                             }
                             WatcherEvent::InitDone => {
                                 backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_start = std::time::Instant::now();
                                 info!("live_query: initial list complete for {}({}), {} items", rt, ns_label, store.len());
                                 let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Apply(obj) => {
                                 backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_start = std::time::Instant::now();
                                 let key = obj_key(&obj);
                                 store.insert(key, convert(obj));
                                 let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Delete(obj) => {
                                 backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_start = std::time::Instant::now();
                                 let key = obj_key(&obj);
                                 store.remove(&key);
                                 let _ = snap_tx.try_send(());

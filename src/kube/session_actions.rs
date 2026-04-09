@@ -3,7 +3,6 @@ use tokio::task::JoinHandle;
 
 use crate::app::{App, InputMode};
 use crate::app::nav::rid;
-use crate::kube::protocol::ObjectRef;
 use crate::event::AppEvent;
 use crate::kube::client_session::ClientSession;
 use crate::kube::session::{ds_try, ActionResult, apply_nav_change};
@@ -20,8 +19,8 @@ use crate::kube::session_nav::{
 };
 use crate::kube::session_handlers::{
     handle_enter, handle_describe, handle_yaml, handle_logs,
-    handle_previous_logs, build_table_dump, resolve_port_forward_target,
-    get_selected_resource_info, get_marked_resource_infos,
+    handle_previous_logs, build_table_dump, resolve_port_forward_dialog,
+    build_scale_form, get_selected_resource_info, get_marked_resource_infos,
 };
 
 pub(crate) fn handle_action(
@@ -30,7 +29,6 @@ pub(crate) fn handle_action(
     event_tx: &mpsc::Sender<AppEvent>,
     data_source: &mut ClientSession,
     log_task: &mut Option<JoinHandle<()>>,
-    port_forward_task: &mut Option<JoinHandle<()>>,
 ) -> ActionResult {
     use crate::app::actions::Action;
     use crate::app::Route;
@@ -98,8 +96,7 @@ pub(crate) fn handle_action(
                 Route::ContainerSelect { ref pod, ref namespace, ref mut selected, .. } => {
                     let container_count = app.data.unified.get(&rid("pods"))
                         .and_then(|t| t.items.iter().find(|p| p.name == *pod && p.namespace == *namespace))
-                        .and_then(|p| p.extra_containers())
-                        .map(|c| c.len())
+                        .map(|p| p.containers.len())
                         .unwrap_or(0);
                     if container_count > 0 && *selected + 1 < container_count {
                         *selected += 1;
@@ -194,7 +191,7 @@ pub(crate) fn handle_action(
             }
         }
         Action::Enter => {
-            let result = handle_enter(app, data_source, log_task, port_forward_task);
+            let result = handle_enter(app, data_source, log_task);
             if !matches!(result, ActionResult::None) {
                 return result;
             }
@@ -203,9 +200,9 @@ pub(crate) fn handle_action(
         Action::Yaml => handle_yaml(app, data_source),
         Action::Logs => handle_logs(app, data_source, log_task),
         Action::Shell => {
-            if app.nav.resource_id().supports_shell() {
+            if app.current_capabilities().supports(crate::kube::protocol::OperationKind::Shell) {
                 if let Some(row) = app.data.unified.get(&rid("pods")).and_then(|t| t.selected_item()) {
-                    let containers = row.extra_containers().unwrap_or(&[]);
+                    let containers = &row.containers;
                     if containers.len() > 1 {
                         // Multi-container pod: show container selector
                         let pod_name = row.name.clone();
@@ -233,21 +230,34 @@ pub(crate) fn handle_action(
             }
         }
         Action::Delete => {
-            let marked = get_marked_resource_infos(app);
-            if !marked.is_empty() {
-                let count = marked.len();
-                let resource = marked[0].resource.display_label().to_string();
-                app.confirm_dialog = Some(crate::app::ConfirmDialog {
-                    message: format!("Delete {} {}s?", count, resource),
-                    pending: crate::app::PendingAction::BatchDelete(marked),
-                    yes_selected: false,
-                });
-            } else if let Some(info) = get_selected_resource_info(app) {
-                app.confirm_dialog = Some(crate::app::ConfirmDialog {
-                    message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
-                    pending: crate::app::PendingAction::Single { action: Action::Delete, target: info },
-                    yes_selected: false,
-                });
+            // Local resources skip the confirm dialog (cheap to recreate).
+            // The wire command (`SessionCommand::Delete`) is the same for
+            // both local and K8s — the server routes by `is_local()`.
+            if app.nav.resource_id().is_local() {
+                if let Some(info) = get_selected_resource_info(app) {
+                    let name = info.name.clone();
+                    ds_try!(app, data_source.delete(&info));
+                    app.flash = Some(crate::app::FlashMessage::info(
+                        format!("Stopped {}", name)
+                    ));
+                }
+            } else {
+                let marked = get_marked_resource_infos(app);
+                if !marked.is_empty() {
+                    let count = marked.len();
+                    let resource = marked[0].resource.display_label().to_string();
+                    app.confirm_dialog = Some(crate::app::ConfirmDialog {
+                        message: format!("Delete {} {}s?", count, resource),
+                        pending: crate::app::PendingAction::BatchDelete(marked),
+                        yes_selected: false,
+                    });
+                } else if let Some(info) = get_selected_resource_info(app) {
+                    app.confirm_dialog = Some(crate::app::ConfirmDialog {
+                        message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
+                        pending: crate::app::PendingAction::Single { action: Action::Delete, target: info },
+                        yes_selected: false,
+                    });
+                }
             }
         }
         Action::Edit => {
@@ -263,9 +273,7 @@ pub(crate) fn handle_action(
         }
         Action::Scale => {
             if let Some(info) = get_selected_resource_info(app) {
-                let msg = format!("Scale {}/{} - enter replica count:", info.resource.display_label(), info.name);
-                app.input_mode = InputMode::Scale { input: String::new(), target: info };
-                app.flash = Some(crate::app::FlashMessage::info(msg));
+                app.form_dialog = Some(build_scale_form(info));
             }
         }
         Action::Filter(_) => {
@@ -365,21 +373,26 @@ pub(crate) fn handle_action(
                 });
             }
         }
+        Action::ShowPortForwards => {
+            // Navigate to the port-forward table as a drill-down so Esc returns
+            // to the previous view. The server streams snapshots via the normal
+            // Subscribe pipeline.
+            let pf_rid = crate::kube::protocol::ResourceId::from_alias("pf")
+                .expect("pf alias should resolve");
+            let sel = app.active_table_selected();
+            app.nav.save_selected(sel);
+            app.route = Route::Resources;
+            let change = app.nav.push(crate::app::nav::NavStep {
+                resource: pf_rid,
+                filter: None,
+                saved_selected: 0,
+                filter_input: crate::app::nav::FilterInputState::default(),
+            });
+            apply_nav_change(app, data_source, change);
+        }
         Action::PortForward => {
-            let pf_target = resolve_port_forward_target(app);
-            if let Some((kubectl_target, namespace, default_ports, ports)) = pf_target {
-                // Split default_ports "local:remote" into two fields.
-                let (local, remote) = default_ports.split_once(':')
-                    .map(|(l, r)| (l.to_string(), r.to_string()))
-                    .unwrap_or((default_ports.clone(), default_ports));
-                app.port_forward_dialog = Some(crate::app::PortForwardDialog {
-                    target: kubectl_target,
-                    namespace,
-                    available_ports: ports,
-                    local_port: local,
-                    container_port: remote,
-                    selected_field: crate::app::PortForwardField::LocalPort,
-                });
+            if let Some(dialog) = resolve_port_forward_dialog(app) {
+                app.form_dialog = Some(dialog);
             } else {
                 app.flash = Some(crate::app::FlashMessage::error(
                     "No target found for port-forward".to_string()
@@ -417,7 +430,7 @@ pub(crate) fn handle_action(
             do_switch_namespace(app, data_source, ns, log_task);
         }
         Action::SwitchContext(ctx) => {
-            begin_context_switch(app, data_source, &ctx, log_task, port_forward_task);
+            begin_context_switch(app, data_source, &ctx, log_task);
         }
         Action::Refresh => {
             data_source.refresh_resource(app.nav.resource_id());
@@ -480,20 +493,22 @@ pub(crate) fn handle_action(
                 app.kubectl_cache.clear();
                 match dialog.pending {
                     crate::app::PendingAction::Single { action: Action::Delete, ref target } => {
-                        ds_try!(app, data_source.delete(target.resource.display_label(), &target.name, target.namespace.display()));
+                        ds_try!(app, data_source.delete(target));
                     }
                     crate::app::PendingAction::Single { action: Action::Restart, ref target } => {
-                        ds_try!(app, data_source.restart(target.resource.display_label(), &target.name, target.namespace.display()));
+                        ds_try!(app, data_source.restart(target));
                     }
                     crate::app::PendingAction::Single { action: Action::ForceKill, ref target } => {
                         let name = target.name.clone();
-                        let namespace = target.namespace.to_string();
+                        // `as_option().map(...)` so `Namespace::All` ends
+                        // up as `None` and we omit the `-n` flag.
+                        let namespace = target.namespace.as_option().map(|s| s.to_string());
                         let context = app.context.clone();
                         let tx = event_tx.clone();
                         tokio::spawn(async move {
                             let mut cmd = tokio::process::Command::new("kubectl");
                             cmd.arg("delete").arg("pod").arg(&name).arg("--force").arg("--grace-period=0");
-                            if !namespace.is_empty() { cmd.arg("-n").arg(&namespace); }
+                            if let Some(ns) = namespace.as_deref() { cmd.arg("-n").arg(ns); }
                             if !context.is_empty() { cmd.arg("--context").arg(&context); }
                             match cmd.output().await {
                                 Ok(o) if o.status.success() => {
@@ -512,13 +527,13 @@ pub(crate) fn handle_action(
                     crate::app::PendingAction::BatchDelete(batch) => {
                         app.clear_marks();
                         for item in &batch {
-                            ds_try!(app, data_source.delete(item.resource.display_label(), &item.name, item.namespace.display()));
+                            ds_try!(app, data_source.delete(item));
                         }
                     }
                     crate::app::PendingAction::BatchRestart(batch) => {
                         app.clear_marks();
                         for item in &batch {
-                            ds_try!(app, data_source.restart(item.resource.display_label(), &item.name, item.namespace.display()));
+                            ds_try!(app, data_source.restart(item));
                         }
                     }
                     crate::app::PendingAction::BatchForceKill(batch) => {
@@ -532,8 +547,13 @@ pub(crate) fn handle_action(
                             for item in &batch {
                                 let mut cmd = tokio::process::Command::new("kubectl");
                                 cmd.arg("delete").arg("pod").arg(&item.name).arg("--force").arg("--grace-period=0");
-                                let ns = item.namespace.display();
-                                if !ns.is_empty() { cmd.arg("-n").arg(ns); }
+                                // Pull the typed Namespace's name out via
+                                // `as_option`, NOT `display()`, so that
+                                // `Namespace::All` becomes "no -n flag" rather
+                                // than the literal string "all".
+                                if let Some(ns) = item.namespace.as_option() {
+                                    cmd.arg("-n").arg(ns);
+                                }
                                 if !context.is_empty() { cmd.arg("--context").arg(&context); }
                                 match cmd.output().await {
                                     Ok(o) if o.status.success() => { ok_count += 1; }
@@ -650,9 +670,9 @@ pub(crate) fn handle_action(
             handle_previous_logs(app, data_source, log_task);
         }
         Action::ShowNode => {
-            if app.nav.resource_id().supports_shell() {
+            if app.current_capabilities().supports(crate::kube::protocol::OperationKind::ShowNode) {
                 if let Some(row) = app.data.unified.get(&rid("pods")).and_then(|t| t.selected_item()) {
-                    let node = row.extra_str("node").unwrap_or("").to_string();
+                    let node = row.node.clone().unwrap_or_default();
                     if !node.is_empty() {
                         let sel = app.data.unified.get(&rid("pods")).map(|t| t.selected).unwrap_or(0);
                         app.nav.save_selected(sel);
@@ -689,28 +709,25 @@ pub(crate) fn handle_action(
                 app.push_route(app.route.clone());
                 let mut state = crate::app::ContentViewState::default();
                 state.set_content(format!("Decoding secret {}/{}...", info.namespace, info.name));
+                ds_try!(app, data_source.decode_secret(&info));
                 app.route = crate::app::Route::Describe {
-                    target: ObjectRef::from_parts("secret", info.name.clone(), info.namespace.clone()),
+                    target: info,
                     awaiting_response: false,
                     state,
                 };
-                ds_try!(app, data_source.decode_secret(&info.name, info.namespace.display()));
             }
         }
         Action::TriggerCronJob => {
             if let Some(info) = get_selected_resource_info(app) {
-                ds_try!(app, data_source.trigger_cronjob(&info.name, info.namespace.display()));
-                app.flash = Some(crate::app::FlashMessage::info(format!("Triggering CronJob: {}", info.name)));
+                let name = info.name.clone();
+                ds_try!(app, data_source.trigger_cronjob(&info));
+                app.flash = Some(crate::app::FlashMessage::info(format!("Triggering CronJob: {}", name)));
             }
         }
         Action::SuspendCronJob => {
             if let Some(info) = get_selected_resource_info(app) {
-                let is_suspended = app.data.unified.get(&rid("cronjobs"))
-                    .and_then(|t| t.selected_item())
-                    .and_then(|row| row.extra_str("suspend"))
-                    .map(|s| s == "true")
-                    .unwrap_or(false);
-                ds_try!(app, data_source.suspend_cronjob(&info.name, info.namespace.display(), !is_suspended));
+                // Server reads current state and toggles — client doesn't need to know.
+                ds_try!(app, data_source.toggle_suspend_cronjob(&info));
             }
         }
         Action::SaveTable => {

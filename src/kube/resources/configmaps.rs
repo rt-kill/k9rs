@@ -22,6 +22,11 @@ pub(crate) fn configmap_to_row(cm: ConfigMap) -> ResourceRow {
         ],
         name,
         namespace: ns,
-        extra: Default::default(),
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: Vec::new(),
+        node: None,
+        crd_info: None,
+        drill_target: None,
     }
 }

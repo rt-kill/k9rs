@@ -15,6 +15,11 @@ pub(crate) fn cluster_role_binding_to_row(crb: ClusterRoleBinding) -> ResourceRo
         cells: vec![name.clone(), role_ref, subjects, crate::util::format_age(age)],
         name,
         namespace: String::new(),
-        extra: Default::default(),
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: Vec::new(),
+        node: None,
+        crd_info: None,
+        drill_target: None,
     }
 }

@@ -24,6 +24,11 @@ pub(crate) fn network_policy_to_row(np: NetworkPolicy) -> ResourceRow {
         cells: vec![ns.clone(), name.clone(), pod_selector, policy_types, crate::util::format_age(age)],
         name,
         namespace: ns,
-        extra: Default::default(),
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: Vec::new(),
+        node: None,
+        crd_info: None,
+        drill_target: None,
     }
 }

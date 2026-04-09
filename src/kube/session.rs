@@ -19,7 +19,7 @@ use crate::kube::session_events::apply_event;
 use crate::kube::session_nav::apply_context_switch_result;
 use crate::kube::session_commands::{
     build_shell_args, build_edit_args, run_interactive_local,
-    handle_command_key, handle_scale_key, handle_filter_key,
+    handle_command_key, handle_form_dialog_key, handle_filter_key,
 };
 
 /// Surface a data_source operation error as a flash message.
@@ -64,21 +64,37 @@ pub(crate) enum ActionResult {
     },
 }
 
+/// Dispatch a single AppEvent. Most events are pure App-state mutations and
+/// go through `apply_event`; `ContextSwitchResult` is the one event that
+/// also needs to talk to `data_source`, so it has its own arm.
+fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: AppEvent) {
+    match event {
+        AppEvent::ContextSwitchResult { context, result } => {
+            apply_context_switch_result(app, data_source, &context, result);
+            app.pod_metrics.clear();
+            app.node_metrics.clear();
+        }
+        other => apply_event(app, other),
+    }
+}
+
 pub(crate) fn apply_nav_change(app: &mut App, data_source: &mut ClientSession, change: crate::app::nav::NavChange) {
     if let Some(ref old) = change.unsubscribe {
         data_source.unsubscribe_resource(old);
-        // Free memory for the old table's row data, but keep the table entry
-        // so re-subscribing shows "Loading..." correctly (has_data stays as-is
-        // until the entry is removed or overwritten by clear_resource).
+        // Free the old table's row data so it doesn't leak across views.
+        // (Earlier code tried to keep these around for "instant Esc back" but
+        // that bled stale rows across namespace switches and drill-down
+        // filter changes — correctness wins; the next snapshot is fast.)
         if let Some(table) = app.data.unified.get_mut(old) {
-            table.items.clear();
-            table.filtered_indices.clear();
+            table.clear_data();
         }
     }
     if let Some(ref new) = change.subscribe {
-        // Clear the target table so the view shows "Loading..." until fresh data arrives.
+        // Always clear the target table so the view shows "Loading..." until
+        // fresh data arrives. `clear_resource` creates the entry if missing
+        // (needed for dynamically-discovered CRDs).
         app.clear_resource(new);
-        data_source.subscribe_resource(new);
+        data_source.subscribe_resource(new, change.subscription_filter.clone());
     }
 }
 
@@ -95,8 +111,6 @@ pub async fn session_main(
 ) -> Result<Option<crate::app::ExitReason>> {
     // Track active log streaming task so we can cancel on Back
     let mut log_task: Option<JoinHandle<()>> = None;
-    // Track active port-forward task so we can cancel it
-    let mut port_forward_task: Option<JoinHandle<()>> = None;
 
     let mut tick_interval = tokio::time::interval(tick_rate);
     let mut last_tick = std::time::Instant::now();
@@ -124,7 +138,10 @@ pub async fn session_main(
                 crate::app::Route::Logs { ref state, .. } | crate::app::Route::Shell { ref state, .. } => state.is_filtering(),
                 _ => false,
             };
-            let in_input_mode = matches!(app.input_mode, InputMode::Command { .. }) || matches!(app.input_mode, InputMode::Scale { .. }) || app.port_forward_dialog.as_ref().map_or(false, |d| d.selected_field.is_text_input())
+            let in_input_mode = matches!(app.input_mode, InputMode::Command { .. })
+                || app.form_dialog.as_ref().map_or(false, |d| {
+                    d.fields.get(d.focused).map_or(false, |f| f.is_text_input())
+                })
                 || app.nav.filter_input().active
                 || route_has_text_input;
             if in_input_mode {
@@ -145,84 +162,13 @@ pub async fn session_main(
                 match ct_event {
                     CtEvent::Key(key) => {
                         // Input mode handlers — each returns true if the key was consumed.
-                        if handle_command_key(&mut app, key, &mut data_source, &mut log_task, &mut port_forward_task, &event_tx) {
+                        if handle_command_key(&mut app, key, &mut data_source, &mut log_task, &event_tx) {
                             needs_redraw = true;
                             continue;
                         }
-                        if handle_scale_key(&mut app, key, &mut data_source) {
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        // Port-forward dialog: capture input
-                        if let Some(ref mut pf_dialog) = app.port_forward_dialog {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    app.port_forward_dialog = None;
-                                }
-                                KeyCode::Tab | KeyCode::Down => {
-                                    pf_dialog.selected_field = pf_dialog.selected_field.next();
-                                }
-                                KeyCode::BackTab | KeyCode::Up => {
-                                    pf_dialog.selected_field = pf_dialog.selected_field.prev();
-                                }
-                                KeyCode::Enter => {
-                                    if pf_dialog.selected_field == crate::app::PortForwardField::Cancel {
-                                        app.port_forward_dialog = None;
-                                    } else {
-                                        let local = pf_dialog.local_port.trim().to_string();
-                                        let remote = pf_dialog.container_port.trim().to_string();
-                                        let kubectl_target = pf_dialog.target.clone();
-                                        let target_ns = pf_dialog.namespace.clone();
-                                        app.port_forward_dialog = None;
-
-                                        if local.parse::<u16>().is_ok() && remote.parse::<u16>().is_ok() {
-                                            let ports_str = format!("{}:{}", local, remote);
-                                            let context = app.context.clone();
-                                            let tx = event_tx.clone();
-                                            let target = kubectl_target.clone();
-                                            if let Some(h) = port_forward_task.take() { h.abort(); }
-                                            port_forward_task = Some(tokio::spawn(async move {
-                                                let mut cmd = tokio::process::Command::new("kubectl");
-                                                cmd.arg("port-forward").arg(&target).arg(&ports_str);
-                                                if !target_ns.is_empty() { cmd.arg("-n").arg(&target_ns); }
-                                                if !context.is_empty() { cmd.arg("--context").arg(&context); }
-                                                match cmd.kill_on_drop(true).spawn() {
-                                                    Ok(mut child) => {
-                                                        match child.wait().await {
-                                                            Ok(_) => { let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(format!("Port-forward ended for {}", target)))).await; }
-                                                            Err(e) => { let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(format!("Port-forward failed: {}", e)))).await; }
-                                                        }
-                                                    }
-                                                    Err(e) => { let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(format!("Port-forward failed: {}", e)))).await; }
-                                                }
-                                            }));
-                                            app.flash = Some(crate::app::FlashMessage::info(
-                                                format!("Port-forwarding {} on {}:{}", kubectl_target, local, remote)
-                                            ));
-                                        } else {
-                                            app.flash = Some(crate::app::FlashMessage::warn(
-                                                "Invalid port numbers".to_string()
-                                            ));
-                                        }
-                                    }
-                                }
-                                KeyCode::Backspace => {
-                                    match pf_dialog.selected_field {
-                                        crate::app::PortForwardField::LocalPort => { pf_dialog.local_port.pop(); }
-                                        crate::app::PortForwardField::ContainerPort => { pf_dialog.container_port.pop(); }
-                                        _ => {}
-                                    }
-                                }
-                                KeyCode::Char(c) if c.is_ascii_digit() => {
-                                    match pf_dialog.selected_field {
-                                        crate::app::PortForwardField::LocalPort => { pf_dialog.local_port.push(c); }
-                                        crate::app::PortForwardField::ContainerPort => { pf_dialog.container_port.push(c); }
-                                        _ => {}
-                                    }
-                                }
-                                _ => {}
-                            }
+                        // Generic form dialog (Scale, PortForward, …) — one
+                        // handler for every operation that needs user input.
+                        if handle_form_dialog_key(&mut app, key, &mut data_source) {
                             needs_redraw = true;
                             continue;
                         }
@@ -319,7 +265,6 @@ pub async fn session_main(
                                 &event_tx,
                                 &mut data_source,
                                 &mut log_task,
-                                &mut port_forward_task,
                             );
                             match result {
                                 ActionResult::Shell { pod, namespace, container, context } => {
@@ -356,32 +301,14 @@ pub async fn session_main(
                 }
             }
             Some(event) = event_rx.recv() => {
-                if let AppEvent::ContextSwitchResult { context, result } = event {
-                    apply_context_switch_result(
-                        &mut app, &mut data_source,
-                        &context, result,
-                    );
-                    app.pod_metrics.clear();
-                    app.node_metrics.clear();
-                } else {
-                    apply_event(&mut app, event);
-                }
+                dispatch_app_event(&mut app, &mut data_source, event);
                 // Drain pending events before redrawing to batch log lines,
                 // but cap at EVENT_DRAIN_CAP to prevent UI freezes during massive bursts.
                 let mut drained = 0;
                 while drained < EVENT_DRAIN_CAP {
                     match event_rx.try_recv() {
                         Ok(event) => {
-                            if let AppEvent::ContextSwitchResult { context, result } = event {
-                                apply_context_switch_result(
-                                    &mut app, &mut data_source,
-                                    &context, result,
-                                );
-                                app.pod_metrics.clear();
-                                app.node_metrics.clear();
-                            } else {
-                                apply_event(&mut app, event);
-                            }
+                            dispatch_app_event(&mut app, &mut data_source, event);
                             drained += 1;
                         }
                         Err(_) => break,
@@ -413,9 +340,6 @@ pub async fn session_main(
 
     // Cleanup
     if let Some(handle) = log_task.take() {
-        handle.abort();
-    }
-    if let Some(handle) = port_forward_task.take() {
         handle.abort();
     }
     disable_raw_mode()?;

@@ -26,6 +26,11 @@ pub(crate) fn pvc_to_row(pvc: PersistentVolumeClaim) -> ResourceRow {
         cells: vec![ns.clone(), name.clone(), status, volume, capacity, access_modes, storage_class, crate::util::format_age(age)],
         name,
         namespace: ns,
-        extra: Default::default(),
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: Vec::new(),
+        node: None,
+        crd_info: None,
+        drill_target: None,
     }
 }

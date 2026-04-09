@@ -2,12 +2,15 @@
 //! and mutating operations (delete, scale, restart, secret decode,
 //! CronJob trigger/suspend).
 
+use std::sync::Arc;
+
 use tracing::{info, warn};
 
 use crate::kube::live_query::QueryKey;
 use crate::kube::protocol::{self, SessionEvent};
 use crate::kube::table;
 
+use crate::kube::capabilities;
 use super::{InitParams, PendingClientResult, ServerSession};
 
 impl ServerSession {
@@ -15,7 +18,14 @@ impl ServerSession {
     // Subscribe / Unsubscribe
     // -----------------------------------------------------------------------
 
-    pub(super) fn handle_subscribe_resource(&mut self, id: &protocol::ResourceId, force: bool) {
+    pub(super) fn handle_subscribe_resource(&mut self, id: &protocol::ResourceId, force: bool, _filter: Option<protocol::SubscriptionFilter>) {
+        // Local (daemon-owned) resources go through a separate path — no
+        // watcher cache, no filter negotiation, no column discovery.
+        if id.is_local() {
+            self.handle_subscribe_local_resource(id, force);
+            return;
+        }
+
         if !force {
             if let Some((_sub, bridge)) = self.subscriptions.get(id) {
                 if bridge.is_finished() {
@@ -31,7 +41,12 @@ impl ServerSession {
             }
         }
 
-        let is_builtin = protocol::ResourceId::from_alias(&id.plural).is_some();
+        // `from_alias` will now also match local aliases (e.g. "pf"). Guard
+        // against that: if the alias resolves to a local rid, it's not a
+        // built-in K8s type from the perspective of column discovery.
+        let is_builtin = protocol::ResourceId::from_alias(&id.plural)
+            .map(|rid| !rid.is_local())
+            .unwrap_or(false);
 
         let effective_ns = if id.scope == protocol::ResourceScope::Cluster {
             protocol::Namespace::All
@@ -42,9 +57,10 @@ impl ServerSession {
             context: self.context.clone(),
             namespace: effective_ns,
             resource: id.clone(),
+            filter: _filter.clone(),
         };
-        info!("handle_subscribe_resource: key=({}, {}, {}), server_url={}",
-            self.context.name, self.namespace, key.resource, self.context.server_url);
+        info!("handle_subscribe_resource: key=({}, {}, {}, filter={:?}), server_url={}",
+            self.context.name, self.namespace, key.resource, key.filter, self.context.server_url);
 
         let watcher_client = self.watcher_client();
 
@@ -78,8 +94,10 @@ impl ServerSession {
             } else {
                 self.shared.watcher_cache.subscribe(key, &watcher_client, server_headers)
             };
-            let bridge = self.spawn_bridge(sub.clone(), id.plural.clone(), id.clone());
+            let bridge = self.spawn_bridge(sub.clone(), id.plural.clone(), id.clone(), _filter.clone());
             self.subscriptions.insert(id.clone(), (sub, bridge));
+            // Emit capabilities so the TUI knows which operations this resource supports.
+            self.emit_capabilities(id);
         } else {
             // CRD: discovery may require HTTP calls — spawn as background task.
             // Track in pending_discovery so we can discard if unsubscribed before completion.
@@ -154,7 +172,117 @@ impl ServerSession {
         }
     }
 
+    /// Build and send a `ResourceCapabilities` event for the given resource.
+    /// Uses `ResourceTypeMeta` as the source of truth for built-in types;
+    /// CRDs get the always-on operations only. Local resources emit their
+    /// capabilities directly from their `LocalResourceSource` impl via
+    /// `handle_subscribe_local_resource`, so this is a no-op for them.
+    pub(super) fn emit_capabilities(&self, id: &protocol::ResourceId) {
+        if id.is_local() {
+            return;
+        }
+        let caps = capabilities::for_k8s(&id.plural);
+        let tx = self.event_tx.clone();
+        let resource = id.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(SessionEvent::ResourceCapabilities { resource, capabilities: caps }).await;
+        });
+    }
+
+    /// Subscribe to a local (daemon-owned) resource. Bypasses the watcher
+    /// cache entirely — local sources are always alive and shared across
+    /// sessions. Each session gets its own bridge task that forwards the
+    /// source's snapshot stream to the client.
+    pub(super) fn handle_subscribe_local_resource(
+        &mut self,
+        id: &protocol::ResourceId,
+        force: bool,
+    ) {
+        // Reuse existing bridge if present.
+        if !force {
+            if let Some(handle) = self.local_subscriptions.get(id) {
+                if !handle.is_finished() {
+                    return;
+                }
+            }
+        }
+        if let Some(old) = self.local_subscriptions.remove(id) {
+            old.abort();
+        }
+
+        let Some(source) = self.shared.local_registry.get(&self.context.name, id) else {
+            let tx = self.event_tx.clone();
+            let resource = id.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(SessionEvent::SubscriptionError {
+                    resource,
+                    message: "Unknown local resource".into(),
+                }).await;
+            });
+            return;
+        };
+
+        // Hand the bridge a strong `Arc` keepalive via `LocalSubscription`.
+        // The subscription's `Drop` impl spawns a grace-period task that
+        // holds the source for a few minutes, so a quick context-switch
+        // away and back reuses the same source.
+        let snapshot_rx = source.subscribe();
+        let sub = crate::kube::local::LocalSubscription::new(
+            id.clone(),
+            snapshot_rx,
+            Arc::clone(&source),
+        );
+        let tx = self.event_tx.clone();
+        let rt = id.plural.clone();
+        let bridge = tokio::spawn(async move {
+            super::bridge_local_subscription_to_events(sub, rt, tx).await;
+        });
+        self.local_subscriptions.insert(id.clone(), bridge);
+
+        // Emit the source's declared capabilities so the TUI knows which
+        // operations this resource supports.
+        let caps = source.capabilities();
+        let tx = self.event_tx.clone();
+        let resource = id.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(SessionEvent::ResourceCapabilities { resource, capabilities: caps }).await;
+        });
+    }
+
+    /// Delete a logical entry on a local resource. Looks up the source by
+    /// resource id, dispatches to its `delete` method, and emits a
+    /// `CommandResult`. No readonly check — local resources are per-daemon
+    /// state, not cluster state, and readonly applies to K8s mutations.
+    pub(super) fn handle_delete_local(&self, obj: &protocol::ObjectRef) {
+        let tx = self.event_tx.clone();
+        let Some(source) = self.shared.local_registry.get(&self.context.name, &obj.resource) else {
+            tokio::spawn(async move {
+                let _ = tx.send(SessionEvent::CommandResult {
+                    ok: false,
+                    message: "Unknown local resource".into(),
+                }).await;
+            });
+            return;
+        };
+        let result = source.delete(&obj.name);
+        let name = obj.name.clone();
+        tokio::spawn(async move {
+            let event = match result {
+                Ok(()) => SessionEvent::CommandResult { ok: true, message: format!("Stopped {name}") },
+                Err(e) => SessionEvent::CommandResult { ok: false, message: e },
+            };
+            let _ = tx.send(event).await;
+        });
+    }
+
     pub(super) fn handle_unsubscribe(&mut self, id: &protocol::ResourceId) {
+        // Local unsubscribe: drop the bridge, source stays alive.
+        if id.is_local() {
+            if let Some(handle) = self.local_subscriptions.remove(id) {
+                handle.abort();
+            }
+            return;
+        }
         // Cancel pending CRD discovery — if the task completes after this,
         // the main loop will discard it because the ID is no longer in pending_discovery.
         self.pending_discovery.remove(id);
@@ -163,6 +291,8 @@ impl ServerSession {
         }
         // Also clean up the watcher cache entry so the watcher's grace period
         // starts immediately rather than being kept alive by a stale Weak ref.
+        // Remove both filtered and unfiltered cache entries for this resource.
+        // TODO: if we track filters per subscription, remove the specific one.
         let key = QueryKey {
             context: self.context.clone(),
             namespace: if id.scope == protocol::ResourceScope::Cluster {
@@ -171,6 +301,7 @@ impl ServerSession {
                 self.namespace.clone()
             },
             resource: id.clone(),
+            filter: None,
         };
         self.shared.watcher_cache.remove(&key);
     }
@@ -196,7 +327,7 @@ impl ServerSession {
         }
         // Re-subscribe namespaced resources with the new namespace.
         for id in namespaced_ids {
-            self.handle_subscribe_resource(&id, false);
+            self.handle_subscribe_resource(&id, false, None);
         }
     }
 
@@ -236,9 +367,10 @@ impl ServerSession {
                 context: self.context.clone(),
                 namespace: self.namespace.clone(),
                 resource: id.clone(),
+                filter: None,
             };
             if let Some(sub) = self.shared.watcher_cache.try_get(&key) {
-                let bridge = self.spawn_bridge(sub.clone(), id.plural.clone(), id.clone());
+                let bridge = self.spawn_bridge(sub.clone(), id.plural.clone(), id.clone(), None);
                 self.subscriptions.insert(id.clone(), (sub, bridge));
             } else {
                 cache_misses.push(id.clone());
@@ -297,7 +429,7 @@ impl ServerSession {
                             self.client = new_client;
                             self.client_config = Some(new_config);
                             for id in pending.cache_misses {
-                                self.handle_subscribe_resource(&id, false);
+                                self.handle_subscribe_resource(&id, false, None);
                             }
                             if let Some(h) = self.metrics_task.take() { h.abort(); }
                             self.spawn_metrics_poller();
@@ -334,26 +466,31 @@ impl ServerSession {
     // Describe / YAML
     // -----------------------------------------------------------------------
 
-    pub(super) fn handle_describe_async(&self, resource_type: &str, name: &str, namespace: &str) {
+    pub(super) fn handle_describe_async(&self, target: &protocol::ObjectRef) {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let context = self.context.name.clone();
-        let rt = resource_type.to_string();
-        let n = name.to_string();
-        let ns = namespace.to_string();
+        let rt = target.resource.plural.clone();
+        let n = target.name.clone();
+        // `Namespace::All` (the cross-namespace TUI view) means "no -n flag";
+        // pass the empty string to the downstream kubectl/native helper, which
+        // interprets that as "default namespace for namespaced resources" or
+        // "cluster-scoped — ignore the field". Avoids the historical bug
+        // where `namespace.display()` returned the literal string "all".
+        let ns = ns_for_kubectl(&target.namespace);
         tokio::spawn(async move {
             let content = crate::kube::describe::fetch_describe_native(&client, &rt, &n, &ns, &context).await;
             let _ = tx.send(SessionEvent::DescribeResult(content)).await;
         });
     }
 
-    pub(super) fn handle_yaml_async(&self, resource_type: &str, name: &str, namespace: &str) {
+    pub(super) fn handle_yaml_async(&self, target: &protocol::ObjectRef) {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let context = self.context.name.clone();
-        let rt = resource_type.to_string();
-        let n = name.to_string();
-        let ns = namespace.to_string();
+        let rt = target.resource.plural.clone();
+        let n = target.name.clone();
+        let ns = ns_for_kubectl(&target.namespace);
         tokio::spawn(async move {
             let content = crate::kube::describe::fetch_yaml_native(&client, &rt, &n, &ns, &context).await;
             let _ = tx.send(SessionEvent::YamlResult(content)).await;
@@ -376,15 +513,15 @@ impl ServerSession {
         true
     }
 
-    pub(super) fn handle_delete_async(&self, resource_type: &str, name: &str, namespace: &str) {
+    pub(super) fn handle_delete_async(&self, target: &protocol::ObjectRef) {
         if self.reject_if_readonly() { return; }
 
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let context = self.context.name.clone();
-        let rt = resource_type.to_string();
-        let n = name.to_string();
-        let ns = namespace.to_string();
+        let rt = target.resource.plural.clone();
+        let n = target.name.clone();
+        let ns = ns_for_kubectl(&target.namespace);
         tokio::spawn(async move {
             let result = crate::kube::ops::execute_delete(&client, &rt, &n, &ns, &context).await;
             let event = match result {
@@ -401,14 +538,14 @@ impl ServerSession {
         });
     }
 
-    pub(super) fn handle_scale_async(&self, resource_type: &str, name: &str, namespace: &str, replicas: u32) {
+    pub(super) fn handle_scale_async(&self, target: &protocol::ObjectRef, replicas: u32) {
         if self.reject_if_readonly() { return; }
 
         let client = self.client.clone();
         let tx = self.event_tx.clone();
-        let rt = resource_type.to_string();
-        let n = name.to_string();
-        let ns = namespace.to_string();
+        let rt = target.resource.plural.clone();
+        let n = target.name.clone();
+        let ns = ns_for_kubectl(&target.namespace);
         tokio::spawn(async move {
             let result = async {
                 use ::kube::api::{Api, DynamicObject, Patch, PatchParams};
@@ -448,14 +585,14 @@ impl ServerSession {
         });
     }
 
-    pub(super) fn handle_restart_async(&self, resource_type: &str, name: &str, namespace: &str) {
+    pub(super) fn handle_restart_async(&self, target: &protocol::ObjectRef) {
         if self.reject_if_readonly() { return; }
 
         let client = self.client.clone();
         let tx = self.event_tx.clone();
-        let rt = resource_type.to_string();
-        let n = name.to_string();
-        let ns = namespace.to_string();
+        let rt = target.resource.plural.clone();
+        let n = target.name.clone();
+        let ns = ns_for_kubectl(&target.namespace);
         tokio::spawn(async move {
             let result = crate::kube::ops::restart_via_patch(&client, &rt, &n, &ns).await;
             let event = match result {
@@ -476,11 +613,11 @@ impl ServerSession {
     // Secret decode
     // -----------------------------------------------------------------------
 
-    pub(super) fn handle_decode_secret_async(&self, name: &str, namespace: &str) {
+    pub(super) fn handle_decode_secret_async(&self, target: &protocol::ObjectRef) {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
-        let n = name.to_string();
-        let ns = namespace.to_string();
+        let n = target.name.clone();
+        let ns = ns_for_kubectl(&target.namespace);
         tokio::spawn(async move {
             use k8s_openapi::api::core::v1::Secret;
             let api: kube::Api<Secret> = if ns.is_empty() {
@@ -520,11 +657,11 @@ impl ServerSession {
     // CronJob trigger / suspend
     // -----------------------------------------------------------------------
 
-    pub(super) fn handle_trigger_cronjob_async(&self, name: &str, namespace: &str) {
+    pub(super) fn handle_trigger_cronjob_async(&self, target: &protocol::ObjectRef) {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
-        let n = name.to_string();
-        let ns = namespace.to_string();
+        let n = target.name.clone();
+        let ns = ns_for_kubectl(&target.namespace);
         tokio::spawn(async move {
             use k8s_openapi::api::batch::v1::{CronJob, Job};
             let cj_api: kube::Api<CronJob> = kube::Api::namespaced(client.clone(), &ns);
@@ -568,20 +705,34 @@ impl ServerSession {
         });
     }
 
-    pub(super) fn handle_suspend_cronjob_async(&self, name: &str, namespace: &str, suspend: bool) {
+    /// Toggle the suspend state of a CronJob. The server reads the current
+    /// state from K8s and flips it.
+    pub(super) fn handle_toggle_suspend_cronjob_async(&self, target: &protocol::ObjectRef) {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
-        let n = name.to_string();
-        let ns = namespace.to_string();
+        let n = target.name.clone();
+        let ns = ns_for_kubectl(&target.namespace);
         tokio::spawn(async move {
             use k8s_openapi::api::batch::v1::CronJob;
             let api: kube::Api<CronJob> = kube::Api::namespaced(client, &ns);
+            // Read current state.
+            let current = match api.get(&n).await {
+                Ok(cj) => cj.spec.and_then(|s| s.suspend).unwrap_or(false),
+                Err(e) => {
+                    let _ = tx.send(SessionEvent::CommandResult {
+                        ok: false,
+                        message: format!("Failed to read CronJob: {}", e),
+                    }).await;
+                    return;
+                }
+            };
+            let new_state = !current;
             let patch = crate::kube::ops::SuspendPatch {
-                spec: crate::kube::ops::SuspendPatchSpec { suspend },
+                spec: crate::kube::ops::SuspendPatchSpec { suspend: new_state },
             };
             match api.patch(&n, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&patch)).await {
                 Ok(_) => {
-                    let action = if suspend { "Suspended" } else { "Resumed" };
+                    let action = if new_state { "Suspended" } else { "Resumed" };
                     let _ = tx.send(SessionEvent::CommandResult {
                         ok: true,
                         message: format!("{} CronJob: {}", action, n),
@@ -596,4 +747,66 @@ impl ServerSession {
             }
         });
     }
+
+    // -----------------------------------------------------------------------
+    // Port-forwarding
+    // -----------------------------------------------------------------------
+
+    /// Create a new port-forward by delegating to the shared
+    /// `PortForwardSource`. State transitions and row snapshots flow through
+    /// the source's `watch::Sender` — any TUI session subscribed to the
+    /// port-forwards table sees them automatically via the normal
+    /// Subscribe/Snapshot pipeline.
+    pub(super) fn handle_port_forward(
+        &mut self,
+        target: &crate::kube::protocol::ObjectRef,
+        local_port: u16,
+        container_port: u16,
+    ) {
+        let kubectl_target = resolve_kubectl_pf_target(target);
+        let namespace = target.namespace.display().to_string();
+
+        // Get-or-create the per-context PortForwardSource. This may be the
+        // very first PF on this context (constructs a fresh source) or
+        // reuse one a sibling session is already keeping alive.
+        let source = self.shared.local_registry.port_forwards_for(&self.context.name);
+        let _pf_id = source.create(
+            crate::kube::local::port_forward::PortForwardRequest {
+                target: target.clone(),
+                kubectl_target,
+                namespace,
+                local_port,
+                remote_port: container_port,
+            },
+        );
+    }
 }
+
+/// Map a typed `Namespace` to the string the downstream kubectl/native
+/// helpers expect: empty string for `All` (the helpers interpret this as
+/// "no -n flag" / "default namespace" / "cluster-scoped, ignore"), and
+/// the named namespace otherwise. Replaces the historical
+/// `namespace.display()` round-trip which leaked the literal string `"all"`
+/// down into the kubectl call path.
+fn ns_for_kubectl(ns: &crate::kube::protocol::Namespace) -> String {
+    match ns.as_option() {
+        Some(name) => name.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Resolve an ObjectRef to a kubectl port-forward target string.
+/// Maps resource types to their kubectl shorthand (e.g., "pod/name", "svc/name").
+fn resolve_kubectl_pf_target(target: &crate::kube::protocol::ObjectRef) -> String {
+    let prefix = match target.resource.plural.as_str() {
+        "services" => "svc",
+        "deployments" => "deploy",
+        "statefulsets" => "sts",
+        "pods" => "pod",
+        "daemonsets" => "ds",
+        "replicasets" => "rs",
+        _ => &target.resource.plural,
+    };
+    format!("{}/{}", prefix, target.name)
+}
+

@@ -1,8 +1,7 @@
-use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::ReplicaSet;
 
-use crate::kube::resources::row::{ExtraValue, ResourceRow};
+use crate::kube::resources::row::{DrillTarget, ResourceRow};
 
 /// Convert a k8s ReplicaSet into a generic ResourceRow.
 pub(crate) fn replicaset_to_row(rs: ReplicaSet) -> ResourceRow {
@@ -14,17 +13,20 @@ pub(crate) fn replicaset_to_row(rs: ReplicaSet) -> ResourceRow {
     let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
     let age = metadata.creation_timestamp.map(|t| t.0);
 
-    let selector_labels = rs.spec.as_ref()
-        .and_then(|s| s.selector.match_labels.clone())
-        .unwrap_or_default();
     let desired = rs.spec.and_then(|s| s.replicas).unwrap_or(0);
     let status = rs.status.unwrap_or_default();
     let current = status.replicas;
     let ready = status.ready_replicas.unwrap_or(0);
 
-    let mut extra = BTreeMap::new();
-    extra.insert("selector_labels".into(), ExtraValue::Map(selector_labels));
-    extra.insert("uid".into(), ExtraValue::Str(uid));
+    let drill_target = if !uid.is_empty() {
+        Some(DrillTarget::PodsByOwner {
+            uid,
+            kind: "ReplicaSet".to_string(),
+            name: name.clone(),
+        })
+    } else {
+        Some(DrillTarget::PodsByNameGrep(name.clone()))
+    };
 
     ResourceRow {
         cells: vec![
@@ -33,6 +35,11 @@ pub(crate) fn replicaset_to_row(rs: ReplicaSet) -> ResourceRow {
         ],
         name,
         namespace: ns,
-        extra,
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: Vec::new(),
+        node: None,
+        crd_info: None,
+        drill_target,
     }
 }

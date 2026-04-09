@@ -7,7 +7,7 @@ use ratatui::{
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{ConfirmDialog, PortForwardDialog};
+use crate::app::{ConfirmDialog, FormDialog, FormFieldKind, FormFieldState};
 use crate::ui::theme::Theme;
 
 /// Confirmation dialog widget — a centered modal overlay with Yes/No buttons.
@@ -115,30 +115,55 @@ impl Widget for ConfirmDialogWidget<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Port-forward dialog
+// Form dialog
 // ---------------------------------------------------------------------------
+//
+// Generic schema-driven dialog widget. Renders any `FormDialog` regardless
+// of which `OperationKind` it's gathering input for. Each field shows up as
+// a labeled input control whose shape comes from `FormFieldKind`:
+//   - Text  → free-form line edit with a block cursor
+//   - Number → digit-only line edit
+//   - Port   → digit-only line edit (1..=65535 enforced on submit)
+//   - Select → cycling picker with `< value >` and a hint about Left/Right
+//
+// Below the fields the widget draws an OK button (focusable as the last
+// position) and a hint bar with Tab/Enter/Esc bindings. There is no Cancel
+// button — Esc cancels.
 
-pub struct PortForwardDialogWidget<'a> {
-    dialog: &'a PortForwardDialog,
+pub struct FormDialogWidget<'a> {
+    dialog: &'a FormDialog,
     theme: &'a Theme,
 }
 
-impl<'a> PortForwardDialogWidget<'a> {
-    pub fn new(dialog: &'a PortForwardDialog, theme: &'a Theme) -> Self {
+impl<'a> FormDialogWidget<'a> {
+    pub fn new(dialog: &'a FormDialog, theme: &'a Theme) -> Self {
         Self { dialog, theme }
     }
 }
 
-impl Widget for PortForwardDialogWidget<'_> {
+impl Widget for FormDialogWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let dialog_width = 50u16.min(area.width.saturating_sub(4));
-        let dialog_height = 13u16.min(area.height.saturating_sub(2));
+        // Sizing: width fits the longest label + value, height fits subtitle
+        // (1) + blank (1) + each field (1) + blank (1) + button (1) + blank (1)
+        // + hint (1) + borders (2). Clamp to the available area.
+        let label_w = self
+            .dialog
+            .fields
+            .iter()
+            .map(|f| f.label.width() as u16)
+            .max()
+            .unwrap_or(0);
+        let dialog_width = (label_w + 30).max(50).min(area.width.saturating_sub(4));
+        let n_fields = self.dialog.fields.len() as u16;
+        // subtitle + blank + n fields + blank + button + blank + hint + borders
+        let dialog_height = (n_fields + 8).min(area.height.saturating_sub(2));
 
         let dialog_area = ConfirmDialogWidget::centered_rect(area, dialog_width, dialog_height);
         Clear.render(dialog_area, buf);
 
+        let title = format!(" {} ", self.dialog.title);
         let block = Block::bordered()
-            .title(" Port Forward ")
+            .title(title)
             .title_style(self.theme.title)
             .border_style(self.theme.dialog_border)
             .style(self.theme.dialog_bg)
@@ -146,73 +171,117 @@ impl Widget for PortForwardDialogWidget<'_> {
 
         let inner = block.inner(dialog_area);
         block.render(dialog_area, buf);
-        if inner.height == 0 || inner.width == 0 { return; }
 
-        use crate::app::PortForwardField;
-        let sel = self.dialog.selected_field;
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
         let mut y = inner.y;
 
-        // Target
-        buf.set_line(inner.x, y, &Line::from(vec![
-            Span::styled("Target:    ", self.theme.info_label),
-            Span::styled(&self.dialog.target, self.theme.info_value),
-        ]), inner.width);
-        y += 1;
-
-        // Available ports
-        if !self.dialog.available_ports.is_empty() {
-            let ps: Vec<String> = self.dialog.available_ports.iter().map(|p| p.to_string()).collect();
-            buf.set_line(inner.x, y, &Line::from(vec![
-                Span::styled("Ports:     ", self.theme.info_label),
-                Span::styled(ps.join(", "), self.theme.info_value),
-            ]), inner.width);
+        // Subtitle (e.g. "namespace: default") — optional, skipped if empty.
+        if !self.dialog.subtitle.is_empty() && y < inner.y + inner.height {
+            let line = Line::from(Span::styled(
+                self.dialog.subtitle.as_str(),
+                self.theme.info_label,
+            ));
+            buf.set_line(inner.x, y, &line, inner.width);
+            y = y.saturating_add(2); // subtitle + blank
         }
-        y += 2;
 
-        // Local port field
-        let local_style = if sel == PortForwardField::LocalPort { self.theme.filter } else { self.theme.info_value };
-        buf.set_line(inner.x, y, &Line::from(vec![
-            Span::styled("Local:     ", self.theme.info_label),
-            Span::styled(&self.dialog.local_port, local_style),
-            if sel == PortForwardField::LocalPort { Span::styled("\u{2588}", self.theme.filter) } else { Span::raw("") },
-        ]), inner.width);
-        y += 1;
+        // Render each field. Label is left-aligned to a fixed column so the
+        // values line up across rows.
+        let label_col = label_w + 2;
+        for (idx, field) in self.dialog.fields.iter().enumerate() {
+            if y >= inner.y + inner.height {
+                break;
+            }
+            let focused = self.dialog.focused == idx;
+            self.render_field(buf, inner.x, y, inner.width, label_col, field, focused);
+            y = y.saturating_add(1);
+        }
 
-        // Container port field
-        let remote_style = if sel == PortForwardField::ContainerPort { self.theme.filter } else { self.theme.info_value };
-        buf.set_line(inner.x, y, &Line::from(vec![
-            Span::styled("Container: ", self.theme.info_label),
-            Span::styled(&self.dialog.container_port, remote_style),
-            if sel == PortForwardField::ContainerPort { Span::styled("\u{2588}", self.theme.filter) } else { Span::raw("") },
-        ]), inner.width);
-        y += 2;
+        // Blank row before the button.
+        y = y.saturating_add(1);
 
-        // Buttons
+        // OK button.
         if y < inner.y + inner.height {
-            let ok_text = " OK ";
-            let cancel_text = " Cancel ";
-            let gap = 4u16;
-            let total = ok_text.len() as u16 + cancel_text.len() as u16 + gap;
-            let bx = inner.x + inner.width.saturating_sub(total) / 2;
-
-            let ok_style = if sel == PortForwardField::Ok { self.theme.dialog_button_active } else { self.theme.dialog_button_inactive };
-            let cancel_style = if sel == PortForwardField::Cancel { self.theme.dialog_button_active } else { self.theme.dialog_button_inactive };
-
+            let ok_text = "  OK  ";
+            let bx = inner.x + inner.width.saturating_sub(ok_text.len() as u16) / 2;
+            let ok_style = if self.dialog.ok_focused() {
+                self.theme.dialog_button_active
+            } else {
+                self.theme.dialog_button_inactive
+            };
             buf.set_string(bx, y, ok_text, ok_style);
-            buf.set_string(bx + ok_text.len() as u16 + gap, y, cancel_text, cancel_style);
+            y = y.saturating_add(2);
         }
 
-        // Hint
-        if y + 1 < inner.y + inner.height {
+        // Hint line at the bottom.
+        let hint_y = inner.y + inner.height.saturating_sub(1);
+        if hint_y >= y || hint_y == y.saturating_sub(1) {
             let hint = Line::from(vec![
                 Span::styled("<Tab>", self.theme.status_bar_key),
                 Span::styled(" next  ", self.theme.help_desc),
+                Span::styled("<\u{2190}/\u{2192}>", self.theme.status_bar_key),
+                Span::styled(" select  ", self.theme.help_desc),
                 Span::styled("<Enter>", self.theme.status_bar_key),
-                Span::styled(" confirm  ", self.theme.help_desc),
+                Span::styled(" submit  ", self.theme.help_desc),
                 Span::styled("<Esc>", self.theme.status_bar_key),
                 Span::styled(" cancel", self.theme.help_desc),
             ]);
-            buf.set_line(inner.x, y + 1, &hint, inner.width);
+            buf.set_line(inner.x, hint_y, &hint, inner.width);
+        }
+    }
+}
+
+impl FormDialogWidget<'_> {
+    /// Render a single field row: label + input control. The input control
+    /// dispatches on `FormFieldKind` so each field type has its own visual.
+    fn render_field(
+        &self,
+        buf: &mut Buffer,
+        x: u16,
+        y: u16,
+        width: u16,
+        label_col: u16,
+        field: &FormFieldState,
+        focused: bool,
+    ) {
+        // Label column.
+        let label_line = Line::from(Span::styled(field.label.as_str(), self.theme.info_label));
+        buf.set_line(x, y, &label_line, width);
+
+        // Value column.
+        let vx = x + label_col;
+        let vw = width.saturating_sub(label_col);
+        if vw == 0 {
+            return;
+        }
+
+        match &field.kind {
+            FormFieldKind::Text { .. } | FormFieldKind::Number { .. } | FormFieldKind::Port => {
+                let style = if focused { self.theme.filter } else { self.theme.info_value };
+                let mut spans = vec![Span::styled(field.value.as_str(), style)];
+                if focused {
+                    spans.push(Span::styled("\u{2588}", self.theme.filter));
+                }
+                buf.set_line(vx, y, &Line::from(spans), vw);
+            }
+            FormFieldKind::Select { options } => {
+                let idx: usize = field.value.parse().unwrap_or(0);
+                let display = options
+                    .get(idx)
+                    .map(|(_, label)| label.as_str())
+                    .unwrap_or("(none)");
+                let style = if focused { self.theme.filter } else { self.theme.info_value };
+                let arrows = if focused { (" ◀ ", " ▶") } else { ("   ", "  ") };
+                let spans = vec![
+                    Span::styled(arrows.0, self.theme.info_label),
+                    Span::styled(display, style),
+                    Span::styled(arrows.1, self.theme.info_label),
+                ];
+                buf.set_line(vx, y, &Line::from(spans), vw);
+            }
         }
     }
 }

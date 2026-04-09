@@ -1,8 +1,7 @@
-use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::Deployment;
 
-use crate::kube::resources::row::{ExtraValue, ResourceRow};
+use crate::kube::resources::row::{DrillTarget, ResourceRow};
 
 /// Convert a k8s Deployment into a generic ResourceRow.
 pub(crate) fn deployment_to_row(dep: Deployment) -> ResourceRow {
@@ -25,7 +24,7 @@ pub(crate) fn deployment_to_row(dep: Deployment) -> ResourceRow {
             .collect())
         .unwrap_or_default();
 
-    let containers = spec.template.spec.as_ref()
+    let container_names = spec.template.spec.as_ref()
         .map(|ps| ps.containers.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(","))
         .unwrap_or_default();
     let images = spec.template.spec.as_ref()
@@ -35,28 +34,39 @@ pub(crate) fn deployment_to_row(dep: Deployment) -> ResourceRow {
     let desired = spec.replicas.unwrap_or(0);
 
     let status = dep.status.unwrap_or_default();
-    let ready_replicas = status.ready_replicas.unwrap_or(0);
     let up_to_date = status.updated_replicas.unwrap_or(0);
     let available = status.available_replicas.unwrap_or(0);
 
-    let ready = format!("{}/{}", ready_replicas, desired);
+    // READY uses available (ready for minReadySeconds), matching kubectl.
+    let ready = format!("{}/{}", available, desired);
 
-    let mut extra = BTreeMap::new();
-    extra.insert("selector_labels".into(), ExtraValue::Map(selector_labels));
-    extra.insert("uid".into(), ExtraValue::Str(uid));
-    extra.insert("container_ports".into(), ExtraValue::Ports(container_ports));
-    extra.insert("available".into(), ExtraValue::Str(available.to_string()));
+    let _ = uid; // uid no longer used on the client; server handles owner filtering
+
+    // Drill-down: deployment → pods by selector labels.
+    let drill_target = if !selector_labels.is_empty() {
+        Some(DrillTarget::PodsByLabels {
+            labels: selector_labels,
+            breadcrumb: format!("deploy/{}", name),
+        })
+    } else {
+        Some(DrillTarget::PodsByNameGrep(name.clone()))
+    };
 
     ResourceRow {
         cells: vec![
             ns.clone(), name.clone(), ready,
             up_to_date.to_string(), available.to_string(),
-            containers, images,
+            container_names, images,
             labels_str,
             crate::util::format_age(age),
         ],
         name,
         namespace: ns,
-        extra,
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: container_ports,
+        node: None,
+        crd_info: None,
+        drill_target,
     }
 }

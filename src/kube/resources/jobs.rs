@@ -1,8 +1,7 @@
-use std::collections::BTreeMap;
 
 use k8s_openapi::api::batch::v1::Job;
 
-use crate::kube::resources::row::{ExtraValue, ResourceRow};
+use crate::kube::resources::row::{DrillTarget, ResourceRow};
 
 /// Convert a k8s Job into a generic ResourceRow.
 pub(crate) fn job_to_row(job: Job) -> ResourceRow {
@@ -15,12 +14,9 @@ pub(crate) fn job_to_row(job: Job) -> ResourceRow {
     let age = metadata.creation_timestamp.map(|t| t.0);
 
     let spec = job.spec.unwrap_or_default();
-    let selector_labels = spec.selector.as_ref()
-        .and_then(|s| s.match_labels.clone())
-        .unwrap_or_default();
     let desired_completions = spec.completions.unwrap_or(1);
 
-    let containers = spec.template.spec.as_ref()
+    let container_names = spec.template.spec.as_ref()
         .map(|ps| ps.containers.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(","))
         .unwrap_or_default();
     let images = spec.template.spec.as_ref()
@@ -50,14 +46,25 @@ pub(crate) fn job_to_row(job: Job) -> ResourceRow {
         None => String::new(),
     };
 
-    let mut extra = BTreeMap::new();
-    extra.insert("selector_labels".into(), ExtraValue::Map(selector_labels));
-    extra.insert("uid".into(), ExtraValue::Str(uid));
+    let drill_target = if !uid.is_empty() {
+        Some(DrillTarget::PodsByOwner {
+            uid,
+            kind: "Job".to_string(),
+            name: name.clone(),
+        })
+    } else {
+        Some(DrillTarget::PodsByNameGrep(name.clone()))
+    };
 
     ResourceRow {
-        cells: vec![ns.clone(), name.clone(), completions, duration, containers, images, labels_str, crate::util::format_age(age)],
+        cells: vec![ns.clone(), name.clone(), completions, duration, container_names, images, labels_str, crate::util::format_age(age)],
         name,
         namespace: ns,
-        extra,
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: Vec::new(),
+        node: None,
+        crd_info: None,
+        drill_target,
     }
 }

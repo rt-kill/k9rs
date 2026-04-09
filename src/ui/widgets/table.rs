@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 
 use ratatui::{
     buffer::Buffer,
@@ -125,14 +124,30 @@ pub struct ResourceTable<'a> {
     rows: &'a [Vec<String>],
     title: &'a str,
     namespace: &'a str,
-    filter_text: &'a str,
     sort_col: Option<usize>,
     sort_asc: bool,
     theme: &'a Theme,
-    /// Set of row indices (in the filtered list) that are marked/selected.
-    marked_rows: &'a HashSet<usize>,
+    /// Per-visible-position mark bitmap. `marked_visible[i] == true` iff the
+    /// row at visible position `i` is marked. Borrowed directly from the
+    /// table's cached bitmap — no per-frame allocation, no per-row hashing.
+    /// Empty slice means "no marks visible" (the cache hasn't been refreshed
+    /// since the last filter change, or there are no marks).
+    marked_visible: &'a [bool],
     /// Rows that changed recently: (namespace, name) -> when. Used for delta highlights.
     changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
+    /// The plural name of the resource, used by per-row health heuristics.
+    resource_plural: &'a str,
+}
+
+/// Health assessment for a row, derived from its cell values + resource type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowHealth {
+    /// Healthy / running. Uses normal row style.
+    Normal,
+    /// In-progress state (pending, starting). Uses pending color.
+    Pending,
+    /// Failed / unhealthy. Uses error color.
+    Failed,
 }
 
 impl<'a> ResourceTable<'a> {
@@ -142,24 +157,111 @@ impl<'a> ResourceTable<'a> {
         title: &'a str,
         theme: &'a Theme,
     ) -> Self {
-        static EMPTY_SET: std::sync::LazyLock<HashSet<usize>> = std::sync::LazyLock::new(HashSet::new);
         static EMPTY_MAP: std::sync::LazyLock<std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>> = std::sync::LazyLock::new(std::collections::HashMap::new);
         Self {
             headers,
             rows,
             title,
             namespace: "",
-            filter_text: "",
             sort_col: None,
             sort_asc: true,
             theme,
-            marked_rows: &EMPTY_SET,
+            marked_visible: &[],
             changed_rows: &EMPTY_MAP,
+            resource_plural: "",
         }
     }
 
-    pub fn marked(mut self, marked: &'a HashSet<usize>) -> Self {
-        self.marked_rows = marked;
+    pub fn resource_plural(mut self, plural: &'a str) -> Self {
+        self.resource_plural = plural;
+        self
+    }
+
+    /// Assess the health of a row based on cell values and resource type.
+    /// Returns `Normal` if no interesting signal is found — caller should
+    /// fall back to the default row style.
+    fn assess_row(&self, row: &[String]) -> RowHealth {
+        let col = |name: &str| -> Option<&str> {
+            self.headers.iter().position(|h| h.eq_ignore_ascii_case(name))
+                .and_then(|i| row.get(i).map(|s| s.as_str()))
+        };
+        match self.resource_plural {
+            "deployments" | "statefulsets" | "replicasets" => {
+                // READY "x/y" — unhealthy if x < y, warning if y == 0.
+                if let Some(ready) = col("READY") {
+                    if let Some((a, b)) = ready.split_once('/') {
+                        let (have, want) = (a.parse::<i64>().ok(), b.parse::<i64>().ok());
+                        if let (Some(have), Some(want)) = (have, want) {
+                            if want == 0 { return RowHealth::Pending; }
+                            if have < want { return RowHealth::Failed; }
+                            return RowHealth::Normal;
+                        }
+                    }
+                }
+            }
+            "daemonsets" => {
+                if let (Some(desired), Some(ready)) = (col("DESIRED"), col("READY")) {
+                    let d = desired.parse::<i64>().ok();
+                    let r = ready.parse::<i64>().ok();
+                    if let (Some(d), Some(r)) = (d, r) {
+                        if d == 0 { return RowHealth::Pending; }
+                        if r < d { return RowHealth::Failed; }
+                    }
+                }
+            }
+            "pods" => {
+                if let Some(status) = col("STATUS") {
+                    match status {
+                        "Running" => return RowHealth::Normal,
+                        "Succeeded" | "Completed" => return RowHealth::Normal,
+                        "Pending" | "ContainerCreating" | "Init" | "PodInitializing" | "Terminating" => {
+                            return RowHealth::Pending;
+                        }
+                        "Failed" | "Error" | "CrashLoopBackOff" | "ImagePullBackOff"
+                        | "ErrImagePull" | "OOMKilled" | "Evicted" => {
+                            return RowHealth::Failed;
+                        }
+                        s if s.starts_with("Init:") && (s.contains("Error") || s.contains("BackOff")) => {
+                            return RowHealth::Failed;
+                        }
+                        s if s.starts_with("Init:") => return RowHealth::Pending,
+                        _ => {}
+                    }
+                }
+            }
+            "nodes" => {
+                if let Some(status) = col("STATUS") {
+                    if status.contains("NotReady") { return RowHealth::Failed; }
+                    if status.contains("SchedulingDisabled") { return RowHealth::Pending; }
+                    if status == "Ready" { return RowHealth::Normal; }
+                }
+            }
+            "jobs" => {
+                if let Some(completions) = col("COMPLETIONS") {
+                    if let Some((a, b)) = completions.split_once('/') {
+                        if a == b && !a.is_empty() { return RowHealth::Normal; }
+                        return RowHealth::Pending;
+                    }
+                }
+            }
+            "portforwards" => {
+                if let Some(state) = col("STATE") {
+                    match state {
+                        "Active" => return RowHealth::Normal,
+                        "Starting" => return RowHealth::Pending,
+                        "Failed" => return RowHealth::Failed,
+                        "Stopped" => return RowHealth::Pending,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        RowHealth::Normal
+    }
+
+    pub fn marked_visible(mut self, marked: &'a [bool]) -> Self {
+        self.marked_visible = marked;
         self
     }
 
@@ -171,11 +273,6 @@ impl<'a> ResourceTable<'a> {
 
     pub fn namespace(mut self, ns: &'a str) -> Self {
         self.namespace = ns;
-        self
-    }
-
-    pub fn filter_text(mut self, text: &'a str) -> Self {
-        self.filter_text = text;
         self
     }
 
@@ -266,8 +363,22 @@ impl<'a> ResourceTable<'a> {
         widths
     }
 
-    /// Render a single cell, truncating if necessary.
-    fn render_cell(buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
+    /// Whether a column header denotes a numeric-valued column. Numeric
+    /// columns are right-aligned for readability.
+    fn is_numeric_column(header: &str) -> bool {
+        matches!(
+            header.trim().to_ascii_uppercase().as_str(),
+            "READY" | "UP-TO-DATE" | "AVAILABLE" | "DESIRED" | "CURRENT"
+            | "RESTARTS" | "CPU" | "MEM" | "CPU%" | "MEM%"
+            | "AGE" | "PORTS" | "PORT(S)" | "COUNT" | "LOCAL" | "REMOTE"
+            | "ACTIVE" | "COMPLETIONS" | "PODS" | "RULES" | "SECRETS"
+            | "SUBJECTS" | "MIN" | "MAX" | "DATA"
+        )
+    }
+
+    /// Render a single cell, truncating if necessary. When `right_align` is
+    /// true the text is padded on the left so it ends flush with the cell.
+    fn render_cell(buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style, right_align: bool) {
         if width == 0 {
             return;
         }
@@ -294,8 +405,17 @@ impl<'a> ResourceTable<'a> {
             text.to_string()
         };
 
-        // Write with leading space padding
-        let content = format!(" {}", display);
+        let content = if right_align {
+            // Right-pad with spaces so the text ends one column before the
+            // cell boundary (matches the left-align trailing gap).
+            let display_width = display.width();
+            let total = padded_width.saturating_sub(1);
+            let pad = total.saturating_sub(display_width);
+            format!("{} {}", " ".repeat(pad), display)
+        } else {
+            // Left-align with a leading space.
+            format!(" {}", display)
+        };
         buf.set_string(x, y, &content, style);
     }
 
@@ -319,14 +439,6 @@ impl<'a> ResourceTable<'a> {
             format!("[{}]", row_count),
             self.theme.title_counter,
         ));
-        // Filter indicator
-        if !self.filter_text.is_empty() {
-            spans.push(Span::styled(" ", self.theme.title));
-            spans.push(Span::styled(
-                format!("<{}>", self.filter_text),
-                self.theme.title_filter_indicator,
-            ));
-        }
         spans.push(Span::styled(" ", self.theme.title));
         Line::from(spans)
     }
@@ -371,6 +483,8 @@ impl StatefulWidget for ResourceTable<'_> {
         }
 
         // Render header row: white bold, sort indicators in orange
+        // Headers left-align regardless of the underlying column alignment —
+        // right-aligned header text next to left-aligned data looks weird.
         let header_y = inner.y;
         let mut x = inner.x;
         for (i, header) in self.headers.iter().enumerate() {
@@ -381,16 +495,14 @@ impl StatefulWidget for ResourceTable<'_> {
             let is_sort_col = self.sort_col == Some(i);
 
             if is_sort_col {
-                // Render header text in white bold
-                Self::render_cell(buf, x, header_y, w.saturating_sub(2), header, self.theme.header);
-                // Render sort arrow in orange at end of column
+                Self::render_cell(buf, x, header_y, w.saturating_sub(2), header, self.theme.header, false);
                 let arrow = if self.sort_asc { "\u{2191}" } else { "\u{2193}" };
                 let arrow_x = x + w.saturating_sub(2);
                 if arrow_x < inner.x + inner.width {
                     buf.set_string(arrow_x, header_y, arrow, self.theme.sort_indicator);
                 }
             } else {
-                Self::render_cell(buf, x, header_y, w, header, self.theme.header);
+                Self::render_cell(buf, x, header_y, w, header, self.theme.header, false);
             }
             x += w;
         }
@@ -421,7 +533,8 @@ impl StatefulWidget for ResourceTable<'_> {
 
             let row = all_rows[row_idx];
             let is_selected = row_idx == state.selected;
-            let is_marked = self.marked_rows.contains(&row_idx);
+            // Cache lookup is O(1) and never allocates. Empty slice → false.
+            let is_marked = self.marked_visible.get(row_idx).copied().unwrap_or(false);
 
             // Check if this row has recent changes (delta tracking).
             // Rows typically have namespace in col 0 and name in col 1.
@@ -432,7 +545,13 @@ impl StatefulWidget for ResourceTable<'_> {
                 false
             };
 
-            // Determine row base style
+            // Determine row base style. Precedence:
+            //   1. selected (highest — user interaction)
+            //   2. marked (user mark)
+            //   3. changed (recent delta)
+            //   4. row health (per-resource diagnosis)
+            //   5. normal
+            let health = self.assess_row(row);
             let row_style = if is_selected {
                 self.theme.selected
             } else if is_marked {
@@ -440,7 +559,11 @@ impl StatefulWidget for ResourceTable<'_> {
             } else if is_changed {
                 self.theme.delta_changed
             } else {
-                self.theme.row_normal
+                match health {
+                    RowHealth::Failed => self.theme.status_failed,
+                    RowHealth::Pending => self.theme.status_pending,
+                    RowHealth::Normal => self.theme.row_normal,
+                }
             };
 
             // Fill entire row with background style for selected
@@ -496,7 +619,11 @@ impl StatefulWidget for ResourceTable<'_> {
                     }
                 };
 
-                Self::render_cell(buf, cx, y, w, cell, cell_style);
+                let right_align = self.headers.get(col_idx)
+                    .map(|h| Self::is_numeric_column(h))
+                    .unwrap_or(false);
+                Self::render_cell(buf, cx, y, w, cell, cell_style, right_align);
+
                 cx += w;
             }
         }

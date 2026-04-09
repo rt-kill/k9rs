@@ -6,7 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::kube::resources::row::{ExtraValue, ResourceRow};
+use crate::kube::resources::row::{DrillTarget, ResourceRow};
+use crate::kube::protocol::ResourceScope;
 
 /// A printer column from a CRD's additionalPrinterColumns spec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,12 +38,22 @@ pub fn cached_crds_to_rows(cached: &[CachedCrd]) -> Vec<ResourceRow> {
     cached
         .iter()
         .map(|c| {
-            let mut extra = std::collections::BTreeMap::new();
-            extra.insert("group".into(), ExtraValue::Str(c.group.clone()));
-            extra.insert("version".into(), ExtraValue::Str(c.version.clone()));
-            extra.insert("kind".into(), ExtraValue::Str(c.kind.clone()));
-            extra.insert("plural".into(), ExtraValue::Str(c.plural.clone()));
-            extra.insert("scope".into(), ExtraValue::Str(c.scope.clone()));
+            let scope = ResourceScope::from_scope_str(&c.scope);
+            let crd_info = Some(crate::kube::resources::row::CrdRowInfo {
+                group: c.group.clone(),
+                version: c.version.clone(),
+                kind: c.kind.clone(),
+                plural: c.plural.clone(),
+                scope,
+            });
+            // Drill target: pressing Enter on a CRD definition browses its instances.
+            let drill_target = Some(DrillTarget::BrowseCrd {
+                group: c.group.clone(),
+                version: c.version.clone(),
+                kind: c.kind.clone(),
+                plural: c.plural.clone(),
+                scope,
+            });
             ResourceRow {
                 cells: vec![
                     c.name.clone(), c.group.clone(), c.version.clone(),
@@ -50,7 +61,12 @@ pub fn cached_crds_to_rows(cached: &[CachedCrd]) -> Vec<ResourceRow> {
                 ],
                 name: c.name.clone(),
                 namespace: String::new(),
-                extra,
+                containers: Vec::new(),
+                owner_refs: Vec::new(),
+                pf_ports: Vec::new(),
+                node: None,
+                crd_info,
+                drill_target,
             }
         })
         .collect()
@@ -64,7 +80,12 @@ pub fn cached_namespaces_to_rows(names: &[String]) -> Vec<crate::kube::resources
             cells: vec![name.clone(), "Active".to_string(), String::new()],
             name: name.clone(),
             namespace: String::new(),
-            extra: Default::default(),
+            containers: Vec::new(),
+            owner_refs: Vec::new(),
+            pf_ports: Vec::new(),
+            node: None,
+            crd_info: None,
+            drill_target: Some(DrillTarget::SwitchNamespace(name.clone())),
         })
         .collect()
 }

@@ -18,6 +18,11 @@ pub(crate) fn hpa_to_row(hpa: HorizontalPodAutoscaler) -> ResourceRow {
         cells: vec![ns.clone(), name.clone(), reference, min_replicas, max_replicas, current_replicas, crate::util::format_age(age)],
         name,
         namespace: ns,
-        extra: Default::default(),
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: Vec::new(),
+        node: None,
+        crd_info: None,
+        drill_target: None,
     }
 }

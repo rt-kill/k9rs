@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::kube::protocol::ObjectKey;
 use crate::kube::resources::KubeResource;
 
 use super::types::{parse_age_seconds, ItemCounts};
@@ -37,15 +38,22 @@ impl<T: Clone + KubeResource> TableNav for StatefulTable<T> {
     fn nav_clear_filter(&mut self) { self.clear_filter(); }
     fn nav_reset(&mut self) { self.clear_data(); }
     fn nav_toggle_mark(&mut self) {
-        if !self.filtered_indices.is_empty() && self.selected < self.filtered_indices.len() {
-            let real_idx = self.filtered_indices[self.selected];
-            if self.marked.contains(&real_idx) {
-                self.marked.remove(&real_idx);
-            } else {
-                self.marked.insert(real_idx);
-            }
-            // Don't advance — Space is a clean toggle. Ctrl+Space handles range selection.
+        if self.filtered_indices.is_empty() || self.selected >= self.filtered_indices.len() {
+            return;
         }
+        let real_idx = self.filtered_indices[self.selected];
+        let Some(item) = self.items.get(real_idx) else { return };
+        let key = ObjectKey::new(item.namespace(), item.name());
+        if self.marked.contains(&key) {
+            self.marked.remove(&key);
+        } else {
+            self.marked.insert(key);
+        }
+        // Maintain the visible-mark cache: a single bit flip at the cursor.
+        if let Some(slot) = self.marked_visible.get_mut(self.selected) {
+            *slot = !*slot;
+        }
+        // Don't advance — Space is a clean toggle. Ctrl+Space handles range selection.
     }
     fn nav_sort_by(&mut self, col: usize) { self.sort_by_column(col); }
     fn nav_toggle_sort(&mut self) {
@@ -55,20 +63,31 @@ impl<T: Clone + KubeResource> TableNav for StatefulTable<T> {
     fn nav_items_count(&self) -> ItemCounts {
         ItemCounts { filtered: self.len(), total: self.total() }
     }
-    fn nav_clear_marks(&mut self) { self.marked.clear(); }
+    fn nav_clear_marks(&mut self) {
+        self.marked.clear();
+        // All visible bits drop to false in one shot.
+        for slot in self.marked_visible.iter_mut() { *slot = false; }
+    }
     fn nav_span_mark(&mut self) {
         if self.filtered_indices.is_empty() { return; }
         let current = self.selected.min(self.filtered_indices.len() - 1);
-        let _current_real = self.filtered_indices[current];
-        // Find the nearest existing mark to use as anchor
-        let anchor = self.marked.iter().copied()
-            .filter_map(|idx| self.filtered_indices.iter().position(|&i| i == idx))
+        // Find the nearest existing mark via the cached visible bitmap —
+        // no per-position ObjectKey allocation.
+        let anchor = self.marked_visible.iter()
+            .enumerate()
+            .filter_map(|(pos, marked)| if *marked { Some(pos) } else { None })
             .min_by_key(|&pos| (pos as isize - current as isize).unsigned_abs())
             .unwrap_or(0);
         let (start, end) = if anchor <= current { (anchor, current) } else { (current, anchor) };
-        for i in start..=end {
-            if i < self.filtered_indices.len() {
-                self.marked.insert(self.filtered_indices[i]);
+        for pos in start..=end {
+            if let Some(real) = self.filtered_indices.get(pos).copied() {
+                if let Some(item) = self.items.get(real) {
+                    let key = ObjectKey::new(item.namespace(), item.name());
+                    self.marked.insert(key);
+                    if let Some(slot) = self.marked_visible.get_mut(pos) {
+                        *slot = true;
+                    }
+                }
             }
         }
     }
@@ -92,12 +111,6 @@ pub struct StatefulTable<T: Clone> {
     pub sort_column: usize,
     pub sort_ascending: bool,
     pub page_size: usize,
-    pub filter_text: String,
-    /// Cached compiled regex for the current filter_text (avoids recompiling on every data update).
-    /// When true, filtering is managed by the NavStack's `reapply_nav_filters()`.
-    /// `set_items_filtered` will skip its own `filter_text`-based filtering and
-    /// show all items, letting `reapply_nav_filters` apply the real filter after.
-    pub nav_managed: bool,
     /// Whether this table has received any response from the watcher.
     /// Used to distinguish "loading" (false) from "empty" (true + no items) in the UI.
     pub has_data: bool,
@@ -109,8 +122,15 @@ pub struct StatefulTable<T: Clone> {
     pub error: Option<String>,
     /// Previous item count — used to detect when initial loading completes.
     prev_item_count: usize,
-    /// Set of marked/selected row indices (real indices into `items`).
-    pub marked: HashSet<usize>,
+    /// Marked/selected rows, keyed by stable identity (namespace + name) so
+    /// marks survive data refreshes and sort changes.
+    pub marked: HashSet<ObjectKey>,
+    /// Cached membership-by-visible-position for `marked`. Same length as
+    /// `filtered_indices`; `marked_visible[i] == true` iff the row at visible
+    /// position `i` is marked. Recomputed exactly when filters or marks
+    /// change — never per-frame. Eliminates the per-row `String` clones
+    /// that the render path used to do to build a transient HashSet.
+    pub marked_visible: Vec<bool>,
 }
 
 impl<T: Clone> Default for StatefulTable<T> {
@@ -123,13 +143,12 @@ impl<T: Clone> Default for StatefulTable<T> {
             sort_column: 0,
             sort_ascending: true,
             page_size: 40,
-            filter_text: String::new(),
-            nav_managed: false,
             has_data: false,
             loading: false,
             error: None,
             prev_item_count: 0,
             marked: HashSet::new(),
+            marked_visible: Vec::new(),
         }
     }
 }
@@ -180,7 +199,6 @@ impl<T: Clone> StatefulTable<T> {
     pub fn set_items(&mut self, items: Vec<T>) {
         self.has_data = true;
         self.items = items;
-        self.marked.clear();
         self.filtered_indices = (0..self.items.len()).collect();
         if self.filtered_indices.is_empty() {
             self.selected = 0;
@@ -188,6 +206,13 @@ impl<T: Clone> StatefulTable<T> {
         } else if self.selected >= self.filtered_indices.len() {
             self.selected = self.filtered_indices.len() - 1;
         }
+        // Reset the marked-visible bitmap to match the new visible set.
+        // KubeResource tables that need it actually populated will call
+        // `refresh_marked_visible()` separately (we can't do it here without
+        // a `KubeResource` bound, and the bound would break the contexts
+        // table which uses `set_items` but has no marks).
+        self.marked_visible.clear();
+        self.marked_visible.resize(self.filtered_indices.len(), false);
         self.adjust_offset();
     }
 
@@ -202,6 +227,11 @@ impl<T: Clone> StatefulTable<T> {
         } else if self.selected >= self.filtered_indices.len() {
             self.selected = self.filtered_indices.len() - 1;
         }
+        // Bitmap layout invariant: same length as filtered_indices. Callers
+        // with marks should call `refresh_marked_visible()` afterwards
+        // (only `KubeResource`-bounded tables have marks anyway).
+        self.marked_visible.clear();
+        self.marked_visible.resize(self.filtered_indices.len(), false);
         self.adjust_offset();
     }
 
@@ -211,21 +241,22 @@ impl<T: Clone> StatefulTable<T> {
         self.filtered_indices.clear();
         self.selected = 0;
         self.offset = 0;
-        self.nav_managed = false;
         self.has_data = false;
         self.loading = false;
         self.error = None;
         self.prev_item_count = 0;
         self.marked.clear();
+        self.marked_visible.clear();
     }
 
     pub fn clear_filter(&mut self) {
-        self.filter_text.clear();
-        self.nav_managed = false;
         self.filtered_indices = (0..self.items.len()).collect();
         if self.selected >= self.filtered_indices.len() && !self.filtered_indices.is_empty() {
             self.selected = self.filtered_indices.len() - 1;
         }
+        // Same invariant as `apply_filter`.
+        self.marked_visible.clear();
+        self.marked_visible.resize(self.filtered_indices.len(), false);
         self.adjust_offset();
     }
 
@@ -282,11 +313,19 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
     }
 
     /// Replace items with a new snapshot. Cursor stays at its current
-    /// screen index — it does NOT follow item identity.
+    /// screen index — it does NOT follow item identity. Marks are keyed by
+    /// identity so they survive refreshes; any mark whose row no longer
+    /// exists in the new snapshot is dropped.
     pub fn set_items_filtered(&mut self, items: Vec<T>) {
         self.update_loading(items.len());
         self.items = items;
-        self.marked.clear(); // Indices invalidated by sort.
+        // Prune marks whose rows no longer exist.
+        if !self.marked.is_empty() {
+            let present: HashSet<ObjectKey> = self.items.iter()
+                .map(|i| ObjectKey::new(i.namespace(), i.name()))
+                .collect();
+            self.marked.retain(|k| present.contains(k));
+        }
         self.sort_items();
         self.rebuild_filter();
         self.clamp_selection();
@@ -344,21 +383,15 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
         });
     }
 
-    /// Rebuild filtered_indices from current items and filter state.
+    /// Rebuild `filtered_indices` to show every row. Filtering itself is
+    /// owned by `App::reapply_nav_filters` (which calls `apply_filter` with
+    /// the nav-stack-derived predicates) — the table is just the storage,
+    /// not the policy. After rebuilding the visible set, refresh the
+    /// marked-visible cache so the bitmap stays in sync.
     pub fn rebuild_filter(&mut self) {
         self.filtered_indices.clear();
-        if self.nav_managed {
-            self.filtered_indices.extend(0..self.items.len());
-        } else if !self.filter_text.is_empty() {
-            let pat = crate::util::SearchPattern::new(&self.filter_text);
-            for (i, item) in self.items.iter().enumerate() {
-                if item.cells().iter().any(|cell| pat.is_match(cell)) {
-                    self.filtered_indices.push(i);
-                }
-            }
-        } else {
-            self.filtered_indices.extend(0..self.items.len());
-        }
+        self.filtered_indices.extend(0..self.items.len());
+        self.refresh_marked_visible();
     }
 
     /// Clamp selection to valid range.
@@ -368,6 +401,25 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
             self.offset = 0;
         } else if self.selected >= self.filtered_indices.len() {
             self.selected = self.filtered_indices.len() - 1;
+        }
+    }
+
+    /// Recompute the `marked_visible` cache from `filtered_indices` + `marked`.
+    /// Called from any mutator that touches either side of the join. The render
+    /// path borrows the result without doing per-row work.
+    pub fn refresh_marked_visible(&mut self) {
+        self.marked_visible.clear();
+        self.marked_visible.resize(self.filtered_indices.len(), false);
+        if self.marked.is_empty() {
+            return;
+        }
+        for (pos, &real_idx) in self.filtered_indices.iter().enumerate() {
+            if let Some(item) = self.items.get(real_idx) {
+                let key = ObjectKey::new(item.namespace(), item.name());
+                if self.marked.contains(&key) {
+                    self.marked_visible[pos] = true;
+                }
+            }
         }
     }
 }

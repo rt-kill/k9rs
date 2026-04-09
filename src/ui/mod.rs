@@ -11,8 +11,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Widget};
 use ratatui::Frame;
 
-use crate::app::{App, InputMode, Route};
-use crate::ui::widgets::{ConfirmDialogWidget, PortForwardDialogWidget, FilterBar, FlashWidget, HelpOverlay};
+use crate::app::{App, Route};
+use crate::ui::widgets::{ConfirmDialogWidget, FormDialogWidget, FilterBar, FlashWidget, HelpOverlay};
 
 /// Main UI draw function.
 ///
@@ -81,9 +81,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Draw confirmation dialog if present
     draw_confirm_dialog(f, app);
 
-    // Draw port-forward dialog if present
-    if let Some(ref dialog) = app.port_forward_dialog {
-        let widget = PortForwardDialogWidget::new(dialog, &app.theme);
+    // Draw the generic form dialog if present (Scale, PortForward, …).
+    if let Some(ref dialog) = app.form_dialog {
+        let widget = FormDialogWidget::new(dialog, &app.theme);
         f.render_widget(widget, f.area());
     }
 }
@@ -130,11 +130,10 @@ fn draw_container_select(f: &mut Frame, app: &App, pod: &str, namespace: &str, s
     let theme = &app.theme;
     let area = f.area();
 
-    // Find the pod's containers
+    // Find the pod's containers (typed field on ResourceRow).
     let containers: Vec<String> = app.data.unified.get(&crate::app::nav::rid("pods"))
         .and_then(|t| t.items.iter().find(|p| p.name == pod && p.namespace == namespace))
-        .and_then(|p| p.extra_containers())
-        .map(|c| c.iter().map(|ci| ci.name.clone()).collect())
+        .map(|p| p.containers.iter().map(|ci| ci.name.clone()).collect())
         .unwrap_or_default();
 
     if containers.is_empty() {
@@ -241,7 +240,6 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
     }
 
     let input = app.input_mode.input().unwrap_or("");
-    let is_scale = matches!(app.input_mode, InputMode::Scale { .. });
     let ghost: String = app.best_completion()
         .and_then(|c| {
             if c.starts_with(input) {
@@ -261,7 +259,7 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
         Span::styled(input, theme.command),
     ];
 
-    if !ghost.is_empty() && !is_scale {
+    if !ghost.is_empty() {
         spans.push(Span::styled(
             ghost,
             theme.command_suggestion.add_modifier(Modifier::DIM | Modifier::ITALIC),

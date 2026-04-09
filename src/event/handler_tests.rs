@@ -13,7 +13,20 @@ fn make_key(code: KeyCode) -> KeyEvent {
 fn make_resource_app() -> App {
     let mut app = App::new(String::new(), Vec::new(), String::new());
     app.route = Route::Resources;
+    populate_capabilities(&mut app);
     app
+}
+
+/// Populate `app.capabilities` for all built-in resource types using the
+/// same builder the real server uses (`capabilities::for_k8s`). Tests
+/// shortcut the wire round-trip by inserting up front.
+fn populate_capabilities(app: &mut App) {
+    use crate::kube::capabilities;
+    use crate::kube::resource_types::RESOURCE_TYPES;
+    for meta in RESOURCE_TYPES {
+        let caps = capabilities::for_k8s(meta.plural);
+        app.capabilities.insert(meta.to_resource_id(), caps);
+    }
 }
 
 fn make_ctrl_key(code: KeyCode) -> KeyEvent {
@@ -129,12 +142,16 @@ fn test_non_workload_no_logs() {
 #[test]
 fn test_confirm_dialog_keys() {
     let mut app = App::new(String::new(), Vec::new(), String::new());
-    use crate::kube::protocol::{Namespace, ObjectRef};
+    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
     app.confirm_dialog = Some(crate::app::ConfirmDialog {
         message: "Are you sure?".to_string(),
         pending: crate::app::PendingAction::Single {
             action: Action::Delete,
-            target: ObjectRef::from_parts("pod", "test", Namespace::from("default")),
+            target: ObjectRef::new(
+                ResourceId::from_alias("pods").unwrap(),
+                "test",
+                Namespace::from("default"),
+            ),
         },
         yes_selected: false,
     });
@@ -167,7 +184,9 @@ fn test_ctrl_r_refresh() {
 fn test_resource_view_port_forward() {
     let app = make_resource_app();
     let action = handle_key_event(&app, make_key(KeyCode::Char('f')));
-    assert!(matches!(action, Some(Action::PortForward)));
+    assert!(matches!(action, Some(Action::ShowPortForwards)));
+    let action2 = handle_key_event(&app, make_key(KeyCode::Char('F')));
+    assert!(matches!(action2, Some(Action::PortForward)));
 }
 
 #[test]
@@ -180,10 +199,14 @@ fn test_restart_on_deployments() {
 
 #[test]
 fn test_q_goes_back_in_detail_view() {
-    use crate::kube::protocol::{Namespace, ObjectRef};
+    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
     let mut app = App::new(String::new(), Vec::new(), String::new());
     app.route = Route::Yaml {
-        target: ObjectRef::from_parts("", String::new(), Namespace::from("")),
+        target: ObjectRef::new(
+            ResourceId::from_alias("pods").unwrap(),
+            String::new(),
+            Namespace::from(""),
+        ),
         awaiting_response: false,
         state: crate::app::ContentViewState::default(),
     };
@@ -250,10 +273,14 @@ fn test_esc_noop_in_resource_view_no_filter() {
 
 #[test]
 fn test_esc_goes_back_in_detail_view() {
-    use crate::kube::protocol::{Namespace, ObjectRef};
+    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
     let mut app = App::new(String::new(), Vec::new(), String::new());
     app.route = Route::Describe {
-        target: ObjectRef::from_parts("", String::new(), Namespace::from("")),
+        target: ObjectRef::new(
+            ResourceId::from_alias("pods").unwrap(),
+            String::new(),
+            Namespace::from(""),
+        ),
         awaiting_response: false,
         state: crate::app::ContentViewState::default(),
     };
@@ -320,10 +347,14 @@ fn test_log_view_home_end() {
 
 #[test]
 fn test_detail_view_home_end() {
-    use crate::kube::protocol::{Namespace, ObjectRef};
+    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
     let mut app = App::new(String::new(), Vec::new(), String::new());
     app.route = Route::Yaml {
-        target: ObjectRef::from_parts("", String::new(), Namespace::from("")),
+        target: ObjectRef::new(
+            ResourceId::from_alias("pods").unwrap(),
+            String::new(),
+            Namespace::from(""),
+        ),
         awaiting_response: false,
         state: crate::app::ContentViewState::default(),
     };

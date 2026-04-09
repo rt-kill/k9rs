@@ -1,15 +1,13 @@
-use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::DaemonSet;
 
-use crate::kube::resources::row::{ExtraValue, ResourceRow};
+use crate::kube::resources::row::{DrillTarget, ResourceRow};
 
 /// Convert a k8s DaemonSet into a generic ResourceRow.
 pub(crate) fn daemonset_to_row(ds: DaemonSet) -> ResourceRow {
     let metadata = ds.metadata;
     let ns = metadata.namespace.unwrap_or_default();
     let name = metadata.name.unwrap_or_default();
-    let uid = metadata.uid.unwrap_or_default();
     let labels = metadata.labels.unwrap_or_default();
     let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
     let age = metadata.creation_timestamp.map(|t| t.0);
@@ -42,10 +40,14 @@ pub(crate) fn daemonset_to_row(ds: DaemonSet) -> ResourceRow {
     let up_to_date = status.updated_number_scheduled.unwrap_or(0);
     let available = status.number_available.unwrap_or(0);
 
-    let mut extra = BTreeMap::new();
-    extra.insert("selector_labels".into(), ExtraValue::Map(selector_labels));
-    extra.insert("uid".into(), ExtraValue::Str(uid));
-    extra.insert("container_ports".into(), ExtraValue::Ports(container_ports));
+    let drill_target = if !selector_labels.is_empty() {
+        Some(DrillTarget::PodsByLabels {
+            labels: selector_labels,
+            breadcrumb: format!("ds/{}", name),
+        })
+    } else {
+        Some(DrillTarget::PodsByNameGrep(name.clone()))
+    };
 
     ResourceRow {
         cells: vec![
@@ -57,6 +59,11 @@ pub(crate) fn daemonset_to_row(ds: DaemonSet) -> ResourceRow {
         ],
         name,
         namespace: ns,
-        extra,
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: container_ports,
+        node: None,
+        crd_info: None,
+        drill_target,
     }
 }

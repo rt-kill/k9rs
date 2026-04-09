@@ -91,6 +91,7 @@ const EXTRA_COLUMNS: &[&str] = &[
     "MEM",
     "CPU%",
     "MEM%",
+    "MESSAGE",
 ];
 
 /// Look up the display level for a column by header name.
@@ -147,8 +148,12 @@ pub struct AppData {
 impl Default for AppData {
     fn default() -> Self {
         let mut unified = std::collections::HashMap::new();
-        // Pre-populate entries for all known resource types.
+        // Pre-populate entries for all known K8s resource types.
         for meta in RESOURCE_TYPES {
+            unified.insert(meta.to_resource_id(), StatefulTable::new());
+        }
+        // Pre-populate entries for all known local resource types (port-forwards, etc.).
+        for meta in crate::kube::local::LOCAL_RESOURCE_TYPES {
             unified.insert(meta.to_resource_id(), StatefulTable::new());
         }
         Self {
@@ -193,7 +198,11 @@ pub struct App {
     pub pinned_resources: Vec<ResourceId>,
     pub flash: Option<FlashMessage>,
     pub confirm_dialog: Option<ConfirmDialog>,
-    pub port_forward_dialog: Option<PortForwardDialog>,
+    /// Single generic form dialog for all input-needing operations (Scale,
+    /// PortForward, …). Replaces the per-operation dialog types — the shape
+    /// comes from the server-declared `OperationDescriptor::input` schema
+    /// at construction time.
+    pub form_dialog: Option<FormDialog>,
 
     pub theme: crate::ui::theme::Theme,
     pub input_mode: InputMode,
@@ -223,12 +232,27 @@ pub struct App {
     pub node_metrics: HashMap<String, crate::kube::protocol::MetricsUsage>,
 
     /// Delta tracking: previous row data per resource.
-    pub prev_rows: HashMap<crate::kube::protocol::ObjectKey, Vec<String>>,
+    /// Per-row content hash from the previous snapshot, used by
+    /// `track_deltas` to detect cell-level changes without storing the
+    /// full `Vec<String>`. A 64-bit hash is collision-prone in theory but
+    /// the only consequence of a collision is a missed flash highlight on
+    /// one row — never a correctness bug. The space win matters: a 1000-row
+    /// table with 15-cell rows used to allocate 15k Strings per snapshot.
+    pub prev_rows: HashMap<crate::kube::protocol::ObjectKey, u64>,
     /// Delta tracking: rows that changed in the last update.
     pub changed_rows: HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
 
     /// Guard against rapid context switches: true while a switch is in flight.
     pub context_switch_pending: bool,
+
+    /// Server-provided capabilities for each resource type.
+    pub capabilities: HashMap<ResourceId, crate::kube::protocol::ResourceCapabilities>,
+
+    /// Cached kubeconfig YAML + env vars, populated by `AppEvent::KubeconfigLoaded`.
+    /// Used by the context-switch path to re-derive a `SwitchContext` payload
+    /// without going back to disk. Empty until the kubeconfig task finishes.
+    pub kubeconfig_yaml: String,
+    pub kubeconfig_env: HashMap<String, String>,
 }
 
 impl App {
@@ -249,7 +273,7 @@ impl App {
             pinned_resources: default_pinned_resources(),
             flash: None,
             confirm_dialog: None,
-            port_forward_dialog: None,
+            form_dialog: None,
             theme: crate::ui::theme::Theme::load(),
             input_mode: InputMode::Normal,
             help_scroll: 0,
@@ -265,6 +289,9 @@ impl App {
             prev_rows: HashMap::new(),
             changed_rows: HashMap::new(),
             context_switch_pending: false,
+            capabilities: HashMap::new(),
+            kubeconfig_yaml: String::new(),
+            kubeconfig_env: HashMap::new(),
         }
     }
 
@@ -308,10 +335,14 @@ impl App {
 
     /// Push a route onto the route stack, capping at 50 entries to prevent
     /// unbounded memory growth from deep navigation.
+    /// Clears any open dialogs — they belong to the current route, not the next one.
     pub fn push_route(&mut self, route: Route) {
         if self.route_stack.last() == Some(&route) {
             return; // Don't push duplicates
         }
+        // Dialogs are route-scoped — dismiss them when navigating away.
+        self.confirm_dialog = None;
+        self.form_dialog = None;
         if self.route_stack.len() >= 50 {
             self.route_stack.remove(0);
         }
@@ -374,11 +405,14 @@ impl App {
     }
 
     /// Clear data for a specific resource so it shows "Loading..." until
-    /// fresh data arrives from the server.
+    /// fresh data arrives from the server. Creates the entry if it doesn't
+    /// exist yet — required for dynamically-discovered CRDs whose
+    /// `ResourceId` isn't in the pre-populated `RESOURCE_TYPES` table.
+    /// Without this, the first snapshot for the CRD would land on a missing
+    /// table in `apply_resource_update` and be dropped on the floor.
     pub fn clear_resource(&mut self, rid: &ResourceId) {
-        if let Some(table) = self.data.unified.get_mut(rid) {
-            table.clear_data();
-        }
+        let table = self.data.unified.entry(rid.clone()).or_insert_with(StatefulTable::new);
+        table.clear_data();
     }
 
     pub fn next_tab(&mut self) -> ResourceId {
@@ -493,131 +527,55 @@ impl App {
         self.with_active_table(|t| t.nav_clear_marks());
     }
 
-    /// Check if a row matches a grep pattern (vim-style smartcase regex).
-    /// Handles `!pattern` for inverse matching.
-    fn grep_matches_row(text: &str, row: &[String]) -> bool {
-        let (pattern, invert) = if let Some(stripped) = text.strip_prefix('!') {
-            (stripped, true)
-        } else {
-            (text, false)
-        };
-        let pat = crate::util::SearchPattern::new(pattern);
-        let matches = row.iter().any(|cell| pat.is_match(cell));
-        if invert { !matches } else { matches }
-    }
-
-    /// Reapply all nav stack filters (plus any uncommitted filter_input text) to the current table.
-    /// Called after: snapshot arrival, nav push/pop, grep commit, filter input keystroke.
+    /// Reapply client-side grep filters (plus any uncommitted filter_input text)
+    /// to the current table. Labels, Field, and OwnerChain filters are handled
+    /// server-side via SubscriptionFilter — the server only sends matching rows.
+    /// Only Grep filtering remains client-side (it operates on display text).
+    ///
+    /// Patterns are compiled **once** here and reused across every row. The
+    /// previous implementation rebuilt a `SearchPattern` per row per filter
+    /// on every snapshot — at 500 rows × 1 filter × N snapshots/sec the
+    /// regex engine thrashed and the TUI froze. The compiled patterns live
+    /// in a local `Vec<CompiledFilter>` captured by the closure; nothing
+    /// escapes, no shared state.
     pub fn reapply_nav_filters(&mut self) {
         use crate::app::nav::NavFilter;
 
-        let filters = self.nav.active_filters();
-        // Include uncommitted filter input text as a transient grep
-        let input_text = if !self.nav.filter_input().text.is_empty() {
-            Some(self.nav.filter_input().text.clone())
-        } else {
-            None
-        };
+        // Collect grep texts from committed nav filters.
+        let mut grep_texts: Vec<String> = Vec::new();
+        for f in self.nav.active_filters() {
+            if let NavFilter::Grep(text) = f {
+                grep_texts.push(text.clone());
+            }
+        }
+        // Include uncommitted filter input text as a transient grep.
+        if !self.nav.filter_input().text.is_empty() {
+            grep_texts.push(self.nav.filter_input().text.clone());
+        }
 
-        let has_filters = !filters.is_empty() || input_text.is_some();
-
-        if !has_filters {
+        if grep_texts.is_empty() {
             self.clear_filter();
             return;
         }
 
-        // Build a display string for the table title
-        // For Pods: apply Labels, Field, OwnerChain, and Grep filters via extra bag.
-        // For everything else: only Grep filters apply (Labels/Field are pod-specific).
-        let is_pods = self.nav.resource_id().plural == "pods";
-        if is_pods {
-            let pods_rid = nav::rid("pods");
-            let empty_labels = std::collections::BTreeMap::new();
-            // Clone the filter data we need before the closure borrows self
-            let filters_owned: Vec<NavFilter> = filters.iter().map(|f| (*f).clone()).collect();
-            let input = input_text.clone();
-            if let Some(table) = self.data.unified.get_mut(&pods_rid) {
-                // Mark as nav-managed so set_items_filtered skips its own filtering.
-                table.filter_text.clear();
-                table.nav_managed = true;
-                table.apply_filter(|row| {
-                    for f in &filters_owned {
-                        match f {
-                            NavFilter::Grep(text) => {
-                                if !Self::grep_matches_row(text, row.cells()) {
-                                    return false;
-                                }
-                            }
-                            NavFilter::Labels(selector) => {
-                                let labels = row.extra_map("labels").unwrap_or(&empty_labels);
-                                if !selector.iter().all(|(k, v)| {
-                                    labels.get(k).map_or(false, |lv| lv == v)
-                                }) {
-                                    return false;
-                                }
-                            }
-                            NavFilter::Field { field, value } => {
-                                let matches = match field.as_str() {
-                                    "node" => row.extra_str("node").unwrap_or("") == value.as_str(),
-                                    "namespace" => row.namespace == *value,
-                                    _ => false,
-                                };
-                                if !matches { return false; }
-                            }
-                            NavFilter::OwnerChain { uid, .. } => {
-                                let refs = row.extra_owner_refs().unwrap_or(&[]);
-                                if !refs.iter().any(|or| or.uid == *uid) {
-                                    return false;
-                                }
-                            }
-                        }
-                    }
-                    // Apply uncommitted input text
-                    if let Some(ref text) = input {
-                        if !Self::grep_matches_row(text, row.cells()) {
-                            return false;
-                        }
-                    }
-                    true
-                });
-            }
-        } else {
-            // Non-pod tables: collect all grep texts, apply as composite
-            let mut grep_texts: Vec<String> = Vec::new();
-            for f in &filters {
-                if let NavFilter::Grep(text) = f {
-                    grep_texts.push(text.clone());
-                }
-            }
-            if let Some(ref text) = input_text {
-                grep_texts.push(text.clone());
-            }
+        // Compile each filter exactly once. Patterns are vim-style smartcase
+        // regex — no `!` or `~` prefix sugar; if you want exclusion or any
+        // other operator, write the regex.
+        let compiled: Vec<crate::util::SearchPattern> = grep_texts
+            .iter()
+            .map(|text| crate::util::SearchPattern::new(text))
+            .collect();
 
-            if grep_texts.is_empty() {
-                self.clear_filter();
-                return;
-            }
-
-            macro_rules! apply_greps {
-                ($table:expr) => {{
-                    // Mark as nav-managed so set_items_filtered skips its own filtering.
-                    $table.filter_text.clear();
-                    $table.nav_managed = true;
-                    $table.apply_filter(|item| {
-                        for t in &grep_texts {
-                            if !Self::grep_matches_row(t, item.cells()) {
-                                return false;
-                            }
-                        }
-                        true
-                    })
-                }};
-            }
-
-            let rid = self.nav.resource_id().clone();
-            if let Some(table) = self.data.unified.get_mut(&rid) {
-                apply_greps!(table);
-            }
+        let rid = self.nav.resource_id().clone();
+        if let Some(table) = self.data.unified.get_mut(&rid) {
+            table.apply_filter(|item| {
+                compiled.iter().all(|pat| {
+                    item.cells().iter().any(|cell| pat.is_match(cell))
+                })
+            });
+            // apply_filter zeroes the marked-visible bitmap; refresh it now
+            // that filtered_indices is in its final state.
+            table.refresh_marked_visible();
         }
     }
 
@@ -655,10 +613,16 @@ impl App {
                 changed = true;
             }
         }
-        // Expire change highlights
+        // Expire row-level change highlights.
         let now = std::time::Instant::now();
         let before = self.changed_rows.len();
-        self.changed_rows.retain(|_, ts| now.duration_since(*ts).as_secs() < CHANGE_HIGHLIGHT_SECS);
+        let expired: Vec<_> = self.changed_rows.iter()
+            .filter(|(_, ts)| now.duration_since(**ts).as_secs() >= CHANGE_HIGHLIGHT_SECS)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &expired {
+            self.changed_rows.remove(key);
+        }
         if self.changed_rows.len() != before {
             changed = true;
         }
@@ -749,8 +713,9 @@ impl App {
             let crd_items = self.data.unified.get(&nav::rid("crds"))
                 .map(|t| &t.items[..]).unwrap_or(&[]);
             let is_crd = !is_builtin && crd_items.iter().any(|row| {
-                let kind = row.extra_str("kind").unwrap_or("").to_lowercase();
-                let plural = row.extra_str("plural").unwrap_or("").to_lowercase();
+                let info = match row.crd_info.as_ref() { Some(i) => i, None => return false };
+                let kind = info.kind.to_lowercase();
+                let plural = info.plural.to_lowercase();
                 let short = row.name.split('.').next().unwrap_or("").to_lowercase();
                 resource_part == kind || resource_part == plural || resource_part == short
             });
@@ -777,12 +742,13 @@ impl App {
             .filter(|s| s.starts_with(&input_lower))
             .collect();
 
-        // Add discovered CRD names as completions using the actual plural field
+        // Add discovered CRD names as completions using the typed crd_info field.
         let crd_items = self.data.unified.get(&nav::rid("crds"))
             .map(|t| &t.items[..]).unwrap_or(&[]);
         for row in crd_items {
-            let kind_lower = row.extra_str("kind").unwrap_or("").to_lowercase();
-            let plural_lower = row.extra_str("plural").unwrap_or("").to_lowercase();
+            let Some(info) = row.crd_info.as_ref() else { continue };
+            let kind_lower = info.kind.to_lowercase();
+            let plural_lower = info.plural.to_lowercase();
             // Also extract the short plural from the CRD name (before the dot)
             let short_plural = row.name.split('.').next().unwrap_or("").to_lowercase();
             for candidate in [&kind_lower, &plural_lower, &short_plural] {
@@ -821,23 +787,33 @@ impl App {
         self.with_active_table_ref(|t| t.nav_items_count())
     }
 
+    /// Look up the server-provided capabilities for the current nav resource.
+    /// Returns an empty manifest if capabilities haven't been received yet —
+    /// `supports(_)` returns false for everything in that case, which is the
+    /// safe default (gates close, no actions fire).
+    pub fn current_capabilities(&self) -> &crate::kube::protocol::ResourceCapabilities {
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<crate::kube::protocol::ResourceCapabilities> = OnceLock::new();
+        let empty = EMPTY.get_or_init(crate::kube::protocol::ResourceCapabilities::default);
+        self.capabilities.get(self.nav.resource_id()).unwrap_or(empty)
+    }
+
     /// Whether the current nav resource is cluster-scoped (no namespace).
     pub fn current_tab_is_cluster_scoped(&self) -> bool {
         self.nav.resource_id().is_cluster_scoped()
     }
 
     /// Find a discovered CRD by its kind name (case-insensitive).
-    /// Returns a lightweight CrdInfo extracted from the unified ResourceRow extra bag.
+    /// Returns a lightweight CrdInfo extracted from the row's typed `crd_info` field.
     pub fn find_crd_by_name(&self, cmd: &str) -> Option<CrdInfo> {
         let lower = cmd.to_lowercase();
         let crds_rid = nav::rid("crds");
         let table = self.data.unified.get(&crds_rid)?;
         table.items.iter().find_map(|row| {
-            let kind = row.extra_str("kind").unwrap_or("");
-            let plural = row.extra_str("plural").unwrap_or("");
-            let kind_lower = kind.to_lowercase();
+            let info = row.crd_info.as_ref()?;
+            let kind_lower = info.kind.to_lowercase();
             let name_lower = row.name.to_lowercase();
-            let plural_lower = plural.to_lowercase();
+            let plural_lower = info.plural.to_lowercase();
             // Match by: kind, plural, full CRD name, kind+"s", or the
             // short plural from the CRD name (before the first dot).
             if kind_lower == lower
@@ -847,11 +823,11 @@ impl App {
                 || name_lower.split('.').next().map_or(false, |short| short == lower)
             {
                 Some(CrdInfo {
-                    group: row.extra_str("group").unwrap_or("").to_string(),
-                    version: row.extra_str("version").unwrap_or("").to_string(),
-                    kind: kind.to_string(),
-                    plural: plural.to_string(),
-                    scope: crate::kube::protocol::ResourceScope::from_scope_str(row.extra_str("scope").unwrap_or("Namespaced")),
+                    group: info.group.clone(),
+                    version: info.version.clone(),
+                    kind: info.kind.clone(),
+                    plural: info.plural.clone(),
+                    scope: info.scope,
                 })
             } else {
                 None

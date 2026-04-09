@@ -40,8 +40,35 @@ pub enum AppEvent {
         resource: crate::kube::protocol::ResourceId,
         message: String,
     },
+    /// Resource capabilities from the server (which operations are supported).
+    ResourceCapabilities {
+        resource: crate::kube::protocol::ResourceId,
+        capabilities: crate::kube::protocol::ResourceCapabilities,
+    },
     /// The daemon connection was lost. TUI should exit gracefully.
     DaemonDisconnected,
+    /// The daemon handshake completed and the session is ready. The TUI should
+    /// populate context/cluster/user info and trigger any initial subscriptions.
+    ConnectionEstablished {
+        context: String,
+        cluster: String,
+        user: String,
+        namespaces: Vec<String>,
+    },
+    /// The daemon handshake failed. The TUI should exit with this error.
+    ConnectionFailed(String),
+    /// The kubeconfig was read in the background. Lets the TUI populate the
+    /// contexts panel and `:ctx <tab>` completion before the daemon answers,
+    /// and gives the context-switch path the cached YAML/env it needs to
+    /// build a new `SwitchContext` payload without going back to disk.
+    KubeconfigLoaded {
+        contexts: Vec<crate::app::KubeContext>,
+        current_context: String,
+        current_cluster: String,
+        current_user: String,
+        kubeconfig_yaml: String,
+        env_vars: HashMap<String, String>,
+    },
 }
 
 /// An update to a particular Kubernetes resource type.

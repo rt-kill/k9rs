@@ -1,8 +1,7 @@
-use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::Service;
 
-use crate::kube::resources::row::{ExtraValue, ResourceRow};
+use crate::kube::resources::row::{DrillTarget, ResourceRow};
 
 /// Convert a k8s Service into a generic ResourceRow.
 pub(crate) fn service_to_row(svc: Service) -> ResourceRow {
@@ -39,6 +38,10 @@ pub(crate) fn service_to_row(svc: Service) -> ResourceRow {
         if ips.is_empty() { "<none>".to_string() } else { ips.join(",") }
     };
 
+    let port_list: Vec<u16> = spec.ports.as_ref().unwrap_or(&vec![]).iter()
+        .map(|p| p.port as u16)
+        .collect();
+
     let ports_str = spec.ports.as_ref().unwrap_or(&vec![]).iter()
         .map(|p| {
             let port = p.port;
@@ -57,9 +60,14 @@ pub(crate) fn service_to_row(svc: Service) -> ResourceRow {
         if pairs.is_empty() { "<none>".to_string() } else { pairs.join(",") }
     };
 
-    let mut extra = BTreeMap::new();
-    extra.insert("selector".into(), ExtraValue::Map(selector));
-    extra.insert("ports".into(), ExtraValue::Str(ports_str.clone()));
+    let drill_target = if !selector.is_empty() {
+        Some(DrillTarget::PodsByLabels {
+            labels: selector,
+            breadcrumb: format!("svc/{}", name),
+        })
+    } else {
+        Some(DrillTarget::PodsByNameGrep(name.clone()))
+    };
 
     ResourceRow {
         cells: vec![
@@ -68,6 +76,11 @@ pub(crate) fn service_to_row(svc: Service) -> ResourceRow {
         ],
         name,
         namespace: ns,
-        extra,
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: port_list,
+        node: None,
+        crd_info: None,
+        drill_target,
     }
 }

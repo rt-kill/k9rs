@@ -209,7 +209,12 @@ fn build_dynamic_snapshot(
                 cells,
                 name,
                 namespace,
-                extra: Default::default(),
+                containers: Vec::new(),
+                owner_refs: Vec::new(),
+                pf_ports: Vec::new(),
+                node: None,
+                crd_info: None,
+                drill_target: None,
             }
         })
         .collect();

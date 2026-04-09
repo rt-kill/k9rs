@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 
-use crate::kube::protocol::ResourceId;
+use crate::kube::protocol::{ResourceId, SubscriptionFilter};
 
 /// What subscription changes a nav operation requires.
 /// Returned by push/pop/reset so the session layer can subscribe/unsubscribe.
 pub struct NavChange {
     pub unsubscribe: Option<ResourceId>,
     pub subscribe: Option<ResourceId>,
+    /// Server-side filter for the new subscription (Labels, Field, OwnerUid).
+    /// None = unfiltered. Only meaningful when `subscribe` is Some.
+    pub subscription_filter: Option<SubscriptionFilter>,
 }
 
 // ---------------------------------------------------------------------------
@@ -35,6 +38,23 @@ pub enum NavFilter {
         /// Display name of the owner resource.
         display_name: String,
     },
+}
+
+impl NavFilter {
+    /// Convert this filter to a server-side subscription filter, if applicable.
+    /// Grep is client-side only and returns None.
+    pub fn to_subscription_filter(&self) -> Option<SubscriptionFilter> {
+        match self {
+            NavFilter::Grep(_) => None,
+            NavFilter::Labels(labels) => Some(SubscriptionFilter::Labels(labels.clone())),
+            NavFilter::Field { field, value } => {
+                Some(SubscriptionFilter::Field(format!("{field}={value}")))
+            }
+            NavFilter::OwnerChain { uid, .. } => {
+                Some(SubscriptionFilter::OwnerUid(uid.clone()))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -108,27 +128,34 @@ impl NavStack {
     /// Push a new step (grep or drill-down). Returns subscription changes.
     pub fn push(&mut self, step: NavStep) -> NavChange {
         let old = self.resource_id().clone();
+        let sub_filter = step.filter.as_ref().and_then(|f| f.to_subscription_filter());
         self.steps.push(step);
         let new = self.resource_id().clone();
         if new != old {
-            NavChange { unsubscribe: Some(old), subscribe: Some(new) }
+            NavChange { unsubscribe: Some(old), subscribe: Some(new), subscription_filter: sub_filter }
         } else {
-            NavChange { unsubscribe: None, subscribe: None }
+            NavChange { unsubscribe: None, subscribe: None, subscription_filter: sub_filter }
         }
     }
 
-    /// Pop one step. Returns (popped_step, subscription_changes).
+    /// Pop one step. Returns (popped_step, subscription_changes). Will not
+    /// pop below the root: returns `None` if only the root is left, which
+    /// preserves the invariant that `current()` / `current_mut()` never
+    /// see an empty stack.
     pub fn pop(&mut self) -> Option<(NavStep, NavChange)> {
         if self.steps.len() <= 1 {
             return None;
         }
         let old = self.resource_id().clone();
         let popped = self.steps.pop()?;
+        debug_assert!(!self.steps.is_empty(), "NavStack invariant: pop never empties the stack");
         let new = self.resource_id().clone();
+        // When popping back, the new top step's filter determines the subscription filter.
+        let sub_filter = self.current().filter.as_ref().and_then(|f| f.to_subscription_filter());
         let change = if new != old {
-            NavChange { unsubscribe: Some(old), subscribe: Some(new) }
+            NavChange { unsubscribe: Some(old), subscribe: Some(new), subscription_filter: sub_filter }
         } else {
-            NavChange { unsubscribe: None, subscribe: None }
+            NavChange { unsubscribe: None, subscribe: None, subscription_filter: None }
         };
         Some((popped, change))
     }
@@ -145,9 +172,9 @@ impl NavStack {
             filter_input: FilterInputState::default(),
         });
         if rid != old {
-            NavChange { unsubscribe: Some(old), subscribe: Some(rid) }
+            NavChange { unsubscribe: Some(old), subscribe: Some(rid), subscription_filter: None }
         } else {
-            NavChange { unsubscribe: None, subscribe: None }
+            NavChange { unsubscribe: None, subscribe: None, subscription_filter: None }
         }
     }
 

@@ -70,7 +70,11 @@ pub fn draw_cluster_info(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled(" Context:   ", theme.info_label),
-            Span::styled(&app.context, theme.info_value),
+            if app.context.is_empty() {
+                Span::styled("connecting…", theme.info_na)
+            } else {
+                Span::styled(&app.context, theme.info_value)
+            },
         ]),
         Line::from(vec![
             Span::styled(" Cluster:   ", theme.info_label),

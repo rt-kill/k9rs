@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -10,7 +9,7 @@ use ratatui::{
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, InputMode, StatefulTable};
+use crate::app::{App, StatefulTable};
 use crate::kube::protocol::ResourceId;
 
 use crate::ui::header;
@@ -63,42 +62,46 @@ fn key_hints_for_resource(rid: &ResourceId) -> Vec<crate::ui::header::KeyHint> {
 // Render a generic resource table given headers and row data.
 // ---------------------------------------------------------------------------
 
-fn draw_resource_table<T: Clone>(
+/// Render a resource table. Returns the new `(offset, page_size)` so the
+/// caller can write them back to the `StatefulTable` after the immutable
+/// borrow is released — avoids the `&mut table` + `&table.marked_visible`
+/// borrow conflict that would otherwise force a per-frame allocation.
+fn draw_resource_table(
     f: &mut Frame,
     area: Rect,
     title: &str,
     headers: Vec<&str>,
     rows: &[Vec<String>],
-    table: &mut StatefulTable<T>,
+    selected: usize,
+    initial_offset: usize,
+    sort_ascending: bool,
     namespace: &str,
-    filter_text: &str,
     theme: &Theme,
-    marked_filtered: &HashSet<usize>,
+    marked_visible: &[bool],
     display_sort_col: Option<usize>,
     changed_rows: &std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
-) {
+    resource_plural: &str,
+) -> (usize, usize) {
     // The widget uses Block::bordered(), so inner height = area.height - 2 (borders).
     // Minus 1 more for the header row.
     let visible_height = (area.height as usize).saturating_sub(3);
 
     let rt = ResourceTable::new(headers, rows, title, theme)
-        .sort(display_sort_col, table.sort_ascending)
+        .sort(display_sort_col, sort_ascending)
         .namespace(namespace)
-        .filter_text(filter_text)
-        .marked(marked_filtered)
-        .changed_rows(changed_rows);
+        .marked_visible(marked_visible)
+        .changed_rows(changed_rows)
+        .resource_plural(resource_plural);
 
     let mut state = ResourceTableState {
-        selected: table.selected,
-        offset: table.offset,
+        selected,
+        offset: initial_offset,
         filtered_count: 0,
     };
 
     f.render_stateful_widget(rt, area, &mut state);
 
-    // Write back corrected offset and actual page_size to the StatefulTable.
-    table.offset = state.offset;
-    table.page_size = visible_height;
+    (state.offset, visible_height)
 }
 
 
@@ -113,9 +116,9 @@ fn draw_unified_table(
     f: &mut Frame,
     area: Rect,
     title: &str,
+    resource_plural: &str,
     table: &mut StatefulTable<crate::kube::resources::row::ResourceRow>,
     namespace: &str,
-    filter_text: &str,
     theme: &Theme,
     descriptor: Option<&crate::app::TableDescriptor>,
     column_level: crate::app::ColumnLevel,
@@ -184,17 +187,26 @@ fn draw_unified_table(
         })
         .collect();
 
-    let marked_filtered: HashSet<usize> = table.filtered_indices
-        .iter()
-        .enumerate()
-        .filter(|(_pos, &real_idx)| table.marked.contains(&real_idx))
-        .map(|(pos, _)| pos)
-        .collect();
-
-    // Map the data sort column to a display column index.
+    // Snapshot the table state we need before any mutable touch. This lets
+    // us pass an immutable borrow of `table.marked_visible` into the
+    // renderer alongside the values, then write back the updated offset
+    // and page size after the borrow ends.
+    let selected = table.selected;
+    let initial_offset = table.offset;
+    let sort_ascending = table.sort_ascending;
     let display_sort_col = visible_indices.iter().position(|&i| i == table.sort_column);
+    let marked_visible: &[bool] = &table.marked_visible;
 
-    draw_resource_table(f, area, title, headers, &rows, table, namespace, filter_text, theme, &marked_filtered, display_sort_col, changed_rows);
+    let (new_offset, new_page_size) = draw_resource_table(
+        f, area, title, headers, &rows,
+        selected, initial_offset, sort_ascending,
+        namespace, theme,
+        marked_visible, display_sort_col, changed_rows, resource_plural,
+    );
+
+    // Borrow on `table.marked_visible` ends here — now we can write back.
+    table.offset = new_offset;
+    table.page_size = new_page_size;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,16 +283,21 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(filter_bar, filter_area);
     }
 
-    // 4. Resource table
+    // 4. Resource table. Collect the borrows we need into locals *before*
+    // taking the mutable reference to the table so the borrow checker stays
+    // happy.
     let ns = app.selected_ns.display();
-    let ft = "";
-    let cr = &app.changed_rows;
     let cl = app.column_level;
     let current_rid = app.nav.resource_id().clone();
     let title = current_rid.short_label().to_string();
+    let plural = current_rid.plural.clone();
+    let desc = app.data.descriptors.get(&current_rid).cloned();
+    // Split-borrow `App` at the field level: we need `&mut app.data.unified`
+    // and `&app.changed_rows` simultaneously, and they're disjoint fields.
+    // The borrow checker accepts this because it sees the field paths.
+    let changed_rows = &app.changed_rows;
     if let Some(table) = app.data.unified.get_mut(&current_rid) {
-        let desc = app.data.descriptors.get(&current_rid);
-        draw_unified_table(f, table_area, &title, table, ns, ft, theme, desc, cl, cr);
+        draw_unified_table(f, table_area, &title, &plural, table, ns, theme, desc.as_ref(), cl, changed_rows);
     } else {
         // Table doesn't exist yet (e.g., CRD not yet discovered). Show loading bar.
         let loading_text = crate::util::loading_bar("Loading...");
@@ -351,7 +368,6 @@ pub fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) 
     }
 
     let input = app.input_mode.input().unwrap_or("");
-    let is_scale = matches!(app.input_mode, InputMode::Scale { .. });
     let ghost: String = app.best_completion()
         .and_then(|c| {
             if c.starts_with(input) {
@@ -374,7 +390,7 @@ pub fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) 
         Span::styled(input, theme.command),
     ];
 
-    if !ghost.is_empty() && !is_scale {
+    if !ghost.is_empty() {
         spans.push(Span::styled(
             ghost,
             theme.command_suggestion.add_modifier(Modifier::DIM | Modifier::ITALIC),

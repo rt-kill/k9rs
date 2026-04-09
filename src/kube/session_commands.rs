@@ -218,7 +218,6 @@ pub(crate) fn handle_command_key(
     key: KeyEvent,
     data_source: &mut ClientSession,
     log_task: &mut Option<JoinHandle<()>>,
-    port_forward_task: &mut Option<JoinHandle<()>>,
     event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
 ) -> bool {
     if !matches!(app.input_mode, InputMode::Command { .. }) {
@@ -242,7 +241,7 @@ pub(crate) fn handle_command_key(
                 }
             }
             app.input_mode = InputMode::Normal;
-            handle_command_submit(app, &raw_cmd, &cmd, data_source, log_task, port_forward_task, event_tx);
+            handle_command_submit(app, &raw_cmd, &cmd, data_source, log_task, event_tx);
         }
         KeyCode::Tab => {
             app.accept_completion();
@@ -294,7 +293,6 @@ fn handle_command_submit(
     cmd: &str,
     data_source: &mut ClientSession,
     log_task: &mut Option<JoinHandle<()>>,
-    port_forward_task: &mut Option<JoinHandle<()>>,
     event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
 ) {
     use crate::kube::session_actions::handle_action;
@@ -313,14 +311,14 @@ fn handle_command_submit(
     } else if matches!(cmd, "alias" | "aliases" | "a") {
         handle_action(
             app, crate::app::actions::Action::ShowAliases, event_tx,
-            data_source, log_task, port_forward_task,
+            data_source, log_task,
         );
     } else if matches!(cmd, "ctx" | "context" | "contexts") {
         app.push_route(app.route.clone());
         app.route = crate::app::Route::Contexts;
     } else if cmd.starts_with("ctx ") || cmd.starts_with("context ") {
         let ctx_name = if cmd.starts_with("ctx ") { &raw_cmd[4..] } else { &raw_cmd[8..] }.trim().to_string();
-        begin_context_switch(app, data_source, &ctx_name, log_task, port_forward_task);
+        begin_context_switch(app, data_source, &ctx_name, log_task);
     } else if cmd.starts_with("ns ") || cmd.starts_with("namespace ") {
         let ns = if cmd.starts_with("ns ") { &raw_cmd[3..] } else { &raw_cmd[10..] }.trim().to_string();
         do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(ns.as_str()), log_task);
@@ -393,53 +391,172 @@ fn handle_command_submit(
     }
 }
 
-/// Handle a keystroke while in scale mode. Returns true if consumed.
-pub(crate) fn handle_scale_key(
+/// Handle a keystroke while a generic form dialog is open. Returns true if
+/// consumed. Replaces the old `handle_scale_key` and the inline port-forward
+/// dialog block in `session.rs` — both flowed into one place because the
+/// dialog is now schema-driven and doesn't need per-operation input logic.
+///
+/// Key bindings:
+///   - Esc                       → cancel (close without dispatching)
+///   - Tab / Down                → focus next field (or OK button)
+///   - BackTab / Up              → focus previous field
+///   - Enter                     → submit (collect values, dispatch typed command)
+///   - Left / Right              → cycle Select field options
+///   - Backspace                 → delete last char from text/number/port field
+///   - Char                      → append to text field; digit-only for number/port
+pub(crate) fn handle_form_dialog_key(
     app: &mut App,
     key: KeyEvent,
     data_source: &mut ClientSession,
 ) -> bool {
-    if !matches!(app.input_mode, InputMode::Scale { .. }) {
+    use crate::app::FormFieldKind;
+    if app.form_dialog.is_none() {
         return false;
     }
     match key.code {
         KeyCode::Esc => {
-            app.input_mode = InputMode::Normal;
+            app.form_dialog = None;
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            if let Some(ref mut d) = app.form_dialog {
+                d.focus_next();
+            }
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            if let Some(ref mut d) = app.form_dialog {
+                d.focus_prev();
+            }
         }
         KeyCode::Enter => {
-            let extracted = if let InputMode::Scale { ref input, ref target } = app.input_mode {
-                Some((input.trim().to_string(), target.clone()))
-            } else { None };
-            app.input_mode = InputMode::Normal;
-            if let Some((replica_str, target)) = extracted {
-                if let Ok(replicas) = replica_str.parse::<u32>() {
-                    app.kubectl_cache.clear();
-                    ds_try!(app, data_source.scale(
-                        target.resource.display_label(),
-                        &target.name,
-                        target.namespace.display(),
-                        replicas,
-                    ));
-                } else {
-                    app.flash = Some(crate::app::FlashMessage::warn(
-                        format!("Invalid replica count: {}", replica_str)
-                    ));
+            // Take the dialog out so the dispatcher can consume it without
+            // borrowing app twice.
+            if let Some(dialog) = app.form_dialog.take() {
+                dispatch_form_submit(app, data_source, dialog);
+            }
+        }
+        KeyCode::Left | KeyCode::Right => {
+            if let Some(ref mut d) = app.form_dialog {
+                if let Some(field) = d.current_field_mut() {
+                    if let FormFieldKind::Select { ref options } = field.kind {
+                        if !options.is_empty() {
+                            let n = options.len();
+                            let cur: usize = field.value.parse().unwrap_or(0);
+                            let new = if matches!(key.code, KeyCode::Left) {
+                                (cur + n - 1) % n
+                            } else {
+                                (cur + 1) % n
+                            };
+                            field.value = new.to_string();
+                        }
+                    }
                 }
             }
         }
         KeyCode::Backspace => {
-            if let InputMode::Scale { ref mut input, .. } = app.input_mode {
-                input.pop();
+            if let Some(ref mut d) = app.form_dialog {
+                if let Some(field) = d.current_field_mut() {
+                    if field.is_text_input() {
+                        field.value.pop();
+                    }
+                }
             }
         }
-        KeyCode::Char(c) if c.is_ascii_digit() => {
-            if let InputMode::Scale { ref mut input, .. } = app.input_mode {
-                input.push(c);
+        KeyCode::Char(c) => {
+            if let Some(ref mut d) = app.form_dialog {
+                if let Some(field) = d.current_field_mut() {
+                    let accept = match field.kind {
+                        FormFieldKind::Text { max_len } => {
+                            max_len.map_or(true, |m| field.value.chars().count() < m)
+                        }
+                        FormFieldKind::Number { .. } | FormFieldKind::Port => c.is_ascii_digit(),
+                        FormFieldKind::Select { .. } => false,
+                    };
+                    if accept {
+                        field.value.push(c);
+                    }
+                }
             }
         }
         _ => {}
     }
     true
+}
+
+/// Dispatch a submitted form dialog to the appropriate typed
+/// `SessionCommand`. The schema told the user what to type; this function
+/// converts the collected values into the strongly-typed wire payload.
+/// Centralized so adding a new operation kind only adds an arm here.
+fn dispatch_form_submit(
+    app: &mut App,
+    data_source: &mut ClientSession,
+    dialog: crate::app::FormDialog,
+) {
+    use crate::app::{FormDialog, FormFieldKind};
+    use crate::kube::protocol::OperationKind;
+
+    let FormDialog { kind, target, fields, .. } = dialog;
+    match kind {
+        OperationKind::Scale => {
+            let replicas_str = fields
+                .iter()
+                .find(|f| f.name == "replicas")
+                .map(|f| f.value.trim().to_string())
+                .unwrap_or_default();
+            match replicas_str.parse::<u32>() {
+                Ok(replicas) => {
+                    app.kubectl_cache.clear();
+                    ds_try!(app, data_source.scale(&target, replicas));
+                    app.flash = Some(crate::app::FlashMessage::info(
+                        format!("Scaling to {} replicas", replicas)
+                    ));
+                }
+                Err(_) => {
+                    app.flash = Some(crate::app::FlashMessage::warn(
+                        format!("Invalid replica count: {}", replicas_str)
+                    ));
+                }
+            }
+        }
+        OperationKind::PortForward => {
+            // container_port may be Select (value = option index → port string)
+            // or Port (value = port string directly). Handle both.
+            let container_port = fields
+                .iter()
+                .find(|f| f.name == "container_port")
+                .and_then(|f| match &f.kind {
+                    FormFieldKind::Select { options } => {
+                        let idx: usize = f.value.parse().ok()?;
+                        options.get(idx).and_then(|(v, _)| v.parse::<u16>().ok())
+                    }
+                    _ => f.value.trim().parse::<u16>().ok(),
+                });
+            let local_port = fields
+                .iter()
+                .find(|f| f.name == "local_port")
+                .and_then(|f| f.value.trim().parse::<u16>().ok());
+            match (container_port, local_port) {
+                (Some(cp), Some(lp)) => {
+                    ds_try!(app, data_source.port_forward(&target, lp, cp));
+                    app.flash = Some(crate::app::FlashMessage::info(
+                        format!("Port-forwarding {}:{} → {}", lp, cp, target.name)
+                    ));
+                }
+                _ => {
+                    app.flash = Some(crate::app::FlashMessage::warn(
+                        "Invalid port numbers".to_string()
+                    ));
+                }
+            }
+        }
+        // Other operations either have no input (handled directly without a
+        // form) or aren't yet wired up to use the form dialog. Surface a
+        // flash so we notice if a stray submit ever lands here.
+        other => {
+            app.flash = Some(crate::app::FlashMessage::warn(
+                format!("No form dispatcher for operation {:?}", other)
+            ));
+        }
+    }
 }
 
 /// Handle a keystroke while the nav filter bar is active. Returns true if consumed.
@@ -477,12 +594,10 @@ pub(crate) fn handle_filter_key(
                 KeyCode::Char(c) => { app.nav.filter_input_mut().text.push(c); }
                 _ => {}
             }
-            let text = app.nav.filter_input().text.clone();
-            let rid = app.nav.resource_id().clone();
-            if let Some(table) = app.data.unified.get_mut(&rid) {
-                table.filter_text = text;
-                table.rebuild_filter();
-            }
+            // The nav layer is the only source of truth for filter text;
+            // re-derive the visible row set from the updated input. This
+            // also refreshes the marked-visible cache.
+            app.reapply_nav_filters();
         }
         _ => {}
     }

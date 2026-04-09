@@ -1,9 +1,11 @@
 pub mod cache;
+pub mod capabilities;
 pub mod client_session;
 pub mod daemon;
 pub mod describe;
 pub mod live_query;
 pub mod live_query_dynamic;
+pub mod local;
 pub mod metrics;
 pub mod ops;
 pub mod protocol;

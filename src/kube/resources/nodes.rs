@@ -1,6 +1,6 @@
 use k8s_openapi::api::core::v1::Node;
 
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{DrillTarget, ResourceRow};
 
 /// Convert a k8s Node into a generic ResourceRow.
 /// CPU and MEM cells are initially "n/a" and mutated in-place by `apply_node_metrics`.
@@ -11,7 +11,9 @@ pub(crate) fn node_to_row(node: Node) -> ResourceRow {
     let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
     let age = metadata.creation_timestamp.map(|t| t.0);
 
-    // Determine roles from labels
+    // Determine roles from labels.
+    // Checks both `node-role.kubernetes.io/<role>` (standard) and
+    // `kubernetes.io/role` (legacy) label conventions.
     let roles = {
         let mut role_list: Vec<String> = Vec::new();
         for (key, value) in &labels {
@@ -23,12 +25,15 @@ pub(crate) fn node_to_row(node: Node) -> ResourceRow {
                 } else {
                     role_list.push(role.to_string());
                 }
+            } else if key == "kubernetes.io/role" && !value.is_empty() {
+                role_list.push(value.clone());
             }
         }
+        role_list.sort();
+        role_list.dedup();
         if role_list.is_empty() {
             "<none>".to_string()
         } else {
-            role_list.sort();
             role_list.join(",")
         }
     };
@@ -92,6 +97,11 @@ pub(crate) fn node_to_row(node: Node) -> ResourceRow {
         .unwrap_or_default();
 
     // CPU (col 8) and MEMORY (col 9) are initially n/a — mutated by apply_node_metrics.
+    let drill_target = Some(DrillTarget::PodsByField {
+        field: "spec.nodeName".to_string(),
+        value: name.clone(),
+        breadcrumb: format!("node/{}", name),
+    });
     ResourceRow {
         cells: vec![
             name.clone(),
@@ -110,6 +120,11 @@ pub(crate) fn node_to_row(node: Node) -> ResourceRow {
         ],
         name,
         namespace: String::new(),
-        extra: Default::default(),
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: Vec::new(),
+        node: None,
+        crd_info: None,
+        drill_target,
     }
 }

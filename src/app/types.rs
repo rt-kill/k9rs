@@ -168,11 +168,6 @@ pub enum InputMode {
         input: String,
         history_index: Option<usize>,
     },
-    /// Scale replica count prompt.
-    Scale {
-        input: String,
-        target: ObjectRef,
-    },
 }
 
 impl InputMode {
@@ -184,7 +179,7 @@ impl InputMode {
     pub fn input(&self) -> Option<&str> {
         match self {
             InputMode::Normal => None,
-            InputMode::Command { input, .. } | InputMode::Scale { input, .. } => Some(input),
+            InputMode::Command { input, .. } => Some(input),
         }
     }
 
@@ -193,7 +188,6 @@ impl InputMode {
         match self {
             InputMode::Normal => "",
             InputMode::Command { .. } => ":",
-            InputMode::Scale { .. } => "Replicas: ",
         }
     }
 }
@@ -254,46 +248,119 @@ pub struct ConfirmDialog {
     pub yes_selected: bool,
 }
 
-/// Which field in the port-forward dialog is focused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PortForwardField {
-    LocalPort,
-    ContainerPort,
-    Ok,
-    Cancel,
-}
+// ---------------------------------------------------------------------------
+// Form dialog
+// ---------------------------------------------------------------------------
+//
+// One generic dialog that handles every operation needing user input. The
+// shape comes from the server-declared `OperationDescriptor::input` schema
+// at construction time, augmented with row-specific defaults the client
+// pulls out of the selected `ResourceRow` (e.g. available container ports
+// for PortForward, current replica count for Scale).
+//
+// Submit dispatch is centralized: a single function pattern-matches on
+// `FormDialog::kind` to build the typed `SessionCommand` from the collected
+// field values. The widget never sees a wire command.
 
-impl PortForwardField {
-    pub fn next(self) -> Self {
-        match self {
-            Self::LocalPort => Self::ContainerPort,
-            Self::ContainerPort => Self::Ok,
-            Self::Ok => Self::Cancel,
-            Self::Cancel => Self::LocalPort,
-        }
-    }
-    pub fn prev(self) -> Self {
-        match self {
-            Self::LocalPort => Self::Cancel,
-            Self::ContainerPort => Self::LocalPort,
-            Self::Ok => Self::ContainerPort,
-            Self::Cancel => Self::Ok,
-        }
-    }
-    pub fn is_text_input(self) -> bool {
-        matches!(self, Self::LocalPort | Self::ContainerPort)
-    }
-}
+use crate::kube::protocol::OperationKind;
 
-/// Port-forward dialog — centered modal showing target and port options.
+/// One field's live state inside an open `FormDialog`. The `kind` is the
+/// schema-declared shape (the widget keys its rendering off this); `value`
+/// is the user's current input — text-typed for everything so partial
+/// input (e.g. mid-typed numbers) parses cleanly.
 #[derive(Debug, Clone)]
-pub struct PortForwardDialog {
-    pub target: String,
-    pub namespace: String,
-    pub available_ports: Vec<u16>,
-    pub local_port: String,
-    pub container_port: String,
-    pub selected_field: PortForwardField,
+pub struct FormFieldState {
+    /// Stable identifier — used by the per-OperationKind dispatcher to look
+    /// the value up at submit time. Must match the schema field name.
+    pub name: String,
+    /// User-facing label rendered to the left of the input.
+    pub label: String,
+    /// Discriminator that decides which input control the widget renders
+    /// and what keystrokes the input handler accepts.
+    pub kind: FormFieldKind,
+    /// Current input. For Text/Number/Port this is whatever the user has
+    /// typed; for Select this is the *selected option index* serialised as
+    /// a digit string ("0", "1", …) so the same field can be cycled by the
+    /// shared input handler.
+    pub value: String,
+}
+
+/// Field type discriminator. Mirrors `protocol::FieldKind` but adds the
+/// per-row data the schema can't carry (Select option list).
+#[derive(Debug, Clone)]
+pub enum FormFieldKind {
+    /// Free-form text. `max_len` is advisory.
+    Text { max_len: Option<usize> },
+    /// Integer with explicit bounds. Input is digits-only.
+    Number { min: i64, max: i64 },
+    /// Network port (1..=65535). Input is digits-only.
+    Port,
+    /// One of a fixed set of choices, cycled with Left/Right. Each entry
+    /// is `(value, display_label)`.
+    Select { options: Vec<(String, String)> },
+}
+
+/// A modal form dialog gathering input for a single operation.
+#[derive(Debug, Clone)]
+pub struct FormDialog {
+    /// Which operation's typed `SessionCommand` we'll build on submit.
+    pub kind: OperationKind,
+    /// Title shown in the dialog border (e.g. "Scale: deploy/nginx").
+    pub title: String,
+    /// Optional context line under the title (e.g. "namespace: default").
+    pub subtitle: String,
+    /// The object the operation will run on. Carried through to dispatch.
+    pub target: ObjectRef,
+    /// Schema fields, in display order.
+    pub fields: Vec<FormFieldState>,
+    /// Currently focused position. `0..fields.len()` are field indices;
+    /// `fields.len()` is the OK button. Esc cancels regardless of focus.
+    pub focused: usize,
+}
+
+impl FormDialog {
+    /// Number of focusable positions (one per field, plus the OK button).
+    pub fn focus_count(&self) -> usize {
+        self.fields.len() + 1
+    }
+
+    /// Move focus to the next position, wrapping around.
+    pub fn focus_next(&mut self) {
+        self.focused = (self.focused + 1) % self.focus_count();
+    }
+
+    /// Move focus to the previous position, wrapping around.
+    pub fn focus_prev(&mut self) {
+        let n = self.focus_count();
+        self.focused = (self.focused + n - 1) % n;
+    }
+
+    /// True if the OK button is currently focused.
+    pub fn ok_focused(&self) -> bool {
+        self.focused == self.fields.len()
+    }
+
+    /// Mutably borrow the currently focused field, if any.
+    pub fn current_field_mut(&mut self) -> Option<&mut FormFieldState> {
+        self.fields.get_mut(self.focused)
+    }
+
+    /// Look up a field's value by name. Returns the raw text; callers
+    /// parse based on the field kind they expect.
+    pub fn value(&self, name: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.value.as_str())
+    }
+}
+
+impl FormFieldState {
+    /// True if this field accepts text/digit input (i.e. the cursor sits
+    /// inside an edit box, not on a Select picker or button).
+    pub fn is_text_input(&self) -> bool {
+        matches!(self.kind, FormFieldKind::Text { .. } | FormFieldKind::Number { .. } | FormFieldKind::Port)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -543,18 +610,17 @@ pub enum ContentKind {
     Describe,
 }
 
-/// Key for the kubectl output cache.
+/// Key for the kubectl output cache. Typed end-to-end: keyed on the full
+/// `ObjectRef` so two CRDs sharing a Kind name across groups never collide.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
-    pub resource: String,
-    pub name: String,
-    pub namespace: String,
+    pub target: ObjectRef,
     pub kind: ContentKind,
 }
 
 impl CacheKey {
-    pub fn new(resource: impl Into<String>, name: impl Into<String>, namespace: impl Into<String>, kind: ContentKind) -> Self {
-        Self { resource: resource.into(), name: name.into(), namespace: namespace.into(), kind }
+    pub fn new(target: ObjectRef, kind: ContentKind) -> Self {
+        Self { target, kind }
     }
 }
 
@@ -581,8 +647,8 @@ impl KubectlCache {
         }
     }
 
-    pub fn get(&self, resource: &str, name: &str, namespace: &str, kind: ContentKind) -> Option<&str> {
-        let key = CacheKey::new(resource, name, namespace, kind);
+    pub fn get(&self, target: &ObjectRef, kind: ContentKind) -> Option<&str> {
+        let key = CacheKey::new(target.clone(), kind);
         self.entries
             .get(&key)
             .and_then(|entry| {
@@ -594,15 +660,8 @@ impl KubectlCache {
             })
     }
 
-    pub fn insert(
-        &mut self,
-        resource: String,
-        name: String,
-        namespace: String,
-        kind: ContentKind,
-        content: String,
-    ) {
-        let key = CacheKey::new(resource, name, namespace, kind);
+    pub fn insert(&mut self, target: ObjectRef, kind: ContentKind, content: String) {
+        let key = CacheKey::new(target, kind);
         // If the key already exists, just update the value (no change to insertion order).
         if self.entries.contains_key(&key) {
             self.entries.insert(key, CacheEntry { content, cached_at: std::time::Instant::now() });

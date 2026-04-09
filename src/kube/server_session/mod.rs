@@ -14,8 +14,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use kube::config::{KubeConfigOptions, Kubeconfig};
-use kube::Config;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -45,28 +43,97 @@ struct InitParams {
 // SessionSharedState — opaque to the daemon, holds kube-aware shared state
 // ---------------------------------------------------------------------------
 
+/// A request submitted to the single-owner client-builder task. The builder
+/// loop drains these one at a time, mutates process-global env vars in
+/// isolation (no concurrent reader), constructs the `kube::Client`, and
+/// hands the result back via `reply`. Replaces the `client_creation_lock`
+/// `Mutex<()>` that used to fence env-var mutations.
+struct ClientBuilderRequest {
+    kubeconfig_yaml: String,
+    env_vars: HashMap<String, String>,
+    context: Option<String>,
+    reply: tokio::sync::oneshot::Sender<anyhow::Result<(kube::Client, kube::Config)>>,
+}
+
 /// Shared state for all `ServerSession`s, created once at daemon startup.
 pub struct SessionSharedState {
     pub(super) watcher_cache: WatcherCache,
-    /// In-memory discovery cache: keyed by server_url for correct sharing.
+    /// Daemon-owned local resource sources (port-forwards, etc.).
+    /// Shared across every session on this daemon.
+    pub local_registry: Arc<crate::kube::local::LocalRegistry>,
     /// In-memory discovery cache: keyed by ContextId (server_url + user).
     pub discovery_cache: DashMap<protocol::ContextId, (Vec<String>, Vec<super::cache::CachedCrd>)>,
     /// Cached server-provided column headers per resource type.
     /// Populated on first subscription via the K8s Table API.
     pub column_cache: DashMap<protocol::ResourceId, Vec<String>>,
-    /// Serializes client creation so concurrent sessions don't corrupt
-    /// each other's process-global environment variables.
-    pub client_creation_lock: tokio::sync::Mutex<()>,
+    /// Channel into the single-owner client-builder task. Sessions submit
+    /// `ClientBuilderRequest`s here and await the oneshot reply. The builder
+    /// task is the only place that touches process-global env vars, which
+    /// removes the need for any lock or `unsafe` synchronization on the
+    /// caller side. (`std::env::set_var` is process-global; with one owner,
+    /// it can't race.)
+    client_builder_tx: mpsc::Sender<ClientBuilderRequest>,
 }
 
 impl SessionSharedState {
     pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<ClientBuilderRequest>(16);
+        // The builder task is detached for the daemon's lifetime. It exits
+        // when the channel closes, which happens when the last
+        // `SessionSharedState` is dropped (i.e. daemon shutdown).
+        tokio::spawn(client_builder_loop(rx));
         Self {
             watcher_cache: WatcherCache::new(),
+            local_registry: Arc::new(crate::kube::local::LocalRegistry::new()),
             discovery_cache: DashMap::new(),
             column_cache: DashMap::new(),
-            client_creation_lock: tokio::sync::Mutex::new(()),
+            client_builder_tx: tx,
         }
+    }
+}
+
+/// The single-owner client-builder loop. Owns process-global env vars; no
+/// other code in the daemon mutates them. Each request runs to completion
+/// before the next is dequeued, so even though we shadow process env vars,
+/// we never race with another reader.
+async fn client_builder_loop(mut rx: mpsc::Receiver<ClientBuilderRequest>) {
+    use kube::config::{Config, KubeConfigOptions, Kubeconfig};
+
+    while let Some(req) = rx.recv().await {
+        let result: anyhow::Result<(kube::Client, kube::Config)> = async {
+            for (key, value) in &req.env_vars {
+                // SAFETY: This task is the only writer of env vars in the
+                // daemon — `client_builder_loop` is spawned exactly once
+                // from `SessionSharedState::new`, and nothing else calls
+                // `std::env::set_var`. So there is no concurrent reader,
+                // and the process-global mutation is sequential.
+                #[allow(unused_unsafe)]
+                unsafe { std::env::set_var(key, value); }
+            }
+
+            let kubeconfig: Kubeconfig = serde_yaml::from_str(&req.kubeconfig_yaml)
+                .map_err(|e| anyhow::anyhow!("Failed to parse kubeconfig YAML: {}", e))?;
+
+            let context_name = req.context.clone()
+                .or_else(|| kubeconfig.current_context.clone());
+
+            let options = KubeConfigOptions {
+                context: context_name,
+                ..Default::default()
+            };
+
+            let mut config = Config::from_custom_kubeconfig(kubeconfig, &options).await
+                .map_err(|e| anyhow::anyhow!("Failed to create config from kubeconfig: {}", e))?;
+
+            config.read_timeout = Some(std::time::Duration::from_secs(300));
+            config.connect_timeout = Some(std::time::Duration::from_secs(30));
+
+            let client = kube::Client::try_from(config.clone())?;
+            Ok((client, config))
+        }.await;
+
+        // Receiver may be gone if the calling session bailed; ignore.
+        let _ = req.reply.send(result);
     }
 }
 
@@ -98,6 +165,10 @@ pub struct ServerSession {
     namespace: protocol::Namespace,
     readonly: bool,
     subscriptions: HashMap<protocol::ResourceId, (Subscription, JoinHandle<()>)>,
+    /// Parallel map for local (daemon-owned) resource subscriptions. These
+    /// have different ownership semantics (no K8s watcher, no grace period)
+    /// so they get their own type and map.
+    local_subscriptions: HashMap<protocol::ResourceId, JoinHandle<()>>,
     /// ResourceIds with CRD discovery tasks in flight. If the user unsubscribes
     /// before discovery completes, the ID is removed so the main loop discards
     /// the subscription when it arrives via sub_ready_rx.
@@ -134,6 +205,7 @@ impl ServerSession {
             namespace,
             readonly,
             subscriptions: HashMap::new(),
+            local_subscriptions: HashMap::new(),
             pending_discovery: std::collections::HashSet::new(),
             log_task: None,
             metrics_task: None,
@@ -286,8 +358,8 @@ impl ServerSession {
         session.client_config = Some(client_config);
 
         // Auto-subscribe to core resources.
-        session.handle_subscribe_resource(&protocol::ResourceId::from_alias("namespaces").unwrap(), false);
-        session.handle_subscribe_resource(&protocol::ResourceId::from_alias("nodes").unwrap(), false);
+        session.handle_subscribe_resource(&protocol::ResourceId::from_alias("namespaces").unwrap(), false, None);
+        session.handle_subscribe_resource(&protocol::ResourceId::from_alias("nodes").unwrap(), false, None);
 
         // Eagerly fetch discovery.
         session.handle_get_discovery_async();
@@ -303,39 +375,25 @@ impl ServerSession {
         }
     }
 
-    /// Create a `kube::Client` from the kubeconfig YAML + env vars sent by the TUI.
+    /// Create a `kube::Client` from the kubeconfig YAML + env vars sent by
+    /// the TUI. Delegates to the daemon-wide `client_builder_loop` so env
+    /// var mutations are serialized through one task — no `Mutex<()>` and
+    /// no concurrent process-global writes.
     async fn create_client_from_init(
         init: &InitParams,
         shared: &SessionSharedState,
     ) -> anyhow::Result<(kube::Client, kube::Config)> {
-        let _guard = shared.client_creation_lock.lock().await;
-
-        for (key, value) in &init.env_vars {
-            #[allow(unused_unsafe)]
-            unsafe {
-                std::env::set_var(key, value);
-            }
-        }
-
-        let kubeconfig: Kubeconfig = serde_yaml::from_str(&init.kubeconfig_yaml)
-            .map_err(|e| anyhow::anyhow!("Failed to parse kubeconfig YAML: {}", e))?;
-
-        let context_name = init.context.clone()
-            .or_else(|| kubeconfig.current_context.clone());
-
-        let options = KubeConfigOptions {
-            context: context_name,
-            ..Default::default()
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let req = ClientBuilderRequest {
+            kubeconfig_yaml: init.kubeconfig_yaml.clone(),
+            env_vars: init.env_vars.clone(),
+            context: init.context.clone(),
+            reply: reply_tx,
         };
-
-        let mut config = Config::from_custom_kubeconfig(kubeconfig, &options).await
-            .map_err(|e| anyhow::anyhow!("Failed to create config from kubeconfig: {}", e))?;
-
-        config.read_timeout = Some(std::time::Duration::from_secs(300));
-        config.connect_timeout = Some(std::time::Duration::from_secs(30));
-
-        let client = kube::Client::try_from(config.clone())?;
-        Ok((client, config))
+        shared.client_builder_tx.send(req).await
+            .map_err(|_| anyhow::anyhow!("Client builder task is gone"))?;
+        reply_rx.await
+            .map_err(|_| anyhow::anyhow!("Client builder dropped reply"))?
     }
 
     // -----------------------------------------------------------------------
@@ -352,11 +410,16 @@ impl ServerSession {
         );
 
         // Spawn a reader task that reads binary commands and sends them
-        // through an mpsc channel. This avoids partial-read issues with select!.
+        // through an mpsc channel. This avoids partial-read issues with
+        // `select!`. Wrap the abort handle in an RAII guard so the reader
+        // is reaped even if the loop body unwinds via panic — without the
+        // guard, a panic between spawn and the explicit `abort()` below
+        // would orphan the task.
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<SessionCommand>(32);
         let reader_handle = tokio::spawn(async move {
             binary_reader_loop(reader, cmd_tx).await;
         });
+        let _reader_guard = AbortOnDrop(Some(reader_handle.abort_handle()));
 
         let mut event_rx = self
             .event_rx
@@ -425,8 +488,10 @@ impl ServerSession {
                     if self.pending_discovery.remove(&id) {
                         // User still wants this subscription — bridge and track it.
                         info!("CRD subscription ready for '{}', spawning bridge", id.plural);
-                        let bridge = self.spawn_bridge(sub.clone(), id.plural.clone(), id.clone());
-                        self.subscriptions.insert(id, (sub, bridge));
+                        let bridge = self.spawn_bridge(sub.clone(), id.plural.clone(), id.clone(), None);
+                        self.subscriptions.insert(id.clone(), (sub, bridge));
+                        // CRDs get capabilities from meta lookup (all-false for unknown).
+                        self.emit_capabilities(&id);
                     } else {
                         // User unsubscribed while discovery was in flight — discard.
                         info!("Discarding stale CRD subscription for '{}' (unsubscribed during discovery)", id.plural);
@@ -436,7 +501,10 @@ impl ServerSession {
             }
         }
 
-        reader_handle.abort();
+        // `_reader_guard` aborts the reader on drop, including the unwind
+        // path. Explicit cleanup of session state (subscriptions, bridges,
+        // metrics poller) still runs here on the normal path.
+        drop(_reader_guard);
         self.cleanup().await;
         Ok(())
     }
@@ -456,10 +524,10 @@ impl ServerSession {
                 debug!("ServerSession: ignoring duplicate Init");
             }
 
-            SessionCommand::Subscribe(ref resource_id) => {
+            SessionCommand::Subscribe { ref resource, ref filter } => {
                 if self.pending_client.is_none() {
-                    info!("Subscribing to '{}' (context={}, ns={})", resource_id.plural, self.context.name, self.namespace);
-                    self.handle_subscribe_resource(resource_id, false);
+                    info!("Subscribing to '{}' (context={}, ns={}, filter={:?})", resource.plural, self.context.name, self.namespace, filter);
+                    self.handle_subscribe_resource(resource, false, filter.clone());
                 }
             }
 
@@ -490,8 +558,11 @@ impl ServerSession {
                     self.send_event(&SessionEvent::DescribeResult(
                         "Context switch in progress...".to_string(),
                     )).await?;
+                } else if obj.resource.is_local() {
+                    let content = self.describe_local(&obj.resource, &obj.name);
+                    self.send_event(&SessionEvent::DescribeResult(content)).await?;
                 } else {
-                    self.handle_describe_async(&obj.resource.plural, &obj.name, obj.namespace.display());
+                    self.handle_describe_async(obj);
                 }
             }
 
@@ -500,8 +571,11 @@ impl ServerSession {
                     self.send_event(&SessionEvent::YamlResult(
                         "Context switch in progress...".to_string(),
                     )).await?;
+                } else if obj.resource.is_local() {
+                    let content = self.yaml_local(&obj.resource, &obj.name);
+                    self.send_event(&SessionEvent::YamlResult(content)).await?;
                 } else {
-                    self.handle_yaml_async(&obj.resource.plural, &obj.name, obj.namespace.display());
+                    self.handle_yaml_async(obj);
                 }
             }
 
@@ -511,8 +585,13 @@ impl ServerSession {
                         ok: false,
                         message: "Context switch in progress".to_string(),
                     }).await;
+                } else if obj.resource.is_local() {
+                    // Same routing pattern as Describe/Yaml: local-resource
+                    // rids dispatch through the LocalResourceSource trait
+                    // (no kubectl), K8s rids go to handle_delete_async.
+                    self.handle_delete_local(obj);
                 } else {
-                    self.handle_delete_async(&obj.resource.plural, &obj.name, obj.namespace.display());
+                    self.handle_delete_async(obj);
                 }
             }
 
@@ -523,7 +602,7 @@ impl ServerSession {
                         message: "Context switch in progress".to_string(),
                     }).await;
                 } else {
-                    self.handle_scale_async(&target.resource.plural, &target.name, target.namespace.display(), replicas);
+                    self.handle_scale_async(target, replicas);
                 }
             }
 
@@ -534,7 +613,7 @@ impl ServerSession {
                         message: "Context switch in progress".to_string(),
                     }).await;
                 } else {
-                    self.handle_restart_async(&obj.resource.plural, &obj.name, obj.namespace.display());
+                    self.handle_restart_async(obj);
                 }
             }
 
@@ -555,7 +634,7 @@ impl ServerSession {
 
             SessionCommand::Refresh(ref resource_id) => {
                 if self.pending_client.is_none() {
-                    self.handle_subscribe_resource(resource_id, true);
+                    self.handle_subscribe_resource(resource_id, true, None);
                 }
             }
 
@@ -567,24 +646,35 @@ impl ServerSession {
                 self.handle_get_discovery_async();
             }
 
-            SessionCommand::DecodeSecret { name, namespace } => {
+            SessionCommand::DecodeSecret(ref target) => {
                 if self.pending_client.is_some() {
                     let _ = self.send_event(&SessionEvent::DescribeResult(
                         "Context switch in progress...".to_string(),
                     )).await;
                 } else {
-                    self.handle_decode_secret_async(&name, namespace.display());
+                    self.handle_decode_secret_async(target);
                 }
             }
 
-            SessionCommand::TriggerCronJob { name, namespace } => {
+            SessionCommand::TriggerCronJob(ref target) => {
                 if self.reject_if_readonly() { return Ok(()); }
-                self.handle_trigger_cronjob_async(&name, namespace.display());
+                self.handle_trigger_cronjob_async(target);
             }
 
-            SessionCommand::SuspendCronJob { name, namespace, suspend } => {
+            SessionCommand::ToggleSuspendCronJob(ref target) => {
                 if self.reject_if_readonly() { return Ok(()); }
-                self.handle_suspend_cronjob_async(&name, namespace.display(), suspend);
+                self.handle_toggle_suspend_cronjob_async(target);
+            }
+
+            SessionCommand::PortForward { ref target, local_port, container_port } => {
+                if self.pending_client.is_some() {
+                    let _ = self.send_event(&SessionEvent::CommandResult {
+                        ok: false,
+                        message: "Context switch in progress".to_string(),
+                    }).await;
+                } else {
+                    self.handle_port_forward(target, local_port, container_port);
+                }
             }
 
             // Management commands should not arrive on a session connection.
@@ -601,9 +691,9 @@ impl ServerSession {
     // Bridge: Subscription -> SessionEvent::Snapshot
     // -----------------------------------------------------------------------
 
-    fn spawn_bridge(&self, sub: Subscription, resource_type: String, resource_id: protocol::ResourceId) -> JoinHandle<()> {
+    fn spawn_bridge(&self, sub: Subscription, resource_type: String, resource_id: protocol::ResourceId, filter: Option<protocol::SubscriptionFilter>) -> JoinHandle<()> {
         let tx = self.event_tx.clone();
-        tokio::spawn(bridge_subscription_to_events(sub, resource_type, resource_id, tx))
+        tokio::spawn(bridge_subscription_to_events(sub, resource_type, resource_id, tx, filter))
     }
 
     // -----------------------------------------------------------------------
@@ -628,6 +718,34 @@ impl ServerSession {
         }
     }
 
+    /// Render a describe view for a local-resource row by dispatching to the
+    /// owning per-context `LocalResourceSource`. The error path returns a
+    /// user-readable string so the TUI can show it in the describe panel
+    /// directly.
+    fn describe_local(&self, rid: &protocol::ResourceId, name: &str) -> String {
+        let Some(source) = self.shared.local_registry.get(&self.context.name, rid) else {
+            return format!("Unknown local resource type: {}", rid.plural);
+        };
+        match source.describe(name) {
+            Some(Ok(content)) => content,
+            Some(Err(e)) => format!("Error: {}", e),
+            None => format!("describe is not supported on {}", rid.plural),
+        }
+    }
+
+    /// Render a YAML view for a local-resource row by dispatching to the
+    /// owning per-context `LocalResourceSource`. Mirrors `describe_local`.
+    fn yaml_local(&self, rid: &protocol::ResourceId, name: &str) -> String {
+        let Some(source) = self.shared.local_registry.get(&self.context.name, rid) else {
+            return format!("Unknown local resource type: {}", rid.plural);
+        };
+        match source.yaml(name) {
+            Some(Ok(content)) => content,
+            Some(Err(e)) => format!("Error: {}", e),
+            None => format!("yaml is not supported on {}", rid.plural),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Cleanup
     // -----------------------------------------------------------------------
@@ -641,6 +759,11 @@ impl ServerSession {
     async fn cleanup(&mut self) {
         self.handle_stop_logs();
         self.stop_all();
+        // Local subscriptions: drop the bridges. The sources stay alive on
+        // the shared registry (shared across all sessions).
+        for (_, h) in self.local_subscriptions.drain() { h.abort(); }
+        // Port-forwards themselves are owned by the shared PortForwardSource
+        // and survive this session's disconnect.
         if let Some(h) = self.metrics_task.take() { h.abort(); }
         if let Some(h) = self.pending_client_task.take() { h.abort(); }
         debug!("ServerSession: cleaned up");
@@ -683,7 +806,26 @@ async fn bridge_subscription_to_events(
     resource_type: String,
     resource_id: protocol::ResourceId,
     tx: mpsc::Sender<SessionEvent>,
+    filter: Option<protocol::SubscriptionFilter>,
 ) {
+    /// Apply OwnerUid post-filtering to a ResourceUpdate if needed.
+    /// Labels and Field filters are handled at the watcher level; OwnerUid
+    /// cannot be pushed to the K8s API, so we filter rows here.
+    fn apply_owner_filter(update: crate::event::ResourceUpdate, filter: &Option<protocol::SubscriptionFilter>) -> crate::event::ResourceUpdate {
+        let Some(protocol::SubscriptionFilter::OwnerUid(ref uid)) = filter else {
+            return update;
+        };
+        match update {
+            crate::event::ResourceUpdate::Rows { resource, headers, rows } => {
+                let filtered: Vec<_> = rows.into_iter().filter(|row| {
+                    row.owner_refs.iter().any(|r| r.uid == *uid)
+                }).collect();
+                crate::event::ResourceUpdate::Rows { resource, headers, rows: filtered }
+            }
+            other => other,
+        }
+    }
+
     // Send the current snapshot immediately if the watcher already has data.
     let current = sub.current();
     if current.is_some() {
@@ -692,39 +834,73 @@ async fn bridge_subscription_to_events(
         info!("Bridge '{}': no cached data yet, waiting for first update", resource_type);
     }
     if let Some(update) = current {
-        let event = SessionEvent::Snapshot(update);
-        if tx.send(event).await.is_err() {
+        let update = apply_owner_filter(update, &filter);
+        if tx.send(SessionEvent::Snapshot(update)).await.is_err() {
             return;
         }
     }
 
     loop {
         if sub.changed().await.is_err() {
-            debug!(
-                "ServerSession bridge: subscription closed for {}",
-                resource_type
-            );
+            debug!("ServerSession bridge: subscription closed for {}", resource_type);
             break;
         }
         let Some(update) = sub.current() else {
-            warn!(
-                "ServerSession bridge: watcher died for {}",
-                resource_type
-            );
+            warn!("ServerSession bridge: watcher died for {}", resource_type);
             let _ = tx.send(SessionEvent::SubscriptionError {
                 resource: resource_id,
                 message: format!("Watcher failed for {}", resource_type),
             }).await;
             break;
         };
+        let update = apply_owner_filter(update, &filter);
         debug!("Bridge sending snapshot for '{}'", resource_type);
-        let event = SessionEvent::Snapshot(update);
-        if tx.send(event).await.is_err() {
-            debug!(
-                "ServerSession bridge: event channel closed for {}",
-                resource_type
-            );
+        if tx.send(SessionEvent::Snapshot(update)).await.is_err() {
+            debug!("ServerSession bridge: event channel closed for {}", resource_type);
             break;
+        }
+    }
+}
+
+/// Bridge loop for local (daemon-owned) resources. Parallel to
+/// `bridge_subscription_to_events` but uses `LocalSubscription`, which has
+/// different ownership semantics — the source is never dropped by the
+/// bridge and there's no filter negotiation.
+async fn bridge_local_subscription_to_events(
+    mut sub: crate::kube::local::LocalSubscription,
+    resource_type: String,
+    tx: mpsc::Sender<SessionEvent>,
+) {
+    // Local sources always have a current snapshot (the type system enforces
+    // it: `LocalSubscription::current` returns `ResourceUpdate`, no Option).
+    info!("Local bridge '{}': sending initial snapshot", resource_type);
+    if tx.send(SessionEvent::Snapshot(sub.current())).await.is_err() {
+        return;
+    }
+
+    loop {
+        if sub.changed().await.is_err() {
+            debug!("Local bridge: channel closed for {}", resource_type);
+            break;
+        }
+        debug!("Local bridge sending snapshot for '{}'", resource_type);
+        if tx.send(SessionEvent::Snapshot(sub.current())).await.is_err() {
+            debug!("Local bridge: event channel closed for {}", resource_type);
+            break;
+        }
+    }
+}
+
+/// RAII guard that aborts a tokio task when dropped. Used by
+/// `ServerSession::run` to make sure the binary reader is reaped on every
+/// exit path, including unwind. Holding the abort handle in an `Option`
+/// lets the guard be `Drop`'d explicitly without `Drop` running twice.
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
         }
     }
 }

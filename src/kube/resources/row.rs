@@ -12,20 +12,37 @@ pub struct ResourceRow {
     pub name: String,
     /// Resource namespace (empty string for cluster-scoped resources).
     pub namespace: String,
-    /// Opaque metadata for action-specific fields (containers, labels, etc.).
-    /// Empty for display-only resources.
-    pub extra: BTreeMap<String, ExtraValue>,
+    /// What happens when the user presses Enter on this row.
+    /// Set by the converter (server-side); the client reads this blindly
+    /// to construct the appropriate nav action — no K8s knowledge needed.
+    /// `None` means describe-on-Enter.
+    pub drill_target: Option<DrillTarget>,
+    /// Container metadata (pods only). Used by the client to render container
+    /// selectors and by the server for owner-chain port resolution.
+    pub containers: Vec<ContainerInfo>,
+    /// Owner references (server-side for OwnerUid post-filtering).
+    pub owner_refs: Vec<OwnerRefInfo>,
+    /// Port-forward metadata: suggested local/remote ports for this resource.
+    /// Used by the client to populate the port-forward dialog.
+    pub pf_ports: Vec<u16>,
+    /// CRD definition metadata (only set on rows in the `crds` table).
+    /// Used by the client for command completion and autocomplete.
+    pub crd_info: Option<CrdRowInfo>,
+    /// Node name. `Some(name)` for pods scheduled to a node, `None` for
+    /// every other resource type AND for unscheduled pods. The client uses
+    /// this for `ShowNode` navigation; non-pod rows skip the action because
+    /// the field is `None` rather than the empty string.
+    pub node: Option<String>,
 }
 
-/// Values that can live in the `extra` metadata bag.
+/// CRD definition metadata (for rows in the `crds` table).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExtraValue {
-    Str(String),
-    List(Vec<String>),
-    Map(BTreeMap<String, String>),
-    Containers(Vec<ContainerInfo>),
-    OwnerRefs(Vec<OwnerRefInfo>),
-    Ports(Vec<u16>),
+pub struct CrdRowInfo {
+    pub group: String,
+    pub version: String,
+    pub kind: String,
+    pub plural: String,
+    pub scope: crate::kube::protocol::ResourceScope,
 }
 
 /// Container info for pods — used by shell, logs, port-forward.
@@ -49,17 +66,45 @@ pub struct OwnerRefInfo {
     pub uid: String,
 }
 
+/// What happens when the user presses Enter on a row. Set by the converter
+/// (server-side) so the client doesn't need K8s knowledge to drill down.
+///
+/// The client reads this blindly and constructs the appropriate nav action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DrillTarget {
+    /// Switch to a different namespace (used by namespace rows).
+    SwitchNamespace(String),
+    /// Push a CRD-instance view onto the nav stack.
+    BrowseCrd {
+        group: String,
+        version: String,
+        kind: String,
+        plural: String,
+        scope: crate::kube::protocol::ResourceScope,
+    },
+    /// Drill down to pods filtered by label selector (deploy/sts/ds/svc/job).
+    PodsByLabels {
+        labels: BTreeMap<String, String>,
+        /// Display label for the breadcrumb (e.g., "deploy/my-app").
+        breadcrumb: String,
+    },
+    /// Drill down to pods filtered by ownerReference UID (replicaset/job).
+    PodsByOwner {
+        uid: String,
+        kind: String,
+        name: String,
+    },
+    /// Drill down to pods filtered by field selector (e.g., spec.nodeName=X).
+    PodsByField {
+        field: String,
+        value: String,
+        breadcrumb: String,
+    },
+    /// Drill down to pods by name prefix (fallback when no selector exists).
+    PodsByNameGrep(String),
+}
+
 impl super::KubeResource for ResourceRow {
-    fn headers() -> &'static [&'static str] where Self: Sized {
-        // ResourceRow uses runtime headers via TableDescriptor.
-        // This static fallback is only called by code that doesn't know the concrete type.
-        &["NAME"]
-    }
-
-    fn row(&self) -> Vec<std::borrow::Cow<'_, str>> {
-        self.cells.iter().map(|c| std::borrow::Cow::Borrowed(c.as_str())).collect()
-    }
-
     fn cells(&self) -> &[String] {
         &self.cells
     }
@@ -71,48 +116,9 @@ impl super::KubeResource for ResourceRow {
     fn namespace(&self) -> &str {
         &self.namespace
     }
-
-    fn kind() -> &'static str where Self: Sized {
-        "resource"
-    }
 }
 
 impl ResourceRow {
-    pub fn extra_str(&self, key: &str) -> Option<&str> {
-        match self.extra.get(key)? {
-            ExtraValue::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    pub fn extra_map(&self, key: &str) -> Option<&BTreeMap<String, String>> {
-        match self.extra.get(key)? {
-            ExtraValue::Map(m) => Some(m),
-            _ => None,
-        }
-    }
-
-    pub fn extra_containers(&self) -> Option<&[ContainerInfo]> {
-        match self.extra.get("containers")? {
-            ExtraValue::Containers(c) => Some(c),
-            _ => None,
-        }
-    }
-
-    pub fn extra_owner_refs(&self) -> Option<&[OwnerRefInfo]> {
-        match self.extra.get("owner_references")? {
-            ExtraValue::OwnerRefs(r) => Some(r),
-            _ => None,
-        }
-    }
-
-    pub fn extra_ports(&self, key: &str) -> Option<&[u16]> {
-        match self.extra.get(key)? {
-            ExtraValue::Ports(p) => Some(p),
-            _ => None,
-        }
-    }
-
     /// Mutate a cell in-place (e.g., for metrics overlay).
     pub fn set_cell(&mut self, col: usize, value: String) {
         if col < self.cells.len() {

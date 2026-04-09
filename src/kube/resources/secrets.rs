@@ -23,6 +23,11 @@ pub(crate) fn secret_to_row(secret: Secret) -> ResourceRow {
         ],
         name,
         namespace: ns,
-        extra: Default::default(),
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: Vec::new(),
+        node: None,
+        crd_info: None,
+        drill_target: None,
     }
 }

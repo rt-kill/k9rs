@@ -6,6 +6,7 @@ use crate::app::{App, Route};
 use crate::app::nav::rid;
 #[cfg(test)]
 use crate::app::ContainerRef;
+use crate::kube::protocol::OperationKind;
 
 /// Maps a `KeyEvent` to an `Action` based on the current application state.
 /// Returns `None` if the key has no binding in the current context.
@@ -156,7 +157,7 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
 
     // Ctrl-K: force-kill pod.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
-        if !app.nav.resource_id().supports_shell() {
+        if !app.current_capabilities().supports(OperationKind::ForceKill) {
             return Some(Action::FlashInfo("Force-kill is only available on Pods".to_string()));
         }
         return Some(Action::ForceKill);
@@ -198,54 +199,63 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') => Some(Action::Yaml),
         KeyCode::Char('e') => Some(Action::Edit),
 
-        // Logs: available on pods and workload types.
+        // Logs: available on pods and workload types. We consult both the
+        // server-provided capabilities AND the static resource_types table —
+        // capabilities arrive asynchronously, so checking only the manifest
+        // would make `l` fail in the brief window after subscribe but before
+        // the server's first ResourceCapabilities event lands.
         KeyCode::Char('l') => {
-            if app.nav.resource_id().supports_logs() {
+            let can_log = app.current_capabilities().supports(OperationKind::StreamLogs)
+                || crate::kube::resource_types::find_by_plural(&app.nav.resource_id().plural)
+                    .map_or(false, |meta| meta.supports_logs);
+            if can_log {
                 Some(Action::Logs)
             } else {
                 Some(Action::FlashInfo("Logs not available for this resource type".to_string()))
             }
         }
         KeyCode::Char('s') => {
-            let rid = app.nav.resource_id();
-            if rid.supports_shell() {
+            let caps = app.current_capabilities();
+            if caps.supports(OperationKind::Shell) {
                 Some(Action::Shell)
-            } else if rid.supports_scale() {
+            } else if caps.supports(OperationKind::Scale) {
                 Some(Action::Scale)
-            } else if rid.plural == "cronjobs" {
+            } else if caps.supports(OperationKind::ToggleSuspendCronJob) {
                 Some(Action::SuspendCronJob)
             } else {
                 None
             }
         }
         KeyCode::Char('x') => {
-            if app.nav.resource_id().plural == "secrets" {
+            if app.current_capabilities().supports(OperationKind::DecodeSecret) {
                 Some(Action::DecodeSecret)
             } else {
                 None
             }
         }
         KeyCode::Char('t') => {
-            if app.nav.resource_id().plural == "cronjobs" {
+            if app.current_capabilities().supports(OperationKind::TriggerCronJob) {
                 Some(Action::TriggerCronJob)
             } else {
                 None
             }
         }
         KeyCode::Char('r') => {
-            if app.nav.resource_id().supports_restart() {
+            if app.current_capabilities().supports(OperationKind::Restart) {
                 Some(Action::Restart)
             } else {
                 None
             }
         }
 
-        // Port-forward (resolves to pod from any workload/service).
-        KeyCode::Char('f') | KeyCode::Char('F') => Some(Action::PortForward),
+        // F: create a new port-forward (opens dialog).
+        KeyCode::Char('F') => Some(Action::PortForward),
+        // f: show active port-forwards for this resource.
+        KeyCode::Char('f') => Some(Action::ShowPortForwards),
 
         // Previous logs: available on pods and workload types.
         KeyCode::Char('p') => {
-            if app.nav.resource_id().supports_logs() {
+            if app.current_capabilities().supports(OperationKind::PreviousLogs) {
                 Some(Action::PreviousLogs)
             } else {
                 Some(Action::FlashInfo("Logs not available for this resource type".to_string()))
@@ -254,7 +264,7 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
 
         // Show node for a pod.
         KeyCode::Char('o') => {
-            if app.nav.resource_id().supports_shell() {
+            if app.current_capabilities().supports(OperationKind::ShowNode) {
                 Some(Action::ShowNode)
             } else {
                 Some(Action::FlashInfo("Show node is only available on Pods".to_string()))
@@ -278,7 +288,7 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('A') => Some(Action::Sort(usize::MAX)),
 
         // Sort by STATUS (column 3, meaningful for Pods).
-        KeyCode::Char('S') if app.nav.resource_id().supports_shell() => Some(Action::Sort(3)),
+        KeyCode::Char('S') if app.current_capabilities().supports(OperationKind::Shell) => Some(Action::Sort(3)),
 
         // Copy.
         KeyCode::Char('c') => Some(Action::Copy),

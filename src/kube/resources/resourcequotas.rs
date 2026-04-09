@@ -20,6 +20,11 @@ pub(crate) fn resource_quota_to_row(rq: ResourceQuota) -> ResourceRow {
         cells: vec![ns.clone(), name.clone(), hard, used, crate::util::format_age(age)],
         name,
         namespace: ns,
-        extra: Default::default(),
+        containers: Vec::new(),
+        owner_refs: Vec::new(),
+        pf_ports: Vec::new(),
+        node: None,
+        crd_info: None,
+        drill_target: None,
     }
 }

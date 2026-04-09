@@ -63,8 +63,10 @@ pub enum Action {
     SwitchContext(String),
     /// Restart the selected deployment/statefulset/daemonset.
     Restart,
-    /// Set up port-forwarding for the selected resource.
+    /// Set up port-forwarding for the selected resource (Shift+F).
     PortForward,
+    /// Show active port-forwards for the selected resource (f).
+    ShowPortForwards,
     /// Toggle the header row visibility.
     ToggleHeader,
     /// Toggle full-fetch mode (wait for complete list vs incremental loading).

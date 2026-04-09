@@ -30,15 +30,17 @@ pub mod pdb;
 pub mod crds;
 pub mod converters;
 
+/// The contract for anything that can live inside a `StatefulTable`. The
+/// only implementor is `ResourceRow`; this trait is the bound used by
+/// generic table machinery (`StatefulTable<T>`, `live_query`'s sort
+/// helpers) so they don't have to depend on the concrete row type.
 pub trait KubeResource: Clone + std::fmt::Debug + Send + Sync + 'static {
-    fn headers() -> &'static [&'static str] where Self: Sized;
-    fn row(&self) -> Vec<std::borrow::Cow<'_, str>>;
-    /// Direct access to cell strings without allocation.
-    /// Default implementation calls row() — override for zero-alloc access.
-    fn cells(&self) -> &[String] { &[] }
+    /// The display columns for this row, in header order.
+    fn cells(&self) -> &[String];
+    /// Resource name (cached for O(1) access in sorts/filters).
     fn name(&self) -> &str;
-    fn namespace(&self) -> &str { "" }
-    fn kind() -> &'static str where Self: Sized;
+    /// Resource namespace, or `""` for cluster-scoped rows.
+    fn namespace(&self) -> &str;
 }
 
 pub fn access_mode_short(mode: &str) -> &str {

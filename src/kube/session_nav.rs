@@ -84,22 +84,6 @@ pub(crate) fn drill_to_pods_by_owner(
     )));
 }
 
-/// Drill from Deployment to its pods via selector labels.
-pub(crate) fn drill_deployment_to_pods(
-    app: &mut App,
-    data_source: &mut ClientSession,
-    deploy_name: &str,
-) {
-    if let Some(row) = app.data.unified.get(&rid("deployments")).and_then(|t| t.selected_item()) {
-        let labels = row.extra_map("selector_labels").cloned().unwrap_or_default();
-        if !labels.is_empty() {
-            drill_to_pods_by_labels(app, data_source, labels, &format!("deploy/{}", deploy_name));
-            return;
-        }
-    }
-    drill_to_pods_by_grep(app, data_source, deploy_name);
-}
-
 /// Begin a context switch. Immediately clears UI state and shows a flash message,
 /// then delegates the slow client creation to `DataSource`. In local mode the
 /// result arrives via `AppEvent::ContextSwitchResult`; in daemon mode it comes
@@ -109,7 +93,6 @@ pub(crate) fn begin_context_switch(
     data_source: &mut ClientSession,
     ctx_name: &str,
     log_task: &mut Option<JoinHandle<()>>,
-    port_forward_task: &mut Option<JoinHandle<()>>,
 ) {
     // Guard against rapid context switches — if one is already in flight, reject.
     if app.context_switch_pending {
@@ -125,10 +108,10 @@ pub(crate) fn begin_context_switch(
         handle.abort();
     }
     ds_try!(app, data_source.stop_logs());
-    // Cancel any active port-forward — it belongs to the old context
-    if let Some(handle) = port_forward_task.take() {
-        handle.abort();
-    }
+    // Note: port-forwards are daemon-wide (shared across sessions) and live
+    // in the `PortForwardSource`. They survive context switches — their
+    // kubectl subprocesses keep running against whatever `--context` they
+    // were spawned with. The PF table just reflects the source's state.
     // Immediate: clear data and show feedback — keeps TUI responsive.
     // Look up cluster/user from the in-memory contexts list (no disk I/O).
     app.context = ctx_name.to_string();
@@ -150,19 +133,24 @@ pub(crate) fn begin_context_switch(
     app.route_stack.clear();
     app.route = crate::app::Route::Overview;
     app.confirm_dialog = None;
-    app.port_forward_dialog = None;
+    app.form_dialog = None;
     app.input_mode = InputMode::Normal;
     app.prev_rows.clear();
     app.changed_rows.clear();
     app.pod_metrics.clear();
     app.node_metrics.clear();
+    app.capabilities.clear();
     app.flash = Some(crate::app::FlashMessage::info(format!(
         "Switching to context: {}...",
         ctx_name
     )));
 
-    // Delegate background client creation to the session.
-    ds_try!(app, data_source.switch_context(ctx_name));
+    // Delegate background client creation to the session. The cached
+    // kubeconfig YAML and env vars come from `app` (populated by the
+    // `KubeconfigLoaded` event when the session first started).
+    let yaml = app.kubeconfig_yaml.clone();
+    let env = app.kubeconfig_env.clone();
+    ds_try!(app, data_source.switch_context(ctx_name, &yaml, &env));
 }
 
 /// Apply the result of a background context switch.
@@ -199,9 +187,11 @@ pub(crate) fn apply_context_switch_result(
             // auto-subscribed by the server session init.
             if app.route == crate::app::Route::Resources {
                 let rid = app.nav.resource_id().clone();
+                let sub_filter = app.nav.current().filter.as_ref().and_then(|f| f.to_subscription_filter());
                 let change = crate::app::nav::NavChange {
                     unsubscribe: None,
                     subscribe: Some(rid),
+                    subscription_filter: sub_filter,
                 };
                 super::session::apply_nav_change(app, data_source, change);
             }
@@ -216,7 +206,7 @@ pub(crate) fn apply_context_switch_result(
             // so the app state is consistent with the actual active client.
             let active_ctx = {
                 let ds_ctx = data_source.context_name();
-                if ds_ctx.is_empty() { app.context.clone() } else { ds_ctx.to_string() }
+                if ds_ctx.is_empty() { app.context.clone() } else { ds_ctx }
             };
             // Look up cluster/user from the in-memory contexts list (no disk I/O).
             let (cluster, user) = app.data.contexts.items.iter()
@@ -234,6 +224,7 @@ pub(crate) fn apply_context_switch_result(
             let change = crate::app::nav::NavChange {
                 unsubscribe: None,
                 subscribe: Some(rid),
+                subscription_filter: None,
             };
             super::session::apply_nav_change(app, data_source, change);
             app.flash = Some(crate::app::FlashMessage::error(format!(
