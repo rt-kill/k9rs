@@ -11,7 +11,7 @@ pub(crate) fn cluster_role_to_row(cr: ClusterRole) -> ResourceRow {
     ResourceRow {
         cells: vec![name.clone(), rules_count.to_string(), crate::util::format_age(age)],
         name,
-        namespace: String::new(),
+        namespace: None,
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

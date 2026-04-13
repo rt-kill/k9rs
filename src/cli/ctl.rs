@@ -24,12 +24,12 @@ pub enum CtlCommand {
     },
 }
 
-pub async fn run(cmd: CtlCommand) -> Result<()> {
+pub async fn run(cmd: CtlCommand, json: bool) -> Result<()> {
     match cmd {
-        CtlCommand::Status => cmd_status().await,
-        CtlCommand::Ping => cmd_ping().await,
-        CtlCommand::Stop => cmd_stop().await,
-        CtlCommand::Clear { context } => cmd_clear(context).await,
+        CtlCommand::Status => cmd_status(json).await,
+        CtlCommand::Ping => cmd_ping(json).await,
+        CtlCommand::Stop => cmd_stop(json).await,
+        CtlCommand::Clear { context } => cmd_clear(context, json).await,
     }
 }
 
@@ -45,67 +45,83 @@ async fn connect_or_bail() -> Result<DaemonClient> {
     }
 }
 
-async fn cmd_status() -> Result<()> {
+async fn cmd_status(json: bool) -> Result<()> {
     let mut dc = connect_or_bail().await?;
     let resp = dc.request(&SessionCommand::Status).await;
     match resp {
         Some(SessionEvent::DaemonStatus(status)) => {
-            let uptime = format_duration(status.uptime_secs);
-            println!("Daemon:     running (pid {})", status.pid);
-            println!("Socket:     {}", status.socket_path);
-            println!("Uptime:     {}", uptime);
+            if json {
+                println!("{}", serde_json::json!({
+                    "status": "running",
+                    "pid": status.pid,
+                    "socket": status.socket_path,
+                    "uptime_secs": status.uptime_secs,
+                }));
+            } else {
+                let uptime = format_duration(status.uptime_secs);
+                println!("Daemon:     running (pid {})", status.pid);
+                println!("Socket:     {}", status.socket_path);
+                println!("Uptime:     {}", uptime);
+            }
         }
         _ => {
-            println!("Daemon: not running");
-            println!(
-                "Socket: {:?} (not found)",
-                crate::kube::daemon::socket_path()
-            );
+            if json {
+                println!("{}", serde_json::json!({"status": "not_running"}));
+            } else {
+                println!("Daemon: not running");
+                println!("Socket: {:?} (not found)", crate::kube::daemon::socket_path());
+            }
         }
     }
     Ok(())
 }
 
-async fn cmd_ping() -> Result<()> {
+async fn cmd_ping(json: bool) -> Result<()> {
     let mut dc = connect_or_bail().await?;
     let start = Instant::now();
     let resp = dc.request(&SessionCommand::Ping).await;
     let elapsed = start.elapsed();
     match resp {
         Some(SessionEvent::CommandResult { ok: true, .. }) => {
-            println!(
-                "Daemon is alive at {:?} ({}ms)",
-                crate::kube::daemon::socket_path(),
-                elapsed.as_millis()
-            );
+            if json {
+                println!("{}", serde_json::json!({"alive": true, "latency_ms": elapsed.as_millis() as u64}));
+            } else {
+                println!("Daemon is alive at {:?} ({}ms)", crate::kube::daemon::socket_path(), elapsed.as_millis());
+            }
         }
-        _ => {
-            bail!("Daemon connected but not responding");
-        }
+        _ => bail!("Daemon connected but not responding"),
     }
     Ok(())
 }
 
-async fn cmd_stop() -> Result<()> {
+async fn cmd_stop(json: bool) -> Result<()> {
     let mut dc = connect_or_bail().await?;
     let resp = dc.request(&SessionCommand::Shutdown).await;
     match resp {
-        Some(SessionEvent::CommandResult { ok: true, .. }) => println!("Daemon shutting down"),
+        Some(SessionEvent::CommandResult { ok: true, .. }) => {
+            if json {
+                println!("{}", serde_json::json!({"ok": true, "message": "shutting down"}));
+            } else {
+                println!("Daemon shutting down");
+            }
+        }
         _ => bail!("Failed to send shutdown request"),
     }
     Ok(())
 }
 
-async fn cmd_clear(context: Option<String>) -> Result<()> {
+async fn cmd_clear(context: Option<String>, json: bool) -> Result<()> {
     let mut dc = connect_or_bail().await?;
     let resp = dc.request(&SessionCommand::Clear { context: context.clone() }).await;
     match resp {
         Some(SessionEvent::CommandResult { ok: true, message }) => {
-            println!("{}", message);
+            if json {
+                println!("{}", serde_json::json!({"ok": true, "message": message}));
+            } else {
+                println!("{}", message);
+            }
         }
-        _ => {
-            bail!("Failed to clear cache");
-        }
+        _ => bail!("Failed to clear cache"),
     }
     Ok(())
 }

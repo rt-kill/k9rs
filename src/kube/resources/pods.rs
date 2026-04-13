@@ -340,7 +340,7 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
             crate::util::format_age(age),
         ],
         name,
-        namespace,
+        namespace: Some(namespace),
         containers: containers_vec,
         owner_refs: owner_references,
         pf_ports,

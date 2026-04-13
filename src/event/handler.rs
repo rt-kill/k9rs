@@ -51,6 +51,16 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
         Route::Shell { .. } => handle_log_view_keys(app, key),
         Route::ContainerSelect { .. } => handle_container_select_keys(key),
         Route::Aliases { .. } => handle_detail_view_keys(key),
+        // Edit flow is modal — keys are blocked while we wait for the
+        // server response or the editor subprocess. The session loop
+        // drives transitions; the user is either looking at a "loading"
+        // screen (AwaitingYaml/Applying) or has been suspended into the
+        // editor (EditorReady). Esc cancels in the AwaitingYaml/Applying
+        // states by popping the route.
+        Route::EditingResource { .. } => match key.code {
+            KeyCode::Esc => Some(Action::Back),
+            _ => None,
+        },
     }
 }
 
@@ -271,6 +281,12 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
             }
         }
 
+        // Jump to owner (Shift+J). Navigates up the ownerReferences chain.
+        KeyCode::Char('J') => Some(Action::JumpToOwner),
+
+        // UsedBy (U). Shows which resources reference the selected row.
+        KeyCode::Char('U') => Some(Action::UsedBy),
+
         // Toggle between last two views.
         KeyCode::Char('-') => Some(Action::ToggleLastView),
 
@@ -349,6 +365,10 @@ fn handle_detail_view_keys(key: KeyEvent) -> Option<Action> {
 // ---------------------------------------------------------------------------
 
 fn handle_log_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
+    // Ctrl+S: save logs to file.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+        return Some(Action::SaveLogs);
+    }
     // Shift-C: clear logs.
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Char('C') {
         return Some(Action::ClearLogs);

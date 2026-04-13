@@ -13,10 +13,21 @@ pub(crate) fn apply_event(
     match event {
         AppEvent::ResourceUpdate(update) => apply_resource_update(app, update),
         AppEvent::Flash(flash) => {
+            // Terminal state of the unified edit flow: when we're waiting
+            // for an `Apply` to come back, the next `CommandResult`
+            // (delivered as a `Flash` event) is *the* result. Pop the
+            // edit route so the user lands back on the resource view,
+            // and clear the kubectl cache since the resource may have
+            // changed.
+            if let crate::app::Route::EditingResource {
+                state: crate::app::EditState::Applying,
+                ..
+            } = app.route {
+                app.kubectl_cache.clear();
+                app.pop_route();
+            }
             app.flash = Some(flash);
         }
-        // ContextSwitchResult is handled in the main event loop before apply_event
-        AppEvent::ContextSwitchResult { .. } => {}
         AppEvent::ResourceResolved { original, resolved } => {
             // The server discovered the true identity of a resource we subscribed to
             // with incomplete info (e.g., `:nodeclaims` → karpenter.sh/v1/NodeClaim/Cluster).
@@ -24,6 +35,14 @@ pub(crate) fn apply_event(
             // snapshots (keyed by resolved rid) find the right table.
             if *app.nav.resource_id() == original {
                 app.nav.current_mut().resource = resolved.clone();
+                // If the resolved resource is cluster-scoped but we're in a
+                // specific namespace, auto-switch to All. The watcher already
+                // uses Api::all_with (server resolved the scope), so this is
+                // a display-only correction — same as the auto-switch that
+                // fires when discovery is loaded (session_commands.rs:366).
+                if resolved.is_cluster_scoped() && !app.selected_ns.is_all() {
+                    app.selected_ns = crate::kube::protocol::Namespace::All;
+                }
             }
             // Move the table entry from old key to new key.
             if let Some(table) = app.data.unified.remove(&original) {
@@ -35,16 +54,28 @@ pub(crate) fn apply_event(
         }
         AppEvent::SubscriptionFailed { resource, message } => {
             // Mark the table as errored so the UI shows the error instead of spinner.
+            // Clear items so the error is visible even if data was previously loaded
+            // (the rendering code only shows table.error when items is empty).
             let table = app.data.unified.entry(resource).or_insert_with(crate::app::StatefulTable::new);
             table.error = Some(message);
+            table.clear_data();
         }
         AppEvent::PodMetrics(metrics) => {
             app.pod_metrics = metrics;
             app.apply_pod_metrics();
+            // Metrics overlay changes cell values — if the user has a grep
+            // filter active on CPU/MEM columns, re-filter so it reflects the
+            // updated values. Only needed when viewing the affected resource.
+            if app.nav.resource_id().plural == "pods" {
+                app.reapply_nav_filters();
+            }
         }
         AppEvent::NodeMetrics(metrics) => {
             app.node_metrics = metrics;
             app.apply_node_metrics();
+            if app.nav.resource_id().plural == "nodes" {
+                app.reapply_nav_filters();
+            }
         }
         AppEvent::LogStreamEnded => {
             if let crate::app::Route::Logs { ref mut state, .. } | crate::app::Route::Shell { ref mut state, .. } = app.route {
@@ -76,8 +107,7 @@ pub(crate) fn apply_event(
             app.should_quit = true;
         }
         AppEvent::KubeconfigLoaded {
-            contexts, current_context, current_cluster, current_user,
-            kubeconfig_yaml, env_vars,
+            contexts, current_context, current_cluster, current_user, ..
         } => {
             // Adopt the kubeconfig's view only if the daemon hasn't already
             // published its own (authoritative) values via ConnectionEstablished.
@@ -90,9 +120,6 @@ pub(crate) fn apply_event(
             }
             app.contexts = contexts.iter().map(|c| c.name.clone()).collect();
             app.data.contexts.set_items(contexts);
-            // Cache the YAML/env so context switches don't have to read disk.
-            app.kubeconfig_yaml = kubeconfig_yaml;
-            app.kubeconfig_env = env_vars;
         }
     }
 }
@@ -103,17 +130,18 @@ fn apply_resource_update(
 ) {
     match update {
         ResourceUpdate::Rows { resource, headers, rows } => {
-            app.data.descriptors.insert(resource.clone(), crate::app::TableDescriptor { headers });
-            track_deltas(app, &rows);
             // The entry is guaranteed to exist for any actively-subscribed
             // resource: `apply_nav_change` calls `clear_resource()` (which
             // creates-or-clears) before sending Subscribe. A `None` here means
             // the snapshot is stale (the user navigated away and we
             // unsubscribed before the snapshot reached us); drop it.
-            let Some(table) = app.data.unified.get_mut(&resource) else {
+            if !app.data.unified.contains_key(&resource) {
                 return;
-            };
-            table.set_items_filtered(rows);
+            }
+            app.data.descriptors.insert(resource.clone(), crate::app::TableDescriptor { headers });
+            track_deltas(app, &rows);
+            // Safe: contains_key check above guarantees the entry exists.
+            app.data.unified.get_mut(&resource).unwrap().set_items_filtered(rows);
             // Apply metrics overlay whenever fresh data arrives.
             if resource.plural == "nodes" {
                 app.apply_node_metrics();
@@ -123,12 +151,38 @@ fn apply_resource_update(
             }
         }
         ResourceUpdate::Yaml(content) => {
+            // Two routes consume `YamlResult`:
+            //   1. `Route::Yaml` — the read-only YAML viewer.
+            //   2. `Route::EditingResource { state: AwaitingYaml }` — the
+            //      first stage of the unified edit flow. We write the
+            //      content to a temp file and transition to `EditorReady`,
+            //      and the session main loop will pick it up on its next
+            //      iteration to suspend + exec `$EDITOR`.
             if let crate::app::Route::Yaml { ref target, ref mut awaiting_response, ref mut state } = app.route {
                 if *awaiting_response {
                     app.kubectl_cache.insert(target.clone(), crate::app::ContentKind::Yaml, content.clone());
                     *awaiting_response = false;
                 }
                 state.set_content(content);
+            } else if let crate::app::Route::EditingResource {
+                ref target,
+                ref mut state,
+            } = app.route {
+                if matches!(state, crate::app::EditState::AwaitingYaml) {
+                    match write_edit_temp_file(target, &content) {
+                        Ok(temp_path) => {
+                            *state = crate::app::EditState::EditorReady { temp_path };
+                        }
+                        Err(e) => {
+                            // Couldn't write the temp file — abort the edit
+                            // and pop back to the previous route.
+                            app.flash = Some(crate::app::FlashMessage::error(
+                                format!("Edit failed: {}", e)
+                            ));
+                            app.pop_route();
+                        }
+                    }
+                }
             }
         }
         ResourceUpdate::Describe(content) => {
@@ -175,7 +229,7 @@ fn track_deltas(app: &mut App, rows: &[crate::kube::resources::row::ResourceRow]
     let mut new_prev = HashMap::with_capacity(rows.len());
 
     for row in rows {
-        let key = ObjectKey::new(row.namespace.clone(), row.name.clone());
+        let key = ObjectKey::new(row.namespace.clone().unwrap_or_default(), row.name.clone());
 
         // 64-bit content hash of the row cells. A collision would only
         // suppress the flash highlight on a single row, never miss data.
@@ -194,4 +248,32 @@ fn track_deltas(app: &mut App, rows: &[crate::kube::resources::row::ResourceRow]
         new_prev.insert(key, new_hash);
     }
     app.prev_rows = new_prev;
+}
+
+/// Write the YAML returned by the server to a temp file the editor can
+/// open. The filename embeds the resource type + name + a process-unique
+/// counter, so concurrent edits in different sessions don't collide and
+/// editors that show the filename in their title give the user useful
+/// context. The session loop is responsible for deleting the file after
+/// the editor exits.
+fn write_edit_temp_file(
+    target: &crate::kube::protocol::ObjectRef,
+    yaml: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
+    let filename = format!(
+        "k9rs-edit-{}-{}-{}.yaml",
+        safe(&target.resource.plural),
+        safe(&target.name),
+        n,
+    );
+    let path = std::env::temp_dir().join(filename);
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(yaml.as_bytes())?;
+    Ok(path)
 }

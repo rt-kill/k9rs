@@ -26,7 +26,7 @@ pub(crate) fn ingress_to_row(ing: Ingress) -> ResourceRow {
     ResourceRow {
         cells: vec![ns.clone(), name.clone(), class, hosts, address, ports, labels_str, crate::util::format_age(age)],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

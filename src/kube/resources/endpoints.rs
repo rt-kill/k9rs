@@ -27,7 +27,7 @@ pub(crate) fn endpoints_to_row(ep: Endpoints) -> ResourceRow {
     ResourceRow {
         cells: vec![ns.clone(), name.clone(), endpoints, crate::util::format_age(age)],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

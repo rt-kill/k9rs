@@ -23,7 +23,7 @@ pub(crate) fn event_to_row(ev: Event) -> ResourceRow {
     ResourceRow {
         cells: vec![ns.clone(), event_type, reason, involved_object.clone(), message, source, count.to_string(), crate::util::format_age(age)],
         name: involved_object,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

@@ -30,6 +30,8 @@ pub struct ResourceTypeMeta {
     pub supports_scale: bool,
     /// Whether this resource supports rollout restart.
     pub supports_restart: bool,
+    /// Whether this resource supports port-forward (pods, workloads, services).
+    pub supports_port_forward: bool,
 }
 
 impl ResourceTypeMeta {
@@ -55,6 +57,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: true,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: true,
     },
     ResourceTypeMeta {
         name: "deployment",
@@ -69,6 +72,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: true,
         supports_restart: true,
+        supports_port_forward: true,
     },
     ResourceTypeMeta {
         name: "service",
@@ -83,6 +87,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: true,
     },
     ResourceTypeMeta {
         name: "configmap",
@@ -97,6 +102,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "secret",
@@ -111,6 +117,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "statefulset",
@@ -125,6 +132,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: true,
         supports_restart: true,
+        supports_port_forward: true,
     },
     ResourceTypeMeta {
         name: "daemonset",
@@ -139,6 +147,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: true,
+        supports_port_forward: true,
     },
     ResourceTypeMeta {
         name: "job",
@@ -153,6 +162,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: true,
     },
     ResourceTypeMeta {
         name: "cronjob",
@@ -167,6 +177,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "replicaset",
@@ -181,6 +192,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: true,
         supports_restart: false,
+        supports_port_forward: true,
     },
     ResourceTypeMeta {
         name: "ingress",
@@ -195,6 +207,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "networkpolicy",
@@ -209,6 +222,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "serviceaccount",
@@ -223,6 +237,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "namespace",
@@ -237,6 +252,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "node",
@@ -251,6 +267,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "pv",
@@ -265,6 +282,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "pvc",
@@ -279,6 +297,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "storageclass",
@@ -293,6 +312,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "role",
@@ -307,6 +327,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "clusterrole",
@@ -321,6 +342,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "rolebinding",
@@ -335,6 +357,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "clusterrolebinding",
@@ -349,6 +372,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "hpa",
@@ -363,6 +387,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "endpoints",
@@ -377,6 +402,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "limitrange",
@@ -391,6 +417,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "resourcequota",
@@ -405,6 +432,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "poddisruptionbudget",
@@ -419,6 +447,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "event",
@@ -433,6 +462,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
     ResourceTypeMeta {
         name: "customresourcedefinition",
@@ -447,6 +477,7 @@ pub const RESOURCE_TYPES: &[ResourceTypeMeta] = &[
         supports_shell: false,
         supports_scale: false,
         supports_restart: false,
+        supports_port_forward: false,
     },
 ];
 

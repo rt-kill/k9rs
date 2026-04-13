@@ -43,7 +43,7 @@ pub(crate) fn crd_to_row(crd: CustomResourceDefinition) -> ResourceRow {
             name.clone(), group, version, kind, scope_str, crate::util::format_age(age),
         ],
         name,
-        namespace: String::new(),
+        namespace: None,
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

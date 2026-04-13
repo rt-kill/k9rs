@@ -11,6 +11,9 @@ pub enum Command {
 
     /// Daemon management commands
     Ctl {
+        /// Output format: "human" (default) or "json"
+        #[arg(long, default_value = "human")]
+        output: String,
         #[command(subcommand)]
         cmd: ctl::CtlCommand,
     },
@@ -31,8 +34,8 @@ pub async fn dispatch(cmd: Command) -> Result<()> {
                 .init();
             crate::kube::daemon::run_daemon().await
         }
-        Command::Ctl { cmd } => {
-            ctl::run(cmd).await
+        Command::Ctl { output, cmd } => {
+            ctl::run(cmd, output == "json").await
         }
         Command::Contexts => {
             contexts::run()

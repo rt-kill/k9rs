@@ -573,9 +573,12 @@ impl StatefulWidget for ResourceTable<'_> {
                 }
             }
 
-            // Prepend a mark indicator for marked rows
-            if is_marked && !is_selected {
-                buf.set_string(inner.x, y, "\u{25cf}", self.theme.marked_row); // filled circle
+            // Prepend a mark indicator for marked rows. Drawn even when the
+            // row is also selected, so the user gets immediate feedback when
+            // toggling Space — without this, the indicator only appears
+            // after the cursor moves off the row.
+            if is_marked {
+                buf.set_string(inner.x, y, "\u{25cf}", self.theme.marked_row);
             }
 
             let mut cx = inner.x;

@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 
 use super::cache::CachedCrd;
-use crate::event::ResourceUpdate;
 
 /// Identity of a Kubernetes resource type, identified by Group/Version/Resource (GVR).
 /// This is the unified representation — no distinction between "built-in" and "dynamic".
@@ -543,6 +542,75 @@ impl SubscriptionFilter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Substream-specific wire types
+// ---------------------------------------------------------------------------
+//
+// With yamux, each subscription and each log view gets its own substream.
+// The control substream still uses `SessionCommand`/`SessionEvent` (below)
+// for one-shot request/response commands. The types here are the per-substream
+// grammars — each substream speaks one of these mini-protocols, never the
+// full session enum.
+
+/// First message on any data substream (subscription or log). The daemon
+/// reads this to determine what kind of bridge to spawn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SubstreamInit {
+    /// Subscribe to a resource type's rows.
+    Subscribe(SubscriptionInit),
+    /// Start streaming logs for a pod/container.
+    Log(LogInit),
+}
+
+/// Subscribe handshake payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionInit {
+    pub resource: ResourceId,
+    pub namespace: Namespace,
+    pub filter: Option<SubscriptionFilter>,
+}
+
+/// Events streamed by the daemon on a **subscription substream**. The
+/// substream carries only events for the subscription that opened it; no
+/// routing tag is needed because the transport layer (yamux) already
+/// isolates the bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StreamEvent {
+    /// Fresh rows for the subscribed resource.
+    Snapshot(crate::event::ResourceUpdate),
+    /// The subscription failed — no further events will arrive on this
+    /// substream. The daemon closes the stream after sending this.
+    Error(String),
+    /// Server-declared capabilities for the subscribed resource type.
+    /// Sent once, right after the initial snapshot.
+    Capabilities(ResourceCapabilities),
+    /// The server resolved an unknown resource (empty group/version) to
+    /// its real identity. The TUI should update its nav/table keys.
+    Resolved {
+        original: ResourceId,
+        resolved: ResourceId,
+    },
+}
+
+/// First (and only) message the TUI writes to a **log substream**. Each
+/// subsequent frame on the substream is a single log line (`String`,
+/// bincode-framed). EOF from the daemon = log stream ended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogInit {
+    pub pod: String,
+    pub namespace: Namespace,
+    pub container: String,
+    pub follow: bool,
+    pub tail: Option<u64>,
+    pub since: Option<String>,
+    pub previous: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Control-substream wire types (existing SessionCommand / SessionEvent,
+// narrowed to one-shot request/response commands + global events)
+// ---------------------------------------------------------------------------
+
 /// All commands from any client (TUI session or management CLI).
 /// The first command on a connection determines the connection type:
 /// - `Init` → long-lived TUI session
@@ -562,21 +630,9 @@ pub enum SessionCommand {
         user_name: String,
     },
 
-    // --- Resource subscriptions ---
+    // --- Session-level commands ---
 
-    Subscribe {
-        resource: ResourceId,
-        filter: Option<SubscriptionFilter>,
-    },
-    Unsubscribe(ResourceId),
     SwitchNamespace { namespace: Namespace },
-    SwitchContext {
-        context: String,
-        kubeconfig_yaml: String,
-        env_vars: HashMap<String, String>,
-        cluster_name: String,
-        user_name: String,
-    },
 
     // --- Resource operations (target identified by ObjectRef) ---
 
@@ -585,18 +641,16 @@ pub enum SessionCommand {
     Delete(ObjectRef),
     Scale { target: ObjectRef, replicas: u32 },
     Restart(ObjectRef),
-    StreamLogs {
-        pod: String,
-        namespace: Namespace,
-        container: String,
-        follow: bool,
-        tail: Option<u64>,
-        since: Option<String>,
-        previous: bool,
-    },
-    Refresh(ResourceId),
-    StopLogs,
+    // StreamLogs and StopLogs are gone — logs now flow on yamux substreams.
+    // The TUI opens a log substream with LogInit, reads lines, drops to stop.
     GetDiscovery,
+    /// Apply edited YAML to a resource. The unified edit flow goes
+    /// `Yaml(target)` → user edits in `$EDITOR` → `Apply(target, new_yaml)`.
+    /// The server routes by `target.resource.is_local()`: K8s resources go
+    /// through kube-rs server-side apply; local resources dispatch through
+    /// `LocalResourceSource::apply_yaml`. The same wire command works for
+    /// both — there is no per-kind branching on the client.
+    Apply { target: ObjectRef, yaml: String },
     /// Decode a Secret's data and return it as a describe-style view.
     /// Carries the full `ObjectRef` rather than `(name, namespace)` so the
     /// daemon (and any future filtering layer) gets the typed rid for free.
@@ -627,10 +681,14 @@ pub enum SessionCommand {
 // Unified event type: Daemon -> Client (bincode)
 // ---------------------------------------------------------------------------
 
-/// All events from daemon to any client (TUI session or management CLI).
+/// Events from daemon to TUI on the **control substream**. One-shot
+/// responses (CommandResult, DescribeResult, YamlResult) and global
+/// events (Discovery, PodMetrics, etc.). Subscription-specific events
+/// (Snapshot, Capabilities, Resolved, SubscriptionError) are no longer
+/// here — they flow on per-subscription yamux substreams as `StreamEvent`.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SessionEvent {
-    // --- Session events ---
+    // --- Session lifecycle ---
 
     Ready {
         context: String,
@@ -638,43 +696,23 @@ pub enum SessionEvent {
         user: String,
         namespaces: Vec<String>,
     },
-    Snapshot(ResourceUpdate),
+    SessionError(String),
+
+    // --- One-shot command responses ---
+
     DescribeResult(String),
     YamlResult(String),
     CommandResult { ok: bool, message: String },
-    LogLine(String),
-    LogEnd,
+
+    // --- Global events ---
+
     Discovery {
         context: String,
         namespaces: Vec<String>,
         crds: Vec<CachedCrd>,
     },
-    ContextSwitched {
-        context: String,
-        ok: bool,
-        message: String,
-    },
-    SessionError(String),
-    /// A subscription failed for a specific resource.
-    SubscriptionError {
-        resource: ResourceId,
-        message: String,
-    },
-    /// The server resolved an unknown resource to its true identity.
-    /// The TUI should update its nav and table keys accordingly.
-    ResourceResolved {
-        original: ResourceId,
-        resolved: ResourceId,
-    },
     PodMetrics(HashMap<ObjectKey, MetricsUsage>),
     NodeMetrics(HashMap<String, MetricsUsage>),
-    /// Capabilities of a resource type (which operations it supports).
-    /// Sent after a successful subscription so the TUI can enable/disable
-    /// keybindings without hardcoded K8s knowledge.
-    ResourceCapabilities {
-        resource: ResourceId,
-        capabilities: ResourceCapabilities,
-    },
 
     // --- Management responses ---
 
@@ -692,7 +730,7 @@ mod tests {
         let row = ResourceRow {
             cells: vec!["default".into(), "test-pod".into(), "1/1".into(), "Running".into()],
             name: "test-pod".into(),
-            namespace: "default".into(),
+            namespace: Some("default".into()),
             containers: Vec::new(),
             owner_refs: Vec::new(),
             pf_ports: Vec::new(),
@@ -712,7 +750,7 @@ mod tests {
         let row = ResourceRow {
             cells: vec!["default".into(), "test".into()],
             name: "test".into(),
-            namespace: "default".into(),
+            namespace: Some("default".into()),
             containers: Vec::new(),
             owner_refs: Vec::new(),
             pf_ports: Vec::new(),
@@ -746,7 +784,7 @@ mod tests {
             rows: vec![ResourceRow {
                 cells: vec!["prod".into(), "web".into(), "3/3".into()],
                 name: "web".into(),
-                namespace: "prod".into(),
+                namespace: Some("prod".into()),
                 containers: Vec::new(),
                 owner_refs: Vec::new(),
                 pf_ports: Vec::new(),
@@ -755,11 +793,12 @@ mod tests {
                 drill_target: None,
             }],
         };
-        let event = SessionEvent::Snapshot(update);
-        let bytes = bincode::serialize(&event).unwrap();
-        let decoded: SessionEvent = bincode::deserialize(&bytes).unwrap();
+        // StreamEvent (substream wire type) bincode roundtrip.
+        let stream_event = StreamEvent::Snapshot(update);
+        let bytes = bincode::serialize(&stream_event).unwrap();
+        let decoded: StreamEvent = bincode::deserialize(&bytes).unwrap();
         match decoded {
-            SessionEvent::Snapshot(ResourceUpdate::Rows { rows, .. }) => {
+            StreamEvent::Snapshot(ResourceUpdate::Rows { rows, .. }) => {
                 assert_eq!(rows[0].name, "web");
             }
             _ => panic!("Wrong event type"),
@@ -767,14 +806,11 @@ mod tests {
     }
 
     #[test]
-    fn test_subscribe_command_bincode_roundtrip() {
+    fn test_subscription_init_bincode_roundtrip() {
         let rid = ResourceId::new("", "v1", "Pod", "pods", ResourceScope::Namespaced);
-        let cmd = SessionCommand::Subscribe { resource: rid, filter: None };
-        let bytes = bincode::serialize(&cmd).unwrap();
-        let decoded: SessionCommand = bincode::deserialize(&bytes).unwrap();
-        match decoded {
-            SessionCommand::Subscribe { resource: r, .. } => assert_eq!(r.plural, "pods"),
-            _ => panic!("Wrong command"),
-        }
+        let init = SubscriptionInit { resource: rid, namespace: Namespace::Named("default".into()), filter: None };
+        let bytes = bincode::serialize(&init).unwrap();
+        let decoded: SubscriptionInit = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.resource.plural, "pods");
     }
 }

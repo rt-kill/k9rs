@@ -143,6 +143,26 @@ pub enum Route {
         target: ContainerRef,
         state: Box<LogState>,
     },
+    /// In-progress edit on `target`. The unified edit flow:
+    ///
+    ///   1. `Action::Edit` enters this route in `EditState::AwaitingYaml`
+    ///      and sends `SessionCommand::Yaml(target)`.
+    ///   2. The server returns the resource's YAML via `YamlResult`.
+    ///      `apply_resource_update` writes it to a temp file and
+    ///      transitions to `EditState::EditorReady { temp_path }`.
+    ///   3. The session loop sees `EditorReady` on its next iteration,
+    ///      suspends raw mode, runs `$EDITOR <temp_path>`, reads the
+    ///      result back, sends `SessionCommand::Apply { target, yaml }`,
+    ///      and transitions to `EditState::Applying`.
+    ///   4. The server's `Apply` handler dispatches by `is_local()` and
+    ///      sends back a `CommandResult`. `apply_event` flashes the result
+    ///      and pops the route.
+    ///
+    /// One state machine, one wire flow, no per-resource branching.
+    EditingResource {
+        target: ObjectRef,
+        state: EditState,
+    },
     Help,
     Contexts,
     ContainerSelect {
@@ -152,6 +172,20 @@ pub enum Route {
         for_shell: bool,
     },
     Aliases { state: ContentViewState },
+}
+
+/// Where we are in the unified edit flow. See `Route::EditingResource`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditState {
+    /// Sent the `Yaml(target)` command, waiting for the server's response.
+    AwaitingYaml,
+    /// YAML on disk, ready for the session loop to suspend + exec the
+    /// editor. The temp file path is owned by this state — the loop
+    /// reads the file back and deletes it after the editor exits.
+    EditorReady { temp_path: std::path::PathBuf },
+    /// Sent the `Apply { target, yaml }` command, waiting for the
+    /// `CommandResult` to know whether the apply succeeded.
+    Applying,
 }
 
 // ---------------------------------------------------------------------------

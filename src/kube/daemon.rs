@@ -120,43 +120,66 @@ struct DaemonState {
 // Connection handler (unified binary protocol)
 // ---------------------------------------------------------------------------
 
+/// Connection-type discriminator written by every client as the very
+/// first byte after connecting. The daemon reads it to decide whether
+/// to wrap the socket in yamux (TUI session) or speak plain bincode
+/// (management CLI).
+pub(crate) const CONN_TYPE_SESSION: u8 = 0x01;
+pub(crate) const CONN_TYPE_MANAGEMENT: u8 = 0x02;
+
 async fn handle_connection(
     stream: UnixStream,
     state: Arc<DaemonState>,
 ) -> anyhow::Result<()> {
-    let (reader, writer) = stream.into_split();
-    let mut reader = BufReader::with_capacity(protocol::IO_BUFFER_SIZE, reader);
-    let mut writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
+    use tokio::io::AsyncReadExt;
 
-    // Read the first command to determine connection type.
-    let first_cmd: SessionCommand = protocol::read_bincode(&mut reader).await?;
+    // First byte: connection type discriminator.
+    let mut conn_type = [0u8; 1];
+    let mut peek_stream = stream;
+    peek_stream.read_exact(&mut conn_type).await?;
 
-    match first_cmd {
-        // Session connection — hand off to ServerSession.
-        SessionCommand::Init { .. } => {
-            info!("Routing connection as TUI session");
-            let boxed_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(reader);
-            let boxed_reader = BufReader::with_capacity(protocol::IO_BUFFER_SIZE, boxed_reader);
-            let boxed_writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(writer);
-            ServerSession::init_and_run_with_parsed(
-                first_cmd,
-                boxed_reader,
-                boxed_writer,
-                state.session_shared.clone(),
-            )
-            .await;
+    match conn_type[0] {
+        // Yamux-multiplexed TUI session.
+        CONN_TYPE_SESSION => {
+            info!("Routing connection as yamux TUI session");
+            let mux = crate::kube::mux::MuxedConnection::server(peek_stream);
+            ServerSession::init_and_run_muxed(mux, state.session_shared.clone()).await;
         }
+
+        // Plain bincode management request (k9rs ctl).
+        CONN_TYPE_MANAGEMENT => {
+            let (reader, writer) = peek_stream.into_split();
+            let mut reader = BufReader::with_capacity(protocol::IO_BUFFER_SIZE, reader);
+            let mut writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
+            let first_cmd: SessionCommand = protocol::read_bincode(&mut reader).await?;
+            handle_management_command(first_cmd, &mut writer, &state).await?;
+        }
+
+        other => {
+            tracing::warn!("Unknown connection type byte: 0x{:02x}", other);
+        }
+    }
+    Ok(())
+}
+
+/// Handle a one-shot management command from `k9rs ctl`.
+async fn handle_management_command(
+    cmd: SessionCommand,
+    writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
+    state: &Arc<DaemonState>,
+) -> anyhow::Result<()> {
+    match cmd {
 
         // Management: one-shot commands
         SessionCommand::Ping => {
-            protocol::write_bincode(&mut writer, &SessionEvent::CommandResult {
+            protocol::write_bincode(writer, &SessionEvent::CommandResult {
                 ok: true,
                 message: "pong".to_string(),
             }).await?;
         }
 
         SessionCommand::Status => {
-            protocol::write_bincode(&mut writer, &SessionEvent::DaemonStatus(DaemonStatus {
+            protocol::write_bincode(writer, &SessionEvent::DaemonStatus(DaemonStatus {
                 pid: std::process::id(),
                 uptime_secs: state.started_at.elapsed().as_secs(),
                 socket_path: state.socket_path.clone(),
@@ -164,7 +187,7 @@ async fn handle_connection(
         }
 
         SessionCommand::Shutdown => {
-            protocol::write_bincode(&mut writer, &SessionEvent::CommandResult {
+            protocol::write_bincode(writer, &SessionEvent::CommandResult {
                 ok: true,
                 message: "shutting down".to_string(),
             }).await?;
@@ -176,14 +199,14 @@ async fn handle_connection(
                 Some(_) => { state.session_shared.discovery_cache.clear(); }
                 None => { state.session_shared.discovery_cache.clear(); }
             }
-            protocol::write_bincode(&mut writer, &SessionEvent::CommandResult {
+            protocol::write_bincode(writer, &SessionEvent::CommandResult {
                 ok: true,
                 message: "cache cleared".to_string(),
             }).await?;
         }
 
         other => {
-            protocol::write_bincode(&mut writer, &SessionEvent::SessionError(
+            protocol::write_bincode(writer, &SessionEvent::SessionError(
                 format!("Expected Init or management command, got: {:?}", other),
             )).await?;
         }
@@ -203,9 +226,14 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     /// Connect to the daemon. Returns None if the daemon isn't running.
+    /// Writes the `CONN_TYPE_MANAGEMENT` discriminator byte immediately so
+    /// the daemon's accept loop routes this connection to the plain-bincode
+    /// management handler (not the yamux session path).
     pub async fn connect() -> Option<Self> {
+        use tokio::io::AsyncWriteExt;
         let path = socket_path();
-        let stream = UnixStream::connect(&path).await.ok()?;
+        let mut stream = UnixStream::connect(&path).await.ok()?;
+        stream.write_all(&[CONN_TYPE_MANAGEMENT]).await.ok()?;
         let (read_half, write_half) = stream.into_split();
         Some(Self {
             reader: BufReader::new(read_half),

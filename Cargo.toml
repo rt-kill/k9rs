@@ -44,6 +44,12 @@ rand = "0.9"
 libc = "0.2"
 dashmap = "6"
 
+# Multiplexer: per-subscription substreams over the single Unix socket
+# between TUI and daemon. We hide this behind `src/kube/mux/` so swapping
+# implementations later (libp2p/yamux, hand-rolled, etc.) touches only that
+# module — the rest of the codebase only sees `MuxedConnection`/`MuxedStream`.
+tokio-yamux = "0.3"
+
 [profile.release]
 opt-level = 3
 lto = true

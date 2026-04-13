@@ -12,7 +12,7 @@ pub(crate) fn namespace_to_row(ns_obj: Namespace) -> ResourceRow {
     ResourceRow {
         cells: vec![name.clone(), status, crate::util::format_age(age)],
         name,
-        namespace: String::new(),
+        namespace: None,
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

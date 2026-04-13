@@ -29,24 +29,6 @@ pub(crate) fn build_shell_args(pod: &str, namespace: &str, container: &str, cont
     args
 }
 
-/// Build `kubectl edit` args for editing a resource.
-pub(crate) fn build_edit_args(resource: &str, name: &str, namespace: &str, context: &str) -> Vec<String> {
-    let mut args = vec![
-        "edit".to_string(),
-        resource.to_string(),
-        name.to_string(),
-    ];
-    if !namespace.is_empty() {
-        args.push("-n".to_string());
-        args.push(namespace.to_string());
-    }
-    if !context.is_empty() {
-        args.push("--context".to_string());
-        args.push(context.to_string());
-    }
-    args
-}
-
 /// Suspend the TUI and run an interactive command directly (with bash->sh fallback for shell).
 pub(crate) async fn run_interactive_local(
     terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
@@ -202,7 +184,6 @@ pub(crate) fn parse_resource_command(cmd: &str) -> Option<ResourceId> {
 // ---------------------------------------------------------------------------
 
 use crossterm::event::{KeyCode, KeyEvent};
-use tokio::task::JoinHandle;
 
 use crate::app::InputMode;
 use crate::kube::client_session::ClientSession;
@@ -217,7 +198,7 @@ pub(crate) fn handle_command_key(
     app: &mut App,
     key: KeyEvent,
     data_source: &mut ClientSession,
-    log_task: &mut Option<JoinHandle<()>>,
+    log_stream: &mut Option<crate::kube::client_session::LogStream>,
     event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
 ) -> bool {
     if !matches!(app.input_mode, InputMode::Command { .. }) {
@@ -241,7 +222,7 @@ pub(crate) fn handle_command_key(
                 }
             }
             app.input_mode = InputMode::Normal;
-            handle_command_submit(app, &raw_cmd, &cmd, data_source, log_task, event_tx);
+            handle_command_submit(app, &raw_cmd, &cmd, data_source, log_stream, event_tx);
         }
         KeyCode::Tab => {
             app.accept_completion();
@@ -292,7 +273,7 @@ fn handle_command_submit(
     raw_cmd: &str,
     cmd: &str,
     data_source: &mut ClientSession,
-    log_task: &mut Option<JoinHandle<()>>,
+    log_stream: &mut Option<crate::kube::client_session::LogStream>,
     event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
 ) {
     use crate::kube::session_actions::handle_action;
@@ -311,21 +292,21 @@ fn handle_command_submit(
     } else if matches!(cmd, "alias" | "aliases" | "a") {
         handle_action(
             app, crate::app::actions::Action::ShowAliases, event_tx,
-            data_source, log_task,
+            data_source, log_stream,
         );
     } else if matches!(cmd, "ctx" | "context" | "contexts") {
         app.push_route(app.route.clone());
         app.route = crate::app::Route::Contexts;
     } else if cmd.starts_with("ctx ") || cmd.starts_with("context ") {
         let ctx_name = if cmd.starts_with("ctx ") { &raw_cmd[4..] } else { &raw_cmd[8..] }.trim().to_string();
-        begin_context_switch(app, data_source, &ctx_name, log_task);
+        begin_context_switch(app, data_source, &ctx_name, log_stream);
     } else if cmd.starts_with("ns ") || cmd.starts_with("namespace ") {
         let ns = if cmd.starts_with("ns ") { &raw_cmd[3..] } else { &raw_cmd[10..] }.trim().to_string();
-        do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(ns.as_str()), log_task);
+        do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(ns.as_str()), log_stream);
     } else if let Some(resource_rid) = parse_resource_command(cmd) {
         app.route = crate::app::Route::Resources;
         if resource_rid.is_cluster_scoped() && !app.selected_ns.is_all() {
-            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All, log_task);
+            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All, log_stream);
         }
         let change = app.nav.reset(resource_rid);
         *app.nav.filter_input_mut() = Default::default();
@@ -335,7 +316,7 @@ fn handle_command_submit(
         let change = app.nav.reset(parsed.rid.clone());
         *app.nav.filter_input_mut() = Default::default();
         if crate::kube::protocol::Namespace::from(parsed.argument.as_str()) != app.selected_ns {
-            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(parsed.argument.as_str()), log_task);
+            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(parsed.argument.as_str()), log_stream);
         }
         apply_nav_change(app, data_source, change);
         app.flash = Some(crate::app::FlashMessage::info(format!(
@@ -350,6 +331,7 @@ fn handle_command_submit(
             filter: Some(crate::app::nav::NavFilter::Grep(parsed.argument.clone())),
             saved_selected: 0,
             filter_input: crate::app::nav::FilterInputState::default(),
+            stream: None,
         });
         apply_nav_change(app, data_source, change);
         *app.nav.filter_input_mut() = Default::default();
@@ -358,7 +340,7 @@ fn handle_command_submit(
         let crd = parsed.crd;
         app.route = crate::app::Route::Resources;
         if crate::kube::protocol::Namespace::from(parsed.namespace.as_str()) != app.selected_ns {
-            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(parsed.namespace.as_str()), log_task);
+            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(parsed.namespace.as_str()), log_stream);
         }
         let crd_rid = ResourceId::new(
             crd.group.clone(), crd.version.clone(),
@@ -382,7 +364,7 @@ fn handle_command_submit(
         };
         app.route = crate::app::Route::Resources;
         if scope == crate::kube::protocol::ResourceScope::Cluster && !app.selected_ns.is_all() {
-            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All, log_task);
+            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All, log_stream);
         }
         let crd_rid = ResourceId::new(group, version, kind.clone(), plural, scope);
         let change = app.nav.reset(crd_rid);
@@ -583,6 +565,7 @@ pub(crate) fn handle_filter_key(
                     filter: Some(crate::app::nav::NavFilter::Grep(text)),
                     saved_selected: 0,
                     filter_input: crate::app::nav::FilterInputState::default(),
+                    stream: None,
                 });
                 apply_nav_change(app, data_source, change);
             }

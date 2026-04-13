@@ -12,7 +12,7 @@ pub(crate) fn role_to_row(role: Role) -> ResourceRow {
     ResourceRow {
         cells: vec![ns.clone(), name.clone(), rules_count.to_string(), crate::util::format_age(age)],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

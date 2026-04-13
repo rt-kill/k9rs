@@ -60,7 +60,7 @@ pub fn cached_crds_to_rows(cached: &[CachedCrd]) -> Vec<ResourceRow> {
                     c.kind.clone(), c.scope.clone(), String::new(), // no age from cache
                 ],
                 name: c.name.clone(),
-                namespace: String::new(),
+                namespace: None,
                 containers: Vec::new(),
                 owner_refs: Vec::new(),
                 pf_ports: Vec::new(),
@@ -79,7 +79,7 @@ pub fn cached_namespaces_to_rows(names: &[String]) -> Vec<crate::kube::resources
         .map(|name| crate::kube::resources::row::ResourceRow {
             cells: vec![name.clone(), "Active".to_string(), String::new()],
             name: name.clone(),
-            namespace: String::new(),
+            namespace: None,
             containers: Vec::new(),
             owner_refs: Vec::new(),
             pf_ports: Vec::new(),

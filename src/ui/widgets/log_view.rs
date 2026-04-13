@@ -1,7 +1,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::Style,
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph, StatefulWidget, Widget, Wrap},
 };
@@ -13,6 +13,37 @@ use crate::util::truncate_to_width;
 struct LogTimestamp<'a> {
     timestamp: &'a str,
     content: &'a str,
+}
+
+/// Stable color for a container name. Uses a simple hash-to-palette so the
+/// same container always gets the same color across log lines.
+fn container_color(name: &str) -> Color {
+    const PALETTE: [Color; 8] = [
+        Color::Cyan,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Red,
+        Color::LightCyan,
+        Color::LightGreen,
+    ];
+    let hash: usize = name.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+    PALETTE[hash % PALETTE.len()]
+}
+
+/// Try to parse a container-name prefix from a multi-container log line.
+/// kubectl `--all-containers` prefixes each line with the container name
+/// followed by a space. Returns `(prefix, rest)` if found.
+fn parse_container_prefix(line: &str) -> Option<(&str, &str)> {
+    // Container prefix is the first word, must not contain '=' or ':' (those
+    // are timestamp or key=value patterns, not prefixes).
+    let space_pos = line.find(' ')?;
+    let prefix = &line[..space_pos];
+    if prefix.is_empty() || prefix.contains('=') || prefix.contains(':') || prefix.contains('/') {
+        return None;
+    }
+    Some((prefix, &line[space_pos + 1..]))
 }
 
 /// Split a text line into spans, highlighting matches for all active filter
@@ -307,13 +338,29 @@ impl StatefulWidget for LogViewer<'_> {
                         line
                     }
                 };
+                // Per-container colored prefix for multi-container logs.
+                let (prefix_span, display_content) = if self.container_name == "all" {
+                    if let Some((prefix, rest)) = parse_container_prefix(content) {
+                        let color = container_color(prefix);
+                        (Some(Span::styled(format!("{} ", prefix), Style::default().fg(color))), rest)
+                    } else {
+                        (None, content)
+                    }
+                } else {
+                    (None, content)
+                };
                 let max_w = inner.width as usize;
-                let display = truncate_to_width(content, max_w);
-                if patterns.is_empty() {
+                let display = truncate_to_width(display_content, max_w);
+                if patterns.is_empty() && prefix_span.is_none() {
                     buf.set_string(inner.x, y, display, self.theme.log_text);
                 } else {
+                    let mut spans = Vec::new();
+                    if let Some(ps) = prefix_span {
+                        spans.push(ps);
+                    }
                     let highlighted = highlight_filters(display, patterns, self.theme.log_text, self.theme.search_match);
-                    buf.set_line(inner.x, y, &highlighted, inner.width);
+                    spans.extend(highlighted.spans);
+                    buf.set_line(inner.x, y, &Line::from(spans), inner.width);
                 }
             }
         }

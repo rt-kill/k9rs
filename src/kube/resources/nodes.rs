@@ -119,7 +119,7 @@ pub(crate) fn node_to_row(node: Node) -> ResourceRow {
             crate::util::format_age(age),
         ],
         name,
-        namespace: String::new(),
+        namespace: None,
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

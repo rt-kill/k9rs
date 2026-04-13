@@ -10,8 +10,8 @@ pub struct ResourceRow {
     pub cells: Vec<String>,
     /// Resource name (cached for O(1) access in sorts/filters).
     pub name: String,
-    /// Resource namespace (empty string for cluster-scoped resources).
-    pub namespace: String,
+    /// Resource namespace. `None` for cluster-scoped resources.
+    pub namespace: Option<String>,
     /// What happens when the user presses Enter on this row.
     /// Set by the converter (server-side); the client reads this blindly
     /// to construct the appropriate nav action — no K8s knowledge needed.
@@ -102,6 +102,11 @@ pub enum DrillTarget {
     },
     /// Drill down to pods by name prefix (fallback when no selector exists).
     PodsByNameGrep(String),
+    /// Drill down to jobs owned by this CronJob (via ownerReference UID).
+    JobsByOwner {
+        uid: String,
+        name: String,
+    },
 }
 
 impl super::KubeResource for ResourceRow {
@@ -114,7 +119,7 @@ impl super::KubeResource for ResourceRow {
     }
 
     fn namespace(&self) -> &str {
-        &self.namespace
+        self.namespace.as_deref().unwrap_or("")
     }
 }
 

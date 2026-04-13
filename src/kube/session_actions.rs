@@ -1,5 +1,4 @@
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use crate::app::{App, InputMode};
 use crate::app::nav::rid;
@@ -28,7 +27,7 @@ pub(crate) fn handle_action(
     action: crate::app::actions::Action,
     event_tx: &mpsc::Sender<AppEvent>,
     data_source: &mut ClientSession,
-    log_task: &mut Option<JoinHandle<()>>,
+    log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) -> ActionResult {
     use crate::app::actions::Action;
     use crate::app::Route;
@@ -39,14 +38,8 @@ pub(crate) fn handle_action(
             app.should_quit = true;
         }
         Action::Back => {
-            // Cancel any active log stream
-            if let Some(handle) = log_task.take() {
-                handle.abort();
-            }
-            // Stop server-side log streaming when leaving a log/shell view
-            if matches!(app.route, Route::Logs { .. } | Route::Shell { .. }) {
-                ds_try!(app, data_source.stop_logs());
-            }
+            // Cancel any active log stream — drop closes the substream.
+            *log_stream = None;
             // Pop the route stack to go back — old route (with its state) is dropped
             if let Some(route) = app.route_stack.pop() {
                 app.route = route;
@@ -95,7 +88,7 @@ pub(crate) fn handle_action(
                 }
                 Route::ContainerSelect { ref pod, ref namespace, ref mut selected, .. } => {
                     let container_count = app.data.unified.get(&rid("pods"))
-                        .and_then(|t| t.items.iter().find(|p| p.name == *pod && p.namespace == *namespace))
+                        .and_then(|t| t.items.iter().find(|p| p.name == *pod && p.namespace.as_deref() == Some(namespace.as_str())))
                         .map(|p| p.containers.len())
                         .unwrap_or(0);
                     if container_count > 0 && *selected + 1 < container_count {
@@ -191,14 +184,14 @@ pub(crate) fn handle_action(
             }
         }
         Action::Enter => {
-            let result = handle_enter(app, data_source, log_task);
+            let result = handle_enter(app, data_source, log_stream);
             if !matches!(result, ActionResult::None) {
                 return result;
             }
         }
         Action::Describe => handle_describe(app, data_source),
         Action::Yaml => handle_yaml(app, data_source),
-        Action::Logs => handle_logs(app, data_source, log_task),
+        Action::Logs => handle_logs(app, data_source, log_stream),
         Action::Shell => {
             if app.current_capabilities().supports(crate::kube::protocol::OperationKind::Shell) {
                 if let Some(row) = app.data.unified.get(&rid("pods")).and_then(|t| t.selected_item()) {
@@ -206,7 +199,7 @@ pub(crate) fn handle_action(
                     if containers.len() > 1 {
                         // Multi-container pod: show container selector
                         let pod_name = row.name.clone();
-                        let pod_ns = row.namespace.clone();
+                        let pod_ns = row.namespace.clone().unwrap_or_default();
                         app.push_route(app.route.clone());
                         app.route = Route::ContainerSelect {
                             pod: pod_name,
@@ -216,7 +209,7 @@ pub(crate) fn handle_action(
                         };
                     } else {
                         let pod_name = row.name.clone();
-                        let pod_ns = row.namespace.clone();
+                        let pod_ns = row.namespace.clone().unwrap_or_default();
                         let container = containers.first().map(|c| c.real_name.clone()).unwrap_or_default();
                         let context = app.context.clone();
                         return ActionResult::Shell {
@@ -261,13 +254,13 @@ pub(crate) fn handle_action(
             }
         }
         Action::Edit => {
+            // Unified edit flow: fetch yaml → $EDITOR → apply.
             if let Some(info) = get_selected_resource_info(app) {
-                let context = app.context.clone();
-                return ActionResult::Edit {
-                    resource: info.resource.display_label().to_string(),
-                    name: info.name,
-                    namespace: info.namespace.to_string(),
-                    context,
+                ds_try!(app, data_source.yaml(&info));
+                app.push_route(app.route.clone());
+                app.route = crate::app::Route::EditingResource {
+                    target: info,
+                    state: crate::app::EditState::AwaitingYaml,
                 };
             }
         }
@@ -387,6 +380,7 @@ pub(crate) fn handle_action(
                 filter: None,
                 saved_selected: 0,
                 filter_input: crate::app::nav::FilterInputState::default(),
+                stream: None,
             });
             apply_nav_change(app, data_source, change);
         }
@@ -427,13 +421,19 @@ pub(crate) fn handle_action(
             }
         }
         Action::SwitchNamespace(ns) => {
-            do_switch_namespace(app, data_source, ns, log_task);
+            do_switch_namespace(app, data_source, ns, log_stream);
         }
         Action::SwitchContext(ctx) => {
-            begin_context_switch(app, data_source, &ctx, log_task);
+            begin_context_switch(app, data_source, &ctx, log_stream);
         }
         Action::Refresh => {
-            data_source.refresh_resource(app.nav.resource_id());
+            // Refresh = drop the current substream and open a fresh one.
+            let rid = app.nav.resource_id().clone();
+            let filter = app.nav.current().filter.as_ref()
+                .and_then(|f| f.to_subscription_filter());
+            app.nav.current_mut().stream = None;
+            let stream = data_source.subscribe_stream(rid, app.selected_ns.clone(), filter);
+            app.nav.current_mut().stream = Some(stream);
             app.flash = Some(crate::app::FlashMessage::info("Refreshed"));
         }
         Action::Copy => {
@@ -632,8 +632,20 @@ pub(crate) fn handle_action(
                 Route::Describe { ref mut state, .. } | Route::Aliases { ref mut state, .. } => {
                     state.next_match(40);
                 }
-                Route::Logs { .. } => {
-                    // Log view uses stackable filters, no next/prev match
+                Route::Logs { ref mut state, .. } | Route::Shell { ref mut state, .. } => {
+                    // Jump to next filtered line (n in vim search).
+                    let current_scroll = state.scroll;
+                    // Find the first filtered_index after current_scroll.
+                    if let Some(&next_idx) = state.filtered_indices.iter()
+                        .find(|&&idx| idx > current_scroll)
+                    {
+                        state.scroll = next_idx;
+                        state.follow = false;
+                    } else if let Some(&first) = state.filtered_indices.first() {
+                        // Wrap around.
+                        state.scroll = first;
+                        state.follow = false;
+                    }
                 }
                 _ => {}
             }
@@ -646,8 +658,19 @@ pub(crate) fn handle_action(
                 Route::Describe { ref mut state, .. } | Route::Aliases { ref mut state, .. } => {
                     state.prev_match(40);
                 }
-                Route::Logs { .. } => {
-                    // Log view uses stackable filters, no next/prev match
+                Route::Logs { ref mut state, .. } | Route::Shell { ref mut state, .. } => {
+                    // Jump to previous filtered line (N in vim search).
+                    let current_scroll = state.scroll;
+                    if let Some(&prev_idx) = state.filtered_indices.iter().rev()
+                        .find(|&&idx| idx < current_scroll)
+                    {
+                        state.scroll = prev_idx;
+                        state.follow = false;
+                    } else if let Some(&last) = state.filtered_indices.last() {
+                        // Wrap around.
+                        state.scroll = last;
+                        state.follow = false;
+                    }
                 }
                 _ => {}
             }
@@ -667,7 +690,7 @@ pub(crate) fn handle_action(
             }
         }
         Action::PreviousLogs => {
-            handle_previous_logs(app, data_source, log_task);
+            handle_previous_logs(app, data_source, log_stream);
         }
         Action::ShowNode => {
             if app.current_capabilities().supports(crate::kube::protocol::OperationKind::ShowNode) {
@@ -681,6 +704,7 @@ pub(crate) fn handle_action(
                             filter: Some(crate::app::nav::NavFilter::Grep(node.clone())),
                             saved_selected: 0,
                             filter_input: crate::app::nav::FilterInputState::default(),
+                stream: None,
                         });
                         apply_nav_change(app, data_source, change);
                         app.reapply_nav_filters();
@@ -693,6 +717,69 @@ pub(crate) fn handle_action(
                 let change = app.nav.reset(last);
                 *app.nav.filter_input_mut() = Default::default();
                 apply_nav_change(app, data_source, change);
+            }
+        }
+        Action::UsedBy => {
+            // Reverse-reference lookup: drill into pods that reference
+            // the selected resource by name. Works for Secrets, ConfigMaps,
+            // PVCs, ServiceAccounts — any resource that pods mount/use.
+            // The grep approach is a fast approximation; the pod's spec
+            // contains the resource name in volume mounts, env refs, etc.
+            if let Some(info) = get_selected_resource_info(app) {
+                let name = info.name.clone();
+                let kind = info.resource.display_label().to_string();
+                let sel = app.active_table_selected();
+                app.nav.save_selected(sel);
+                let change = app.nav.push(crate::app::nav::NavStep {
+                    resource: rid("pods"),
+                    filter: Some(crate::app::nav::NavFilter::Grep(name.clone())),
+                    saved_selected: 0,
+                    filter_input: crate::app::nav::FilterInputState::default(),
+                    stream: None,
+                });
+                apply_nav_change(app, data_source, change);
+                app.reapply_nav_filters();
+                app.flash = Some(crate::app::FlashMessage::info(
+                    format!("Pods referencing {}/{}", kind.to_lowercase(), name)
+                ));
+            }
+        }
+        Action::JumpToOwner => {
+            // Walk up the ownerReferences chain. The selected row's
+            // owner_refs carry the owner's kind/name/uid. We resolve the
+            // kind to a ResourceId and drill into that resource filtered
+            // by name (grep). If there's no owner, flash a message.
+            let current_rid = app.nav.resource_id().clone();
+            if let Some(row) = app.data.unified.get(&current_rid).and_then(|t| t.selected_item()) {
+                if let Some(owner) = row.owner_refs.first() {
+                    let owner_kind = owner.kind.clone();
+                    let owner_name = owner.name.clone();
+                    let owner_rid = crate::kube::protocol::ResourceId::from_alias(&owner_kind.to_lowercase())
+                        .unwrap_or_else(|| {
+                            // CRD or unknown kind — build a best-effort rid
+                            crate::kube::protocol::ResourceId::new(
+                                String::new(), String::new(),
+                                owner_kind.clone(), format!("{}s", owner_kind.to_lowercase()),
+                                crate::kube::protocol::ResourceScope::Namespaced,
+                            )
+                        });
+                    let sel = app.active_table_selected();
+                    app.nav.save_selected(sel);
+                    let change = app.nav.push(crate::app::nav::NavStep {
+                        resource: owner_rid,
+                        filter: Some(crate::app::nav::NavFilter::Grep(owner_name.clone())),
+                        saved_selected: 0,
+                        filter_input: crate::app::nav::FilterInputState::default(),
+                        stream: None,
+                    });
+                    apply_nav_change(app, data_source, change);
+                    app.reapply_nav_filters();
+                    app.flash = Some(crate::app::FlashMessage::info(
+                        format!("Owner: {}/{}", owner_kind.to_lowercase(), owner_name)
+                    ));
+                } else {
+                    app.flash = Some(crate::app::FlashMessage::warn("No owner found".to_string()));
+                }
             }
         }
         Action::ToggleMark => {
@@ -780,7 +867,7 @@ pub(crate) fn handle_action(
             let since_label = since.as_deref().unwrap_or("tail");
             app.flash = Some(crate::app::FlashMessage::info(format!("Log range: {}", since_label)));
             // Cancel existing log task
-            if let Some(handle) = log_task.take() { handle.abort(); }
+            *log_stream = None;
             // Restart with new since/tail parameter
             if let Route::Logs { ref target, ref mut state } = app.route {
                 state.since = since.clone();
@@ -793,7 +880,7 @@ pub(crate) fn handle_action(
                 let pod = target.pod.clone();
                 let namespace = target.namespace.clone();
                 let container = target.container.clone();
-                ds_try!(app, data_source.stream_logs(
+                *log_stream = Some(data_source.stream_log_substream(
                     &pod,
                     &namespace,
                     &container,
@@ -812,6 +899,8 @@ pub(crate) fn handle_action(
         }
         Action::ToggleFaultFilter => {
             if !app.nav.has_fault_filter() {
+                let sel = app.active_table_selected();
+                app.nav.save_selected(sel);
                 let change = app.nav.push(crate::app::nav::NavStep {
                     resource: app.nav.resource_id().clone(),
                     filter: Some(crate::app::nav::NavFilter::Grep(
@@ -819,6 +908,7 @@ pub(crate) fn handle_action(
                     )),
                     saved_selected: 0,
                     filter_input: crate::app::nav::FilterInputState::default(),
+                stream: None,
                 });
                 apply_nav_change(app, data_source, change);
                 app.reapply_nav_filters();
@@ -832,6 +922,34 @@ pub(crate) fn handle_action(
         }
         Action::FlashInfo(msg) => {
             app.flash = Some(crate::app::FlashMessage::info(msg));
+        }
+        Action::SaveLogs => {
+            if let crate::app::Route::Logs { ref target, ref state, .. }
+                | crate::app::Route::Shell { ref target, ref state, .. } = app.route
+            {
+                let filename = format!(
+                    "/tmp/k9rs-logs-{}-{}-{}.log",
+                    target.pod, target.container,
+                    chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+                );
+                let content: String = state.lines.iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                match std::fs::write(&filename, &content) {
+                    Ok(()) => {
+                        let count = content.lines().count();
+                        app.flash = Some(crate::app::FlashMessage::info(
+                            format!("Saved {} lines to {}", count, filename)
+                        ));
+                    }
+                    Err(e) => {
+                        app.flash = Some(crate::app::FlashMessage::error(
+                            format!("Save failed: {}", e)
+                        ));
+                    }
+                }
+            }
         }
     }
     ActionResult::None

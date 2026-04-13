@@ -29,7 +29,7 @@ pub(crate) fn pv_to_row(pv: PersistentVolume) -> ResourceRow {
     ResourceRow {
         cells: vec![name.clone(), capacity, access_modes, reclaim_policy, status, claim, storage_class, crate::util::format_age(age)],
         name,
-        namespace: String::new(),
+        namespace: None,
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

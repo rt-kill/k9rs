@@ -14,7 +14,7 @@ pub(crate) fn storage_class_to_row(sc: StorageClass) -> ResourceRow {
     ResourceRow {
         cells: vec![name.clone(), provisioner, reclaim_policy, volume_binding_mode, allow_expansion.to_string(), crate::util::format_age(age)],
         name,
-        namespace: String::new(),
+        namespace: None,
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

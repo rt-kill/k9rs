@@ -17,7 +17,7 @@ pub(crate) fn limit_range_to_row(lr: LimitRange) -> ResourceRow {
     ResourceRow {
         cells: vec![ns.clone(), name.clone(), types, crate::util::format_age(age)],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

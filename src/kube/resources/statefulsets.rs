@@ -45,7 +45,7 @@ pub(crate) fn statefulset_to_row(sts: StatefulSet) -> ResourceRow {
     ResourceRow {
         cells: vec![ns.clone(), name.clone(), ready, service_name, container_names, images, labels_str, crate::util::format_age(age)],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: container_ports,

@@ -16,13 +16,6 @@ pub enum AppEvent {
     ResourceUpdate(ResourceUpdate),
     /// A temporary flash message shown in the status bar.
     Flash(FlashMessage),
-    /// Result of a background context switch. Contains the context name and
-    /// success/failure. On success the server has already switched contexts
-    /// and the `ClientSession` will update its stored context info.
-    ContextSwitchResult {
-        context: String,
-        result: Result<(), String>,
-    },
     /// Pod metrics from the metrics-server.
     PodMetrics(HashMap<crate::kube::protocol::ObjectKey, crate::kube::protocol::MetricsUsage>),
     /// Node metrics from the metrics-server.
@@ -58,9 +51,7 @@ pub enum AppEvent {
     /// The daemon handshake failed. The TUI should exit with this error.
     ConnectionFailed(String),
     /// The kubeconfig was read in the background. Lets the TUI populate the
-    /// contexts panel and `:ctx <tab>` completion before the daemon answers,
-    /// and gives the context-switch path the cached YAML/env it needs to
-    /// build a new `SwitchContext` payload without going back to disk.
+    /// contexts panel and `:ctx <tab>` completion before the daemon answers.
     KubeconfigLoaded {
         contexts: Vec<crate::app::KubeContext>,
         current_context: String,

@@ -24,6 +24,8 @@ pub fn for_k8s(plural: &str) -> ResourceCapabilities {
         if meta.supports_logs {
             ops.push(op_no_input(OperationKind::StreamLogs, "Logs"));
             ops.push(op_no_input(OperationKind::PreviousLogs, "Previous logs"));
+        }
+        if meta.supports_port_forward {
             ops.push(op_no_input(OperationKind::PortForward, "Port forward"));
         }
         if meta.supports_shell {

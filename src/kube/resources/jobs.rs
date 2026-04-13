@@ -59,7 +59,7 @@ pub(crate) fn job_to_row(job: Job) -> ResourceRow {
     ResourceRow {
         cells: vec![ns.clone(), name.clone(), completions, duration, container_names, images, labels_str, crate::util::format_age(age)],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

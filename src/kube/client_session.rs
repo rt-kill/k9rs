@@ -92,6 +92,51 @@ pub struct ClientSession {
     cmd_tx: mpsc::UnboundedSender<SessionCommand>,
     context: watch::Sender<String>,
     _shutdown: oneshot::Sender<()>,
+    mux_handle_rx: watch::Receiver<Option<crate::kube::mux::MuxHandle>>,
+    event_tx: mpsc::Sender<AppEvent>,
+    no_daemon: bool,
+}
+
+/// An active subscription backed by its own yamux substream. Drop aborts
+/// the bridge task which closes the substream (sending RST to the daemon).
+/// The daemon's bridge for this substream exits on EOF; the underlying
+/// watcher enters its grace period via `Subscription::Drop`.
+///
+/// From the application's perspective: this IS the subscription. Hold it
+/// to keep the data flowing; drop it to stop. No ids, no routing tags.
+pub struct SubscriptionStream {
+    _bridge: tokio::task::AbortHandle,
+}
+
+impl std::fmt::Debug for SubscriptionStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubscriptionStream").finish_non_exhaustive()
+    }
+}
+
+impl Drop for SubscriptionStream {
+    fn drop(&mut self) {
+        self._bridge.abort();
+    }
+}
+
+/// An active log stream backed by its own yamux substream. Same shape as
+/// `SubscriptionStream` — drop aborts the bridge, closes the substream,
+/// the daemon's kubectl subprocess dies via `kill_on_drop`.
+pub struct LogStream {
+    _bridge: tokio::task::AbortHandle,
+}
+
+impl std::fmt::Debug for LogStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogStream").finish_non_exhaustive()
+    }
+}
+
+impl Drop for LogStream {
+    fn drop(&mut self) {
+        self._bridge.abort();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,23 +149,34 @@ impl ClientSession {
     /// locally on an unbounded channel and are flushed to the wire as soon as
     /// the manager task spawns the writer (after a successful handshake).
     pub fn new(params: ConnectionParams, event_tx: mpsc::Sender<AppEvent>) -> Self {
+        let no_daemon = params.no_daemon;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
         let (context, _) = watch::channel(String::new());
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (mux_handle_tx, mux_handle_rx) = watch::channel(None);
 
         tokio::spawn(connection_manager(
             params,
             cmd_rx,
-            event_tx,
+            event_tx.clone(),
             context.clone(),
             shutdown_rx,
+            mux_handle_tx,
         ));
 
         Self {
             cmd_tx,
             context,
             _shutdown: shutdown_tx,
+            mux_handle_rx,
+            event_tx,
+            no_daemon,
         }
+    }
+
+    /// Whether this session is running in no-daemon mode (in-process).
+    pub fn is_no_daemon(&self) -> bool {
+        self.no_daemon
     }
 
     /// Read the on-disk kubeconfig and produce both the daemon Init payload
@@ -164,26 +220,6 @@ impl ClientSession {
         })
     }
 
-    fn prepare_kubeconfig_from_cached(
-        yaml: &str,
-        env: &HashMap<String, String>,
-        context: Option<&str>,
-    ) -> PreparedKubeconfig {
-        let kubeconfig: Kubeconfig = serde_yaml::from_str(yaml).unwrap_or_default();
-        let context_name = context
-            .map(|s| s.to_string())
-            .or_else(|| kubeconfig.current_context.clone())
-            .unwrap_or_default();
-        let (cluster_name, user_name) = lookup_cluster_user(&kubeconfig, &context_name);
-        PreparedKubeconfig {
-            kubeconfig_yaml: yaml.to_string(),
-            env_vars: env.clone(),
-            context_name,
-            cluster_name,
-            user_name,
-        }
-    }
-
     fn build_init_command(
         namespace: Option<&str>,
         readonly: bool,
@@ -217,8 +253,9 @@ async fn connection_manager(
     event_tx: mpsc::Sender<AppEvent>,
     context: watch::Sender<String>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    mux_handle_tx: watch::Sender<Option<crate::kube::mux::MuxHandle>>,
 ) {
-    let pipeline = run_connection_pipeline(params, cmd_rx, event_tx, context);
+    let pipeline = run_connection_pipeline(params, cmd_rx, event_tx, context, mux_handle_tx);
     tokio::pin!(pipeline);
     tokio::select! {
         biased;
@@ -244,6 +281,7 @@ async fn run_connection_pipeline(
     cmd_rx: mpsc::UnboundedReceiver<SessionCommand>,
     event_tx: mpsc::Sender<AppEvent>,
     context: watch::Sender<String>,
+    mux_handle_tx: watch::Sender<Option<crate::kube::mux::MuxHandle>>,
 ) {
     macro_rules! fail {
         ($($arg:tt)*) => {{
@@ -269,16 +307,38 @@ async fn run_connection_pipeline(
         env_vars: bundle.prepared.env_vars.clone(),
     }).await;
 
-    // Stage 2: open the transport. Real Unix socket, or in-memory duplex
-    // running an in-process `ServerSession` when `--no-daemon`.
-    let (reader_io, writer_io) = match open_transport(params.no_daemon).await {
-        Ok(t) => t,
+    // Stage 2: open the transport and establish the yamux multiplexed
+    // connection. The first substream we open is the CONTROL stream, which
+    // carries the Init/Ready handshake plus one-shot commands (Apply,
+    // Delete, Yaml, etc.) and global events (Flash, PodMetrics, etc.).
+    let mux = match open_transport(params.no_daemon).await {
+        Ok(m) => m,
         Err(e) => fail!("{}", e),
     };
-    let reader = BufReader::with_capacity(protocol::IO_BUFFER_SIZE, reader_io);
-    let writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer_io);
+    // Publish the MuxHandle so subscribe_stream() tasks can open their own
+    // substreams. They'll await the handshake completion before actually
+    // subscribing, but having the handle early lets them start their await
+    // immediately rather than polling.
+    let _ = mux_handle_tx.send(Some(mux.handle()));
+    let control_stream = match mux.open().await {
+        Ok(s) => s,
+        Err(e) => fail!("failed to open control stream: {}", e),
+    };
 
-    // Stage 3: Init/Ready handshake.
+    // Split the control substream into reader/writer halves for the
+    // existing handshake + I/O loop code. Inside, it's still plain bincode
+    // framing — the yamux layer is invisible at this level.
+    let (ctrl_read, ctrl_write) = tokio::io::split(control_stream);
+    let reader: BufReader<Box<dyn AsyncRead + Unpin + Send>> = BufReader::with_capacity(
+        protocol::IO_BUFFER_SIZE,
+        Box::new(ctrl_read),
+    );
+    let writer: BufWriter<Box<dyn AsyncWrite + Unpin + Send>> = BufWriter::with_capacity(
+        protocol::IO_BUFFER_SIZE,
+        Box::new(ctrl_write),
+    );
+
+    // Stage 3: Init/Ready handshake over the control substream.
     let outcome = match do_handshake(
         reader, writer,
         params.namespace.as_deref(),
@@ -291,10 +351,10 @@ async fn run_connection_pipeline(
     // Publish the resolved context name now that the daemon has confirmed it.
     let _ = context.send(outcome.context.clone());
 
-    // Stage 4: spawn the reader/writer loops and notify the TUI. The
-    // `_io_guard` captures both abort handles; if this future is dropped
-    // (e.g. shutdown raced ahead), the guard fires in its `Drop` and the
-    // tasks are aborted. Otherwise we await the guarded `select!` below.
+    // Stage 4: spawn the reader/writer loops (on the control substream)
+    // and notify the TUI. The `_io_guard` captures both abort handles; if
+    // this future is dropped (e.g. shutdown raced ahead), the guard fires
+    // in its `Drop` and the tasks are aborted.
     let writer_handle = tokio::spawn(writer_loop(cmd_rx, outcome.writer));
     let reader_handle = tokio::spawn(reader_loop(
         outcome.reader,
@@ -316,10 +376,13 @@ async fn run_connection_pipeline(
     // Stage 5: keep the I/O loops alive for as long as both are running.
     // When either dies (cmd_tx dropped → writer exits; daemon disconnects
     // → reader exits) the other is aborted by `_io_guard` going out of scope.
+    // The `mux` connection stays alive here on the stack so the yamux
+    // driver task continues running for the session's lifetime.
     tokio::select! {
         _ = writer_handle => {}
         _ = reader_handle => {}
     }
+    drop(mux); // explicit for clarity — driver task dies here
 }
 
 /// RAII guard: aborts a fixed set of tokio tasks when dropped. Used by the
@@ -350,22 +413,29 @@ async fn load_kubeconfig(cli_context: Option<String>) -> anyhow::Result<Kubeconf
         .map_err(|e| anyhow::anyhow!("kubeconfig task panicked: {}", e))?
 }
 
-/// Stage 2: open either the daemon Unix socket or an in-process duplex.
+/// Stage 2: open the transport and establish a multiplexed connection.
+///
+/// Returns a `MuxedConnection` (the yamux session wrapped in our
+/// abstraction) plus its `MuxHandle` for opening subscription substreams
+/// from arbitrary tasks. The caller opens the first substream (control)
+/// from the connection to run the Init/Ready handshake over it.
+///
+/// In `--no-daemon` mode, both ends of an in-memory duplex are wrapped
+/// in yamux sessions; the server side is spawned as a background task.
 async fn open_transport(
     no_daemon: bool,
-) -> anyhow::Result<(Box<dyn AsyncRead + Unpin + Send>, Box<dyn AsyncWrite + Unpin + Send>)> {
+) -> anyhow::Result<crate::kube::mux::MuxedConnection> {
+    use crate::kube::mux::MuxedConnection;
     if no_daemon {
         let server_state = Arc::new(SessionSharedState::new());
         let (client_stream, server_stream) = tokio::io::duplex(protocol::DUPLEX_BUFFER_SIZE);
 
-        let (server_read, server_write) = tokio::io::split(server_stream);
-        let server_boxed_read: Box<dyn AsyncRead + Unpin + Send> = Box::new(server_read);
-        let server_boxed_write: Box<dyn AsyncWrite + Unpin + Send> = Box::new(server_write);
+        // Server side of the duplex — wrapped in a yamux session and
+        // handed to the existing ServerSession entry point.
         tokio::spawn(async move {
             let result = std::panic::AssertUnwindSafe(
-                ServerSession::init_and_run(
-                    BufReader::with_capacity(protocol::IO_BUFFER_SIZE, server_boxed_read),
-                    server_boxed_write,
+                ServerSession::init_and_run_muxed(
+                    MuxedConnection::server(server_stream),
                     server_state,
                 )
             );
@@ -374,19 +444,22 @@ async fn open_transport(
             }
         });
 
-        let (client_read, client_write) = tokio::io::split(client_stream);
-        Ok((Box::new(client_read), Box::new(client_write)))
+        Ok(MuxedConnection::client(client_stream))
     } else {
+        use tokio::io::AsyncWriteExt;
         let path = socket_path();
-        let stream = UnixStream::connect(&path).await.map_err(|e| {
+        let mut stream = UnixStream::connect(&path).await.map_err(|e| {
             anyhow::anyhow!(
                 "Failed to connect to daemon at {}: {}. Is the daemon running?",
                 path.display(),
                 e
             )
         })?;
-        let (read_half, write_half) = stream.into_split();
-        Ok((Box::new(read_half), Box::new(write_half)))
+        // Write the connection-type discriminator so the daemon's accept
+        // loop knows to wrap this connection in yamux (not plain bincode).
+        stream.write_all(&[crate::kube::daemon::CONN_TYPE_SESSION]).await
+            .map_err(|e| anyhow::anyhow!("Failed to write session marker: {}", e))?;
+        Ok(MuxedConnection::client(stream))
     }
 }
 
@@ -461,32 +534,21 @@ impl ClientSession {
         })
     }
 
-    /// Build a `SwitchContext` command and queue it on the wire. The cached
-    /// kubeconfig YAML and env vars come from the caller (App owns them, set
-    /// by the `KubeconfigLoaded` event) so this method does no I/O and needs
-    /// no shared state.
-    pub fn switch_context(
-        &mut self,
-        context: &str,
-        cached_yaml: &str,
-        cached_env: &HashMap<String, String>,
-    ) -> anyhow::Result<()> {
-        let prepared = Self::prepare_kubeconfig_from_cached(cached_yaml, cached_env, Some(context));
-        self.send_command(&SessionCommand::SwitchContext {
-            context: context.to_string(),
-            kubeconfig_yaml: prepared.kubeconfig_yaml,
-            env_vars: prepared.env_vars,
-            cluster_name: prepared.cluster_name,
-            user_name: prepared.user_name,
-        })
-    }
-
     pub fn describe(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
         self.send_command(&SessionCommand::Describe(target.clone()))
     }
 
     pub fn yaml(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
         self.send_command(&SessionCommand::Yaml(target.clone()))
+    }
+
+    /// Submit edited YAML for `target`. The server routes by
+    /// `target.resource.is_local()` — same wire command for K8s and local
+    /// resources, no client-side branching. Used by the unified edit flow:
+    /// `Action::Edit` fetches via `yaml()`, the user edits in `$EDITOR`,
+    /// and the result is sent back via `apply()`.
+    pub fn apply(&mut self, target: &protocol::ObjectRef, yaml: String) -> anyhow::Result<()> {
+        self.send_command(&SessionCommand::Apply { target: target.clone(), yaml })
     }
 
     pub fn delete(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
@@ -504,8 +566,12 @@ impl ClientSession {
         self.send_command(&SessionCommand::Restart(target.clone()))
     }
 
-    pub fn stream_logs(
-        &mut self,
+    /// Open a log substream. Same shape as `subscribe_stream` — spawns a
+    /// bridge task that opens a yamux substream, writes `LogInit`, reads
+    /// log lines, and forwards them as `AppEvent`s. Drop the `LogStream`
+    /// to stop (the substream RSTs, the daemon kills kubectl).
+    pub fn stream_log_substream(
+        &self,
         pod: &str,
         namespace: &str,
         container: &str,
@@ -513,8 +579,10 @@ impl ClientSession {
         tail: Option<u64>,
         since: Option<String>,
         previous: bool,
-    ) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::StreamLogs {
+    ) -> LogStream {
+        let mut mux_rx = self.mux_handle_rx.clone();
+        let event_tx = self.event_tx.clone();
+        let init = protocol::SubstreamInit::Log(protocol::LogInit {
             pod: pod.to_string(),
             namespace: protocol::Namespace::from(namespace),
             container: container.to_string(),
@@ -522,11 +590,59 @@ impl ClientSession {
             tail,
             since,
             previous,
-        })
-    }
+        });
+        let handle = tokio::spawn(async move {
+            // Wait for MuxHandle.
+            loop {
+                if mux_rx.borrow_and_update().is_some() { break; }
+                if mux_rx.changed().await.is_err() { return; }
+            }
+            let mux_handle = mux_rx.borrow().clone().unwrap();
 
-    pub fn stop_logs(&mut self) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::StopLogs)
+            let stream = match mux_handle.open().await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::Flash(FlashMessage::error(
+                        format!("log substream open failed: {}", e),
+                    ))).await;
+                    return;
+                }
+            };
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = tokio::io::BufReader::with_capacity(
+                protocol::IO_BUFFER_SIZE,
+                read_half,
+            );
+
+            if protocol::write_bincode(&mut write_half, &init).await.is_err() {
+                return;
+            }
+
+            // Each frame is a single log line (String, bincode-framed).
+            // EOF = log stream ended.
+            loop {
+                match protocol::read_bincode::<_, String>(&mut reader).await {
+                    Ok(line) => {
+                        let clean = crate::util::strip_ansi(&line);
+                        let event = AppEvent::ResourceUpdate(
+                            crate::event::ResourceUpdate::LogLine(clean),
+                        );
+                        if event_tx.send(event).await.is_err() { break; }
+                    }
+                    Err(_) => {
+                        // EOF — log stream ended.
+                        let _ = event_tx.send(AppEvent::LogStreamEnded).await;
+                        let _ = event_tx.send(AppEvent::Flash(
+                            FlashMessage::info("Log stream ended"),
+                        )).await;
+                        break;
+                    }
+                }
+            }
+        });
+        LogStream {
+            _bridge: handle.abort_handle(),
+        }
     }
 
     pub fn get_discovery(&mut self) -> anyhow::Result<()> {
@@ -574,25 +690,6 @@ impl ClientSession {
 // ---------------------------------------------------------------------------
 
 impl ClientSession {
-    /// Subscribe to a resource by its ResourceId, optionally with a server-side filter.
-    pub fn subscribe_resource(&mut self, rid: &protocol::ResourceId, filter: Option<protocol::SubscriptionFilter>) {
-        if let Err(e) = self.send_command(&SessionCommand::Subscribe { resource: rid.clone(), filter }) {
-            tracing::warn!("ClientSession::subscribe_resource failed: {}", e);
-        }
-    }
-
-    /// Unsubscribe from a resource by its ResourceId.
-    pub fn unsubscribe_resource(&mut self, rid: &protocol::ResourceId) {
-        if let Err(e) = self.send_command(&SessionCommand::Unsubscribe(rid.clone())) {
-            tracing::warn!("ClientSession::unsubscribe_resource failed: {}", e);
-        }
-    }
-
-    pub fn refresh_resource(&mut self, rid: &protocol::ResourceId) {
-        if let Err(e) = self.send_command(&SessionCommand::Refresh(rid.clone())) {
-            tracing::warn!("ClientSession::refresh_resource failed: {}", e);
-        }
-    }
 
     pub fn set_context_info(&self, new_context: &str) {
         let _ = self.context.send(new_context.to_string());
@@ -602,6 +699,108 @@ impl ClientSession {
     /// initial handshake hasn't completed yet.
     pub fn context_name(&self) -> String {
         self.context.borrow().clone()
+    }
+
+    /// Open a per-subscription substream. Spawns a background task that:
+    ///
+    /// 1. Awaits the `MuxHandle` (blocks until the handshake completes —
+    ///    same timing as the old `cmd_tx` queue-until-handshake pattern).
+    /// 2. Opens a fresh yamux substream.
+    /// 3. Writes a `SubscriptionInit { resource, filter }` handshake.
+    /// 4. Reads `StreamEvent`s from the substream and forwards them into
+    ///    the main event channel as `AppEvent`s.
+    ///
+    /// Returns a `SubscriptionStream` handle. Drop it to unsubscribe —
+    /// the bridge task is aborted, the substream is closed (RST sent to
+    /// the daemon), and the daemon's bridge exits on EOF.
+    pub fn subscribe_stream(
+        &self,
+        resource: protocol::ResourceId,
+        namespace: protocol::Namespace,
+        filter: Option<protocol::SubscriptionFilter>,
+    ) -> SubscriptionStream {
+        let mut mux_rx = self.mux_handle_rx.clone();
+        let event_tx = self.event_tx.clone();
+        let rid = resource.clone();
+        let handle = tokio::spawn(async move {
+            // Wait for the MuxHandle to become available (connection established).
+            loop {
+                {
+                    let val = mux_rx.borrow_and_update();
+                    if val.is_some() { break; }
+                }
+                if mux_rx.changed().await.is_err() {
+                    // Session dropped before connection established.
+                    return;
+                }
+            }
+            let mux_handle = mux_rx.borrow().clone().unwrap();
+
+            // Open a substream and send the subscription handshake.
+            let stream = match mux_handle.open().await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::SubscriptionFailed {
+                        resource: rid,
+                        message: format!("substream open failed: {}", e),
+                    }).await;
+                    return;
+                }
+            };
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = tokio::io::BufReader::with_capacity(
+                protocol::IO_BUFFER_SIZE,
+                read_half,
+            );
+
+            let init = protocol::SubstreamInit::Subscribe(protocol::SubscriptionInit {
+                resource: rid.clone(),
+                namespace,
+                filter,
+            });
+            if protocol::write_bincode(&mut write_half, &init).await.is_err() {
+                return;
+            }
+
+            // Bridge: read StreamEvents from the substream, convert to
+            // AppEvents, forward into the main event channel.
+            loop {
+                match protocol::read_bincode::<_, protocol::StreamEvent>(&mut reader).await {
+                    Ok(event) => {
+                        let app_event = match event {
+                            protocol::StreamEvent::Snapshot(update) => {
+                                AppEvent::ResourceUpdate(update)
+                            }
+                            protocol::StreamEvent::Error(msg) => {
+                                AppEvent::SubscriptionFailed {
+                                    resource: rid.clone(),
+                                    message: msg,
+                                }
+                            }
+                            protocol::StreamEvent::Capabilities(caps) => {
+                                AppEvent::ResourceCapabilities {
+                                    resource: rid.clone(),
+                                    capabilities: caps,
+                                }
+                            }
+                            protocol::StreamEvent::Resolved { original, resolved } => {
+                                AppEvent::ResourceResolved { original, resolved }
+                            }
+                        };
+                        if event_tx.send(app_event).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        // Substream closed (EOF or error) — subscription ended.
+                        break;
+                    }
+                }
+            }
+        });
+        SubscriptionStream {
+            _bridge: handle.abort_handle(),
+        }
     }
 }
 
@@ -643,19 +842,12 @@ fn collect_env_vars() -> HashMap<String, String> {
 async fn reader_loop(
     mut reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     event_tx: mpsc::Sender<AppEvent>,
-    initial_context: String,
+    context: String,
 ) {
-    let mut current_context = initial_context;
-
     loop {
         match protocol::read_bincode::<_, SessionEvent>(&mut reader).await {
             Ok(event) => {
-                // Track context switches so we can filter stale events.
-                if let SessionEvent::ContextSwitched { ref context, ok: true, .. } = event {
-                    current_context = context.clone();
-                }
-
-                for app_event in convert_session_event(event, &current_context) {
+                for app_event in convert_session_event(event, &context) {
                     if event_tx.send(app_event).await.is_err() {
                         debug!("ClientSession: TUI event channel closed, stopping reader");
                         return;
@@ -684,12 +876,14 @@ async fn reader_loop(
 /// Convert a `SessionEvent` from the daemon into `AppEvent`s for the TUI.
 /// With the binary protocol, Snapshot events carry typed ResourceUpdate
 /// directly — no JSON parsing needed.
+/// Convert a `SessionEvent` from the daemon's control substream into
+/// `AppEvent`s for the TUI. Subscription-specific events (Snapshot,
+/// Capabilities, Resolved, SubscriptionError) no longer arrive here —
+/// they flow on per-subscription yamux substreams via `StreamEvent` and
+/// are converted inside the per-subscription bridge task in
+/// `subscribe_stream`.
 fn convert_session_event(event: SessionEvent, current_context: &str) -> Vec<AppEvent> {
     match event {
-        SessionEvent::Snapshot(update) => {
-            vec![AppEvent::ResourceUpdate(update)]
-        }
-
         SessionEvent::DescribeResult(content) => {
             vec![AppEvent::ResourceUpdate(ResourceUpdate::Describe(content))]
         }
@@ -698,17 +892,8 @@ fn convert_session_event(event: SessionEvent, current_context: &str) -> Vec<AppE
             vec![AppEvent::ResourceUpdate(ResourceUpdate::Yaml(content))]
         }
 
-        SessionEvent::LogLine(line) => {
-            let clean = crate::util::strip_ansi(&line);
-            vec![AppEvent::ResourceUpdate(ResourceUpdate::LogLine(clean))]
-        }
-
-        SessionEvent::LogEnd => {
-            vec![
-                AppEvent::LogStreamEnded,
-                AppEvent::Flash(FlashMessage::info("Log stream ended")),
-            ]
-        }
+        // LogLine and LogEnd are gone — logs now flow on yamux substreams.
+        // The bridge task in stream_log_substream forwards them.
 
         SessionEvent::CommandResult { ok, message } => {
             let flash = if ok {
@@ -758,26 +943,6 @@ fn convert_session_event(event: SessionEvent, current_context: &str) -> Vec<AppE
 
         SessionEvent::SessionError(message) => {
             vec![AppEvent::Flash(FlashMessage::error(message))]
-        }
-
-        SessionEvent::SubscriptionError { resource, message } => {
-            vec![
-                AppEvent::SubscriptionFailed { resource, message: message.clone() },
-                AppEvent::Flash(FlashMessage::error(message)),
-            ]
-        }
-
-        SessionEvent::ResourceResolved { original, resolved } => {
-            vec![AppEvent::ResourceResolved { original, resolved }]
-        }
-
-        SessionEvent::ResourceCapabilities { resource, capabilities } => {
-            vec![AppEvent::ResourceCapabilities { resource, capabilities }]
-        }
-
-        SessionEvent::ContextSwitched { context, ok, message } => {
-            let result = if ok { Ok(()) } else { Err(message) };
-            vec![AppEvent::ContextSwitchResult { context, result }]
         }
 
         // Ready and DaemonStatus are handled during handshake / by ctl, not in the reader loop.

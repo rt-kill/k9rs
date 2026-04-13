@@ -8,7 +8,6 @@ use crossterm::{
     terminal::{disable_raw_mode, LeaveAlternateScreen},
 };
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use crate::app::{App, InputMode};
 use crate::event::AppEvent;
@@ -16,9 +15,8 @@ use crate::kube::client_session::ClientSession;
 
 use crate::kube::session_actions::handle_action;
 use crate::kube::session_events::apply_event;
-use crate::kube::session_nav::apply_context_switch_result;
 use crate::kube::session_commands::{
-    build_shell_args, build_edit_args, run_interactive_local,
+    build_shell_args, run_interactive_local,
     handle_command_key, handle_form_dialog_key, handle_filter_key,
 };
 
@@ -45,6 +43,11 @@ const SEARCH_SCROLL_CONTEXT: usize = 10;
 
 /// Result returned from `handle_action` to signal the main loop about actions
 /// that require terminal access (suspend/resume TUI for interactive commands).
+///
+/// Note: edit no longer lives here. The unified edit flow is driven by the
+/// `Route::EditingResource` state machine — `apply_resource_update` writes
+/// the YAML to a temp file when the server's response arrives, and the main
+/// loop polls for `EditState::EditorReady` at the top of each iteration.
 pub(crate) enum ActionResult {
     /// No special handling needed.
     None,
@@ -55,46 +58,71 @@ pub(crate) enum ActionResult {
         container: String,
         context: String,
     },
-    /// Suspend the TUI and run `kubectl edit` on a resource.
-    Edit {
-        resource: String,
-        name: String,
-        namespace: String,
-        context: String,
-    },
 }
 
-/// Dispatch a single AppEvent. Most events are pure App-state mutations and
-/// go through `apply_event`; `ContextSwitchResult` is the one event that
-/// also needs to talk to `data_source`, so it has its own arm.
+/// Auto-subscriptions that the TUI opens once the daemon connection is ready.
+/// These are core resources that the TUI always needs (namespace list for
+/// the namespace picker, node list for ShowNode drill, etc.). Each gets its
+/// own yamux substream — the daemon creates a watcher per substream.
+///
+/// Stored on App so they stay alive for the session's lifetime. Dropped on
+/// context switch (new session = new substreams).
+pub(crate) fn open_core_subscriptions(app: &mut App, data_source: &ClientSession) {
+    use crate::kube::protocol::ResourceId;
+
+    let core = ["namespaces", "nodes"];
+    for alias in &core {
+        if let Some(rid) = ResourceId::from_alias(alias) {
+            // Core resources are cluster-scoped — always All.
+            let stream = data_source.subscribe_stream(
+                rid,
+                crate::kube::protocol::Namespace::All,
+                None,
+            );
+            app.core_streams.push(stream);
+        }
+    }
+}
+
 fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: AppEvent) {
     match event {
-        AppEvent::ContextSwitchResult { context, result } => {
-            apply_context_switch_result(app, data_source, &context, result);
-            app.pod_metrics.clear();
-            app.node_metrics.clear();
+        event @ AppEvent::ConnectionEstablished { .. } => {
+            // Apply the event first (populates context/cluster/user/namespaces).
+            apply_event(app, event);
+            // Context switch complete — allow new switches.
+            app.context_switch_pending = false;
+            // Open core resource substreams now that the connection is ready.
+            // The user lands on Overview (the default route) with only the
+            // mandatory subscriptions (namespaces, nodes). They navigate to
+            // a resource view explicitly — no automatic pods(all) subscribe.
+            open_core_subscriptions(app, data_source);
         }
         other => apply_event(app, other),
     }
 }
 
 pub(crate) fn apply_nav_change(app: &mut App, data_source: &mut ClientSession, change: crate::app::nav::NavChange) {
-    if let Some(ref old) = change.unsubscribe {
-        data_source.unsubscribe_resource(old);
-        // Free the old table's row data so it doesn't leak across views.
-        // (Earlier code tried to keep these around for "instant Esc back" but
-        // that bled stale rows across namespace switches and drill-down
-        // filter changes — correctness wins; the next snapshot is fast.)
-        if let Some(table) = app.data.unified.get_mut(old) {
-            table.clear_data();
-        }
-    }
+    // Unsubscribe: dropping the old step's stream is all that's needed.
+    // The yamux substream RSTs → daemon bridge exits → watcher enters
+    // grace period. No control-stream command required.
+
     if let Some(ref new) = change.subscribe {
-        // Always clear the target table so the view shows "Loading..." until
-        // fresh data arrives. `clear_resource` creates the entry if missing
-        // (needed for dynamically-discovered CRDs).
+        // Clear the target table so the view shows fresh "Loading…" until
+        // the first snapshot arrives on the new substream. This prevents
+        // stale rows from a previous subscription (different filter, same
+        // rid) from bleeding into the new view. The substream's bridge
+        // sends its first snapshot within milliseconds (the daemon's
+        // watcher has data cached), so the flash is negligible.
         app.clear_resource(new);
-        data_source.subscribe_resource(new, change.subscription_filter.clone());
+        // Open a fresh subscription substream via yamux. The bridge task
+        // inside subscribe_stream reads StreamEvents from the substream
+        // and forwards them as AppEvents into the main event channel.
+        let stream = data_source.subscribe_stream(
+            new.clone(),
+            app.selected_ns.clone(),
+            change.subscription_filter.clone(),
+        );
+        app.nav.current_mut().stream = Some(stream);
     }
 }
 
@@ -102,15 +130,16 @@ pub async fn session_main(
     mut app: App,
     mut data_source: ClientSession,
     mut terminal: ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
-    event_tx: mpsc::Sender<AppEvent>,
+    mut event_tx: mpsc::Sender<AppEvent>,
     mut event_rx: mpsc::Receiver<AppEvent>,
     mut input_rx: mpsc::Receiver<CtEvent>,
     tick_rate: Duration,
     input_suspend: tokio::sync::watch::Sender<bool>,
     mut input_suspend_ack: mpsc::Receiver<()>,
 ) -> Result<Option<crate::app::ExitReason>> {
-    // Track active log streaming task so we can cancel on Back
-    let mut log_task: Option<JoinHandle<()>> = None;
+    // Track active log streaming substream so we can cancel on Back.
+    // Drop = close substream = daemon kills kubectl = log stream ended.
+    let mut log_stream: Option<crate::kube::client_session::LogStream> = None;
 
     let mut tick_interval = tokio::time::interval(tick_rate);
     let mut last_tick = std::time::Instant::now();
@@ -118,6 +147,42 @@ pub async fn session_main(
     // Main event loop — only redraw when state changes
     let mut needs_redraw = true; // draw the first frame immediately
     loop {
+        // Context switch: one socket = one context = one session.
+        //
+        // Ownership guarantee: we create a NEW event channel for the new
+        // session. Dropping the old `event_rx` makes it impossible for
+        // stale bridge tasks (which hold clones of the old `event_tx`) to
+        // deliver events — their `send()` returns `Err` and they exit.
+        // The new session's bridge tasks use the new `event_tx`, and only
+        // those events reach our new `event_rx`. Cross-session data bleed
+        // is structurally impossible.
+        if let Some(new_ctx) = app.pending_context_switch.take() {
+            let no_daemon = data_source.is_no_daemon();
+            // 1. Drop the old session — closes the socket, aborts bridge tasks.
+            drop(data_source);
+            // 2. Drop the old event_rx — any buffered stale events are discarded.
+            //    Old bridge tasks that haven't been aborted yet will fail on send.
+            drop(event_rx);
+            // 3. Clear all data AFTER dropping the session so no race exists
+            //    between clear and stale bridge sends.
+            app.clear_data();
+            // 4. New channel for the new session — total isolation.
+            let (new_tx, new_rx) = mpsc::channel::<AppEvent>(256);
+            event_tx = new_tx;
+            event_rx = new_rx;
+            // 5. Create a fresh session with the new channel.
+            let new_params = crate::kube::client_session::ConnectionParams {
+                context: Some(new_ctx),
+                namespace: app.selected_ns.as_option().map(|s| s.to_string()),
+                readonly: app.read_only,
+                no_daemon,
+            };
+            data_source = ClientSession::new(new_params, event_tx.clone());
+            // ConnectionEstablished will fire when the new session is ready,
+            // which triggers open_core_subscriptions + re-subscribe.
+            needs_redraw = true;
+        }
+
         // Tick check BEFORE select — guarantees animation runs even during event floods.
         if last_tick.elapsed() >= tick_rate {
             if app.tick() {
@@ -153,6 +218,57 @@ pub async fn session_main(
             needs_redraw = false;
         }
 
+        // Unified edit flow, stage 2: if the YAML for an in-flight edit
+        // arrived since the last loop iteration, the event handler put us
+        // into `EditState::EditorReady { temp_path }`. Take the path out,
+        // transition to `Applying`, suspend the TUI, run `$EDITOR`, read
+        // the result back, and send `Apply { target, yaml }`. The response
+        // (a `CommandResult` flash) will pop the edit route. Failures
+        // along the way pop the route immediately and flash the error.
+        if let crate::app::Route::EditingResource { ref target, ref state } = app.route {
+            if let crate::app::EditState::EditorReady { ref temp_path } = state {
+                let target = target.clone();
+                let temp_path = temp_path.clone();
+                // Mark the route as Applying *before* the suspend so any
+                // CommandResult that arrives during the editor session
+                // (which can't happen — the loop is parked — but for
+                // future-proofing) lands in the right state.
+                app.route = crate::app::Route::EditingResource {
+                    target: target.clone(),
+                    state: crate::app::EditState::Applying,
+                };
+
+                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+                let path_arg = temp_path.to_string_lossy().to_string();
+                let args = vec![path_arg];
+                run_interactive_local(
+                    &mut terminal, &mut app, &editor, &args, &input_suspend, &mut input_suspend_ack,
+                ).await?;
+
+                // Read the edited file back, send Apply, then delete the temp.
+                let read_result = std::fs::read_to_string(&temp_path);
+                let _ = std::fs::remove_file(&temp_path);
+                match read_result {
+                    Ok(yaml) => {
+                        if let Err(e) = data_source.apply(&target, yaml) {
+                            app.flash = Some(crate::app::FlashMessage::error(
+                                format!("Apply failed: {}", e)
+                            ));
+                            app.pop_route();
+                        }
+                    }
+                    Err(e) => {
+                        app.flash = Some(crate::app::FlashMessage::error(
+                            format!("Failed to read edited file: {}", e)
+                        ));
+                        app.pop_route();
+                    }
+                }
+                needs_redraw = true;
+                continue;
+            }
+        }
+
         tokio::select! {
             // biased: always check key events first so user input (like disabling
             // autoscroll) takes effect before processing queued data events.
@@ -162,7 +278,7 @@ pub async fn session_main(
                 match ct_event {
                     CtEvent::Key(key) => {
                         // Input mode handlers — each returns true if the key was consumed.
-                        if handle_command_key(&mut app, key, &mut data_source, &mut log_task, &event_tx) {
+                        if handle_command_key(&mut app, key, &mut data_source, &mut log_stream, &event_tx) {
                             needs_redraw = true;
                             continue;
                         }
@@ -264,7 +380,7 @@ pub async fn session_main(
                                 action,
                                 &event_tx,
                                 &mut data_source,
-                                &mut log_task,
+                                &mut log_stream,
                             );
                             match result {
                                 ActionResult::Shell { pod, namespace, container, context } => {
@@ -273,27 +389,12 @@ pub async fn session_main(
                                         &mut terminal, &mut app, "kubectl", &args, &input_suspend, &mut input_suspend_ack,
                                     ).await?;
                                 }
-                                ActionResult::Edit { resource, name, namespace, context } => {
-                                    let args = build_edit_args(&resource, &name, &namespace, &context);
-                                    app.flash = Some(crate::app::FlashMessage::info(
-                                        format!("Applying edit: {}/{}...", resource, name)
-                                    ));
-                                    run_interactive_local(
-                                        &mut terminal, &mut app, "kubectl", &args, &input_suspend, &mut input_suspend_ack,
-                                    ).await?;
-                                    // Clear cache after edit (resource may have changed)
-                                    app.kubectl_cache.clear();
-                                    app.flash = Some(crate::app::FlashMessage::info(
-                                        format!("Edit complete: {}/{}", resource, name)
-                                    ));
-                                }
                                 ActionResult::None => {}
                             }
                         }
                     }
-                    CtEvent::Mouse(_mouse) => {
-                        // TODO: mouse handling
-                    }
+                    // Pure-keyboard TUI by design — mouse events are
+                    // intentionally dropped (see ~/.config/claude memory).
                     CtEvent::Resize(_, _) => {
                         needs_redraw = true;
                     }
@@ -320,16 +421,8 @@ pub async fn session_main(
                 if app.tick() {
                     needs_redraw = true;
                 }
-                // Check if the log streaming task has finished
-                if let Some(ref handle) = log_task {
-                    if handle.is_finished() {
-                        log_task.take();
-                        if let crate::app::Route::Logs { ref mut state, .. } | crate::app::Route::Shell { ref mut state, .. } = app.route {
-                            state.streaming = false;
-                        }
-                        needs_redraw = true;
-                    }
-                }
+                // Log stream end is signalled by the bridge task via
+                // AppEvent::LogStreamEnded — no polling needed here.
             }
         }
 
@@ -338,10 +431,8 @@ pub async fn session_main(
         }
     }
 
-    // Cleanup
-    if let Some(handle) = log_task.take() {
-        handle.abort();
-    }
+    // Cleanup — dropping log_stream closes the substream.
+    drop(log_stream);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),

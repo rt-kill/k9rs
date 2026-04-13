@@ -12,7 +12,7 @@ pub(crate) fn service_account_to_row(sa: ServiceAccount) -> ResourceRow {
     ResourceRow {
         cells: vec![ns.clone(), name.clone(), secrets.to_string(), crate::util::format_age(age)],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

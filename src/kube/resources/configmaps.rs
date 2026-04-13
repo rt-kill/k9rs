@@ -21,7 +21,7 @@ pub(crate) fn configmap_to_row(cm: ConfigMap) -> ResourceRow {
             crate::util::format_age(age),
         ],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

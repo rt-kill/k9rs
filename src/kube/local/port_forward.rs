@@ -5,7 +5,7 @@
 //! `watch::Sender` whenever any entry transitions states.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -105,6 +105,24 @@ pub struct PortForwardSource {
     tx: watch::Sender<ResourceUpdate>,
     /// Keeps the `watch::Sender` alive regardless of subscriber count.
     _keep_rx: watch::Receiver<ResourceUpdate>,
+    /// Self-reference set by `Arc::new_cyclic` during construction. Lets
+    /// `&self` methods (e.g. `apply_yaml` from the trait) reach the `Arc`
+    /// they live inside without interior mutability — `create()` needs the
+    /// `Arc` to spawn a monitor task that outlives the call.
+    self_weak: Weak<Self>,
+}
+
+impl Drop for PortForwardSource {
+    fn drop(&mut self) {
+        // Abort every monitor task. This drops their Arc<Self> references
+        // (breaking the circular ref) AND drops the `kill_on_drop` child
+        // process handle inside each task, which kills the kubectl subprocess.
+        for entry in self.entries.iter() {
+            if let Some(ref abort) = entry.abort {
+                abort.abort();
+            }
+        }
+    }
 }
 
 impl PortForwardSource {
@@ -120,14 +138,25 @@ impl PortForwardSource {
             rows: Vec::new(),
         };
         let (tx, rx) = watch::channel(empty);
-        Arc::new(Self {
+        Arc::new_cyclic(|weak: &Weak<Self>| Self {
             id,
             bound_context,
             entries: DashMap::new(),
             next_id: AtomicU64::new(1),
             tx,
             _keep_rx: rx,
+            self_weak: weak.clone(),
         })
+    }
+
+    /// Recover the live `Arc<Self>` from the cyclic `Weak`. Always succeeds
+    /// while at least one external strong ref is held — which is true any
+    /// time a method is being called, since the caller had to upgrade the
+    /// registry's `Weak` to land here.
+    fn arc_self(&self) -> Arc<Self> {
+        self.self_weak
+            .upgrade()
+            .expect("self_weak must upgrade while a method is running on this source")
     }
 
     /// The context this source is bound to.
@@ -339,6 +368,71 @@ impl LocalResourceSource for PortForwardSource {
         };
         Some(format_yaml(&slot.entry))
     }
+
+    fn apply_yaml(&self, name: &str, yaml: &str) -> Result<String, String> {
+        let id = parse_pf_row_name(name)?;
+
+        // Read the user's edits as a free-form YAML map. We deliberately
+        // accept extra/missing fields — only the user-editable subset
+        // matters; system-managed ones (`id`, `state`, `age`,
+        // `last_message`) round-trip but are ignored on apply.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml)
+            .map_err(|e| format!("yaml parse error: {e}"))?;
+        let map = parsed
+            .as_mapping()
+            .ok_or_else(|| "yaml root must be a mapping".to_string())?;
+
+        let new_local: u16 = read_u16(map, "local_port")?;
+        let new_remote: u16 = read_u16(map, "remote_port")?;
+        let new_namespace = read_string(map, "namespace").unwrap_or_default();
+        let new_kubectl_target = read_string(map, "kubectl_target")
+            .ok_or_else(|| "missing field: kubectl_target".to_string())?;
+
+        // Snapshot the current entry so we can decide what changed and
+        // build a fresh request from it.
+        let current = self
+            .entries
+            .get(&id)
+            .map(|slot| slot.entry.clone())
+            .ok_or_else(|| format!("no port-forward with id {id}"))?;
+
+        let unchanged = current.local_port == new_local
+            && current.remote_port == new_remote
+            && current.namespace == new_namespace
+            && current.kubectl_target == new_kubectl_target;
+        if unchanged {
+            return Ok(format!("pf-{id} unchanged"));
+        }
+
+        // Reconcile by stop + recreate. The new entry gets a fresh id; the
+        // old row disappears from the next snapshot. `create` requires
+        // `Arc<Self>` because it spawns a long-lived monitor task — we
+        // recover the Arc via the cyclic `self_weak`.
+        self.stop(id)?;
+        let arc = self.arc_self();
+        let new_id = arc.create(PortForwardRequest {
+            target: current.target,
+            kubectl_target: new_kubectl_target,
+            namespace: new_namespace,
+            local_port: new_local,
+            remote_port: new_remote,
+        });
+        Ok(format!("pf-{id} → pf-{new_id}"))
+    }
+}
+
+fn read_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    map.get(serde_yaml::Value::String(key.into()))
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+}
+
+fn read_u16(map: &serde_yaml::Mapping, key: &str) -> Result<u16, String> {
+    let v = map
+        .get(serde_yaml::Value::String(key.into()))
+        .ok_or_else(|| format!("missing field: {key}"))?;
+    v.as_u64()
+        .and_then(|n| u16::try_from(n).ok())
+        .ok_or_else(|| format!("field {key} must be a number in 0..=65535"))
 }
 
 /// Parse a row name (`"pf-42"`) into the underlying entry id. Centralized so
@@ -419,7 +513,7 @@ pub fn pf_to_row(entry: &PortForwardEntry) -> ResourceRow {
             entry.last_message.clone(),
         ],
         name: row_name,
-        namespace: String::new(),
+        namespace: Some(entry.namespace.clone()),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

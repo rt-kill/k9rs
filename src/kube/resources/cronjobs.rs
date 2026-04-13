@@ -29,6 +29,16 @@ pub(crate) fn cronjob_to_row(cj: CronJob) -> ResourceRow {
     let active = status.active.as_ref().map(|a| a.len() as i32).unwrap_or(0);
     let last_schedule = status.last_schedule_time.map(|t| t.0);
 
+    let uid = metadata.uid.unwrap_or_default();
+    let drill = if !uid.is_empty() {
+        Some(crate::kube::resources::row::DrillTarget::JobsByOwner {
+            uid,
+            name: name.clone(),
+        })
+    } else {
+        None
+    };
+
     ResourceRow {
         cells: vec![
             ns.clone(), name.clone(), schedule, suspend.to_string(),
@@ -38,12 +48,12 @@ pub(crate) fn cronjob_to_row(cj: CronJob) -> ResourceRow {
             crate::util::format_age(age),
         ],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),
         node: None,
         crd_info: None,
-        drill_target: None,
+        drill_target: drill,
     }
 }

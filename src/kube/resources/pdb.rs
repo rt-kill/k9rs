@@ -29,7 +29,7 @@ pub(crate) fn pdb_to_row(pdb: PodDisruptionBudget) -> ResourceRow {
     ResourceRow {
         cells: vec![ns.clone(), name.clone(), min_available, max_unavailable, allowed_disruptions, crate::util::format_age(age)],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

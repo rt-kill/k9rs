@@ -36,6 +36,7 @@ pub(crate) async fn run_dynamic_live_watcher(
     plural: String,
     scope: ResourceScope,
     printer_columns: Vec<PrinterColumn>,
+    last_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let ar = if plural.is_empty() {
         ApiResource::from_gvk(&gvk)
@@ -63,8 +64,9 @@ pub(crate) async fn run_dynamic_live_watcher(
 
     let mut store: HashMap<ObjectKey, DynamicObject> = HashMap::new();
     let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
-    let backoff_start = std::time::Instant::now();
+    let mut backoff_start = std::time::Instant::now();
     let mut init_dirty = false;
+    let mut had_success = false;
 
     let (snap_tx, mut snap_rx) = mpsc::channel::<()>(2);
 
@@ -79,6 +81,7 @@ pub(crate) async fn run_dynamic_live_watcher(
                         match event {
                             WatcherEvent::Init => {
                                 store.clear();
+                                backoff_start = std::time::Instant::now();
                             }
                             WatcherEvent::InitApply(obj) => {
                                 let key = dyn_obj_key(&obj);
@@ -86,18 +89,24 @@ pub(crate) async fn run_dynamic_live_watcher(
                                 init_dirty = true;
                             }
                             WatcherEvent::InitDone => {
+                                had_success = true;
                                 backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_start = std::time::Instant::now();
                                 debug!("live_query dynamic: initial list complete, {} items", store.len());
                                 let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Apply(obj) => {
+                                had_success = true;
                                 backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_start = std::time::Instant::now();
                                 let key = dyn_obj_key(&obj);
                                 store.insert(key, obj);
                                 let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Delete(obj) => {
+                                had_success = true;
                                 backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_start = std::time::Instant::now();
                                 let key = dyn_obj_key(&obj);
                                 store.remove(&key);
                                 let _ = snap_tx.try_send(());
@@ -109,8 +118,14 @@ pub(crate) async fn run_dynamic_live_watcher(
                         break;
                     }
                     Err(e) => {
+                        if !had_success {
+                            warn!("live_query dynamic: initial load failed: {}", e);
+                            *last_error.lock().unwrap() = Some(format!("{}", e));
+                            break;
+                        }
                         if backoff_start.elapsed().as_millis() as u64 > MAX_ELAPSED_MS {
-                            warn!("live_query dynamic: watcher failed for over 2 minutes, giving up");
+                            warn!("live_query dynamic: watcher failed for over 2 minutes, giving up: {}", e);
+                            *last_error.lock().unwrap() = Some(format!("{}", e));
                             break;
                         }
                         warn!("live_query dynamic: watcher error: {}, retrying in {}ms", e, backoff_ms);
@@ -208,7 +223,7 @@ fn build_dynamic_snapshot(
             crate::kube::resources::row::ResourceRow {
                 cells,
                 name,
-                namespace,
+                namespace: Some(namespace),
                 containers: Vec::new(),
                 owner_refs: Vec::new(),
                 pf_ports: Vec::new(),

@@ -71,6 +71,11 @@ pub struct LiveQuery {
     task: JoinHandle<()>,
     /// What this query watches.
     pub key: QueryKey,
+    /// The last error seen by the watcher task before it exited. Written by
+    /// the watcher just before sending `None` on the snapshot channel. Read
+    /// by the bridge to include the actual K8s error in the StreamEvent::Error
+    /// sent to the TUI, rather than a generic "Watcher failed" message.
+    last_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Drop for LiveQuery {
@@ -143,6 +148,11 @@ impl Subscription {
         !self._keepalive.task.is_finished()
     }
 
+    /// The last error message from the watcher task (if it died with an error).
+    pub fn last_error(&self) -> Option<String> {
+        self._keepalive.last_error.lock().unwrap().clone()
+    }
+
     /// Eagerly drop the keepalive Arc without spawning a grace period task.
     /// Use this when you know the watcher is dead or you want immediate cleanup.
     pub fn eager_drop(self) {
@@ -204,12 +214,16 @@ impl WatcherCache {
         // Fast path: try existing entry.
         if let Some(weak) = self.entries.get(&key) {
             if let Some(arc) = weak.upgrade() {
-                tracing::info!("WatcherCache: reusing existing watcher for {:?}", key);
-                return Subscription {
-                    key,
-                    snapshot_rx: arc.snapshot_tx.subscribe(),
-                    _keepalive: arc,
-                };
+                if !arc.task.is_finished() {
+                    tracing::info!("WatcherCache: reusing existing watcher for {:?}", key);
+                    return Subscription {
+                        key,
+                        snapshot_rx: arc.snapshot_tx.subscribe(),
+                        _keepalive: arc,
+                    };
+                }
+                // Task is dead — fall through to create a new watcher.
+                tracing::info!("WatcherCache: existing watcher is dead, replacing for {:?}", key);
             }
         }
 
@@ -218,14 +232,16 @@ impl WatcherCache {
             Entry::Occupied(mut e) => {
                 // Another thread might have inserted between our get() and entry().
                 if let Some(arc) = e.get().upgrade() {
-                    tracing::info!("WatcherCache: reusing watcher (race winner) for {:?}", key);
-                    return Subscription {
-                        key,
-                        snapshot_rx: arc.snapshot_tx.subscribe(),
-                        _keepalive: arc,
-                    };
+                    if !arc.task.is_finished() {
+                        tracing::info!("WatcherCache: reusing watcher (race winner) for {:?}", key);
+                        return Subscription {
+                            key,
+                            snapshot_rx: arc.snapshot_tx.subscribe(),
+                            _keepalive: arc,
+                        };
+                    }
                 }
-                // Dead Weak — replace with new watcher.
+                // Dead Weak or dead task — replace with new watcher.
                 tracing::info!("WatcherCache: creating new watcher for {:?}", key);
                 let (live_query, snapshot_rx) = Self::create_watcher(&key, client, server_headers);
                 e.insert(Arc::downgrade(&live_query));
@@ -243,16 +259,19 @@ impl WatcherCache {
     /// Internal: spawn a watcher task and return the LiveQuery + initial receiver.
     fn create_watcher(key: &QueryKey, client: &Client, server_headers: Vec<String>) -> (Arc<LiveQuery>, watch::Receiver<Option<ResourceUpdate>>) {
         let (snapshot_tx, snapshot_rx) = watch::channel(None);
+        let last_error: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
         let task_client = client.clone();
         let task_key = key.clone();
         let task_tx = snapshot_tx.clone();
+        let task_error = last_error.clone();
         let task = tokio::spawn(async move {
-            run_live_watcher(task_client, task_key, task_tx, server_headers).await;
+            run_live_watcher(task_client, task_key, task_tx, server_headers, task_error).await;
         });
         let live_query = Arc::new(LiveQuery {
             snapshot_tx,
             task,
             key: key.clone(),
+            last_error,
         });
         (live_query, snapshot_rx)
     }
@@ -279,19 +298,22 @@ impl WatcherCache {
 
         // Start a new watcher (same logic as subscribe but without reuse).
         let (snapshot_tx, snapshot_rx) = watch::channel(None);
+        let last_error: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
 
         let task_client = client.clone();
         let task_key = key.clone();
         let task_tx = snapshot_tx.clone();
+        let task_error = last_error.clone();
 
         let task = tokio::spawn(async move {
-            run_live_watcher(task_client, task_key, task_tx, server_headers).await;
+            run_live_watcher(task_client, task_key, task_tx, server_headers, task_error).await;
         });
 
         let live_query = Arc::new(LiveQuery {
             snapshot_tx,
             task,
             key: key.clone(),
+            last_error,
         });
 
         self.entries.insert(key.clone(), Arc::downgrade(&live_query));
@@ -319,6 +341,7 @@ async fn run_live_watcher(
     key: QueryKey,
     snapshot_tx: watch::Sender<Option<ResourceUpdate>>,
     server_headers: Vec<String>,
+    last_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let ns = &key.namespace;
     let rt = key.resource.plural.as_str();
@@ -359,7 +382,7 @@ async fn run_live_watcher(
             move |rows| ResourceUpdate::Rows {
                 resource: resource_id.clone(), headers: headers.clone(), rows,
             },
-            rt, ns_str, watcher_filter.clone(),
+            rt, ns_str, watcher_filter.clone(), last_error,
         ).await;
         return;
     }
@@ -372,7 +395,7 @@ async fn run_live_watcher(
                 let headers = pick_headers(&server_headers, $fallback);
                 run_typed_watcher(api, snapshot_tx, $conv, move |rows| ResourceUpdate::Rows {
                     resource: resource_id.clone(), headers: headers.clone(), rows,
-                }, rt, ns_str, watcher_filter.clone()).await;
+                }, rt, ns_str, watcher_filter.clone(), last_error.clone()).await;
                 return;
             }
         };
@@ -385,7 +408,7 @@ async fn run_live_watcher(
                 let headers = pick_headers(&server_headers, $fallback);
                 run_typed_watcher(api, snapshot_tx, $conv, move |rows| ResourceUpdate::Rows {
                     resource: resource_id.clone(), headers: headers.clone(), rows,
-                }, rt, "all", watcher_filter.clone()).await;
+                }, rt, "all", watcher_filter.clone(), last_error.clone()).await;
                 return;
             }
         };
@@ -410,7 +433,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt, ns_str, watcher_filter.clone()).await;
+        }, rt, ns_str, watcher_filter.clone(), last_error.clone()).await;
         return;
     }
     unified_ns!("events", "events", Event, event_to_row,
@@ -430,7 +453,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt, ns_str, watcher_filter.clone()).await;
+        }, rt, ns_str, watcher_filter.clone(), last_error.clone()).await;
         return;
     }
     unified_ns!("endpoints", "endpoints", Endpoints, endpoints_to_row,
@@ -450,7 +473,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt, ns_str, watcher_filter.clone()).await;
+        }, rt, ns_str, watcher_filter.clone(), last_error.clone()).await;
         return;
     }
 
@@ -484,7 +507,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt, ns_str, watcher_filter.clone()).await;
+        }, rt, ns_str, watcher_filter.clone(), last_error.clone()).await;
         return;
     }
     unified_cluster!("clusterroles", "clusterroles", ClusterRole, cluster_role_to_row,
@@ -504,7 +527,7 @@ async fn run_live_watcher(
             resource: resource_id.clone(),
             headers: headers.clone(),
             rows,
-        }, rt, ns_str, watcher_filter.clone()).await;
+        }, rt, ns_str, watcher_filter.clone(), last_error.clone()).await;
         return;
     }
 
@@ -517,7 +540,7 @@ async fn run_live_watcher(
             &["CPU%", "MEM%"]);
         run_typed_watcher(api, snapshot_tx, node_to_row, move |rows| ResourceUpdate::Rows {
             resource: resource_id.clone(), headers: headers.clone(), rows,
-        }, rt, ns_str, watcher_filter.clone()).await;
+        }, rt, ns_str, watcher_filter.clone(), last_error.clone()).await;
         return;
     }
 
@@ -530,7 +553,7 @@ async fn run_live_watcher(
             &["CPU", "MEM"]);
         run_typed_watcher(api, snapshot_tx, pod_to_row, move |rows| ResourceUpdate::Rows {
             resource: resource_id.clone(), headers: headers.clone(), rows,
-        }, rt, ns_str, watcher_filter.clone()).await;
+        }, rt, ns_str, watcher_filter.clone(), last_error.clone()).await;
         return;
     }
 
@@ -561,12 +584,15 @@ impl WatcherCache {
         // Fast path: try existing entry.
         if let Some(weak) = self.entries.get(&key) {
             if let Some(arc) = weak.upgrade() {
-                tracing::info!("WatcherCache: reusing existing dynamic watcher for {:?}", key);
-                return Subscription {
-                    key,
-                    snapshot_rx: arc.snapshot_tx.subscribe(),
-                    _keepalive: arc,
-                };
+                if !arc.task.is_finished() {
+                    tracing::info!("WatcherCache: reusing existing dynamic watcher for {:?}", key);
+                    return Subscription {
+                        key,
+                        snapshot_rx: arc.snapshot_tx.subscribe(),
+                        _keepalive: arc,
+                    };
+                }
+                tracing::info!("WatcherCache: existing dynamic watcher is dead, replacing for {:?}", key);
             }
         }
 
@@ -574,14 +600,16 @@ impl WatcherCache {
         match self.entries.entry(key.clone()) {
             Entry::Occupied(mut e) => {
                 if let Some(arc) = e.get().upgrade() {
-                    tracing::info!("WatcherCache: reusing dynamic watcher (race winner) for {:?}", key);
-                    return Subscription {
-                        key,
-                        snapshot_rx: arc.snapshot_tx.subscribe(),
-                        _keepalive: arc,
-                    };
+                    if !arc.task.is_finished() {
+                        tracing::info!("WatcherCache: reusing dynamic watcher (race winner) for {:?}", key);
+                        return Subscription {
+                            key,
+                            snapshot_rx: arc.snapshot_tx.subscribe(),
+                            _keepalive: arc,
+                        };
+                    }
                 }
-                // Dead Weak — replace with new dynamic watcher.
+                // Dead Weak or dead task — replace with new dynamic watcher.
                 tracing::info!("WatcherCache: creating new dynamic watcher for {:?}", key);
                 let (live_query, snapshot_rx) = Self::create_dynamic_watcher(&key, client, gvk, plural, scope, printer_columns);
                 e.insert(Arc::downgrade(&live_query));
@@ -606,16 +634,19 @@ impl WatcherCache {
         printer_columns: Vec<PrinterColumn>,
     ) -> (Arc<LiveQuery>, watch::Receiver<Option<ResourceUpdate>>) {
         let (snapshot_tx, snapshot_rx) = watch::channel(None);
+        let last_error: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
         let task_client = client.clone();
         let task_ns = key.namespace.clone();
         let task_tx = snapshot_tx.clone();
+        let task_error = last_error.clone();
         let task = tokio::spawn(async move {
-            crate::kube::live_query_dynamic::run_dynamic_live_watcher(task_client, task_ns, task_tx, gvk, plural, scope, printer_columns).await;
+            crate::kube::live_query_dynamic::run_dynamic_live_watcher(task_client, task_ns, task_tx, gvk, plural, scope, printer_columns, task_error).await;
         });
         let live_query = Arc::new(LiveQuery {
             snapshot_tx,
             task,
             key: key.clone(),
+            last_error,
         });
         (live_query, snapshot_rx)
     }
@@ -667,6 +698,7 @@ async fn run_typed_watcher<K, T, C, W>(
     resource_type: &str,
     namespace: &str,
     filter: Option<crate::kube::protocol::SubscriptionFilter>,
+    last_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 ) where
     K: Resource<DynamicType = ()>
         + Clone
@@ -700,6 +732,10 @@ async fn run_typed_watcher<K, T, C, W>(
     let mut store: HashMap<ObjectKey, T> = HashMap::new();
     let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
     let mut backoff_start = std::time::Instant::now();
+    // Track whether we've ever received data successfully. If the initial
+    // LIST fails (RBAC, wrong resource, etc.), fail immediately instead of
+    // retrying for 2 minutes — it's almost certainly a permanent error.
+    let mut had_success = false;
     let mut init_dirty = false; // tracks whether we have unsent InitApply items
 
     // Channel for signalling that a snapshot should be built.
@@ -725,6 +761,7 @@ async fn run_typed_watcher<K, T, C, W>(
                         match event {
                             WatcherEvent::Init => {
                                 store.clear();
+                                backoff_start = std::time::Instant::now();
                                 info!("live_query: starting initial list for {}({})", rt, ns_label);
                             }
                             WatcherEvent::InitApply(obj) => {
@@ -733,12 +770,14 @@ async fn run_typed_watcher<K, T, C, W>(
                                 init_dirty = true;
                             }
                             WatcherEvent::InitDone => {
+                                had_success = true;
                                 backoff_ms = INITIAL_BACKOFF_MS;
                                 backoff_start = std::time::Instant::now();
                                 info!("live_query: initial list complete for {}({}), {} items", rt, ns_label, store.len());
                                 let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Apply(obj) => {
+                                had_success = true;
                                 backoff_ms = INITIAL_BACKOFF_MS;
                                 backoff_start = std::time::Instant::now();
                                 let key = obj_key(&obj);
@@ -746,6 +785,7 @@ async fn run_typed_watcher<K, T, C, W>(
                                 let _ = snap_tx.try_send(());
                             }
                             WatcherEvent::Delete(obj) => {
+                                had_success = true;
                                 backoff_ms = INITIAL_BACKOFF_MS;
                                 backoff_start = std::time::Instant::now();
                                 let key = obj_key(&obj);
@@ -759,8 +799,16 @@ async fn run_typed_watcher<K, T, C, W>(
                         break;
                     }
                     Err(e) => {
+                        if !had_success {
+                            // Initial LIST failed — almost certainly permanent
+                            // (RBAC, unknown resource, etc.). Fail immediately.
+                            warn!("live_query: initial load failed for {}: {}", rt, e);
+                            *last_error.lock().unwrap() = Some(format!("{}", e));
+                            break;
+                        }
                         if backoff_start.elapsed().as_millis() as u64 > MAX_ELAPSED_MS {
-                            warn!("live_query: watcher for {} failed for over 2 minutes, giving up", rt);
+                            warn!("live_query: watcher for {} failed for over 2 minutes, giving up: {}", rt, e);
+                            *last_error.lock().unwrap() = Some(format!("{}", e));
                             break;
                         }
                         warn!("live_query: watcher error for {}: {}, retrying in {}ms", rt, e, backoff_ms);

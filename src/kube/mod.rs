@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod capabilities;
 pub mod client_session;
+pub mod mux;
 pub mod daemon;
 pub mod describe;
 pub mod live_query;

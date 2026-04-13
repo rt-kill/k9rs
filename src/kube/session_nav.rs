@@ -1,5 +1,3 @@
-use tokio::task::JoinHandle;
-
 use crate::app::{App, InputMode};
 use crate::app::nav::rid;
 use crate::kube::client_session::ClientSession;
@@ -28,6 +26,7 @@ pub(crate) fn drill_to_pods_by_labels(
         filter: Some(NavFilter::Labels(labels)),
         saved_selected: 0,
         filter_input: crate::app::nav::FilterInputState::default(),
+                stream: None,
     });
     apply_nav_change(app, data_source, change);
     app.reapply_nav_filters();
@@ -48,6 +47,7 @@ pub(crate) fn drill_to_pods_by_grep(
         filter: Some(NavFilter::Grep(filter)),
         saved_selected: 0,
         filter_input: crate::app::nav::FilterInputState::default(),
+                stream: None,
     });
     apply_nav_change(app, data_source, change);
     app.reapply_nav_filters();
@@ -75,6 +75,7 @@ pub(crate) fn drill_to_pods_by_owner(
         }),
         saved_selected: 0,
         filter_input: crate::app::nav::FilterInputState::default(),
+                stream: None,
     });
     apply_nav_change(app, data_source, change);
     app.reapply_nav_filters();
@@ -84,15 +85,14 @@ pub(crate) fn drill_to_pods_by_owner(
     )));
 }
 
-/// Begin a context switch. Immediately clears UI state and shows a flash message,
-/// then delegates the slow client creation to `DataSource`. In local mode the
-/// result arrives via `AppEvent::ContextSwitchResult`; in daemon mode it comes
-/// through the event stream.
+/// Begin a context switch. Immediately clears UI state and sets
+/// `pending_context_switch` so the main loop drops the current session
+/// and creates a new one. One socket = one context = one session.
 pub(crate) fn begin_context_switch(
     app: &mut App,
-    data_source: &mut ClientSession,
+    _data_source: &mut ClientSession,
     ctx_name: &str,
-    log_task: &mut Option<JoinHandle<()>>,
+    log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) {
     // Guard against rapid context switches — if one is already in flight, reject.
     if app.context_switch_pending {
@@ -103,17 +103,14 @@ pub(crate) fn begin_context_switch(
     }
     app.context_switch_pending = true;
 
-    // Cancel any active log stream — both local task and daemon-side.
-    if let Some(handle) = log_task.take() {
-        handle.abort();
-    }
-    ds_try!(app, data_source.stop_logs());
-    // Note: port-forwards are daemon-wide (shared across sessions) and live
-    // in the `PortForwardSource`. They survive context switches — their
-    // kubectl subprocesses keep running against whatever `--context` they
-    // were spawned with. The PF table just reflects the source's state.
-    // Immediate: clear data and show feedback — keeps TUI responsive.
-    // Look up cluster/user from the in-memory contexts list (no disk I/O).
+    // Cancel any active log stream — drop closes the substream.
+    *log_stream = None;
+    // Drop all subscription substreams (core + nav).
+    app.core_streams.clear();
+    app.nav.current_mut().stream = None;
+    // Reset UI state immediately so the user sees a clean slate.
+    // Data clearing happens in session_main's pending_context_switch block,
+    // AFTER the old session is dropped and stale events are discarded.
     app.context = ctx_name.to_string();
     app.selected_ns = crate::kube::protocol::Namespace::All;
     if let Some(ctx) = app.data.contexts.items.iter().find(|c| c.name == ctx_name) {
@@ -123,10 +120,7 @@ pub(crate) fn begin_context_switch(
         app.cluster = String::new();
         app.user = String::new();
     }
-    app.clear_data();
     let root = app.nav.root_resource_id().clone();
-    // Reset nav but DON'T subscribe yet — the server is creating a new client.
-    // Subscription happens in apply_context_switch_result after the new client is ready.
     let _change = app.nav.reset(root);
     *app.nav.filter_input_mut() = Default::default();
     app.kubectl_cache.clear();
@@ -140,99 +134,17 @@ pub(crate) fn begin_context_switch(
     app.pod_metrics.clear();
     app.node_metrics.clear();
     app.capabilities.clear();
+
+    // Signal the main loop to drop the entire ClientSession and create
+    // a new one for the target context. One socket = one context = one
+    // session. The old session's socket close causes the daemon to exit
+    // the session (all watchers enter grace period). The new session
+    // connects fresh with the new kubeconfig.
+    app.pending_context_switch = Some(ctx_name.to_string());
     app.flash = Some(crate::app::FlashMessage::info(format!(
         "Switching to context: {}...",
         ctx_name
     )));
-
-    // Delegate background client creation to the session. The cached
-    // kubeconfig YAML and env vars come from `app` (populated by the
-    // `KubeconfigLoaded` event when the session first started).
-    let yaml = app.kubeconfig_yaml.clone();
-    let env = app.kubeconfig_env.clone();
-    ds_try!(app, data_source.switch_context(ctx_name, &yaml, &env));
-}
-
-/// Apply the result of a background context switch.
-pub(crate) fn apply_context_switch_result(
-    app: &mut App,
-    data_source: &mut ClientSession,
-    ctx_name: &str,
-    result: Result<(), String>,
-) {
-    // Always clear the pending flag when a result arrives.
-    app.context_switch_pending = false;
-
-    // Discard stale result if user already switched to a different context
-    if ctx_name != app.context {
-        return;
-    }
-    match result {
-        Ok(()) => {
-            data_source.set_context_info(ctx_name);
-            let updated: Vec<crate::app::KubeContext> = app
-                .data.contexts.items
-                .iter()
-                .map(|ctx| crate::app::KubeContext {
-                    name: ctx.name.clone(),
-                    cluster: ctx.cluster.clone(),
-                    user: ctx.user.clone(),
-                    is_current: ctx.name == ctx_name,
-                })
-                .collect();
-            app.data.contexts.set_items(updated);
-
-            // Only re-subscribe if the user was on a resource view.
-            // Overview has no subscription; namespaces and nodes are
-            // auto-subscribed by the server session init.
-            if app.route == crate::app::Route::Resources {
-                let rid = app.nav.resource_id().clone();
-                let sub_filter = app.nav.current().filter.as_ref().and_then(|f| f.to_subscription_filter());
-                let change = crate::app::nav::NavChange {
-                    unsubscribe: None,
-                    subscribe: Some(rid),
-                    subscription_filter: sub_filter,
-                };
-                super::session::apply_nav_change(app, data_source, change);
-            }
-
-            app.flash = Some(crate::app::FlashMessage::info(format!(
-                "Switched to context: {}",
-                ctx_name
-            )));
-        }
-        Err(e) => {
-            // Restore context/cluster to match the still-running data source,
-            // so the app state is consistent with the actual active client.
-            let active_ctx = {
-                let ds_ctx = data_source.context_name();
-                if ds_ctx.is_empty() { app.context.clone() } else { ds_ctx }
-            };
-            // Look up cluster/user from the in-memory contexts list (no disk I/O).
-            let (cluster, user) = app.data.contexts.items.iter()
-                .find(|c| c.name == active_ctx)
-                .map(|c| (c.cluster.clone(), c.user.clone()))
-                .unwrap_or_default();
-            app.context = active_ctx.clone();
-            app.cluster = cluster.clone();
-            app.user = user;
-            data_source.set_context_info(&active_ctx);
-            // Data was already cleared by begin_context_switch. Re-subscribe
-            // via apply_nav_change so the table is properly initialized.
-            app.route = crate::app::Route::Resources;
-            let rid = app.nav.resource_id().clone();
-            let change = crate::app::nav::NavChange {
-                unsubscribe: None,
-                subscribe: Some(rid),
-                subscription_filter: None,
-            };
-            super::session::apply_nav_change(app, data_source, change);
-            app.flash = Some(crate::app::FlashMessage::error(format!(
-                "Context switch failed: {}",
-                e
-            )));
-        }
-    }
 }
 
 /// Perform a namespace switch: update app state, clear data, restart watchers.
@@ -240,7 +152,7 @@ pub(crate) fn do_switch_namespace(
     app: &mut App,
     data_source: &mut ClientSession,
     ns: crate::kube::protocol::Namespace,
-    log_task: &mut Option<JoinHandle<()>>,
+    log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) {
     // Record the namespace change globally (affects future namespaced subscriptions).
     app.selected_ns = ns.clone();
@@ -252,20 +164,48 @@ pub(crate) fn do_switch_namespace(
         return;
     }
 
-    // Cancel any active log stream — both local task and daemon-side.
-    if let Some(handle) = log_task.take() {
-        handle.abort();
-    }
-    ds_try!(app, data_source.stop_logs());
-    // Clear the current table so "Loading..." shows while fresh data arrives.
-    // Note: stale data from the old namespace may briefly appear if already queued,
-    // but will be overwritten by fresh data from the new namespace's watcher.
-    let current_rid = app.nav.resource_id().clone();
-    app.clear_resource(&current_rid);
+    // Cancel any active log stream — drop closes the substream.
+    *log_stream = None;
+    // Pop any stacked routes (Yaml, Describe, Logs) — they reference
+    // resources from the old namespace and would show stale content on Back.
+    app.route_stack.clear();
+    app.route = crate::app::Route::Resources;
+    // Dismiss any open confirm/form dialogs — they hold ObjectRefs from
+    // the old namespace. Confirming after a switch could mutate the wrong
+    // resource.
+    app.confirm_dialog = None;
+    app.form_dialog = None;
+    app.input_mode = InputMode::Normal;
+    // Wipe every namespaced table so cached rows from the old namespace
+    // can't bleed into the new namespace's view.
+    app.clear_namespaced_caches();
     app.kubectl_cache.clear();
     app.prev_rows.clear();
     app.changed_rows.clear();
+
+    // Reset nav to root resource — any drill-down filters (owner UIDs,
+    // labels) reference old-namespace resources and are now invalid.
+    // steps.clear() inside reset() drops every NavStep, which drops their
+    // subscription streams via SubscriptionStream::drop → AbortHandle::abort.
+    // This is the structural guarantee: no old-namespace subscription can
+    // deliver data after this point.
+    let root_rid = app.nav.root_resource_id().clone();
+    let _change = app.nav.reset(root_rid.clone());
+    *app.nav.filter_input_mut() = Default::default();
+
+    // Notify the daemon of the namespace change. This is informational —
+    // each subscription carries its own namespace in SubscriptionInit,
+    // so the daemon doesn't need session-level namespace state for
+    // subscription scoping. Kept for logging/debugging on the server side.
     ds_try!(app, data_source.switch_namespace(ns.display()));
+
+    // Open a fresh subscription substream for the root resource in the
+    // new namespace. Same drop+recreate pattern as apply_nav_change and
+    // the Refresh action — structural ownership guarantees isolation.
+    app.clear_resource(&root_rid);
+    let stream = data_source.subscribe_stream(root_rid, ns.clone(), None);
+    app.nav.current_mut().stream = Some(stream);
+
     app.flash = Some(crate::app::FlashMessage::info(format!(
         "Switched to namespace: {}",
         ns.display()

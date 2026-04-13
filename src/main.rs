@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
     //   - `AppEvent::KubeconfigLoaded`     (fast: contexts panel populated)
     //   - `AppEvent::ConnectionEstablished` (handshake complete: do initial subscribe)
     //   - `AppEvent::ConnectionFailed`     (fatal: TUI exits with error)
-    let mut data_source = ClientSession::new(
+    let data_source = ClientSession::new(
         crate::kube::client_session::ConnectionParams {
             context: cli_context.clone(),
             namespace: app.selected_ns.as_option().map(|s| s.to_string()),
@@ -171,16 +171,19 @@ async fn main() -> Result<()> {
         event_tx.clone(),
     );
 
-    // If `--command` put us straight into a resource view, queue the
-    // subscribe immediately. The unbounded command channel holds it until
-    // the writer task spawns post-handshake. The server auto-subscribes to
-    // namespaces and nodes itself, so we skip those.
+    // If `--command` put us straight into a resource view, open a
+    // subscription substream immediately. The bridge task inside
+    // subscribe_stream awaits the MuxHandle (which becomes available
+    // after the connection handshake), so the subscribe fires as soon
+    // as the connection is up. The server auto-subscribes to namespaces
+    // and nodes itself, so we skip those.
     if app.route == crate::app::Route::Resources {
         let initial_rid = app.nav.resource_id().clone();
         if initial_rid.plural != "namespaces" && initial_rid.plural != "nodes" {
             let filter = app.nav.current().filter.as_ref()
                 .and_then(|f| f.to_subscription_filter());
-            data_source.subscribe_resource(&initial_rid, filter);
+            let stream = data_source.subscribe_stream(initial_rid, app.selected_ns.clone(), filter);
+            app.nav.current_mut().stream = Some(stream);
         }
     }
 

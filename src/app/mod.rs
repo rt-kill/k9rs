@@ -248,11 +248,15 @@ pub struct App {
     /// Server-provided capabilities for each resource type.
     pub capabilities: HashMap<ResourceId, crate::kube::protocol::ResourceCapabilities>,
 
-    /// Cached kubeconfig YAML + env vars, populated by `AppEvent::KubeconfigLoaded`.
-    /// Used by the context-switch path to re-derive a `SwitchContext` payload
-    /// without going back to disk. Empty until the kubeconfig task finishes.
-    pub kubeconfig_yaml: String,
-    pub kubeconfig_env: HashMap<String, String>,
+    /// Yamux substreams for core resources (namespaces, nodes) that the TUI
+    /// always needs. Opened when ConnectionEstablished fires; dropped on
+    /// context switch.
+    pub core_streams: Vec<crate::kube::client_session::SubscriptionStream>,
+
+    /// When set, the main loop drops the current `ClientSession` and creates
+    /// a new one for this context. One socket = one context = one session.
+    /// Set by `begin_context_switch`, consumed by `session_main`.
+    pub pending_context_switch: Option<String>,
 }
 
 impl App {
@@ -290,8 +294,8 @@ impl App {
             changed_rows: HashMap::new(),
             context_switch_pending: false,
             capabilities: HashMap::new(),
-            kubeconfig_yaml: String::new(),
-            kubeconfig_env: HashMap::new(),
+            core_streams: Vec::new(),
+            pending_context_switch: None,
         }
     }
 
@@ -349,6 +353,15 @@ impl App {
         self.route_stack.push(route);
     }
 
+    /// Pop the route stack — returns to the previous route. No-op if the
+    /// stack is empty (the current route is preserved). Used by the unified
+    /// edit flow's terminal states (success/cancel/error).
+    pub fn pop_route(&mut self) {
+        if let Some(prev) = self.route_stack.pop() {
+            self.route = prev;
+        }
+    }
+
     /// Apply stored pod metrics to all current pod items.
     pub fn apply_pod_metrics(&mut self) {
         let pods_rid = nav::rid("pods");
@@ -358,7 +371,7 @@ impl App {
         if cpu_col.is_none() && mem_col.is_none() { return; }
         if let Some(table) = self.data.unified.get_mut(&pods_rid) {
             for row in &mut table.items {
-                if let Some(usage) = self.pod_metrics.get(&ObjectKey::new(row.namespace.clone(), row.name.clone())) {
+                if let Some(usage) = self.pod_metrics.get(&ObjectKey::new(row.namespace.clone().unwrap_or_default(), row.name.clone())) {
                     if let Some(col) = cpu_col { row.set_cell(col, usage.cpu.clone()); }
                     if let Some(col) = mem_col { row.set_cell(col, usage.mem.clone()); }
                 }
@@ -413,6 +426,29 @@ impl App {
     pub fn clear_resource(&mut self, rid: &ResourceId) {
         let table = self.data.unified.entry(rid.clone()).or_insert_with(StatefulTable::new);
         table.clear_data();
+    }
+
+    /// Ensure a table entry exists for the given rid, but **do not** clear
+    /// any cached data. Used by the nav-change path so that drilling down
+    /// and popping back is instant — the parent table's rows are still
+    /// there from before the drill-down. Pair this with namespace-switch
+    /// cleanup (which clears every namespaced table) so the cache can
+    /// never go stale relative to the active namespace.
+    pub fn ensure_resource_table(&mut self, rid: &ResourceId) {
+        self.data.unified.entry(rid.clone()).or_insert_with(StatefulTable::new);
+    }
+
+    /// Clear every namespace-scoped resource table. Called from
+    /// `do_switch_namespace` so cached rows from the old namespace can't
+    /// bleed into the new namespace's view. Cluster-scoped tables (nodes,
+    /// PVs, namespaces themselves, etc.) are left alone — their data is
+    /// the same across namespaces.
+    pub fn clear_namespaced_caches(&mut self) {
+        for (rid, table) in self.data.unified.iter_mut() {
+            if !rid.is_cluster_scoped() {
+                table.clear_data();
+            }
+        }
     }
 
     pub fn next_tab(&mut self) -> ResourceId {

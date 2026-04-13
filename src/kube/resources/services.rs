@@ -75,7 +75,7 @@ pub(crate) fn service_to_row(svc: Service) -> ResourceRow {
             selector_str, ports_str, labels_str, crate::util::format_age(age),
         ],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: port_list,

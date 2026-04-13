@@ -1,4 +1,3 @@
-use tokio::task::JoinHandle;
 
 use crate::app::{App, ContainerRef};
 use crate::app::nav::rid;
@@ -13,7 +12,7 @@ use crate::kube::session_nav::{
 pub(crate) fn handle_enter(
     app: &mut App,
     data_source: &mut ClientSession,
-    log_task: &mut Option<JoinHandle<()>>,
+    log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) -> ActionResult {
     use crate::app::Route;
     use crate::kube::protocol::ResourceId;
@@ -22,7 +21,7 @@ pub(crate) fn handle_enter(
     if matches!(app.route, Route::Contexts) {
         if let Some(ctx) = app.data.contexts.selected_item() {
             let ctx_name = ctx.name.clone();
-            begin_context_switch(app, data_source, &ctx_name, log_task);
+            begin_context_switch(app, data_source, &ctx_name, log_stream);
         }
         return ActionResult::None;
     }
@@ -32,7 +31,7 @@ pub(crate) fn handle_enter(
         let pod_name = pod.clone();
         let pod_ns = namespace.clone();
         let container_name = app.data.unified.get(&rid("pods"))
-            .and_then(|t| t.items.iter().find(|p| p.name == pod_name && p.namespace == pod_ns))
+            .and_then(|t| t.items.iter().find(|p| p.name == pod_name && p.namespace.as_deref() == Some(pod_ns.as_str())))
             .and_then(|p| p.containers.get(selected).map(|ci| ci.real_name.clone()))
             .unwrap_or_default();
 
@@ -56,12 +55,10 @@ pub(crate) fn handle_enter(
             state: Box::new(log_state),
         };
 
-        // Cancel any previous log stream
-        if let Some(handle) = log_task.take() {
-            handle.abort();
-        }
+        // Cancel any previous log stream — drop closes the substream.
+        *log_stream = None;
 
-        ds_try!(app, data_source.stream_logs(
+        *log_stream = Some(data_source.stream_log_substream(
             &pod_name,
             &pod_ns,
             &container_name,
@@ -87,7 +84,7 @@ pub(crate) fn handle_enter(
 
     match row.drill_target.clone() {
         Some(DrillTarget::SwitchNamespace(ns)) => {
-            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(ns.as_str()), log_task);
+            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(ns.as_str()), log_stream);
         }
         Some(DrillTarget::BrowseCrd { group, version, kind, plural, scope }) => {
             let crd_rid = ResourceId::new(group, version, kind.clone(), plural, scope);
@@ -98,6 +95,7 @@ pub(crate) fn handle_enter(
                 filter: None,
                 saved_selected: 0,
                 filter_input: crate::app::nav::FilterInputState::default(),
+                stream: None,
             });
             apply_nav_change(app, data_source, change);
             app.flash = Some(crate::app::FlashMessage::info(format!("Browsing CRD: {}", kind)));
@@ -116,6 +114,7 @@ pub(crate) fn handle_enter(
                 filter: Some(crate::app::nav::NavFilter::Field { field, value }),
                 saved_selected: 0,
                 filter_input: crate::app::nav::FilterInputState::default(),
+                stream: None,
             });
             apply_nav_change(app, data_source, change);
             app.reapply_nav_filters();
@@ -123,6 +122,27 @@ pub(crate) fn handle_enter(
         }
         Some(DrillTarget::PodsByNameGrep(name)) => {
             drill_to_pods_by_grep(app, data_source, &name);
+        }
+        Some(DrillTarget::JobsByOwner { uid, name }) => {
+            // CronJob → Jobs drill: push jobs filtered by ownerReference UID
+            // of the CronJob. Same mechanism as PodsByOwner but targets jobs.
+            use crate::app::nav::{NavFilter, NavStep};
+            let sel = app.data.unified.get(&current_rid).map(|t| t.selected).unwrap_or(0);
+            app.nav.save_selected(sel);
+            let change = app.nav.push(NavStep {
+                resource: rid("jobs"),
+                filter: Some(NavFilter::OwnerChain {
+                    uid,
+                    kind: "CronJob".to_string(),
+                    display_name: name.clone(),
+                }),
+                saved_selected: 0,
+                filter_input: crate::app::nav::FilterInputState::default(),
+                stream: None,
+            });
+            apply_nav_change(app, data_source, change);
+            app.reapply_nav_filters();
+            app.flash = Some(crate::app::FlashMessage::info(format!("Jobs for cronjob/{}", name)));
         }
         None => {
             handle_describe(app, data_source);
@@ -198,7 +218,7 @@ pub(crate) fn handle_yaml(
 pub(crate) fn handle_logs(
     app: &mut App,
     data_source: &mut ClientSession,
-    log_task: &mut Option<JoinHandle<()>>,
+    log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) {
     use crate::app::Route;
 
@@ -259,12 +279,10 @@ pub(crate) fn handle_logs(
         state: Box::new(log_state),
     };
 
-    // Cancel any previous log stream
-    if let Some(handle) = log_task.take() {
-        handle.abort();
-    }
+    // Cancel any previous log stream — drop closes the substream.
+    *log_stream = None;
 
-    ds_try!(app, data_source.stream_logs(
+    *log_stream = Some(data_source.stream_log_substream(
         &log_target,
         &namespace,
         &route_container,
@@ -278,7 +296,7 @@ pub(crate) fn handle_logs(
 pub(crate) fn handle_previous_logs(
     app: &mut App,
     data_source: &mut ClientSession,
-    log_task: &mut Option<JoinHandle<()>>,
+    log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) {
     use crate::app::Route;
 
@@ -312,12 +330,10 @@ pub(crate) fn handle_previous_logs(
         state: Box::new(log_state),
     };
 
-    // Cancel any previous log stream
-    if let Some(handle) = log_task.take() {
-        handle.abort();
-    }
+    // Cancel any previous log stream — drop closes the substream.
+    *log_stream = None;
 
-    ds_try!(app, data_source.stream_logs(
+    *log_stream = Some(data_source.stream_log_substream(
         &log_target,
         &namespace,
         &route_container,
@@ -414,7 +430,7 @@ pub(crate) fn resolve_port_forward_dialog(app: &App) -> Option<crate::app::FormD
 
     let short = rid_key.short_label().to_lowercase();
     let title = format!("Port forward: {}/{}", short, row.name);
-    let ns = row.namespace.clone();
+    let ns = row.namespace.clone().unwrap_or_default();
     let subtitle = if ns.is_empty() {
         String::new()
     } else {

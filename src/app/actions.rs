@@ -129,6 +129,12 @@ pub enum Action {
     ClearMarks,
     /// Span-mark (select range from anchor to cursor).
     SpanMark,
+    /// Jump to the owner of the selected row (e.g., Pod → ReplicaSet → Deployment).
+    JumpToOwner,
+    /// Save the current log view to a file.
+    SaveLogs,
+    /// Show which resources reference the selected row (reverse lookup).
+    UsedBy,
 }
 
 impl Action {

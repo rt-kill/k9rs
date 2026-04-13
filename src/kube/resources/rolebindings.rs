@@ -15,7 +15,7 @@ pub(crate) fn role_binding_to_row(rb: RoleBinding) -> ResourceRow {
     ResourceRow {
         cells: vec![ns.clone(), name.clone(), role_ref, subjects, crate::util::format_age(age)],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),

@@ -58,7 +58,7 @@ pub(crate) fn daemonset_to_row(ds: DaemonSet) -> ResourceRow {
             crate::util::format_age(age),
         ],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: container_ports,

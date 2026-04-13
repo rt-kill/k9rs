@@ -114,6 +114,17 @@ pub trait LocalResourceSource: Send + Sync + 'static {
     fn yaml(&self, _name: &str) -> Option<Result<String, String>> {
         None
     }
+
+    /// Apply a new YAML representation for an entry. Mirrors `kubectl apply
+    /// -f`. Implementations parse the YAML, diff against the current entry,
+    /// and reconcile (in PortForwardSource: stop the existing kubectl
+    /// subprocess and create a new one with the new ports). Returns the
+    /// user-facing message on success, or an error string on failure.
+    ///
+    /// Default: not supported.
+    fn apply_yaml(&self, _name: &str, _yaml: &str) -> Result<String, String> {
+        Err("apply is not supported on this resource".into())
+    }
 }
 
 /// Convenience: downcast-free typed handle to the daemon's PortForwardSource.

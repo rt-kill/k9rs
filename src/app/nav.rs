@@ -62,7 +62,7 @@ impl NavFilter {
 // ---------------------------------------------------------------------------
 
 /// A single level in the navigation stack.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct NavStep {
     /// What resource this step is viewing (universal identity).
     pub resource: ResourceId,
@@ -72,6 +72,12 @@ pub struct NavStep {
     pub saved_selected: usize,
     /// Uncommitted filter input for this frame.
     pub filter_input: FilterInputState,
+    /// The active subscription substream for this step's view. Dropping it
+    /// closes the yamux substream (RST to the daemon), which cleanly
+    /// terminates the daemon's bridge for this subscription. `None` before
+    /// the first subscribe or for steps that don't own a subscription
+    /// (grep filters on the same rid reuse the parent's stream).
+    pub stream: Option<crate::kube::client_session::SubscriptionStream>,
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +106,7 @@ impl NavStack {
                 filter: None,
                 saved_selected: 0,
                 filter_input: FilterInputState::default(),
+                stream: None,
             }],
             prev_root: None,
         }
@@ -161,6 +168,11 @@ impl NavStack {
     }
 
     /// Replace the entire stack with a new root. Returns subscription changes.
+    ///
+    /// Always returns `subscribe: Some(rid)` because `steps.clear()` drops
+    /// every step's subscription stream. Even when the rid is unchanged
+    /// (e.g., `:pods` while already on pods), the stream was destroyed and
+    /// the caller must open a new one via `apply_nav_change`.
     pub fn reset(&mut self, rid: ResourceId) -> NavChange {
         let old = self.resource_id().clone();
         self.prev_root = Some(self.root_resource_id().clone());
@@ -170,11 +182,12 @@ impl NavStack {
             filter: None,
             saved_selected: 0,
             filter_input: FilterInputState::default(),
+                stream: None,
         });
-        if rid != old {
-            NavChange { unsubscribe: Some(old), subscribe: Some(rid), subscription_filter: None }
-        } else {
-            NavChange { unsubscribe: None, subscribe: None, subscription_filter: None }
+        NavChange {
+            unsubscribe: if rid != old { Some(old) } else { None },
+            subscribe: Some(rid),
+            subscription_filter: None,
         }
     }
 

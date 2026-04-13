@@ -60,6 +60,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             // Reuse the describe view to show alias content
             views::describe::draw_describe(f, app, area);
         }
+        Route::EditingResource { .. } => {
+            // Snapshot the label first (immutable borrow on `app.route`),
+            // then run the resource view (mutable borrow on `app`), then
+            // draw the overlay (immutable borrow on `app.theme`). The
+            // borrows are disjoint in time so the borrow checker accepts
+            // them in this order.
+            let label = if let Route::EditingResource { ref target, ref state } = app.route {
+                let kind = target.resource.display_label().to_string();
+                let name = target.name.clone();
+                match state {
+                    crate::app::EditState::AwaitingYaml => format!("Fetching YAML for {}/{}…", kind, name),
+                    crate::app::EditState::EditorReady { .. } => format!("Launching editor for {}/{}…", kind, name),
+                    crate::app::EditState::Applying => format!("Applying {}/{}…", kind, name),
+                }
+            } else { String::new() };
+            views::resource::draw_resources(f, app, area);
+            draw_centered_overlay(f, &label, &app.theme);
+        }
     }
 
     // Draw command prompt overlay on top of any view when command mode is active.
@@ -93,6 +111,36 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
     let theme = &app.theme;
     let help = HelpOverlay::new(theme, app.help_scroll);
     f.render_widget(help, f.area());
+}
+
+/// Draw a single status line centered horizontally in the visible area.
+/// Used by the modal stages of the unified edit flow ("Fetching YAML…",
+/// "Launching editor…", "Applying…") to give the user feedback while the
+/// async pipeline runs.
+fn draw_centered_overlay(f: &mut Frame, label: &str, theme: &crate::ui::theme::Theme) {
+    use ratatui::widgets::Clear;
+    let area = f.area();
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let len = label.chars().count() as u16;
+    let pad = 2u16;
+    let box_w = (len + pad * 2 + 2).min(area.width);
+    let box_h = 3u16.min(area.height);
+    let x = area.x + (area.width.saturating_sub(box_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(box_h)) / 2;
+    let rect = ratatui::layout::Rect::new(x, y, box_w, box_h);
+    f.render_widget(Clear, rect);
+    let block = ratatui::widgets::Block::bordered()
+        .border_style(theme.dialog_border)
+        .style(theme.dialog_bg);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height > 0 && inner.width > 0 {
+        let line = Line::from(Span::styled(label, theme.info_value));
+        let lx = inner.x + inner.width.saturating_sub(len) / 2;
+        f.render_widget(line, ratatui::layout::Rect::new(lx, inner.y, inner.width, 1));
+    }
 }
 
 /// Draw flash messages at the bottom of the screen.
@@ -132,7 +180,7 @@ fn draw_container_select(f: &mut Frame, app: &App, pod: &str, namespace: &str, s
 
     // Find the pod's containers (typed field on ResourceRow).
     let containers: Vec<String> = app.data.unified.get(&crate::app::nav::rid("pods"))
-        .and_then(|t| t.items.iter().find(|p| p.name == pod && p.namespace == namespace))
+        .and_then(|t| t.items.iter().find(|p| p.name == pod && p.namespace.as_deref() == Some(namespace)))
         .map(|p| p.containers.iter().map(|ci| ci.name.clone()).collect())
         .unwrap_or_default();
 

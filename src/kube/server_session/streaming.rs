@@ -20,83 +20,8 @@ impl ServerSession {
     // Log streaming
     // -----------------------------------------------------------------------
 
-    pub(super) async fn handle_stream_logs(
-        &mut self,
-        pod: &str,
-        namespace: &str,
-        container: &str,
-        follow: bool,
-        tail: Option<u64>,
-        since: Option<String>,
-        previous: bool,
-    ) {
-        self.handle_stop_logs();
-
-        let log_tx = self.event_tx.clone();
-        let pod = pod.to_string();
-        let namespace = namespace.to_string();
-        let container = container.to_string();
-        let context = self.context.name.clone();
-
-        let log_handle = tokio::spawn(async move {
-            use tokio::io::BufReader as TokioBufReader;
-            use tokio::io::AsyncBufReadExt;
-            use tokio::process::Command;
-
-            let mut cmd = Command::new("kubectl");
-            cmd.arg("logs");
-
-            if follow { cmd.arg("-f"); }
-            if previous { cmd.arg("--previous"); }
-            cmd.arg(&pod);
-            if !namespace.is_empty() { cmd.arg("-n").arg(&namespace); }
-            if !container.is_empty() && container != "all" {
-                cmd.arg("-c").arg(&container);
-            } else if container == "all" {
-                cmd.arg("--all-containers=true");
-            }
-            if let Some(ref s) = since {
-                cmd.arg(format!("--since={}", s));
-            } else if let Some(t) = tail {
-                cmd.arg("--tail").arg(t.to_string());
-            }
-            if !context.is_empty() { cmd.arg("--context").arg(&context); }
-
-            cmd.stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
-
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = log_tx.send(SessionEvent::SessionError(
-                        format!("Failed to spawn kubectl logs: {}", e),
-                    )).await;
-                    let _ = log_tx.send(SessionEvent::LogEnd).await;
-                    return;
-                }
-            };
-
-            if let Some(stdout) = child.stdout.take() {
-                let mut lines = TokioBufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if log_tx.send(SessionEvent::LogLine(line)).await.is_err() {
-                        break;
-                    }
-                }
-            }
-
-            let _ = log_tx.send(SessionEvent::LogEnd).await;
-        });
-
-        self.log_task = Some(log_handle);
-    }
-
-    pub(super) fn handle_stop_logs(&mut self) {
-        if let Some(handle) = self.log_task.take() {
-            handle.abort();
-        }
-    }
+    // Log streaming is handled via yamux substreams now.
+    // handle_stop_logs is a no-op (log_task is always None).
 
     // -----------------------------------------------------------------------
     // Discovery
@@ -108,12 +33,9 @@ impl ServerSession {
         let shared = self.shared.clone();
         let context = self.context.clone();
         tokio::spawn(async move {
-            if let Some(entry) = shared.discovery_cache.get(&context) {
-                let (ns, crds) = entry.value().clone();
-                let _ = tx.send(SessionEvent::Discovery { context: context.name.clone(), namespaces: ns, crds }).await;
-                return;
-            }
-
+            // Always refetch — CRDs may have been added/removed since last
+            // fetch. The discovery result is small and this only fires once
+            // per session (on ConnectionEstablished).
             let ns_api: Api<Namespace> = Api::all(client.clone());
             let mut ns_ok = false;
             let namespaces: Vec<String> = match ns_api.list(&ListParams::default()).await {

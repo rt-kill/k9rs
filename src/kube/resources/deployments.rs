@@ -61,7 +61,7 @@ pub(crate) fn deployment_to_row(dep: Deployment) -> ResourceRow {
             crate::util::format_age(age),
         ],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: container_ports,

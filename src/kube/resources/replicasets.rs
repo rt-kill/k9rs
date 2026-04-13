@@ -34,7 +34,7 @@ pub(crate) fn replicaset_to_row(rs: ReplicaSet) -> ResourceRow {
             ready.to_string(), labels_str, crate::util::format_age(age),
         ],
         name,
-        namespace: ns,
+        namespace: Some(ns),
         containers: Vec::new(),
         owner_refs: Vec::new(),
         pf_ports: Vec::new(),
