@@ -115,6 +115,8 @@ pub enum Action {
     ForceKill,
     /// Show the node a pod is running on (switch to nodes view filtered by node name).
     ShowNode,
+    /// Shell into a node via `kubectl debug node/<name>`.
+    NodeShell,
     /// Toggle between the current and last resource tab view.
     ToggleLastView,
     /// Toggle mark/select on the currently selected row.

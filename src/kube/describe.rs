@@ -41,9 +41,18 @@ pub fn dynamic_api_for(
 /// Fetch a describe view for a resource via `kubectl describe`. We shell
 /// out because kubectl's describe output (events, replica sets, rolling
 /// update strategy, conditions) is comprehensive in a way that's tedious
-/// to reproduce against the raw API.
-pub async fn fetch_describe(target: &ObjectRef, context: &crate::kube::protocol::ContextName) -> String {
-    fetch_describe_via_kubectl(target, context).await
+/// to reproduce against the raw API. We try the API first (fast — reuses
+/// the session's authenticated `kube::Client`) and fall back to kubectl
+/// only on failure.
+pub async fn fetch_describe(
+    client: &kube::Client,
+    target: &ObjectRef,
+    context: &crate::kube::protocol::ContextName,
+) -> String {
+    match fetch_describe_via_api(client, target).await {
+        Ok(content) => content,
+        Err(_) => fetch_describe_via_kubectl(target, context).await,
+    }
 }
 
 /// Fetch YAML for a resource. Tries the kube API first (fast, no subprocess),
@@ -144,9 +153,121 @@ async fn fetch_yaml_via_api(
 ) -> anyhow::Result<String> {
     let (ar, scope) = api_resource_for(client, &target.resource).await?;
     let api = dynamic_api_for(client, &ar, scope, &target.namespace);
-    let obj = api.get(&target.name).await?;
+    let mut obj = api.get(&target.name).await?;
+    // Strip server-managed fields that the API rejects on apply.
+    // `managedFields` in particular causes "metadata.managedFields must be
+    // nil" on any write-back. Users editing YAML shouldn't have to manually
+    // delete these — the apply path sends the full object and the server
+    // fills them back in.
+    obj.metadata.managed_fields = None;
     let yaml = serde_yaml::to_string(&obj)?;
     Ok(yaml)
+}
+
+// ---------------------------------------------------------------------------
+// Describe via kube API (no subprocess)
+// ---------------------------------------------------------------------------
+
+/// Fetch a resource and format key sections in a describe-like layout.
+/// Not as rich as kubectl's describe (no events, no related resources), but
+/// covers the core fields and is ~50ms instead of 1-5s (no subprocess, no
+/// re-authentication).
+async fn fetch_describe_via_api(
+    client: &kube::Client,
+    target: &ObjectRef,
+) -> anyhow::Result<String> {
+    let (ar, scope) = api_resource_for(client, &target.resource).await?;
+    let api = dynamic_api_for(client, &ar, scope, &target.namespace);
+    let obj = api.get(&target.name).await?;
+    Ok(format_describe(&obj))
+}
+
+/// Format a DynamicObject into a human-readable describe view.
+fn format_describe(obj: &kube::api::DynamicObject) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let meta = &obj.metadata;
+
+    // Header
+    let kind = obj.types.as_ref().map(|t| t.kind.as_str()).unwrap_or("Resource");
+    let _ = writeln!(out, "Name:         {}", meta.name.as_deref().unwrap_or(""));
+    let _ = writeln!(out, "Namespace:    {}", meta.namespace.as_deref().unwrap_or("<none>"));
+    if let Some(uid) = &meta.uid {
+        let _ = writeln!(out, "UID:          {}", uid);
+    }
+    if let Some(ref ts) = meta.creation_timestamp {
+        let _ = writeln!(out, "Created:      {}", ts.0.to_rfc3339());
+    }
+
+    // Labels
+    let _ = writeln!(out);
+    if let Some(ref labels) = meta.labels {
+        if labels.is_empty() {
+            let _ = writeln!(out, "Labels:       <none>");
+        } else {
+            for (i, (k, v)) in labels.iter().enumerate() {
+                if i == 0 {
+                    let _ = writeln!(out, "Labels:       {}={}", k, v);
+                } else {
+                    let _ = writeln!(out, "              {}={}", k, v);
+                }
+            }
+        }
+    } else {
+        let _ = writeln!(out, "Labels:       <none>");
+    }
+
+    // Annotations
+    if let Some(ref annotations) = meta.annotations {
+        if annotations.is_empty() {
+            let _ = writeln!(out, "Annotations:  <none>");
+        } else {
+            for (i, (k, v)) in annotations.iter().enumerate() {
+                let display_v = if v.len() > 80 { format!("{}...", &v[..77]) } else { v.clone() };
+                if i == 0 {
+                    let _ = writeln!(out, "Annotations:  {}={}", k, display_v);
+                } else {
+                    let _ = writeln!(out, "              {}={}", k, display_v);
+                }
+            }
+        }
+    } else {
+        let _ = writeln!(out, "Annotations:  <none>");
+    }
+
+    // Owner references
+    if let Some(ref owners) = meta.owner_references {
+        let _ = writeln!(out);
+        for owner in owners {
+            let _ = writeln!(out, "Controlled By:  {}/{}", owner.kind, owner.name);
+        }
+    }
+
+    // Spec + Status as YAML subsections
+    if let Some(spec) = obj.data.get("spec") {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Spec:");
+        if let Ok(yaml) = serde_yaml::to_string(spec) {
+            for line in yaml.lines() {
+                let _ = writeln!(out, "  {}", line);
+            }
+        }
+    }
+    if let Some(status) = obj.data.get("status") {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Status:");
+        if let Ok(yaml) = serde_yaml::to_string(status) {
+            for line in yaml.lines() {
+                let _ = writeln!(out, "  {}", line);
+            }
+        }
+    }
+
+    // Type header for context
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Kind:         {}", kind);
+
+    out
 }
 
 // ---------------------------------------------------------------------------

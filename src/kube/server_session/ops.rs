@@ -105,11 +105,12 @@ impl ServerSession {
     // -----------------------------------------------------------------------
 
     pub(super) fn handle_describe_async(&mut self, target: &protocol::ObjectRef) {
+        let client = self.client.clone();
         let tx = self.event_tx.clone();
         let context = self.context.name.clone();
         let target = target.clone();
         self.track_task(async move {
-            let content = crate::kube::describe::fetch_describe(&target, &context).await;
+            let content = crate::kube::describe::fetch_describe(&client, &target, &context).await;
             let _ = tx.send(SessionEvent::DescribeResult { target, content }).await;
         });
     }

@@ -1,6 +1,7 @@
 //! Cluster-scoped resource definitions: Namespace, Node, PersistentVolume,
-//! StorageClass, Role, ClusterRole, RoleBinding, ClusterRoleBinding,
-//! CustomResourceDefinition.
+//! StorageClass, PriorityClass, Role, ClusterRole, RoleBinding,
+//! ClusterRoleBinding, ValidatingWebhookConfiguration,
+//! MutatingWebhookConfiguration, CustomResourceDefinition.
 //!
 //! Note: Role and RoleBinding are Namespaced scope despite being grouped here
 //! with cluster-level resources.
@@ -9,8 +10,12 @@ use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::row::ResourceRow;
 
+use k8s_openapi::api::admissionregistration::v1::{
+    MutatingWebhookConfiguration, ValidatingWebhookConfiguration,
+};
 use k8s_openapi::api::core::v1::{Namespace, Node, PersistentVolume};
 use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding};
+use k8s_openapi::api::scheduling::v1::PriorityClass;
 use k8s_openapi::api::storage::v1::StorageClass;
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 
@@ -67,6 +72,7 @@ impl ResourceDef for NodeDef {
             .into_iter().map(String::from).collect()
     }
     fn is_core(&self) -> bool { true }
+    fn is_node_shellable(&self) -> bool { true }
     fn metrics_kind(&self) -> Option<MetricsKind> { Some(MetricsKind::Node) }
 
     fn column_defs(&self) -> Vec<ColumnDef> {
@@ -292,5 +298,94 @@ impl ResourceDef for CrdDef {
 impl ConvertToRow<CustomResourceDefinition> for CrdDef {
     fn convert(obj: CustomResourceDefinition) -> ResourceRow {
         crate::kube::resources::crds::crd_to_row(obj)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PriorityClass
+// ---------------------------------------------------------------------------
+
+pub struct PriorityClassDef;
+
+impl ResourceDef for PriorityClassDef {
+    fn kind(&self) -> BuiltInKind { BuiltInKind::PriorityClass }
+    fn gvr(&self) -> &'static Gvr {
+        const G: Gvr = Gvr {
+            group: "scheduling.k8s.io", version: "v1", kind: "PriorityClass",
+            plural: "priorityclasses", scope: ResourceScope::Cluster,
+        };
+        &G
+    }
+    fn aliases(&self) -> &[&str] { &["pc", "priorityclass", "priorityclasses"] }
+    fn short_label(&self) -> &str { "PC" }
+    fn default_headers(&self) -> Vec<String> {
+        ["NAME", "VALUE", "GLOBAL-DEFAULT", "PREEMPTION", "AGE"]
+            .into_iter().map(String::from).collect()
+    }
+}
+
+impl ConvertToRow<PriorityClass> for PriorityClassDef {
+    fn convert(obj: PriorityClass) -> ResourceRow {
+        crate::kube::resources::priorityclasses::priority_class_to_row(obj)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ValidatingWebhookConfiguration
+// ---------------------------------------------------------------------------
+
+pub struct ValidatingWebhookDef;
+
+impl ResourceDef for ValidatingWebhookDef {
+    fn kind(&self) -> BuiltInKind { BuiltInKind::ValidatingWebhookConfiguration }
+    fn gvr(&self) -> &'static Gvr {
+        const G: Gvr = Gvr {
+            group: "admissionregistration.k8s.io", version: "v1",
+            kind: "ValidatingWebhookConfiguration",
+            plural: "validatingwebhookconfigurations", scope: ResourceScope::Cluster,
+        };
+        &G
+    }
+    fn aliases(&self) -> &[&str] { &["vwc", "validatingwebhook", "validatingwebhookconfigurations"] }
+    fn short_label(&self) -> &str { "VWC" }
+    fn default_headers(&self) -> Vec<String> {
+        ["NAME", "WEBHOOKS", "FAILURE-POLICY", "AGE"]
+            .into_iter().map(String::from).collect()
+    }
+}
+
+impl ConvertToRow<ValidatingWebhookConfiguration> for ValidatingWebhookDef {
+    fn convert(obj: ValidatingWebhookConfiguration) -> ResourceRow {
+        crate::kube::resources::webhooks::validating_webhook_to_row(obj)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MutatingWebhookConfiguration
+// ---------------------------------------------------------------------------
+
+pub struct MutatingWebhookDef;
+
+impl ResourceDef for MutatingWebhookDef {
+    fn kind(&self) -> BuiltInKind { BuiltInKind::MutatingWebhookConfiguration }
+    fn gvr(&self) -> &'static Gvr {
+        const G: Gvr = Gvr {
+            group: "admissionregistration.k8s.io", version: "v1",
+            kind: "MutatingWebhookConfiguration",
+            plural: "mutatingwebhookconfigurations", scope: ResourceScope::Cluster,
+        };
+        &G
+    }
+    fn aliases(&self) -> &[&str] { &["mwc", "mutatingwebhook", "mutatingwebhookconfigurations"] }
+    fn short_label(&self) -> &str { "MWC" }
+    fn default_headers(&self) -> Vec<String> {
+        ["NAME", "WEBHOOKS", "FAILURE-POLICY", "AGE"]
+            .into_iter().map(String::from).collect()
+    }
+}
+
+impl ConvertToRow<MutatingWebhookConfiguration> for MutatingWebhookDef {
+    fn convert(obj: MutatingWebhookConfiguration) -> ResourceRow {
+        crate::kube::resources::webhooks::mutating_webhook_to_row(obj)
     }
 }

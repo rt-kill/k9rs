@@ -214,6 +214,8 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
             let caps = app.current_capabilities();
             if caps.supports(OperationKind::Shell) {
                 Some(Action::Shell)
+            } else if caps.supports(OperationKind::NodeShell) {
+                Some(Action::NodeShell)
             } else if caps.supports(OperationKind::Scale) {
                 Some(Action::Scale)
             } else if caps.supports(OperationKind::ToggleSuspendCronJob) {

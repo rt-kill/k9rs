@@ -54,6 +54,9 @@ pub(crate) enum ActionResult {
     /// Suspend the TUI and run `kubectl exec -it` into a pod shell.
     /// Carries the typed [`ExecTarget`] — was four loose strings before.
     Shell(ExecTarget),
+    /// Suspend the TUI and run `kubectl debug node/<name> -it` for
+    /// node-level debugging.
+    NodeShell { node: String, context: crate::kube::protocol::ContextName },
 }
 
 /// Identifies a pod + container + cluster context for an interactive
@@ -430,6 +433,26 @@ pub async fn session_main(
                                     let kind = crate::kube::session_commands::InteractiveKind::Shell {
                                         pod: target.pod.clone(),
                                         container: target.container.clone(),
+                                    };
+                                    run_interactive_local(
+                                        &mut terminal, &mut app, "kubectl", &args, kind,
+                                        &input_suspend, &mut input_suspend_ack,
+                                    ).await?;
+                                }
+                                ActionResult::NodeShell { node, context } => {
+                                    let mut args = vec![
+                                        "debug".to_string(),
+                                        format!("node/{}", node),
+                                        "-it".to_string(),
+                                        "--image=busybox".to_string(),
+                                    ];
+                                    if !context.is_empty() {
+                                        args.push("--context".to_string());
+                                        args.push(context.to_string());
+                                    }
+                                    let kind = crate::kube::session_commands::InteractiveKind::Shell {
+                                        pod: format!("node/{}", node),
+                                        container: String::new(),
                                     };
                                     run_interactive_local(
                                         &mut terminal, &mut app, "kubectl", &args, kind,

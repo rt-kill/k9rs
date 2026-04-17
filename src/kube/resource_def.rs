@@ -181,21 +181,26 @@ pub enum BuiltInKind {
     NetworkPolicy,
     Hpa,
     Endpoints,
+    EndpointSlice,
     LimitRange,
     ResourceQuota,
     PodDisruptionBudget,
     Event,
     PersistentVolumeClaim,
+    Lease,
 
     // Cluster
     Namespace,
     Node,
     PersistentVolume,
     StorageClass,
+    PriorityClass,
     Role,
     ClusterRole,
     RoleBinding,
     ClusterRoleBinding,
+    ValidatingWebhookConfiguration,
+    MutatingWebhookConfiguration,
     CustomResourceDefinition,
 }
 
@@ -310,6 +315,7 @@ pub trait ResourceDef: Send + Sync + 'static {
 
     fn is_loggable(&self) -> bool { false }
     fn is_shellable(&self) -> bool { false }
+    fn is_node_shellable(&self) -> bool { false }
     fn is_show_nodeable(&self) -> bool { false }
     fn is_scaleable(&self) -> bool { false }
     fn is_restartable(&self) -> bool { false }
@@ -335,6 +341,7 @@ pub trait ResourceDef: Send + Sync + 'static {
             ops.extend_from_slice(&[StreamLogs, PreviousLogs]);
         }
         if self.is_shellable() { ops.push(Shell); }
+        if self.is_node_shellable() { ops.push(NodeShell); }
         if self.is_show_nodeable() { ops.push(ShowNode); }
         if self.is_scaleable() { ops.push(Scale); }
         if self.is_restartable() { ops.push(Restart); }

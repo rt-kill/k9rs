@@ -13,16 +13,20 @@ pub mod workloads;
 use std::sync::LazyLock;
 
 use k8s_openapi::api::{
+    admissionregistration::v1::{MutatingWebhookConfiguration, ValidatingWebhookConfiguration},
     apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet},
     autoscaling::v2::HorizontalPodAutoscaler,
     batch::v1::{CronJob, Job},
+    coordination::v1::Lease,
     core::v1::{
         ConfigMap, Endpoints, Event, LimitRange, Namespace, Node, PersistentVolume,
         PersistentVolumeClaim, Pod, ResourceQuota, Secret, Service, ServiceAccount,
     },
+    discovery::v1::EndpointSlice,
     networking::v1::{Ingress, NetworkPolicy},
     policy::v1::PodDisruptionBudget,
     rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding},
+    scheduling::v1::PriorityClass,
     storage::v1::StorageClass,
 };
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
@@ -59,19 +63,24 @@ fn build_registry() -> ResourceRegistry {
     r.register_namespaced::<_, NetworkPolicy>(NetworkPolicyDef);
     r.register_namespaced::<_, HorizontalPodAutoscaler>(HpaDef);
     r.register_namespaced::<_, Endpoints>(EndpointsDef);
+    r.register_namespaced::<_, EndpointSlice>(EndpointSliceDef);
     r.register_namespaced::<_, LimitRange>(LimitRangeDef);
     r.register_namespaced::<_, ResourceQuota>(ResourceQuotaDef);
     r.register_namespaced::<_, PodDisruptionBudget>(PodDisruptionBudgetDef);
     r.register_namespaced::<_, Event>(EventDef);
     r.register_namespaced::<_, PersistentVolumeClaim>(PvcDef);
+    r.register_namespaced::<_, Lease>(LeaseDef);
 
     // Cluster-scoped
     r.register_cluster::<_, Namespace>(NamespaceDef);
     r.register_cluster::<_, Node>(NodeDef);
     r.register_cluster::<_, PersistentVolume>(PvDef);
     r.register_cluster::<_, StorageClass>(StorageClassDef);
+    r.register_cluster::<_, PriorityClass>(PriorityClassDef);
     r.register_cluster::<_, ClusterRole>(ClusterRoleDef);
     r.register_cluster::<_, ClusterRoleBinding>(ClusterRoleBindingDef);
+    r.register_cluster::<_, ValidatingWebhookConfiguration>(ValidatingWebhookDef);
+    r.register_cluster::<_, MutatingWebhookConfiguration>(MutatingWebhookDef);
     r.register_cluster::<_, CustomResourceDefinition>(CrdDef);
 
     // RBAC (namespaced despite living in the cluster module)

@@ -173,7 +173,9 @@ impl MuxedConnection {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("muxed connection: session error: {}", e);
+                        // Normal on disconnect — peer closed the socket,
+                        // producing EPIPE or EOF. Not a warning.
+                        tracing::debug!("muxed connection: session ended: {}", e);
                         break;
                     }
                 }

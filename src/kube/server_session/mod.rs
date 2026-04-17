@@ -1118,60 +1118,134 @@ impl Drop for AbortOnDrop {
 // Log substream handler
 // ---------------------------------------------------------------------------
 
-/// Handle a log substream. Spawns `kubectl logs` and streams lines back
-/// as bincode-framed `String`s. When the substream closes (TUI dropped it),
-/// the subprocess is killed via `kill_on_drop`.
+/// Handle a log substream. Streams pod logs via the kube-rs API (reusing
+/// the session's authenticated client) as bincode-framed `String`s. Falls
+/// back to `kubectl logs` if the API path fails (e.g., exec credentials
+/// that kube-rs can't use). When the substream closes (TUI dropped it),
+/// the stream is cancelled naturally.
 async fn handle_log_substream(
     init: protocol::LogInit,
     mut writer: tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
     ctx: Arc<SessionContext>,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    // Try the kube-rs API first — reuses the session's authenticated
+    // client, no subprocess spawn, no re-authentication overhead.
+    if let Ok(()) = stream_logs_via_api(&init, &mut writer, &ctx).await {
+        tracing::debug!("log substream ended (API) for pod={}", init.pod);
+        return;
+    }
 
-    // The dispatch site `handle_substream` already logged
-    // `pod={} container={:?}` at substream open — we don't need to
-    // duplicate it here. The typed `LogContainer` enum's Debug repr
-    // is already self-explanatory.
+    // Fallback: kubectl logs. Spawns a subprocess with its own auth.
+    stream_logs_via_kubectl(&init, &mut writer, &ctx).await;
+    tracing::debug!("log substream ended (kubectl) for pod={}", init.pod);
+}
 
-    let ns = match init.namespace.as_option() {
-        Some(n) => n.to_string(),
-        None => String::new(),
+/// Stream logs via the kube-rs `Api::log_stream` API.
+async fn stream_logs_via_api(
+    init: &protocol::LogInit,
+    writer: &mut tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
+    ctx: &SessionContext,
+) -> Result<(), ()> {
+    let ns = init.namespace.as_option().unwrap_or("default");
+    let api: kube::Api<k8s_openapi::api::core::v1::Pod> =
+        kube::Api::namespaced(ctx.client.clone(), ns);
+
+    let mut params = kube::api::LogParams {
+        follow: init.follow,
+        previous: init.previous,
+        ..Default::default()
     };
+    if let Some(tail) = init.tail {
+        params.tail_lines = Some(tail as i64);
+    }
+    if let Some(ref since) = init.since {
+        if let Some(secs) = parse_since_to_seconds(since) {
+            params.since_seconds = Some(secs);
+        }
+    }
+    match &init.container {
+        protocol::LogContainer::Named(name) => {
+            params.container = Some(name.clone());
+        }
+        protocol::LogContainer::All => {
+            // kube-rs LogParams doesn't support --all-containers.
+            // Fall back to kubectl for this case.
+            return Err(());
+        }
+        protocol::LogContainer::Default => {}
+    }
+
+    let reader = match api.log_stream(&init.pod, &params).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("log API failed for pod={}: {}, falling back to kubectl", init.pod, e);
+            return Err(());
+        }
+    };
+
+    // kube-rs log_stream returns `impl futures::AsyncBufRead`. Convert
+    // to lines via the futures crate's async line reader.
+    let mut lines = futures::io::AsyncBufReadExt::lines(reader);
+    while let Some(line_result) = futures::StreamExt::next(&mut lines).await {
+        match line_result {
+            Ok(line) => {
+                if protocol::write_bincode(writer, &line).await.is_err() { return Ok(()); }
+                if writer.flush().await.is_err() { return Ok(()); }
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+/// Parse a kubectl-style duration string ("5m", "1h", "30s") into seconds.
+fn parse_since_to_seconds(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Some(val) = s.strip_suffix('s') {
+        return val.parse().ok();
+    }
+    if let Some(val) = s.strip_suffix('m') {
+        return val.parse::<i64>().ok().map(|v| v * 60);
+    }
+    if let Some(val) = s.strip_suffix('h') {
+        return val.parse::<i64>().ok().map(|v| v * 3600);
+    }
+    if let Some(val) = s.strip_suffix('d') {
+        return val.parse::<i64>().ok().map(|v| v * 86400);
+    }
+    s.parse().ok()
+}
+
+/// Fallback: stream logs via `kubectl logs` subprocess.
+async fn stream_logs_via_kubectl(
+    init: &protocol::LogInit,
+    writer: &mut tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
+    ctx: &SessionContext,
+) {
+    use tokio::io::AsyncBufReadExt;
 
     let mut cmd = tokio::process::Command::new("kubectl");
     cmd.arg("logs").arg(&init.pod);
     match &init.container {
-        protocol::LogContainer::All => {
-            cmd.arg("--all-containers");
-        }
-        protocol::LogContainer::Named(name) => {
-            cmd.arg("-c").arg(name);
-        }
+        protocol::LogContainer::All => { cmd.arg("--all-containers"); }
+        protocol::LogContainer::Named(name) => { cmd.arg("-c").arg(name); }
         protocol::LogContainer::Default => {}
     }
-    if !ns.is_empty() {
-        cmd.arg("-n").arg(&ns);
+    if let Some(ns) = init.namespace.as_option() {
+        cmd.arg("-n").arg(ns);
     }
     if !ctx.context.name.is_empty() {
         cmd.arg("--context").arg(ctx.context.name.as_str());
     }
-    if init.follow {
-        cmd.arg("-f");
-    }
+    if init.follow { cmd.arg("-f"); }
     if let Some(tail) = init.tail {
         cmd.arg("--tail").arg(tail.to_string());
     }
     if let Some(ref since) = init.since {
         cmd.arg("--since").arg(since);
     }
-    if init.previous {
-        cmd.arg("--previous");
-    }
+    if init.previous { cmd.arg("--previous"); }
     cmd.stdout(std::process::Stdio::piped());
-    // stderr → null. We don't surface kubectl's own warnings to the TUI,
-    // and an unread piped stderr can fill the OS pipe buffer (kubectl emits
-    // a line per pod restart / auth refresh / TLS handshake on long-running
-    // follow streams) and stall the subprocess after ~64 KiB.
     cmd.stderr(std::process::Stdio::null());
     cmd.kill_on_drop(true);
 
@@ -1190,13 +1264,7 @@ async fn handle_log_substream(
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
     while let Ok(Some(line)) = lines.next_line().await {
-        if protocol::write_bincode(&mut writer, &line).await.is_err() {
-            break;
-        }
-        if writer.flush().await.is_err() {
-            break;
-        }
+        if protocol::write_bincode(writer, &line).await.is_err() { break; }
+        if writer.flush().await.is_err() { break; }
     }
-    // Substream closes here → TUI sees EOF → LogStreamEnded.
-    tracing::debug!("log substream ended for pod={}", init.pod);
 }

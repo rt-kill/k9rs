@@ -1,16 +1,18 @@
 //! Core and networking resource definitions: Service, ConfigMap, Secret,
-//! ServiceAccount, Ingress, NetworkPolicy, HPA, Endpoints, LimitRange,
-//! ResourceQuota, PodDisruptionBudget, Event, PVC.
+//! ServiceAccount, Ingress, NetworkPolicy, HPA, Endpoints, EndpointSlice,
+//! LimitRange, ResourceQuota, PodDisruptionBudget, Event, PVC, Lease.
 
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::row::ResourceRow;
 
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
+use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{
     ConfigMap, Endpoints, Event, LimitRange, PersistentVolumeClaim, ResourceQuota, Secret,
     Service, ServiceAccount,
 };
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 
@@ -394,5 +396,63 @@ impl ResourceDef for PvcDef {
 impl ConvertToRow<PersistentVolumeClaim> for PvcDef {
     fn convert(obj: PersistentVolumeClaim) -> ResourceRow {
         crate::kube::resources::pvcs::pvc_to_row(obj)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EndpointSlice
+// ---------------------------------------------------------------------------
+
+pub struct EndpointSliceDef;
+
+impl ResourceDef for EndpointSliceDef {
+    fn kind(&self) -> BuiltInKind { BuiltInKind::EndpointSlice }
+    fn gvr(&self) -> &'static Gvr {
+        const G: Gvr = Gvr {
+            group: "discovery.k8s.io", version: "v1", kind: "EndpointSlice",
+            plural: "endpointslices", scope: ResourceScope::Namespaced,
+        };
+        &G
+    }
+    fn aliases(&self) -> &[&str] { &["eps", "endpointslice", "endpointslices"] }
+    fn short_label(&self) -> &str { "EPS" }
+    fn default_headers(&self) -> Vec<String> {
+        ["NAMESPACE", "NAME", "ADDRESSTYPE", "ENDPOINTS", "PORTS", "AGE"]
+            .into_iter().map(String::from).collect()
+    }
+}
+
+impl ConvertToRow<EndpointSlice> for EndpointSliceDef {
+    fn convert(obj: EndpointSlice) -> ResourceRow {
+        crate::kube::resources::endpointslices::endpoint_slice_to_row(obj)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lease
+// ---------------------------------------------------------------------------
+
+pub struct LeaseDef;
+
+impl ResourceDef for LeaseDef {
+    fn kind(&self) -> BuiltInKind { BuiltInKind::Lease }
+    fn gvr(&self) -> &'static Gvr {
+        const G: Gvr = Gvr {
+            group: "coordination.k8s.io", version: "v1", kind: "Lease",
+            plural: "leases", scope: ResourceScope::Namespaced,
+        };
+        &G
+    }
+    fn aliases(&self) -> &[&str] { &["lease", "leases"] }
+    fn short_label(&self) -> &str { "LEASE" }
+    fn default_headers(&self) -> Vec<String> {
+        ["NAMESPACE", "NAME", "HOLDER", "DURATION", "AGE"]
+            .into_iter().map(String::from).collect()
+    }
+}
+
+impl ConvertToRow<Lease> for LeaseDef {
+    fn convert(obj: Lease) -> ResourceRow {
+        crate::kube::resources::leases::lease_to_row(obj)
     }
 }

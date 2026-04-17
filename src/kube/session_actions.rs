@@ -730,6 +730,16 @@ pub(crate) fn handle_action(
                 }
             }
         }
+        Action::NodeShell => {
+            if let Some(row) = app.data.unified
+                .get(&rid(BuiltInKind::Node))
+                .and_then(|t| t.selected_item())
+            {
+                let node = row.name.clone();
+                let context = app.context.clone();
+                return ActionResult::NodeShell { node, context };
+            }
+        }
         Action::ToggleLastView => {
             if let Some(last) = app.nav.prev_root().cloned() {
                 let change = app.nav.reset(last);

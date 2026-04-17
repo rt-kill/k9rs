@@ -28,6 +28,10 @@ pub mod limitranges;
 pub mod resourcequotas;
 pub mod pdb;
 pub mod crds;
+pub mod endpointslices;
+pub mod leases;
+pub mod priorityclasses;
+pub mod webhooks;
 
 /// The contract for anything that can live inside a `StatefulTable`. The
 /// only implementor is `ResourceRow`; this trait is the bound used by

@@ -662,6 +662,9 @@ pub enum OperationKind {
     ShowNode,
     ForceKill,
 
+    // Node-specific.
+    NodeShell,
+
     // Special-purpose K8s resources.
     DecodeSecret,
     TriggerCronJob,

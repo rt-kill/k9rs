@@ -761,7 +761,13 @@ impl App {
 
         // Otherwise, complete command names (resource types + special commands)
         let mut all_commands: Vec<&str> = Self::resource_commands();
-        all_commands.extend_from_slice(&["ctx", "context", "contexts", "q", "quit", "help", "h"]);
+        all_commands.extend_from_slice(&[
+            "ctx", "context", "contexts",
+            "q", "quit", "exit",
+            "help", "h",
+            "home", "overview",
+            "alias", "aliases",
+        ]);
 
         let mut completions: Vec<String> = all_commands.iter()
             .map(|s| String::from(*s))

@@ -149,12 +149,10 @@ fn apply_resource_update(
 ) {
     match update {
         ResourceUpdate::Rows { resource, headers, rows } => {
-            // The entry is expected to exist for any actively-subscribed
-            // resource: `apply_nav_change` calls `clear_resource()` (which
-            // creates-or-clears) before sending Subscribe. A `None` here means
-            // the snapshot is stale (the user navigated away and we
-            // unsubscribed before the snapshot reached us); drop it.
-            let Some(table) = app.data.unified.get_mut(&resource) else { return; };
+            // Create the table entry on demand. CRD entries aren't pre-
+            // populated in `unified` (only BuiltInKind + LocalResourceKind
+            // are), so the first snapshot for a CRD needs to create it.
+            let table = app.data.unified.entry(resource.clone()).or_default();
             app.deltas.update(&rows);
             table.set_items_filtered(rows);
             app.data.descriptors.insert(resource.clone(), crate::app::TableDescriptor { headers });
