@@ -1070,13 +1070,6 @@ async fn handle_subscription_substream_inner(
             break;
         };
         let update = apply_owner_filter_inline(update, &filter);
-        if let crate::event::ResourceUpdate::Rows { ref resource, ref rows, .. } = update {
-            tracing::info!(
-                session = session_id, sub = sub_id,
-                "server bridge: writing snapshot for {} ({} rows)",
-                resource.plural(), rows.len(),
-            );
-        }
         if protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await.is_err() {
             break;
         }

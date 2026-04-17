@@ -155,17 +155,18 @@ impl<'a> ResourceTable<'a> {
         let usable32 = usable as u32;
 
         if total_needed <= usable32 {
-            // Distribute remaining space across all columns proportionally.
+            // Distribute remaining space evenly across columns. The old
+            // proportional approach made wide columns (NAME, LABELS)
+            // wastefully wide while narrow columns (READY, AGE) stayed
+            // cramped. Even distribution levels the playing field.
             let remaining = usable32 - total_needed;
-            if !widths.is_empty() && total_needed > 0 {
-                let mut distributed: u32 = 0;
-                let last = widths.len() - 1;
-                for w in widths.iter_mut().take(last) {
-                    let share = ((*w as f64 / total_needed as f64) * remaining as f64) as u32;
-                    *w = (*w as u32 + share).min(usable32) as u16;
-                    distributed += share;
+            if !widths.is_empty() {
+                let per_col = remaining / widths.len() as u32;
+                let leftover = remaining % widths.len() as u32;
+                for (i, w) in widths.iter_mut().enumerate() {
+                    let extra = per_col + if (i as u32) < leftover { 1 } else { 0 };
+                    *w = (*w as u32 + extra).min(usable32) as u16;
                 }
-                widths[last] = (widths[last] as u32 + remaining - distributed).min(usable32) as u16;
             }
         } else if usable > 0 {
             // Scale down proportionally but give each column at least 4 chars.

@@ -189,16 +189,20 @@ pub(crate) fn apply_nav_change(app: &mut App, data_source: &mut ClientSession, c
     // grace period. No control-stream command required.
 
     if let Some(ref new) = change.subscribe {
-        // Clear the target table so the view shows fresh "Loading…" until
-        // the first snapshot arrives on the new substream. This prevents
-        // stale rows from a previous subscription (different filter, same
-        // rid) from bleeding into the new view. The substream's bridge
-        // sends its first snapshot within milliseconds (the daemon's
-        // watcher has data cached), so the flash is negligible.
-        app.clear_resource(new);
-        // Open a fresh subscription substream via yamux. The bridge task
-        // inside subscribe_stream reads StreamEvents from the substream
-        // and forwards them as AppEvents into the main event channel.
+        // DON'T clear the table — let stale data stay visible until the new
+        // subscription's first snapshot replaces it atomically via
+        // `set_items_filtered`. The daemon's watcher cache almost always has
+        // data ready (the server bridge sends it immediately at line 1051 of
+        // handle_data_substream), so the old rows are replaced within
+        // milliseconds. Clearing first caused a visible "Loading..." flash
+        // on every navigation, even when the watcher had cached data —
+        // especially noticeable on large resources (2k+ nodes, 9k+ pods)
+        // where the snapshot takes 200-500ms to serialize + transfer.
+        //
+        // The tradeoff: if the filter changed (different namespace, different
+        // labels), the OLD filter's rows are briefly visible until the new
+        // snapshot arrives. This is less jarring than a blank "Loading..."
+        // screen and the window is sub-second.
         let stream = data_source.subscribe_stream(
             new.clone(),
             app.selected_ns.clone(),

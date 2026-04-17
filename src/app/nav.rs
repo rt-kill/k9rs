@@ -361,7 +361,14 @@ impl NavStack {
         // duplicate watcher AND wipe the ancestor's rows.
         let sub_filter = self.top.filter.as_ref().and_then(|f| f.to_subscription_filter());
         let change = if new != old {
-            if self.same_rid_ancestor_has_stream() {
+            // The new top (restored parent) may still hold its own live
+            // subscription stream from before the drill-down. Check the
+            // top's own stream FIRST — `same_rid_ancestor_has_stream` only
+            // walks ancestors, missing the top itself. Without this, every
+            // pop-back across a rid change triggered a re-subscribe + data
+            // clear, causing a visible "Loading..." flash even though the
+            // data was already cached and the stream alive.
+            if self.top.stream.is_some() || self.same_rid_ancestor_has_stream() {
                 NavChange { subscribe: None, subscription_filter: None }
             } else {
                 NavChange { subscribe: Some(new), subscription_filter: sub_filter }

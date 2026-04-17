@@ -9,7 +9,7 @@ use futures::{StreamExt, TryStreamExt};
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::watcher::{self, Event as WatcherEvent};
 use kube::{Api, Client};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::event::ResourceUpdate;
@@ -63,12 +63,11 @@ pub(crate) async fn run_dynamic_live_watcher(
     let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
     let mut backoff_start = std::time::Instant::now();
     let mut init_dirty = false;
+    let mut steady_dirty = false;
     let mut had_success = false;
 
-    let (snap_tx, mut snap_rx) = mpsc::channel::<()>(2);
-
-    let mut init_flush = tokio::time::interval(std::time::Duration::from_millis(INIT_FLUSH_INTERVAL_MS));
-    init_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut flush_timer = tokio::time::interval(std::time::Duration::from_millis(INIT_FLUSH_INTERVAL_MS));
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Reason we exit the loop — same pattern as run_typed_watcher.
     let mut exit_reason: Option<String> = None;
@@ -93,7 +92,12 @@ pub(crate) async fn run_dynamic_live_watcher(
                                 backoff_ms = INITIAL_BACKOFF_MS;
                                 backoff_start = std::time::Instant::now();
                                 debug!("live_query dynamic: initial list complete, {} items", store.len());
-                                let _ = snap_tx.try_send(());
+                                let snap = build_dynamic_snapshot(&store, &printer_columns, scope);
+                                let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
+                                    resource: resource_id.clone(),
+                                    headers: snap.headers,
+                                    rows: snap.rows,
+                                }));
                             }
                             WatcherEvent::Apply(obj) => {
                                 had_success = true;
@@ -101,7 +105,7 @@ pub(crate) async fn run_dynamic_live_watcher(
                                 backoff_start = std::time::Instant::now();
                                 let key = dyn_obj_key(&obj);
                                 store.insert(key, obj);
-                                let _ = snap_tx.try_send(());
+                                steady_dirty = true;
                             }
                             WatcherEvent::Delete(obj) => {
                                 had_success = true;
@@ -109,7 +113,7 @@ pub(crate) async fn run_dynamic_live_watcher(
                                 backoff_start = std::time::Instant::now();
                                 let key = dyn_obj_key(&obj);
                                 store.remove(&key);
-                                let _ = snap_tx.try_send(());
+                                steady_dirty = true;
                             }
                         }
                     }
@@ -134,17 +138,18 @@ pub(crate) async fn run_dynamic_live_watcher(
                     }
                 }
             }
-            _ = snap_rx.recv() => {
-                let snap = build_dynamic_snapshot(&store, &printer_columns, scope);
-                let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
-                    resource: resource_id.clone(),
-                    headers: snap.headers,
-                    rows: snap.rows,
-                }));
-            }
-            _ = init_flush.tick() => {
-                if init_dirty && !store.is_empty() {
+            _ = flush_timer.tick() => {
+                if init_dirty && !store.is_empty() && store.len() <= super::live_query::INIT_FLUSH_ROW_LIMIT {
                     init_dirty = false;
+                    let snap = build_dynamic_snapshot(&store, &printer_columns, scope);
+                    let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
+                        resource: resource_id.clone(),
+                        headers: snap.headers,
+                        rows: snap.rows,
+                    }));
+                }
+                if steady_dirty {
+                    steady_dirty = false;
                     let snap = build_dynamic_snapshot(&store, &printer_columns, scope);
                     let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
                         resource: resource_id.clone(),

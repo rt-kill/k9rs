@@ -822,12 +822,6 @@ impl ClientSession {
             while let Ok(event) = protocol::read_bincode::<_, protocol::StreamEvent>(&mut reader).await {
                 let app_event = match event {
                     protocol::StreamEvent::Snapshot(update) => {
-                        if let crate::event::ResourceUpdate::Rows { ref resource, ref rows, .. } = update {
-                            tracing::info!(
-                                "client bridge: received snapshot for {} ({} rows)",
-                                resource.plural(), rows.len(),
-                            );
-                        }
                         AppEvent::ResourceUpdate(update)
                     }
                     protocol::StreamEvent::Error(msg) => {

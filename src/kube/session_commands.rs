@@ -590,14 +590,14 @@ pub(crate) fn handle_form_dialog_key(
                 dispatch_form_submit(app, data_source, dialog);
             }
         }
-        KeyCode::Left | KeyCode::Right => {
+        KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
             if let Some(ref mut d) = app.form_dialog {
                 if let Some(field) = d.current_field_mut() {
                     if let FormFieldKind::Select { ref options } = field.kind {
                         if !options.is_empty() {
                             let n = options.len();
                             let cur: usize = field.value.parse().unwrap_or(0);
-                            let new = if matches!(key.code, KeyCode::Left) {
+                            let new = if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) {
                                 (cur + n - 1) % n
                             } else {
                                 (cur + 1) % n

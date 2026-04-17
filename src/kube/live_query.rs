@@ -22,7 +22,7 @@ use futures::{StreamExt, TryStreamExt};
 use kube::api::GroupVersionKind;
 use kube::runtime::watcher::{self, Event as WatcherEvent};
 use kube::{Api, Client, Resource};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -121,6 +121,13 @@ pub struct Subscription {
 pub(crate) const WATCHER_PAGE_SIZE: u32 = 1000;
 /// Interval for flushing intermediate snapshots during the initial list.
 pub(crate) const INIT_FLUSH_INTERVAL_MS: u64 = 200;
+/// Maximum store size for which intermediate flushes fire during the
+/// initial list. Above this threshold we skip intermediate snapshots and
+/// wait for `InitDone` — cloning + sorting + serializing thousands of rows
+/// every 200ms produces multi-MB payloads that choke the yamux pipe with
+/// diminishing UX return (the table just shows a blur of growing data).
+/// The full snapshot after `InitDone` still delivers all the data.
+pub(crate) const INIT_FLUSH_ROW_LIMIT: usize = 2_000;
 /// Initial backoff duration for watcher retries (milliseconds).
 pub(crate) const INITIAL_BACKOFF_MS: u64 = 300;
 /// Maximum single-sleep backoff cap (milliseconds).
@@ -433,6 +440,22 @@ fn obj_key<K: Resource<DynamicType = ()>>(obj: &K) -> ObjectKey {
     )
 }
 
+/// Clone all items from the store, sort by (namespace, name), and return as
+/// a `Vec`. Used by the InitDone immediate publish, the init flush timer,
+/// and the steady-state debounce timer.
+fn sorted_snapshot<T>(store: &HashMap<ObjectKey, T>) -> Vec<T>
+where
+    T: Clone + crate::kube::resources::KubeResource,
+{
+    let mut items: Vec<T> = store.values().cloned().collect();
+    items.sort_by(|a, b| {
+        let key_a = (a.namespace(), a.name());
+        let key_b = (b.namespace(), b.name());
+        key_a.cmp(&key_b)
+    });
+    items
+}
+
 /// Runs a typed `kube::runtime::watcher` stream, maintaining a local cache.
 ///
 /// Events are debounced during `InitApply` bursts (every 100ms). `Apply`,
@@ -485,14 +508,15 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
     // retrying for 2 minutes — it's almost certainly a permanent error.
     let mut had_success = false;
     let mut init_dirty = false; // tracks whether we have unsent InitApply items
+    let mut steady_dirty = false; // tracks whether Apply/Delete changed the store
 
-    // Channel for signalling that a snapshot should be built.
-    let (snap_tx, mut snap_rx) = mpsc::channel::<()>(2);
-
-    // Timer for flushing intermediate snapshots during initial list.
-    // Fires every 200ms so data appears progressively on large clusters.
-    let mut init_flush = tokio::time::interval(std::time::Duration::from_millis(INIT_FLUSH_INTERVAL_MS));
-    init_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Timer for flushing snapshots. During the initial list this fires
+    // every 200ms for progressive display (if the store is small enough).
+    // In steady state it fires every 200ms but only rebuilds when
+    // `steady_dirty` is set — debouncing rapid Apply/Delete events
+    // (e.g., 2000 node heartbeats/sec) into one snapshot rebuild per tick.
+    let mut flush_timer = tokio::time::interval(std::time::Duration::from_millis(INIT_FLUSH_INTERVAL_MS));
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Trace labels: `rt` from the K8s type metadata (e.g. "pods"), `ns_label`
     // from the typed namespace. Both are derived — no string round-trip.
@@ -528,7 +552,10 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
                                 backoff_ms = INITIAL_BACKOFF_MS;
                                 backoff_start = std::time::Instant::now();
                                 info!("live_query: initial list complete for {}({}), {} items", rt, ns_label, store.len());
-                                let _ = snap_tx.try_send(());
+                                // Publish immediately — the user is waiting
+                                // for the initial list, no reason to debounce.
+                                let items = sorted_snapshot(&store);
+                                let _ = snapshot_tx.send(WatcherSnapshot::Live(wrap(items)));
                             }
                             WatcherEvent::Apply(obj) => {
                                 had_success = true;
@@ -536,7 +563,7 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
                                 backoff_start = std::time::Instant::now();
                                 let key = obj_key(&obj);
                                 store.insert(key, convert(obj));
-                                let _ = snap_tx.try_send(());
+                                steady_dirty = true;
                             }
                             WatcherEvent::Delete(obj) => {
                                 had_success = true;
@@ -544,7 +571,7 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
                                 backoff_start = std::time::Instant::now();
                                 let key = obj_key(&obj);
                                 store.remove(&key);
-                                let _ = snap_tx.try_send(());
+                                steady_dirty = true;
                             }
                         }
                     }
@@ -571,30 +598,21 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
                     }
                 }
             }
-            _ = snap_rx.recv() => {
-                // Build a sorted snapshot and wrap into a ResourceUpdate.
-                let mut items: Vec<T> = store.values().cloned().collect();
-                items.sort_by(|a, b| {
-                    let key_a = (a.namespace(), a.name());
-                    let key_b = (b.namespace(), b.name());
-                    key_a.cmp(&key_b)
-                });
-
-                // Update the watch channel with typed data.
-                let _ = snapshot_tx.send(WatcherSnapshot::Live(wrap(items)));
-            }
-            _ = init_flush.tick() => {
-                // Flush intermediate snapshots during initial list so data
-                // appears progressively instead of waiting for InitDone.
-                if init_dirty && !store.is_empty() {
+            _ = flush_timer.tick() => {
+                // Intermediate init flush: progressive display for small stores.
+                if init_dirty && !store.is_empty() && store.len() <= INIT_FLUSH_ROW_LIMIT {
                     info!("live_query: flushing intermediate snapshot for {}({}) ({} items)", rt, ns_label, store.len());
                     init_dirty = false;
-                    let mut items: Vec<T> = store.values().cloned().collect();
-                    items.sort_by(|a, b| {
-                        let key_a = (a.namespace(), a.name());
-                        let key_b = (b.namespace(), b.name());
-                        key_a.cmp(&key_b)
-                    });
+                    let items = sorted_snapshot(&store);
+                    let _ = snapshot_tx.send(WatcherSnapshot::Live(wrap(items)));
+                }
+                // Steady-state debounce: coalesce rapid Apply/Delete events
+                // (e.g., node heartbeats) into one snapshot rebuild per tick
+                // instead of one per event. With 2000 nodes, this reduces
+                // bridge traffic from ~50 snapshots/sec to ~5.
+                if steady_dirty {
+                    steady_dirty = false;
+                    let items = sorted_snapshot(&store);
                     let _ = snapshot_tx.send(WatcherSnapshot::Live(wrap(items)));
                 }
             }
