@@ -19,9 +19,10 @@
 //! # Identity
 //!
 //! Local resources use the sentinel group `"k9rs.local"` (see
-//! [`crate::kube::protocol::LOCAL_GROUP`]). Metadata lives in a parallel table
-//! ([`LOCAL_RESOURCE_TYPES`]) that the existing alias lookup consults after
-//! the K8s `RESOURCE_TYPES` table, so `:pf` resolves the same way as `:pods`.
+//! [`crate::kube::protocol::LOCAL_GROUP`]). Metadata lives on the closed
+//! [`LocalResourceKind`] enum via exhaustive-match `const fn` accessors;
+//! the alias lookup ([`find_by_alias`]) consults it after the K8s `REGISTRY`
+//! so `:pf` resolves the same way as `:pods`. No parallel static table.
 //!
 //! # Per-context lifetime
 //!
@@ -41,15 +42,17 @@
 //!
 //! # Adding a new local resource type
 //!
-//! 1. Implement [`LocalResourceSource`] on a new struct with a
-//!    `for_context(name: String)` constructor.
-//! 2. Write a converter `*_to_row` next to the source that turns entries
+//! 1. Add a variant to [`LocalResourceKind`] — every `const fn` accessor
+//!    becomes a compile error on the missing arm; fill in name, version,
+//!    kind_str, plural, scope, aliases, short_label, and add the variant
+//!    to [`LocalResourceKind::all`].
+//! 2. Implement [`LocalResourceSource`] on a new struct with a
+//!    `for_context(name: ContextName)` constructor.
+//! 3. Write a converter `*_to_row` next to the source that turns entries
 //!    into [`crate::kube::resources::row::ResourceRow`].
-//! 3. Add a [`LocalTypeMeta`] entry to [`LOCAL_RESOURCE_TYPES`] with aliases,
-//!    short label, and scope.
 //! 4. Add a per-context cache field on [`registry::LocalRegistry`] and a
-//!    `*_for(context)` accessor (mirror `port_forwards_for`); plug the new
-//!    plural into the match arm in `LocalRegistry::get`.
+//!    `*_for(context)` accessor (mirror `port_forwards_for`); add a match
+//!    arm in `LocalRegistry::get` for the new kind.
 
 pub mod port_forward;
 pub mod registry;
@@ -58,13 +61,13 @@ pub mod types;
 
 pub use registry::LocalRegistry;
 pub use subscription::LocalSubscription;
-pub use types::{find_by_alias, find_by_plural, LocalTypeMeta, LOCAL_RESOURCE_TYPES};
+pub use types::{find_by_alias, LocalResourceKind};
 
 use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::event::ResourceUpdate;
-use crate::kube::protocol::{ResourceCapabilities, ResourceId};
+use crate::kube::protocol::ResourceId;
 
 /// A daemon-owned source of [`ResourceRow`](crate::kube::resources::row::ResourceRow)
 /// snapshots. See the module docs for the contract.
@@ -76,9 +79,10 @@ pub trait LocalResourceSource: Send + Sync + 'static {
     /// Runtime column headers (matches the order of `ResourceRow::cells`).
     fn headers(&self) -> Vec<String>;
 
-    /// Capabilities this resource exposes (can_log, can_delete, etc.).
-    /// Emitted to the client right after subscription succeeds.
-    fn capabilities(&self) -> ResourceCapabilities;
+    // Capabilities used to live on this trait as `fn capabilities() ->
+    // ResourceCapabilities`. Removed: the client computes them from the
+    // typed `ResourceId::capabilities()` method, so nothing on the server
+    // consumed this trait method after the wire send was dropped.
 
     /// Get a `watch::Receiver` for snapshot updates. Local sources are
     /// infallible by construction — the receiver always carries the
@@ -90,41 +94,37 @@ pub trait LocalResourceSource: Send + Sync + 'static {
     /// converter and carries whatever encoded id the source needs (e.g.
     /// `"pf-42"`). Returns `Err` with a user-visible message if the name is
     /// invalid or the entry doesn't exist.
-    ///
-    /// Default: unsupported.
-    fn delete(&self, _name: &str) -> Result<(), String> {
-        Err("delete not supported on this resource".into())
-    }
+    fn delete(&self, name: &str) -> Result<(), String>;
 
     /// Render a human-readable describe of a single entry by row name.
     /// Mirrors `kubectl describe`'s formatting role for K8s resources.
     /// Returns `None` if the source doesn't expose a describe view, or
     /// `Some(Err(msg))` if the entry is missing/invalid.
-    ///
-    /// Default: not supported.
-    fn describe(&self, _name: &str) -> Option<Result<String, String>> {
-        None
-    }
+    fn describe(&self, name: &str) -> Option<Result<String, String>>;
 
     /// Serialize a single entry as YAML. Mirrors `kubectl get -o yaml`.
     /// Returns `None` if the source doesn't expose a yaml view, or
     /// `Some(Err(msg))` if the entry is missing/invalid.
-    ///
-    /// Default: not supported.
-    fn yaml(&self, _name: &str) -> Option<Result<String, String>> {
-        None
-    }
+    fn yaml(&self, name: &str) -> Option<Result<String, String>>;
 
     /// Apply a new YAML representation for an entry. Mirrors `kubectl apply
     /// -f`. Implementations parse the YAML, diff against the current entry,
     /// and reconcile (in PortForwardSource: stop the existing kubectl
     /// subprocess and create a new one with the new ports). Returns the
     /// user-facing message on success, or an error string on failure.
-    ///
-    /// Default: not supported.
-    fn apply_yaml(&self, _name: &str, _yaml: &str) -> Result<String, String> {
-        Err("apply is not supported on this resource".into())
-    }
+    fn apply_yaml(&self, name: &str, yaml: &str) -> Result<String, String>;
+
+    /// Try to claim the "grace task in flight" slot. Returns `true` if the
+    /// caller won the race and SHOULD spawn a fresh grace task; `false`
+    /// if a grace task is already running for this source and the caller
+    /// should just drop its Arc immediately. Implementations typically
+    /// CAS-flip an `AtomicBool`.
+    fn try_begin_grace(&self) -> bool;
+
+    /// Reset the "grace task in flight" slot. Called by the grace task
+    /// just before it drops its Arc, so that a subsequent subscribe/drop
+    /// cycle can spawn a fresh grace task.
+    fn end_grace(&self);
 }
 
 /// Convenience: downcast-free typed handle to the daemon's PortForwardSource.

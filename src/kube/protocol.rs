@@ -5,44 +5,138 @@
 //! No JSON on the wire.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
+use crate::kube::local::LocalResourceKind;
+use crate::kube::resource_def::BuiltInKind;
 use super::cache::CachedCrd;
 
-/// Identity of a Kubernetes resource type, identified by Group/Version/Resource (GVR).
-/// This is the unified representation — no distinction between "built-in" and "dynamic".
-/// Every K8s resource type (including CRDs) is just a GVR.
+/// A kubeconfig context name (e.g. "prod-us-west", "minikube"). Typed
+/// so you cannot accidentally substitute a namespace, cluster name, user
+/// name, or any other free-form string where a context is expected.
 ///
+/// `Arc<str>` inside because context names are read once at kubeconfig
+/// load and then cloned into many long-lived places (app state, each
+/// session, per-port-forward state, registry keys); ref-counted sharing
+/// avoids allocating the same name over and over.
+///
+/// `#[serde(transparent)]` — wire encoding is byte-identical to a bare
+/// `String`, so swapping `context: String` → `context: ContextName` in
+/// protocol types is wire-compatible.
+///
+/// `Borrow<str>` is implemented so `HashMap<ContextName, V>::get(&str)`
+/// and `DashMap<ContextName, V>::get(&str)` both work without cloning.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ContextName(Arc<str>);
+
+impl ContextName {
+    pub fn new(s: impl Into<Arc<str>>) -> Self {
+        Self(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Default for ContextName {
+    fn default() -> Self {
+        Self(Arc::from(""))
+    }
+}
+
+impl From<String> for ContextName {
+    fn from(s: String) -> Self { Self(Arc::from(s)) }
+}
+
+impl From<&str> for ContextName {
+    fn from(s: &str) -> Self { Self(Arc::from(s)) }
+}
+
+impl std::borrow::Borrow<str> for ContextName {
+    fn borrow(&self) -> &str { &self.0 }
+}
+
+impl AsRef<str> for ContextName {
+    fn as_ref(&self) -> &str { &self.0 }
+}
+
+impl std::fmt::Display for ContextName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for ContextName {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from(s))
+    }
+}
+
 /// Sentinel group for daemon-owned "local" resources (port-forwards, saved
 /// queries, etc.). Distinct from every real K8s API group so identity checks
 /// are unambiguous. See `crate::kube::local` for the abstraction.
 pub const LOCAL_GROUP: &str = "k9rs.local";
 
-/// Identity (Hash/Eq) is determined by `(group, version, plural)` only.
-/// `kind` and `scope` are properties of the resource, not part of its identity.
+/// Identity of a resource type. Three disjoint variants — every callsite
+/// can branch on `match` and the compiler enforces exhaustiveness.
+///
+/// - [`ResourceId::BuiltIn`]: a closed-set K8s resource the daemon ships
+///   with (Pod, Deployment, etc.). Carries only the typed [`BuiltInKind`]
+///   discriminant; group/version/kind/plural/scope are fetched on demand
+///   from the registry's `&'static Gvr`. No allocation.
+/// - [`ResourceId::Crd`]: a runtime-discovered CRD. Carries the GVR strings
+///   in a [`CrdRef`] because CRDs are not statically known.
+/// - [`ResourceId::Local`]: a daemon-owned local resource (port-forwards,
+///   etc.). Like built-ins, carries only the typed [`LocalResourceKind`]
+///   discriminant.
+///
+/// Equality / hashing semantics: identity is `(group, version, plural)` for
+/// CRDs (matching the previous struct semantics for wire compat), and the
+/// typed kind for built-ins and locals. Distinct variants never compare
+/// equal, even if a CRD's strings happen to match a built-in.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceId {
+    /// Closed-set, statically-known K8s resource. Carries only the typed
+    /// kind — the full GVR is looked up from the registry.
+    BuiltIn(BuiltInKind),
+    /// Runtime-discovered CRD with raw GVR strings.
+    Crd(CrdRef),
+    /// Daemon-owned local resource (port-forwards, etc.).
+    Local(LocalResourceKind),
+}
+
+/// GVR payload for CRDs (resources that aren't in the closed [`BuiltInKind`]
+/// enum). Identity (Hash/Eq) is `(group, version, plural)` only — `kind`
+/// and `scope` are display/metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceId {
-    /// API group (e.g., "" for core, "apps", "batch", "clickhouse.altinity.com")
+pub struct CrdRef {
+    /// API group (e.g. "clickhouse.altinity.com")
     pub group: String,
-    /// API version (e.g., "v1", "v1beta1")
+    /// API version (e.g. "v1", "v1beta1")
     pub version: String,
-    /// Kind (e.g., "Pod", "Deployment") — for display, NOT part of identity
+    /// K8s kind (e.g. "ClickHouseInstallation") — display, not identity
     pub kind: String,
-    /// Plural name (e.g., "pods", "deployments") — for API URLs, part of identity
+    /// Plural name used in API URLs — part of identity
     pub plural: String,
-    /// Whether this resource is cluster-scoped or namespace-scoped — NOT part of identity
+    /// Cluster vs namespace scope — display/runtime, not identity
     pub scope: ResourceScope,
 }
 
-impl PartialEq for ResourceId {
+impl PartialEq for CrdRef {
     fn eq(&self, other: &Self) -> bool {
         self.group == other.group && self.version == other.version && self.plural == other.plural
     }
 }
 
-impl Eq for ResourceId {}
+impl Eq for CrdRef {}
 
-impl std::hash::Hash for ResourceId {
+impl std::hash::Hash for CrdRef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.group.hash(state);
         self.version.hash(state);
@@ -50,7 +144,7 @@ impl std::hash::Hash for ResourceId {
     }
 }
 
-impl ResourceId {
+impl CrdRef {
     pub fn new(
         group: impl Into<String>,
         version: impl Into<String>,
@@ -67,91 +161,205 @@ impl ResourceId {
         }
     }
 
-    /// Look up a built-in resource by any alias (e.g., "po", "deploy", "svc", "namespaces", "pf").
-    /// Consults both the K8s RESOURCE_TYPES table and the local LOCAL_RESOURCE_TYPES table.
-    pub fn from_alias(alias: &str) -> Option<Self> {
-        if let Some(meta) = crate::kube::resource_types::find_by_alias(alias) {
-            return Some(Self {
-                group: meta.group.to_string(),
-                version: meta.version.to_string(),
-                kind: meta.kind.to_string(),
-                plural: meta.plural.to_string(),
-                scope: meta.scope,
-            });
+    /// Build a "please resolve me" placeholder CrdRef for cases where the
+    /// client only knows the plural / kind and the daemon needs to fill in
+    /// group + version via discovery (e.g. user types `:nodeclaims`,
+    /// owner-chain drill-down where the owner kind isn't in the registry).
+    /// The daemon's `api_resource_for` recognizes this shape via
+    /// [`Self::is_unresolved`] and walks discovery.
+    pub fn unresolved(plural: impl Into<String>) -> Self {
+        let plural = plural.into();
+        Self {
+            group: String::new(),
+            version: String::new(),
+            kind: plural.clone(),
+            plural,
+            scope: ResourceScope::Namespaced,
         }
-        if let Some(local) = crate::kube::local::find_by_alias(alias) {
-            return Some(local.to_resource_id());
+    }
+
+    /// True if this is an unresolved placeholder produced by
+    /// [`Self::unresolved`]. Replaces the open-coded
+    /// `crd_ref.group.is_empty() && crd_ref.version.is_empty()` checks
+    /// at every dispatch site.
+    pub fn is_unresolved(&self) -> bool {
+        self.group.is_empty() && self.version.is_empty()
+    }
+}
+
+impl From<BuiltInKind> for ResourceId {
+    fn from(k: BuiltInKind) -> Self { ResourceId::BuiltIn(k) }
+}
+
+impl From<LocalResourceKind> for ResourceId {
+    fn from(k: LocalResourceKind) -> Self { ResourceId::Local(k) }
+}
+
+impl From<CrdRef> for ResourceId {
+    fn from(r: CrdRef) -> Self { ResourceId::Crd(r) }
+}
+
+/// A borrowed view over a resource's identity metadata. Built once per
+/// [`ResourceId::identity`] call, with fields borrowing either `&'static`
+/// data (for built-ins and locals — both of which point into `const`
+/// tables) or the receiver itself (for CRDs, which own their strings).
+///
+/// The per-variant dispatch on `ResourceId` lives in [`ResourceId::identity`]
+/// — exactly ONE place. Every accessor (`group`, `plural`, `scope`, …)
+/// is a one-liner over the returned `IdentityData`, so adding a new
+/// accessor means adding a field here and three lines in `identity()`
+/// (once), not touching six accessors. Adding a new `ResourceId` variant
+/// means one new arm in `identity()`, not six.
+pub struct IdentityData<'a> {
+    pub group: &'a str,
+    pub version: &'a str,
+    pub kind_str: &'a str,
+    pub plural: &'a str,
+    pub short_label: &'a str,
+    pub scope: ResourceScope,
+}
+
+impl ResourceId {
+    /// Construct a CRD-backed ResourceId from raw GVR strings. Used by the
+    /// daemon's discovery / resolve paths and by tests.
+    pub fn crd(
+        group: impl Into<String>,
+        version: impl Into<String>,
+        kind: impl Into<String>,
+        plural: impl Into<String>,
+        scope: ResourceScope,
+    ) -> Self {
+        ResourceId::Crd(CrdRef::new(group, version, kind, plural, scope))
+    }
+
+    /// Look up a resource by any alias (e.g., "po", "deploy", "svc", "namespaces", "pf").
+    /// Consults the trait-based REGISTRY and the local table.
+    pub fn from_alias(alias: &str) -> Option<Self> {
+        if let Some(def) = crate::kube::resource_defs::REGISTRY.by_alias(alias) {
+            return Some(ResourceId::BuiltIn(def.kind()));
+        }
+        if let Some(kind) = crate::kube::local::find_by_alias(alias) {
+            return Some(ResourceId::Local(kind));
         }
         None
     }
 
-    /// Display label (the kind name).
-    pub fn display_label(&self) -> &str {
-        &self.kind
+    // -- Variant predicates ---------------------------------------------------
+
+    /// True if this is a daemon-owned local resource.
+    pub fn is_local(&self) -> bool {
+        matches!(self, ResourceId::Local(_))
     }
+
+    /// True if this is a runtime-discovered CRD.
+    pub fn is_crd(&self) -> bool {
+        matches!(self, ResourceId::Crd(_))
+    }
+
+    /// Extract the typed [`BuiltInKind`] if this is a built-in. Useful for
+    /// dispatching through the registry without re-parsing strings.
+    pub fn built_in_kind(&self) -> Option<BuiltInKind> {
+        if let ResourceId::BuiltIn(k) = self { Some(*k) } else { None }
+    }
+
+    // -- Identity --------------------------------------------------------
+
+    /// Build a borrowed view over this resource's identity metadata. This
+    /// is the single place where `ResourceId`'s variant is resolved to
+    /// backing metadata; all six accessors below are one-liners over the
+    /// returned view. Adding a new accessor or variant is a localized
+    /// edit, not a 6×3 grid refactor.
+    pub fn identity(&self) -> IdentityData<'_> {
+        match self {
+            ResourceId::BuiltIn(k) => {
+                let def = crate::kube::resource_defs::REGISTRY.by_kind(*k);
+                let g = def.gvr();
+                IdentityData {
+                    group: g.group,
+                    version: g.version,
+                    kind_str: g.kind,
+                    plural: g.plural,
+                    short_label: def.short_label(),
+                    scope: g.scope,
+                }
+            }
+            ResourceId::Crd(r) => IdentityData {
+                group: &r.group,
+                version: &r.version,
+                kind_str: &r.kind,
+                plural: &r.plural,
+                // CRDs have no def-defined short label; fall back to kind.
+                short_label: &r.kind,
+                scope: r.scope,
+            },
+            ResourceId::Local(k) => IdentityData {
+                group: LOCAL_GROUP,
+                version: k.version(),
+                kind_str: k.kind_str(),
+                plural: k.plural(),
+                short_label: k.short_label(),
+                scope: k.scope(),
+            },
+        }
+    }
+
+    // -- Accessors (thin wrappers over identity()) ------------------------
+
+    pub fn group(&self) -> &str { self.identity().group }
+    pub fn version(&self) -> &str { self.identity().version }
+
+    /// The K8s "kind" string (e.g. "Pod", "Deployment"). Named `kind_str`
+    /// to avoid colliding with the typed `BuiltInKind` accessor.
+    pub fn kind_str(&self) -> &str { self.identity().kind_str }
+
+    /// The plural name used in API URLs and as the wire-format identifier
+    /// (e.g. "pods", "deployments").
+    pub fn plural(&self) -> &str { self.identity().plural }
+
+    pub fn scope(&self) -> ResourceScope { self.identity().scope }
+
+    /// Display label (the kind name). Same as `kind_str` — kept for
+    /// readability at callsites that mean "show this to the user".
+    pub fn display_label(&self) -> &str { self.kind_str() }
 
     /// Short UI label for tab bar/breadcrumbs (e.g., "Deploy", "STS", "PF").
-    /// Falls back to kind for unknown/CRD resource types.
-    pub fn short_label(&self) -> &str {
-        if self.is_local() {
-            if let Some(m) = crate::kube::local::find_by_plural(&self.plural) {
-                return m.short_label;
-            }
-            return &self.kind;
-        }
-        crate::kube::resource_types::find_by_plural(&self.plural)
-            .map(|m| m.short_label)
-            .unwrap_or(&self.kind)
-    }
-
-    /// Look up the static metadata for this resource (if it's a known type).
-    pub fn meta(&self) -> Option<&'static crate::kube::resource_types::ResourceTypeMeta> {
-        crate::kube::resource_types::find_by_plural(&self.plural)
-    }
-
-    /// Whether this resource supports viewing logs (resolves to pods).
-    pub fn supports_logs(&self) -> bool {
-        self.meta().map_or(false, |m| m.supports_logs)
-    }
-
-    /// Whether this resource supports shell exec (must be a pod).
-    pub fn supports_shell(&self) -> bool {
-        self.meta().map_or(false, |m| m.supports_shell)
-    }
-
-    /// Whether this resource has a /scale subresource.
-    pub fn supports_scale(&self) -> bool {
-        self.meta().map_or(false, |m| m.supports_scale)
-    }
-
-    /// Whether this resource supports rollout restart.
-    pub fn supports_restart(&self) -> bool {
-        self.meta().map_or(false, |m| m.supports_restart)
-    }
+    pub fn short_label(&self) -> &str { self.identity().short_label }
 
     /// Whether this resource is cluster-scoped.
     pub fn is_cluster_scoped(&self) -> bool {
-        self.scope == ResourceScope::Cluster
+        self.scope() == ResourceScope::Cluster
     }
 
-    /// Whether this resource is a daemon-owned local resource (not from K8s API).
-    /// Local resources use the sentinel group `"k9rs.local"`.
-    pub fn is_local(&self) -> bool {
-        self.group == LOCAL_GROUP
-    }
-
-    /// The plural name used in API URLs and watcher keys.
-    pub fn api_plural(&self) -> &str {
-        &self.plural
+    /// Build the capability manifest for this resource type. The TUI uses
+    /// this to gate keys and render action menus. CRDs fall back to the
+    /// always-on trio: Describe, YAML, Delete.
+    ///
+    /// Operations still branch on the variant (not derived from `IdentityData`)
+    /// because the computation is fundamentally different per source:
+    /// built-ins read flags from the registry's `ResourceDef`, locals call
+    /// `LocalResourceKind::operations()`, CRDs get the static trio.
+    pub fn capabilities(&self) -> ResourceCapabilities {
+        let ops: Vec<OperationKind> = match self {
+            ResourceId::BuiltIn(k) => {
+                crate::kube::resource_defs::REGISTRY.by_kind(*k).operations()
+            }
+            ResourceId::Local(k) => k.operations(),
+            ResourceId::Crd(_) => {
+                vec![OperationKind::Describe, OperationKind::Yaml, OperationKind::Delete]
+            }
+        };
+        ResourceCapabilities { operations: ops }
     }
 }
 
 impl std::fmt::Display for ResourceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.group.is_empty() {
-            write!(f, "{}", self.plural)
+        let group = self.group();
+        let plural = self.plural();
+        if group.is_empty() {
+            write!(f, "{}", plural)
         } else {
-            write!(f, "{}.{}", self.plural, self.group)
+            write!(f, "{}.{}", plural, group)
         }
     }
 }
@@ -164,10 +372,25 @@ pub enum ResourceScope {
 }
 
 impl ResourceScope {
-    pub fn from_scope_str(s: &str) -> Self {
-        match s {
+    /// Parse the K8s API spec.scope string ("Cluster" / "Namespaced") into
+    /// the typed enum. Anything other than "Cluster" defaults to
+    /// `Namespaced` because that's the K8s default for CRDs that don't
+    /// explicitly set a scope. Centralized so the boundary parse lives in
+    /// one place — duplicating the match arms across crds.rs and
+    /// streaming.rs let one drift away from the other.
+    pub fn from_k8s_spec(scope: &str) -> Self {
+        match scope {
             "Cluster" => ResourceScope::Cluster,
             _ => ResourceScope::Namespaced,
+        }
+    }
+
+    /// The canonical K8s spec.scope label for this variant. Used when
+    /// rendering the CRD table column.
+    pub fn k8s_label(self) -> &'static str {
+        match self {
+            ResourceScope::Cluster => "Cluster",
+            ResourceScope::Namespaced => "Namespaced",
         }
     }
 }
@@ -203,27 +426,34 @@ impl Namespace {
     pub fn is_all(&self) -> bool {
         matches!(self, Namespace::All)
     }
-}
 
-impl From<&str> for Namespace {
-    fn from(s: &str) -> Self {
+    /// Construct from a user command-mode input string. The TUI accepts
+    /// `:ns all` and `:ns ""` as "all namespaces"; any other value is a
+    /// specific namespace name. This constructor is the single source of
+    /// truth for user-input → typed conversion — the previous
+    /// `From<&str>` impl baked the same semantic but its name didn't
+    /// document the user-input context, leading callsites that handle
+    /// row data to reach for it and silently coerce empty strings to
+    /// `All` (the audit's "footgun" finding).
+    pub fn from_user_command(s: &str) -> Self {
         match s {
-            "all" => Namespace::All,
-            // Empty string is ambiguous in K8s — treat as "all" for TUI purposes
-            // (the TUI's default view is all-namespaces). Callers that mean
-            // "use context default" should resolve that before constructing Namespace.
-            "" => Namespace::All,
-            _ => Namespace::Named(s.to_string()),
+            "all" | "" => Namespace::All,
+            other => Namespace::Named(other.to_string()),
         }
     }
-}
 
-impl From<String> for Namespace {
-    fn from(s: String) -> Self {
-        if s == "all" || s.is_empty() {
+    /// Construct from a row's namespace field. K8s reports the empty
+    /// string for cluster-scoped resources; for namespaced resources it's
+    /// always populated. Empty maps to `All` here (so `as_option()` will
+    /// return `None` and the kubectl call omits `-n`), but mutating
+    /// handlers like force-kill explicitly refuse `Namespace::All` to
+    /// guard against data-corruption cases where a namespaced row
+    /// somehow lost its namespace string.
+    pub fn from_row(s: &str) -> Self {
+        if s.is_empty() {
             Namespace::All
         } else {
-            Namespace::Named(s)
+            Namespace::Named(s.to_string())
         }
     }
 }
@@ -245,12 +475,34 @@ impl std::fmt::Display for Namespace {
 /// Two sessions with different credentials on the same cluster MUST NOT
 /// share watchers (different RBAC = different visible resources).
 ///
+/// Kubeconfig `(cluster, user)` pair — the two labels the TUI displays
+/// alongside the context name in its header / overview, and the server
+/// echoes back in [`SessionEvent::Ready`] after the handshake.
+///
+/// Distinct from [`ContextId`]: this carries the human-readable labels
+/// (kubeconfig `clusters:` entry name + `users:` entry name), while
+/// [`ContextId`] carries the canonical `(server_url, user)` identity used
+/// for cache sharing. Bundling the pair here DRYs up ~8 structs that used
+/// to carry `cluster: String, user: String` as adjacent fields — and
+/// prevents accidental positional swaps when they ride together.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterIdentity {
+    pub cluster: String,
+    pub user: String,
+}
+
+impl ClusterIdentity {
+    pub fn new(cluster: String, user: String) -> Self {
+        Self { cluster, user }
+    }
+}
+
 /// Identity (Hash/Eq) is `(server_url, user)` — the context name is
 /// display-only and does NOT affect cache sharing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextId {
     /// The kubeconfig context name (for display only, NOT part of identity).
-    pub name: String,
+    pub name: ContextName,
     /// The API server URL (cluster identity).
     pub server_url: String,
     /// The kubeconfig user name (user identity for cache sharing).
@@ -273,14 +525,14 @@ impl std::hash::Hash for ContextId {
 }
 
 impl ContextId {
-    pub fn new(name: String, server_url: String, user: String) -> Self {
+    pub fn new(name: ContextName, server_url: String, user: String) -> Self {
         Self { name, server_url, user }
     }
 }
 
 impl std::fmt::Display for ContextId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.name)
+        f.write_str(self.name.as_str())
     }
 }
 
@@ -301,10 +553,25 @@ impl ObjectRef {
             namespace,
         }
     }
+
+    /// Render this object as the positional argument `kubectl` expects for
+    /// subcommands like `port-forward` — `"pods/foo"`, `"services/bar"`, etc.
+    /// Uses the plural from the unified `identity()` view so there's no
+    /// tripartite match — one lookup, same plural `&'static str` for
+    /// built-ins/locals, borrow for CRDs.
+    pub fn kubectl_target(&self) -> String {
+        format!("{}/{}", self.resource.plural(), self.name)
+    }
 }
 
-/// Key identifying a Kubernetes object by namespace + name.
+/// Key identifying a Kubernetes object by its namespace + name.
 /// Used as a map key for metrics, delta tracking, etc.
+///
+/// The `namespace` field is a `String` rather than [`Namespace`] because
+/// this is a *location* — "which namespace does this object actually live
+/// in" — not a *selection* (the all-vs-named distinction [`Namespace`]
+/// encodes). Cluster-scoped objects use `""`; namespaced objects use
+/// their actual namespace name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ObjectKey {
     pub namespace: String,
@@ -314,6 +581,40 @@ pub struct ObjectKey {
 impl ObjectKey {
     pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Self {
         Self { namespace: namespace.into(), name: name.into() }
+    }
+}
+
+/// Typed key for node-name-keyed maps (e.g. node metrics). Prevents
+/// accidentally looking up a pod name, resource plural, or any other
+/// string where a node name is expected — `NodeMetrics` is declared
+/// as `HashMap<NodeName, MetricsUsage>` and nothing but a `NodeName`
+/// (or a `&str` via the `Borrow<str>` impl for lookup) can index in.
+///
+/// `#[serde(transparent)]` keeps the wire encoding byte-identical to
+/// the pre-newtype `HashMap<String, MetricsUsage>` shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeName(String);
+
+impl NodeName {
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+impl From<String> for NodeName {
+    fn from(s: String) -> Self { Self(s) }
+}
+
+impl From<&str> for NodeName {
+    fn from(s: &str) -> Self { Self(s.to_owned()) }
+}
+
+impl std::borrow::Borrow<str> for NodeName {
+    fn borrow(&self) -> &str { &self.0 }
+}
+
+impl std::fmt::Display for NodeName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -367,87 +668,44 @@ pub enum OperationKind {
     ToggleSuspendCronJob,
 }
 
-/// A field in an `InputSchema::Form`. Names are stable identifiers the
-/// dialog widget keys its values map by; labels are user-facing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FormField {
-    pub name: String,
-    pub label: String,
-    pub kind: FieldKind,
-}
-
-/// Type-narrowing for a single form field. The dialog widget renders the
-/// appropriate input control based on this discriminator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FieldKind {
-    /// Free-form text. `max_len` is advisory; the widget may enforce it.
-    Text { max_len: Option<usize> },
-    /// Integer with explicit bounds.
-    Number { min: i64, max: i64 },
-    /// Network port (1..=65535) — convenience for the common case.
-    Port,
-    /// One of a fixed set of choices. Each entry is `(value, display_label)`.
-    Select { options: Vec<(String, String)> },
-}
-
-/// A value submitted for a `FormField`. The dialog widget produces these
-/// when the user submits; the per-`OperationKind` mapper converts them into
-/// the typed `SessionCommand` payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FieldValue {
-    Text(String),
-    Number(i64),
-    Selection(String),
-}
-
-/// What input the operation needs from the user before it can be dispatched.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum InputSchema {
-    /// No input — the action runs immediately (modulo `requires_confirm`).
-    None,
-    /// Render a form with these fields and collect a value for each.
-    Form(Vec<FormField>),
-}
-
-/// One operation declared on a resource type. The triple `(kind, input,
-/// requires_confirm)` is enough for the TUI to gate keys, render any input
-/// dialog, and emit the typed wire command on submit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OperationDescriptor {
-    pub kind: OperationKind,
-    /// Short user-facing label. The TUI may show it in help text or hint
-    /// bars; never used to dispatch.
-    pub label: String,
-    /// What input the operation needs (None for one-shot actions).
-    pub input: InputSchema,
-    /// If true, the TUI shows a confirm dialog before dispatching. The
-    /// confirm message is built client-side from the kind + row context.
-    pub requires_confirm: bool,
+/// Single source of truth for client-side form-field name strings.
+/// Form construction (`session_handlers::build_*_form`) and submit
+/// dispatch (`session_commands::handle_form_submit`) both reach for these
+/// — drift becomes a compile error rather than a silent "field not found"
+/// lookup miss at submit time. Not part of the wire protocol; the daemon
+/// never sees field names.
+pub mod form_field_name {
+    pub const REPLICAS: &str = "replicas";
+    pub const CONTAINER_PORT: &str = "container_port";
+    pub const LOCAL_PORT: &str = "local_port";
 }
 
 /// The full set of operations a resource type supports. Sent from the server
 /// to the TUI after a successful subscription. Empty `operations` means the
 /// resource is read-only.
+///
+/// We send the bare list of [`OperationKind`] discriminants over the wire —
+/// labels, input schemas, and confirm-gates are all derived client-side
+/// from the discriminant (the TUI knows what "Scale" means; the daemon
+/// doesn't need to spell it out).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResourceCapabilities {
-    pub operations: Vec<OperationDescriptor>,
+    pub operations: Vec<OperationKind>,
 }
 
 impl ResourceCapabilities {
-    /// True if any declared operation has the given kind.
+    /// True if the given operation is declared.
     pub fn supports(&self, kind: OperationKind) -> bool {
-        self.operations.iter().any(|op| op.kind == kind)
-    }
-
-    /// Look up the descriptor for an operation, if declared. Use this when
-    /// you need the input schema or the label, not just a boolean.
-    pub fn get(&self, kind: OperationKind) -> Option<&OperationDescriptor> {
-        self.operations.iter().find(|op| op.kind == kind)
+        self.operations.contains(&kind)
     }
 }
 
-/// Maximum bincode message size: 64 MiB. Protects against corrupted frames.
-const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
+/// Maximum bincode message size on the daemon socket. The largest
+/// legitimate message is a `ResourceUpdate::Rows` snapshot for a busy
+/// cluster — even 5000 pods × 10 containers each lands well under 8 MiB.
+/// The cap is set to 16 MiB to give comfortable headroom while still
+/// rejecting outrageous allocations from a corrupted frame.
+const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Buffer capacity for BufReader/BufWriter on session connections.
 pub const IO_BUFFER_SIZE: usize = 256 * 1024;
@@ -568,12 +826,23 @@ pub struct SubscriptionInit {
     pub resource: ResourceId,
     pub namespace: Namespace,
     pub filter: Option<SubscriptionFilter>,
+    /// If true, invalidate any cached watcher and start a fresh LIST.
+    /// Used by Ctrl-R refresh to guarantee fresh data from the API server.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Events streamed by the daemon on a **subscription substream**. The
 /// substream carries only events for the subscription that opened it; no
 /// routing tag is needed because the transport layer (yamux) already
 /// isolates the bytes.
+///
+/// Capabilities used to be sent as a dedicated `Capabilities(ResourceCapabilities)`
+/// variant right after the initial snapshot. They're gone now —
+/// `ResourceId::capabilities()` computes the same manifest on both sides
+/// from the typed kind, and the wire round-trip + client-side cache was
+/// pure duplication that introduced a three-map rekey bug every time a
+/// CRD resolved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamEvent {
     /// Fresh rows for the subscribed resource.
@@ -581,15 +850,25 @@ pub enum StreamEvent {
     /// The subscription failed — no further events will arrive on this
     /// substream. The daemon closes the stream after sending this.
     Error(String),
-    /// Server-declared capabilities for the subscribed resource type.
-    /// Sent once, right after the initial snapshot.
-    Capabilities(ResourceCapabilities),
     /// The server resolved an unknown resource (empty group/version) to
     /// its real identity. The TUI should update its nav/table keys.
     Resolved {
         original: ResourceId,
         resolved: ResourceId,
     },
+}
+
+/// Which container(s) a log stream subscribes to. Replaces the previous
+/// magic-string `"all"` sentinel — the closed enum makes the daemon's
+/// kubectl-arg construction exhaustive and protects against typos.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogContainer {
+    /// Stream every container in the pod (`kubectl logs --all-containers`).
+    All,
+    /// Stream a specific container (`kubectl logs -c <name>`).
+    Named(String),
+    /// Let kubectl pick the default container (omit `-c`).
+    Default,
 }
 
 /// First (and only) message the TUI writes to a **log substream**. Each
@@ -599,7 +878,7 @@ pub enum StreamEvent {
 pub struct LogInit {
     pub pod: String,
     pub namespace: Namespace,
-    pub container: String,
+    pub container: LogContainer,
     pub follow: bool,
     pub tail: Option<u64>,
     pub since: Option<String>,
@@ -621,24 +900,33 @@ pub enum SessionCommand {
 
     /// Start a TUI session with raw kubeconfig + environment variables.
     Init {
-        context: Option<String>,
+        context: Option<ContextName>,
         namespace: Namespace,
         readonly: bool,
         kubeconfig_yaml: String,
         env_vars: HashMap<String, String>,
-        cluster_name: String,
-        user_name: String,
+        /// Cluster + user labels as resolved from the kubeconfig by the
+        /// client. Sent across so the server can round-trip them back in
+        /// `Ready` without re-parsing the kubeconfig.
+        identity: ClusterIdentity,
     },
 
-    // --- Session-level commands ---
-
-    SwitchNamespace { namespace: Namespace },
-
     // --- Resource operations (target identified by ObjectRef) ---
+    //
+    // (There used to be a `SwitchNamespace` session-level command here;
+    // it was deleted because every subscription carries its own namespace
+    // in `SubscriptionInit`, so the server never needed session-level
+    // namespace state.)
 
     Describe(ObjectRef),
     Yaml(ObjectRef),
     Delete(ObjectRef),
+    /// Force-delete a pod immediately (`grace_period_seconds: 0`,
+    /// background propagation). Pod-only — the daemon refuses anything
+    /// else. Replaces the old client-side `kubectl delete --force`
+    /// shell-out so the daemon can enforce RBAC, run without a `kubectl`
+    /// binary on the client host, and surface structured errors.
+    ForceKill(ObjectRef),
     Scale { target: ObjectRef, replicas: u32 },
     Restart(ObjectRef),
     // StreamLogs and StopLogs are gone — logs now flow on yamux substreams.
@@ -674,7 +962,47 @@ pub enum SessionCommand {
     Ping,
     Status,
     Shutdown,
-    Clear { context: Option<String> },
+    Clear { context: Option<ContextName> },
+}
+
+impl SessionCommand {
+    /// True if this command mutates cluster or daemon state and must be
+    /// refused when the session is read-only. Exhaustive match so that
+    /// adding a new command variant is a compile error in this method —
+    /// the classification can't drift from the wire type, and no handler
+    /// has to remember to call a readonly gate.
+    ///
+    /// `DecodeSecret` is NOT classified as mutating: it reads an existing
+    /// Secret (same auth as a regular `Describe`) and renders the decoded
+    /// values. Feel free to treat it as sensitive at the UI layer, but the
+    /// server-side readonly gate protects against *writes*, and decoding
+    /// is a read.
+    pub fn is_mutating(&self) -> bool {
+        match self {
+            // Lifecycle / reads
+            SessionCommand::Init { .. }
+            | SessionCommand::Describe(_)
+            | SessionCommand::Yaml(_)
+            | SessionCommand::DecodeSecret(_)
+            | SessionCommand::GetDiscovery
+            | SessionCommand::Ping
+            | SessionCommand::Status => false,
+
+            // Cluster/daemon mutations
+            SessionCommand::Delete(_)
+            | SessionCommand::ForceKill(_)
+            | SessionCommand::Apply { .. }
+            | SessionCommand::Scale { .. }
+            | SessionCommand::Restart(_)
+            | SessionCommand::TriggerCronJob(_)
+            | SessionCommand::ToggleSuspendCronJob(_)
+            | SessionCommand::PortForward { .. } => true,
+
+            // Management (one-shot, don't arrive on session connections —
+            // dispatched by the daemon's accept loop, not `handle_command`).
+            SessionCommand::Shutdown | SessionCommand::Clear { .. } => true,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -691,28 +1019,38 @@ pub enum SessionEvent {
     // --- Session lifecycle ---
 
     Ready {
-        context: String,
-        cluster: String,
-        user: String,
+        context: ContextName,
+        identity: ClusterIdentity,
         namespaces: Vec<String>,
     },
     SessionError(String),
 
     // --- One-shot command responses ---
+    //
+    // Each response carries the originating `ObjectRef` so the TUI can
+    // gate apply on a target match. Rapid navigation (A→B) used to let
+    // A's slower fetch arrive while the route was already B, writing A's
+    // YAML to B's temp file in the edit flow. Same shape as the LogLine
+    // generation fix but uses the typed target for correlation.
 
-    DescribeResult(String),
-    YamlResult(String),
-    CommandResult { ok: bool, message: String },
+    DescribeResult { target: ObjectRef, content: String },
+    YamlResult { target: ObjectRef, content: String },
+    /// Result of a mutating operation. The message is carried in the Ok/Err
+    /// variant directly so the receiver can't access the message without
+    /// branching on success/failure — the old `{ ok: bool, message: String }`
+    /// shape let callers read the message with unchecked ok, trusting
+    /// convention instead of types.
+    CommandResult(Result<String, String>),
 
     // --- Global events ---
 
     Discovery {
-        context: String,
+        context: ContextName,
         namespaces: Vec<String>,
         crds: Vec<CachedCrd>,
     },
     PodMetrics(HashMap<ObjectKey, MetricsUsage>),
-    NodeMetrics(HashMap<String, MetricsUsage>),
+    NodeMetrics(HashMap<NodeName, MetricsUsage>),
 
     // --- Management responses ---
 
@@ -723,7 +1061,7 @@ pub enum SessionEvent {
 mod tests {
     use super::*;
     use crate::event::ResourceUpdate;
-    use crate::kube::resources::row::ResourceRow;
+    use crate::kube::resources::row::{ResourceRow, RowHealth};
 
     #[test]
     fn test_resource_row_bincode_roundtrip() {
@@ -735,6 +1073,7 @@ mod tests {
             owner_refs: Vec::new(),
             pf_ports: Vec::new(),
             node: None,
+            health: RowHealth::Normal,
             crd_info: None,
             drill_target: None,
         };
@@ -746,7 +1085,7 @@ mod tests {
 
     #[test]
     fn test_resource_update_rows_bincode_roundtrip() {
-        let rid = ResourceId::new("", "v1", "Pod", "pods", ResourceScope::Namespaced);
+        let rid = ResourceId::BuiltIn(BuiltInKind::Pod);
         let row = ResourceRow {
             cells: vec!["default".into(), "test".into()],
             name: "test".into(),
@@ -755,6 +1094,7 @@ mod tests {
             owner_refs: Vec::new(),
             pf_ports: Vec::new(),
             node: None,
+            health: RowHealth::Normal,
             crd_info: None,
             drill_target: None,
         };
@@ -767,7 +1107,8 @@ mod tests {
         let decoded: ResourceUpdate = bincode::deserialize(&bytes).unwrap();
         match decoded {
             ResourceUpdate::Rows { resource, headers, rows } => {
-                assert_eq!(resource.plural, "pods");
+                assert_eq!(resource, ResourceId::BuiltIn(BuiltInKind::Pod));
+                assert_eq!(resource.plural(), "pods");
                 assert_eq!(headers.len(), 2);
                 assert_eq!(rows.len(), 1);
             }
@@ -777,7 +1118,7 @@ mod tests {
 
     #[test]
     fn test_session_event_snapshot_bincode_roundtrip() {
-        let rid = ResourceId::new("apps", "v1", "Deployment", "deployments", ResourceScope::Namespaced);
+        let rid = ResourceId::BuiltIn(BuiltInKind::Deployment);
         let update = ResourceUpdate::Rows {
             resource: rid,
             headers: vec!["NAMESPACE".into(), "NAME".into(), "READY".into()],
@@ -789,6 +1130,7 @@ mod tests {
                 owner_refs: Vec::new(),
                 pf_ports: Vec::new(),
                 node: None,
+                health: RowHealth::Normal,
                 crd_info: None,
                 drill_target: None,
             }],
@@ -807,10 +1149,43 @@ mod tests {
 
     #[test]
     fn test_subscription_init_bincode_roundtrip() {
-        let rid = ResourceId::new("", "v1", "Pod", "pods", ResourceScope::Namespaced);
-        let init = SubscriptionInit { resource: rid, namespace: Namespace::Named("default".into()), filter: None };
+        let rid = ResourceId::BuiltIn(BuiltInKind::Pod);
+        let init = SubscriptionInit { resource: rid, namespace: Namespace::Named("default".into()), filter: None, force: false };
         let bytes = bincode::serialize(&init).unwrap();
         let decoded: SubscriptionInit = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(decoded.resource.plural, "pods");
+        assert_eq!(decoded.resource, ResourceId::BuiltIn(BuiltInKind::Pod));
+        assert_eq!(decoded.resource.plural(), "pods");
+    }
+
+    #[test]
+    fn test_resource_id_crd_roundtrip() {
+        let rid = ResourceId::crd(
+            "clickhouse.altinity.com", "v1", "ClickHouseInstallation",
+            "clickhouseinstallations", ResourceScope::Namespaced,
+        );
+        let bytes = bincode::serialize(&rid).unwrap();
+        let decoded: ResourceId = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, rid);
+        assert_eq!(decoded.plural(), "clickhouseinstallations");
+        assert!(decoded.is_crd());
+    }
+
+    #[test]
+    fn test_resource_id_local_roundtrip() {
+        let rid = ResourceId::Local(LocalResourceKind::PortForward);
+        let bytes = bincode::serialize(&rid).unwrap();
+        let decoded: ResourceId = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, rid);
+        assert!(decoded.is_local());
+        assert_eq!(decoded.plural(), "portforwards");
+    }
+
+    #[test]
+    fn test_resource_id_distinct_variants_never_equal() {
+        let built_in = ResourceId::BuiltIn(BuiltInKind::Pod);
+        let crd = ResourceId::crd("", "v1", "Pod", "pods", ResourceScope::Namespaced);
+        // Even though the CRD's strings happen to match Pod's GVR, the
+        // tagged variants are distinct types — they must never compare equal.
+        assert_ne!(built_in, crd);
     }
 }

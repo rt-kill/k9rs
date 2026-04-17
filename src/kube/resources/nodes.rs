@@ -1,22 +1,18 @@
 use k8s_openapi::api::core::v1::Node;
 
-use crate::kube::resources::row::{DrillTarget, ResourceRow};
+use crate::kube::resources::CommonMeta;
+use crate::kube::resources::row::{DrillTarget, ResourceRow, RowHealth};
 
 /// Convert a k8s Node into a generic ResourceRow.
 /// CPU and MEM cells are initially "n/a" and mutated in-place by `apply_node_metrics`.
 pub(crate) fn node_to_row(node: Node) -> ResourceRow {
-    let metadata = node.metadata;
-    let name = metadata.name.unwrap_or_default();
-    let labels = metadata.labels.clone().unwrap_or_default();
-    let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
-    let age = metadata.creation_timestamp.map(|t| t.0);
+    let meta = CommonMeta::from_k8s(node.metadata);
 
-    // Determine roles from labels.
-    // Checks both `node-role.kubernetes.io/<role>` (standard) and
-    // `kubernetes.io/role` (legacy) label conventions.
+    // Determine roles from labels. Checks both `node-role.kubernetes.io/<role>`
+    // (standard) and `kubernetes.io/role` (legacy) label conventions.
     let roles = {
         let mut role_list: Vec<String> = Vec::new();
-        for (key, value) in &labels {
+        for (key, value) in &meta.labels {
             if let Some(role) = key.strip_prefix("node-role.kubernetes.io/") {
                 if role.is_empty() {
                     if !value.is_empty() {
@@ -47,19 +43,30 @@ pub(crate) fn node_to_row(node: Node) -> ResourceRow {
         .unwrap_or(0);
 
     let status_val = node.status.unwrap_or_default();
-    let status = {
-        let conditions = status_val.conditions.unwrap_or_default();
-        let mut node_status = "NotReady".to_string();
-        for cond in &conditions {
-            if cond.type_ == "Ready" && cond.status == "True" {
-                node_status = "Ready".to_string();
-                break;
-            }
-        }
-        if spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false) {
-            node_status = format!("{},SchedulingDisabled", node_status);
-        }
-        node_status
+    // Classify node state + schedulability as typed booleans, then derive
+    // both the display string AND the RowHealth from them. The older code
+    // built `format!("{},SchedulingDisabled", ...)` and then ran
+    // `status.contains("NotReady")` / `.contains("SchedulingDisabled")` —
+    // synthesizing a string and re-parsing its own output.
+    let is_ready = status_val.conditions.as_deref().unwrap_or(&[])
+        .iter()
+        .any(|cond| cond.type_ == "Ready" && cond.status == "True");
+    let is_scheduling_disabled = spec.as_ref()
+        .and_then(|s| s.unschedulable)
+        .unwrap_or(false);
+
+    let status = match (is_ready, is_scheduling_disabled) {
+        (true, true) => "Ready,SchedulingDisabled".to_string(),
+        (true, false) => "Ready".to_string(),
+        (false, true) => "NotReady,SchedulingDisabled".to_string(),
+        (false, false) => "NotReady".to_string(),
+    };
+    let health = if !is_ready {
+        RowHealth::Failed
+    } else if is_scheduling_disabled {
+        RowHealth::Pending
+    } else {
+        RowHealth::Normal
     };
 
     let node_info = status_val.node_info.as_ref();
@@ -97,14 +104,13 @@ pub(crate) fn node_to_row(node: Node) -> ResourceRow {
         .unwrap_or_default();
 
     // CPU (col 8) and MEMORY (col 9) are initially n/a — mutated by apply_node_metrics.
-    let drill_target = Some(DrillTarget::PodsByField {
-        field: "spec.nodeName".to_string(),
-        value: name.clone(),
-        breadcrumb: format!("node/{}", name),
-    });
+    let drill_target = Some(DrillTarget::PodsByField(
+        crate::app::nav::K8sFieldSelector::SpecNodeName(meta.name.clone()),
+    ));
+
     ResourceRow {
         cells: vec![
-            name.clone(),
+            meta.name.clone(),
             status,
             roles,
             taints.to_string(),
@@ -115,16 +121,13 @@ pub(crate) fn node_to_row(node: Node) -> ResourceRow {
             format!("n/a/{}", cpu_capacity),
             format!("n/a/{}", mem_capacity),
             arch,
-            labels_str,
-            crate::util::format_age(age),
+            meta.labels_str,
+            crate::util::format_age(meta.age),
         ],
-        name,
+        name: meta.name,
         namespace: None,
-        containers: Vec::new(),
-        owner_refs: Vec::new(),
-        pf_ports: Vec::new(),
-        node: None,
-        crd_info: None,
+        health,
         drill_target,
+        ..Default::default()
     }
 }

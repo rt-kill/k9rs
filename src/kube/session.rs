@@ -52,12 +52,26 @@ pub(crate) enum ActionResult {
     /// No special handling needed.
     None,
     /// Suspend the TUI and run `kubectl exec -it` into a pod shell.
-    Shell {
-        pod: String,
-        namespace: String,
-        container: String,
-        context: String,
-    },
+    /// Carries the typed [`ExecTarget`] — was four loose strings before.
+    Shell(ExecTarget),
+}
+
+/// Identifies a pod + container + cluster context for an interactive
+/// `kubectl exec`. Replaces `ActionResult::Shell { pod, namespace,
+/// container, context }` four-string tuple. Lives here next to
+/// `ActionResult` because that's the only producer/consumer.
+///
+/// `namespace` and `context` are locations passed verbatim to
+/// `kubectl -n …  --context …`, not selections — same distinction as
+/// [`crate::kube::protocol::ObjectKey`], so `String` is intentional.
+#[derive(Debug, Clone)]
+pub(crate) struct ExecTarget {
+    pub pod: String,
+    pub namespace: String,
+    /// Container to exec into. The TUI's container-select dialog produces
+    /// a real container name here; default-container exec isn't supported.
+    pub container: String,
+    pub context: crate::kube::protocol::ContextName,
 }
 
 /// Auto-subscriptions that the TUI opens once the daemon connection is ready.
@@ -68,12 +82,9 @@ pub(crate) enum ActionResult {
 /// Stored on App so they stay alive for the session's lifetime. Dropped on
 /// context switch (new session = new substreams).
 pub(crate) fn open_core_subscriptions(app: &mut App, data_source: &ClientSession) {
-    use crate::kube::protocol::ResourceId;
-
-    let core = ["namespaces", "nodes"];
-    for alias in &core {
-        if let Some(rid) = ResourceId::from_alias(alias) {
-            // Core resources are cluster-scoped — always All.
+    for def in crate::kube::resource_defs::REGISTRY.all() {
+        if def.is_core() {
+            let rid = def.resource_id();
             let stream = data_source.subscribe_stream(
                 rid,
                 crate::kube::protocol::Namespace::All,
@@ -89,8 +100,9 @@ fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: App
         event @ AppEvent::ConnectionEstablished { .. } => {
             // Apply the event first (populates context/cluster/user/namespaces).
             apply_event(app, event);
-            // Context switch complete — allow new switches.
-            app.context_switch_pending = false;
+            // Transition: InFlight → Stable. The new session is live; a
+            // subsequent `begin_context_switch` is now allowed.
+            app.context_switch.mark_stable();
             // Open core resource substreams now that the connection is ready.
             // The user lands on Overview (the default route) with only the
             // mandatory subscriptions (namespaces, nodes). They navigate to
@@ -98,6 +110,76 @@ fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: App
             open_core_subscriptions(app, data_source);
         }
         other => apply_event(app, other),
+    }
+}
+
+/// Capture a keystroke into the log filter input draft (`/`-prompt within
+/// the logs view). Returns `true` if the key was consumed. Mirrors the
+/// shape of `handle_command_key` / `handle_form_dialog_key` /
+/// `handle_filter_key` — each input modality has its own free function so
+/// the main loop just calls them in priority order.
+fn handle_log_filter_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    let crate::app::Route::Logs { ref mut state, .. } = app.route else {
+        return false;
+    };
+    if !state.is_filtering() {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => state.cancel_filter(),
+        KeyCode::Enter => state.commit_filter(),
+        KeyCode::Backspace => {
+            let mut text = state.draft_filter.clone().unwrap_or_default();
+            text.pop();
+            state.update_draft(text);
+        }
+        KeyCode::Char(c) => {
+            let mut text = state.draft_filter.clone().unwrap_or_default();
+            text.push(c);
+            state.update_draft(text);
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Capture a keystroke into the YAML / Describe / Aliases search input.
+/// Both content-view routes share the same `ContentViewState`, so the
+/// match arms diverge only on which route variant we're inside —
+/// extracted so the main loop doesn't carry the same 20 lines twice.
+fn handle_content_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    use crate::app::SearchInputResult;
+    let state = match app.route {
+        crate::app::Route::Yaml { ref mut state, .. } if state.search_input_active => state,
+        crate::app::Route::Describe { ref mut state, .. }
+        | crate::app::Route::Aliases { ref mut state, .. }
+            if state.search_input_active =>
+        {
+            state
+        }
+        _ => return false,
+    };
+    match crate::app::handle_search_key(&mut state.search_input, key.code) {
+        SearchInputResult::Cancelled => {
+            state.search_input_active = false;
+            state.clear_search();
+            true
+        }
+        SearchInputResult::Committed(term) => {
+            state.search_input_active = false;
+            if term.is_empty() {
+                state.clear_search();
+            } else {
+                state.search = Some(term);
+                state.update_search();
+                if let Some(&t) = state.search_matches.first() {
+                    state.current_match = 0;
+                    state.scroll = t.saturating_sub(SEARCH_SCROLL_CONTEXT);
+                }
+            }
+            true
+        }
+        SearchInputResult::Updated => true,
     }
 }
 
@@ -156,7 +238,13 @@ pub async fn session_main(
         // The new session's bridge tasks use the new `event_tx`, and only
         // those events reach our new `event_rx`. Cross-session data bleed
         // is structurally impossible.
-        if let Some(new_ctx) = app.pending_context_switch.take() {
+        //
+        // `take_requested()` atomically transitions the state from
+        // `Requested(name)` to `InFlight`, so a second `begin_context_switch`
+        // call fired between this line and `mark_stable()` (in
+        // `dispatch_app_event` on `ConnectionEstablished`) will be rejected
+        // by the `is_stable()` check.
+        if let Some(new_ctx) = app.context_switch.take_requested() {
             let no_daemon = data_source.is_no_daemon();
             // 1. Drop the old session — closes the socket, aborts bridge tasks.
             drop(data_source);
@@ -173,7 +261,7 @@ pub async fn session_main(
             // 5. Create a fresh session with the new channel.
             let new_params = crate::kube::client_session::ConnectionParams {
                 context: Some(new_ctx),
-                namespace: app.selected_ns.as_option().map(|s| s.to_string()),
+                namespace: app.selected_ns.clone(),
                 readonly: app.read_only,
                 no_daemon,
             };
@@ -200,12 +288,12 @@ pub async fn session_main(
             let route_has_text_input = match &app.route {
                 crate::app::Route::Yaml { ref state, .. } => state.search_input_active,
                 crate::app::Route::Describe { ref state, .. } | crate::app::Route::Aliases { ref state, .. } => state.search_input_active,
-                crate::app::Route::Logs { ref state, .. } | crate::app::Route::Shell { ref state, .. } => state.is_filtering(),
+                crate::app::Route::Logs { ref state, .. } => state.is_filtering(),
                 _ => false,
             };
             let in_input_mode = matches!(app.input_mode, InputMode::Command { .. })
-                || app.form_dialog.as_ref().map_or(false, |d| {
-                    d.fields.get(d.focused).map_or(false, |f| f.is_text_input())
+                || app.form_dialog.as_ref().is_some_and(|d| {
+                    d.fields.get(d.focused).is_some_and(|f| f.is_text_input())
                 })
                 || app.nav.filter_input().active
                 || route_has_text_input;
@@ -225,48 +313,51 @@ pub async fn session_main(
         // the result back, and send `Apply { target, yaml }`. The response
         // (a `CommandResult` flash) will pop the edit route. Failures
         // along the way pop the route immediately and flash the error.
-        if let crate::app::Route::EditingResource { ref target, ref state } = app.route {
-            if let crate::app::EditState::EditorReady { ref temp_path } = state {
-                let target = target.clone();
-                let temp_path = temp_path.clone();
-                // Mark the route as Applying *before* the suspend so any
-                // CommandResult that arrives during the editor session
-                // (which can't happen — the loop is parked — but for
-                // future-proofing) lands in the right state.
-                app.route = crate::app::Route::EditingResource {
-                    target: target.clone(),
-                    state: crate::app::EditState::Applying,
-                };
+        if let crate::app::Route::EditingResource {
+            ref target,
+            state: crate::app::EditState::EditorReady { ref temp_path },
+        } = app.route {
+            let target = target.clone();
+            let temp_path = temp_path.clone();
+            // Mark the route as Applying *before* the suspend so any
+            // CommandResult that arrives during the editor session
+            // (which can't happen — the loop is parked — but for
+            // future-proofing) lands in the right state.
+            app.route = crate::app::Route::EditingResource {
+                target: target.clone(),
+                state: crate::app::EditState::Applying,
+            };
 
-                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-                let path_arg = temp_path.to_string_lossy().to_string();
-                let args = vec![path_arg];
-                run_interactive_local(
-                    &mut terminal, &mut app, &editor, &args, &input_suspend, &mut input_suspend_ack,
-                ).await?;
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+            let path_arg = temp_path.to_string_lossy().to_string();
+            let args = vec![path_arg];
+            run_interactive_local(
+                &mut terminal, &mut app, &editor, &args,
+                crate::kube::session_commands::InteractiveKind::Editor,
+                &input_suspend, &mut input_suspend_ack,
+            ).await?;
 
-                // Read the edited file back, send Apply, then delete the temp.
-                let read_result = std::fs::read_to_string(&temp_path);
-                let _ = std::fs::remove_file(&temp_path);
-                match read_result {
-                    Ok(yaml) => {
-                        if let Err(e) = data_source.apply(&target, yaml) {
-                            app.flash = Some(crate::app::FlashMessage::error(
-                                format!("Apply failed: {}", e)
-                            ));
-                            app.pop_route();
-                        }
-                    }
-                    Err(e) => {
+            // Read the edited file back, send Apply, then delete the temp.
+            let read_result = std::fs::read_to_string(&temp_path);
+            let _ = std::fs::remove_file(&temp_path);
+            match read_result {
+                Ok(yaml) => {
+                    if let Err(e) = data_source.apply(&target, yaml) {
                         app.flash = Some(crate::app::FlashMessage::error(
-                            format!("Failed to read edited file: {}", e)
+                            format!("Apply failed: {}", e)
                         ));
                         app.pop_route();
                     }
                 }
-                needs_redraw = true;
-                continue;
+                Err(e) => {
+                    app.flash = Some(crate::app::FlashMessage::error(
+                        format!("Failed to read edited file: {}", e)
+                    ));
+                    app.pop_route();
+                }
             }
+            needs_redraw = true;
+            continue;
         }
 
         tokio::select! {
@@ -297,80 +388,27 @@ pub async fn session_main(
                         // Log filter input capture — must come before the
                         // yaml/describe search handler so it intercepts keys
                         // while the user is typing a filter pattern.
-                        if let crate::app::Route::Logs { ref mut state, .. } = app.route {
-                            if state.is_filtering() {
-                                match key.code {
-                                    KeyCode::Esc => { state.cancel_filter(); }
-                                    KeyCode::Enter => { state.commit_filter(); }
-                                    KeyCode::Backspace => {
-                                        let mut text = state.draft_filter.clone().unwrap_or_default();
-                                        text.pop();
-                                        state.update_draft(text);
-                                    }
-                                    KeyCode::Char(c) => {
-                                        let mut text = state.draft_filter.clone().unwrap_or_default();
-                                        text.push(c);
-                                        state.update_draft(text);
-                                    }
-                                    _ => {}
-                                }
-                                needs_redraw = true;
-                                continue;
-                            }
+                        if handle_log_filter_key(&mut app, key) {
+                            needs_redraw = true;
+                            continue;
                         }
 
                         // Search input capture for yaml and describe views.
-                        use crate::app::SearchInputResult;
-                        let search_handled = match app.route {
-                            crate::app::Route::Yaml { ref mut state, .. } if state.search_input_active => {
-                                match crate::app::handle_search_key(true, &mut state.search_input, key.code) {
-                                    SearchInputResult::Cancelled => { state.search_input_active = false; state.clear_search(); true }
-                                    SearchInputResult::Committed(term) => {
-                                        state.search_input_active = false;
-                                        if term.is_empty() { state.clear_search(); }
-                                        else {
-                                            state.search = Some(term);
-                                            state.update_search();
-                                            if let Some(&t) = state.search_matches.first() {
-                                                state.current_match = 0;
-                                                state.scroll = t.saturating_sub(SEARCH_SCROLL_CONTEXT);
-                                            }
-                                        }
-                                        true
-                                    }
-                                    SearchInputResult::Updated => true,
-                                    SearchInputResult::Ignored => false,
-                                }
-                            }
-                            crate::app::Route::Describe { ref mut state, .. } | crate::app::Route::Aliases { ref mut state, .. } if state.search_input_active => {
-                                match crate::app::handle_search_key(true, &mut state.search_input, key.code) {
-                                    SearchInputResult::Cancelled => { state.search_input_active = false; state.clear_search(); true }
-                                    SearchInputResult::Committed(term) => {
-                                        state.search_input_active = false;
-                                        if term.is_empty() { state.clear_search(); }
-                                        else {
-                                            state.search = Some(term);
-                                            state.update_search();
-                                            if let Some(&t) = state.search_matches.first() {
-                                                state.current_match = 0;
-                                                state.scroll = t.saturating_sub(SEARCH_SCROLL_CONTEXT);
-                                            }
-                                        }
-                                        true
-                                    }
-                                    SearchInputResult::Updated => true,
-                                    SearchInputResult::Ignored => false,
-                                }
-                            }
-                            _ => false,
-                        };
-                        if search_handled {
+                        if handle_content_search_key(&mut app, key) {
                             needs_redraw = true;
                             continue;
                         }
 
                         needs_redraw = true;
                         if let Some(action) = crate::event::handler::handle_key_event(&app, key) {
+                            // Client-side UX shortcut: flash "Read-only mode"
+                            // immediately without a wire round-trip. The server
+                            // is the real security boundary and rejects every
+                            // mutating command in readonly mode via its own
+                            // `reject_if_readonly` — if `is_mutating()` ever
+                            // drifts from the server's classification, the
+                            // server still refuses. This is polish, not a
+                            // second source of truth.
                             if app.read_only && action.is_mutating() {
                                 app.flash = Some(crate::app::FlashMessage::info("Read-only mode".to_string()));
                                 continue;
@@ -383,10 +421,15 @@ pub async fn session_main(
                                 &mut log_stream,
                             );
                             match result {
-                                ActionResult::Shell { pod, namespace, container, context } => {
-                                    let args = build_shell_args(&pod, &namespace, &container, &context);
+                                ActionResult::Shell(target) => {
+                                    let args = build_shell_args(&target.pod, &target.namespace, &target.container, &target.context);
+                                    let kind = crate::kube::session_commands::InteractiveKind::Shell {
+                                        pod: target.pod.clone(),
+                                        container: target.container.clone(),
+                                    };
                                     run_interactive_local(
-                                        &mut terminal, &mut app, "kubectl", &args, &input_suspend, &mut input_suspend_ack,
+                                        &mut terminal, &mut app, "kubectl", &args, kind,
+                                        &input_suspend, &mut input_suspend_ack,
                                     ).await?;
                                 }
                                 ActionResult::None => {}

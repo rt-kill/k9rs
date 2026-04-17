@@ -22,9 +22,7 @@ use crate::kube::protocol::ResourceId;
 
 use super::SharedLocalSource;
 
-/// How long to keep a local source alive after the last subscriber drops.
-/// Matches the K8s watcher cache so the two systems behave consistently.
-const GRACE_PERIOD_SECS: u64 = 300;
+use crate::kube::GRACE_PERIOD_SECS;
 
 /// A subscription to a local resource source. Unlike the K8s
 /// `live_query::Subscription` which carries `Option<ResourceUpdate>` to
@@ -72,21 +70,28 @@ impl LocalSubscription {
 
 impl Drop for LocalSubscription {
     fn drop(&mut self) {
-        // Clone the keepalive `Arc` and hand it to a detached task that
-        // holds it for the grace period before releasing. If anything
-        // re-subscribes within the window, the registry's `Weak` upgrades
-        // to this same `Arc` and the source is reused. After the window,
-        // the last `Arc` drops → the source's background tasks die →
-        // the registry's `Weak` becomes dead and is recycled on next get.
-        let arc = self._keepalive.clone();
-        // Best-effort spawn — if the runtime is shutting down, the Arc
-        // simply drops here and the source dies immediately, which is the
-        // right thing on shutdown.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(GRACE_PERIOD_SECS)).await;
-                drop(arc);
-            });
+        // Coalesce: only the first drop in a run wins the `try_begin_grace`
+        // CAS and spawns the grace task. Subsequent drops see the slot
+        // occupied and just drop their Arc immediately. Without this,
+        // rapid context-switch churn used to stack one detached 5-minute
+        // task per drop, each holding `Arc<dyn LocalResourceSource>`.
+        if !self._keepalive.try_begin_grace() {
+            return;
         }
+        // Best-effort spawn — if the runtime is shutting down, reset the
+        // grace slot and let the Arc drop here; the source dies immediately,
+        // which is the right thing on shutdown.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self._keepalive.end_grace();
+            return;
+        };
+        let arc = self._keepalive.clone();
+        handle.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(GRACE_PERIOD_SECS)).await;
+            // Reset the grace slot BEFORE dropping the Arc so a future
+            // subscribe-then-drop cycle can spawn a fresh grace task.
+            arc.end_grace();
+            drop(arc);
+        });
     }
 }

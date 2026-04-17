@@ -1,13 +1,11 @@
 use k8s_openapi::api::core::v1::Endpoints;
 
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::CommonMeta;
+use crate::kube::resources::row::{ResourceRow};
 
 /// Convert a k8s Endpoints into a generic ResourceRow.
 pub(crate) fn endpoints_to_row(ep: Endpoints) -> ResourceRow {
-    let metadata = ep.metadata;
-    let ns = metadata.namespace.unwrap_or_default();
-    let name = metadata.name.unwrap_or_default();
-    let age = metadata.creation_timestamp.map(|t| t.0);
+    let meta = CommonMeta::from_k8s(ep.metadata);
     let endpoints = ep.subsets.unwrap_or_default().iter()
         .flat_map(|subset| {
             let addresses = subset.addresses.as_deref().unwrap_or_default();
@@ -25,14 +23,12 @@ pub(crate) fn endpoints_to_row(ep: Endpoints) -> ResourceRow {
         .join(",");
     let endpoints = if endpoints.is_empty() { "<none>".to_string() } else { endpoints };
     ResourceRow {
-        cells: vec![ns.clone(), name.clone(), endpoints, crate::util::format_age(age)],
-        name,
-        namespace: Some(ns),
-        containers: Vec::new(),
-        owner_refs: Vec::new(),
-        pf_ports: Vec::new(),
-        node: None,
-        crd_info: None,
-        drill_target: None,
+        cells: vec![
+            meta.namespace.clone(), meta.name.clone(),
+            endpoints, crate::util::format_age(meta.age),
+        ],
+        name: meta.name,
+        namespace: Some(meta.namespace),
+        ..Default::default()
     }
 }

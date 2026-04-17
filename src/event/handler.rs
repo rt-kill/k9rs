@@ -25,10 +25,10 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     // -----------------------------------------------------------------------
     // Detail views and log view override `/` to start search instead of filter.
     // -----------------------------------------------------------------------
-    if matches!(app.route, Route::Yaml { .. } | Route::Describe { .. } | Route::Aliases { .. } | Route::Logs { .. }) {
-        if key.code == KeyCode::Char('/') {
-            return Some(Action::SearchStart);
-        }
+    if matches!(app.route, Route::Yaml { .. } | Route::Describe { .. } | Route::Aliases { .. } | Route::Logs { .. })
+        && key.code == KeyCode::Char('/')
+    {
+        return Some(Action::SearchStart);
     }
 
     // -----------------------------------------------------------------------
@@ -48,7 +48,6 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
         Route::Logs { .. } => handle_log_view_keys(app, key),
         Route::Help => handle_help_view_keys(key),
         Route::Contexts => handle_contexts_view_keys(key),
-        Route::Shell { .. } => handle_log_view_keys(app, key),
         Route::ContainerSelect { .. } => handle_container_select_keys(key),
         Route::Aliases { .. } => handle_detail_view_keys(key),
         // Edit flow is modal — keys are blocked while we wait for the
@@ -74,7 +73,7 @@ fn handle_confirm_dialog(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Enter => {
             // Confirm or cancel based on which button is selected
-            if app.confirm_dialog.as_ref().map_or(false, |d| d.yes_selected) {
+            if app.confirm_dialog.as_ref().is_some_and(|d| d.yes_selected) {
                 Some(Action::Confirm)
             } else {
                 Some(Action::Cancel)
@@ -137,11 +136,6 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
     // Ctrl-Z: toggle fault filter.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
         return Some(Action::ToggleFaultFilter);
-    }
-
-    // Ctrl-L: toggle full-fetch mode.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
-        return Some(Action::ToggleFullFetch);
     }
 
     match key.code {
@@ -209,16 +203,8 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') => Some(Action::Yaml),
         KeyCode::Char('e') => Some(Action::Edit),
 
-        // Logs: available on pods and workload types. We consult both the
-        // server-provided capabilities AND the static resource_types table —
-        // capabilities arrive asynchronously, so checking only the manifest
-        // would make `l` fail in the brief window after subscribe but before
-        // the server's first ResourceCapabilities event lands.
         KeyCode::Char('l') => {
-            let can_log = app.current_capabilities().supports(OperationKind::StreamLogs)
-                || crate::kube::resource_types::find_by_plural(&app.nav.resource_id().plural)
-                    .map_or(false, |meta| meta.supports_logs);
-            if can_log {
+            if app.current_capabilities().supports(OperationKind::StreamLogs) {
                 Some(Action::Logs)
             } else {
                 Some(Action::FlashInfo("Logs not available for this resource type".to_string()))
@@ -297,14 +283,23 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // column 1 for namespaced resources.
         KeyCode::Char('N') => {
             let col = if app.current_tab_is_cluster_scoped() { 0 } else { 1 };
-            Some(Action::Sort(col))
+            Some(Action::Sort(crate::app::SortTarget::Column(col)))
         }
 
-        // Sort by AGE (last column — sentinel value usize::MAX).
-        KeyCode::Char('A') => Some(Action::Sort(usize::MAX)),
+        // Sort by AGE (last column — resolved at apply time).
+        KeyCode::Char('A') => Some(Action::Sort(crate::app::SortTarget::Last)),
 
-        // Sort by STATUS (column 3, meaningful for Pods).
-        KeyCode::Char('S') if app.current_capabilities().supports(OperationKind::Shell) => Some(Action::Sort(3)),
+        // Sort by STATUS — pod-only (column 3 of the Pod schema). Gated on
+        // the typed `BuiltInKind::Pod` discriminant rather than "supports
+        // Shell" — the latter happens to coincide today (Pod is the only
+        // Shellable built-in) but is fragile: if any future resource gained
+        // Shell support, this would silently sort the wrong column.
+        KeyCode::Char('S')
+            if app.nav.resource_id().built_in_kind()
+                == Some(crate::kube::resource_def::BuiltInKind::Pod) =>
+        {
+            Some(Action::Sort(crate::app::SortTarget::Column(3)))
+        }
 
         // Copy.
         KeyCode::Char('c') => Some(Action::Copy),
@@ -380,7 +375,7 @@ fn handle_log_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Esc: if filtering, cancel draft or pop filter; otherwise go back.
         KeyCode::Esc => {
             let has_log_filters = match &app.route {
-                Route::Logs { ref state, .. } | Route::Shell { ref state, .. } => {
+                Route::Logs { ref state, .. } => {
                     state.is_filtering() || !state.filters.is_empty()
                 }
                 _ => false,

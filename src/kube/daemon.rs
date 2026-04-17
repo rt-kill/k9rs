@@ -47,15 +47,47 @@ pub async fn run_daemon() -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // Socket startup is fundamentally TOCTOU-prone: bind() will fail if a
+    // file already exists at the path, but if we blindly remove + retry we
+    // open a window for a symlink attack on `/tmp/k9rs-<uid>.sock`. The
+    // safer dance:
+    //   1. Try bind. Success → done.
+    //   2. On EADDRINUSE, probe with a fresh connect. If the daemon is
+    //      live, refuse to start (don't trample its socket).
+    //   3. Otherwise the file is a stale leftover. Use `symlink_metadata`
+    //      to confirm it's an owned-by-us socket (not a regular file or a
+    //      symlink) before unlinking, then bind again.
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             if UnixStream::connect(&path).await.is_ok() {
                 anyhow::bail!("Daemon already running at {}", path.display());
             }
-            let _ = std::fs::remove_file(&path);
+            // Refuse to remove anything that isn't a Unix socket owned by
+            // the current uid. A regular file or symlink at this path is
+            // a planted attack and we should bail rather than unlink it.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                let md = std::fs::symlink_metadata(&path)?;
+                if !md.file_type().is_socket() {
+                    anyhow::bail!(
+                        "Refusing to remove {} — not a Unix socket (file type: {:?})",
+                        path.display(), md.file_type(),
+                    );
+                }
+                let our_uid = unsafe { libc::getuid() };
+                if md.uid() != our_uid {
+                    anyhow::bail!(
+                        "Refusing to remove {} — owned by uid {}, not us ({})",
+                        path.display(), md.uid(), our_uid,
+                    );
+                }
+            }
+            std::fs::remove_file(&path)?;
             UnixListener::bind(&path)?
         }
+        Err(e) => return Err(e.into()),
     };
     info!("k9rs cache daemon listening on {:?}", path);
 
@@ -73,18 +105,27 @@ pub async fn run_daemon() -> anyhow::Result<()> {
         session_shared: Arc::new(SessionSharedState::new()),
     });
 
+    // Track in-flight connection handlers so that on shutdown we can
+    // abort any that are still running rather than relying on process
+    // exit to reap them. `JoinSet` cleans up finished handles
+    // automatically when we await it.
+    let mut connections: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
     loop {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, _) = result?;
                 info!("New connection accepted");
                 let conn_state = state.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     if let Err(e) = handle_connection(stream, conn_state).await {
                         info!("Connection ended: {}", e);
                     }
                 });
             }
+            // Periodically drain finished handlers so the JoinSet doesn't
+            // grow with every accepted connection.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
             _ = sigterm.recv() => {
                 info!("Daemon received SIGTERM — shutting down");
                 break;
@@ -99,6 +140,13 @@ pub async fn run_daemon() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Abort any in-flight connections so we don't leak them across
+    // process exit. Handlers that are mid-write to a TUI session will
+    // see their substreams RST, which the TUI handles cleanly.
+    info!("Aborting {} in-flight connection(s)", connections.len());
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
 
     let _ = std::fs::remove_file(&path);
     info!("Daemon stopped");
@@ -172,10 +220,7 @@ async fn handle_management_command(
 
         // Management: one-shot commands
         SessionCommand::Ping => {
-            protocol::write_bincode(writer, &SessionEvent::CommandResult {
-                ok: true,
-                message: "pong".to_string(),
-            }).await?;
+            protocol::write_bincode(writer, &SessionEvent::CommandResult(Ok("pong".to_string()))).await?;
         }
 
         SessionCommand::Status => {
@@ -187,22 +232,28 @@ async fn handle_management_command(
         }
 
         SessionCommand::Shutdown => {
-            protocol::write_bincode(writer, &SessionEvent::CommandResult {
-                ok: true,
-                message: "shutting down".to_string(),
-            }).await?;
+            protocol::write_bincode(writer, &SessionEvent::CommandResult(Ok("shutting down".to_string()))).await?;
             state.shutdown.notify_one();
         }
 
         SessionCommand::Clear { context } => {
-            match &context {
-                Some(_) => { state.session_shared.discovery_cache.clear(); }
-                None => { state.session_shared.discovery_cache.clear(); }
-            }
-            protocol::write_bincode(writer, &SessionEvent::CommandResult {
-                ok: true,
-                message: "cache cleared".to_string(),
-            }).await?;
+            // Selectively clear discovery cache entries for the given
+            // context name, or wipe everything if no context was specified.
+            // The cache is keyed by ContextId (server_url + user) but the
+            // CLI argument is the human-readable name; `DiscoveryCache` owns
+            // the filter + atomic retain so the count stays stable under
+            // concurrent inserts.
+            let message = match &context {
+                Some(name) => {
+                    let removed = state.session_shared.discovery_cache.clear_context(name);
+                    format!("cleared {} cache entries for context '{}'", removed, name)
+                }
+                None => {
+                    let n = state.session_shared.discovery_cache.clear_all();
+                    format!("cleared {} cache entries (all contexts)", n)
+                }
+            };
+            protocol::write_bincode(writer, &SessionEvent::CommandResult(Ok(message))).await?;
         }
 
         other => {

@@ -4,6 +4,7 @@ use crate::app::{App, InputMode};
 use crate::app::nav::rid;
 use crate::event::AppEvent;
 use crate::kube::client_session::ClientSession;
+use crate::kube::resource_def::BuiltInKind;
 use crate::kube::session::{ds_try, ActionResult, apply_nav_change};
 
 const PAGE_SCROLL_LINES: usize = 40;
@@ -11,7 +12,17 @@ const HELP_PAGE_SCROLL_LINES: usize = 10;
 const DEFAULT_TERMINAL_HEIGHT: usize = 24;
 const CHROME_LINES: usize = 5;
 const LOG_CHROME_LINES: usize = 4;
-const FAULT_FILTER_PATTERN: &str = "error|failed|crashloop|pending|imagepull|oom|evicted|init";
+
+/// Render-clamp-aware max for `help_scroll`. Mirrors the formula the
+/// help overlay uses at render time so action handlers can store a
+/// stable max and PrevItem decrements move the scroll position
+/// immediately instead of being absorbed by the render-time clamp.
+fn help_max_scroll() -> usize {
+    let h = crossterm::terminal::size()
+        .map(|(_, h)| h)
+        .unwrap_or(DEFAULT_TERMINAL_HEIGHT as u16);
+    crate::ui::widgets::HelpOverlay::max_scroll(h)
+}
 
 use crate::kube::session_nav::{
     do_switch_namespace, begin_context_switch,
@@ -86,9 +97,11 @@ pub(crate) fn handle_action(
                     let max = state.line_count().saturating_sub(1);
                     state.scroll = (state.scroll + 1).min(max);
                 }
-                Route::ContainerSelect { ref pod, ref namespace, ref mut selected, .. } => {
-                    let container_count = app.data.unified.get(&rid("pods"))
-                        .and_then(|t| t.items.iter().find(|p| p.name == *pod && p.namespace.as_deref() == Some(namespace.as_str())))
+                Route::ContainerSelect { ref target, ref mut selected, .. } => {
+                    let container_count = app.data.unified.get(&target.resource)
+                        .and_then(|t| t.items.iter().find(|p| {
+                            p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
+                        }))
                         .map(|p| p.containers.len())
                         .unwrap_or(0);
                     if container_count > 0 && *selected + 1 < container_count {
@@ -96,7 +109,8 @@ pub(crate) fn handle_action(
                     }
                 }
                 Route::Help => {
-                    app.help_scroll += 1;
+                    let max = help_max_scroll();
+                    app.help_scroll = (app.help_scroll + 1).min(max);
                 }
                 _ => app.select_next(),
             }
@@ -116,7 +130,7 @@ pub(crate) fn handle_action(
         }
         Action::PageUp => {
             match &mut app.route {
-                Route::Logs { ref mut state, .. } | Route::Shell { ref mut state, .. } => {
+                Route::Logs { ref mut state, .. } => {
                     state.follow = false;
                     state.scroll = state.scroll.saturating_sub(PAGE_SCROLL_LINES);
                 }
@@ -130,7 +144,7 @@ pub(crate) fn handle_action(
         }
         Action::PageDown => {
             match &mut app.route {
-                Route::Logs { ref mut state, .. } | Route::Shell { ref mut state, .. } => {
+                Route::Logs { ref mut state, .. } => {
                     state.follow = false;
                     let total = state.visible_count();
                     let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CHROME_LINES);
@@ -146,14 +160,15 @@ pub(crate) fn handle_action(
                     state.scroll = (state.scroll + PAGE_SCROLL_LINES).min(max);
                 }
                 Route::Help => {
-                    app.help_scroll += HELP_PAGE_SCROLL_LINES;
+                    let max = help_max_scroll();
+                    app.help_scroll = (app.help_scroll + HELP_PAGE_SCROLL_LINES).min(max);
                 }
                 _ => app.page_down(),
             }
         }
         Action::Home => {
             match &mut app.route {
-                Route::Logs { ref mut state, .. } | Route::Shell { ref mut state, .. } => {
+                Route::Logs { ref mut state, .. } => {
                     state.follow = false;
                     state.scroll = 0;
                 }
@@ -165,7 +180,7 @@ pub(crate) fn handle_action(
         }
         Action::End => {
             match &mut app.route {
-                Route::Logs { ref mut state, .. } | Route::Shell { ref mut state, .. } => {
+                Route::Logs { ref mut state, .. } => {
                     let total = state.visible_count();
                     let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CHROME_LINES);
                     state.scroll = total.saturating_sub(visible);
@@ -178,7 +193,12 @@ pub(crate) fn handle_action(
                     state.scroll = state.line_count().saturating_sub(1);
                 }
                 Route::Help => {
-                    app.help_scroll = usize::MAX; // clamped in render
+                    // Use the same render-time clamp formula so PrevItem /
+                    // PageUp from End immediately scrolls — using
+                    // `total_lines() - 1` left help_scroll well above the
+                    // rendered max, so the first ~visible_height keystrokes
+                    // produced no visible movement.
+                    app.help_scroll = help_max_scroll();
                 }
                 _ => app.go_end(),
             }
@@ -194,30 +214,50 @@ pub(crate) fn handle_action(
         Action::Logs => handle_logs(app, data_source, log_stream),
         Action::Shell => {
             if app.current_capabilities().supports(crate::kube::protocol::OperationKind::Shell) {
-                if let Some(row) = app.data.unified.get(&rid("pods")).and_then(|t| t.selected_item()) {
+                if let Some(row) = app.data.unified.get(&rid(BuiltInKind::Pod)).and_then(|t| t.selected_item()) {
+                    // Refuse to shell if the row lacks a namespace string —
+                    // mirrors the force-kill guard. Without this, an
+                    // unwrap_or_default would pass `-n ""` to kubectl and
+                    // shell into an arbitrary pod in the default namespace.
+                    let Some(pod_ns) = row.namespace.clone() else {
+                        app.flash = Some(crate::app::FlashMessage::error(
+                            format!("Shell refused: pod/{} has no resolved namespace", row.name)
+                        ));
+                        return ActionResult::None;
+                    };
+                    if pod_ns.is_empty() {
+                        app.flash = Some(crate::app::FlashMessage::error(
+                            format!("Shell refused: pod/{} has empty namespace", row.name)
+                        ));
+                        return ActionResult::None;
+                    }
+                    let pod_name = row.name.clone();
                     let containers = &row.containers;
+                    // Build the typed target once — used by both the
+                    // multi-container picker route and the single-container
+                    // direct exec.
+                    let target = crate::kube::protocol::ObjectRef::new(
+                        rid(BuiltInKind::Pod),
+                        pod_name.clone(),
+                        crate::kube::protocol::Namespace::from_row(&pod_ns),
+                    );
                     if containers.len() > 1 {
-                        // Multi-container pod: show container selector
-                        let pod_name = row.name.clone();
-                        let pod_ns = row.namespace.clone().unwrap_or_default();
+                        // Multi-container pod: show container selector.
                         app.push_route(app.route.clone());
                         app.route = Route::ContainerSelect {
-                            pod: pod_name,
-                            namespace: pod_ns,
+                            target,
                             selected: 0,
-                            for_shell: true,
+                            action: crate::app::ContainerAction::Shell,
                         };
                     } else {
-                        let pod_name = row.name.clone();
-                        let pod_ns = row.namespace.clone().unwrap_or_default();
-                        let container = containers.first().map(|c| c.real_name.clone()).unwrap_or_default();
+                        let container = containers.first().map(|c| c.name.clone()).unwrap_or_default();
                         let context = app.context.clone();
-                        return ActionResult::Shell {
+                        return ActionResult::Shell(crate::kube::session::ExecTarget {
                             pod: pod_name,
                             namespace: pod_ns,
                             container,
                             context,
-                        };
+                        });
                     }
                 }
             }
@@ -247,7 +287,7 @@ pub(crate) fn handle_action(
                 } else if let Some(info) = get_selected_resource_info(app) {
                     app.confirm_dialog = Some(crate::app::ConfirmDialog {
                         message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
-                        pending: crate::app::PendingAction::Single { action: Action::Delete, target: info },
+                        pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::Delete, target: info },
                         yes_selected: false,
                     });
                 }
@@ -300,7 +340,7 @@ pub(crate) fn handle_action(
             }
         }
         Action::ToggleLogFollow => {
-            if let crate::app::Route::Logs { ref mut state, .. } | crate::app::Route::Shell { ref mut state, .. } = app.route {
+            if let crate::app::Route::Logs { ref mut state, .. } = app.route {
                 state.follow = !state.follow;
                 if state.follow {
                     state.scroll = state.visible_count().saturating_sub(1);
@@ -313,12 +353,12 @@ pub(crate) fn handle_action(
             }
         }
         Action::ToggleLogWrap => {
-            if let crate::app::Route::Logs { ref mut state, .. } | crate::app::Route::Shell { ref mut state, .. } = app.route {
+            if let crate::app::Route::Logs { ref mut state, .. } = app.route {
                 state.wrap = !state.wrap;
             }
         }
         Action::ToggleLogTimestamps => {
-            if let crate::app::Route::Logs { ref mut state, .. } | crate::app::Route::Shell { ref mut state, .. } = app.route {
+            if let crate::app::Route::Logs { ref mut state, .. } = app.route {
                 state.show_timestamps = !state.show_timestamps;
                 app.flash = Some(crate::app::FlashMessage::info(
                     if state.show_timestamps { "Timestamps: on" } else { "Timestamps: off" }
@@ -326,7 +366,7 @@ pub(crate) fn handle_action(
             }
         }
         Action::ClearLogs => {
-            if let crate::app::Route::Logs { ref mut state, .. } | crate::app::Route::Shell { ref mut state, .. } = app.route {
+            if let crate::app::Route::Logs { ref mut state, .. } = app.route {
                 state.clear();
             }
             app.flash = Some(crate::app::FlashMessage::info("Logs cleared"));
@@ -344,7 +384,7 @@ pub(crate) fn handle_action(
             } else if let Some(info) = get_selected_resource_info(app) {
                 app.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Restart {}/{}?", info.resource.display_label(), info.name),
-                    pending: crate::app::PendingAction::Single { action: Action::Restart, target: info },
+                    pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::Restart, target: info },
                     yes_selected: false,
                 });
             }
@@ -361,7 +401,7 @@ pub(crate) fn handle_action(
             } else if let Some(info) = get_selected_resource_info(app) {
                 app.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Force-kill {}/{}?", info.resource.display_label(), info.name),
-                    pending: crate::app::PendingAction::Single { action: Action::ForceKill, target: info },
+                    pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::ForceKill, target: info },
                     yes_selected: false,
                 });
             }
@@ -370,18 +410,13 @@ pub(crate) fn handle_action(
             // Navigate to the port-forward table as a drill-down so Esc returns
             // to the previous view. The server streams snapshots via the normal
             // Subscribe pipeline.
-            let pf_rid = crate::kube::protocol::ResourceId::from_alias("pf")
-                .expect("pf alias should resolve");
+            let pf_rid = crate::kube::protocol::ResourceId::Local(
+                crate::kube::local::LocalResourceKind::PortForward,
+            );
             let sel = app.active_table_selected();
             app.nav.save_selected(sel);
             app.route = Route::Resources;
-            let change = app.nav.push(crate::app::nav::NavStep {
-                resource: pf_rid,
-                filter: None,
-                saved_selected: 0,
-                filter_input: crate::app::nav::FilterInputState::default(),
-                stream: None,
-            });
+            let change = app.nav.push(crate::app::nav::NavStep::new(pf_rid, None));
             apply_nav_change(app, data_source, change);
         }
         Action::PortForward => {
@@ -396,11 +431,8 @@ pub(crate) fn handle_action(
         Action::ToggleHeader => {
             app.show_header = !app.show_header;
         }
-        Action::ToggleFullFetch => {
-            // No-op: full-fetch mode is not implemented in the daemon architecture.
-        }
         Action::ScrollUp(n) => {
-            if let crate::app::Route::Logs { ref mut state, .. } | crate::app::Route::Shell { ref mut state, .. } = app.route {
+            if let crate::app::Route::Logs { ref mut state, .. } = app.route {
                 if state.follow {
                     let total = state.visible_count();
                     let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CHROME_LINES);
@@ -411,7 +443,7 @@ pub(crate) fn handle_action(
             }
         }
         Action::ScrollDown(n) => {
-            if let crate::app::Route::Logs { ref mut state, .. } | crate::app::Route::Shell { ref mut state, .. } = app.route {
+            if let crate::app::Route::Logs { ref mut state, .. } = app.route {
                 if !state.follow {
                     let total = state.visible_count();
                     let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CHROME_LINES);
@@ -427,13 +459,31 @@ pub(crate) fn handle_action(
             begin_context_switch(app, data_source, &ctx, log_stream);
         }
         Action::Refresh => {
-            // Refresh = drop the current substream and open a fresh one.
+            // Refresh = drop the substream feeding the current view, clear
+            // stale rows, and force a fresh watcher. Without `clear_resource`,
+            // the old rows stay visible until the new snapshot lands — and if
+            // the new watcher fails outright, the table keeps showing stale
+            // data with no error indication.
+            //
+            // The substream is owned by an ancestor step when the current step
+            // is a same-rid client-side filter (Grep, Fault) over a parent
+            // that drilled in via Labels/Field/OwnerChain. Reading the current
+            // step's filter would lose the parent's server-side filter and
+            // open an unfiltered watcher alongside the still-alive parent.
+            // Walk back to the actual owner.
             let rid = app.nav.resource_id().clone();
-            let filter = app.nav.current().filter.as_ref()
-                .and_then(|f| f.to_subscription_filter());
-            app.nav.current_mut().stream = None;
-            let stream = data_source.subscribe_stream(rid, app.selected_ns.clone(), filter);
-            app.nav.current_mut().stream = Some(stream);
+            // Snapshot the owner's server-side filter (if any) and drop
+            // its stream. The stream handle closing is what forces the
+            // daemon-side bridge to shut down — the new subscribe opens
+            // a fresh substream on the owner step.
+            let filter = app.nav.with_subscription_owner(|owner| {
+                let f = owner.filter.as_ref().and_then(|f| f.to_subscription_filter());
+                owner.stream = None;
+                f
+            });
+            app.clear_resource(&rid);
+            let stream = data_source.subscribe_stream_force(rid, app.selected_ns.clone(), filter);
+            app.nav.with_subscription_owner(|owner| owner.stream = Some(stream));
             app.flash = Some(crate::app::FlashMessage::info("Refreshed"));
         }
         Action::Copy => {
@@ -454,7 +504,7 @@ pub(crate) fn handle_action(
                         (state.content.clone(), format!("Copied {} lines to clipboard", lines))
                     }
                 }
-                Route::Logs { ref state, .. } | Route::Shell { ref state, .. } => {
+                Route::Logs { ref state, .. } => {
                     if state.lines.is_empty() {
                         (String::new(), String::new())
                     } else {
@@ -474,7 +524,7 @@ pub(crate) fn handle_action(
             };
             if !text.is_empty() {
                 let tx = event_tx.clone();
-                tokio::spawn(async move {
+                data_source.track_task(async move {
                     let ok = tokio::task::spawn_blocking(move || {
                         crate::util::try_copy_to_clipboard(&text)
                     }).await.unwrap_or(false);
@@ -492,37 +542,25 @@ pub(crate) fn handle_action(
             if let Some(dialog) = app.confirm_dialog.take() {
                 app.kubectl_cache.clear();
                 match dialog.pending {
-                    crate::app::PendingAction::Single { action: Action::Delete, ref target } => {
+                    crate::app::PendingAction::Single { op: crate::app::SingleOp::Delete, ref target } => {
                         ds_try!(app, data_source.delete(target));
                     }
-                    crate::app::PendingAction::Single { action: Action::Restart, ref target } => {
+                    crate::app::PendingAction::Single { op: crate::app::SingleOp::Restart, ref target } => {
                         ds_try!(app, data_source.restart(target));
                     }
-                    crate::app::PendingAction::Single { action: Action::ForceKill, ref target } => {
-                        let name = target.name.clone();
-                        // `as_option().map(...)` so `Namespace::All` ends
-                        // up as `None` and we omit the `-n` flag.
-                        let namespace = target.namespace.as_option().map(|s| s.to_string());
-                        let context = app.context.clone();
-                        let tx = event_tx.clone();
-                        tokio::spawn(async move {
-                            let mut cmd = tokio::process::Command::new("kubectl");
-                            cmd.arg("delete").arg("pod").arg(&name).arg("--force").arg("--grace-period=0");
-                            if let Some(ns) = namespace.as_deref() { cmd.arg("-n").arg(ns); }
-                            if !context.is_empty() { cmd.arg("--context").arg(&context); }
-                            match cmd.output().await {
-                                Ok(o) if o.status.success() => {
-                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(format!("Force-killed pod/{}", name)))).await;
-                                }
-                                Ok(o) => {
-                                    let err = String::from_utf8_lossy(&o.stderr);
-                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(format!("Force-kill failed: {}", err)))).await;
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(format!("Failed: {}", e)))).await;
-                                }
-                            }
-                        });
+                    crate::app::PendingAction::Single { op: crate::app::SingleOp::ForceKill, ref target } => {
+                        // Force-kill REQUIRES a concrete namespace. The
+                        // daemon enforces this too via
+                        // `reject_if_namespace_unresolved`, but we surface
+                        // a friendlier message at the call site so the
+                        // user sees the row name instead of "ObjectRef".
+                        if target.namespace.as_option().is_none() {
+                            app.flash = Some(crate::app::FlashMessage::error(
+                                format!("Force-kill refused: pod/{} has no resolved namespace", target.name)
+                            ));
+                            return ActionResult::None;
+                        }
+                        ds_try!(app, data_source.force_kill(target));
                     }
                     crate::app::PendingAction::BatchDelete(batch) => {
                         app.clear_marks();
@@ -537,43 +575,20 @@ pub(crate) fn handle_action(
                         }
                     }
                     crate::app::PendingAction::BatchForceKill(batch) => {
-                        let count = batch.len();
                         app.clear_marks();
-                        let context = app.context.clone();
-                        let tx = event_tx.clone();
-                        tokio::spawn(async move {
-                            let mut ok_count = 0usize;
-                            let mut last_err = String::new();
-                            for item in &batch {
-                                let mut cmd = tokio::process::Command::new("kubectl");
-                                cmd.arg("delete").arg("pod").arg(&item.name).arg("--force").arg("--grace-period=0");
-                                // Pull the typed Namespace's name out via
-                                // `as_option`, NOT `display()`, so that
-                                // `Namespace::All` becomes "no -n flag" rather
-                                // than the literal string "all".
-                                if let Some(ns) = item.namespace.as_option() {
-                                    cmd.arg("-n").arg(ns);
-                                }
-                                if !context.is_empty() { cmd.arg("--context").arg(&context); }
-                                match cmd.output().await {
-                                    Ok(o) if o.status.success() => { ok_count += 1; }
-                                    Ok(o) => { last_err = String::from_utf8_lossy(&o.stderr).to_string(); }
-                                    Err(e) => { last_err = e.to_string(); }
-                                }
-                            }
-                            if ok_count == count {
-                                let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(
-                                    format!("Force-killed {} pods", count)
-                                ))).await;
-                            } else {
-                                let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(
-                                    format!("Force-killed {}/{}, last error: {}", ok_count, count, last_err)
-                                ))).await;
-                            }
-                        });
-                    }
-                    _ => {
-                        app.flash = Some(crate::app::FlashMessage::info("Confirmed"));
+                        // Refuse the entire batch up-front if ANY target
+                        // lacks a resolved namespace. The daemon also
+                        // checks per-target, but the all-or-nothing policy
+                        // is friendlier than partial completion.
+                        if let Some(bad) = batch.iter().find(|t| t.namespace.as_option().is_none()) {
+                            app.flash = Some(crate::app::FlashMessage::error(
+                                format!("Batch force-kill refused: pod/{} has no resolved namespace", bad.name)
+                            ));
+                            return ActionResult::None;
+                        }
+                        for item in &batch {
+                            ds_try!(app, data_source.force_kill(item));
+                        }
                     }
                 }
             }
@@ -589,8 +604,8 @@ pub(crate) fn handle_action(
                 dialog.yes_selected = !dialog.yes_selected;
             }
         }
-        Action::Sort(col) => {
-            app.sort_by(col);
+        Action::Sort(target) => {
+            app.sort_by(target);
         }
         Action::ToggleSortDirection => {
             app.toggle_sort_direction();
@@ -632,7 +647,7 @@ pub(crate) fn handle_action(
                 Route::Describe { ref mut state, .. } | Route::Aliases { ref mut state, .. } => {
                     state.next_match(40);
                 }
-                Route::Logs { ref mut state, .. } | Route::Shell { ref mut state, .. } => {
+                Route::Logs { ref mut state, .. } => {
                     // Jump to next filtered line (n in vim search).
                     let current_scroll = state.scroll;
                     // Find the first filtered_index after current_scroll.
@@ -658,7 +673,7 @@ pub(crate) fn handle_action(
                 Route::Describe { ref mut state, .. } | Route::Aliases { ref mut state, .. } => {
                     state.prev_match(40);
                 }
-                Route::Logs { ref mut state, .. } | Route::Shell { ref mut state, .. } => {
+                Route::Logs { ref mut state, .. } => {
                     // Jump to previous filtered line (N in vim search).
                     let current_scroll = state.scroll;
                     if let Some(&prev_idx) = state.filtered_indices.iter().rev()
@@ -694,18 +709,21 @@ pub(crate) fn handle_action(
         }
         Action::ShowNode => {
             if app.current_capabilities().supports(crate::kube::protocol::OperationKind::ShowNode) {
-                if let Some(row) = app.data.unified.get(&rid("pods")).and_then(|t| t.selected_item()) {
+                if let Some(row) = app.data.unified.get(&rid(BuiltInKind::Pod)).and_then(|t| t.selected_item()) {
                     let node = row.node.clone().unwrap_or_default();
                     if !node.is_empty() {
-                        let sel = app.data.unified.get(&rid("pods")).map(|t| t.selected).unwrap_or(0);
+                        let sel = app.data.unified.get(&rid(BuiltInKind::Pod)).map(|t| t.selected).unwrap_or(0);
                         app.nav.save_selected(sel);
-                        let change = app.nav.push(crate::app::nav::NavStep {
-                            resource: rid("nodes"),
-                            filter: Some(crate::app::nav::NavFilter::Grep(node.clone())),
-                            saved_selected: 0,
-                            filter_input: crate::app::nav::FilterInputState::default(),
-                stream: None,
-                        });
+                        // Escape: node names contain `.` which is a regex
+                        // metachar. Without escape the filter matches
+                        // arbitrary nodes whose names happen to share the
+                        // pattern shape.
+                        let change = app.nav.push(crate::app::nav::NavStep::new(
+                            rid(BuiltInKind::Node),
+                            Some(crate::app::nav::NavFilter::Grep(
+                                crate::app::nav::CompiledGrep::new(regex::escape(&node)),
+                            )),
+                        ));
                         apply_nav_change(app, data_source, change);
                         app.reapply_nav_filters();
                     }
@@ -730,13 +748,15 @@ pub(crate) fn handle_action(
                 let kind = info.resource.display_label().to_string();
                 let sel = app.active_table_selected();
                 app.nav.save_selected(sel);
-                let change = app.nav.push(crate::app::nav::NavStep {
-                    resource: rid("pods"),
-                    filter: Some(crate::app::nav::NavFilter::Grep(name.clone())),
-                    saved_selected: 0,
-                    filter_input: crate::app::nav::FilterInputState::default(),
-                    stream: None,
-                });
+                // Escape regex metachars in resource names (dots, dashes,
+                // brackets) — otherwise the filter silently matches the
+                // wrong rows.
+                let change = app.nav.push(crate::app::nav::NavStep::new(
+                    rid(BuiltInKind::Pod),
+                    Some(crate::app::nav::NavFilter::Grep(
+                        crate::app::nav::CompiledGrep::new(regex::escape(&name)),
+                    )),
+                ));
                 apply_nav_change(app, data_source, change);
                 app.reapply_nav_filters();
                 app.flash = Some(crate::app::FlashMessage::info(
@@ -754,24 +774,29 @@ pub(crate) fn handle_action(
                 if let Some(owner) = row.owner_refs.first() {
                     let owner_kind = owner.kind.clone();
                     let owner_name = owner.name.clone();
+                    // Resolve owner kind → ResourceId. Built-ins hit the
+                    // registry by alias; unknown kinds become a typed
+                    // unresolved CRD ref via `CrdRef::unresolved`. The
+                    // daemon's `api_resource_for` recognizes the placeholder
+                    // and walks discovery to fill in group/version. The
+                    // discovery loop matches against both `kind` and
+                    // `kind+s`, so no client-side pluralization is needed.
                     let owner_rid = crate::kube::protocol::ResourceId::from_alias(&owner_kind.to_lowercase())
                         .unwrap_or_else(|| {
-                            // CRD or unknown kind — build a best-effort rid
-                            crate::kube::protocol::ResourceId::new(
-                                String::new(), String::new(),
-                                owner_kind.clone(), format!("{}s", owner_kind.to_lowercase()),
-                                crate::kube::protocol::ResourceScope::Namespaced,
+                            crate::kube::protocol::ResourceId::Crd(
+                                crate::kube::protocol::CrdRef::unresolved(owner_kind.to_lowercase()),
                             )
                         });
                     let sel = app.active_table_selected();
                     app.nav.save_selected(sel);
-                    let change = app.nav.push(crate::app::nav::NavStep {
-                        resource: owner_rid,
-                        filter: Some(crate::app::nav::NavFilter::Grep(owner_name.clone())),
-                        saved_selected: 0,
-                        filter_input: crate::app::nav::FilterInputState::default(),
-                        stream: None,
-                    });
+                    // Escape: owner names from K8s contain `.` and `-`;
+                    // unescaped grep matches wrong rows.
+                    let change = app.nav.push(crate::app::nav::NavStep::new(
+                        owner_rid,
+                        Some(crate::app::nav::NavFilter::Grep(
+                            crate::app::nav::CompiledGrep::new(regex::escape(&owner_name)),
+                        )),
+                    ));
                     apply_nav_change(app, data_source, change);
                     app.reapply_nav_filters();
                     app.flash = Some(crate::app::FlashMessage::info(
@@ -818,18 +843,27 @@ pub(crate) fn handle_action(
             }
         }
         Action::SaveTable => {
+            let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
             let filename = format!(
-                "/tmp/k9rs-{}-{}.txt",
-                app.nav.resource_id().short_label(),
+                "{}-{}.txt",
+                safe(app.nav.resource_id().short_label()),
                 chrono::Utc::now().format("%Y%m%d-%H%M%S")
             );
             let content = build_table_dump(app);
-            let fname = filename.clone();
             let tx = event_tx.clone();
-            tokio::spawn(async move {
-                match tokio::fs::write(&fname, &content).await {
-                    Ok(_) => {
-                        let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(format!("Saved to {}", fname)))).await;
+            data_source.track_task(async move {
+                // Use the blocking safe-write helper from a spawn_blocking
+                // thread so the tokio runtime stays unblocked. The helper
+                // does the O_CREAT|O_EXCL dance internally.
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::util::safe_write_temp(&filename, content.as_bytes())
+                }).await;
+                match result {
+                    Ok(Ok(path)) => {
+                        let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(format!("Saved to {}", path.display())))).await;
+                    }
+                    Ok(Err(e)) => {
+                        let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(format!("Save failed: {}", e)))).await;
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::error(format!("Save failed: {}", e)))).await;
@@ -841,9 +875,9 @@ pub(crate) fn handle_action(
             let mut content = String::from("Resource Aliases\n================\n\n");
             content.push_str(&format!("  {:<45} {}\n", "ALIAS", "RESOURCE"));
             content.push_str(&format!("  {:<45} {}\n", "-----", "--------"));
-            for meta in crate::kube::resource_types::RESOURCE_TYPES {
-                let aliases = meta.aliases.join("/");
-                content.push_str(&format!("  {:<45} {}\n", aliases, meta.kind));
+            for def in crate::kube::resource_defs::REGISTRY.all() {
+                let aliases = def.aliases().join("/");
+                content.push_str(&format!("  {:<45} {}\n", aliases, def.gvr().kind));
             }
             content.push_str("\n\nSpecial Commands\n================\n\n");
             content.push_str("  :q / :quit / :exit         Quit\n");
@@ -877,18 +911,21 @@ pub(crate) fn handle_action(
                 state.streaming = true;
                 state.since = since.clone();
                 let tail = if since.is_none() { Some(tail_lines) } else { None };
-                let pod = target.pod.clone();
-                let namespace = target.namespace.clone();
-                let container = target.container.clone();
-                *log_stream = Some(data_source.stream_log_substream(
-                    &pod,
-                    &namespace,
-                    &container,
-                    true,  // follow
+                let new_stream = data_source.stream_log_substream(crate::kube::protocol::LogInit {
+                    pod: target.pod.clone(),
+                    namespace: crate::kube::protocol::Namespace::from_row(&target.namespace),
+                    // The `target.container` is the typed `LogContainer`
+                    // selector — clone it directly, no string round-trip.
+                    container: target.container.clone(),
+                    follow: true,
                     tail,
-                    since.clone(),
-                    false, // not previous
-                ));
+                    since: since.clone(),
+                    previous: false,
+                });
+                // Stamp the fresh generation so stale lines from the
+                // previous stream get filtered out by the apply check.
+                state.generation = new_stream.generation;
+                *log_stream = Some(new_stream);
             }
         }
         Action::ToggleWide => {
@@ -901,21 +938,16 @@ pub(crate) fn handle_action(
             if !app.nav.has_fault_filter() {
                 let sel = app.active_table_selected();
                 app.nav.save_selected(sel);
-                let change = app.nav.push(crate::app::nav::NavStep {
-                    resource: app.nav.resource_id().clone(),
-                    filter: Some(crate::app::nav::NavFilter::Grep(
-                        FAULT_FILTER_PATTERN.to_string(),
-                    )),
-                    saved_selected: 0,
-                    filter_input: crate::app::nav::FilterInputState::default(),
-                stream: None,
-                });
+                let current_rid = app.nav.resource_id().clone();
+                let change = app.nav.push(crate::app::nav::NavStep::new(
+                    current_rid,
+                    Some(crate::app::nav::NavFilter::Fault),
+                ));
                 apply_nav_change(app, data_source, change);
                 app.reapply_nav_filters();
                 app.flash = Some(crate::app::FlashMessage::info("Fault filter ON"));
             } else {
-                // Remove the fault filter grep specifically (not just the top step)
-                app.nav.pop_grep_containing("crashloop");
+                app.nav.pop_fault_filter();
                 app.reapply_nav_filters();
                 app.flash = Some(crate::app::FlashMessage::info("Fault filter OFF"));
             }
@@ -925,22 +957,23 @@ pub(crate) fn handle_action(
         }
         Action::SaveLogs => {
             if let crate::app::Route::Logs { ref target, ref state, .. }
-                | crate::app::Route::Shell { ref target, ref state, .. } = app.route
+ = app.route
             {
+                let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
                 let filename = format!(
-                    "/tmp/k9rs-logs-{}-{}-{}.log",
-                    target.pod, target.container,
+                    "logs-{}-{}-{}.log",
+                    safe(&target.pod), safe(target.container_label()),
                     chrono::Utc::now().format("%Y%m%d-%H%M%S"),
                 );
                 let content: String = state.lines.iter()
                     .cloned()
                     .collect::<Vec<_>>()
                     .join("\n");
-                match std::fs::write(&filename, &content) {
-                    Ok(()) => {
+                match crate::util::safe_write_temp(&filename, content.as_bytes()) {
+                    Ok(path) => {
                         let count = content.lines().count();
                         app.flash = Some(crate::app::FlashMessage::info(
-                            format!("Saved {} lines to {}", count, filename)
+                            format!("Saved {} lines to {}", count, path.display())
                         ));
                     }
                     Err(e) => {

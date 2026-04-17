@@ -1,13 +1,11 @@
 use k8s_openapi::api::core::v1::PersistentVolume;
 
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::{CommonMeta, access_mode_short};
+use crate::kube::resources::row::{ResourceRow};
 
 /// Convert a k8s PersistentVolume into a generic ResourceRow.
 pub(crate) fn pv_to_row(pv: PersistentVolume) -> ResourceRow {
-    use crate::kube::resources::access_mode_short;
-    let metadata = pv.metadata;
-    let name = metadata.name.unwrap_or_default();
-    let age = metadata.creation_timestamp.map(|t| t.0);
+    let meta = CommonMeta::from_k8s(pv.metadata);
     let spec = pv.spec.unwrap_or_default();
     let capacity = spec.capacity.as_ref()
         .and_then(|c| c.get("storage"))
@@ -27,14 +25,13 @@ pub(crate) fn pv_to_row(pv: PersistentVolume) -> ResourceRow {
         .unwrap_or_default();
     let storage_class = spec.storage_class_name.unwrap_or_default();
     ResourceRow {
-        cells: vec![name.clone(), capacity, access_modes, reclaim_policy, status, claim, storage_class, crate::util::format_age(age)],
-        name,
+        cells: vec![
+            meta.name.clone(),
+            capacity, access_modes, reclaim_policy, status, claim, storage_class,
+            crate::util::format_age(meta.age),
+        ],
+        name: meta.name,
         namespace: None,
-        containers: Vec::new(),
-        owner_refs: Vec::new(),
-        pf_ports: Vec::new(),
-        node: None,
-        crd_info: None,
-        drill_target: None,
+        ..Default::default()
     }
 }

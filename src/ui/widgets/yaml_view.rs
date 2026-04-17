@@ -8,89 +8,16 @@ use ratatui::{
 
 use crate::ui::theme::Theme;
 
-/// State for the YAML viewer widget.
+/// State for the YAML viewer widget. Pure data — the authoritative state
+/// lives in [`crate::app::ContentViewState`] (inside `Route::Yaml`); this
+/// struct is just the per-frame snapshot that satisfies
+/// `StatefulWidget::State`. The view function builds it via struct literal
+/// each draw, so impl methods would be dead weight.
 pub struct YamlViewState {
     pub scroll: usize,
     pub search: Option<String>,
     pub search_matches: Vec<usize>,
     pub current_match: usize,
-}
-
-impl YamlViewState {
-    pub fn new() -> Self {
-        Self {
-            scroll: 0,
-            search: None,
-            search_matches: Vec::new(),
-            current_match: 0,
-        }
-    }
-
-    pub fn scroll_up(&mut self, amount: usize) {
-        self.scroll = self.scroll.saturating_sub(amount);
-    }
-
-    pub fn scroll_down(&mut self, amount: usize, total_lines: usize, visible: usize) {
-        let max_scroll = total_lines.saturating_sub(visible);
-        self.scroll = (self.scroll + amount).min(max_scroll);
-    }
-
-    pub fn scroll_to_top(&mut self) {
-        self.scroll = 0;
-    }
-
-    pub fn scroll_to_bottom(&mut self, total_lines: usize, visible: usize) {
-        self.scroll = total_lines.saturating_sub(visible);
-    }
-
-    /// Find all lines containing the search term.
-    pub fn update_search(&mut self, content: &str) {
-        self.search_matches.clear();
-        self.current_match = 0;
-
-        if let Some(ref term) = self.search {
-            if term.is_empty() {
-                return;
-            }
-            let lower_term = term.to_lowercase();
-            for (i, line) in content.lines().enumerate() {
-                if line.to_lowercase().contains(&lower_term) {
-                    self.search_matches.push(i);
-                }
-            }
-        }
-    }
-
-    /// Jump to the next search match.
-    pub fn next_match(&mut self, visible: usize) {
-        if self.search_matches.is_empty() {
-            return;
-        }
-        self.current_match = (self.current_match + 1) % self.search_matches.len();
-        let target_line = self.search_matches[self.current_match];
-        // Center the match in the viewport
-        self.scroll = target_line.saturating_sub(visible / 2);
-    }
-
-    /// Jump to the previous search match.
-    pub fn prev_match(&mut self, visible: usize) {
-        if self.search_matches.is_empty() {
-            return;
-        }
-        self.current_match = if self.current_match == 0 {
-            self.search_matches.len() - 1
-        } else {
-            self.current_match - 1
-        };
-        let target_line = self.search_matches[self.current_match];
-        self.scroll = target_line.saturating_sub(visible / 2);
-    }
-}
-
-impl Default for YamlViewState {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// YAML viewer with syntax highlighting.
@@ -145,9 +72,8 @@ impl<'a> YamlViewer<'a> {
                     || value_trimmed == "false"
                     || value_trimmed == "null"
                     || value_trimmed == "~"
+                    || value_trimmed.parse::<f64>().is_ok()
                 {
-                    spans.push(Span::styled(value.to_string(), theme.yaml_number));
-                } else if value_trimmed.parse::<f64>().is_ok() {
                     spans.push(Span::styled(value.to_string(), theme.yaml_number));
                 } else {
                     spans.push(Span::styled(value.to_string(), theme.yaml_string));

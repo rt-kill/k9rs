@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use clap::Subcommand;
 
 use crate::kube::daemon::DaemonClient;
-use crate::kube::protocol::{SessionCommand, SessionEvent};
+use crate::kube::protocol::{ContextName, SessionCommand, SessionEvent};
 
 #[derive(Subcommand, Debug)]
 pub enum CtlCommand {
@@ -20,7 +20,7 @@ pub enum CtlCommand {
     /// Clear cached data
     Clear {
         /// Context to clear (clears all if omitted)
-        context: Option<String>,
+        context: Option<ContextName>,
     },
 }
 
@@ -82,7 +82,7 @@ async fn cmd_ping(json: bool) -> Result<()> {
     let resp = dc.request(&SessionCommand::Ping).await;
     let elapsed = start.elapsed();
     match resp {
-        Some(SessionEvent::CommandResult { ok: true, .. }) => {
+        Some(SessionEvent::CommandResult(Ok(_))) => {
             if json {
                 println!("{}", serde_json::json!({"alive": true, "latency_ms": elapsed.as_millis() as u64}));
             } else {
@@ -98,7 +98,7 @@ async fn cmd_stop(json: bool) -> Result<()> {
     let mut dc = connect_or_bail().await?;
     let resp = dc.request(&SessionCommand::Shutdown).await;
     match resp {
-        Some(SessionEvent::CommandResult { ok: true, .. }) => {
+        Some(SessionEvent::CommandResult(Ok(_))) => {
             if json {
                 println!("{}", serde_json::json!({"ok": true, "message": "shutting down"}));
             } else {
@@ -110,11 +110,11 @@ async fn cmd_stop(json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_clear(context: Option<String>, json: bool) -> Result<()> {
+async fn cmd_clear(context: Option<ContextName>, json: bool) -> Result<()> {
     let mut dc = connect_or_bail().await?;
     let resp = dc.request(&SessionCommand::Clear { context: context.clone() }).await;
     match resp {
-        Some(SessionEvent::CommandResult { ok: true, message }) => {
+        Some(SessionEvent::CommandResult(Ok(message))) => {
             if json {
                 println!("{}", serde_json::json!({"ok": true, "message": message}));
             } else {

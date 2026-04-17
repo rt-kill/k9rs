@@ -1,3 +1,7 @@
+pub mod atomic_option;
+
+pub use atomic_option::AtomicOption;
+
 use chrono::{DateTime, Utc};
 use unicode_width::UnicodeWidthChar;
 
@@ -93,6 +97,51 @@ impl SearchPattern {
     pub fn is_empty(&self) -> bool {
         self.literal.is_empty()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-process safe temp directory
+// ---------------------------------------------------------------------------
+
+/// Path to the per-process temp directory, created on first use with mode
+/// `0700`. Used by every "save this to disk" path (edit YAML, save logs,
+/// save table) so we never dump predictable filenames into world-writable
+/// `/tmp`. Files written into this dir use `O_CREAT | O_EXCL` so a symlink
+/// planted in advance can't divert the write — see [`safe_create_temp`].
+pub fn process_temp_dir() -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("k9rs-{}", std::process::id()));
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    Ok(dir)
+}
+
+/// Atomically create a fresh file inside [`process_temp_dir`] and return
+/// its path + an open `File` handle. Refuses to follow symlinks or
+/// overwrite an existing entry. Caller is responsible for writing content
+/// and dropping the handle.
+pub fn safe_create_temp(filename: &str) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = process_temp_dir()?;
+    let path = dir.join(filename);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    Ok((path, f))
+}
+
+/// Convenience wrapper: create + write the entire payload. Returns the
+/// final path.
+pub fn safe_write_temp(filename: &str, content: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    let (path, mut f) = safe_create_temp(filename)?;
+    f.write_all(content)?;
+    Ok(path)
 }
 
 /// Try to copy text to the system clipboard using available tools.
@@ -206,23 +255,13 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> &str {
     s
 }
 
-/// Formats a Kubernetes timestamp into a human-readable age string like "2d3h", "5m", "10s".
-/// Returns "<unknown>" if the timestamp is None.
-pub fn format_age(timestamp: Option<DateTime<Utc>>) -> String {
-    let ts = match timestamp {
-        Some(t) => t,
-        None => return "<unknown>".to_string(),
-    };
-
-    let now = Utc::now();
-    let duration = now.signed_duration_since(ts);
-
-    if duration.num_seconds() < 0 {
+/// Formats a total-seconds count into the `2d3h`/`5m10s`/`30s` age string.
+/// Shared backend for [`format_age`] (timestamp-based) and
+/// [`format_age_duration`] (`Duration`-based).
+fn format_age_secs(total_secs: i64) -> String {
+    if total_secs < 0 {
         return "0s".to_string();
     }
-
-    let total_secs = duration.num_seconds();
-
     let days = total_secs / 86400;
     let hours = (total_secs % 86400) / 3600;
     let minutes = (total_secs % 3600) / 60;
@@ -251,6 +290,23 @@ pub fn format_age(timestamp: Option<DateTime<Utc>>) -> String {
     }
 }
 
+/// Formats a Kubernetes timestamp into a human-readable age string like "2d3h", "5m", "10s".
+/// Returns "<unknown>" if the timestamp is None.
+pub fn format_age(timestamp: Option<DateTime<Utc>>) -> String {
+    let ts = match timestamp {
+        Some(t) => t,
+        None => return "<unknown>".to_string(),
+    };
+    let now = Utc::now();
+    format_age_secs(now.signed_duration_since(ts).num_seconds())
+}
+
+/// Like [`format_age`] but takes a `Duration` directly — for locally-timed
+/// work (port-forward uptime, etc.) that doesn't have a kube timestamp.
+pub fn format_age_duration(d: std::time::Duration) -> String {
+    format_age_secs(d.as_secs() as i64)
+}
+
 /// Formats CPU quantities from Kubernetes resource strings.
 ///
 /// Handles:
@@ -268,7 +324,7 @@ pub fn format_cpu(cpu_str: &str) -> String {
     if let Some(nano_str) = s.strip_suffix('n') {
         if let Ok(nano) = nano_str.parse::<u64>() {
             let milli = nano / 1_000_000;
-            if milli >= 1000 && milli % 1000 == 0 {
+            if milli >= 1000 && milli.is_multiple_of(1000) {
                 return format!("{}", milli / 1000);
             }
             return format!("{}m", milli);
@@ -279,7 +335,7 @@ pub fn format_cpu(cpu_str: &str) -> String {
     // Millicores: e.g. "500m"
     if let Some(milli_str) = s.strip_suffix('m') {
         if let Ok(milli) = milli_str.parse::<u64>() {
-            if milli >= 1000 && milli % 1000 == 0 {
+            if milli >= 1000 && milli.is_multiple_of(1000) {
                 return format!("{}", milli / 1000);
             }
             return format!("{}m", milli);
@@ -290,7 +346,7 @@ pub fn format_cpu(cpu_str: &str) -> String {
     // Whole cores: e.g. "2" or "1.5"
     if let Ok(cores) = s.parse::<f64>() {
         let milli = (cores * 1000.0) as u64;
-        if milli >= 1000 && milli % 1000 == 0 {
+        if milli >= 1000 && milli.is_multiple_of(1000) {
             return format!("{}", milli / 1000);
         }
         return format!("{}m", milli);
@@ -349,17 +405,14 @@ pub fn format_mem(mem_str: &str) -> String {
             Ok(v) => v * 1_000_000.0,
             Err(_) => return s.to_string(),
         }
-    } else if let Some(val) = s.strip_suffix('k') {
+    } else if let Some(val) = s.strip_suffix('k').or_else(|| s.strip_suffix('K')) {
         match val.parse::<f64>() {
             Ok(v) => v * 1_000.0,
             Err(_) => return s.to_string(),
         }
-    } else if s.contains('e') || s.contains('E') {
-        match s.parse::<f64>() {
-            Ok(v) => v,
-            Err(_) => return s.to_string(),
-        }
     } else {
+        // Suffix-less: bare bytes (or scientific notation, which `f64::parse`
+        // handles natively — no special branch needed).
         match s.parse::<f64>() {
             Ok(v) => v,
             Err(_) => return s.to_string(),

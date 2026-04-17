@@ -112,68 +112,10 @@ pub struct LogViewState {
     pub committed_filter_count: usize,
 }
 
-impl LogViewState {
-    pub fn new() -> Self {
-        Self {
-            scroll: 0,
-            follow: true,
-            wrap: false,
-            show_timestamps: true,
-            total_lines: 0,
-            scroll_display: None,
-            active_patterns: Vec::new(),
-            filter_input_active: false,
-            filter_input: String::new(),
-            visible_count: 0,
-            committed_filter_count: 0,
-        }
-    }
-
-    pub fn scroll_up(&mut self, amount: usize) {
-        self.follow = false;
-        self.scroll = self.scroll.saturating_sub(amount);
-    }
-
-    pub fn scroll_down(&mut self, amount: usize, visible: usize) {
-        let max_scroll = self.total_lines.saturating_sub(visible);
-        self.scroll = (self.scroll + amount).min(max_scroll);
-        // Re-enable follow if at the bottom
-        if self.scroll >= max_scroll {
-            self.follow = true;
-        }
-    }
-
-    pub fn scroll_to_top(&mut self) {
-        self.follow = false;
-        self.scroll = 0;
-    }
-
-    pub fn scroll_to_bottom(&mut self, visible: usize) {
-        self.scroll = self.total_lines.saturating_sub(visible);
-        self.follow = true;
-    }
-
-    pub fn toggle_follow(&mut self, visible: usize) {
-        self.follow = !self.follow;
-        if self.follow {
-            self.scroll = self.total_lines.saturating_sub(visible);
-        }
-    }
-
-    pub fn toggle_wrap(&mut self) {
-        self.wrap = !self.wrap;
-    }
-
-    pub fn toggle_timestamps(&mut self) {
-        self.show_timestamps = !self.show_timestamps;
-    }
-}
-
-impl Default for LogViewState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// `LogViewState` is pure data — the authoritative state lives in
+// [`crate::app::LogState`] (inside `Route::Logs`). The view function
+// snapshots into a `LogViewState` via struct literal each draw, so impl
+// methods on this type would never be called.
 
 /// Log viewer widget.
 ///
@@ -185,7 +127,13 @@ impl Default for LogViewState {
 pub struct LogViewer<'a> {
     lines: &'a [&'a str],
     pod_name: &'a str,
-    container_name: &'a str,
+    /// User-facing label for the header bar — derived from the typed
+    /// [`crate::kube::protocol::LogContainer`] via `ContainerRef::container_label`.
+    container_label: &'a str,
+    /// Whether this view is streaming all containers (vs a single one).
+    /// Drives the per-line container-prefix parsing & coloring. Replaces
+    /// the previous `container_name == "all"` magic-string check.
+    is_all_containers: bool,
     since_label: &'a str,
     theme: &'a Theme,
 }
@@ -194,14 +142,16 @@ impl<'a> LogViewer<'a> {
     pub fn new(
         lines: &'a [&'a str],
         pod_name: &'a str,
-        container_name: &'a str,
+        container_label: &'a str,
+        is_all_containers: bool,
         since_label: &'a str,
         theme: &'a Theme,
     ) -> Self {
         Self {
             lines,
             pod_name,
-            container_name,
+            container_label,
+            is_all_containers,
             since_label,
             theme,
         }
@@ -251,7 +201,7 @@ impl StatefulWidget for LogViewer<'_> {
         let since_indicator = format!(" [{}]", self.since_label);
         let title = format!(
             " Logs: {}/{}{}{}{} ",
-            self.pod_name, self.container_name, follow_indicator, wrap_indicator, since_indicator
+            self.pod_name, self.container_label, follow_indicator, wrap_indicator, since_indicator
         );
 
         let block = Block::bordered()
@@ -339,7 +289,7 @@ impl StatefulWidget for LogViewer<'_> {
                     }
                 };
                 // Per-container colored prefix for multi-container logs.
-                let (prefix_span, display_content) = if self.container_name == "all" {
+                let (prefix_span, display_content) = if self.is_all_containers {
                     if let Some((prefix, rest)) = parse_container_prefix(content) {
                         let color = container_color(prefix);
                         (Some(Span::styled(format!("{} ", prefix), Style::default().fg(color))), rest)

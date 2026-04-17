@@ -1,60 +1,107 @@
-use kube::api::{Api, DynamicObject};
+//! Describe / YAML / discovery helpers for the daemon.
+//!
+//! Two entry points:
+//! - [`fetch_describe`] / [`fetch_yaml`] — operate on a typed [`ObjectRef`]
+//!   the daemon already holds. Built-ins skip discovery entirely; CRDs use
+//!   their stored GVR if populated, falling back to discovery only when the
+//!   client sent us an incomplete shape (`:nodeclaims` etc.). No string-
+//!   keyed dispatch.
+//! - [`api_resource_for`] — typed entrypoint that takes a [`ResourceId`]
+//!   and returns the kube `ApiResource` + scope. Used by the Apply /
+//!   Delete / YAML paths and by the subscribe path's CRD branch (it
+//!   handles the incomplete-CrdRef → discovery fallback internally).
 
-use crate::kube::protocol::ResourceScope;
+use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
+use kube::discovery::{self, Scope};
+
+use crate::kube::protocol::{Namespace, ObjectRef, ResourceId, ResourceScope};
+
+/// Build an `Api<DynamicObject>` for the given ApiResource + scope +
+/// namespace. Centralizes the four-way `match scope { Cluster, Namespaced
+/// (with empty special case), Namespaced }` that every mutating handler
+/// otherwise duplicates. Takes a typed `Namespace` rather than a raw
+/// string so the empty-vs-None semantics are encoded once at the boundary.
+pub fn dynamic_api_for(
+    client: &kube::Client,
+    ar: &ApiResource,
+    scope: ResourceScope,
+    namespace: &Namespace,
+) -> Api<DynamicObject> {
+    match (scope, namespace.as_option()) {
+        (ResourceScope::Cluster, _) => Api::all_with(client.clone(), ar),
+        (ResourceScope::Namespaced, None) => Api::default_namespaced_with(client.clone(), ar),
+        (ResourceScope::Namespaced, Some(ns)) => Api::namespaced_with(client.clone(), ns, ar),
+    }
+}
 
 // ---------------------------------------------------------------------------
-// Public API
+// Public API — typed `ObjectRef` entry points
 // ---------------------------------------------------------------------------
 
-/// Fetch a describe view for a resource via `kubectl describe`.
-/// kubectl's output is comprehensive (events, replica sets, rolling update
-/// strategy, etc.) and matches what users expect from k9s.
-pub async fn fetch_describe_native(
-    _client: &kube::Client,
-    resource: &str,
-    name: &str,
-    namespace: &str,
-    context: &str,
-) -> String {
-    fetch_describe_via_kubectl(resource, name, namespace, context).await
+/// Fetch a describe view for a resource via `kubectl describe`. We shell
+/// out because kubectl's describe output (events, replica sets, rolling
+/// update strategy, conditions) is comprehensive in a way that's tedious
+/// to reproduce against the raw API.
+pub async fn fetch_describe(target: &ObjectRef, context: &crate::kube::protocol::ContextName) -> String {
+    fetch_describe_via_kubectl(target, context).await
 }
 
 /// Fetch YAML for a resource. Tries the kube API first (fast, no subprocess),
-/// falls back to kubectl if API discovery fails.
-pub async fn fetch_yaml_native(
+/// falls back to kubectl on any failure.
+pub async fn fetch_yaml(
     client: &kube::Client,
-    resource: &str,
-    name: &str,
-    namespace: &str,
-    context: &str,
+    target: &ObjectRef,
+    context: &crate::kube::protocol::ContextName,
 ) -> String {
-    match fetch_yaml_via_api(client, resource, name, namespace).await {
+    match fetch_yaml_via_api(client, target).await {
         Ok(yaml) => yaml,
-        Err(_) => fetch_yaml_via_kubectl(resource, name, namespace, context).await,
+        Err(_) => fetch_yaml_via_kubectl(target, context).await,
     }
 }
 
-/// Resolve a resource type string to an ApiResource.
-/// Tries built-in lookups first (instant), falls back to API discovery.
-pub async fn resolve_api_resource(
+// ---------------------------------------------------------------------------
+// Typed API resource resolution
+// ---------------------------------------------------------------------------
+
+/// Build the kube `ApiResource` for any `ResourceId`. Built-ins resolve
+/// through the registry's `&'static Gvr` with no allocation and no HTTP
+/// call. CRDs use their stored GVR if populated; only the incomplete-shape
+/// case (`group`/`version` empty) hits discovery.
+///
+/// Errors only on truly unknown resources or local rids (which have no K8s
+/// API representation by definition).
+pub async fn api_resource_for(
+    client: &kube::Client,
+    rid: &ResourceId,
+) -> anyhow::Result<(ApiResource, ResourceScope)> {
+    match rid {
+        ResourceId::BuiltIn(kind) => {
+            let g = crate::kube::resource_defs::REGISTRY.by_kind(*kind).gvr();
+            let gvk = GroupVersionKind::gvk(g.group, g.version, g.kind);
+            Ok((ApiResource::from_gvk_with_plural(&gvk, g.plural), g.scope))
+        }
+        ResourceId::Crd(crd_ref) => {
+            if !crd_ref.is_unresolved() {
+                let gvk = GroupVersionKind::gvk(&crd_ref.group, &crd_ref.version, &crd_ref.kind);
+                Ok((ApiResource::from_gvk_with_plural(&gvk, &crd_ref.plural), crd_ref.scope))
+            } else {
+                // Incomplete CRD ref (e.g. user typed `:nodeclaims` without
+                // group): fall back to discovery to fill in the GVR.
+                resolve_via_discovery(client, &crd_ref.plural).await
+            }
+        }
+        ResourceId::Local(_) => {
+            anyhow::bail!("local resources have no K8s API resource descriptor")
+        }
+    }
+}
+
+async fn resolve_via_discovery(
     client: &kube::Client,
     resource: &str,
-) -> anyhow::Result<(kube::api::ApiResource, ResourceScope)> {
-    use kube::api::ApiResource;
-    use kube::discovery::{self, Scope};
+) -> anyhow::Result<(ApiResource, ResourceScope)> {
     use ResourceScope::{Cluster, Namespaced};
 
-    // Try singular name ("deployment"), plural ("deployments"), or alias ("deploy").
-    let meta = crate::kube::resource_types::find_by_name(resource)
-        .or_else(|| crate::kube::resource_types::find_by_plural(resource))
-        .or_else(|| crate::kube::resource_types::find_by_alias(resource));
-    if let Some(meta) = meta {
-        let gvk = kube::api::GroupVersionKind::gvk(meta.group, meta.version, meta.kind);
-        let ar = ApiResource::from_gvk_with_plural(&gvk, meta.plural);
-        return Ok((ar, meta.scope));
-    }
-
-    // Use API discovery to find the resource by plural name (with or without group).
     let discovery = discovery::Discovery::new(client.clone()).run().await?;
 
     if resource.contains('.') {
@@ -93,17 +140,11 @@ pub async fn resolve_api_resource(
 
 async fn fetch_yaml_via_api(
     client: &kube::Client,
-    resource: &str,
-    name: &str,
-    namespace: &str,
+    target: &ObjectRef,
 ) -> anyhow::Result<String> {
-    let (ar, scope) = resolve_api_resource(client, resource).await?;
-    let api: Api<DynamicObject> = match scope {
-        ResourceScope::Cluster => Api::all_with(client.clone(), &ar),
-        ResourceScope::Namespaced if namespace.is_empty() => Api::default_namespaced_with(client.clone(), &ar),
-        ResourceScope::Namespaced => Api::namespaced_with(client.clone(), namespace, &ar),
-    };
-    let obj = api.get(name).await?;
+    let (ar, scope) = api_resource_for(client, &target.resource).await?;
+    let api = dynamic_api_for(client, &ar, scope, &target.namespace);
+    let obj = api.get(&target.name).await?;
     let yaml = serde_yaml::to_string(&obj)?;
     Ok(yaml)
 }
@@ -112,11 +153,12 @@ async fn fetch_yaml_via_api(
 // kubectl fallbacks
 // ---------------------------------------------------------------------------
 
-async fn fetch_describe_via_kubectl(resource: &str, name: &str, namespace: &str, context: &str) -> String {
+async fn fetch_describe_via_kubectl(target: &ObjectRef, context: &crate::kube::protocol::ContextName) -> String {
     let mut cmd = tokio::process::Command::new("kubectl");
-    cmd.arg("describe").arg(resource).arg(name);
-    if !context.is_empty() { cmd.arg("--context").arg(context); }
-    if !namespace.is_empty() { cmd.arg("-n").arg(namespace); }
+    cmd.arg("describe").arg(target.kubectl_target());
+    if !context.is_empty() { cmd.arg("--context").arg(context.as_str()); }
+    if let Some(ns) = target.namespace.as_option() { cmd.arg("-n").arg(ns); }
+    cmd.kill_on_drop(true);
     match cmd.output().await {
         Ok(output) if output.status.success() => {
             crate::util::strip_ansi(&String::from_utf8_lossy(&output.stdout))
@@ -126,11 +168,12 @@ async fn fetch_describe_via_kubectl(resource: &str, name: &str, namespace: &str,
     }
 }
 
-async fn fetch_yaml_via_kubectl(resource: &str, name: &str, namespace: &str, context: &str) -> String {
+async fn fetch_yaml_via_kubectl(target: &ObjectRef, context: &crate::kube::protocol::ContextName) -> String {
     let mut cmd = tokio::process::Command::new("kubectl");
-    cmd.arg("get").arg(resource).arg(name).arg("-o").arg("yaml");
-    if !context.is_empty() { cmd.arg("--context").arg(context); }
-    if !namespace.is_empty() { cmd.arg("-n").arg(namespace); }
+    cmd.arg("get").arg(target.kubectl_target()).arg("-o").arg("yaml");
+    if !context.is_empty() { cmd.arg("--context").arg(context.as_str()); }
+    if let Some(ns) = target.namespace.as_option() { cmd.arg("-n").arg(ns); }
+    cmd.kill_on_drop(true);
     match cmd.output().await {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).to_string(),
         Ok(output) => format!("Error fetching YAML:\n{}", String::from_utf8_lossy(&output.stderr)),

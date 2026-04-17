@@ -1,27 +1,16 @@
 
 use k8s_openapi::api::batch::v1::Job;
 
-use crate::kube::resources::row::{DrillTarget, ResourceRow};
+use crate::kube::resources::{CommonMeta, WorkloadContainers};
+use crate::kube::resources::row::{DrillTarget, ResourceRow, RowHealth};
 
 /// Convert a k8s Job into a generic ResourceRow.
 pub(crate) fn job_to_row(job: Job) -> ResourceRow {
-    let metadata = job.metadata;
-    let ns = metadata.namespace.unwrap_or_default();
-    let name = metadata.name.unwrap_or_default();
-    let uid = metadata.uid.unwrap_or_default();
-    let labels = metadata.labels.unwrap_or_default();
-    let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
-    let age = metadata.creation_timestamp.map(|t| t.0);
+    let meta = CommonMeta::from_k8s(job.metadata);
 
     let spec = job.spec.unwrap_or_default();
     let desired_completions = spec.completions.unwrap_or(1);
-
-    let container_names = spec.template.spec.as_ref()
-        .map(|ps| ps.containers.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(","))
-        .unwrap_or_default();
-    let images = spec.template.spec.as_ref()
-        .map(|ps| ps.containers.iter().map(|c| c.image.clone().unwrap_or_default()).collect::<Vec<_>>().join(","))
-        .unwrap_or_default();
+    let containers = WorkloadContainers::from_pod_spec(spec.template.spec.as_ref());
 
     let status_obj = job.status.unwrap_or_default();
     let succeeded = status_obj.succeeded.unwrap_or(0);
@@ -46,25 +35,30 @@ pub(crate) fn job_to_row(job: Job) -> ResourceRow {
         None => String::new(),
     };
 
-    let drill_target = if !uid.is_empty() {
+    let drill_target = if !meta.uid.is_empty() {
         Some(DrillTarget::PodsByOwner {
-            uid,
-            kind: "Job".to_string(),
-            name: name.clone(),
+            uid: meta.uid.clone(),
+            kind: crate::kube::resource_def::BuiltInKind::Job,
+            name: meta.name.clone(),
         })
     } else {
-        Some(DrillTarget::PodsByNameGrep(name.clone()))
+        Some(DrillTarget::PodsByNameGrep(meta.name.clone()))
     };
 
+    let health = if succeeded >= desired_completions { RowHealth::Normal }
+        else { RowHealth::Pending };
+
     ResourceRow {
-        cells: vec![ns.clone(), name.clone(), completions, duration, container_names, images, labels_str, crate::util::format_age(age)],
-        name,
-        namespace: Some(ns),
-        containers: Vec::new(),
-        owner_refs: Vec::new(),
-        pf_ports: Vec::new(),
-        node: None,
-        crd_info: None,
+        cells: vec![
+            meta.namespace.clone(), meta.name.clone(),
+            completions, duration,
+            containers.names, containers.images,
+            meta.labels_str, crate::util::format_age(meta.age),
+        ],
+        name: meta.name,
+        namespace: Some(meta.namespace),
+        health,
         drill_target,
+        ..Default::default()
     }
 }

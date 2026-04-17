@@ -20,98 +20,10 @@ pub struct ResourceTableState {
     pub filtered_count: usize,
 }
 
-impl ResourceTableState {
-    pub fn new() -> Self {
-        Self {
-            selected: 0,
-            offset: 0,
-            filtered_count: 0,
-        }
-    }
-
-    /// Move selection up by one, scrolling if necessary.
-    pub fn select_prev(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
-            if self.selected < self.offset {
-                self.offset = self.selected;
-            }
-        }
-    }
-
-    /// Move selection down by one, scrolling if necessary.
-    pub fn select_next(&mut self, visible_height: usize) {
-        if self.filtered_count == 0 {
-            return;
-        }
-        if self.selected < self.filtered_count.saturating_sub(1) {
-            self.selected += 1;
-            if self.selected >= self.offset + visible_height {
-                self.offset = self.selected.saturating_sub(visible_height.saturating_sub(1));
-            }
-        }
-    }
-
-    /// Jump to the top of the table.
-    pub fn select_first(&mut self) {
-        self.selected = 0;
-        self.offset = 0;
-    }
-
-    /// Jump to the bottom of the table.
-    pub fn select_last(&mut self, visible_height: usize) {
-        if self.filtered_count == 0 {
-            return;
-        }
-        self.selected = self.filtered_count - 1;
-        if self.selected >= visible_height {
-            self.offset = self.selected - visible_height + 1;
-        }
-    }
-
-    /// Move selection down by a page.
-    pub fn page_down(&mut self, visible_height: usize) {
-        if self.filtered_count == 0 {
-            return;
-        }
-        let max = self.filtered_count.saturating_sub(1);
-        self.selected = (self.selected + visible_height).min(max);
-        self.offset = if self.selected >= visible_height {
-            self.selected - visible_height + 1
-        } else {
-            0
-        };
-    }
-
-    /// Move selection up by a page.
-    pub fn page_up(&mut self, visible_height: usize) {
-        self.selected = self.selected.saturating_sub(visible_height);
-        self.offset = self.offset.saturating_sub(visible_height);
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        }
-    }
-
-    /// Ensure the selected index is within bounds after data changes.
-    pub fn clamp(&mut self, total_rows: usize) {
-        if total_rows == 0 {
-            self.selected = 0;
-            self.offset = 0;
-            self.filtered_count = 0;
-            return;
-        }
-        self.filtered_count = total_rows;
-        if self.selected >= total_rows {
-            self.selected = total_rows - 1;
-        }
-    }
-}
-
-impl Default for ResourceTableState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// `ResourceTableState` is pure data. The authoritative state lives in
+// [`crate::app::StatefulTable`] (one per resource); the view function
+// builds a `ResourceTableState` via struct literal each draw, so impl
+// methods would never be called.
 
 /// A high-performance virtual scrolling table widget.
 ///
@@ -135,19 +47,17 @@ pub struct ResourceTable<'a> {
     marked_visible: &'a [bool],
     /// Rows that changed recently: (namespace, name) -> when. Used for delta highlights.
     changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
-    /// The plural name of the resource, used by per-row health heuristics.
-    resource_plural: &'a str,
-}
-
-/// Health assessment for a row, derived from its cell values + resource type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowHealth {
-    /// Healthy / running. Uses normal row style.
-    Normal,
-    /// In-progress state (pending, starting). Uses pending color.
-    Pending,
-    /// Failed / unhealthy. Uses error color.
-    Failed,
+    /// Typed `(namespace, name)` keys per visible row, in the same order
+    /// as `rows`. Used to look up delta highlights in `changed_rows`. The
+    /// widget used to build keys from `row[0]`/`row[1]` but that assumed
+    /// namespace=col0/name=col1, which is wrong for cluster-scoped tables
+    /// (name=col0) and when the NAMESPACE column is hidden. Taking a
+    /// parallel `ObjectKey` slice puts the caller in charge of the typed
+    /// lookup.
+    row_keys: &'a [crate::kube::protocol::ObjectKey],
+    /// Server-computed health per row, used for row coloring. Indexed by
+    /// visible row position (same order as `rows`).
+    row_health: &'a [crate::kube::resources::row::RowHealth],
 }
 
 impl<'a> ResourceTable<'a> {
@@ -168,96 +78,24 @@ impl<'a> ResourceTable<'a> {
             theme,
             marked_visible: &[],
             changed_rows: &EMPTY_MAP,
-            resource_plural: "",
+            row_keys: &[],
+            row_health: &[],
         }
     }
 
-    pub fn resource_plural(mut self, plural: &'a str) -> Self {
-        self.resource_plural = plural;
+    pub fn row_keys(mut self, keys: &'a [crate::kube::protocol::ObjectKey]) -> Self {
+        self.row_keys = keys;
         self
     }
 
-    /// Assess the health of a row based on cell values and resource type.
-    /// Returns `Normal` if no interesting signal is found — caller should
-    /// fall back to the default row style.
-    fn assess_row(&self, row: &[String]) -> RowHealth {
-        let col = |name: &str| -> Option<&str> {
-            self.headers.iter().position(|h| h.eq_ignore_ascii_case(name))
-                .and_then(|i| row.get(i).map(|s| s.as_str()))
-        };
-        match self.resource_plural {
-            "deployments" | "statefulsets" | "replicasets" => {
-                // READY "x/y" — unhealthy if x < y, warning if y == 0.
-                if let Some(ready) = col("READY") {
-                    if let Some((a, b)) = ready.split_once('/') {
-                        let (have, want) = (a.parse::<i64>().ok(), b.parse::<i64>().ok());
-                        if let (Some(have), Some(want)) = (have, want) {
-                            if want == 0 { return RowHealth::Pending; }
-                            if have < want { return RowHealth::Failed; }
-                            return RowHealth::Normal;
-                        }
-                    }
-                }
-            }
-            "daemonsets" => {
-                if let (Some(desired), Some(ready)) = (col("DESIRED"), col("READY")) {
-                    let d = desired.parse::<i64>().ok();
-                    let r = ready.parse::<i64>().ok();
-                    if let (Some(d), Some(r)) = (d, r) {
-                        if d == 0 { return RowHealth::Pending; }
-                        if r < d { return RowHealth::Failed; }
-                    }
-                }
-            }
-            "pods" => {
-                if let Some(status) = col("STATUS") {
-                    match status {
-                        "Running" => return RowHealth::Normal,
-                        "Succeeded" | "Completed" => return RowHealth::Normal,
-                        "Pending" | "ContainerCreating" | "Init" | "PodInitializing" | "Terminating" => {
-                            return RowHealth::Pending;
-                        }
-                        "Failed" | "Error" | "CrashLoopBackOff" | "ImagePullBackOff"
-                        | "ErrImagePull" | "OOMKilled" | "Evicted" => {
-                            return RowHealth::Failed;
-                        }
-                        s if s.starts_with("Init:") && (s.contains("Error") || s.contains("BackOff")) => {
-                            return RowHealth::Failed;
-                        }
-                        s if s.starts_with("Init:") => return RowHealth::Pending,
-                        _ => {}
-                    }
-                }
-            }
-            "nodes" => {
-                if let Some(status) = col("STATUS") {
-                    if status.contains("NotReady") { return RowHealth::Failed; }
-                    if status.contains("SchedulingDisabled") { return RowHealth::Pending; }
-                    if status == "Ready" { return RowHealth::Normal; }
-                }
-            }
-            "jobs" => {
-                if let Some(completions) = col("COMPLETIONS") {
-                    if let Some((a, b)) = completions.split_once('/') {
-                        if a == b && !a.is_empty() { return RowHealth::Normal; }
-                        return RowHealth::Pending;
-                    }
-                }
-            }
-            "portforwards" => {
-                if let Some(state) = col("STATE") {
-                    match state {
-                        "Active" => return RowHealth::Normal,
-                        "Starting" => return RowHealth::Pending,
-                        "Failed" => return RowHealth::Failed,
-                        "Stopped" => return RowHealth::Pending,
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-        RowHealth::Normal
+    pub fn row_health(mut self, health: &'a [crate::kube::resources::row::RowHealth]) -> Self {
+        self.row_health = health;
+        self
+    }
+
+    /// Get the server-computed health for a visible row index.
+    fn health_at(&self, visible_idx: usize) -> crate::kube::resources::row::RowHealth {
+        self.row_health.get(visible_idx).copied().unwrap_or_default()
     }
 
     pub fn marked_visible(mut self, marked: &'a [bool]) -> Self {
@@ -322,9 +160,9 @@ impl<'a> ResourceTable<'a> {
             if !widths.is_empty() && total_needed > 0 {
                 let mut distributed: u32 = 0;
                 let last = widths.len() - 1;
-                for i in 0..last {
-                    let share = ((widths[i] as f64 / total_needed as f64) * remaining as f64) as u32;
-                    widths[i] = (widths[i] as u32 + share).min(usable32) as u16;
+                for w in widths.iter_mut().take(last) {
+                    let share = ((*w as f64 / total_needed as f64) * remaining as f64) as u32;
+                    *w = (*w as u32 + share).min(usable32) as u16;
                     distributed += share;
                 }
                 widths[last] = (widths[last] as u32 + remaining - distributed).min(usable32) as u16;
@@ -537,10 +375,13 @@ impl StatefulWidget for ResourceTable<'_> {
             let is_marked = self.marked_visible.get(row_idx).copied().unwrap_or(false);
 
             // Check if this row has recent changes (delta tracking).
-            // Rows typically have namespace in col 0 and name in col 1.
-            let is_changed = if row.len() >= 2 && !self.changed_rows.is_empty() {
-                let key = crate::kube::protocol::ObjectKey::new(&row[0], &row[1]);
-                self.changed_rows.contains_key(&key)
+            // The key comes from the typed (namespace, name) pair the
+            // caller built from `ResourceRow` — NOT from cell column
+            // offsets, which get confused by cluster-scoped tables and
+            // hidden-NAMESPACE columns.
+            let is_changed = if !self.changed_rows.is_empty() {
+                self.row_keys.get(row_idx)
+                    .is_some_and(|k| self.changed_rows.contains_key(k))
             } else {
                 false
             };
@@ -551,7 +392,7 @@ impl StatefulWidget for ResourceTable<'_> {
             //   3. changed (recent delta)
             //   4. row health (per-resource diagnosis)
             //   5. normal
-            let health = self.assess_row(row);
+            let health = self.health_at(row_idx);
             let row_style = if is_selected {
                 self.theme.selected
             } else if is_marked {
@@ -559,6 +400,7 @@ impl StatefulWidget for ResourceTable<'_> {
             } else if is_changed {
                 self.theme.delta_changed
             } else {
+                use crate::kube::resources::row::RowHealth;
                 match health {
                     RowHealth::Failed => self.theme.status_failed,
                     RowHealth::Pending => self.theme.status_pending,
@@ -581,47 +423,25 @@ impl StatefulWidget for ResourceTable<'_> {
                 buf.set_string(inner.x, y, "\u{25cf}", self.theme.marked_row);
             }
 
+            // Per-cell style follows row style — every cell uses the
+            // typed `row.health` classification computed by the converter
+            // (server-side). Previously this loop did its own
+            // `match cell.as_str()` over 15 hardcoded Pod status strings,
+            // duplicating the classification the server already did.
+            let cell_style = if is_selected {
+                self.theme.selected
+            } else if is_marked {
+                self.theme.marked_row
+            } else {
+                row_style
+            };
+
             let mut cx = inner.x;
             for (col_idx, cell) in row.iter().enumerate() {
                 if col_idx >= col_widths.len() {
                     break;
                 }
                 let w = col_widths[col_idx];
-
-                // For status columns, apply color-coded style (unless selected or marked).
-                let cell_style = if is_selected {
-                    self.theme.selected
-                } else if is_marked {
-                    self.theme.marked_row
-                } else {
-                    match cell.as_str() {
-                        "Running" | "Active" | "Bound" | "Available" | "Ready" | "True" | "Healthy" => {
-                            self.theme.status_running
-                        }
-                        "Pending" | "ContainerCreating" | "Terminating" | "Waiting" | "Init"
-                        | "PodInitializing" => {
-                            self.theme.status_pending
-                        }
-                        "Failed" | "Error" | "CrashLoopBackOff" | "ImagePullBackOff"
-                        | "ErrImagePull" | "OOMKilled" | "False" | "Evicted"
-                        | "CreateContainerConfigError" => self.theme.status_failed,
-                        "Succeeded" | "Completed" => self.theme.status_succeeded,
-                        _ => {
-                            // Fallback: check for init container status patterns
-                            // like "Init:0/1", "Init:Error", "Init:CrashLoopBackOff"
-                            if cell.starts_with("Init:") {
-                                if cell.contains("Error") || cell.contains("CrashLoopBackOff") || cell.contains("BackOff") {
-                                    self.theme.status_failed
-                                } else {
-                                    self.theme.status_pending
-                                }
-                            } else {
-                                row_style
-                            }
-                        }
-                    }
-                };
-
                 let right_align = self.headers.get(col_idx)
                     .map(|h| Self::is_numeric_column(h))
                     .unwrap_or(false);

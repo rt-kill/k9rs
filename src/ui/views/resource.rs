@@ -10,7 +10,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, StatefulTable};
-use crate::kube::protocol::ResourceId;
+use crate::kube::protocol::{OperationKind, ResourceCapabilities};
 
 use crate::ui::header;
 use crate::ui::theme::Theme;
@@ -20,7 +20,10 @@ use crate::ui::widgets::{FilterBar, ResourceTable, ResourceTableState};
 // Key hints (displayed in header center panel)
 // ---------------------------------------------------------------------------
 
-fn key_hints_for_resource(rid: &ResourceId) -> Vec<crate::ui::header::KeyHint> {
+/// Build key hints based on the server-declared capabilities for the
+/// current resource type. Driven entirely by `ResourceCapabilities` —
+/// no static type knowledge needed on the client side.
+fn key_hints_for_resource(caps: &ResourceCapabilities) -> Vec<crate::ui::header::KeyHint> {
     use crate::ui::header::KeyHint;
     let mut hints = vec![
         KeyHint { key: ":", description: "cmd" },
@@ -31,27 +34,32 @@ fn key_hints_for_resource(rid: &ResourceId) -> Vec<crate::ui::header::KeyHint> {
         KeyHint { key: "?", description: "help" },
     ];
     let mut pos = 4;
-    if rid.supports_logs() {
+    if caps.supports(OperationKind::StreamLogs) {
         hints.insert(pos, KeyHint { key: "l", description: "logs" });
         pos += 1;
     }
-    if rid.supports_shell() {
+    if caps.supports(OperationKind::Shell) {
         hints.insert(pos, KeyHint { key: "s", description: "shell" });
         pos += 1;
+    }
+    if caps.supports(OperationKind::PortForward) {
         hints.insert(pos, KeyHint { key: "f", description: "pf" });
         pos += 1;
+    }
+    if caps.supports(OperationKind::PreviousLogs) {
         hints.insert(pos, KeyHint { key: "p", description: "prev-logs" });
         pos += 1;
+    }
+    if caps.supports(OperationKind::ShowNode) {
         hints.insert(pos, KeyHint { key: "o", description: "node" });
         pos += 1;
     }
-    if rid.supports_restart() {
+    if caps.supports(OperationKind::Restart) {
         hints.insert(pos, KeyHint { key: "r", description: "restart" });
         pos += 1;
     }
-    if rid.supports_scale() {
+    if caps.supports(OperationKind::Scale) {
         hints.insert(pos, KeyHint { key: "s", description: "scale" });
-        let _ = pos;
     }
     hints.push(KeyHint { key: "Space", description: "mark" });
     hints.push(KeyHint { key: "q", description: "quit" });
@@ -80,7 +88,8 @@ fn draw_resource_table(
     marked_visible: &[bool],
     display_sort_col: Option<usize>,
     changed_rows: &std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
-    resource_plural: &str,
+    row_keys: &[crate::kube::protocol::ObjectKey],
+    row_health: &[crate::kube::resources::row::RowHealth],
 ) -> (usize, usize) {
     // The widget uses Block::bordered(), so inner height = area.height - 2 (borders).
     // Minus 1 more for the header row.
@@ -91,7 +100,8 @@ fn draw_resource_table(
         .namespace(namespace)
         .marked_visible(marked_visible)
         .changed_rows(changed_rows)
-        .resource_plural(resource_plural);
+        .row_keys(row_keys)
+        .row_health(row_health);
 
     let mut state = ResourceTableState {
         selected,
@@ -116,13 +126,13 @@ fn draw_unified_table(
     f: &mut Frame,
     area: Rect,
     title: &str,
-    resource_plural: &str,
     table: &mut StatefulTable<crate::kube::resources::row::ResourceRow>,
-    namespace: &str,
+    namespace: &crate::kube::protocol::Namespace,
     theme: &Theme,
     descriptor: Option<&crate::app::TableDescriptor>,
     column_level: crate::app::ColumnLevel,
     changed_rows: &std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
+    rid: &crate::kube::protocol::ResourceId,
 ) {
     let display_title = if table.loading {
         format!("{} (loading...)", title)
@@ -131,13 +141,15 @@ fn draw_unified_table(
     };
     let title = &display_title;
 
-    let skip_ns = namespace != "all"
-        && !namespace.is_empty()
-        && descriptor.map_or(false, |d| d.headers.first().map_or(false, |h| h.eq_ignore_ascii_case("NAMESPACE")));
+    // Hide the NAMESPACE column when viewing a single namespace —
+    // `visible_columns` walks columns by name, so the first-column gate the
+    // old code added was redundant (and would have masked any future
+    // descriptor that put NAMESPACE at a non-zero index).
+    let skip_ns = !namespace.is_all();
 
     // Compute which columns (by data index) are visible at the current level.
     let visible: Vec<(usize, &str)> = if let Some(desc) = descriptor {
-        desc.visible_columns(column_level, skip_ns)
+        desc.visible_columns(rid, column_level, skip_ns)
     } else {
         vec![(0, "NAME")]
     };
@@ -153,10 +165,10 @@ fn draw_unified_table(
             crate::util::loading_bar("Loading...")
         };
         let loading_line = Line::from(Span::styled(loading_text, theme.info_value));
-        let title_ns = if !namespace.is_empty() {
-            format!(" {}({})[0]", title.to_lowercase(), namespace)
-        } else {
+        let title_ns = if namespace.is_all() {
             format!(" {}[0]", title.to_lowercase())
+        } else {
+            format!(" {}({})[0]", title.to_lowercase(), namespace.display())
         };
         let block = Block::bordered()
             .title(Span::styled(title_ns, theme.title))
@@ -175,36 +187,24 @@ fn draw_unified_table(
         return;
     }
 
-    // Extract only the visible cells from each row.
-    let rows: Vec<Vec<String>> = table
-        .filtered_indices
-        .iter()
-        .filter_map(|&i| table.items.get(i))
-        .map(|r| {
-            visible_indices.iter()
-                .map(|&ci| r.cells.get(ci).cloned().unwrap_or_default())
-                .collect()
-        })
-        .collect();
+    // Build the parallel arrays the widget needs in one pass inside
+    // StatefulTable — no manual index arithmetic in the render path.
+    let view = table.prepare_view(&visible_indices);
 
-    // Snapshot the table state we need before any mutable touch. This lets
-    // us pass an immutable borrow of `table.marked_visible` into the
-    // renderer alongside the values, then write back the updated offset
-    // and page size after the borrow ends.
     let selected = table.selected;
     let initial_offset = table.offset;
     let sort_ascending = table.sort_ascending;
     let display_sort_col = visible_indices.iter().position(|&i| i == table.sort_column);
     let marked_visible: &[bool] = &table.marked_visible;
 
+    let ns_label = if namespace.is_all() { "" } else { namespace.display() };
     let (new_offset, new_page_size) = draw_resource_table(
-        f, area, title, headers, &rows,
+        f, area, title, headers, &view.rows,
         selected, initial_offset, sort_ascending,
-        namespace, theme,
-        marked_visible, display_sort_col, changed_rows, resource_plural,
+        ns_label, theme,
+        marked_visible, display_sort_col, changed_rows, &view.keys, &view.health,
     );
 
-    // Borrow on `table.marked_visible` ends here — now we can write back.
     table.offset = new_offset;
     table.page_size = new_page_size;
 }
@@ -258,9 +258,9 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
 
     // 1. Header section: 3 columns (only when visible)
     if app.show_header {
-        let current_rid = app.nav.resource_id().clone();
+        let caps = app.current_capabilities();
         header::draw_header(f, app, header_area, theme, |f, area, theme| {
-            draw_key_hints(f, &current_rid, area, theme);
+            draw_key_hints(f, &caps, area, theme);
         });
     }
 
@@ -286,24 +286,23 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     // 4. Resource table. Collect the borrows we need into locals *before*
     // taking the mutable reference to the table so the borrow checker stays
     // happy.
-    let ns = app.selected_ns.display();
+    let ns_display = app.selected_ns.display();
+    let ns = app.selected_ns.clone();
     let cl = app.column_level;
     let current_rid = app.nav.resource_id().clone();
     let title = current_rid.short_label().to_string();
-    let plural = current_rid.plural.clone();
     let desc = app.data.descriptors.get(&current_rid).cloned();
     // Split-borrow `App` at the field level: we need `&mut app.data.unified`
-    // and `&app.changed_rows` simultaneously, and they're disjoint fields.
-    // The borrow checker accepts this because it sees the field paths.
-    let changed_rows = &app.changed_rows;
+    // and `app.deltas` simultaneously, and they're disjoint fields.
+    let changed_rows = app.deltas.changed_rows();
     if let Some(table) = app.data.unified.get_mut(&current_rid) {
-        draw_unified_table(f, table_area, &title, &plural, table, ns, theme, desc.as_ref(), cl, changed_rows);
+        draw_unified_table(f, table_area, &title, table, &ns, theme, desc.as_ref(), cl, changed_rows, &current_rid);
     } else {
         // Table doesn't exist yet (e.g., CRD not yet discovered). Show loading bar.
         let loading_text = crate::util::loading_bar("Loading...");
         let loading_line = Line::from(Span::styled(loading_text, theme.info_value));
-        let title_ns = if !ns.is_empty() {
-            format!(" {}({})[0]", title.to_lowercase(), ns)
+        let title_ns = if !ns_display.is_empty() {
+            format!(" {}({})[0]", title.to_lowercase(), ns_display)
         } else {
             format!(" {}[0]", title.to_lowercase())
         };
@@ -344,8 +343,8 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 /// Center panel: compact key hint grid for the resource view.
-fn draw_key_hints(f: &mut Frame, rid: &ResourceId, area: Rect, theme: &Theme) {
-    let hints = key_hints_for_resource(rid);
+fn draw_key_hints(f: &mut Frame, caps: &ResourceCapabilities, area: Rect, theme: &Theme) {
+    let hints = key_hints_for_resource(caps);
     header::draw_key_hint_grid(f, area, &hints, theme);
 }
 
@@ -369,13 +368,7 @@ pub fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) 
 
     let input = app.input_mode.input().unwrap_or("");
     let ghost: String = app.best_completion()
-        .and_then(|c| {
-            if c.starts_with(input) {
-                Some(c[input.len()..].to_string())
-            } else {
-                None
-            }
-        })
+        .and_then(|c| c.strip_prefix(input).map(str::to_string))
         .unwrap_or_default();
 
     // Fish-style rendering: typed text (bright) followed immediately by ghost

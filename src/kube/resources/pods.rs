@@ -1,15 +1,54 @@
 
 use k8s_openapi::api::core::v1::Pod;
 
-use crate::kube::resources::row::{ContainerInfo, OwnerRefInfo, ResourceRow};
+use crate::kube::resources::row::{ContainerInfo, OwnerRefInfo, ResourceRow, RowHealth};
 
-/// Computes the effective pod status string, mimicking kubectl's logic.
-/// Computes the effective pod status string, matching k9s/kubectl logic.
+/// Pod status display + health, computed together in one pass.
 ///
-/// Handles: NodeLost, SchedulingGated, sidecar init containers, detailed
-/// init error reasons (OOMKilled, Signal:N, ExitCode:N), PodInitializing
-/// filtering, Completed+Running with PodReady check, and proper
-/// deletion timestamp interaction.
+/// Returning both atomically prevents the old bug where `compute_pod_status`
+/// emitted a free-form display string and the caller then re-classified
+/// it via `match effective_status.as_str()` into `RowHealth`. Any string
+/// the builder produced that didn't match the classifier's hardcoded set
+/// silently became `RowHealth::Normal`.
+pub(crate) struct PodStatus {
+    pub display: String,
+    pub health: RowHealth,
+}
+
+impl PodStatus {
+    fn pending(s: impl Into<String>) -> Self {
+        Self { display: s.into(), health: RowHealth::Pending }
+    }
+    fn failed(s: impl Into<String>) -> Self {
+        Self { display: s.into(), health: RowHealth::Failed }
+    }
+}
+
+/// Classify a bare status reason string into a typed health. This is the
+/// SOURCE-OF-TRUTH classifier for K8s container/pod state strings, which
+/// come in from the API as an open-ended set (custom controllers can add
+/// new reasons). Used only during `compute_pod_status` — callers never
+/// re-classify a display string afterwards.
+fn classify_pod_reason(reason: &str) -> RowHealth {
+    match reason {
+        "Running" | "Succeeded" | "Completed" => RowHealth::Normal,
+        "Pending" | "ContainerCreating" | "PodInitializing" | "Terminating"
+        | "SchedulingGated" | "NotReady" | "Unknown" => RowHealth::Pending,
+        "Failed" | "Error" | "CrashLoopBackOff" | "ImagePullBackOff"
+        | "ErrImagePull" | "OOMKilled" | "Evicted" | "NodeLost"
+        | "CreateContainerConfigError" => RowHealth::Failed,
+        // Unknown reason string — treat as pending so the row is visible
+        // but not flagged as healthy. Previously defaulted to Normal which
+        // silently hid misbehaving pods with unusual reasons.
+        _ => RowHealth::Pending,
+    }
+}
+
+/// Computes the effective pod status + health together, matching k9s/kubectl
+/// display logic. Handles: NodeLost, SchedulingGated, sidecar init
+/// containers, detailed init error reasons (OOMKilled, Signal:N, ExitCode:N),
+/// PodInitializing filtering, Completed+Running with PodReady check, and
+/// proper deletion timestamp interaction.
 pub(crate) fn compute_pod_status(
     phase: &str,
     container_statuses: &[k8s_openapi::api::core::v1::ContainerStatus],
@@ -18,11 +57,11 @@ pub(crate) fn compute_pod_status(
     conditions: &[k8s_openapi::api::core::v1::PodCondition],
     reason: &Option<String>,
     has_deletion_timestamp: bool,
-) -> String {
+) -> PodStatus {
     const NODE_UNREACHABLE: &str = "NodeLost";
 
     // Start with the pod-level reason or phase.
-    let mut status = if let Some(r) = reason {
+    let mut status_str = if let Some(r) = reason {
         if !r.is_empty() { r.clone() } else { phase.to_string() }
     } else {
         phase.to_string()
@@ -33,7 +72,7 @@ pub(crate) fn compute_pod_status(
         if cond.type_ == "PodScheduled" {
             if let Some(ref r) = cond.reason {
                 if r == "SchedulingGated" {
-                    status = "SchedulingGated".to_string();
+                    status_str = "SchedulingGated".to_string();
                 }
             }
         }
@@ -46,42 +85,46 @@ pub(crate) fn compute_pod_status(
     for (i, ics) in init_container_statuses.iter().enumerate() {
         let is_sidecar = init_containers_spec.get(i)
             .and_then(|c| c.restart_policy.as_deref())
-            .map_or(false, |p| p == "Always");
+            .is_some_and(|p| p == "Always");
 
         if let Some(ref state) = ics.state {
             if let Some(ref terminated) = state.terminated {
                 if terminated.exit_code == 0 {
                     continue; // Successfully completed init container.
                 }
-                // Non-zero exit: show detailed reason.
+                // Non-zero exit on an init container is always Failed.
                 if let Some(ref r) = terminated.reason {
                     if !r.is_empty() {
-                        return format!("Init:{}", r);
+                        return PodStatus::failed(format!("Init:{}", r));
                     }
                 }
                 if let Some(sig) = terminated.signal {
                     if sig != 0 {
-                        return format!("Init:Signal:{}", sig);
+                        return PodStatus::failed(format!("Init:Signal:{}", sig));
                     }
                 }
-                return format!("Init:ExitCode:{}", terminated.exit_code);
+                return PodStatus::failed(format!("Init:ExitCode:{}", terminated.exit_code));
             } else if let Some(ref waiting) = state.waiting {
                 let reason_str = waiting.reason.as_deref().unwrap_or("");
-                // Filter out "PodInitializing" — show Init:i/n instead.
+                // An init container stuck in an error-typed waiting state
+                // (ImagePullBackOff, CrashLoopBackOff, ErrImagePull, ...) is
+                // Failed — everything else that blocks init progress is
+                // Pending.
                 if !reason_str.is_empty() && reason_str != "PodInitializing" {
-                    return format!("Init:{}", reason_str);
+                    let health = classify_pod_reason(reason_str);
+                    return PodStatus { display: format!("Init:{}", reason_str), health };
                 }
-                return format!("Init:{}/{}", i, total_init);
+                return PodStatus::pending(format!("Init:{}/{}", i, total_init));
             } else if state.running.is_some() {
                 // Sidecar that is started+ready: healthy, skip it.
                 if is_sidecar && ics.ready {
                     continue;
                 }
-                return format!("Init:{}/{}", i, total_init);
+                return PodStatus::pending(format!("Init:{}/{}", i, total_init));
             }
         } else {
             // No state at all — container hasn't started.
-            return format!("Init:{}/{}", i, total_init);
+            return PodStatus::pending(format!("Init:{}/{}", i, total_init));
         }
     }
 
@@ -93,23 +136,23 @@ pub(crate) fn compute_pod_status(
             if let Some(ref waiting) = state.waiting {
                 if let Some(ref r) = waiting.reason {
                     if !r.is_empty() {
-                        status = r.clone();
+                        status_str = r.clone();
                     }
                 }
             } else if let Some(ref terminated) = state.terminated {
                 if let Some(ref r) = terminated.reason {
                     if !r.is_empty() {
-                        status = r.clone();
+                        status_str = r.clone();
                         continue;
                     }
                 }
                 if let Some(sig) = terminated.signal {
                     if sig != 0 {
-                        status = format!("Signal:{}", sig);
+                        status_str = format!("Signal:{}", sig);
                         continue;
                     }
                 }
-                status = format!("ExitCode:{}", terminated.exit_code);
+                status_str = format!("ExitCode:{}", terminated.exit_code);
             } else if state.running.is_some() && cs.ready {
                 has_running = true;
             }
@@ -117,41 +160,48 @@ pub(crate) fn compute_pod_status(
     }
 
     // Completed phase with running+ready containers: check PodReady condition.
-    if status == "Completed" && has_running {
+    if status_str == "Completed" && has_running {
         let pod_ready = conditions.iter().any(|c| c.type_ == "Ready" && c.status == "True");
-        status = if pod_ready { "Running".to_string() } else { "NotReady".to_string() };
+        status_str = if pod_ready { "Running".to_string() } else { "NotReady".to_string() };
     }
 
     // Deletion timestamp handling.
     if has_deletion_timestamp {
         if reason.as_deref() == Some(NODE_UNREACHABLE) {
-            return "Unknown".to_string();
+            return PodStatus::pending("Unknown");
         }
-        return "Terminating".to_string();
+        return PodStatus::pending("Terminating");
     }
 
-    status
+    // Exit code terminated states are always failed — catch them via
+    // classify_pod_reason's default (Pending), then override below.
+    let health = if status_str.starts_with("ExitCode:") || status_str.starts_with("Signal:") {
+        RowHealth::Failed
+    } else {
+        classify_pod_reason(&status_str)
+    };
+    PodStatus { display: status_str, health }
 }
 
 /// Convert a k8s Pod into a generic ResourceRow with containers, labels, and owner refs in extra.
 pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
-    let metadata = pod.metadata;
-    let namespace = metadata.namespace.unwrap_or_default();
-    let name = metadata.name.unwrap_or_default();
-    let labels = metadata.labels.unwrap_or_default();
-    let owner_references: Vec<OwnerRefInfo> = metadata
-        .owner_references
+    // Pods carry two fields no other resource row needs — `owner_references`
+    // (for the owner-chain drill down) and `deletion_timestamp` (for the
+    // Terminating pseudo-status). Pluck them off the owned metadata before
+    // handing the rest to the common extractor, so the pod-specific fields
+    // aren't shoehorned into `CommonMeta`.
+    let mut metadata = pod.metadata;
+    let owner_references: Vec<OwnerRefInfo> = metadata.owner_references.take()
         .unwrap_or_default()
         .into_iter()
-        .map(|or| OwnerRefInfo {
-            api_version: or.api_version,
-            kind: or.kind,
-            name: or.name,
-            uid: or.uid,
-        })
+        .map(|or| OwnerRefInfo { kind: or.kind, name: or.name, uid: or.uid })
         .collect();
-    let deletion_timestamp = metadata.deletion_timestamp;
-    let age = metadata.creation_timestamp.map(|t| t.0);
+    let deletion_timestamp = metadata.deletion_timestamp.take();
+    let meta = crate::kube::resources::CommonMeta::from_k8s(metadata);
+    let namespace = meta.namespace;
+    let name = meta.name;
+    let labels_str = meta.labels_str;
+    let age = meta.age;
 
     let spec = pod.spec.unwrap_or_default();
     // `spec.node_name` is `None` when the pod isn't yet scheduled. Keep
@@ -182,7 +232,7 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
     let init_container_statuses = status.init_container_statuses.unwrap_or_default();
     let conditions = status.conditions.as_deref().unwrap_or(&[]);
 
-    let effective_status = compute_pod_status(
+    let pod_status = compute_pod_status(
         &phase,
         &container_statuses,
         &init_container_statuses,
@@ -191,6 +241,8 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
         &status.reason,
         deletion_timestamp.is_some(),
     );
+    let effective_status = pod_status.display;
+    let health = pod_status.health;
 
     // Ready count: denominator from spec (not status), includes sidecar init containers.
     // This matches k9s which uses spec.containers.len() + sidecar init count.
@@ -202,7 +254,7 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
         .filter(|(i, cs)| {
             cs.ready && init_containers_spec.get(*i)
                 .and_then(|c| c.restart_policy.as_deref())
-                .map_or(false, |p| p == "Always")
+                .is_some_and(|p| p == "Always")
         })
         .count();
     let total = (spec.containers.len() + sidecar_count) as i32;
@@ -214,76 +266,37 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
         .enumerate()
         .filter(|(i, _)| init_containers_spec.get(*i)
             .and_then(|c| c.restart_policy.as_deref())
-            .map_or(false, |p| p == "Always"))
+            .is_some_and(|p| p == "Always"))
         .map(|(_, cs)| cs.restart_count)
         .sum();
     let restarts: i32 = container_statuses.iter().map(|cs| cs.restart_count).sum::<i32>() + sidecar_restarts;
 
     let init_containers: Vec<ContainerInfo> = init_container_statuses
         .iter()
-        .map(|cs| {
-            let state = if let Some(ref s) = cs.state {
-                if s.running.is_some() {
-                    "Running".to_string()
-                } else if let Some(ref w) = s.waiting {
-                    w.reason.clone().unwrap_or_else(|| "Waiting".to_string())
-                } else if let Some(ref t) = s.terminated {
-                    t.reason.clone().unwrap_or_else(|| "Terminated".to_string())
-                } else {
-                    "Unknown".to_string()
-                }
-            } else {
-                "Unknown".to_string()
-            };
-            ContainerInfo {
-                name: format!("init:{}", cs.name),
-                real_name: cs.name.clone(),
-                image: cs.image.clone(),
-                ready: cs.ready,
-                state,
-                restarts: cs.restart_count,
-                ports: vec![],
-            }
+        .map(|cs| ContainerInfo {
+            name: cs.name.clone(),
+            kind: crate::kube::resources::row::ContainerKind::Init,
         })
         .collect();
 
     let regular_containers: Vec<ContainerInfo> = container_statuses
         .iter()
-        .map(|cs| {
-            let state = if let Some(ref s) = cs.state {
-                if s.running.is_some() {
-                    "Running".to_string()
-                } else if let Some(ref w) = s.waiting {
-                    w.reason.clone().unwrap_or_else(|| "Waiting".to_string())
-                } else if let Some(ref t) = s.terminated {
-                    t.reason.clone().unwrap_or_else(|| "Terminated".to_string())
-                } else {
-                    "Unknown".to_string()
-                }
-            } else {
-                "Unknown".to_string()
-            };
-            ContainerInfo {
-                ports: spec_ports.get(&cs.name).cloned().unwrap_or_default(),
-                name: cs.name.clone(),
-                real_name: cs.name.clone(),
-                image: cs.image.clone(),
-                ready: cs.ready,
-                state,
-                restarts: cs.restart_count,
-            }
+        .map(|cs| ContainerInfo {
+            name: cs.name.clone(),
+            kind: crate::kube::resources::row::ContainerKind::Regular,
         })
         .collect();
 
     let mut containers_vec = init_containers;
     containers_vec.extend(regular_containers);
 
-    let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
-    let _ = labels;
-
     // All container ports across all containers — used by port-forward dialog.
-    let pf_ports: Vec<u16> = containers_vec.iter()
-        .flat_map(|c| c.ports.iter().copied())
+    // Drawn directly from the spec (`spec_ports`) since `ContainerInfo` no
+    // longer carries a per-container port list (it was wire-shipped only to
+    // be re-flattened here, dead bytes for every other consumer).
+    let pf_ports: Vec<u16> = container_statuses
+        .iter()
+        .flat_map(|cs| spec_ports.get(&cs.name).cloned().unwrap_or_default())
         .collect();
 
     // QOS class
@@ -310,7 +323,7 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
         if gate_count > 0 {
             let ready_gates = status.conditions.as_ref().map(|conds| {
                 conds.iter().filter(|c| {
-                    spec.readiness_gates.as_ref().map_or(false, |gates| {
+                    spec.readiness_gates.as_ref().is_some_and(|gates| {
                         gates.iter().any(|g| g.condition_type == c.type_ && c.status == "True")
                     })
                 }).count()
@@ -320,6 +333,9 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
             String::new()
         }
     };
+
+    // `health` was computed by `compute_pod_status` above — no string
+    // round-trip re-classification.
 
     ResourceRow {
         cells: vec![
@@ -345,7 +361,7 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
         owner_refs: owner_references,
         pf_ports,
         node,
-        crd_info: None,
-        drill_target: None,
+        health,
+        ..Default::default()
     }
 }

@@ -108,8 +108,8 @@ async fn main() -> Result<()> {
     // resolved values via `AppEvent::KubeconfigLoaded` (fast, from disk) and
     // then `AppEvent::ConnectionEstablished` (authoritative, from the daemon).
     let namespace = cli.namespace.unwrap_or_else(|| "all".to_string());
-    let cli_context = cli.context.clone();
-    let mut app = App::new(String::new(), Vec::new(), namespace);
+    let cli_context: Option<crate::kube::protocol::ContextName> = cli.context.clone().map(Into::into);
+    let mut app = App::new(crate::kube::protocol::ContextName::default(), namespace);
     if cli.readonly {
         app.read_only = true;
     }
@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
     let data_source = ClientSession::new(
         crate::kube::client_session::ConnectionParams {
             context: cli_context.clone(),
-            namespace: app.selected_ns.as_option().map(|s| s.to_string()),
+            namespace: app.selected_ns.clone(),
             readonly: cli.readonly,
             no_daemon: cli.no_daemon,
         },
@@ -175,11 +175,16 @@ async fn main() -> Result<()> {
     // subscription substream immediately. The bridge task inside
     // subscribe_stream awaits the MuxHandle (which becomes available
     // after the connection handshake), so the subscribe fires as soon
-    // as the connection is up. The server auto-subscribes to namespaces
-    // and nodes itself, so we skip those.
+    // as the connection is up. Core resources (namespaces, nodes) are
+    // auto-subscribed by the client via `open_core_subscriptions` on
+    // `ConnectionEstablished`, so we skip them here to avoid opening
+    // a duplicate substream for the same table.
     if app.route == crate::app::Route::Resources {
         let initial_rid = app.nav.resource_id().clone();
-        if initial_rid.plural != "namespaces" && initial_rid.plural != "nodes" {
+        let is_core = initial_rid.built_in_kind()
+            .map(|k| crate::kube::resource_defs::REGISTRY.by_kind(k).is_core())
+            .unwrap_or(false);
+        if !is_core {
             let filter = app.nav.current().filter.as_ref()
                 .and_then(|f| f.to_subscription_filter());
             let stream = data_source.subscribe_stream(initial_rid, app.selected_ns.clone(), filter);
@@ -194,7 +199,7 @@ async fn main() -> Result<()> {
         mpsc::channel::<crossterm::event::Event>(100);
     let (suspend_tx, mut suspend_rx) = tokio::sync::watch::channel(false);
     let (suspend_ack_tx, suspend_ack_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
+    let input_bridge = tokio::spawn(async move {
         let mut event_stream = EventStream::new();
         let mut suspended = false;
         loop {
@@ -247,6 +252,12 @@ async fn main() -> Result<()> {
         suspend_ack_rx,
     )
     .await?;
+
+    // Abort the input bridge so it doesn't outlive session_main. It
+    // usually exits on its own when `input_tx.send()` fails (rx dropped),
+    // but if it's parked inside `event_stream.next()` it can linger
+    // holding the crossterm EventStream after raw mode has been disabled.
+    input_bridge.abort();
 
     // TerminalGuard drops here, restoring the terminal.
     // Print exit message AFTER terminal is restored.

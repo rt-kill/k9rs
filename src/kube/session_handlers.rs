@@ -1,9 +1,24 @@
 
 use crate::app::{App, ContainerRef};
 use crate::app::nav::rid;
-use crate::kube::protocol::ObjectRef;
+use crate::kube::protocol::{self, ObjectRef};
 use crate::kube::client_session::ClientSession;
+use crate::kube::resource_def::BuiltInKind;
 use crate::kube::session::{ds_try, ActionResult, apply_nav_change};
+
+/// Map a container name string from a row to the typed `LogContainer`.
+/// Empty → `Default` (let kubectl pick); a real container name → `Named`.
+/// There's deliberately no `"all"` branch — multi-container streaming is
+/// requested explicitly by the workload-not-Pod path that constructs
+/// `LogContainer::All` directly, never by passing a literal "all" through
+/// here.
+fn log_container_from_str(name: &str) -> protocol::LogContainer {
+    if name.is_empty() {
+        protocol::LogContainer::Default
+    } else {
+        protocol::LogContainer::Named(name.to_string())
+    }
+}
 use crate::kube::session_nav::{
     drill_to_pods_by_labels, drill_to_pods_by_grep, drill_to_pods_by_owner,
     do_switch_namespace, begin_context_switch,
@@ -27,46 +42,81 @@ pub(crate) fn handle_enter(
     }
 
     // Handle ContainerSelect: open logs or shell for the selected container.
-    if let Route::ContainerSelect { ref pod, ref namespace, selected, for_shell } = app.route {
-        let pod_name = pod.clone();
-        let pod_ns = namespace.clone();
-        let container_name = app.data.unified.get(&rid("pods"))
-            .and_then(|t| t.items.iter().find(|p| p.name == pod_name && p.namespace.as_deref() == Some(pod_ns.as_str())))
-            .and_then(|p| p.containers.get(selected).map(|ci| ci.real_name.clone()))
-            .unwrap_or_default();
+    if let Route::ContainerSelect { ref target, selected, action } = app.route {
+        let target = target.clone();
+        // Find the selected container on the live pod row. Lookup by the
+        // typed `ObjectRef`'s (resource, name, namespace) triple — no
+        // flat string re-parse.
+        let pod_ns_str = target.namespace.display().to_string();
+        let container_name = app.data.unified.get(&target.resource)
+            .and_then(|t| t.items.iter().find(|p| {
+                p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
+            }))
+            .and_then(|p| p.containers.get(selected).map(|ci| ci.name.clone()));
 
-        if for_shell {
-            // Shell mode: return ActionResult::Shell so the main loop runs it
+        // If the pod disappeared mid-dialog or the index is out of range,
+        // refuse rather than sending an empty container name (which the
+        // server interprets as "default container" — the user almost
+        // certainly didn't want logs from a different container than the
+        // one they selected).
+        let container_name = match container_name {
+            Some(n) => n,
+            None => {
+                app.flash = Some(crate::app::FlashMessage::error(
+                    format!("Pod {}/{} no longer has a container at index {}", pod_ns_str, target.name, selected)
+                ));
+                app.route = app.route_stack.pop().unwrap_or(Route::Resources);
+                return ActionResult::None;
+            }
+        };
+
+        if matches!(action, crate::app::ContainerAction::Shell) {
+            // Shell mode: return ActionResult::Shell so the main loop runs it.
             app.route = app.route_stack.pop().unwrap_or(Route::Resources);
-            return ActionResult::Shell {
-                pod: pod_name,
-                namespace: pod_ns,
+            return ActionResult::Shell(crate::kube::session::ExecTarget {
+                pod: target.name,
+                namespace: pod_ns_str,
                 container: container_name,
                 context: app.context.clone(),
-            };
+            });
         }
+
+        let previous = matches!(action, crate::app::ContainerAction::PreviousLogs);
 
         app.push_route(app.route.clone());
         let mut log_state = crate::app::LogState::new();
+        log_state.follow = !previous;
         log_state.streaming = true;
         let tail = Some(log_state.tail_lines);
-        app.route = Route::Logs {
-            target: ContainerRef::new(pod_name.clone(), pod_ns.clone(), container_name.clone()),
-            state: Box::new(log_state),
-        };
 
         // Cancel any previous log stream — drop closes the substream.
         *log_stream = None;
 
-        *log_stream = Some(data_source.stream_log_substream(
-            &pod_name,
-            &pod_ns,
-            &container_name,
-            true,  // follow
+        // Create the stream FIRST so we can stamp its generation onto
+        // the new LogState. The receiver gates on `state.generation` and
+        // drops any LogLine that doesn't match — protects against stale
+        // lines from the previous stream's bridge bleeding into this view.
+        let new_stream = data_source.stream_log_substream(crate::kube::protocol::LogInit {
+            pod: target.name.clone(),
+            // Typed namespace survives end-to-end — no `from_row`.
+            namespace: target.namespace.clone(),
+            container: log_container_from_str(&container_name),
+            follow: !previous,
             tail,
-            None,
-            false, // not previous
-        ));
+            since: None,
+            previous,
+        });
+        log_state.generation = new_stream.generation;
+        *log_stream = Some(new_stream);
+
+        app.route = Route::Logs {
+            target: ContainerRef::new(
+                target.name.clone(),
+                pod_ns_str,
+                log_container_from_str(&container_name),
+            ),
+            state: Box::new(log_state),
+        };
         return ActionResult::None;
     }
 
@@ -84,65 +134,59 @@ pub(crate) fn handle_enter(
 
     match row.drill_target.clone() {
         Some(DrillTarget::SwitchNamespace(ns)) => {
-            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(ns.as_str()), log_stream);
+            do_switch_namespace(app, data_source, ns, log_stream);
         }
-        Some(DrillTarget::BrowseCrd { group, version, kind, plural, scope }) => {
-            let crd_rid = ResourceId::new(group, version, kind.clone(), plural, scope);
+        Some(DrillTarget::BrowseCrd(crd_ref)) => {
+            let kind_label = crd_ref.kind.clone();
             let sel = app.data.unified.get(&current_rid).map(|t| t.selected).unwrap_or(0);
             app.nav.save_selected(sel);
-            let change = app.nav.push(crate::app::nav::NavStep {
-                resource: crd_rid,
-                filter: None,
-                saved_selected: 0,
-                filter_input: crate::app::nav::FilterInputState::default(),
-                stream: None,
-            });
+            let change = app.nav.push(crate::app::nav::NavStep::new(
+                ResourceId::Crd(crd_ref),
+                None,
+            ));
             apply_nav_change(app, data_source, change);
-            app.flash = Some(crate::app::FlashMessage::info(format!("Browsing CRD: {}", kind)));
+            app.flash = Some(crate::app::FlashMessage::info(format!("Browsing CRD: {}", kind_label)));
         }
         Some(DrillTarget::PodsByLabels { labels, breadcrumb }) => {
             drill_to_pods_by_labels(app, data_source, labels, &breadcrumb);
         }
         Some(DrillTarget::PodsByOwner { uid, kind, name }) => {
-            drill_to_pods_by_owner(app, data_source, &uid, &kind, &name);
+            drill_to_pods_by_owner(app, data_source, &uid, kind, &name);
         }
-        Some(DrillTarget::PodsByField { field, value, breadcrumb }) => {
+        Some(DrillTarget::PodsByField(selector)) => {
+            let breadcrumb = selector.breadcrumb();
             let sel = app.data.unified.get(&current_rid).map(|t| t.selected).unwrap_or(0);
             app.nav.save_selected(sel);
-            let change = app.nav.push(crate::app::nav::NavStep {
-                resource: rid("pods"),
-                filter: Some(crate::app::nav::NavFilter::Field { field, value }),
-                saved_selected: 0,
-                filter_input: crate::app::nav::FilterInputState::default(),
-                stream: None,
-            });
+            let change = app.nav.push(crate::app::nav::NavStep::new(
+                rid(BuiltInKind::Pod),
+                Some(crate::app::nav::NavFilter::Field(selector)),
+            ));
             apply_nav_change(app, data_source, change);
             app.reapply_nav_filters();
-            app.flash = Some(crate::app::FlashMessage::info(format!("Pods for {}", breadcrumb)));
+            app.flash = Some(crate::app::FlashMessage::info(format!("Pods filtered by {}", breadcrumb)));
         }
         Some(DrillTarget::PodsByNameGrep(name)) => {
             drill_to_pods_by_grep(app, data_source, &name);
         }
-        Some(DrillTarget::JobsByOwner { uid, name }) => {
-            // CronJob → Jobs drill: push jobs filtered by ownerReference UID
-            // of the CronJob. Same mechanism as PodsByOwner but targets jobs.
+        Some(DrillTarget::JobsByOwner { uid, kind, name }) => {
+            // Drill into jobs filtered by ownerReference UID. The
+            // parent `kind` comes from the server — client doesn't
+            // assume it's `CronJob` (even though it is today).
             use crate::app::nav::{NavFilter, NavStep};
             let sel = app.data.unified.get(&current_rid).map(|t| t.selected).unwrap_or(0);
             app.nav.save_selected(sel);
-            let change = app.nav.push(NavStep {
-                resource: rid("jobs"),
-                filter: Some(NavFilter::OwnerChain {
+            let kind_lower = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().kind.to_lowercase();
+            let change = app.nav.push(NavStep::new(
+                rid(BuiltInKind::Job),
+                Some(NavFilter::OwnerChain {
                     uid,
-                    kind: "CronJob".to_string(),
+                    kind,
                     display_name: name.clone(),
                 }),
-                saved_selected: 0,
-                filter_input: crate::app::nav::FilterInputState::default(),
-                stream: None,
-            });
+            ));
             apply_nav_change(app, data_source, change);
             app.reapply_nav_filters();
-            app.flash = Some(crate::app::FlashMessage::info(format!("Jobs for cronjob/{}", name)));
+            app.flash = Some(crate::app::FlashMessage::info(format!("Jobs for {}/{}", kind_lower, name)));
         }
         None => {
             handle_describe(app, data_source);
@@ -220,77 +264,7 @@ pub(crate) fn handle_logs(
     data_source: &mut ClientSession,
     log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) {
-    use crate::app::Route;
-
-    let Some(info) = get_selected_resource_info(app) else { return; };
-    let resource_type = info.resource.display_label().to_string();
-    let name = info.name;
-    let namespace = info.namespace.to_string();
-
-    // The server returns an error or empty stream if there are no pods —
-    // the client doesn't need to gate on deployment "available" state.
-
-    // Detect "is this a pod?" from the current nav resource id directly.
-    // We can't rely on `capabilities().supports(Shell)` because capabilities
-    // arrive asynchronously from the server and may not be set yet when the
-    // user hits `l` immediately after navigating.
-    let is_pod = app.nav.resource_id().plural == "pods";
-
-    // For multi-container pods, open ContainerSelect instead of going straight to logs
-    if is_pod {
-        let container_count = app.data.unified.get(&rid("pods"))
-            .and_then(|t| t.selected_item())
-            .map(|p| p.containers.len())
-            .unwrap_or(0);
-        if container_count > 1 {
-            app.push_route(app.route.clone());
-            app.route = crate::app::Route::ContainerSelect {
-                pod: name.clone(),
-                namespace: namespace.clone(),
-                selected: 0,
-                for_shell: false,
-            };
-            return;
-        }
-    }
-
-    app.push_route(app.route.clone());
-
-    // Build the kubectl target and container depending on the resource type.
-    // For pods, target the pod directly with -c <container>.
-    // For workloads (deployments, statefulsets, etc.), use "type/name" with --all-containers.
-    let (log_target, route_pod, route_container) = if is_pod {
-        let container = app.data.unified.get(&rid("pods"))
-            .and_then(|t| t.selected_item())
-            .and_then(|p| p.containers.first().map(|ci| ci.real_name.clone()))
-            .unwrap_or_default();
-        (name.clone(), name.clone(), container)
-    } else {
-        let target = format!("{}/{}", resource_type, name);
-        (target.clone(), target, "all".to_string())
-    };
-
-    let mut log_state = crate::app::LogState::new();
-    log_state.streaming = true;
-    let tail = Some(log_state.tail_lines);
-
-    app.route = Route::Logs {
-        target: ContainerRef::new(route_pod, namespace.clone(), route_container.clone()),
-        state: Box::new(log_state),
-    };
-
-    // Cancel any previous log stream — drop closes the substream.
-    *log_stream = None;
-
-    *log_stream = Some(data_source.stream_log_substream(
-        &log_target,
-        &namespace,
-        &route_container,
-        true,  // follow
-        tail,
-        None,
-        false, // not previous
-    ));
+    open_logs(app, data_source, log_stream, false);
 }
 
 pub(crate) fn handle_previous_logs(
@@ -298,50 +272,99 @@ pub(crate) fn handle_previous_logs(
     data_source: &mut ClientSession,
     log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) {
+    open_logs(app, data_source, log_stream, true);
+}
+
+/// Core log-open flow shared by live and previous-logs actions. `previous=false`
+/// opens a follow-mode stream, `previous=true` opens a static tail of the
+/// previous container incarnation. Multi-container pods route through
+/// [`Route::ContainerSelect`] with a matching [`crate::app::ContainerAction`]
+/// variant so the picker remembers which flow the user chose.
+fn open_logs(
+    app: &mut App,
+    data_source: &mut ClientSession,
+    log_stream: &mut Option<crate::kube::client_session::LogStream>,
+    previous: bool,
+) {
     use crate::app::Route;
 
     let Some(info) = get_selected_resource_info(app) else { return; };
-    let resource_type = info.resource.display_label().to_string();
-    let name = info.name;
-    let namespace = info.namespace.to_string();
+    let name = info.name.clone();
+    // `info.namespace` is the typed `Namespace`. Keep it typed for `LogInit`;
+    // separately materialize a display string for `ContainerRef` (which
+    // stores a *location* string, not a selection).
+    let namespace_typed = info.namespace.clone();
+    let namespace_display = namespace_typed.display().to_string();
+
+    // Typed kind check — `built_in_kind() == Pod` is the actual semantic
+    // we want, not "this resource has Shell capability". The two happened
+    // to coincide because Pod is the only Shellable built-in, but coupling
+    // log routing to a marker trait would silently break if a future
+    // resource gained Shell support.
+    let is_pod = info.resource.built_in_kind() == Some(BuiltInKind::Pod);
+
+    // Multi-container pods route through the container picker. The picker
+    // re-enters this flow via the `Route::ContainerSelect` branch of
+    // `handle_enter_key` which threads `previous` through from the
+    // ContainerAction variant.
+    if is_pod {
+        let container_count = app.data.unified.get(&rid(BuiltInKind::Pod))
+            .and_then(|t| t.selected_item())
+            .map(|p| p.containers.len())
+            .unwrap_or(0);
+        if container_count > 1 {
+            app.push_route(app.route.clone());
+            app.route = Route::ContainerSelect {
+                target: info.clone(),
+                selected: 0,
+                action: if previous {
+                    crate::app::ContainerAction::PreviousLogs
+                } else {
+                    crate::app::ContainerAction::Logs
+                },
+            };
+            return;
+        }
+    }
 
     app.push_route(app.route.clone());
 
-    // Build the kubectl target and container depending on the resource type.
-    let is_pod = app.nav.resource_id().plural == "pods";
+    // For pods, log the (single) container directly. For workloads, use the
+    // typed `kubectl_target()` ("deployment/foo") and stream all containers.
     let (log_target, route_pod, route_container) = if is_pod {
-        let container = app.data.unified.get(&rid("pods"))
+        let container = app.data.unified.get(&rid(BuiltInKind::Pod))
             .and_then(|t| t.selected_item())
-            .and_then(|p| p.containers.first().map(|ci| ci.real_name.clone()))
+            .and_then(|p| p.containers.first().map(|ci| ci.name.clone()))
             .unwrap_or_default();
-        (name.clone(), name.clone(), container)
+        (name.clone(), name.clone(), log_container_from_str(&container))
     } else {
-        let target = format!("{}/{}", resource_type, name);
-        (target.clone(), target, "all".to_string())
+        let target = info.kubectl_target();
+        (target.clone(), target, protocol::LogContainer::All)
     };
 
     let mut log_state = crate::app::LogState::new();
-    log_state.follow = false; // previous logs are static
+    log_state.follow = !previous;
     log_state.streaming = true;
-    let tail_lines = log_state.tail_lines;
+    let tail = Some(log_state.tail_lines);
 
-    app.route = Route::Logs {
-        target: ContainerRef::new(route_pod, namespace.clone(), route_container.clone()),
-        state: Box::new(log_state),
-    };
-
-    // Cancel any previous log stream — drop closes the substream.
     *log_stream = None;
 
-    *log_stream = Some(data_source.stream_log_substream(
-        &log_target,
-        &namespace,
-        &route_container,
-        false, // no follow for previous logs
-        Some(tail_lines), // always tail for previous logs
-        None,  // no --since for previous logs
-        true,  // --previous
-    ));
+    let new_stream = data_source.stream_log_substream(protocol::LogInit {
+        pod: log_target.clone(),
+        namespace: namespace_typed,
+        container: route_container.clone(),
+        follow: !previous,
+        tail,
+        since: None,
+        previous,
+    });
+    log_state.generation = new_stream.generation;
+    *log_stream = Some(new_stream);
+
+    app.route = Route::Logs {
+        target: ContainerRef::new(route_pod, namespace_display, route_container),
+        state: Box::new(log_state),
+    };
 }
 
 /// Build a tab-separated text dump of the currently visible resource table.
@@ -349,10 +372,9 @@ pub(crate) fn handle_previous_logs(
 pub(crate) fn build_table_dump(app: &App) -> String {
     let current_rid = app.nav.resource_id();
     if let Some(table) = app.data.unified.get(current_rid) {
-        let ns = app.selected_ns.display();
-        let skip_ns = ns != "all" && !ns.is_empty();
+        let skip_ns = !app.selected_ns.is_all();
         let visible = app.data.descriptors.get(current_rid)
-            .map(|d| d.visible_columns(app.column_level, skip_ns))
+            .map(|d| d.visible_columns(current_rid, app.column_level, skip_ns))
             .unwrap_or_default();
         let visible_indices: Vec<usize> = visible.iter().map(|&(i, _)| i).collect();
         let headers: String = visible.iter().map(|&(_, name)| name).collect::<Vec<_>>().join("\t");
@@ -380,21 +402,18 @@ pub(crate) fn build_table_dump(app: &App) -> String {
 /// confirming "scale to current = no-op" by hitting Enter.
 pub(crate) fn build_scale_form(target: ObjectRef) -> crate::app::FormDialog {
     use crate::app::{FormDialog, FormFieldKind, FormFieldState};
-    use crate::kube::protocol::OperationKind;
 
     let title = format!("Scale: {}/{}", target.resource.display_label(), target.name);
-    let subtitle = if target.namespace.display().is_empty() {
-        String::new()
-    } else {
-        format!("namespace: {}", target.namespace.display())
-    };
+    // Namespace::display() is never empty — Named carries a non-empty string
+    // and All renders as "all". Show "all" verbatim so the user sees scope.
+    let subtitle = format!("namespace: {}", target.namespace.display());
     FormDialog {
-        kind: OperationKind::Scale,
+        kind: crate::app::FormKind::Scale,
         title,
         subtitle,
         target,
         fields: vec![FormFieldState {
-            name: "replicas".into(),
+            name: crate::kube::protocol::form_field_name::REPLICAS.into(),
             label: "Replicas".into(),
             kind: FormFieldKind::Number { min: 0, max: 1_000_000 },
             value: String::new(),
@@ -407,11 +426,11 @@ pub(crate) fn build_scale_form(target: ObjectRef) -> crate::app::FormDialog {
 /// Returns `None` if the current resource type doesn't support
 /// port-forwarding or if no row is selected.
 ///
-/// The schema declared in `ResourceCapabilities` for `PortForward` is the
-/// starting point — we read the field names/types from there and then
-/// augment them with row-specific data: `container_port` becomes a Select
-/// over `row.pf_ports` (if non-empty), and both ports default to the first
-/// available container port.
+/// Field shapes (`container_port`, `local_port`) are decided here from the
+/// row context: `container_port` is a Select over `row.pf_ports` when the
+/// pod exposes ports, both fields default to the first available port.
+/// Field name strings come from the `form_field_name` constants so the
+/// submit dispatcher and the form builder share a single source of truth.
 pub(crate) fn resolve_port_forward_dialog(app: &App) -> Option<crate::app::FormDialog> {
     use crate::app::{FormDialog, FormFieldKind, FormFieldState};
     use crate::kube::protocol::{Namespace, OperationKind};
@@ -436,24 +455,24 @@ pub(crate) fn resolve_port_forward_dialog(app: &App) -> Option<crate::app::FormD
     } else {
         format!("namespace: {}", ns)
     };
-    let target_ref = ObjectRef::new(rid_key, row.name.clone(), Namespace::from(ns.as_str()));
+    let target_ref = ObjectRef::new(rid_key, row.name.clone(), Namespace::from_row(ns.as_str()));
 
     // container_port: Select if we know the available ports, plain Port
     // input otherwise. The initial value is the index of the first option.
     let container_field = if ports.is_empty() {
         FormFieldState {
-            name: "container_port".into(),
+            name: crate::kube::protocol::form_field_name::CONTAINER_PORT.into(),
             label: "Container port".into(),
             kind: FormFieldKind::Port,
             value: first_port.to_string(),
         }
     } else {
-        let options: Vec<(String, String)> = ports
+        let options: Vec<crate::app::SelectOption> = ports
             .iter()
-            .map(|p| (p.to_string(), p.to_string()))
+            .map(|p| crate::app::SelectOption::new(p.to_string(), p.to_string()))
             .collect();
         FormFieldState {
-            name: "container_port".into(),
+            name: crate::kube::protocol::form_field_name::CONTAINER_PORT.into(),
             label: "Container port".into(),
             kind: FormFieldKind::Select { options },
             value: "0".into(),
@@ -461,14 +480,14 @@ pub(crate) fn resolve_port_forward_dialog(app: &App) -> Option<crate::app::FormD
     };
 
     let local_field = FormFieldState {
-        name: "local_port".into(),
+        name: crate::kube::protocol::form_field_name::LOCAL_PORT.into(),
         label: "Local port".into(),
         kind: FormFieldKind::Port,
         value: first_port.to_string(),
     };
 
     Some(FormDialog {
-        kind: OperationKind::PortForward,
+        kind: crate::app::FormKind::PortForward,
         title,
         subtitle,
         target: target_ref,
@@ -487,7 +506,7 @@ pub(crate) fn get_selected_resource_info(app: &App) -> Option<ObjectRef> {
     Some(ObjectRef::new(
         current_rid,
         item.name().to_string(),
-        Namespace::from(item.namespace()),
+        Namespace::from_row(item.namespace()),
     ))
 }
 
@@ -506,7 +525,7 @@ pub(crate) fn get_marked_resource_infos(app: &App) -> Vec<ObjectRef> {
                 result.push(ObjectRef::new(
                     current_rid.clone(),
                     item.name().to_string(),
-                    Namespace::from(item.namespace()),
+                    Namespace::from_row(item.namespace()),
                 ));
             }
         }

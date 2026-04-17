@@ -1,6 +1,20 @@
+/// Which column the user wants to sort by. Replaces the prior
+/// `Action::Sort(usize)` + `usize::MAX` sentinel for "last column" — the
+/// dispatcher branches on the variant instead of comparing to a magic
+/// integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortTarget {
+    /// Sort by the column at the given data index.
+    Column(usize),
+    /// Sort by the last column of the current table (e.g. AGE). Resolved
+    /// at apply time using the actual table width — `usize::MAX` no
+    /// longer leaks into the action layer.
+    Last,
+}
+
 /// Represents every discrete user action that the application can handle.
-/// Actions are produced by the event handler (key/mouse -> Action mapping)
-/// and consumed by the application state machine.
+/// Actions are produced by the event handler (keystroke → Action mapping;
+/// k9rs is keyboard-only) and consumed by the application state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Quit the application.
@@ -60,7 +74,7 @@ pub enum Action {
     /// Switch to a different namespace ("all" for all namespaces).
     SwitchNamespace(crate::kube::protocol::Namespace),
     /// Switch to a different Kubernetes context.
-    SwitchContext(String),
+    SwitchContext(crate::kube::protocol::ContextName),
     /// Restart the selected deployment/statefulset/daemonset.
     Restart,
     /// Set up port-forwarding for the selected resource (Shift+F).
@@ -69,8 +83,6 @@ pub enum Action {
     ShowPortForwards,
     /// Toggle the header row visibility.
     ToggleHeader,
-    /// Toggle full-fetch mode (wait for complete list vs incremental loading).
-    ToggleFullFetch,
     /// Force-refresh the current resource data.
     Refresh,
     /// Copy the selected item or content to the system clipboard.
@@ -83,8 +95,8 @@ pub enum Action {
     CommandMode,
     /// Toggle the Yes/No selection in the confirmation dialog.
     ToggleDialogButton,
-    /// Sort by column index.
-    Sort(usize),
+    /// Sort by a specific column.
+    Sort(SortTarget),
     /// Toggle ascending/descending sort direction on the current column.
     ToggleSortDirection,
     /// Begin search in YAML/describe view.
@@ -138,7 +150,26 @@ pub enum Action {
 }
 
 impl Action {
-    /// Whether this action mutates cluster state (requires write access).
+    /// Whether this action should be blocked in readonly mode with a local
+    /// "Read-only mode" flash, BEFORE the wire round-trip.
+    ///
+    /// This is a strict **superset** of the server-side classification in
+    /// `SessionCommand::is_mutating`:
+    ///
+    /// - `Shell` and `DecodeSecret` aren't mutations on the server (exec
+    ///   can mutate but isn't gated; decode is a pure read). They're here
+    ///   because "readonly mode" in the TUI is a user-facing stance about
+    ///   *what the user wants to do*, not about what the wire command is —
+    ///   readonly users don't want pop-up shells, and decoded secret values
+    ///   shouldn't appear at all.
+    /// - `Edit` is a local action that may trigger an `Apply` later; we
+    ///   reject it up front before launching `$EDITOR` rather than after.
+    ///
+    /// The authoritative readonly gate lives on the server
+    /// (`SessionCommand::is_mutating` + the centralized check in
+    /// `handle_command`). If this list ever falls out of sync, the server
+    /// still refuses — this check is UX polish to give instant feedback
+    /// without a round-trip, not a second source of truth.
     pub fn is_mutating(&self) -> bool {
         matches!(
             self,

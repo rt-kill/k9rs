@@ -127,10 +127,10 @@ fn draw_context_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         let is_selected = vi + offset == selected;
 
         let current_marker = if ctx.is_current { "\u{2713}" } else { " " };
-        let cluster_display = if ctx.cluster.is_empty() {
-            ctx.name.clone()
+        let cluster_display: String = if ctx.identity.cluster.is_empty() {
+            ctx.name.to_string()
         } else {
-            ctx.cluster.clone()
+            ctx.identity.cluster.clone()
         };
         let line_text = format!(
             " {} {:<nw$} {:<cw$}",

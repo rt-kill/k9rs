@@ -8,6 +8,7 @@ use ratatui::{
 
 use crate::app::{App, InputMode};
 use crate::app::nav::rid;
+use crate::kube::resource_def::BuiltInKind;
 use crate::ui::header;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::TabBar;
@@ -66,36 +67,38 @@ pub fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
-    let nodes_table = app.data.unified.get(&rid("nodes"));
+    use crate::kube::resources::row::RowHealth;
+    let nodes_table = app.data.unified.get(&rid(BuiltInKind::Node));
     let node_count = nodes_table.map(|t| t.items.len()).unwrap_or(0);
+    // Use the typed `row.health` field instead of substring-matching on
+    // the STATUS cell — the converter already classified the node, and
+    // coupling the overview to the cell column order would silently
+    // break if the node row schema changed.
     let node_ready = nodes_table.map(|t| t.items.iter()
-        .filter(|row| {
-            // STATUS is column 1 in the node row
-            row.cells.get(1).map_or(false, |s| s.contains("Ready") && !s.contains("NotReady"))
-        })
+        .filter(|row| matches!(row.health, RowHealth::Normal))
         .count()).unwrap_or(0);
     let node_not_ready = node_count - node_ready;
-    let ns_count = app.data.unified.get(&rid("namespaces"))
+    let ns_count = app.data.unified.get(&rid(BuiltInKind::Namespace))
         .map(|t| t.items.len()).unwrap_or(0);
 
-    let mut lines: Vec<Line> = Vec::new();
-
     // Big centered title
-    lines.push(Line::from(""));
-    lines.push(Line::from(""));
-    lines.push(Line::from(
-        Span::styled("k9rs", theme.title.add_modifier(Modifier::BOLD))
-    ).alignment(Alignment::Center));
-    lines.push(Line::from(
-        Span::styled("Kubernetes TUI", theme.info_label)
-    ).alignment(Alignment::Center));
-    lines.push(Line::from(""));
-    lines.push(Line::from(""));
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(""),
+        Line::from(
+            Span::styled("k9rs", theme.title.add_modifier(Modifier::BOLD))
+        ).alignment(Alignment::Center),
+        Line::from(
+            Span::styled("Kubernetes TUI", theme.info_label)
+        ).alignment(Alignment::Center),
+        Line::from(""),
+        Line::from(""),
+    ];
 
     // Cluster info — centered block
-    let ctx_display = if app.context.is_empty() { "connecting…" } else { &app.context };
-    let cluster_display = if app.cluster.is_empty() { "n/a" } else { &app.cluster };
-    let user_display = if app.user.is_empty() { "n/a" } else { &app.user };
+    let ctx_display = if app.context.is_empty() { "connecting…" } else { app.context.as_str() };
+    let cluster_display = if app.identity.cluster.is_empty() { "n/a" } else { &app.identity.cluster };
+    let user_display = if app.identity.user.is_empty() { "n/a" } else { &app.identity.user };
     let ctx_line = format!("Context: {}  |  Cluster: {}  |  User: {}", ctx_display, cluster_display, user_display);
     lines.push(Line::from(
         Span::styled(ctx_line, theme.info_value)

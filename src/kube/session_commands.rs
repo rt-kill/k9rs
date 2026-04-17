@@ -8,7 +8,7 @@ use crate::kube::protocol::ResourceId;
 /// Build `kubectl exec -it` args for shelling into a container.
 /// Uses `sh -c "command -v bash && exec bash || exec sh"` (same as k9s)
 /// so it works regardless of where bash/sh are installed.
-pub(crate) fn build_shell_args(pod: &str, namespace: &str, container: &str, context: &str) -> Vec<String> {
+pub(crate) fn build_shell_args(pod: &str, namespace: &str, container: &str, context: &crate::kube::protocol::ContextName) -> Vec<String> {
     let mut args = vec![
         "exec".to_string(),
         "-it".to_string(),
@@ -20,7 +20,7 @@ pub(crate) fn build_shell_args(pod: &str, namespace: &str, container: &str, cont
     ];
     if !context.is_empty() {
         args.push("--context".to_string());
-        args.push(context.to_string());
+        args.push(context.as_str().to_string());
     }
     args.push("--".to_string());
     args.push("sh".to_string());
@@ -29,12 +29,29 @@ pub(crate) fn build_shell_args(pod: &str, namespace: &str, container: &str, cont
     args
 }
 
-/// Suspend the TUI and run an interactive command directly (with bash->sh fallback for shell).
+/// What kind of interactive command we're about to suspend the TUI for.
+/// Determines pre-launch UI (the "Connecting…" box for shells) and
+/// post-launch failure handling. Replaces the previous trick of inspecting
+/// `args.first() == "exec"` to guess the kind from argv.
+pub(crate) enum InteractiveKind {
+    /// `kubectl exec -it pod -c container -- ...`. Shows a centered
+    /// "Connecting…" box and reports a flash on non-zero exit.
+    Shell { pod: String, container: String },
+    /// `$EDITOR /tmp/k9rs-edit-...`. No connecting box, no flash on
+    /// non-zero exit (the edit flow surfaces its own errors).
+    Editor,
+}
+
+/// Suspend the TUI and run an interactive command directly (with bash->sh
+/// fallback for shell). The caller hands in a typed `InteractiveKind` so
+/// this function doesn't have to inspect `args` to guess what it's about
+/// to launch.
 pub(crate) async fn run_interactive_local(
     terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
     app: &mut App,
     command: &str,
     args: &[String],
+    kind: InteractiveKind,
     input_suspend: &tokio::sync::watch::Sender<bool>,
     input_suspend_ack: &mut mpsc::Receiver<()>,
 ) -> Result<()> {
@@ -55,22 +72,16 @@ pub(crate) async fn run_interactive_local(
         LeaveAlternateScreen,
     )?;
 
-    let is_shell = args.first().map_or(false, |a| a == "exec");
-
-    if is_shell {
-        let pod = args.get(2).map(|s| s.as_str()).unwrap_or("?");
-        let container = args.iter()
-            .position(|a| a == "-c")
-            .and_then(|i| args.get(i + 1))
-            .map(|s| s.as_str())
-            .unwrap_or("?");
+    if let InteractiveKind::Shell { pod, container } = &kind {
         let msg = format!("{}/{}", pod, container);
         // Clear screen and show a centered connecting box.
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         print!("\x1b[2J\x1b[H");
         let box_w = msg.len() + 6;
         let x = (cols as usize).saturating_sub(box_w) / 2;
-        let y = (rows as usize) / 2 - 1;
+        // Saturating subtraction guards against tiny terminals where
+        // `rows < 2` would otherwise underflow usize.
+        let y = ((rows as usize) / 2).saturating_sub(1);
         let pad = " ".repeat(x);
         let top = format!("{}┌{}┐", pad, "─".repeat(box_w));
         let mid = format!("{}│  {}  │", pad, msg);
@@ -83,17 +94,35 @@ pub(crate) async fn run_interactive_local(
         println!("{}", bot);
     }
 
-    let mut cmd = std::process::Command::new(command);
-    cmd.args(args);
-    let status = cmd.status();
+    // Run the subprocess on a blocking thread so the tokio runtime's
+    // worker threads stay unblocked. The blocking call is unavoidable:
+    // `$EDITOR` and `kubectl exec -it` both want a real terminal, so
+    // this is a full tokio::process::Command::status().await away (mode
+    // switching on our terminal) and in practice the TUI is suspended
+    // anyway — but parking an async worker thread can still stall
+    // background tasks on the same runtime (watchers, metrics polling).
+    // `spawn_blocking` puts this on the blocking pool where it belongs.
+    let command_owned = command.to_string();
+    let args_owned: Vec<String> = args.to_vec();
+    let status = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(command_owned);
+        cmd.args(args_owned);
+        cmd.status()
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        // spawn_blocking only fails if the task panicked. Surface it as
+        // an IO error so the existing match-on-Result logic handles it.
+        Err(std::io::Error::other(join_err.to_string()))
+    });
 
     // Report shell failures (the smart shell command already tries bash then sh).
-    if is_shell {
-        if status.is_err() || status.as_ref().map_or(false, |s| !s.success()) {
-            app.flash = Some(crate::app::FlashMessage::error(
-                "Shell failed — no shell available in container".to_string(),
-            ));
-        }
+    if matches!(kind, InteractiveKind::Shell { .. })
+        && (status.is_err() || status.as_ref().is_ok_and(|s| !s.success()))
+    {
+        app.flash = Some(crate::app::FlashMessage::error(
+            "Shell failed — no shell available in container".to_string(),
+        ));
     }
 
     // Resume TUI — restore raw mode and alternate screen.
@@ -111,42 +140,172 @@ pub(crate) async fn run_interactive_local(
     Ok(())
 }
 
-/// A parsed command that targets a resource tab with a filter or namespace.
-pub(crate) struct ParsedResourceCommand {
-    pub(crate) rid: ResourceId,
-    pub(crate) argument: String,
+/// A classified `:command`. Produced by [`parse_command_input`] and
+/// consumed by [`handle_command_submit`]. The grammar priority is
+/// expressed inside the parser; the dispatcher is a single exhaustive
+/// match on this enum, so reordering two rules is a one-line change in
+/// the parser and the dispatcher is drift-free.
+///
+/// The variants are ordered by priority in [`parse_command_input`] —
+/// listing them in the same order here makes the grammar self-documenting.
+pub(crate) enum ParsedCommand {
+    /// `:q`, `:quit`, `:exit`, `:q!`
+    Quit,
+    /// `:help`, `:h`, `:?`
+    Help,
+    /// `:alias`, `:aliases`, `:a`
+    Aliases,
+    /// `:overview`, `:home`
+    Overview,
+    /// `:ctx`, `:context`, `:contexts`
+    ContextList,
+    /// `:ctx <name>`, `:context <name>`
+    ContextSwitch(crate::kube::protocol::ContextName),
+    /// `:ns <name>`, `:namespace <name>`
+    NamespaceSwitch(crate::kube::protocol::Namespace),
+    /// `:pods /Nginx` — drill into a resource tab with a grep filter.
+    /// Matched before `ResourceInNamespace` so `pods /Nginx` never parses
+    /// as namespace `/Nginx`.
+    ResourceFilter { rid: ResourceId, filter: String },
+    /// `:deploy kube-system` — browse a resource in a specific namespace.
+    ResourceInNamespace { rid: ResourceId, namespace: crate::kube::protocol::Namespace },
+    /// `:pods` — plain resource alias.
+    Resource(ResourceId),
+    /// `:clickhouseinstallation prod` — namespaced CRD with namespace arg.
+    CrdInNamespace { crd: crate::app::CrdInfo, namespace: crate::kube::protocol::Namespace },
+    /// Fallback: anything that isn't a recognized shape. The dispatcher
+    /// tries to resolve it as a known CRD via discovery cache, then falls
+    /// back to a typed unresolved placeholder the daemon can resolve.
+    CrdCandidate(String),
 }
 
-/// Parse commands like "deploy /nginx" -> resource + filter text.
-pub(crate) fn parse_resource_filter_command(cmd: &str) -> Option<ParsedResourceCommand> {
-    let (resource_part, filter_part) = if let Some(slash_pos) = cmd.find('/') {
-        let r = cmd[..slash_pos].trim();
-        let f = cmd[slash_pos + 1..].trim();
-        (r, f)
-    } else {
-        return None;
-    };
+/// Classify a `:command` string into a [`ParsedCommand`]. The caller
+/// passes both the raw case-preserving string (for filter text that must
+/// keep its case) and the lowercased form (for alias matching). `app`
+/// is threaded in for the CRD-discovery lookup.
+///
+/// Rule ordering is expressed here in one linear function: whichever
+/// rule matches first wins. The most common source of bugs in the old
+/// else-if chain was reordering pairs of rules without realizing one
+/// intercepted the other's input shape (pass 11 caught exactly this
+/// between `resource filter` and `resource ns`). Extracting the grammar
+/// into a single function makes the ordering visible at a glance and
+/// testable in isolation.
+pub(crate) fn parse_command_input(raw_cmd: &str, cmd: &str, app: &App) -> ParsedCommand {
+    // 1. Static command words.
+    if matches!(cmd, "q" | "quit" | "exit" | "q!") { return ParsedCommand::Quit; }
+    if matches!(cmd, "help" | "h" | "?") { return ParsedCommand::Help; }
+    if matches!(cmd, "alias" | "aliases" | "a") { return ParsedCommand::Aliases; }
+    if matches!(cmd, "overview" | "home") { return ParsedCommand::Overview; }
+    if matches!(cmd, "ctx" | "context" | "contexts") { return ParsedCommand::ContextList; }
+
+    // 2. `:ctx <name>` / `:context <name>`. The prefix lives in `cmd` (the
+    // lowercased form) so alias matching is case-insensitive, but the
+    // *value* comes from `raw_cmd` so context names keep their case.
+    // Slicing `raw_cmd` by the ASCII prefix length is safe (the prefix
+    // is always ASCII; it doesn't shift under lowercasing).
+    if let Some(value) = strip_ascii_prefix(raw_cmd, cmd, &["ctx ", "context "]) {
+        return ParsedCommand::ContextSwitch(value.into());
+    }
+
+    // 3. `:ns <name>` / `:namespace <name>`. Same case-preserving slice.
+    if let Some(value) = strip_ascii_prefix(raw_cmd, cmd, &["ns ", "namespace "]) {
+        return ParsedCommand::NamespaceSwitch(
+            crate::kube::protocol::Namespace::from_user_command(value),
+        );
+    }
+
+    // 4. Plain resource alias (bare `:pods`, `:deploy`, etc.). Matches
+    // before multi-token shapes because a single-token alias can't hit
+    // any of them (none have a space).
+    if let Some(rid) = ResourceId::from_alias(cmd) {
+        return ParsedCommand::Resource(rid);
+    }
+
+    // 5. `<resource> /<filter>` — resource drill with grep filter. Runs
+    // BEFORE the `<resource> <ns>` rule below so `pods /Nginx` never
+    // parses as namespace `/Nginx`. Uses the *raw* command so the filter
+    // text keeps its case (smartcase regex).
+    if let Some(parsed) = parse_resource_filter(raw_cmd) {
+        return ParsedCommand::ResourceFilter { rid: parsed.0, filter: parsed.1 };
+    }
+
+    // 6. `<resource> <ns>` — browse a resource in a specific namespace.
+    // Rejects values starting with `/` (those would have matched rule 5)
+    // and cluster-scoped resources (which have no namespace concept).
+    if let Some(parsed) = parse_resource_in_namespace(cmd) {
+        return ParsedCommand::ResourceInNamespace { rid: parsed.0, namespace: parsed.1 };
+    }
+
+    // 7. `<crd> <ns>` — namespaced CRD browse. Consults the runtime
+    // discovery cache on `app`.
+    if let Some(parsed) = parse_crd_in_namespace(cmd, app) {
+        return ParsedCommand::CrdInNamespace { crd: parsed.0, namespace: parsed.1 };
+    }
+
+    // 8. Fallback: treat as a CRD name. The dispatcher resolves via the
+    // discovery cache, or falls back to a typed unresolved placeholder.
+    ParsedCommand::CrdCandidate(cmd.to_string())
+}
+
+/// Internal: check if `cmd` (the lowercased form) starts with any of
+/// `prefixes`, and if so, return the corresponding tail of `raw_cmd`
+/// (the case-preserving form) with surrounding whitespace trimmed.
+///
+/// All prefixes must be ASCII. That's the load-bearing invariant: ASCII
+/// lowercasing is a byte-for-byte no-op, so slicing `raw_cmd` at the
+/// same offset that matched in `cmd` lands at the exact same character.
+/// If a prefix contained non-ASCII, lowercasing could change its byte
+/// length and the slice would point into the middle of a UTF-8 rune.
+fn strip_ascii_prefix<'a>(raw_cmd: &'a str, cmd: &str, prefixes: &[&str]) -> Option<&'a str> {
+    for p in prefixes {
+        debug_assert!(p.is_ascii(), "command prefix must be ASCII: {:?}", p);
+        if cmd.starts_with(p) {
+            let tail = raw_cmd.get(p.len()..)?.trim();
+            if tail.is_empty() {
+                return None;
+            }
+            return Some(tail);
+        }
+    }
+    None
+}
+
+/// Internal: parse `<resource> /<filter>`. Returns `(rid, filter_text)`
+/// or None on shape mismatch / empty filter / unknown alias.
+fn parse_resource_filter(raw_cmd: &str) -> Option<(ResourceId, String)> {
+    let slash_pos = raw_cmd.find('/')?;
+    let resource_part = raw_cmd[..slash_pos].trim();
+    let filter_part = raw_cmd[slash_pos + 1..].trim();
     if filter_part.is_empty() {
         return None;
     }
-    let resource_rid = parse_resource_command(resource_part)?;
-    Some(ParsedResourceCommand { rid: resource_rid, argument: filter_part.to_string() })
+    let rid = ResourceId::from_alias(&resource_part.to_lowercase())?;
+    Some((rid, filter_part.to_string()))
 }
 
-/// A parsed CRD command with namespace.
-pub(crate) struct ParsedCrdCommand {
-    pub(crate) crd: crate::app::CrdInfo,
-    pub(crate) namespace: String,
-}
-
-/// Parse a CRD command with optional namespace: "clickhouseinstallation prod"
-pub(crate) fn parse_crd_ns_command(cmd: &str, app: &App) -> Option<ParsedCrdCommand> {
-    let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
-    if parts.len() != 2 {
+/// Internal: parse `<resource> <ns>`. Returns None for cluster-scoped
+/// resources (no namespace concept) or ns values beginning with `/`
+/// (those belong to the filter grammar, checked upstream of here).
+fn parse_resource_in_namespace(cmd: &str) -> Option<(ResourceId, crate::kube::protocol::Namespace)> {
+    let (resource, ns) = cmd.split_once(' ')?;
+    let resource = resource.trim();
+    let ns = ns.trim();
+    if ns.is_empty() || ns.starts_with('/') {
         return None;
     }
-    let crd_part = parts[0].trim();
-    let ns = parts[1].trim();
+    let rid = ResourceId::from_alias(resource)?;
+    if rid.is_cluster_scoped() {
+        return None;
+    }
+    Some((rid, crate::kube::protocol::Namespace::from_user_command(ns)))
+}
+
+/// Internal: parse `<crd> <ns>` against the discovery cache on `app`.
+fn parse_crd_in_namespace(cmd: &str, app: &App) -> Option<(crate::app::CrdInfo, crate::kube::protocol::Namespace)> {
+    let (crd_part, ns) = cmd.split_once(' ')?;
+    let crd_part = crd_part.trim();
+    let ns = ns.trim();
     if ns.is_empty() {
         return None;
     }
@@ -154,27 +313,13 @@ pub(crate) fn parse_crd_ns_command(cmd: &str, app: &App) -> Option<ParsedCrdComm
     if crd.scope == crate::kube::protocol::ResourceScope::Cluster {
         return None;
     }
-    Some(ParsedCrdCommand { crd, namespace: ns.to_string() })
+    Some((crd, crate::kube::protocol::Namespace::from_user_command(ns)))
 }
 
-pub(crate) fn parse_resource_ns_command(cmd: &str) -> Option<ParsedResourceCommand> {
-    let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let resource = parts[0].trim();
-    let ns = parts[1].trim();
-    if ns.is_empty() {
-        return None;
-    }
-    let resource_rid = parse_resource_command(resource)?;
-    if resource_rid.is_cluster_scoped() {
-        None
-    } else {
-        Some(ParsedResourceCommand { rid: resource_rid, argument: ns.to_string() })
-    }
-}
-
+/// Legacy shim kept for a few callers (CLI dispatch, the startup
+/// `--command` flag) that want the single-alias form without going
+/// through the full parser. New call sites should use
+/// [`parse_command_input`] instead.
 pub(crate) fn parse_resource_command(cmd: &str) -> Option<ResourceId> {
     ResourceId::from_alias(cmd)
 }
@@ -267,7 +412,11 @@ pub(crate) fn handle_command_key(
     true
 }
 
-/// Dispatch a submitted `:command` string.
+/// Dispatch a submitted `:command` string. Grammar is classified once via
+/// [`parse_command_input`] into a [`ParsedCommand`]; this function is a
+/// single exhaustive match over the classification. Adding a new command
+/// form means adding a variant to `ParsedCommand`, a rule in the parser,
+/// and an arm here — drift between any two becomes a compile error.
 fn handle_command_submit(
     app: &mut App,
     raw_cmd: &str,
@@ -283,100 +432,125 @@ fn handle_command_submit(
         return;
     }
 
-    if matches!(cmd, "q" | "quit" | "exit" | "q!") {
-        app.exit_reason = Some(crate::app::ExitReason::UserQuit);
-        app.should_quit = true;
-    } else if matches!(cmd, "help" | "h" | "?") {
-        app.push_route(app.route.clone());
-        app.route = crate::app::Route::Help;
-    } else if matches!(cmd, "alias" | "aliases" | "a") {
-        handle_action(
-            app, crate::app::actions::Action::ShowAliases, event_tx,
-            data_source, log_stream,
-        );
-    } else if matches!(cmd, "ctx" | "context" | "contexts") {
-        app.push_route(app.route.clone());
-        app.route = crate::app::Route::Contexts;
-    } else if cmd.starts_with("ctx ") || cmd.starts_with("context ") {
-        let ctx_name = if cmd.starts_with("ctx ") { &raw_cmd[4..] } else { &raw_cmd[8..] }.trim().to_string();
-        begin_context_switch(app, data_source, &ctx_name, log_stream);
-    } else if cmd.starts_with("ns ") || cmd.starts_with("namespace ") {
-        let ns = if cmd.starts_with("ns ") { &raw_cmd[3..] } else { &raw_cmd[10..] }.trim().to_string();
-        do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(ns.as_str()), log_stream);
-    } else if let Some(resource_rid) = parse_resource_command(cmd) {
-        app.route = crate::app::Route::Resources;
-        if resource_rid.is_cluster_scoped() && !app.selected_ns.is_all() {
-            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All, log_stream);
+    match parse_command_input(raw_cmd, cmd, app) {
+        ParsedCommand::Quit => {
+            app.exit_reason = Some(crate::app::ExitReason::UserQuit);
+            app.should_quit = true;
         }
-        let change = app.nav.reset(resource_rid);
-        *app.nav.filter_input_mut() = Default::default();
-        apply_nav_change(app, data_source, change);
-    } else if let Some(parsed) = parse_resource_ns_command(cmd) {
-        app.route = crate::app::Route::Resources;
-        let change = app.nav.reset(parsed.rid.clone());
-        *app.nav.filter_input_mut() = Default::default();
-        if crate::kube::protocol::Namespace::from(parsed.argument.as_str()) != app.selected_ns {
-            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(parsed.argument.as_str()), log_stream);
+        ParsedCommand::Help => {
+            app.push_route(app.route.clone());
+            app.route = crate::app::Route::Help;
         }
-        apply_nav_change(app, data_source, change);
-        app.flash = Some(crate::app::FlashMessage::info(format!(
-            "{}({})", parsed.rid.short_label(), parsed.argument
-        )));
-    } else if let Some(parsed) = parse_resource_filter_command(cmd) {
-        app.route = crate::app::Route::Resources;
-        let change = app.nav.reset(parsed.rid.clone());
-        apply_nav_change(app, data_source, change);
-        let change = app.nav.push(crate::app::nav::NavStep {
-            resource: parsed.rid,
-            filter: Some(crate::app::nav::NavFilter::Grep(parsed.argument.clone())),
-            saved_selected: 0,
-            filter_input: crate::app::nav::FilterInputState::default(),
-            stream: None,
-        });
-        apply_nav_change(app, data_source, change);
-        *app.nav.filter_input_mut() = Default::default();
-        app.reapply_nav_filters();
-    } else if let Some(parsed) = parse_crd_ns_command(cmd, app) {
-        let crd = parsed.crd;
-        app.route = crate::app::Route::Resources;
-        if crate::kube::protocol::Namespace::from(parsed.namespace.as_str()) != app.selected_ns {
-            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::from(parsed.namespace.as_str()), log_stream);
+        ParsedCommand::Aliases => {
+            handle_action(
+                app, crate::app::actions::Action::ShowAliases, event_tx,
+                data_source, log_stream,
+            );
         }
-        let crd_rid = ResourceId::new(
-            crd.group.clone(), crd.version.clone(),
-            crd.kind.clone(), crd.plural.clone(), crd.scope,
-        );
-        let change = app.nav.reset(crd_rid);
-        apply_nav_change(app, data_source, change);
-        app.flash = Some(crate::app::FlashMessage::info(
-            format!("Browsing CRD: {}({})", crd.kind, parsed.namespace)
-        ));
-    } else if matches!(cmd, "overview" | "home") {
-        app.route = crate::app::Route::Overview;
-    } else {
-        // Unknown — try as CRD.
-        let crd_info = app.find_crd_by_name(cmd);
-        let (group, version, kind, plural, scope) = if let Some(crd) = &crd_info {
-            (crd.group.clone(), crd.version.clone(), crd.kind.clone(), crd.plural.clone(), crd.scope)
-        } else {
-            (String::new(), String::new(), cmd.to_string(), cmd.to_string(),
-             crate::kube::protocol::ResourceScope::Namespaced)
-        };
-        app.route = crate::app::Route::Resources;
-        if scope == crate::kube::protocol::ResourceScope::Cluster && !app.selected_ns.is_all() {
-            do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All, log_stream);
+        ParsedCommand::Overview => {
+            app.route = crate::app::Route::Overview;
         }
-        let crd_rid = ResourceId::new(group, version, kind.clone(), plural, scope);
-        let change = app.nav.reset(crd_rid);
-        apply_nav_change(app, data_source, change);
-        app.flash = Some(crate::app::FlashMessage::info(format!("Browsing: {}", kind)));
+        ParsedCommand::ContextList => {
+            app.push_route(app.route.clone());
+            app.route = crate::app::Route::Contexts;
+        }
+        ParsedCommand::ContextSwitch(ctx_name) => {
+            begin_context_switch(app, data_source, &ctx_name, log_stream);
+        }
+        ParsedCommand::NamespaceSwitch(ns) => {
+            do_switch_namespace(app, data_source, ns, log_stream);
+        }
+        ParsedCommand::Resource(rid) => {
+            app.route = crate::app::Route::Resources;
+            if rid.is_cluster_scoped() && !app.selected_ns.is_all() {
+                do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All, log_stream);
+            }
+            let change = app.nav.reset(rid);
+            *app.nav.filter_input_mut() = Default::default();
+            apply_nav_change(app, data_source, change);
+        }
+        ParsedCommand::ResourceFilter { rid, filter } => {
+            app.route = crate::app::Route::Resources;
+            let change = app.nav.reset(rid.clone());
+            apply_nav_change(app, data_source, change);
+            let change = app.nav.push(crate::app::nav::NavStep::new(
+                rid,
+                Some(crate::app::nav::NavFilter::Grep(
+                    crate::app::nav::CompiledGrep::new(filter),
+                )),
+            ));
+            apply_nav_change(app, data_source, change);
+            *app.nav.filter_input_mut() = Default::default();
+            app.reapply_nav_filters();
+        }
+        ParsedCommand::ResourceInNamespace { rid, namespace } => {
+            app.route = crate::app::Route::Resources;
+            let change = app.nav.reset(rid.clone());
+            *app.nav.filter_input_mut() = Default::default();
+            if namespace != app.selected_ns {
+                // `do_switch_namespace` calls `nav.reset(root_rid)` and
+                // opens a fresh substream for the new namespace itself,
+                // so the earlier `change` from our own `reset(rid)` is
+                // stale (its stream was already dropped and replaced).
+                // Applying it would just churn through clear+resubscribe
+                // a second time on the same rid; skip it.
+                do_switch_namespace(app, data_source, namespace.clone(), log_stream);
+            } else {
+                apply_nav_change(app, data_source, change);
+            }
+            app.flash = Some(crate::app::FlashMessage::info(format!(
+                "{}({})", rid.short_label(), namespace.display()
+            )));
+        }
+        ParsedCommand::CrdInNamespace { crd, namespace } => {
+            app.route = crate::app::Route::Resources;
+            if namespace != app.selected_ns {
+                do_switch_namespace(app, data_source, namespace.clone(), log_stream);
+            }
+            let crd_rid = ResourceId::crd(
+                crd.group.clone(), crd.version.clone(),
+                crd.kind.clone(), crd.plural.clone(), crd.scope,
+            );
+            let change = app.nav.reset(crd_rid);
+            apply_nav_change(app, data_source, change);
+            app.flash = Some(crate::app::FlashMessage::info(
+                format!("Browsing CRD: {}({})", crd.kind, namespace.display())
+            ));
+        }
+        ParsedCommand::CrdCandidate(name) => {
+            // Unknown shape — try as CRD via the discovery cache, or fall
+            // back to a typed unresolved placeholder the daemon will resolve.
+            let crd_info = app.find_crd_by_name(&name);
+            let (crd_rid, kind_label, scope) = if let Some(crd) = &crd_info {
+                let scope = crd.scope;
+                let kind = crd.kind.clone();
+                (
+                    ResourceId::crd(crd.group.clone(), crd.version.clone(), crd.kind.clone(), crd.plural.clone(), scope),
+                    kind,
+                    scope,
+                )
+            } else {
+                (
+                    ResourceId::Crd(crate::kube::protocol::CrdRef::unresolved(name.clone())),
+                    name,
+                    crate::kube::protocol::ResourceScope::Namespaced,
+                )
+            };
+            app.route = crate::app::Route::Resources;
+            if scope == crate::kube::protocol::ResourceScope::Cluster && !app.selected_ns.is_all() {
+                do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All, log_stream);
+            }
+            let change = app.nav.reset(crd_rid);
+            apply_nav_change(app, data_source, change);
+            app.flash = Some(crate::app::FlashMessage::info(format!("Browsing: {}", kind_label)));
+        }
     }
 }
 
 /// Handle a keystroke while a generic form dialog is open. Returns true if
 /// consumed. Replaces the old `handle_scale_key` and the inline port-forward
-/// dialog block in `session.rs` — both flowed into one place because the
-/// dialog is now schema-driven and doesn't need per-operation input logic.
+/// dialog block in `session.rs` — both flowed into one place once `FormDialog`
+/// became a single client-side type with typed `FormFieldKind` variants.
 ///
 /// Key bindings:
 ///   - Esc                       → cancel (close without dispatching)
@@ -448,7 +622,7 @@ pub(crate) fn handle_form_dialog_key(
                 if let Some(field) = d.current_field_mut() {
                     let accept = match field.kind {
                         FormFieldKind::Text { max_len } => {
-                            max_len.map_or(true, |m| field.value.chars().count() < m)
+                            max_len.is_none_or(|m| field.value.chars().count() < m)
                         }
                         FormFieldKind::Number { .. } | FormFieldKind::Port => c.is_ascii_digit(),
                         FormFieldKind::Select { .. } => false,
@@ -465,23 +639,23 @@ pub(crate) fn handle_form_dialog_key(
 }
 
 /// Dispatch a submitted form dialog to the appropriate typed
-/// `SessionCommand`. The schema told the user what to type; this function
-/// converts the collected values into the strongly-typed wire payload.
-/// Centralized so adding a new operation kind only adds an arm here.
+/// `SessionCommand`. Reads the collected field values (string-typed,
+/// validated by the dialog widget per `FormFieldKind`) and produces a
+/// strongly-typed wire payload. Centralized so adding a new operation
+/// kind only adds an arm here.
 fn dispatch_form_submit(
     app: &mut App,
     data_source: &mut ClientSession,
     dialog: crate::app::FormDialog,
 ) {
-    use crate::app::{FormDialog, FormFieldKind};
-    use crate::kube::protocol::OperationKind;
+    use crate::app::{FormDialog, FormFieldKind, FormKind};
 
     let FormDialog { kind, target, fields, .. } = dialog;
     match kind {
-        OperationKind::Scale => {
+        FormKind::Scale => {
             let replicas_str = fields
                 .iter()
-                .find(|f| f.name == "replicas")
+                .find(|f| f.name == crate::kube::protocol::form_field_name::REPLICAS)
                 .map(|f| f.value.trim().to_string())
                 .unwrap_or_default();
             match replicas_str.parse::<u32>() {
@@ -499,22 +673,22 @@ fn dispatch_form_submit(
                 }
             }
         }
-        OperationKind::PortForward => {
+        FormKind::PortForward => {
             // container_port may be Select (value = option index → port string)
             // or Port (value = port string directly). Handle both.
             let container_port = fields
                 .iter()
-                .find(|f| f.name == "container_port")
+                .find(|f| f.name == crate::kube::protocol::form_field_name::CONTAINER_PORT)
                 .and_then(|f| match &f.kind {
                     FormFieldKind::Select { options } => {
                         let idx: usize = f.value.parse().ok()?;
-                        options.get(idx).and_then(|(v, _)| v.parse::<u16>().ok())
+                        options.get(idx).and_then(|opt| opt.value.parse::<u16>().ok())
                     }
                     _ => f.value.trim().parse::<u16>().ok(),
                 });
             let local_port = fields
                 .iter()
-                .find(|f| f.name == "local_port")
+                .find(|f| f.name == crate::kube::protocol::form_field_name::LOCAL_PORT)
                 .and_then(|f| f.value.trim().parse::<u16>().ok());
             match (container_port, local_port) {
                 (Some(cp), Some(lp)) => {
@@ -529,14 +703,6 @@ fn dispatch_form_submit(
                     ));
                 }
             }
-        }
-        // Other operations either have no input (handled directly without a
-        // form) or aren't yet wired up to use the form dialog. Surface a
-        // flash so we notice if a stray submit ever lands here.
-        other => {
-            app.flash = Some(crate::app::FlashMessage::warn(
-                format!("No form dispatcher for operation {:?}", other)
-            ));
         }
     }
 }
@@ -560,13 +726,13 @@ pub(crate) fn handle_filter_key(
             let text = std::mem::take(&mut app.nav.filter_input_mut().text);
             app.nav.filter_input_mut().active = false;
             if !text.is_empty() {
-                let change = app.nav.push(crate::app::nav::NavStep {
-                    resource: app.nav.resource_id().clone(),
-                    filter: Some(crate::app::nav::NavFilter::Grep(text)),
-                    saved_selected: 0,
-                    filter_input: crate::app::nav::FilterInputState::default(),
-                    stream: None,
-                });
+                let current_rid = app.nav.resource_id().clone();
+                let change = app.nav.push(crate::app::nav::NavStep::new(
+                    current_rid,
+                    Some(crate::app::nav::NavFilter::Grep(
+                        crate::app::nav::CompiledGrep::new(text),
+                    )),
+                ));
                 apply_nav_change(app, data_source, change);
             }
             app.reapply_nav_filters();
@@ -585,4 +751,120 @@ pub(crate) fn handle_filter_key(
         _ => {}
     }
     true
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::*;
+    use crate::kube::protocol::Namespace;
+    use crate::kube::resource_def::BuiltInKind;
+
+    fn make_app() -> App {
+        App::new(crate::kube::protocol::ContextName::default(), String::new())
+    }
+
+    fn parse(input: &str) -> ParsedCommand {
+        let app = make_app();
+        parse_command_input(input, &input.to_lowercase(), &app)
+    }
+
+    #[test]
+    fn static_words_classify() {
+        assert!(matches!(parse("q"), ParsedCommand::Quit));
+        assert!(matches!(parse("quit"), ParsedCommand::Quit));
+        assert!(matches!(parse("help"), ParsedCommand::Help));
+        assert!(matches!(parse("?"), ParsedCommand::Help));
+        assert!(matches!(parse("alias"), ParsedCommand::Aliases));
+        assert!(matches!(parse("home"), ParsedCommand::Overview));
+        assert!(matches!(parse("ctx"), ParsedCommand::ContextList));
+    }
+
+    #[test]
+    fn ctx_switch_keeps_case() {
+        match parse("ctx prod-us-east") {
+            ParsedCommand::ContextSwitch(name) => assert_eq!(name.as_str(), "prod-us-east"),
+            _ => panic!("expected ContextSwitch"),
+        }
+    }
+
+    #[test]
+    fn ns_switch_respects_all_and_named() {
+        match parse("ns kube-system") {
+            ParsedCommand::NamespaceSwitch(Namespace::Named(n)) => assert_eq!(n, "kube-system"),
+            _ => panic!("expected NamespaceSwitch(Named)"),
+        }
+        match parse("ns all") {
+            ParsedCommand::NamespaceSwitch(Namespace::All) => {}
+            _ => panic!("expected NamespaceSwitch(All)"),
+        }
+    }
+
+    #[test]
+    fn bare_resource_alias_resolves() {
+        match parse("pods") {
+            ParsedCommand::Resource(rid) => {
+                assert_eq!(rid.built_in_kind(), Some(BuiltInKind::Pod));
+            }
+            _ => panic!("expected Resource"),
+        }
+    }
+
+    #[test]
+    fn resource_with_filter_runs_before_resource_with_ns() {
+        // The pass-11 bug: `pods /Nginx` used to parse as namespace `/Nginx`.
+        // The filter rule must come first.
+        match parse("pods /Nginx") {
+            ParsedCommand::ResourceFilter { rid, filter } => {
+                assert_eq!(rid.built_in_kind(), Some(BuiltInKind::Pod));
+                assert_eq!(filter, "Nginx", "filter must preserve case");
+            }
+            other => panic!("expected ResourceFilter, got {:?}", match other {
+                ParsedCommand::NamespaceSwitch(_) => "NamespaceSwitch",
+                ParsedCommand::ResourceInNamespace { .. } => "ResourceInNamespace",
+                _ => "other",
+            }),
+        }
+    }
+
+    #[test]
+    fn resource_in_namespace_classifies() {
+        match parse("deploy kube-system") {
+            ParsedCommand::ResourceInNamespace { rid, namespace } => {
+                assert_eq!(rid.built_in_kind(), Some(BuiltInKind::Deployment));
+                assert_eq!(namespace, Namespace::Named("kube-system".into()));
+            }
+            _ => panic!("expected ResourceInNamespace"),
+        }
+    }
+
+    #[test]
+    fn cluster_scoped_rejects_ns_arg() {
+        // Nodes are cluster-scoped — "nodes foo" isn't a ns-switch, so it
+        // falls through to the CRD-candidate fallback.
+        match parse("nodes foo") {
+            ParsedCommand::CrdCandidate(_) => {}
+            _ => panic!("expected CrdCandidate fallback for cluster-scoped + ns"),
+        }
+    }
+
+    #[test]
+    fn unknown_input_falls_through_to_crd_candidate() {
+        match parse("clickhouseinstallation") {
+            ParsedCommand::CrdCandidate(name) => assert_eq!(name, "clickhouseinstallation"),
+            _ => panic!("expected CrdCandidate fallback"),
+        }
+    }
+
+    #[test]
+    fn bare_ns_alias_opens_namespace_resource() {
+        // `:ns` alone is the resource alias for Namespace (matches rule 4,
+        // "plain resource alias"). The `:ns <name>` form only triggers
+        // when there's an explicit namespace argument.
+        match parse("ns") {
+            ParsedCommand::Resource(rid) => {
+                assert_eq!(rid.built_in_kind(), Some(BuiltInKind::Namespace));
+            }
+            _ => panic!("expected Resource(Namespace)"),
+        }
+    }
 }

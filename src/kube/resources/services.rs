@@ -1,16 +1,12 @@
 
 use k8s_openapi::api::core::v1::Service;
 
+use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{DrillTarget, ResourceRow};
 
 /// Convert a k8s Service into a generic ResourceRow.
 pub(crate) fn service_to_row(svc: Service) -> ResourceRow {
-    let metadata = svc.metadata;
-    let ns = metadata.namespace.unwrap_or_default();
-    let name = metadata.name.unwrap_or_default();
-    let labels = metadata.labels.unwrap_or_default();
-    let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
-    let age = metadata.creation_timestamp.map(|t| t.0);
+    let meta = CommonMeta::from_k8s(svc.metadata);
 
     let spec = svc.spec.unwrap_or_default();
     let selector = spec.selector.clone().unwrap_or_default();
@@ -63,24 +59,23 @@ pub(crate) fn service_to_row(svc: Service) -> ResourceRow {
     let drill_target = if !selector.is_empty() {
         Some(DrillTarget::PodsByLabels {
             labels: selector,
-            breadcrumb: format!("svc/{}", name),
+            breadcrumb: format!("svc/{}", meta.name),
         })
     } else {
-        Some(DrillTarget::PodsByNameGrep(name.clone()))
+        Some(DrillTarget::PodsByNameGrep(meta.name.clone()))
     };
 
     ResourceRow {
         cells: vec![
-            ns.clone(), name.clone(), service_type, cluster_ip, external_ip,
-            selector_str, ports_str, labels_str, crate::util::format_age(age),
+            meta.namespace.clone(), meta.name.clone(),
+            service_type, cluster_ip, external_ip,
+            selector_str, ports_str, meta.labels_str,
+            crate::util::format_age(meta.age),
         ],
-        name,
-        namespace: Some(ns),
-        containers: Vec::new(),
-        owner_refs: Vec::new(),
+        name: meta.name,
+        namespace: Some(meta.namespace),
         pf_ports: port_list,
-        node: None,
-        crd_info: None,
         drill_target,
+        ..Default::default()
     }
 }

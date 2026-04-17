@@ -2,9 +2,23 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Row health indicator, computed server-side by each converter.
+/// The client reads this for row coloring — no resource-type-specific
+/// knowledge needed on the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RowHealth {
+    /// Healthy / running / ready.
+    #[default]
+    Normal,
+    /// In-progress / starting / pending.
+    Pending,
+    /// Error / degraded / not-ready.
+    Failed,
+}
+
 /// A single resource row in the unified table model.
 /// Replaces all 28 typed Kube* structs with a generic representation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRow {
     /// Display columns, matching the header order.
     pub cells: Vec<String>,
@@ -33,34 +47,54 @@ pub struct ResourceRow {
     /// this for `ShowNode` navigation; non-pod rows skip the action because
     /// the field is `None` rather than the empty string.
     pub node: Option<String>,
+    /// Server-computed health for row coloring. The client reads this
+    /// directly instead of parsing cells per resource type.
+    #[serde(default)]
+    pub health: RowHealth,
 }
 
-/// CRD definition metadata (for rows in the `crds` table).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CrdRowInfo {
-    pub group: String,
-    pub version: String,
-    pub kind: String,
-    pub plural: String,
-    pub scope: crate::kube::protocol::ResourceScope,
-}
+/// CRD definition metadata (for rows in the `crds` table). Type alias over
+/// [`crate::kube::protocol::CrdRef`] — the wire shape is identical, and
+/// using one type means converters/consumers can hand the value straight
+/// to anything that takes a `CrdRef` (e.g. `ResourceId::Crd(CrdRef)` for
+/// nav drill-downs).
+pub type CrdRowInfo = crate::kube::protocol::CrdRef;
 
 /// Container info for pods — used by shell, logs, port-forward.
+///
+/// Only the fields the client actually reads ride the wire. The server
+/// uses additional intermediate values (image, ready, state, restarts,
+/// container-level ports) at construction time but distills them into
+/// the parent row's cells / `pf_ports` / `health` before serializing.
+///
+/// `kind` distinguishes init from regular containers as a typed enum;
+/// the UI renders the `init:` prefix from the discriminant rather than
+/// from a string-prefix encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerInfo {
+    /// Container name as `kubectl exec/logs` expects it. The UI
+    /// renders it with an `init:` prefix when `kind == Init`, and
+    /// passes it verbatim into `LogContainer::Named` on shell/log.
     pub name: String,
-    pub real_name: String,
-    pub image: String,
-    pub ready: bool,
-    pub state: String,
-    pub restarts: i32,
-    pub ports: Vec<u16>,
+    /// Init vs regular. Typed so the UI doesn't string-parse `name`.
+    #[serde(default)]
+    pub kind: ContainerKind,
+}
+
+/// Init vs regular container. Defaults to `Regular` for forward compat
+/// with snapshots that pre-date this field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContainerKind {
+    #[default]
+    Regular,
+    Init,
 }
 
 /// Owner reference info for pods — used by owner chain drill-down.
+/// Only the fields the client reads (kind/name/uid for breadcrumbs and
+/// chain matching) ride the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerRefInfo {
-    pub api_version: String,
     pub kind: String,
     pub name: String,
     pub uid: String,
@@ -72,16 +106,14 @@ pub struct OwnerRefInfo {
 /// The client reads this blindly and constructs the appropriate nav action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DrillTarget {
-    /// Switch to a different namespace (used by namespace rows).
-    SwitchNamespace(String),
-    /// Push a CRD-instance view onto the nav stack.
-    BrowseCrd {
-        group: String,
-        version: String,
-        kind: String,
-        plural: String,
-        scope: crate::kube::protocol::ResourceScope,
-    },
+    /// Switch to a different namespace (used by namespace rows). Typed
+    /// as `Namespace` because this is a *selection* (the user picking a
+    /// scope), not a location string.
+    SwitchNamespace(crate::kube::protocol::Namespace),
+    /// Push a CRD-instance view onto the nav stack. Wraps a [`crate::kube::protocol::CrdRef`]
+    /// so the drill handler can build a `ResourceId::Crd(...)` directly
+    /// without re-marshaling fields.
+    BrowseCrd(crate::kube::protocol::CrdRef),
     /// Drill down to pods filtered by label selector (deploy/sts/ds/svc/job).
     PodsByLabels {
         labels: BTreeMap<String, String>,
@@ -91,20 +123,27 @@ pub enum DrillTarget {
     /// Drill down to pods filtered by ownerReference UID (replicaset/job).
     PodsByOwner {
         uid: String,
-        kind: String,
+        /// Parent kind, typed. Producers have a [`BuiltInKind`] in hand
+        /// already; stringifying and re-parsing on the client was extra
+        /// motion. Breadcrumb display fetches the human string via
+        /// [`crate::kube::resource_defs::REGISTRY`].
+        kind: crate::kube::resource_def::BuiltInKind,
         name: String,
     },
-    /// Drill down to pods filtered by field selector (e.g., spec.nodeName=X).
-    PodsByField {
-        field: String,
-        value: String,
-        breadcrumb: String,
-    },
+    /// Drill down to pods filtered by a typed K8s field selector.
+    /// Replaces the older `PodsByField { field: String, value: String }`
+    /// shape — the typed enum carries the field path so producers can't
+    /// fat-finger `"spec.nodeName"`.
+    PodsByField(crate::app::nav::K8sFieldSelector),
     /// Drill down to pods by name prefix (fallback when no selector exists).
     PodsByNameGrep(String),
-    /// Drill down to jobs owned by this CronJob (via ownerReference UID).
+    /// Drill down to jobs owned by a parent resource (via ownerReference
+    /// UID). Produced server-side by the cronjobs converter today (so
+    /// `kind` is `CronJob`), but typed so it doesn't assume the parent
+    /// kind at the client.
     JobsByOwner {
         uid: String,
+        kind: crate::kube::resource_def::BuiltInKind,
         name: String,
     },
 }

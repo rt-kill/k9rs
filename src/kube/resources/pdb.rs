@@ -1,13 +1,11 @@
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::CommonMeta;
+use crate::kube::resources::row::{ResourceRow};
 
 /// Convert a k8s PodDisruptionBudget into a generic ResourceRow.
 pub(crate) fn pdb_to_row(pdb: PodDisruptionBudget) -> ResourceRow {
-    let metadata = pdb.metadata;
-    let ns = metadata.namespace.unwrap_or_default();
-    let name = metadata.name.unwrap_or_default();
-    let age = metadata.creation_timestamp.map(|t| t.0);
+    let meta = CommonMeta::from_k8s(pdb.metadata);
     let spec = pdb.spec;
     let min_available = spec.as_ref()
         .and_then(|s| s.min_available.as_ref())
@@ -27,14 +25,13 @@ pub(crate) fn pdb_to_row(pdb: PodDisruptionBudget) -> ResourceRow {
         .map(|s| s.disruptions_allowed.to_string())
         .unwrap_or_else(|| "0".to_string());
     ResourceRow {
-        cells: vec![ns.clone(), name.clone(), min_available, max_unavailable, allowed_disruptions, crate::util::format_age(age)],
-        name,
-        namespace: Some(ns),
-        containers: Vec::new(),
-        owner_refs: Vec::new(),
-        pf_ports: Vec::new(),
-        node: None,
-        crd_info: None,
-        drill_target: None,
+        cells: vec![
+            meta.namespace.clone(), meta.name.clone(),
+            min_available, max_unavailable, allowed_disruptions,
+            crate::util::format_age(meta.age),
+        ],
+        name: meta.name,
+        namespace: Some(meta.namespace),
+        ..Default::default()
     }
 }

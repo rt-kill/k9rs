@@ -33,6 +33,38 @@ impl<'a> HelpOverlay<'a> {
         Self { theme, scroll }
     }
 
+    /// Total rendered line count for the help content (section titles +
+    /// entries + blank separators between sections). Used internally by
+    /// [`Self::max_scroll`].
+    fn total_lines() -> usize {
+        let sections = Self::sections();
+        let mut total = 0usize;
+        for (si, section) in sections.iter().enumerate() {
+            total += 1; // section title
+            total += section.entries.len();
+            if si + 1 < sections.len() {
+                total += 1; // blank separator
+            }
+        }
+        total
+    }
+
+    /// Maximum sensible value for `help_scroll` given the current terminal
+    /// height. Mirrors the render-time clamp at line 350 so action handlers
+    /// can store a stable max instead of `usize::MAX` (which makes PrevItem
+    /// decrements appear to do nothing for ~`visible_height` keystrokes
+    /// before they overcome the difference).
+    ///
+    /// Returns 0 if the content fits without scrolling.
+    pub fn max_scroll(terminal_height: u16) -> usize {
+        // Dialog is `centered_rect(area, 42, 85)` — 85% of terminal height.
+        // Block overhead is 3 rows (2 borders + 1 top pad). See render.
+        let dialog_height = (terminal_height as usize) * 85 / 100;
+        let visible_height = dialog_height.saturating_sub(3).max(1);
+        let total = Self::total_lines();
+        total.saturating_sub(visible_height)
+    }
+
     fn sections() -> Vec<HelpSection> {
         vec![
             HelpSection {
@@ -342,11 +374,17 @@ impl Widget for HelpOverlay<'_> {
 
         let total = all_lines.len();
 
-        // Build title with scroll indicator
-        let visible_height = dialog_area.height.saturating_sub(4) as usize; // borders + padding
+        // Clamp scroll BEFORE formatting the title — Action::End sets
+        // help_scroll to usize::MAX as a sentinel, so `scroll + 1` would
+        // overflow if we used `self.scroll` directly.
+        //
+        // Block overhead is 2 border rows + 1 top-padding row + 0 bottom-
+        // padding row = 3 (matches `Padding::new(1, 1, 1, 0)` below).
+        let visible_height = dialog_area.height.saturating_sub(3) as usize;
         let has_more = total > visible_height;
+        let scroll = self.scroll.min(total.saturating_sub(visible_height.max(1)));
         let title = if has_more {
-            format!(" Help [j/k to scroll] [{}/{}] ", self.scroll + 1, total)
+            format!(" Help [j/k to scroll] [{}/{}] ", scroll + 1, total)
         } else {
             " Help — press ? or Esc to close ".to_string()
         };
@@ -367,7 +405,6 @@ impl Widget for HelpOverlay<'_> {
 
         let max_y = inner.y + inner.height;
         let visible = inner.height as usize;
-        let scroll = self.scroll.min(total.saturating_sub(visible.max(1)));
 
         let mut y = inner.y;
         for line in all_lines.iter().skip(scroll) {

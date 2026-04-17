@@ -37,10 +37,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Route::Logs { .. } => {
             views::log::draw_logs(f, app, area);
         }
-        Route::Shell { .. } => {
-            // Shell view -- handled externally; draw resource view underneath
-            views::resource::draw_resources(f, app, area);
-        }
         Route::Help => {
             // Draw resource view underneath the help overlay
             views::resource::draw_resources(f, app, area);
@@ -49,12 +45,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Route::Contexts => {
             views::context::draw_contexts(f, app, area);
         }
-        Route::ContainerSelect { ref pod, ref namespace, selected, .. } => {
-            let pod = pod.clone();
-            let namespace = namespace.clone();
+        Route::ContainerSelect { ref target, selected, .. } => {
+            let target = target.clone();
             let sel = *selected;
             views::resource::draw_resources(f, app, area);
-            draw_container_select(f, app, &pod, &namespace, sel);
+            draw_container_select(f, app, &target, sel);
         }
         Route::Aliases { .. } => {
             // Reuse the describe view to show alias content
@@ -170,7 +165,12 @@ fn draw_flash(f: &mut Frame, app: &App) {
 }
 
 /// Draw the container selection overlay for multi-container pods.
-fn draw_container_select(f: &mut Frame, app: &App, pod: &str, namespace: &str, selected_idx: usize) {
+fn draw_container_select(
+    f: &mut Frame,
+    app: &App,
+    target: &crate::kube::protocol::ObjectRef,
+    selected_idx: usize,
+) {
     use ratatui::layout::{Constraint, Layout, Rect};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Clear};
@@ -178,10 +178,20 @@ fn draw_container_select(f: &mut Frame, app: &App, pod: &str, namespace: &str, s
     let theme = &app.theme;
     let area = f.area();
 
-    // Find the pod's containers (typed field on ResourceRow).
-    let containers: Vec<String> = app.data.unified.get(&crate::app::nav::rid("pods"))
-        .and_then(|t| t.items.iter().find(|p| p.name == pod && p.namespace.as_deref() == Some(namespace)))
-        .map(|p| p.containers.iter().map(|ci| ci.name.clone()).collect())
+    // Find the pod's containers (typed field on ResourceRow). Init
+    // containers get an `init:` display prefix so the user can tell
+    // them apart from regular containers — derived from the typed
+    // `kind` discriminant rather than carried as a string prefix in
+    // `name` like the older shape.
+    use crate::kube::resources::row::ContainerKind;
+    let containers: Vec<String> = app.data.unified.get(&target.resource)
+        .and_then(|t| t.items.iter().find(|p| {
+            p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
+        }))
+        .map(|p| p.containers.iter().map(|ci| match ci.kind {
+            ContainerKind::Init => format!("init:{}", ci.name),
+            ContainerKind::Regular => ci.name.clone(),
+        }).collect())
         .unwrap_or_default();
 
     if containers.is_empty() {
@@ -190,7 +200,7 @@ fn draw_container_select(f: &mut Frame, app: &App, pod: &str, namespace: &str, s
 
     // Size the dialog
     let max_name_len = containers.iter().map(|c| c.len()).max().unwrap_or(10);
-    let dialog_width = (max_name_len as u16 + 6).max(30).min(60).min(area.width.saturating_sub(4));
+    let dialog_width = (max_name_len as u16 + 6).clamp(30, 60).min(area.width.saturating_sub(4));
     let dialog_height = (containers.len() as u16 + 4).min(area.height.saturating_sub(4));
 
     // Center the dialog
@@ -209,7 +219,7 @@ fn draw_container_select(f: &mut Frame, app: &App, pod: &str, namespace: &str, s
     Clear.render(dialog_area, f.buffer_mut());
 
     let block = Block::bordered()
-        .title(format!(" Select Container ({}) ", pod))
+        .title(format!(" Select Container ({}) ", target.name))
         .title_style(theme.title)
         .border_style(theme.border)
         .style(theme.dialog_bg);
@@ -289,13 +299,7 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
 
     let input = app.input_mode.input().unwrap_or("");
     let ghost: String = app.best_completion()
-        .and_then(|c| {
-            if c.starts_with(input) {
-                Some(c[input.len()..].to_string())
-            } else {
-                None
-            }
-        })
+        .and_then(|c| c.strip_prefix(input).map(str::to_string))
         .unwrap_or_default();
 
     let prefix = app.input_mode.prompt();

@@ -1,31 +1,20 @@
 
 use k8s_openapi::api::apps::v1::DaemonSet;
 
-use crate::kube::resources::row::{DrillTarget, ResourceRow};
+use crate::kube::resources::{CommonMeta, WorkloadContainers};
+use crate::kube::resources::row::{DrillTarget, ResourceRow, RowHealth};
 
 /// Convert a k8s DaemonSet into a generic ResourceRow.
 pub(crate) fn daemonset_to_row(ds: DaemonSet) -> ResourceRow {
-    let metadata = ds.metadata;
-    let ns = metadata.namespace.unwrap_or_default();
-    let name = metadata.name.unwrap_or_default();
-    let labels = metadata.labels.unwrap_or_default();
-    let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
-    let age = metadata.creation_timestamp.map(|t| t.0);
+    let meta = CommonMeta::from_k8s(ds.metadata);
 
     let selector_labels = ds.spec.as_ref()
         .and_then(|s| s.selector.match_labels.clone())
         .unwrap_or_default();
-    let container_ports: Vec<u16> = ds.spec.as_ref()
-        .and_then(|s| s.template.spec.as_ref())
-        .map(|ps| ps.containers.iter()
-            .flat_map(|c| c.ports.as_ref().into_iter().flatten())
-            .filter(|p| p.protocol.as_deref() != Some("UDP"))
-            .map(|p| p.container_port as u16)
-            .collect())
-        .unwrap_or_default();
+    let pod_spec = ds.spec.as_ref().and_then(|s| s.template.spec.as_ref());
+    let containers = WorkloadContainers::from_pod_spec(pod_spec);
 
-    let node_selector = ds.spec.as_ref()
-        .and_then(|s| s.template.spec.as_ref())
+    let node_selector = pod_spec
         .and_then(|ps| ps.node_selector.as_ref())
         .map(|ns| {
             let pairs: Vec<String> = ns.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
@@ -43,27 +32,30 @@ pub(crate) fn daemonset_to_row(ds: DaemonSet) -> ResourceRow {
     let drill_target = if !selector_labels.is_empty() {
         Some(DrillTarget::PodsByLabels {
             labels: selector_labels,
-            breadcrumb: format!("ds/{}", name),
+            breadcrumb: format!("ds/{}", meta.name),
         })
     } else {
-        Some(DrillTarget::PodsByNameGrep(name.clone()))
+        Some(DrillTarget::PodsByNameGrep(meta.name.clone()))
     };
+
+    let health = if desired == 0 { RowHealth::Pending }
+        else if ready < desired { RowHealth::Failed }
+        else { RowHealth::Normal };
 
     ResourceRow {
         cells: vec![
-            ns.clone(), name.clone(), desired.to_string(), current.to_string(),
-            ready.to_string(), up_to_date.to_string(), available.to_string(),
+            meta.namespace.clone(), meta.name.clone(),
+            desired.to_string(), current.to_string(), ready.to_string(),
+            up_to_date.to_string(), available.to_string(),
             node_selector,
-            labels_str,
-            crate::util::format_age(age),
+            meta.labels_str,
+            crate::util::format_age(meta.age),
         ],
-        name,
-        namespace: Some(ns),
-        containers: Vec::new(),
-        owner_refs: Vec::new(),
-        pf_ports: container_ports,
-        node: None,
-        crd_info: None,
+        name: meta.name,
+        namespace: Some(meta.namespace),
+        pf_ports: containers.tcp_ports,
+        health,
         drill_target,
+        ..Default::default()
     }
 }

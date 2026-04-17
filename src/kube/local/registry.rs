@@ -26,9 +26,10 @@ use std::sync::{Arc, Weak};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 
-use crate::kube::protocol::ResourceId;
+use crate::kube::protocol::{ContextName, ResourceId};
 
 use super::port_forward::PortForwardSource;
+use super::types::LocalResourceKind;
 use super::SharedLocalSource;
 
 /// Daemon-wide registry of per-context local resource sources.
@@ -36,7 +37,7 @@ pub struct LocalRegistry {
     /// Per-context cache of PortForwardSource. Weak refs only — the strong
     /// `Arc` lives in `LocalSubscription` instances held by the bridge tasks
     /// of currently-subscribed sessions.
-    port_forwards: DashMap<String, Weak<PortForwardSource>>,
+    port_forwards: DashMap<ContextName, Weak<PortForwardSource>>,
 }
 
 impl Default for LocalRegistry {
@@ -55,7 +56,13 @@ impl LocalRegistry {
     /// Get (or lazily create) the `PortForwardSource` for a context. Mirrors
     /// `WatcherCache::subscribe` — fast path tries to upgrade an existing
     /// `Weak`, slow path uses the `DashMap::entry` API for race-safe insert.
-    pub fn port_forwards_for(&self, context: &str) -> Arc<PortForwardSource> {
+    pub fn port_forwards_for(&self, context: &ContextName) -> Arc<PortForwardSource> {
+        // Reap dead Weak entries opportunistically. Without this, every
+        // context the daemon has ever served leaves a dead slot behind;
+        // `port_forwards` grows monotonically for the daemon's lifetime.
+        // Mirrors `WatcherCache::reap_dead`.
+        self.port_forwards.retain(|_, weak| weak.strong_count() > 0);
+
         // Fast path: try existing entry.
         if let Some(weak) = self.port_forwards.get(context) {
             if let Some(arc) = weak.upgrade() {
@@ -63,17 +70,17 @@ impl LocalRegistry {
             }
         }
         // Slow path: atomic check-and-insert.
-        match self.port_forwards.entry(context.to_string()) {
+        match self.port_forwards.entry(context.clone()) {
             Entry::Occupied(mut e) => {
                 if let Some(arc) = e.get().upgrade() {
                     return arc;
                 }
-                let arc = PortForwardSource::for_context(context.to_string());
+                let arc = PortForwardSource::for_context(context.clone());
                 e.insert(Arc::downgrade(&arc));
                 arc
             }
             Entry::Vacant(e) => {
-                let arc = PortForwardSource::for_context(context.to_string());
+                let arc = PortForwardSource::for_context(context.clone());
                 e.insert(Arc::downgrade(&arc));
                 arc
             }
@@ -81,18 +88,18 @@ impl LocalRegistry {
     }
 
     /// Generic subscribe-path lookup: given `(context, rid)`, return the
-    /// matching local source as a trait object. Returns `None` if the rid
-    /// doesn't correspond to a registered local type.
+    /// matching local source as a trait object. Returns `None` if `rid` is
+    /// not a [`ResourceId::Local`] variant.
     ///
-    /// New local resource types are wired in by adding a typed cache field
-    /// above and a match arm here.
-    pub fn get(&self, context: &str, rid: &ResourceId) -> Option<SharedLocalSource> {
-        if !rid.is_local() {
-            return None;
-        }
-        match rid.plural.as_str() {
-            "portforwards" => Some(self.port_forwards_for(context) as SharedLocalSource),
-            _ => None,
+    /// New local resource types are wired in by adding a [`LocalResourceKind`]
+    /// variant + table entry, then a match arm here. The match is exhaustive,
+    /// so the compiler enforces that every kind has a backing source.
+    pub fn get(&self, context: &ContextName, rid: &ResourceId) -> Option<SharedLocalSource> {
+        let ResourceId::Local(kind) = rid else { return None; };
+        match kind {
+            LocalResourceKind::PortForward => {
+                Some(self.port_forwards_for(context) as SharedLocalSource)
+            }
         }
     }
 }

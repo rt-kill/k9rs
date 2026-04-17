@@ -17,9 +17,8 @@ pub(crate) trait TableNav {
     fn nav_home(&mut self);
     fn nav_end(&mut self);
     fn nav_clear_filter(&mut self);
-    fn nav_reset(&mut self);
     fn nav_toggle_mark(&mut self);
-    fn nav_sort_by(&mut self, col: usize);
+    fn nav_sort_by(&mut self, target: crate::app::SortTarget, kind: ColumnSortKind);
     fn nav_toggle_sort(&mut self);
     fn nav_items_count(&self) -> ItemCounts;
     fn nav_clear_marks(&mut self);
@@ -36,7 +35,6 @@ impl<T: Clone + KubeResource> TableNav for StatefulTable<T> {
     fn nav_home(&mut self) { self.home(); }
     fn nav_end(&mut self) { self.end(); }
     fn nav_clear_filter(&mut self) { self.clear_filter(); }
-    fn nav_reset(&mut self) { self.clear_data(); }
     fn nav_toggle_mark(&mut self) {
         if self.filtered_indices.is_empty() || self.selected >= self.filtered_indices.len() {
             return;
@@ -55,10 +53,15 @@ impl<T: Clone + KubeResource> TableNav for StatefulTable<T> {
         }
         // Don't advance — Space is a clean toggle. Ctrl+Space handles range selection.
     }
-    fn nav_sort_by(&mut self, col: usize) { self.sort_by_column(col); }
+    fn nav_sort_by(&mut self, target: crate::app::SortTarget, kind: ColumnSortKind) {
+        self.sort_by_column(target, kind);
+    }
     fn nav_toggle_sort(&mut self) {
+        // Reuses the existing column AND its existing sort_kind — toggling
+        // the direction never re-derives the kind from headers.
         let col = self.sort_column;
-        self.sort_by_column(col);
+        let kind = self.sort_kind;
+        self.sort_by_column(crate::app::SortTarget::Column(col), kind);
     }
     fn nav_items_count(&self) -> ItemCounts {
         ItemCounts { filtered: self.len(), total: self.total() }
@@ -110,6 +113,12 @@ pub struct StatefulTable<T: Clone> {
     pub offset: usize,
     pub sort_column: usize,
     pub sort_ascending: bool,
+    /// How the sort comparator interprets cell values for the current
+    /// sort column. Set by `sort_by_column` from a typed
+    /// [`ColumnSortKind`] so age-vs-string detection isn't a content
+    /// guess. Persists across refreshes so re-sorts (after a fresh
+    /// snapshot) keep the same ordering.
+    pub sort_kind: ColumnSortKind,
     pub page_size: usize,
     /// Whether this table has received any response from the watcher.
     /// Used to distinguish "loading" (false) from "empty" (true + no items) in the UI.
@@ -120,8 +129,6 @@ pub struct StatefulTable<T: Clone> {
     /// Error message if the subscription failed (e.g., resource doesn't exist).
     /// When set, the UI shows this instead of the loading spinner.
     pub error: Option<String>,
-    /// Previous item count — used to detect when initial loading completes.
-    prev_item_count: usize,
     /// Marked/selected rows, keyed by stable identity (namespace + name) so
     /// marks survive data refreshes and sort changes.
     pub marked: HashSet<ObjectKey>,
@@ -142,11 +149,11 @@ impl<T: Clone> Default for StatefulTable<T> {
             offset: 0,
             sort_column: 0,
             sort_ascending: true,
+            sort_kind: ColumnSortKind::default(),
             page_size: 40,
             has_data: false,
             loading: false,
             error: None,
-            prev_item_count: 0,
             marked: HashSet::new(),
             marked_visible: Vec::new(),
         }
@@ -244,7 +251,6 @@ impl<T: Clone> StatefulTable<T> {
         self.has_data = false;
         self.loading = false;
         self.error = None;
-        self.prev_item_count = 0;
         self.marked.clear();
         self.marked_visible.clear();
     }
@@ -287,18 +293,25 @@ impl<T: Clone> StatefulTable<T> {
     }
 }
 
+/// How the table sort should compare values in the chosen column. Driven
+/// by the column header (so the caller looks it up from `TableDescriptor`)
+// `ColumnSortKind` now lives in `kube::resource_def` next to `ColumnDef`.
+// Re-exported via `crate::app::ColumnSortKind` (from `app/mod.rs`).
+pub use crate::kube::resource_def::ColumnSortKind;
+
 impl<T: Clone + KubeResource> StatefulTable<T> {
     /// Toggle sort on a column. Reuses sort_items and rebuild_filter.
     /// Cursor stays at its screen index.
-    pub fn sort_by_column(&mut self, col: usize) {
-        let actual_col = if col == usize::MAX {
-            // Resolve sentinel to last column using actual data width,
-            // not the static trait fallback (which is meaningless for ResourceRow).
-            self.items.first()
-                .map(|item| item.cells().len().saturating_sub(1))
-                .unwrap_or(0)
-        } else {
-            col
+    pub fn sort_by_column(&mut self, target: crate::app::SortTarget, kind: ColumnSortKind) {
+        let actual_col = match target {
+            crate::app::SortTarget::Column(c) => c,
+            crate::app::SortTarget::Last => {
+                // Resolved at apply time using the actual table width —
+                // the AGE column's data index varies per resource type.
+                self.items.first()
+                    .map(|item| item.cells().len().saturating_sub(1))
+                    .unwrap_or(0)
+            }
         };
         if self.sort_column == actual_col {
             self.sort_ascending = !self.sort_ascending;
@@ -306,6 +319,7 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
             self.sort_column = actual_col;
             self.sort_ascending = true;
         }
+        self.sort_kind = kind;
         self.sort_items();
         self.rebuild_filter();
         self.clamp_selection();
@@ -332,46 +346,45 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
         self.adjust_offset();
     }
 
-    /// Update loading indicator based on item count changes.
-    fn update_loading(&mut self, new_count: usize) {
-        if self.loading {
-            if new_count <= self.prev_item_count {
-                self.loading = false;
-            }
-        } else if self.prev_item_count == 0 && new_count > 0 {
-            self.loading = true;
-        }
-        self.prev_item_count = new_count;
+    /// Mark the table as having received data. `loading` becomes false on
+    /// the first snapshot — the user sees the count increasing in the title
+    /// as the initial list streams in, which is sufficient progress feedback.
+    ///
+    /// The previous heuristic tried to detect "still streaming" by checking
+    /// whether the item count was still growing, and only cleared `loading`
+    /// when the count stopped increasing. This broke on large initial lists
+    /// (9k+ pods) because after the final snapshot no further snapshots
+    /// arrive in steady state — the "count stopped growing" condition never
+    /// fires and the table stays in "loading" forever.
+    fn update_loading(&mut self, _new_count: usize) {
+        self.loading = false;
         self.has_data = true;
     }
 
     /// Sort items by the current sort column with a stable tiebreaker.
+    /// The comparator type is driven by `self.sort_kind`, set by the
+    /// caller from the typed column header — no content sniffing.
     fn sort_items(&mut self) {
         if self.items.is_empty() { return; }
         let col = self.sort_column;
         let asc = self.sort_ascending;
-        // Detect whether this column contains age-formatted values (e.g. "3d5h",
-        // "10m") by sampling the first non-empty cell. This avoids depending on
-        // header names (which ResourceRow doesn't expose via the trait).
-        let is_age_col = self.items.iter()
-            .find_map(|item| {
-                let val = item.cells().get(col)?.as_str();
-                if val.is_empty() || val == "<unknown>" { return None; }
-                Some(val.chars().all(|c| c.is_ascii_digit() || matches!(c, 'd' | 'h' | 'm' | 's'))
-                    && val.chars().any(|c| matches!(c, 'd' | 'h' | 'm' | 's')))
-            })
-            .unwrap_or(false);
+        let kind = self.sort_kind;
         self.items.sort_by(|a, b| {
             let a_cells = a.cells();
             let b_cells = b.cells();
             let a_val = a_cells.get(col).map(|c| c.as_str()).unwrap_or("");
             let b_val = b_cells.get(col).map(|c| c.as_str()).unwrap_or("");
-            let primary = if is_age_col {
-                parse_age_seconds(a_val).cmp(&parse_age_seconds(b_val))
-            } else if let (Ok(an), Ok(bn)) = (a_val.parse::<f64>(), b_val.parse::<f64>()) {
-                an.partial_cmp(&bn).unwrap_or(std::cmp::Ordering::Equal)
-            } else {
-                a_val.cmp(b_val)
+            let primary = match kind {
+                ColumnSortKind::Age => {
+                    parse_age_seconds(a_val).cmp(&parse_age_seconds(b_val))
+                }
+                ColumnSortKind::StringOrNumber => {
+                    if let (Ok(an), Ok(bn)) = (a_val.parse::<f64>(), b_val.parse::<f64>()) {
+                        an.partial_cmp(&bn).unwrap_or(std::cmp::Ordering::Equal)
+                    } else {
+                        a_val.cmp(b_val)
+                    }
+                }
             };
             let primary = if asc { primary } else { primary.reverse() };
             if primary == std::cmp::Ordering::Equal {
@@ -420,6 +433,47 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
                     self.marked_visible[pos] = true;
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PreparedView — pre-zipped data for the table renderer
+// ---------------------------------------------------------------------------
+
+/// The product of [`StatefulTable::prepare_view`]: parallel arrays of
+/// visible-column cells, health tags, and identity keys, ready for the
+/// table widget. Encapsulates the `filtered_indices → items → visible
+/// cells` pipeline so the render code doesn't do manual index arithmetic.
+pub struct PreparedView {
+    pub rows: Vec<Vec<String>>,
+    pub health: Vec<crate::kube::resources::row::RowHealth>,
+    pub keys: Vec<crate::kube::protocol::ObjectKey>,
+}
+
+impl StatefulTable<crate::kube::resources::row::ResourceRow> {
+    /// Prepare the visible rows for rendering. Walks `filtered_indices`,
+    /// projects each row's cells through `visible_col_indices` (the
+    /// display-level-filtered column set), and collects health + identity
+    /// keys alongside. The caller passes the result to the table widget
+    /// — no index arithmetic or ObjectKey allocation in the render path.
+    pub fn prepare_view(&self, visible_col_indices: &[usize]) -> PreparedView {
+        let items: Vec<&crate::kube::resources::row::ResourceRow> = self.filtered_indices.iter()
+            .filter_map(|&i| self.items.get(i))
+            .collect();
+        PreparedView {
+            rows: items.iter().map(|r| {
+                visible_col_indices.iter()
+                    .map(|&ci| r.cells.get(ci).cloned().unwrap_or_default())
+                    .collect()
+            }).collect(),
+            health: items.iter().map(|r| r.health).collect(),
+            keys: items.iter().map(|r| {
+                crate::kube::protocol::ObjectKey::new(
+                    r.namespace.clone().unwrap_or_default(),
+                    r.name.clone(),
+                )
+            }).collect(),
         }
     }
 }

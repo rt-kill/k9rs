@@ -109,6 +109,24 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Yamux configuration tuned for the k9rs workload. Large clusters (9k+
+/// pods) produce multi-MB snapshots per subscription. The default 256 KB
+/// stream window forces ~24 window-update round-trips per snapshot; if the
+/// receiver is slow to drain (CPU busy sorting/rendering), the sender's
+/// write stalls and the 10-second connection_write_timeout can fire,
+/// silently killing the substream.
+///
+/// We bump the window to 16 MB so a single snapshot fits without flow-
+/// control pauses, and extend the write timeout so transient stalls on
+/// very large clusters don't kill the connection.
+fn mux_config() -> tokio_yamux::Config {
+    tokio_yamux::Config {
+        max_stream_window_size: 16 * 1024 * 1024,
+        connection_write_timeout: std::time::Duration::from_secs(60),
+        ..tokio_yamux::Config::default()
+    }
+}
+
 impl MuxedConnection {
     /// Construct the **client** side of the muxer over any async
     /// bidirectional transport (Unix socket, in-memory duplex for
@@ -118,10 +136,7 @@ impl MuxedConnection {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        Self::from_session(tokio_yamux::Session::new_client(
-            socket,
-            tokio_yamux::Config::default(),
-        ))
+        Self::from_session(tokio_yamux::Session::new_client(socket, mux_config()))
     }
 
     /// Construct the **server** side. The daemon uses this on each
@@ -130,10 +145,7 @@ impl MuxedConnection {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        Self::from_session(tokio_yamux::Session::new_server(
-            socket,
-            tokio_yamux::Config::default(),
-        ))
+        Self::from_session(tokio_yamux::Session::new_server(socket, mux_config()))
     }
 
     /// Internal constructor — wires the session into the driver task and
@@ -188,7 +200,7 @@ impl MuxedConnection {
     pub async fn open(&self) -> io::Result<MuxedStream> {
         let mut control = self.control.clone();
         let handle = control.open_stream().await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("yamux open: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("yamux open: {}", e)))?;
         Ok(MuxedStream { inner: handle })
     }
 
@@ -205,7 +217,7 @@ impl MuxHandle {
     pub async fn open(&self) -> io::Result<MuxedStream> {
         let mut control = self.control.clone();
         let handle = control.open_stream().await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("yamux open: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("yamux open: {}", e)))?;
         Ok(MuxedStream { inner: handle })
     }
 }

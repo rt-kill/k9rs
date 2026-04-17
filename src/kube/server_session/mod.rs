@@ -13,7 +13,6 @@ mod streaming;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -30,13 +29,12 @@ use super::protocol::{self, SessionCommand, SessionEvent};
 /// Holds the fields from `SessionCommand::Init` in a flat struct so
 /// `init_and_run` doesn't have to juggle a dozen local variables.
 struct InitParams {
-    context: Option<String>,
+    context: Option<protocol::ContextName>,
     namespace: protocol::Namespace,
     readonly: bool,
     kubeconfig_yaml: String,
     env_vars: HashMap<String, String>,
-    cluster_name: String,
-    user_name: String,
+    identity: protocol::ClusterIdentity,
 }
 
 // ---------------------------------------------------------------------------
@@ -51,7 +49,7 @@ struct InitParams {
 struct ClientBuilderRequest {
     kubeconfig_yaml: String,
     env_vars: HashMap<String, String>,
-    context: Option<String>,
+    context: Option<protocol::ContextName>,
     reply: tokio::sync::oneshot::Sender<anyhow::Result<(kube::Client, kube::Config)>>,
 }
 
@@ -61,11 +59,10 @@ pub struct SessionSharedState {
     /// Daemon-owned local resource sources (port-forwards, etc.).
     /// Shared across every session on this daemon.
     pub local_registry: Arc<crate::kube::local::LocalRegistry>,
-    /// In-memory discovery cache: keyed by ContextId (server_url + user).
-    pub discovery_cache: DashMap<protocol::ContextId, (Vec<String>, Vec<super::cache::CachedCrd>)>,
-    /// Cached server-provided column headers per resource type.
-    /// Populated on first subscription via the K8s Table API.
-    pub column_cache: DashMap<protocol::ResourceId, Vec<String>>,
+    /// In-memory discovery cache. Per-resource-type storage means a failed
+    /// namespace fetch can't erase a prior cached CRD list and vice-versa —
+    /// the cache can't be partially poisoned.
+    pub discovery_cache: super::cache::DiscoveryCache,
     /// Channel into the single-owner client-builder task. Sessions submit
     /// `ClientBuilderRequest`s here and await the oneshot reply. The builder
     /// task is the only place that touches process-global env vars, which
@@ -75,6 +72,12 @@ pub struct SessionSharedState {
     client_builder_tx: mpsc::Sender<ClientBuilderRequest>,
     /// Monotonic session ID counter for structured logging.
     next_session_id: std::sync::atomic::AtomicU64,
+}
+
+impl Default for SessionSharedState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionSharedState {
@@ -87,8 +90,7 @@ impl SessionSharedState {
         Self {
             watcher_cache: WatcherCache::new(),
             local_registry: Arc::new(crate::kube::local::LocalRegistry::new()),
-            discovery_cache: DashMap::new(),
-            column_cache: DashMap::new(),
+            discovery_cache: super::cache::DiscoveryCache::new(),
             client_builder_tx: tx,
             next_session_id: std::sync::atomic::AtomicU64::new(1),
         }
@@ -117,11 +119,11 @@ async fn client_builder_loop(mut rx: mpsc::Receiver<ClientBuilderRequest>) {
             let kubeconfig: Kubeconfig = serde_yaml::from_str(&req.kubeconfig_yaml)
                 .map_err(|e| anyhow::anyhow!("Failed to parse kubeconfig YAML: {}", e))?;
 
-            let context_name = req.context.clone()
-                .or_else(|| kubeconfig.current_context.clone());
+            let context_name: Option<protocol::ContextName> = req.context.clone()
+                .or_else(|| kubeconfig.current_context.clone().map(protocol::ContextName::from));
 
             let options = KubeConfigOptions {
-                context: context_name,
+                context: context_name.as_ref().map(|c| c.as_str().to_owned()),
                 ..Default::default()
             };
 
@@ -176,9 +178,20 @@ pub struct ServerSession {
     client: kube::Client,
     client_config: Option<kube::Config>,
     context: protocol::ContextId,
-    namespace: protocol::Namespace,
+    // `namespace` field removed — session doesn't need session-level
+    // namespace state. Each subscription carries its own in `SubscriptionInit`.
     readonly: bool,
     metrics_task: Option<JoinHandle<()>>,
+    /// Background loop that periodically re-runs discovery (namespaces +
+    /// CRDs), so new namespaces / new CRDs land in the cache and reach the
+    /// client without the user having to reconnect. Aborted in `cleanup()`.
+    discovery_refresher_task: Option<JoinHandle<()>>,
+    /// Tracks every `handle_*_async` background task (describe, yaml,
+    /// delete, apply, scale, restart, decode, cron-trigger,
+    /// cron-toggle-suspend, force-kill, save, etc). On `cleanup()` we
+    /// `abort_all` so a session that exits mid-operation doesn't leak
+    /// detached tasks holding kube clients and channel senders.
+    pending_tasks: tokio::task::JoinSet<()>,
     event_tx: mpsc::Sender<SessionEvent>,
     event_rx: Option<mpsc::Receiver<SessionEvent>>,
 }
@@ -189,7 +202,6 @@ impl ServerSession {
         shared: Arc<SessionSharedState>,
         client: kube::Client,
         context: protocol::ContextId,
-        namespace: protocol::Namespace,
         readonly: bool,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -199,9 +211,10 @@ impl ServerSession {
             client,
             client_config: None,
             context,
-            namespace,
             readonly,
             metrics_task: None,
+            discovery_refresher_task: None,
+            pending_tasks: tokio::task::JoinSet::new(),
             event_tx,
             event_rx: Some(event_rx),
         }
@@ -254,23 +267,33 @@ impl ServerSession {
         // the handshake (by which time the kube client exists) and before
         // the command loop runs.
         let (session_ctx_tx, session_ctx_rx) = watch::channel::<Option<Arc<SessionContext>>>(None);
+        // Track substream tasks in a JoinSet so we can abort them when the
+        // session ends. Without this, when the control loop exits the
+        // substream tasks keep running until their dead yamux stream
+        // eventually errors — they hold `Arc<SessionContext>` and any
+        // `Subscription` keepalives during that window.
+        let mut substream_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         let sub_acceptor = async {
-            // Wait for the session context to become available.
+            // Wait for the session context to become available, yielding it
+            // directly out of the loop so the invariant "context is Some" is
+            // discharged by the `if let`, not an `.unwrap()` afterwards.
             let mut rx = session_ctx_rx;
-            loop {
-                if rx.borrow_and_update().is_some() { break; }
+            let ctx: Arc<SessionContext> = loop {
+                if let Some(v) = rx.borrow_and_update().clone() { break v; }
                 if rx.changed().await.is_err() { return; }
-            }
-            let ctx: Arc<SessionContext> = rx.borrow().clone().unwrap();
+            };
             let mut substream_counter: u64 = 0;
             loop {
                 let Some(sub_stream) = mux.accept().await else { break };
                 substream_counter += 1;
                 let ctx = ctx.clone();
                 let sub_id = substream_counter;
-                tokio::spawn(async move {
+                substream_tasks.spawn(async move {
                     handle_data_substream(sub_stream, ctx, sub_id).await;
                 });
+                // Reap finished substreams opportunistically so the JoinSet
+                // doesn't grow with every accepted substream.
+                while substream_tasks.try_join_next().is_some() {}
             }
         };
 
@@ -278,6 +301,13 @@ impl ServerSession {
             _ = Self::init_and_run_with_ctx(reader, writer, shared, session_ctx_tx, session_id) => {}
             _ = sub_acceptor => {}
         }
+
+        // Session ended — abort any in-flight substream tasks. Each task
+        // holds an Arc<SessionContext> and possibly a Subscription
+        // keepalive; aborting drops them, which lets the watcher cache
+        // enter its grace period normally.
+        substream_tasks.abort_all();
+        while substream_tasks.join_next().await.is_some() {}
     }
 
     /// Create and run a session from a raw binary connection.
@@ -294,10 +324,10 @@ impl ServerSession {
         let init = match protocol::read_bincode::<_, SessionCommand>(&mut reader).await {
             Ok(SessionCommand::Init {
                 context, namespace, readonly,
-                kubeconfig_yaml, env_vars, cluster_name, user_name,
+                kubeconfig_yaml, env_vars, identity,
             }) => InitParams {
                 context, namespace, readonly,
-                kubeconfig_yaml, env_vars, cluster_name, user_name,
+                kubeconfig_yaml, env_vars, identity,
             },
             Ok(_) => {
                 let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
@@ -329,10 +359,10 @@ impl ServerSession {
         let init = match first_cmd {
             SessionCommand::Init {
                 context, namespace, readonly,
-                kubeconfig_yaml, env_vars, cluster_name, user_name,
+                kubeconfig_yaml, env_vars, identity,
             } => InitParams {
                 context, namespace, readonly,
-                kubeconfig_yaml, env_vars, cluster_name, user_name,
+                kubeconfig_yaml, env_vars, identity,
             },
             _ => {
                 let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
@@ -358,14 +388,20 @@ impl ServerSession {
         let init = match protocol::read_bincode::<_, SessionCommand>(&mut reader).await {
             Ok(SessionCommand::Init {
                 context, namespace, readonly,
-                kubeconfig_yaml, env_vars, cluster_name, user_name,
+                kubeconfig_yaml, env_vars, identity,
             }) => InitParams {
                 context, namespace, readonly,
-                kubeconfig_yaml, env_vars, cluster_name, user_name,
+                kubeconfig_yaml, env_vars, identity,
             },
-            Ok(_) | Err(_) => {
+            Ok(_) => {
                 let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
-                    "Expected Init command".to_string(),
+                    "Expected Init command as first message".to_string(),
+                )).await;
+                return;
+            }
+            Err(e) => {
+                let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
+                    format!("Failed to read Init command: {}", e),
                 )).await;
                 return;
             }
@@ -429,15 +465,13 @@ impl ServerSession {
         let context_id = protocol::ContextId::new(
             context_name.clone(),
             client_config.cluster_url.to_string(),
-            init.user_name.clone(),
+            init.identity.user.clone(),
         );
 
         // 4. Send Ready.
-        let ns = init.namespace.clone();
         let ready = SessionEvent::Ready {
             context: context_name.clone(),
-            cluster: init.cluster_name.clone(),
-            user: init.user_name.clone(),
+            identity: init.identity.clone(),
             namespaces: vec![],
         };
         if protocol::write_bincode(&mut buf_writer, &ready).await.is_err() {
@@ -450,7 +484,6 @@ impl ServerSession {
             shared.clone(),
             client.clone(),
             context_id.clone(),
-            ns.clone(),
             init.readonly,
         );
         session.client_config = Some(client_config.clone());
@@ -476,10 +509,15 @@ impl ServerSession {
         // Eagerly fetch discovery.
         session.handle_get_discovery_async();
 
+        // Keep discovery fresh while the session is alive — new namespaces
+        // and new CRDs land in the cache without the user having to
+        // disconnect/reconnect.
+        session.spawn_discovery_refresher();
+
         // Spawn metrics polling.
         session.spawn_metrics_poller();
 
-        info!("Session ready, entering command loop (context={}, ns={})", session.context.name, session.namespace.display());
+        info!("Session ready, entering command loop (context={})", session.context.name);
         if let Err(e) = session.run(reader).await {
             info!("Session ended: {}", e);
         } else {
@@ -516,10 +554,7 @@ impl ServerSession {
     /// Uses a spawned reader task to avoid partial-read corruption from
     /// select! cancellation.
     pub async fn run(mut self, reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>) -> anyhow::Result<()> {
-        debug!(
-            "ServerSession started: context={}, namespace={}",
-            self.context.name, self.namespace
-        );
+        debug!("ServerSession started: context={}", self.context.name);
 
         // Spawn a reader task that reads binary commands and sends them
         // through an mpsc channel. This avoids partial-read issues with
@@ -603,81 +638,45 @@ impl ServerSession {
             SessionCommand::Init { .. } => info!("Session cmd: Init"),
             other => debug!("Session cmd: {:?}", other),
         }
+
+        // Single readonly gate — classified by the typed `is_mutating`
+        // method on `SessionCommand` itself. Exhaustive match on the
+        // classifier means adding a new mutating command variant without
+        // declaring its classification is a compile error. No per-arm
+        // `reject_if_readonly` calls; forgetting to call one becomes
+        // structurally impossible.
+        if cmd.is_mutating() && self.readonly {
+            self.reject_async("Session is read-only".to_string());
+            return Ok(());
+        }
+
         match cmd {
             SessionCommand::Init { .. } => {
                 debug!("ServerSession: ignoring duplicate Init");
             }
 
-            // Subscribe/Unsubscribe/Refresh are gone — subscriptions are
-            // managed via per-subscription yamux substreams now.
+            // CRUD ops: route by resource backend (K8s vs local). The
+            // dispatchers live as private methods so `handle_command`
+            // reads as a flat per-variant match.
+            SessionCommand::Describe(ref obj) => self.dispatch_describe(obj).await?,
+            SessionCommand::Yaml(ref obj) => self.dispatch_yaml(obj).await?,
+            SessionCommand::Delete(ref obj) => self.dispatch_delete(obj),
+            SessionCommand::Apply { ref target, ref yaml } => self.dispatch_apply(target, yaml.clone()),
 
-            SessionCommand::SwitchNamespace { namespace } => {
-                self.handle_switch_namespace(namespace).await;
-            }
-
-            SessionCommand::Describe(ref obj) => {
-                if obj.resource.is_local() {
-                    let content = self.describe_local(&obj.resource, &obj.name);
-                    self.send_event(&SessionEvent::DescribeResult(content)).await?;
-                } else {
-                    self.handle_describe_async(obj);
-                }
-            }
-
-            SessionCommand::Yaml(ref obj) => {
-                if obj.resource.is_local() {
-                    let content = self.yaml_local(&obj.resource, &obj.name);
-                    self.send_event(&SessionEvent::YamlResult(content)).await?;
-                } else {
-                    self.handle_yaml_async(obj);
-                }
-            }
-
-            SessionCommand::Delete(ref obj) => {
-                if obj.resource.is_local() {
-                    self.handle_delete_local(obj);
-                } else {
-                    self.handle_delete_async(obj);
-                }
-            }
-
-            SessionCommand::Apply { ref target, ref yaml } => {
-                if self.reject_if_readonly() { return Ok(()); }
-                if target.resource.is_local() {
-                    self.handle_apply_local(target, yaml);
-                } else {
-                    self.handle_apply_async(target, yaml.clone());
-                }
-            }
-
-            SessionCommand::Scale { ref target, replicas } => {
-                self.handle_scale_async(target, replicas);
-            }
-
-            SessionCommand::Restart(ref obj) => {
-                self.handle_restart_async(obj);
+            // K8s-only mutating ops. Locals are rejected inside the
+            // handlers via `require_capability` / typed kind checks.
+            SessionCommand::ForceKill(ref obj) => self.handle_force_kill_async(obj),
+            SessionCommand::Scale { ref target, replicas } => self.handle_scale_async(target, replicas),
+            SessionCommand::Restart(ref obj) => self.handle_restart_async(obj),
+            SessionCommand::DecodeSecret(ref target) => self.handle_decode_secret_async(target),
+            SessionCommand::TriggerCronJob(ref target) => self.handle_trigger_cronjob_async(target),
+            SessionCommand::ToggleSuspendCronJob(ref target) => self.handle_toggle_suspend_cronjob_async(target),
+            SessionCommand::PortForward { ref target, local_port, container_port } => {
+                self.handle_port_forward(target, local_port, container_port);
             }
 
             SessionCommand::GetDiscovery => {
                 self.handle_get_discovery_async();
-            }
-
-            SessionCommand::DecodeSecret(ref target) => {
-                self.handle_decode_secret_async(target);
-            }
-
-            SessionCommand::TriggerCronJob(ref target) => {
-                if self.reject_if_readonly() { return Ok(()); }
-                self.handle_trigger_cronjob_async(target);
-            }
-
-            SessionCommand::ToggleSuspendCronJob(ref target) => {
-                if self.reject_if_readonly() { return Ok(()); }
-                self.handle_toggle_suspend_cronjob_async(target);
-            }
-
-            SessionCommand::PortForward { ref target, local_port, container_port } => {
-                self.handle_port_forward(target, local_port, container_port);
             }
 
             // Management commands should not arrive on a session connection.
@@ -688,6 +687,57 @@ impl ServerSession {
         }
 
         Ok(())
+    }
+
+    /// Describe dispatcher: sends the response synchronously for local
+    /// resources (the lookup is cheap), spawns the async handler for K8s.
+    async fn dispatch_describe(&mut self, obj: &protocol::ObjectRef) -> anyhow::Result<()> {
+        if obj.resource.is_local() {
+            let content = self.describe_local(&obj.resource, &obj.name);
+            self.send_event(&SessionEvent::DescribeResult {
+                target: obj.clone(),
+                content,
+            }).await?;
+        } else {
+            self.handle_describe_async(obj);
+        }
+        Ok(())
+    }
+
+    /// Yaml dispatcher: mirrors `dispatch_describe`.
+    async fn dispatch_yaml(&mut self, obj: &protocol::ObjectRef) -> anyhow::Result<()> {
+        if obj.resource.is_local() {
+            let content = self.yaml_local(&obj.resource, &obj.name);
+            self.send_event(&SessionEvent::YamlResult {
+                target: obj.clone(),
+                content,
+            }).await?;
+        } else {
+            self.handle_yaml_async(obj);
+        }
+        Ok(())
+    }
+
+    /// Delete dispatcher: routes by backend. Port-forward "delete" means
+    /// "stop the forward" — a daemon-side mutation which the readonly
+    /// gate already refused before we got here.
+    fn dispatch_delete(&mut self, obj: &protocol::ObjectRef) {
+        if obj.resource.is_local() {
+            self.handle_delete_local(obj);
+        } else {
+            self.handle_delete_async(obj);
+        }
+    }
+
+    /// Apply dispatcher: routes by backend. Same-wire `Apply { target, yaml }`
+    /// works for both K8s (server-side apply via kube-rs) and locals (parse
+    /// the edit view and reconcile).
+    fn dispatch_apply(&mut self, target: &protocol::ObjectRef, yaml: String) {
+        if target.resource.is_local() {
+            self.handle_apply_local(target, &yaml);
+        } else {
+            self.handle_apply_async(target, yaml);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -709,12 +759,12 @@ impl ServerSession {
     /// directly.
     fn describe_local(&self, rid: &protocol::ResourceId, name: &str) -> String {
         let Some(source) = self.shared.local_registry.get(&self.context.name, rid) else {
-            return format!("Unknown local resource type: {}", rid.plural);
+            return format!("Unknown local resource type: {}", rid.plural());
         };
         match source.describe(name) {
             Some(Ok(content)) => content,
             Some(Err(e)) => format!("Error: {}", e),
-            None => format!("describe is not supported on {}", rid.plural),
+            None => format!("describe is not supported on {}", rid.plural()),
         }
     }
 
@@ -722,12 +772,12 @@ impl ServerSession {
     /// owning per-context `LocalResourceSource`. Mirrors `describe_local`.
     fn yaml_local(&self, rid: &protocol::ResourceId, name: &str) -> String {
         let Some(source) = self.shared.local_registry.get(&self.context.name, rid) else {
-            return format!("Unknown local resource type: {}", rid.plural);
+            return format!("Unknown local resource type: {}", rid.plural());
         };
         match source.yaml(name) {
             Some(Ok(content)) => content,
             Some(Err(e)) => format!("Error: {}", e),
-            None => format!("yaml is not supported on {}", rid.plural),
+            None => format!("yaml is not supported on {}", rid.plural()),
         }
     }
 
@@ -740,7 +790,28 @@ impl ServerSession {
         // substreams now. When the mux connection drops (session exits),
         // all substream reads return EOF and the bridge tasks exit naturally.
         if let Some(h) = self.metrics_task.take() { h.abort(); }
+        if let Some(h) = self.discovery_refresher_task.take() { h.abort(); }
+        // Abort every pending mutating handler (scale/restart/apply/delete
+        // /etc) and drain. Without this, a session that exits while a
+        // handler is mid-`api.patch().await` would leave the task running
+        // detached against the kube client.
+        self.pending_tasks.abort_all();
+        while self.pending_tasks.join_next().await.is_some() {}
         debug!("ServerSession: cleaned up");
+    }
+
+    /// Spawn a background task and track it on the session's `JoinSet`.
+    /// Every `handle_*_async` helper goes through this instead of bare
+    /// `tokio::spawn` so that session shutdown can abort all in-flight
+    /// work in one place (`cleanup`). Reaps finished tasks opportunistically
+    /// so the JoinSet doesn't grow without bound.
+    pub(super) fn track_task<F>(&mut self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        // Drain any already-finished tasks before adding a new one.
+        while self.pending_tasks.try_join_next().is_some() {}
+        self.pending_tasks.spawn(fut);
     }
 }
 
@@ -818,7 +889,7 @@ async fn handle_data_substream(
             handle_subscription_substream_inner(sub_init, writer, ctx, sid, sub_id).await;
         }
         protocol::SubstreamInit::Log(log_init) => {
-            tracing::info!(session = sid, sub = sub_id, "log: pod={} container={}", log_init.pod, log_init.container);
+            tracing::info!(session = sid, sub = sub_id, "log: pod={} container={:?}", log_init.pod, log_init.container);
             handle_log_substream(log_init, writer, ctx).await;
         }
     }
@@ -836,26 +907,24 @@ async fn handle_subscription_substream_inner(
 
     let rid = init.resource.clone();
     let filter = init.filter.clone();
-    tracing::info!(session = session_id, sub = sub_id, "subscribe: {}({}) filter={:?}", rid.plural, init.namespace.display(), filter);
+    tracing::info!(session = session_id, sub = sub_id, "subscribe: {}({}) filter={:?}",
+        rid.plural(), init.namespace.display(), filter);
 
-    // Handle local resources via the LocalResourceSource trait.
+    // Local resources branch out into the LocalResourceSource pipeline.
     if rid.is_local() {
         let Some(source) = ctx.shared.local_registry.get(&ctx.context.name, &rid) else {
             let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Error(
-                format!("Unknown local resource: {}", rid.plural)
+                format!("Unknown local resource: {}", rid.plural())
             )).await;
             return;
         };
-        // Emit capabilities.
-        let caps = source.capabilities();
-        let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Capabilities(caps)).await;
-        // Bridge the local source's watch channel to the substream.
+        // Capabilities are computed client-side from the typed rid via
+        // `ResourceId::capabilities()`; no wire send needed.
         let mut sub = crate::kube::local::LocalSubscription::new(
             rid.clone(),
             source.subscribe(),
             source,
         );
-        // Send initial snapshot.
         let _ = protocol::write_bincode(&mut writer,
             &protocol::StreamEvent::Snapshot(sub.current())).await;
         let _ = writer.flush().await;
@@ -871,7 +940,7 @@ async fn handle_subscription_substream_inner(
     // K8s resource: build QueryKey, subscribe via WatcherCache.
     // Namespace comes from the client's SubscriptionInit — each subscription
     // declares its own namespace so the server doesn't need mutable session state.
-    let effective_ns = if rid.scope == protocol::ResourceScope::Cluster {
+    let effective_ns = if rid.is_cluster_scoped() {
         protocol::Namespace::All
     } else {
         init.namespace.clone()
@@ -891,14 +960,6 @@ async fn handle_subscription_substream_inner(
         filter: cache_filter,
     };
 
-    // Column discovery (best-effort, non-blocking).
-    let is_builtin = protocol::ResourceId::from_alias(&rid.plural)
-        .map(|r| !r.is_local())
-        .unwrap_or(false);
-    let server_headers = ctx.shared.column_cache.get(&rid)
-        .map(|v| v.clone())
-        .unwrap_or_default();
-
     // Create a fresh kube::Client per watcher (avoids pool starvation).
     let watcher_client = if let Some(ref cfg) = ctx.client_config {
         kube::Client::try_from(cfg.clone()).unwrap_or_else(|_| ctx.client.clone())
@@ -906,68 +967,88 @@ async fn handle_subscription_substream_inner(
         ctx.client.clone()
     };
 
-    let mut sub = if is_builtin {
-        ctx.shared.watcher_cache.subscribe(key, &watcher_client, server_headers)
-    } else {
-        // CRD or unknown resource: resolve the API resource descriptor
-        // via the K8s discovery API, then use subscribe_dynamic which
-        // builds a DynamicObject watcher from the resolved GVK.
-        let (gvk, plural, scope) = if rid.group.is_empty() && rid.version.is_empty() {
-            // Unknown CRD with no group/version — resolve via HTTP.
-            match crate::kube::describe::resolve_api_resource(&watcher_client, &rid.plural).await {
+    let mut sub = match &rid {
+        protocol::ResourceId::BuiltIn(kind) => {
+            // Built-ins go through the typed registry path — the watcher
+            // factory is dispatched on the typed kind, no string match.
+            // Hand the destructured `kind` in so the cache doesn't have to
+            // re-extract it at runtime.
+            if init.force {
+                ctx.shared.watcher_cache.subscribe_force(key, *kind, &watcher_client)
+            } else {
+                ctx.shared.watcher_cache.subscribe(key, *kind, &watcher_client)
+            }
+        }
+        protocol::ResourceId::Crd(crd_ref) => {
+            // CRD: resolve GVR via the typed `api_resource_for` helper —
+            // it already handles both populated and incomplete (group/version
+            // empty) shapes, falling back to discovery for the latter. We
+            // only need to notify the TUI of the resolved identity when
+            // the original was incomplete.
+            let was_incomplete = crd_ref.is_unresolved();
+            let (gvk, plural, scope) = match crate::kube::describe::api_resource_for(&watcher_client, &rid).await {
                 Ok((ar, resolved_scope)) => {
                     let gvk = kube::api::GroupVersionKind::gvk(&ar.group, &ar.version, &ar.kind);
-                    // Notify TUI of the resolved identity so it can update
-                    // nav and table keys.
-                    let resolved_rid = protocol::ResourceId::new(
-                        ar.group.clone(), ar.version.clone(),
-                        ar.kind.clone(), ar.plural.clone(), resolved_scope,
-                    );
-                    let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Resolved {
-                        original: rid.clone(),
-                        resolved: resolved_rid,
-                    }).await;
+                    if was_incomplete {
+                        let resolved_rid = protocol::ResourceId::crd(
+                            ar.group.clone(), ar.version.clone(),
+                            ar.kind.clone(), ar.plural.clone(), resolved_scope,
+                        );
+                        let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Resolved {
+                            original: rid.clone(),
+                            resolved: resolved_rid,
+                        }).await;
+                    }
                     (gvk, ar.plural, resolved_scope)
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to discover resource '{}': {}", rid.plural, e);
+                    tracing::warn!("Failed to resolve resource '{}': {}", crd_ref.plural, e);
                     let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Error(
-                        format!("Unknown resource: {}", rid.plural)
+                        format!("Unknown resource: {}", crd_ref.plural)
                     )).await;
                     return;
                 }
+            };
+
+            // Rebuild the QueryKey with the resolved GVR so the cache key
+            // matches on subsequent navigations (where the TUI sends the
+            // resolved ResourceId with populated group/version).
+            let resolved_key = QueryKey {
+                context: key.context,
+                namespace: key.namespace,
+                resource: protocol::ResourceId::crd(
+                    gvk.group.clone(), gvk.version.clone(),
+                    gvk.kind.clone(), plural.clone(), scope,
+                ),
+                filter: key.filter,
+            };
+
+            // Look up printer columns from the discovery cache for CRD-specific columns.
+            let printer_columns = ctx.shared.discovery_cache
+                .printer_columns_for(&ctx.context, &gvk.group, &plural)
+                .unwrap_or_default();
+
+            if init.force {
+                ctx.shared.watcher_cache.remove(&resolved_key);
             }
-        } else {
-            let gvk = kube::api::GroupVersionKind::gvk(&rid.group, &rid.version, &rid.kind);
-            (gvk, rid.plural.clone(), rid.scope)
-        };
-
-        // Look up printer columns from the discovery cache for CRD-specific columns.
-        // Use the resolved gvk.group and plural (not rid.group which may be empty
-        // for unknown resources that went through the resolution path).
-        let printer_columns = ctx.shared.discovery_cache.get(&ctx.context)
-            .and_then(|entry| {
-                let (_ns, crds) = entry.value();
-                crds.iter()
-                    .find(|c| c.group == gvk.group && c.plural == plural)
-                    .map(|c| c.printer_columns.clone())
-            })
-            .unwrap_or_default();
-
-        ctx.shared.watcher_cache.subscribe_dynamic(
-            key, &watcher_client, gvk, plural, scope, printer_columns,
-        )
+            ctx.shared.watcher_cache.subscribe_dynamic(
+                resolved_key, &watcher_client, gvk, plural, scope, printer_columns,
+            )
+        }
+        protocol::ResourceId::Local(_) => {
+            // Unreachable — we early-returned above for locals.
+            unreachable!("local rids are handled by the early-return branch");
+        }
     };
 
-    // Emit capabilities.
-    let caps = crate::kube::capabilities::for_k8s(&rid.plural);
-    let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Capabilities(caps)).await;
-    let _ = writer.flush().await;
+    // Capabilities used to be emitted here as `StreamEvent::Capabilities`.
+    // Removed — the client computes the identical manifest from the typed
+    // `ResourceId::capabilities()` method, so the wire round-trip and
+    // client-side cache were redundant.
 
     // Bridge: watcher → StreamEvent frames on the substream.
     // Send current snapshot immediately if available.
     if let Some(update) = sub.current() {
-        // Apply owner-uid post-filter if needed.
         let update = apply_owner_filter_inline(update, &filter);
         let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await;
         let _ = writer.flush().await;
@@ -975,20 +1056,27 @@ async fn handle_subscription_substream_inner(
 
     loop {
         if sub.changed().await.is_err() {
-            tracing::debug!(session = session_id, sub = sub_id, "watcher closed for {}", rid.plural);
+            tracing::debug!(session = session_id, sub = sub_id, "watcher closed for {}", rid.plural());
             break;
         }
         let Some(update) = sub.current() else {
             let detail = sub.last_error().unwrap_or_default();
             let msg = if detail.is_empty() {
-                format!("Watcher failed for {}", rid.plural)
+                format!("Watcher failed for {}", rid.plural())
             } else {
-                format!("Watcher failed for {}: {}", rid.plural, detail)
+                format!("Watcher failed for {}: {}", rid.plural(), detail)
             };
             let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Error(msg)).await;
             break;
         };
         let update = apply_owner_filter_inline(update, &filter);
+        if let crate::event::ResourceUpdate::Rows { ref resource, ref rows, .. } = update {
+            tracing::info!(
+                session = session_id, sub = sub_id,
+                "server bridge: writing snapshot for {} ({} rows)",
+                resource.plural(), rows.len(),
+            );
+        }
         if protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await.is_err() {
             break;
         }
@@ -996,9 +1084,11 @@ async fn handle_subscription_substream_inner(
     }
 }
 
-/// Inline owner-uid post-filter for subscription substreams (same logic as
-/// `apply_owner_filter` in `bridge_subscription_to_events`, duplicated here
-/// to avoid coupling to the old mpsc-based bridge function).
+/// Owner-uid post-filter for subscription substreams. OwnerUid is the one
+/// `SubscriptionFilter` variant that K8s can't apply server-side (the
+/// field doesn't exist on the resource schema), so we drop rows whose
+/// owner chain doesn't include the requested UID after the watcher hands
+/// us each snapshot.
 fn apply_owner_filter_inline(
     update: crate::event::ResourceUpdate,
     filter: &Option<protocol::SubscriptionFilter>,
@@ -1045,7 +1135,10 @@ async fn handle_log_substream(
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    tracing::info!("log substream: pod={} container={}", init.pod, init.container);
+    // The dispatch site `handle_substream` already logged
+    // `pod={} container={:?}` at substream open — we don't need to
+    // duplicate it here. The typed `LogContainer` enum's Debug repr
+    // is already self-explanatory.
 
     let ns = match init.namespace.as_option() {
         Some(n) => n.to_string(),
@@ -1054,16 +1147,20 @@ async fn handle_log_substream(
 
     let mut cmd = tokio::process::Command::new("kubectl");
     cmd.arg("logs").arg(&init.pod);
-    if init.container == "all" {
-        cmd.arg("--all-containers");
-    } else if !init.container.is_empty() {
-        cmd.arg("-c").arg(&init.container);
+    match &init.container {
+        protocol::LogContainer::All => {
+            cmd.arg("--all-containers");
+        }
+        protocol::LogContainer::Named(name) => {
+            cmd.arg("-c").arg(name);
+        }
+        protocol::LogContainer::Default => {}
     }
     if !ns.is_empty() {
         cmd.arg("-n").arg(&ns);
     }
     if !ctx.context.name.is_empty() {
-        cmd.arg("--context").arg(&ctx.context.name);
+        cmd.arg("--context").arg(ctx.context.name.as_str());
     }
     if init.follow {
         cmd.arg("-f");
@@ -1078,7 +1175,11 @@ async fn handle_log_substream(
         cmd.arg("--previous");
     }
     cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    // stderr → null. We don't surface kubectl's own warnings to the TUI,
+    // and an unread piped stderr can fill the OS pipe buffer (kubectl emits
+    // a line per pod restart / auth refresh / TLS handshake on long-running
+    // follow streams) and stall the subprocess after ~64 KiB.
+    cmd.stderr(std::process::Stdio::null());
     cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {

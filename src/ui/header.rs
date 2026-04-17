@@ -73,23 +73,23 @@ pub fn draw_cluster_info(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             if app.context.is_empty() {
                 Span::styled("connecting…", theme.info_na)
             } else {
-                Span::styled(&app.context, theme.info_value)
+                Span::styled(app.context.as_str(), theme.info_value)
             },
         ]),
         Line::from(vec![
             Span::styled(" Cluster:   ", theme.info_label),
-            if app.cluster.is_empty() {
+            if app.identity.cluster.is_empty() {
                 Span::styled("n/a", theme.info_na)
             } else {
-                Span::styled(&app.cluster, theme.info_value)
+                Span::styled(&app.identity.cluster, theme.info_value)
             },
         ]),
         Line::from(vec![
             Span::styled(" User:      ", theme.info_label),
-            if app.user.is_empty() {
+            if app.identity.user.is_empty() {
                 Span::styled("n/a", theme.info_na)
             } else {
-                Span::styled(&app.user, theme.info_value)
+                Span::styled(&app.identity.user, theme.info_value)
             },
         ]),
         Line::from(vec![
@@ -141,7 +141,7 @@ pub fn draw_key_hint_grid(
     }
 
     let col_width = area.width / 2;
-    let entries_per_col = (hints.len() + 1) / 2;
+    let entries_per_col = hints.len().div_ceil(2);
 
     for row in 0..entries_per_col {
         if row as u16 >= area.height {

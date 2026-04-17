@@ -1,39 +1,33 @@
 
 use k8s_openapi::api::batch::v1::CronJob;
 
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::{CommonMeta, WorkloadContainers};
+use crate::kube::resources::row::{ResourceRow};
 
 /// Convert a k8s CronJob into a generic ResourceRow.
 pub(crate) fn cronjob_to_row(cj: CronJob) -> ResourceRow {
-    let metadata = cj.metadata;
-    let ns = metadata.namespace.unwrap_or_default();
-    let name = metadata.name.unwrap_or_default();
-    let labels = metadata.labels.unwrap_or_default();
-    let labels_str = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
-    let age = metadata.creation_timestamp.map(|t| t.0);
+    let meta = CommonMeta::from_k8s(cj.metadata);
 
     let spec = cj.spec.unwrap_or_default();
     let schedule = spec.schedule;
     let suspend = spec.suspend.unwrap_or(false);
 
-    let job_template_containers = spec.job_template.spec.as_ref()
+    // Containers live two templates deep: CronJobSpec → JobTemplateSpec →
+    // PodTemplateSpec → PodSpec. We only want names/images; port-forward
+    // isn't offered for cron-scheduled workloads.
+    let pod_spec = spec.job_template.spec.as_ref()
         .and_then(|js| js.template.spec.as_ref());
-    let container_names = job_template_containers
-        .map(|ps| ps.containers.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(","))
-        .unwrap_or_default();
-    let images = job_template_containers
-        .map(|ps| ps.containers.iter().map(|c| c.image.clone().unwrap_or_default()).collect::<Vec<_>>().join(","))
-        .unwrap_or_default();
+    let containers = WorkloadContainers::from_pod_spec(pod_spec);
 
     let status = cj.status.unwrap_or_default();
     let active = status.active.as_ref().map(|a| a.len() as i32).unwrap_or(0);
     let last_schedule = status.last_schedule_time.map(|t| t.0);
 
-    let uid = metadata.uid.unwrap_or_default();
-    let drill = if !uid.is_empty() {
+    let drill = if !meta.uid.is_empty() {
         Some(crate::kube::resources::row::DrillTarget::JobsByOwner {
-            uid,
-            name: name.clone(),
+            uid: meta.uid.clone(),
+            kind: crate::kube::resource_def::BuiltInKind::CronJob,
+            name: meta.name.clone(),
         })
     } else {
         None
@@ -41,19 +35,16 @@ pub(crate) fn cronjob_to_row(cj: CronJob) -> ResourceRow {
 
     ResourceRow {
         cells: vec![
-            ns.clone(), name.clone(), schedule, suspend.to_string(),
+            meta.namespace.clone(), meta.name.clone(),
+            schedule, suspend.to_string(),
             active.to_string(), crate::util::format_age(last_schedule),
-            container_names, images,
-            labels_str,
-            crate::util::format_age(age),
+            containers.names, containers.images,
+            meta.labels_str,
+            crate::util::format_age(meta.age),
         ],
-        name,
-        namespace: Some(ns),
-        containers: Vec::new(),
-        owner_refs: Vec::new(),
-        pf_ports: Vec::new(),
-        node: None,
-        crd_info: None,
+        name: meta.name,
+        namespace: Some(meta.namespace),
         drill_target: drill,
+        ..Default::default()
     }
 }

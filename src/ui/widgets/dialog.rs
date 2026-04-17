@@ -46,7 +46,7 @@ impl Widget for ConfirmDialogWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Size the dialog to fit the message with some padding
         let msg_len = self.dialog.message.width() as u16 + 6; // padding
-        let dialog_width = msg_len.max(30).min(60).min(area.width.saturating_sub(4));
+        let dialog_width = msg_len.clamp(30, 60).min(area.width.saturating_sub(4));
         let dialog_height = 7u16.min(area.height.saturating_sub(2));
 
         let dialog_area = Self::centered_rect(area, dialog_width, dialog_height);
@@ -271,7 +271,7 @@ impl FormDialogWidget<'_> {
                 let idx: usize = field.value.parse().unwrap_or(0);
                 let display = options
                     .get(idx)
-                    .map(|(_, label)| label.as_str())
+                    .map(|opt| opt.label.as_str())
                     .unwrap_or("(none)");
                 let style = if focused { self.theme.filter } else { self.theme.info_value };
                 let arrows = if focused { (" ◀ ", " ▶") } else { ("   ", "  ") };

@@ -27,10 +27,17 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     let indicator_area = chunks[1];
     let bar_area = chunks[2];
 
-    // Extract pod/container and state from route
-    let (pod_name, container_name, logs) = match &app.route {
-        Route::Logs { ref target, ref state, .. } => (target.pod.as_str(), target.container.as_str(), state.as_ref()),
-        Route::Shell { ref target, ref state, .. } => (target.pod.as_str(), target.container.as_str(), state.as_ref()),
+    use crate::kube::protocol::LogContainer;
+    // Extract pod/container and state from route. The container is the
+    // typed `LogContainer`; the widget needs both a display label and a
+    // boolean for "should I parse per-line container prefixes".
+    let (pod_name, container_label, is_all_containers, logs) = match &app.route {
+        Route::Logs { ref target, ref state, .. } => (
+            target.pod.as_str(),
+            target.container_label(),
+            matches!(target.container, LogContainer::All),
+            state.as_ref(),
+        ),
         _ => return, // Not a log view — nothing to draw
     };
     let since_label = logs.since.as_deref().unwrap_or("tail");
@@ -60,7 +67,8 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             let log_viewer = LogViewer::new(
                 &all_lines,
                 pod_name,
-                container_name,
+                container_label,
+                is_all_containers,
                 since_label,
                 theme,
             );
@@ -108,7 +116,8 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             let log_viewer = LogViewer::new(
                 &visible_lines,
                 pod_name,
-                container_name,
+                container_label,
+                is_all_containers,
                 since_label,
                 theme,
             );
@@ -137,7 +146,7 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             format!(" [{}]", since_label)
         };
         let block = ratatui::widgets::Block::bordered()
-            .title(format!(" Logs: {}/{}{} ", pod_name, container_name, since_title))
+            .title(format!(" Logs: {}/{}{} ", pod_name, container_label, since_title))
             .title_style(theme.title)
             .border_style(theme.border);
         let inner = block.inner(log_area);

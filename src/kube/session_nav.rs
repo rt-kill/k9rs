@@ -1,7 +1,8 @@
 use crate::app::{App, InputMode};
 use crate::app::nav::rid;
 use crate::kube::client_session::ClientSession;
-use crate::kube::session::{ds_try, apply_nav_change};
+use crate::kube::resource_def::BuiltInKind;
+use crate::kube::session::apply_nav_change;
 
 // ---------------------------------------------------------------------------
 // Nav drill-down helpers
@@ -21,13 +22,10 @@ pub(crate) fn drill_to_pods_by_labels(
     use crate::app::nav::{NavFilter, NavStep};
 
     app.nav.save_selected(app.active_table_selected());
-    let change = app.nav.push(NavStep {
-        resource: rid("pods"),
-        filter: Some(NavFilter::Labels(labels)),
-        saved_selected: 0,
-        filter_input: crate::app::nav::FilterInputState::default(),
-                stream: None,
-    });
+    let change = app.nav.push(NavStep::new(
+        rid(BuiltInKind::Pod),
+        Some(NavFilter::Labels(labels)),
+    ));
     apply_nav_change(app, data_source, change);
     app.reapply_nav_filters();
     app.flash = Some(crate::app::FlashMessage::info(format!("Pods for {}", description)));
@@ -39,16 +37,13 @@ pub(crate) fn drill_to_pods_by_grep(
     data_source: &mut ClientSession,
     name: &str,
 ) {
-    use crate::app::nav::{NavFilter, NavStep};
+    use crate::app::nav::{CompiledGrep, NavFilter, NavStep};
     let filter = format!("{}-", regex::escape(name));
     app.nav.save_selected(app.active_table_selected());
-    let change = app.nav.push(NavStep {
-        resource: rid("pods"),
-        filter: Some(NavFilter::Grep(filter)),
-        saved_selected: 0,
-        filter_input: crate::app::nav::FilterInputState::default(),
-                stream: None,
-    });
+    let change = app.nav.push(NavStep::new(
+        rid(BuiltInKind::Pod),
+        Some(NavFilter::Grep(CompiledGrep::new(filter))),
+    ));
     apply_nav_change(app, data_source, change);
     app.reapply_nav_filters();
     app.flash = Some(crate::app::FlashMessage::info(format!("Pods matching: {}", name)));
@@ -60,66 +55,63 @@ pub(crate) fn drill_to_pods_by_owner(
     app: &mut App,
     data_source: &mut ClientSession,
     uid: &str,
-    kind: &str,
+    kind: BuiltInKind,
     name: &str,
 ) {
     use crate::app::nav::{NavFilter, NavStep};
 
     app.nav.save_selected(app.active_table_selected());
-    let change = app.nav.push(NavStep {
-        resource: rid("pods"),
-        filter: Some(NavFilter::OwnerChain {
+    let change = app.nav.push(NavStep::new(
+        rid(BuiltInKind::Pod),
+        Some(NavFilter::OwnerChain {
             uid: uid.to_string(),
-            kind: kind.to_string(),
+            kind,
             display_name: name.to_string(),
         }),
-        saved_selected: 0,
-        filter_input: crate::app::nav::FilterInputState::default(),
-                stream: None,
-    });
+    ));
     apply_nav_change(app, data_source, change);
     app.reapply_nav_filters();
+    let kind_lower = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().kind.to_lowercase();
     app.flash = Some(crate::app::FlashMessage::info(format!(
         "Pods for {}/{}",
-        kind.to_lowercase(), name
+        kind_lower, name
     )));
 }
 
-/// Begin a context switch. Immediately clears UI state and sets
-/// `pending_context_switch` so the main loop drops the current session
-/// and creates a new one. One socket = one context = one session.
+/// Begin a context switch. Immediately clears UI state and transitions
+/// `app.context_switch` to `Requested(ctx_name)` so the main loop drops
+/// the current session and creates a new one. One socket = one context
+/// = one session.
 pub(crate) fn begin_context_switch(
     app: &mut App,
     _data_source: &mut ClientSession,
-    ctx_name: &str,
+    ctx_name: &crate::kube::protocol::ContextName,
     log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) {
-    // Guard against rapid context switches — if one is already in flight, reject.
-    if app.context_switch_pending {
+    // Guard against rapid context switches — only `Stable` accepts a new
+    // switch; `Requested` and `InFlight` reject with a user-visible error.
+    if !app.context_switch.is_stable() {
         app.flash = Some(crate::app::FlashMessage::error(
             "Context switch already in progress".to_string(),
         ));
         return;
     }
-    app.context_switch_pending = true;
 
     // Cancel any active log stream — drop closes the substream.
     *log_stream = None;
     // Drop all subscription substreams (core + nav).
     app.core_streams.clear();
     app.nav.current_mut().stream = None;
-    // Reset UI state immediately so the user sees a clean slate.
-    // Data clearing happens in session_main's pending_context_switch block,
-    // AFTER the old session is dropped and stale events are discarded.
-    app.context = ctx_name.to_string();
+    // Reset UI state immediately so the user sees a clean slate. Data
+    // clearing happens in session_main's `context_switch.take_requested()`
+    // block, AFTER the old session is dropped and stale events are
+    // discarded.
+    app.context = ctx_name.clone();
     app.selected_ns = crate::kube::protocol::Namespace::All;
-    if let Some(ctx) = app.data.contexts.items.iter().find(|c| c.name == ctx_name) {
-        app.cluster = ctx.cluster.clone();
-        app.user = ctx.user.clone();
-    } else {
-        app.cluster = String::new();
-        app.user = String::new();
-    }
+    app.identity = app.data.contexts.items.iter()
+        .find(|c| c.name == *ctx_name)
+        .map(|ctx| ctx.identity.clone())
+        .unwrap_or_default();
     let root = app.nav.root_resource_id().clone();
     let _change = app.nav.reset(root);
     *app.nav.filter_input_mut() = Default::default();
@@ -129,18 +121,23 @@ pub(crate) fn begin_context_switch(
     app.confirm_dialog = None;
     app.form_dialog = None;
     app.input_mode = InputMode::Normal;
-    app.prev_rows.clear();
-    app.changed_rows.clear();
+    app.deltas.clear();
     app.pod_metrics.clear();
     app.node_metrics.clear();
-    app.capabilities.clear();
+    // Capabilities are no longer cached — `current_capabilities()` reads
+    // straight off the typed rid via `ResourceId::capabilities()`, so
+    // there's nothing to clear here.
 
     // Signal the main loop to drop the entire ClientSession and create
     // a new one for the target context. One socket = one context = one
     // session. The old session's socket close causes the daemon to exit
     // the session (all watchers enter grace period). The new session
     // connects fresh with the new kubeconfig.
-    app.pending_context_switch = Some(ctx_name.to_string());
+    //
+    // Transition: Stable → Requested(ctx_name). The main loop's
+    // `take_requested()` will atomically move it to `InFlight` at the
+    // top of the next iteration.
+    app.context_switch = crate::app::ContextSwitchState::Requested(ctx_name.clone());
     app.flash = Some(crate::app::FlashMessage::info(format!(
         "Switching to context: {}...",
         ctx_name
@@ -157,10 +154,11 @@ pub(crate) fn do_switch_namespace(
     // Record the namespace change globally (affects future namespaced subscriptions).
     app.selected_ns = ns.clone();
 
-    // If the current view is cluster-scoped, just record the ns for later — nothing
+    // If the current view is cluster-scoped, just record the ns locally — nothing
     // to re-subscribe or clear since cluster-scoped resources ignore namespaces.
+    // No daemon notification needed; every subscription carries its own
+    // namespace in `SubscriptionInit`.
     if app.current_tab_is_cluster_scoped() {
-        ds_try!(app, data_source.switch_namespace(ns.display()));
         return;
     }
 
@@ -180,8 +178,7 @@ pub(crate) fn do_switch_namespace(
     // can't bleed into the new namespace's view.
     app.clear_namespaced_caches();
     app.kubectl_cache.clear();
-    app.prev_rows.clear();
-    app.changed_rows.clear();
+    app.deltas.clear();
 
     // Reset nav to root resource — any drill-down filters (owner UIDs,
     // labels) reference old-namespace resources and are now invalid.
@@ -193,11 +190,10 @@ pub(crate) fn do_switch_namespace(
     let _change = app.nav.reset(root_rid.clone());
     *app.nav.filter_input_mut() = Default::default();
 
-    // Notify the daemon of the namespace change. This is informational —
-    // each subscription carries its own namespace in SubscriptionInit,
-    // so the daemon doesn't need session-level namespace state for
-    // subscription scoping. Kept for logging/debugging on the server side.
-    ds_try!(app, data_source.switch_namespace(ns.display()));
+    // No daemon notification needed — each subscription carries its own
+    // namespace in SubscriptionInit, so the server doesn't track session-
+    // level namespace state. (The previous `SwitchNamespace` wire command
+    // was server-side logging only; removed for simplicity.)
 
     // Open a fresh subscription substream for the root resource in the
     // new namespace. Same drop+recreate pattern as apply_nav_change and

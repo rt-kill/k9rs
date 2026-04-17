@@ -588,30 +588,4 @@ impl Theme {
 
         Some(theme)
     }
-
-    /// Returns the appropriate style for a pod/resource status string.
-    pub fn status_style(&self, status: &str) -> Style {
-        let s = status.to_lowercase();
-        if s.contains("running") || s.contains("active") || s.contains("bound") || s == "ready" {
-            self.status_running
-        } else if s.contains("pending")
-            || s.contains("waiting")
-            || s.contains("creating")
-            || s.contains("init")
-            || s.contains("terminating")
-        {
-            self.status_pending
-        } else if s.contains("failed")
-            || s.contains("error")
-            || s.contains("crash")
-            || s.contains("backoff")
-            || s.contains("unknown")
-        {
-            self.status_failed
-        } else if s.contains("succeeded") || s.contains("completed") {
-            self.status_succeeded
-        } else {
-            self.row_normal
-        }
-    }
 }
