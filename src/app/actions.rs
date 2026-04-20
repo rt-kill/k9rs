@@ -127,6 +127,10 @@ pub enum Action {
     ShowAliases,
     /// Change the log time range (--since flag). None = tail all logs.
     LogSince(Option<String>),
+    /// Move the column cursor left.
+    ColLeft,
+    /// Move the column cursor right.
+    ColRight,
     /// Toggle wide column mode.
     ToggleWide,
     /// Toggle fault filter (show only unhealthy resources).

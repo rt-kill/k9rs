@@ -123,6 +123,14 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(Action::ToggleWide);
     }
 
+    // Ctrl-H / Ctrl-L: column cursor left/right.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
+        return Some(Action::ColLeft);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+        return Some(Action::ColRight);
+    }
+
     // Ctrl-Space: span-mark (select range).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(' ') {
         return Some(Action::SpanMark);

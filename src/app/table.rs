@@ -25,6 +25,8 @@ pub(crate) trait TableNav {
     fn nav_span_mark(&mut self);
     fn nav_select(&mut self, idx: usize);
     fn nav_selected(&self) -> usize;
+    fn nav_col_left(&mut self);
+    fn nav_col_right(&mut self);
 }
 
 impl<T: Clone + KubeResource> TableNav for StatefulTable<T> {
@@ -99,6 +101,11 @@ impl<T: Clone + KubeResource> TableNav for StatefulTable<T> {
         self.adjust_offset();
     }
     fn nav_selected(&self) -> usize { self.selected }
+    fn nav_col_left(&mut self) { self.col_left(); }
+    fn nav_col_right(&mut self) {
+        // Use 100 as upper bound; the render path clamps.
+        self.col_right(100);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +118,12 @@ pub struct StatefulTable<T: Clone> {
     pub filtered_indices: Vec<usize>,
     pub selected: usize,
     pub offset: usize,
+    /// Selected column index (for horizontal cursor / scrolling).
+    pub selected_col: usize,
+    /// Horizontal scroll offset — the pixel x-position of the leftmost
+    /// visible column edge. Adjusted automatically to keep `selected_col`
+    /// visible, similar to how `offset` keeps `selected` row visible.
+    pub col_offset: u16,
     pub sort_column: usize,
     pub sort_ascending: bool,
     /// How the sort comparator interprets cell values for the current
@@ -147,6 +160,8 @@ impl<T: Clone> Default for StatefulTable<T> {
             filtered_indices: Vec::new(),
             selected: 0,
             offset: 0,
+            selected_col: 0,
+            col_offset: 0,
             sort_column: 0,
             sort_ascending: true,
             sort_kind: ColumnSortKind::default(),
@@ -201,6 +216,19 @@ impl<T: Clone> StatefulTable<T> {
             self.selected = self.filtered_indices.len() - 1;
         }
         self.adjust_offset();
+    }
+
+    /// Move the column cursor left.
+    pub fn col_left(&mut self) {
+        self.selected_col = self.selected_col.saturating_sub(1);
+    }
+
+    /// Move the column cursor right. The caller should provide the total
+    /// number of visible columns so we don't go past the last one.
+    pub fn col_right(&mut self, num_cols: usize) {
+        if num_cols > 0 && self.selected_col + 1 < num_cols {
+            self.selected_col += 1;
+        }
     }
 
     pub fn set_items(&mut self, items: Vec<T>) {

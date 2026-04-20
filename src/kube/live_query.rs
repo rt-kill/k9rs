@@ -175,6 +175,10 @@ impl Drop for Subscription {
 }
 
 impl Subscription {
+    /// Get the current value from the watch channel, cloned. Returns the
+    /// full snapshot for `Live`, the delta for `Delta`, or None for
+    /// Pending/Dead. The server bridge uses this after `changed()` to
+    /// decide what to send to the client.
     /// Get the current snapshot (None if the watcher hasn't published yet,
     /// or if the watcher died — in which case `last_error()` returns Some).
     pub fn current(&mut self) -> Option<ResourceUpdate> {
@@ -193,7 +197,7 @@ impl Subscription {
     pub fn last_error(&self) -> Option<String> {
         match &*self.snapshot_rx.borrow() {
             WatcherSnapshot::Dead(msg) => Some(msg.clone()),
-            WatcherSnapshot::Pending | WatcherSnapshot::Live(_) => None,
+            _ => None,
         }
     }
 }
@@ -607,9 +611,7 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
                     let _ = snapshot_tx.send(WatcherSnapshot::Live(wrap(items)));
                 }
                 // Steady-state debounce: coalesce rapid Apply/Delete events
-                // (e.g., node heartbeats) into one snapshot rebuild per tick
-                // instead of one per event. With 2000 nodes, this reduces
-                // bridge traffic from ~50 snapshots/sec to ~5.
+                // into one snapshot rebuild per tick.
                 if steady_dirty {
                     steady_dirty = false;
                     let items = sorted_snapshot(&store);

@@ -82,6 +82,8 @@ fn draw_resource_table(
     rows: &[Vec<String>],
     selected: usize,
     initial_offset: usize,
+    selected_col: usize,
+    col_offset: u16,
     sort_ascending: bool,
     namespace: &str,
     theme: &Theme,
@@ -90,9 +92,7 @@ fn draw_resource_table(
     changed_rows: &std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
     row_keys: &[crate::kube::protocol::ObjectKey],
     row_health: &[crate::kube::resources::row::RowHealth],
-) -> (usize, usize) {
-    // The widget uses Block::bordered(), so inner height = area.height - 2 (borders).
-    // Minus 1 more for the header row.
+) -> (usize, usize, u16) {
     let visible_height = (area.height as usize).saturating_sub(3);
 
     let rt = ResourceTable::new(headers, rows, title, theme)
@@ -106,12 +106,14 @@ fn draw_resource_table(
     let mut state = ResourceTableState {
         selected,
         offset: initial_offset,
+        selected_col,
+        col_offset,
         filtered_count: 0,
     };
 
     f.render_stateful_widget(rt, area, &mut state);
 
-    (state.offset, visible_height)
+    (state.offset, visible_height, state.col_offset)
 }
 
 
@@ -193,20 +195,23 @@ fn draw_unified_table(
 
     let selected = table.selected;
     let initial_offset = table.offset;
+    let selected_col = table.selected_col;
+    let col_offset = table.col_offset;
     let sort_ascending = table.sort_ascending;
     let display_sort_col = visible_indices.iter().position(|&i| i == table.sort_column);
     let marked_visible: &[bool] = &table.marked_visible;
 
     let ns_label = if namespace.is_all() { "" } else { namespace.display() };
-    let (new_offset, new_page_size) = draw_resource_table(
+    let (new_offset, new_page_size, new_col_offset) = draw_resource_table(
         f, area, title, headers, &view.rows,
-        selected, initial_offset, sort_ascending,
-        ns_label, theme,
+        selected, initial_offset, selected_col, col_offset,
+        sort_ascending, ns_label, theme,
         marked_visible, display_sort_col, changed_rows, &view.keys, &view.health,
     );
 
     table.offset = new_offset;
     table.page_size = new_page_size;
+    table.col_offset = new_col_offset;
 }
 
 // ---------------------------------------------------------------------------

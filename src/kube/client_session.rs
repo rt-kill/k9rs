@@ -831,8 +831,6 @@ impl ClientSession {
                         }
                     }
                     protocol::StreamEvent::Resolved { original, resolved } => {
-                        // Update the bridge's local view of the rid so
-                        // subsequent events use the resolved key.
                         current_rid = resolved.clone();
                         AppEvent::ResourceResolved { original, resolved }
                     }

@@ -460,6 +460,14 @@ impl App {
         }
     }
 
+    pub fn col_left(&mut self) {
+        self.with_active_table(|t| t.nav_col_left());
+    }
+
+    pub fn col_right(&mut self) {
+        self.with_active_table(|t| t.nav_col_right());
+    }
+
     pub fn select_next(&mut self) {
         if self.route == Route::Contexts {
             self.data.contexts.next();

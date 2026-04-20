@@ -171,6 +171,11 @@ pub struct Theme {
     // Delta tracking: rows that changed since last update
     pub delta_changed: Style,
 
+    // Column cursor: a subtle background tint applied to the entire
+    // selected column (header + all visible rows). Must not interfere
+    // with foreground colors (red/yellow/green health indicators).
+    pub col_highlight: Style,
+
     // Legacy aliases (kept for compat with other views)
     pub tab_active: Style,
     pub tab_inactive: Style,
@@ -340,6 +345,12 @@ impl Default for Theme {
             delta_changed: Style::default()
                 .fg(Color::Rgb(135, 206, 250)) // LightSkyBlue
                 .add_modifier(Modifier::ITALIC),
+
+            // Column cursor: very subtle dark-gray background. Doesn't
+            // change foreground color so red/yellow/green health text
+            // stays readable.
+            col_highlight: Style::default()
+                .bg(Color::Rgb(35, 38, 45)),
 
             // Legacy tab styles (breadcrumbs now)
             tab_active: Style::default()

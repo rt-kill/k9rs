@@ -938,6 +938,12 @@ pub(crate) fn handle_action(
                 *log_stream = Some(new_stream);
             }
         }
+        Action::ColLeft => {
+            app.col_left();
+        }
+        Action::ColRight => {
+            app.col_right();
+        }
         Action::ToggleWide => {
             app.column_level = app.column_level.next();
             app.flash = Some(crate::app::FlashMessage::info(
