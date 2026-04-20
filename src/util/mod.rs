@@ -151,10 +151,10 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
     use std::process::{Command, Stdio};
 
     let tools: &[(&str, &[&str])] = &[
-        ("xclip", &["-selection", "clipboard"]),
-        ("xsel", &["--clipboard", "--input"]),
-        ("wl-copy", &[]),
-        ("pbcopy", &[]),
+        ("wl-copy", &[]),       // Wayland-native (preferred on Wayland)
+        ("pbcopy", &[]),        // macOS
+        ("xclip", &["-selection", "clipboard"]),  // X11
+        ("xsel", &["--clipboard", "--input"]),    // X11 fallback
     ];
 
     for (tool, args) in tools {

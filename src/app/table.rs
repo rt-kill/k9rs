@@ -283,17 +283,6 @@ impl<T: Clone> StatefulTable<T> {
         self.marked_visible.clear();
     }
 
-    pub fn clear_filter(&mut self) {
-        self.filtered_indices = (0..self.items.len()).collect();
-        if self.selected >= self.filtered_indices.len() && !self.filtered_indices.is_empty() {
-            self.selected = self.filtered_indices.len() - 1;
-        }
-        // Same invariant as `apply_filter`.
-        self.marked_visible.clear();
-        self.marked_visible.resize(self.filtered_indices.len(), false);
-        self.adjust_offset();
-    }
-
     pub fn selected_item(&self) -> Option<&T> {
         let idx = *self.filtered_indices.get(self.selected)?;
         self.items.get(idx)
@@ -328,6 +317,15 @@ impl<T: Clone> StatefulTable<T> {
 pub use crate::kube::resource_def::ColumnSortKind;
 
 impl<T: Clone + KubeResource> StatefulTable<T> {
+    pub fn clear_filter(&mut self) {
+        self.filtered_indices = (0..self.items.len()).collect();
+        if self.selected >= self.filtered_indices.len() && !self.filtered_indices.is_empty() {
+            self.selected = self.filtered_indices.len() - 1;
+        }
+        self.refresh_marked_visible();
+        self.adjust_offset();
+    }
+
     /// Toggle sort on a column. Reuses sort_items and rebuild_filter.
     /// Cursor stays at its screen index.
     pub fn sort_by_column(&mut self, target: crate::app::SortTarget, kind: ColumnSortKind) {
