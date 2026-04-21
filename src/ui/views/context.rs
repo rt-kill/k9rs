@@ -19,7 +19,7 @@ use crate::util::truncate_to_width;
 pub fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
 
-    let header_height: u16 = if app.show_header { 7 } else { 0 };
+    let header_height: u16 = if app.show_header { crate::ui::HEADER_HEIGHT } else { 0 };
 
     let chunks = Layout::vertical([
         Constraint::Length(header_height), // header

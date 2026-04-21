@@ -3,6 +3,36 @@ pub mod theme;
 pub mod views;
 pub mod widgets;
 
+/// Header panel height in rows (context/cluster/user + logo).
+pub const HEADER_HEIGHT: u16 = 5;
+
+/// Guaranteed-visible dark background for dialog interiors. Applied after
+/// Clear + Block to prevent skin-overridable `dialog_bg: default` from
+/// making dialogs invisible against the terminal background.
+pub const DIALOG_BG: ratatui::style::Color = ratatui::style::Color::Rgb(25, 28, 38);
+
+/// Fill a rectangular area with the dialog background color.
+pub fn fill_dialog_bg(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+    let style = ratatui::style::Style::default().bg(DIALOG_BG);
+    for row in area.y..area.y + area.height {
+        for col in area.x..area.x + area.width {
+            buf[(col, row)].set_style(style);
+        }
+    }
+}
+
+/// Center a rectangle of given dimensions within an outer area.
+pub fn centered_rect(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
+    use ratatui::layout::{Constraint, Layout};
+    let vert = Layout::vertical([
+        Constraint::Fill(1), Constraint::Length(height), Constraint::Fill(1),
+    ]).split(area);
+    let horiz = Layout::horizontal([
+        Constraint::Fill(1), Constraint::Length(width), Constraint::Fill(1),
+    ]).split(vert[1]);
+    horiz[1]
+}
+
 use unicode_width::UnicodeWidthStr;
 
 use ratatui::layout::Rect;
@@ -222,9 +252,11 @@ fn draw_container_select(
     Clear.render(dialog_area, f.buffer_mut());
 
     let block = Block::bordered()
-        .title(format!(" Select Container ({}) ", target.name))
-        .title_style(theme.title)
-        .border_style(theme.border)
+        .title(Span::styled(
+            format!(" Select Container ({}) ", target.name),
+            theme.title,
+        ))
+        .border_style(theme.dialog_border)
         .style(theme.dialog_bg);
 
     let inner = block.inner(dialog_area);
@@ -233,6 +265,8 @@ fn draw_container_select(
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+
+    fill_dialog_bg(f.buffer_mut(), inner);
 
     // Render container list
     for (i, container) in containers.iter().enumerate() {

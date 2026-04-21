@@ -309,18 +309,17 @@ impl Default for Theme {
             help_desc: Style::default()
                 .fg(Color::White),
 
-            // Dialog
+            // Dialog — dark bg pops from terminal, not pure black
             dialog_border: Style::default()
                 .fg(ORANGE_RED),
             dialog_bg: Style::default()
-                .bg(Color::Black),
+                .bg(Color::Rgb(25, 28, 38)),
             dialog_button_active: Style::default()
                 .fg(Color::Black)
-                .bg(ORANGE_RED)
+                .bg(AQUA)
                 .add_modifier(Modifier::BOLD),
             dialog_button_inactive: Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray),
+                .fg(Color::DarkGray),
 
             // Log viewer
             log_timestamp: Style::default()

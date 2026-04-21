@@ -1,6 +1,7 @@
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     text::{Line, Span},
+    widgets::Paragraph,
     Frame,
 };
 
@@ -30,35 +31,53 @@ pub const LOGO: &[&str] = &[
 // Header: cluster info (left), key hints (center), logo (right)
 // ---------------------------------------------------------------------------
 
-/// Draw the standard header with a caller-supplied center-panel function.
-///
-/// `draw_center_fn` receives the center area and can render whatever key hints
-/// are appropriate for the current view.
+/// Compact header: context/cluster/user stacked vertically on the left,
+/// k9rs logo on the right. No key hints — those live in the ? help dialog.
 pub fn draw_header(
     f: &mut Frame,
     app: &App,
     area: Rect,
     theme: &Theme,
-    draw_center_fn: impl FnOnce(&mut Frame, Rect, &Theme),
+    _draw_center_fn: impl FnOnce(&mut Frame, Rect, &Theme),
 ) {
     if area.height == 0 || area.width == 0 {
         return;
     }
 
-    // Split into 3 columns: 40% / 40% / 20%
-    let cols = Layout::horizontal([
-        Constraint::Percentage(40),
-        Constraint::Percentage(40),
-        Constraint::Percentage(20),
-    ])
-    .split(area);
+    let ctx = if app.context.is_empty() { "connecting..." } else { app.context.as_str() };
+    let cluster = if app.identity.cluster.is_empty() { "n/a" } else { &app.identity.cluster };
+    let user = if app.identity.user.is_empty() { "n/a" } else { &app.identity.user };
 
-    // Left: cluster info
-    draw_cluster_info(f, app, cols[0], theme);
-    // Center: caller-provided key hints
-    draw_center_fn(f, cols[1], theme);
-    // Right: logo
-    draw_logo(f, cols[2], theme);
+    let logo_width = LOGO.iter().map(|l| l.len()).max().unwrap_or(0) as u16 + 2;
+    let cols = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(logo_width),
+    ]).split(area);
+
+    // Left: context / cluster / user stacked vertically.
+    let info = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(" Context: ", theme.info_label),
+            Span::styled(ctx, theme.info_value),
+        ]),
+        Line::from(vec![
+            Span::styled(" Cluster: ", theme.info_label),
+            Span::styled(cluster, theme.info_value),
+        ]),
+        Line::from(vec![
+            Span::styled(" User:    ", theme.info_label),
+            Span::styled(user, theme.info_value),
+        ]),
+    ]);
+    f.render_widget(info, cols[0]);
+
+    // Right: k9rs logo.
+    let logo_lines: Vec<Line> = LOGO.iter()
+        .map(|l| Line::from(Span::styled(*l, theme.logo)))
+        .collect();
+    let logo = Paragraph::new(logo_lines)
+        .alignment(ratatui::layout::Alignment::Right);
+    f.render_widget(logo, cols[1]);
 }
 
 /// Left panel: Context, Cluster, User, K9rs Rev, CPU, MEM

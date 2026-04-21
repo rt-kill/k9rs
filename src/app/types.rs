@@ -510,8 +510,11 @@ pub enum PendingAction {
 #[derive(Debug, Clone)]
 pub struct ConfirmDialog {
     pub message: String,
+    /// Label for the action button (e.g. "Delete", "Restart", "Force Kill").
+    pub action_label: String,
     pub pending: PendingAction,
-    pub yes_selected: bool,
+    /// True = action button focused, false = cancel focused (safe default).
+    pub action_focused: bool,
 }
 
 // ---------------------------------------------------------------------------

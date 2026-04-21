@@ -262,14 +262,16 @@ pub(crate) fn handle_action(
                 let resource = marked[0].resource.display_label().to_string();
                 app.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Delete {} {}s?", count, resource),
+                    action_label: "Delete".to_string(),
                     pending: crate::app::PendingAction::BatchDelete(marked),
-                    yes_selected: false,
+                    action_focused: false,
                 });
             } else if let Some(info) = get_selected_resource_info(app) {
                 app.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
+                    action_label: "Delete".to_string(),
                     pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::Delete, target: info },
-                    yes_selected: false,
+                    action_focused: false,
                 });
             }
         }
@@ -360,14 +362,16 @@ pub(crate) fn handle_action(
                 let resource = marked[0].resource.display_label().to_string();
                 app.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Restart {} {}s?", count, resource),
+                    action_label: "Restart".to_string(),
                     pending: crate::app::PendingAction::BatchRestart(marked),
-                    yes_selected: false,
+                    action_focused: false,
                 });
             } else if let Some(info) = get_selected_resource_info(app) {
                 app.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Restart {}/{}?", info.resource.display_label(), info.name),
+                    action_label: "Restart".to_string(),
                     pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::Restart, target: info },
-                    yes_selected: false,
+                    action_focused: false,
                 });
             }
         }
@@ -377,14 +381,16 @@ pub(crate) fn handle_action(
                 let count = marked.len();
                 app.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Force-kill {} pods?", count),
+                    action_label: "Force Kill".to_string(),
                     pending: crate::app::PendingAction::BatchForceKill(marked),
-                    yes_selected: false,
+                    action_focused: false,
                 });
             } else if let Some(info) = get_selected_resource_info(app) {
                 app.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Force-kill {}/{}?", info.resource.display_label(), info.name),
+                    action_label: "Force Kill".to_string(),
                     pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::ForceKill, target: info },
-                    yes_selected: false,
+                    action_focused: false,
                 });
             }
         }
@@ -583,7 +589,7 @@ pub(crate) fn handle_action(
         }
         Action::ToggleDialogButton => {
             if let Some(ref mut dialog) = app.confirm_dialog {
-                dialog.yes_selected = !dialog.yes_selected;
+                dialog.action_focused = !dialog.action_focused;
             }
         }
         Action::Sort(target) => {

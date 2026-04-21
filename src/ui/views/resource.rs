@@ -237,7 +237,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.theme;
 
     // Determine dynamic section heights
-    let header_height: u16 = if app.show_header { 7 } else { 0 };
+    let header_height: u16 = if app.show_header { crate::ui::HEADER_HEIGHT } else { 0 };
     let command_height: u16 = if app.input_mode.is_active() { 3 } else { 0 };
     // Only show the filter bar box while actively typing; when committed
     // (inactive but text non-empty), the table title shows `</:filter_text>`.

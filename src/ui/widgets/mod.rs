@@ -3,11 +3,13 @@ pub mod filter;
 pub mod flash;
 pub mod help;
 pub mod log_view;
+pub mod modal;
 pub mod table;
 pub mod tabs;
 pub mod yaml_view;
 
 pub use dialog::{ConfirmDialogWidget, FormDialogWidget};
+pub use modal::{ModalOverlay, DialogSize};
 pub use filter::FilterBar;
 pub use flash::FlashWidget;
 pub use help::HelpOverlay;

@@ -77,7 +77,7 @@ fn handle_confirm_dialog(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Enter => {
             // Confirm or cancel based on which button is selected
-            if app.confirm_dialog.as_ref().is_some_and(|d| d.yes_selected) {
+            if app.confirm_dialog.as_ref().is_some_and(|d| d.action_focused) {
                 Some(Action::Confirm)
             } else {
                 Some(Action::Cancel)

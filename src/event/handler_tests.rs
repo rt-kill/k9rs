@@ -147,7 +147,8 @@ fn test_confirm_dialog_keys() {
                 Namespace::from_user_command("default"),
             ),
         },
-        yes_selected: false,
+        action_label: "Delete".to_string(),
+        action_focused: false,
     });
 
     assert!(matches!(

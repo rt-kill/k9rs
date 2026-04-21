@@ -20,7 +20,7 @@ use crate::ui::widgets::TabBar;
 pub fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
 
-    let header_height: u16 = if app.show_header { 7 } else { 0 };
+    let header_height: u16 = if app.show_header { crate::ui::HEADER_HEIGHT } else { 0 };
     let command_height: u16 = if matches!(app.input_mode, InputMode::Command { .. }) { 3 } else { 0 };
 
     let chunks = Layout::vertical([
