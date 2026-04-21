@@ -72,7 +72,7 @@ fn key_hints_for_resource(caps: &ResourceCapabilities) -> Vec<crate::ui::header:
 
 /// Render a resource table. Returns the new `(offset, page_size)` so the
 /// caller can write them back to the `StatefulTable` after the immutable
-/// borrow is released — avoids the `&mut table` + `&table.marked_visible`
+/// borrow is released — avoids the `&mut table` + `&table.marked`
 /// borrow conflict that would otherwise force a per-frame allocation.
 fn draw_resource_table(
     f: &mut Frame,
@@ -87,7 +87,7 @@ fn draw_resource_table(
     sort_ascending: bool,
     namespace: &str,
     theme: &Theme,
-    marked_visible: &[bool],
+    marked: &std::collections::HashSet<crate::kube::protocol::ObjectKey>,
     display_sort_col: Option<usize>,
     changed_rows: &std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
     row_keys: &[crate::kube::protocol::ObjectKey],
@@ -98,7 +98,7 @@ fn draw_resource_table(
     let rt = ResourceTable::new(headers, rows, title, theme)
         .sort(display_sort_col, sort_ascending)
         .namespace(namespace)
-        .marked_visible(marked_visible)
+        .marked(marked)
         .changed_rows(changed_rows)
         .row_keys(row_keys)
         .row_health(row_health);
@@ -199,14 +199,14 @@ fn draw_unified_table(
     let col_offset = table.col_offset;
     let sort_ascending = table.sort_ascending;
     let display_sort_col = visible_indices.iter().position(|&i| i == table.sort_column);
-    let marked_visible: &[bool] = &table.marked_visible;
+    let marked: &std::collections::HashSet<crate::kube::protocol::ObjectKey> = &table.marked;
 
     let ns_label = if namespace.is_all() { "" } else { namespace.display() };
     let (new_offset, new_page_size, new_col_offset) = draw_resource_table(
         f, area, title, headers, &view.rows,
         selected, initial_offset, selected_col, col_offset,
         sort_ascending, ns_label, theme,
-        marked_visible, display_sort_col, changed_rows, &view.keys, &view.health,
+        marked, display_sort_col, changed_rows, &view.keys, &view.health,
     );
 
     table.offset = new_offset;

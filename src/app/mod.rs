@@ -302,25 +302,22 @@ impl App {
         }
     }
 
-    /// Push a route onto the route stack, capping at 50 entries to prevent
-    /// unbounded memory growth from deep navigation.
-    /// Clears any open dialogs — they belong to the current route, not the next one.
-    pub fn push_route(&mut self, route: Route) {
-        if self.route_stack.last() == Some(&route) {
-            return; // Don't push duplicates
-        }
-        // Dialogs are route-scoped — dismiss them when navigating away.
+    /// Navigate to a new route: swaps the current route into the stack and
+    /// sets `new_route` as current. No Clone needed — the old route is moved.
+    /// When the old route drops off the stack (or is replaced), any resources
+    /// it owns (like LogStream in Route::Logs) drop automatically.
+    pub fn navigate_to(&mut self, new_route: Route) {
         self.confirm_dialog = None;
         self.form_dialog = None;
+        let old = std::mem::replace(&mut self.route, new_route);
         if self.route_stack.len() >= 50 {
             self.route_stack.remove(0);
         }
-        self.route_stack.push(route);
+        self.route_stack.push(old);
     }
 
     /// Pop the route stack — returns to the previous route. No-op if the
-    /// stack is empty (the current route is preserved). Used by the unified
-    /// edit flow's terminal states (success/cancel/error).
+    /// stack is empty (the current route is preserved).
     pub fn pop_route(&mut self) {
         if let Some(prev) = self.route_stack.pop() {
             self.route = prev;
@@ -469,42 +466,42 @@ impl App {
     }
 
     pub fn select_next(&mut self) {
-        if self.route == Route::Contexts {
+        if matches!(self.route, Route::Contexts) {
             self.data.contexts.next();
         } else {
             self.with_active_table(|t| t.nav_next());
         }
     }
     pub fn select_prev(&mut self) {
-        if self.route == Route::Contexts {
+        if matches!(self.route, Route::Contexts) {
             self.data.contexts.previous();
         } else {
             self.with_active_table(|t| t.nav_prev());
         }
     }
     pub fn page_up(&mut self) {
-        if self.route == Route::Contexts {
+        if matches!(self.route, Route::Contexts) {
             self.data.contexts.page_up();
         } else {
             self.with_active_table(|t| t.nav_page_up());
         }
     }
     pub fn page_down(&mut self) {
-        if self.route == Route::Contexts {
+        if matches!(self.route, Route::Contexts) {
             self.data.contexts.page_down();
         } else {
             self.with_active_table(|t| t.nav_page_down());
         }
     }
     pub fn go_home(&mut self) {
-        if self.route == Route::Contexts {
+        if matches!(self.route, Route::Contexts) {
             self.data.contexts.home();
         } else {
             self.with_active_table(|t| t.nav_home());
         }
     }
     pub fn go_end(&mut self) {
-        if self.route == Route::Contexts {
+        if matches!(self.route, Route::Contexts) {
             self.data.contexts.end();
         } else {
             self.with_active_table(|t| t.nav_end());
@@ -599,9 +596,6 @@ impl App {
                 }
                 true
             });
-            // apply_filter zeroes the marked-visible bitmap; refresh it now
-            // that filtered_indices is in its final state.
-            table.refresh_marked_visible();
         }
     }
 

@@ -109,7 +109,7 @@ pub struct ResourceTable<'a> {
     sort_col: Option<usize>,
     sort_asc: bool,
     theme: &'a Theme,
-    marked_visible: &'a [bool],
+    marked: &'a std::collections::HashSet<crate::kube::protocol::ObjectKey>,
     changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
     row_keys: &'a [crate::kube::protocol::ObjectKey],
     row_health: &'a [crate::kube::resources::row::RowHealth],
@@ -123,10 +123,11 @@ impl<'a> ResourceTable<'a> {
         theme: &'a Theme,
     ) -> Self {
         static EMPTY_MAP: std::sync::LazyLock<std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>> = std::sync::LazyLock::new(std::collections::HashMap::new);
+        static EMPTY_MARKED: std::sync::LazyLock<std::collections::HashSet<crate::kube::protocol::ObjectKey>> = std::sync::LazyLock::new(std::collections::HashSet::new);
         Self {
             headers, rows, title, namespace: "",
             sort_col: None, sort_asc: true, theme,
-            marked_visible: &[],
+            marked: &EMPTY_MARKED,
             changed_rows: &EMPTY_MAP,
             row_keys: &[],
             row_health: &[],
@@ -135,7 +136,7 @@ impl<'a> ResourceTable<'a> {
 
     pub fn row_keys(mut self, keys: &'a [crate::kube::protocol::ObjectKey]) -> Self { self.row_keys = keys; self }
     pub fn row_health(mut self, health: &'a [crate::kube::resources::row::RowHealth]) -> Self { self.row_health = health; self }
-    pub fn marked_visible(mut self, marked: &'a [bool]) -> Self { self.marked_visible = marked; self }
+    pub fn marked(mut self, marked: &'a std::collections::HashSet<crate::kube::protocol::ObjectKey>) -> Self { self.marked = marked; self }
     pub fn sort(mut self, col: Option<usize>, ascending: bool) -> Self { self.sort_col = col; self.sort_asc = ascending; self }
     pub fn namespace(mut self, ns: &'a str) -> Self { self.namespace = ns; self }
     pub fn changed_rows(mut self, changed: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>) -> Self { self.changed_rows = changed; self }
@@ -330,12 +331,25 @@ impl StatefulWidget for ResourceTable<'_> {
 
             let row = all_rows[row_idx];
             let is_selected = row_idx == state.selected;
-            let is_marked = self.marked_visible.get(row_idx).copied().unwrap_or(false);
+            let is_marked = !self.marked.is_empty()
+                && self.row_keys.get(row_idx).is_some_and(|k| self.marked.contains(k));
             let is_changed = !self.changed_rows.is_empty()
                 && self.row_keys.get(row_idx).is_some_and(|k| self.changed_rows.contains_key(k));
 
-            // Row base style (priority cascade).
-            let row_style = if is_selected {
+            // Fill selected row background edge-to-edge. Uses `selected`
+            // directly — `selected_marked` intentionally has no bg so it
+            // inherits this fill via ratatui's `None`-means-don't-touch
+            // style patching.
+            if is_selected {
+                for dx in 0..inner.width {
+                    buf.set_string(inner.x + dx, y, " ", self.theme.selected);
+                }
+            }
+
+            // Cell style priority: selected > marked > changed > health.
+            let cell_style = if is_selected && is_marked {
+                self.theme.selected_marked
+            } else if is_selected {
                 self.theme.selected
             } else if is_marked {
                 self.theme.marked_row
@@ -350,26 +364,8 @@ impl StatefulWidget for ResourceTable<'_> {
                 }
             };
 
-            // Fill selected row background edge-to-edge.
-            if is_selected {
-                for dx in 0..inner.width {
-                    buf.set_string(inner.x + dx, y, " ", self.theme.selected);
-                }
-            }
-
-            // Cell style: selected/marked rows override health coloring.
-            let cell_style = if is_selected { self.theme.selected }
-                else if is_marked { self.theme.marked_row }
-                else { row_style };
-
             let cell_strs: Vec<&str> = row.iter().map(|s| s.as_str()).collect();
             self.render_row(buf, y, &cell_strs, cell_style, is_selected, &layout);
-
-            // Mark indicator — drawn AFTER cells so it overwrites the first
-            // column's │ border instead of being overwritten by it.
-            if is_marked {
-                buf.set_string(inner.x, y, "\u{25cf}", self.theme.marked_row);
-            }
         }
     }
 }

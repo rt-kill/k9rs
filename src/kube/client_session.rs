@@ -129,6 +129,14 @@ impl Drop for SubscriptionStream {
     }
 }
 
+/// An active exec session backed by a yamux substream. The daemon
+/// spawns kubectl in a PTY; raw terminal bytes flow over yamux.
+/// Drop closes the substream (RST → daemon kills kubectl).
+pub struct ExecStream {
+    pub reader: tokio::io::BufReader<tokio::io::ReadHalf<crate::kube::mux::MuxedStream>>,
+    pub writer: tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
+}
+
 /// An active log stream backed by its own yamux substream. Same shape as
 /// `SubscriptionStream` — drop aborts the bridge, closes the substream,
 /// the daemon's kubectl subprocess dies via `kill_on_drop`.
@@ -579,6 +587,27 @@ impl ClientSession {
     /// and the result is sent back via `apply()`.
     pub fn apply(&mut self, target: &protocol::ObjectRef, yaml: String) -> anyhow::Result<()> {
         self.send_command(&SessionCommand::Apply { target: target.clone(), yaml })
+    }
+
+    /// Open an exec substream. Returns the raw split stream so the TUI
+    /// can forward terminal bytes directly.
+    pub async fn open_exec_stream(&self, exec_init: protocol::ExecInit) -> anyhow::Result<ExecStream> {
+        let mux_handle = self.mux_handle_rx.borrow().clone()
+            .ok_or_else(|| anyhow::anyhow!("not connected"))?;
+        let stream = mux_handle.open().await
+            .map_err(|e| anyhow::anyhow!("substream open failed: {}", e))?;
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let reader = tokio::io::BufReader::with_capacity(
+            protocol::IO_BUFFER_SIZE,
+            read_half,
+        );
+        let init_msg = protocol::SubstreamInit::Exec(exec_init);
+        protocol::write_bincode(&mut write_half, &init_msg).await?;
+        let writer = tokio::io::BufWriter::with_capacity(
+            protocol::IO_BUFFER_SIZE,
+            write_half,
+        );
+        Ok(ExecStream { reader, writer })
     }
 
     pub fn delete(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {

@@ -213,7 +213,7 @@ fn test_log_view_s_toggles_follow() {
     let mut app = App::new(crate::kube::protocol::ContextName::default(), String::new());
     app.route = Route::Logs {
         target: ContainerRef::new(String::new(), String::new(), crate::kube::protocol::LogContainer::Default),
-        state: Box::new(crate::app::LogState::new()),
+        state: Box::new(crate::app::LogState::new()), stream: None,
     };
     let action = handle_key_event(&app, make_key(KeyCode::Char('s')));
     assert!(matches!(action, Some(Action::ToggleLogFollow)));
@@ -224,7 +224,7 @@ fn test_log_view_t_toggles_timestamps() {
     let mut app = App::new(crate::kube::protocol::ContextName::default(), String::new());
     app.route = Route::Logs {
         target: ContainerRef::new(String::new(), String::new(), crate::kube::protocol::LogContainer::Default),
-        state: Box::new(crate::app::LogState::new()),
+        state: Box::new(crate::app::LogState::new()), stream: None,
     };
     let action = handle_key_event(&app, make_key(KeyCode::Char('t')));
     assert!(matches!(action, Some(Action::ToggleLogTimestamps)));
@@ -235,7 +235,7 @@ fn test_log_view_shift_c_clears_logs() {
     let mut app = App::new(crate::kube::protocol::ContextName::default(), String::new());
     app.route = Route::Logs {
         target: ContainerRef::new(String::new(), String::new(), crate::kube::protocol::LogContainer::Default),
-        state: Box::new(crate::app::LogState::new()),
+        state: Box::new(crate::app::LogState::new()), stream: None,
     };
     let action = handle_key_event(&app, make_shift_key(KeyCode::Char('C')));
     assert!(matches!(action, Some(Action::ClearLogs)));
@@ -287,7 +287,7 @@ fn test_esc_goes_back_in_log_view() {
     let mut app = App::new(crate::kube::protocol::ContextName::default(), String::new());
     app.route = Route::Logs {
         target: ContainerRef::new(String::new(), String::new(), crate::kube::protocol::LogContainer::Default),
-        state: Box::new(crate::app::LogState::new()),
+        state: Box::new(crate::app::LogState::new()), stream: None,
     };
     let action = handle_key_event(&app, make_key(KeyCode::Esc));
     assert!(matches!(action, Some(Action::Back)));
@@ -330,7 +330,7 @@ fn test_log_view_home_end() {
     let mut app = App::new(crate::kube::protocol::ContextName::default(), String::new());
     app.route = Route::Logs {
         target: ContainerRef::new(String::new(), String::new(), crate::kube::protocol::LogContainer::Default),
-        state: Box::new(crate::app::LogState::new()),
+        state: Box::new(crate::app::LogState::new()), stream: None,
     };
     assert!(matches!(
         handle_key_event(&app, make_key(KeyCode::Char('g'))),

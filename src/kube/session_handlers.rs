@@ -27,7 +27,7 @@ use crate::kube::session_nav::{
 pub(crate) fn handle_enter(
     app: &mut App,
     data_source: &mut ClientSession,
-    log_stream: &mut Option<crate::kube::client_session::LogStream>,
+
 ) -> ActionResult {
     use crate::app::Route;
     use crate::kube::protocol::ResourceId;
@@ -36,7 +36,7 @@ pub(crate) fn handle_enter(
     if matches!(app.route, Route::Contexts) {
         if let Some(ctx) = app.data.contexts.selected_item() {
             let ctx_name = ctx.name.clone();
-            begin_context_switch(app, data_source, &ctx_name, log_stream);
+            begin_context_switch(app, data_source, &ctx_name);
         }
         return ActionResult::None;
     }
@@ -77,28 +77,19 @@ pub(crate) fn handle_enter(
                 pod: target.name,
                 namespace: pod_ns_str,
                 container: container_name,
-                context: app.context.clone(),
             });
         }
 
         let previous = matches!(action, crate::app::ContainerAction::PreviousLogs);
 
-        app.push_route(app.route.clone());
         let mut log_state = crate::app::LogState::new();
         log_state.follow = !previous;
         log_state.streaming = true;
         let tail = Some(log_state.tail_lines);
 
-        // Cancel any previous log stream — drop closes the substream.
-        *log_stream = None;
-
-        // Create the stream FIRST so we can stamp its generation onto
-        // the new LogState. The receiver gates on `state.generation` and
-        // drops any LogLine that doesn't match — protects against stale
-        // lines from the previous stream's bridge bleeding into this view.
+        // Create the stream and stamp its generation on the state.
         let new_stream = data_source.stream_log_substream(crate::kube::protocol::LogInit {
             pod: target.name.clone(),
-            // Typed namespace survives end-to-end — no `from_row`.
             namespace: target.namespace.clone(),
             container: log_container_from_str(&container_name),
             follow: !previous,
@@ -107,16 +98,18 @@ pub(crate) fn handle_enter(
             previous,
         });
         log_state.generation = new_stream.generation;
-        *log_stream = Some(new_stream);
 
-        app.route = Route::Logs {
+        // The log stream is owned by the Route — when the route is
+        // dropped (Back, tab switch, navigate away), the stream dies.
+        app.navigate_to(Route::Logs {
             target: ContainerRef::new(
                 target.name.clone(),
                 pod_ns_str,
                 log_container_from_str(&container_name),
             ),
             state: Box::new(log_state),
-        };
+            stream: Some(new_stream),
+        });
         return ActionResult::None;
     }
 
@@ -134,7 +127,7 @@ pub(crate) fn handle_enter(
 
     match row.drill_target.clone() {
         Some(DrillTarget::SwitchNamespace(ns)) => {
-            do_switch_namespace(app, data_source, ns, log_stream);
+            do_switch_namespace(app, data_source, ns);
         }
         Some(DrillTarget::BrowseCrd(crd_ref)) => {
             let kind_label = crd_ref.kind.clone();
@@ -209,22 +202,20 @@ pub(crate) fn handle_describe(
         if let Some(cached) = app.kubectl_cache.get(&info, crate::app::ContentKind::Describe) {
             let mut state = crate::app::ContentViewState::default();
             state.set_content(cached.to_string());
-            app.push_route(app.route.clone());
-            app.route = Route::Describe {
+            app.navigate_to(Route::Describe {
                 target: info,
                 awaiting_response: false,
                 state,
-            };
+            });
             return;
         }
 
-        app.push_route(app.route.clone());
         ds_try!(app, data_source.describe(&info));
-        app.route = Route::Describe {
+        app.navigate_to(Route::Describe {
             target: info,
             awaiting_response: true,
             state: crate::app::ContentViewState::default(),
-        };
+        });
     }
 }
 
@@ -240,39 +231,37 @@ pub(crate) fn handle_yaml(
         if let Some(cached) = app.kubectl_cache.get(&info, crate::app::ContentKind::Yaml) {
             let mut state = crate::app::ContentViewState::default();
             state.set_content(cached.to_string());
-            app.push_route(app.route.clone());
-            app.route = Route::Yaml {
+            app.navigate_to(Route::Yaml {
                 target: info,
                 awaiting_response: false,
                 state,
-            };
+            });
             return;
         }
 
-        app.push_route(app.route.clone());
         ds_try!(app, data_source.yaml(&info));
-        app.route = Route::Yaml {
+        app.navigate_to(Route::Yaml {
             target: info,
             awaiting_response: true,
             state: crate::app::ContentViewState::default(),
-        };
+        });
     }
 }
 
 pub(crate) fn handle_logs(
     app: &mut App,
     data_source: &mut ClientSession,
-    log_stream: &mut Option<crate::kube::client_session::LogStream>,
+
 ) {
-    open_logs(app, data_source, log_stream, false);
+    open_logs(app, data_source, false);
 }
 
 pub(crate) fn handle_previous_logs(
     app: &mut App,
     data_source: &mut ClientSession,
-    log_stream: &mut Option<crate::kube::client_session::LogStream>,
+
 ) {
-    open_logs(app, data_source, log_stream, true);
+    open_logs(app, data_source, true);
 }
 
 /// Core log-open flow shared by live and previous-logs actions. `previous=false`
@@ -283,7 +272,7 @@ pub(crate) fn handle_previous_logs(
 fn open_logs(
     app: &mut App,
     data_source: &mut ClientSession,
-    log_stream: &mut Option<crate::kube::client_session::LogStream>,
+
     previous: bool,
 ) {
     use crate::app::Route;
@@ -313,8 +302,7 @@ fn open_logs(
             .map(|p| p.containers.len())
             .unwrap_or(0);
         if container_count > 1 {
-            app.push_route(app.route.clone());
-            app.route = Route::ContainerSelect {
+            app.navigate_to(Route::ContainerSelect {
                 target: info.clone(),
                 selected: 0,
                 action: if previous {
@@ -322,12 +310,11 @@ fn open_logs(
                 } else {
                     crate::app::ContainerAction::Logs
                 },
-            };
+            });
             return;
         }
     }
 
-    app.push_route(app.route.clone());
 
     // For pods, log the (single) container directly. For workloads, use the
     // typed `kubectl_target()` ("deployment/foo") and stream all containers.
@@ -347,8 +334,6 @@ fn open_logs(
     log_state.streaming = true;
     let tail = Some(log_state.tail_lines);
 
-    *log_stream = None;
-
     let new_stream = data_source.stream_log_substream(protocol::LogInit {
         pod: log_target.clone(),
         namespace: namespace_typed,
@@ -359,12 +344,12 @@ fn open_logs(
         previous,
     });
     log_state.generation = new_stream.generation;
-    *log_stream = Some(new_stream);
 
-    app.route = Route::Logs {
+    app.navigate_to(Route::Logs {
         target: ContainerRef::new(route_pod, namespace_display, route_container),
         state: Box::new(log_state),
-    };
+        stream: Some(new_stream),
+    });
 }
 
 /// Build a tab-separated text dump of the currently visible resource table.

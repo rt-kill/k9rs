@@ -60,6 +60,10 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
             KeyCode::Esc => Some(Action::Back),
             _ => None,
         },
+        // Shell keys are handled directly in the session loop (raw byte
+        // forwarding). The event handler should never see them, but if it
+        // does, swallow them.
+        Route::Shell(_) => None,
     }
 }
 

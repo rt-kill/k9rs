@@ -86,7 +86,6 @@ pub(crate) fn begin_context_switch(
     app: &mut App,
     _data_source: &mut ClientSession,
     ctx_name: &crate::kube::protocol::ContextName,
-    log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) {
     // Guard against rapid context switches — only `Stable` accepts a new
     // switch; `Requested` and `InFlight` reject with a user-visible error.
@@ -97,8 +96,7 @@ pub(crate) fn begin_context_switch(
         return;
     }
 
-    // Cancel any active log stream — drop closes the substream.
-    *log_stream = None;
+    // Log stream (if any) lives in Route::Logs — it dies when route resets below.
     // Drop all subscription substreams (core + nav).
     app.core_streams.clear();
     app.nav.current_mut().stream = None;
@@ -149,22 +147,19 @@ pub(crate) fn do_switch_namespace(
     app: &mut App,
     data_source: &mut ClientSession,
     ns: crate::kube::protocol::Namespace,
-    log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) {
     // Record the namespace change globally (affects future namespaced subscriptions).
     app.selected_ns = ns.clone();
 
     // If the current view is cluster-scoped, just record the ns locally — nothing
     // to re-subscribe or clear since cluster-scoped resources ignore namespaces.
-    // No daemon notification needed; every subscription carries its own
-    // namespace in `SubscriptionInit`.
     if app.current_tab_is_cluster_scoped() {
         return;
     }
 
-    // Cancel any active log stream — drop closes the substream.
-    *log_stream = None;
     // Pop any stacked routes (Yaml, Describe, Logs) — they reference
+    // resources from the old namespace. Log streams in Route::Logs die
+    // automatically when the route is replaced (RAII).
     // resources from the old namespace and would show stale content on Back.
     app.route_stack.clear();
     app.route = crate::app::Route::Resources;

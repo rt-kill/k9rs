@@ -38,22 +38,21 @@ impl<T: Clone + KubeResource> TableNav for StatefulTable<T> {
     fn nav_end(&mut self) { self.end(); }
     fn nav_clear_filter(&mut self) { self.clear_filter(); }
     fn nav_toggle_mark(&mut self) {
-        if self.filtered_indices.is_empty() || self.selected >= self.filtered_indices.len() {
+        // Clamp first — a snapshot might have shrunk the table since the
+        // last render. Without this, `selected` can be past the end and
+        // the mark silently doesn't happen.
+        if self.filtered_indices.is_empty() {
             return;
+        }
+        if self.selected >= self.filtered_indices.len() {
+            self.selected = self.filtered_indices.len() - 1;
         }
         let real_idx = self.filtered_indices[self.selected];
         let Some(item) = self.items.get(real_idx) else { return };
         let key = ObjectKey::new(item.namespace(), item.name());
-        if self.marked.contains(&key) {
-            self.marked.remove(&key);
-        } else {
+        if !self.marked.remove(&key) {
             self.marked.insert(key);
         }
-        // Maintain the visible-mark cache: a single bit flip at the cursor.
-        if let Some(slot) = self.marked_visible.get_mut(self.selected) {
-            *slot = !*slot;
-        }
-        // Don't advance — Space is a clean toggle. Ctrl+Space handles range selection.
     }
     fn nav_sort_by(&mut self, target: crate::app::SortTarget, kind: ColumnSortKind) {
         self.sort_by_column(target, kind);
@@ -70,17 +69,20 @@ impl<T: Clone + KubeResource> TableNav for StatefulTable<T> {
     }
     fn nav_clear_marks(&mut self) {
         self.marked.clear();
-        // All visible bits drop to false in one shot.
-        for slot in self.marked_visible.iter_mut() { *slot = false; }
     }
     fn nav_span_mark(&mut self) {
         if self.filtered_indices.is_empty() { return; }
         let current = self.selected.min(self.filtered_indices.len() - 1);
-        // Find the nearest existing mark via the cached visible bitmap —
-        // no per-position ObjectKey allocation.
-        let anchor = self.marked_visible.iter()
+        // Find the nearest existing mark by checking each visible row against
+        // the authoritative `marked` set. One ObjectKey per visible row — only
+        // happens once per keypress, not per frame.
+        let anchor = self.filtered_indices.iter()
             .enumerate()
-            .filter_map(|(pos, marked)| if *marked { Some(pos) } else { None })
+            .filter_map(|(pos, &real)| {
+                let item = self.items.get(real)?;
+                let key = ObjectKey::new(item.namespace(), item.name());
+                if self.marked.contains(&key) { Some(pos) } else { None }
+            })
             .min_by_key(|&pos| (pos as isize - current as isize).unsigned_abs())
             .unwrap_or(0);
         let (start, end) = if anchor <= current { (anchor, current) } else { (current, anchor) };
@@ -89,9 +91,6 @@ impl<T: Clone + KubeResource> TableNav for StatefulTable<T> {
                 if let Some(item) = self.items.get(real) {
                     let key = ObjectKey::new(item.namespace(), item.name());
                     self.marked.insert(key);
-                    if let Some(slot) = self.marked_visible.get_mut(pos) {
-                        *slot = true;
-                    }
                 }
             }
         }
@@ -143,14 +142,9 @@ pub struct StatefulTable<T: Clone> {
     /// When set, the UI shows this instead of the loading spinner.
     pub error: Option<String>,
     /// Marked/selected rows, keyed by stable identity (namespace + name) so
-    /// marks survive data refreshes and sort changes.
+    /// marks survive data refreshes and sort changes. The render path checks
+    /// this set directly via row_keys — no intermediate bitmap cache.
     pub marked: HashSet<ObjectKey>,
-    /// Cached membership-by-visible-position for `marked`. Same length as
-    /// `filtered_indices`; `marked_visible[i] == true` iff the row at visible
-    /// position `i` is marked. Recomputed exactly when filters or marks
-    /// change — never per-frame. Eliminates the per-row `String` clones
-    /// that the render path used to do to build a transient HashSet.
-    pub marked_visible: Vec<bool>,
 }
 
 impl<T: Clone> Default for StatefulTable<T> {
@@ -170,7 +164,6 @@ impl<T: Clone> Default for StatefulTable<T> {
             loading: false,
             error: None,
             marked: HashSet::new(),
-            marked_visible: Vec::new(),
         }
     }
 }
@@ -241,13 +234,6 @@ impl<T: Clone> StatefulTable<T> {
         } else if self.selected >= self.filtered_indices.len() {
             self.selected = self.filtered_indices.len() - 1;
         }
-        // Reset the marked-visible bitmap to match the new visible set.
-        // KubeResource tables that need it actually populated will call
-        // `refresh_marked_visible()` separately (we can't do it here without
-        // a `KubeResource` bound, and the bound would break the contexts
-        // table which uses `set_items` but has no marks).
-        self.marked_visible.clear();
-        self.marked_visible.resize(self.filtered_indices.len(), false);
         self.adjust_offset();
     }
 
@@ -262,11 +248,6 @@ impl<T: Clone> StatefulTable<T> {
         } else if self.selected >= self.filtered_indices.len() {
             self.selected = self.filtered_indices.len() - 1;
         }
-        // Bitmap layout invariant: same length as filtered_indices. Callers
-        // with marks should call `refresh_marked_visible()` afterwards
-        // (only `KubeResource`-bounded tables have marks anyway).
-        self.marked_visible.clear();
-        self.marked_visible.resize(self.filtered_indices.len(), false);
         self.adjust_offset();
     }
 
@@ -280,7 +261,6 @@ impl<T: Clone> StatefulTable<T> {
         self.loading = false;
         self.error = None;
         self.marked.clear();
-        self.marked_visible.clear();
     }
 
     pub fn selected_item(&self) -> Option<&T> {
@@ -322,7 +302,6 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
         if self.selected >= self.filtered_indices.len() && !self.filtered_indices.is_empty() {
             self.selected = self.filtered_indices.len() - 1;
         }
-        self.refresh_marked_visible();
         self.adjust_offset();
     }
 
@@ -425,12 +404,10 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
     /// Rebuild `filtered_indices` to show every row. Filtering itself is
     /// owned by `App::reapply_nav_filters` (which calls `apply_filter` with
     /// the nav-stack-derived predicates) — the table is just the storage,
-    /// not the policy. After rebuilding the visible set, refresh the
-    /// marked-visible cache so the bitmap stays in sync.
+    /// not the policy.
     pub fn rebuild_filter(&mut self) {
         self.filtered_indices.clear();
         self.filtered_indices.extend(0..self.items.len());
-        self.refresh_marked_visible();
     }
 
     /// Clamp selection to valid range.
@@ -443,24 +420,6 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
         }
     }
 
-    /// Recompute the `marked_visible` cache from `filtered_indices` + `marked`.
-    /// Called from any mutator that touches either side of the join. The render
-    /// path borrows the result without doing per-row work.
-    pub fn refresh_marked_visible(&mut self) {
-        self.marked_visible.clear();
-        self.marked_visible.resize(self.filtered_indices.len(), false);
-        if self.marked.is_empty() {
-            return;
-        }
-        for (pos, &real_idx) in self.filtered_indices.iter().enumerate() {
-            if let Some(item) = self.items.get(real_idx) {
-                let key = ObjectKey::new(item.namespace(), item.name());
-                if self.marked.contains(&key) {
-                    self.marked_visible[pos] = true;
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

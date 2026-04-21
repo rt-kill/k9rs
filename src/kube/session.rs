@@ -16,7 +16,7 @@ use crate::kube::client_session::ClientSession;
 use crate::kube::session_actions::handle_action;
 use crate::kube::session_events::apply_event;
 use crate::kube::session_commands::{
-    build_shell_args, run_interactive_local,
+    run_interactive_local,
     handle_command_key, handle_form_dialog_key, handle_filter_key,
 };
 
@@ -52,29 +52,20 @@ pub(crate) enum ActionResult {
     /// No special handling needed.
     None,
     /// Suspend the TUI and run `kubectl exec -it` into a pod shell.
-    /// Carries the typed [`ExecTarget`] — was four loose strings before.
     Shell(ExecTarget),
-    /// Suspend the TUI and run `kubectl debug node/<name> -it` for
-    /// node-level debugging.
-    NodeShell { node: String, context: crate::kube::protocol::ContextName },
+    /// Suspend the TUI and run `kubectl debug node/<name> -it` via the
+    /// daemon's PTY exec substream.
+    NodeShell { node: String },
 }
 
-/// Identifies a pod + container + cluster context for an interactive
-/// `kubectl exec`. Replaces `ActionResult::Shell { pod, namespace,
-/// container, context }` four-string tuple. Lives here next to
-/// `ActionResult` because that's the only producer/consumer.
-///
-/// `namespace` and `context` are locations passed verbatim to
-/// `kubectl -n …  --context …`, not selections — same distinction as
-/// [`crate::kube::protocol::ObjectKey`], so `String` is intentional.
+/// Identifies a pod + container for an interactive exec session via
+/// `kubectl exec`. Uses SPDY protocol which works universally, unlike
+/// kube-rs's WebSocket-only exec which fails on many proxied clusters.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecTarget {
     pub pod: String,
     pub namespace: String,
-    /// Container to exec into. The TUI's container-select dialog produces
-    /// a real container name here; default-container exec isn't supported.
     pub container: String,
-    pub context: crate::kube::protocol::ContextName,
 }
 
 /// Auto-subscriptions that the TUI opens once the daemon connection is ready.
@@ -84,6 +75,210 @@ pub(crate) struct ExecTarget {
 ///
 /// Stored on App so they stay alive for the session's lifetime. Dropped on
 /// context switch (new session = new substreams).
+/// Convert a crossterm key event to raw terminal bytes for forwarding
+/// to a PTY. Handles printable chars, control keys, arrows, etc.
+fn crossterm_key_to_bytes(key: crossterm::event::KeyEvent) -> Vec<u8> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // Alt wraps the inner key bytes with an ESC prefix.
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        let inner = crossterm_key_to_bytes(crossterm::event::KeyEvent::new(
+            key.code,
+            key.modifiers.difference(KeyModifiers::ALT),
+        ));
+        if !inner.is_empty() {
+            let mut v = vec![0x1b];
+            v.extend(inner);
+            return v;
+        }
+    }
+
+    // Shift modifier for navigation keys: CSI 1;2 <final>.
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        let shifted = match key.code {
+            KeyCode::Up => Some(b'A'),
+            KeyCode::Down => Some(b'B'),
+            KeyCode::Right => Some(b'C'),
+            KeyCode::Left => Some(b'D'),
+            KeyCode::Home => Some(b'H'),
+            KeyCode::End => Some(b'F'),
+            _ => None,
+        };
+        if let Some(ch) = shifted {
+            return vec![0x1b, b'[', b'1', b';', b'2', ch];
+        }
+    }
+
+    match key.code {
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                // Ctrl+A..Z → 0x01..0x1a
+                if c.is_ascii_alphabetic() {
+                    let byte = (c.to_ascii_lowercase() as u8) - b'a' + 1;
+                    return vec![byte];
+                }
+                // Ctrl+Space → NUL, Ctrl+[ → ESC, etc.
+                return match c {
+                    ' ' | '2' => vec![0x00],  // Ctrl+Space / Ctrl+2
+                    '[' | '3' => vec![0x1b],  // Ctrl+[
+                    '\\' | '4' => vec![0x1c], // Ctrl+\
+                    ']' | '5' => vec![0x1d],  // Ctrl+]
+                    '^' | '6' => vec![0x1e],  // Ctrl+^
+                    '_' | '7' | '/' => vec![0x1f], // Ctrl+_
+                    _ => vec![],
+                };
+            }
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            s.as_bytes().to_vec()
+        }
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
+        KeyCode::Up => vec![0x1b, b'[', b'A'],
+        KeyCode::Down => vec![0x1b, b'[', b'B'],
+        KeyCode::Right => vec![0x1b, b'[', b'C'],
+        KeyCode::Left => vec![0x1b, b'[', b'D'],
+        KeyCode::Home => vec![0x1b, b'[', b'H'],
+        KeyCode::End => vec![0x1b, b'[', b'F'],
+        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
+        KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
+        KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
+        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
+        KeyCode::F(n) => match n {
+            1 => vec![0x1b, b'O', b'P'],
+            2 => vec![0x1b, b'O', b'Q'],
+            3 => vec![0x1b, b'O', b'R'],
+            4 => vec![0x1b, b'O', b'S'],
+            5..=12 => {
+                let codes = [b"15", b"17", b"18", b"19", b"20", b"21", b"23", b"24"];
+                let idx = (n - 5) as usize;
+                if idx < codes.len() {
+                    let mut v = vec![0x1b, b'['];
+                    v.extend_from_slice(codes[idx]);
+                    v.push(b'~');
+                    v
+                } else { vec![] }
+            }
+            _ => vec![],
+        },
+        _ => vec![],
+    }
+}
+
+/// Open an exec session and navigate to Route::Shell. The session renders
+/// inside the TUI — no suspend, no alternate screen exit. The daemon spawns
+/// kubectl in a PTY; bytes flow over yamux and are parsed by vt100 into a
+/// screen buffer that the TUI renders each frame.
+pub(crate) async fn open_exec_route(
+    app: &mut App,
+    data_source: &ClientSession,
+    exec_init: crate::kube::protocol::ExecInit,
+    title: String,
+    event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
+) -> Result<()> {
+    let stream = data_source.open_exec_stream(exec_init.clone()).await?;
+    let parser = vt100::Parser::new(exec_init.term_height, exec_init.term_width, 0);
+
+    // Split: writer stays in Route for keystrokes, reader goes to bridge task.
+    let crate::kube::client_session::ExecStream { reader, writer } = stream;
+    let tx = event_tx.clone();
+    let bridge = tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            match crate::kube::protocol::read_bincode::<_, crate::kube::protocol::ExecFrame>(&mut reader).await {
+                Ok(crate::kube::protocol::ExecFrame::Data(bytes)) => {
+                    if tx.send(crate::event::AppEvent::ExecData(bytes)).await.is_err() { break; }
+                }
+                Ok(crate::kube::protocol::ExecFrame::Resize { .. }) => {}
+                Err(_) => {
+                    let _ = tx.send(crate::event::AppEvent::ExecEnded).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    app.navigate_to(crate::app::Route::Shell(Box::new(crate::app::ShellState {
+        title,
+        parser,
+        writer: Some(writer),
+        _bridge: Some(bridge.abort_handle()),
+        connected: false,
+    })));
+    Ok(())
+}
+
+/// Strip leading `#` comment lines from edited YAML. We prepend server
+/// error messages as `# ...` on re-open so the user can see what went
+/// wrong. These must be stripped before diffing or sending to the server.
+/// Only strips the contiguous comment block at the top — comments in the
+/// middle of the YAML are the user's and are left alone.
+/// Strip leading comment lines that WE prepended (error re-open).
+/// Only strips lines starting with `# k9rs:` or blank lines in the
+/// leading block. User's own `#` comments in the YAML are preserved.
+fn strip_leading_comments(s: &str) -> &str {
+    let mut pos = 0;
+    for line in s.lines() {
+        if line.starts_with("# k9rs:") || line == "#" || line.trim().is_empty() {
+            pos += line.len();
+            if s[pos..].starts_with("\r\n") {
+                pos += 2;
+            } else if s[pos..].starts_with('\n') {
+                pos += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    &s[pos.min(s.len())..]
+}
+
+/// RAII guard for a suspended TUI. Creation suspends the input bridge and
+/// leaves the alternate screen. Drop restores both — whether the caller
+/// returns normally, errors, or panics. This makes it impossible to leave
+/// the TUI in a suspended state: you hold a `SuspendGuard` while doing
+/// interactive work, and the guard's drop handles cleanup.
+///
+/// Follows the same permit pattern as `SubscriptionStream` (drop closes
+/// substream), `LogStream` (drop aborts bridge), and `LiveQuery` (drop
+/// aborts watcher): the resource's lifetime IS the guard's lifetime.
+pub(crate) struct SuspendGuard<'a, B: ratatui::backend::Backend + std::io::Write> {
+    terminal: &'a mut ratatui::Terminal<B>,
+    input_suspend: &'a tokio::sync::watch::Sender<bool>,
+}
+
+impl<'a, B: ratatui::backend::Backend + std::io::Write> SuspendGuard<'a, B> {
+    /// Suspend the TUI: stop the input bridge, leave alternate screen.
+    /// Returns a guard that resumes on drop.
+    pub(crate) async fn new(
+        terminal: &'a mut ratatui::Terminal<B>,
+        input_suspend: &'a tokio::sync::watch::Sender<bool>,
+        input_suspend_ack: &mut mpsc::Receiver<()>,
+    ) -> Result<Self> {
+        let _ = input_suspend.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), input_suspend_ack.recv()).await;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        Ok(Self { terminal, input_suspend })
+    }
+
+    /// Access the terminal (e.g., to disable raw mode for subprocess shells).
+    pub(crate) fn terminal_mut(&mut self) -> &mut ratatui::Terminal<B> {
+        self.terminal
+    }
+}
+
+impl<B: ratatui::backend::Backend + std::io::Write> Drop for SuspendGuard<'_, B> {
+    fn drop(&mut self) {
+        let _ = execute!(self.terminal.backend_mut(), crossterm::terminal::EnterAlternateScreen);
+        let _ = self.terminal.clear();
+        let _ = self.input_suspend.send(false);
+    }
+}
+
+
 pub(crate) fn open_core_subscriptions(app: &mut App, data_source: &ClientSession) {
     for def in crate::kube::resource_defs::REGISTRY.all() {
         if def.is_core() {
@@ -228,7 +423,7 @@ pub async fn session_main(
 ) -> Result<Option<crate::app::ExitReason>> {
     // Track active log streaming substream so we can cancel on Back.
     // Drop = close substream = daemon kills kubectl = log stream ended.
-    let mut log_stream: Option<crate::kube::client_session::LogStream> = None;
+    // Log stream is owned by Route::Logs — no separate variable needed.
 
     let mut tick_interval = tokio::time::interval(tick_rate);
     let mut last_tick = std::time::Instant::now();
@@ -315,53 +510,104 @@ pub async fn session_main(
 
         // Unified edit flow, stage 2: if the YAML for an in-flight edit
         // arrived since the last loop iteration, the event handler put us
-        // into `EditState::EditorReady { temp_path }`. Take the path out,
-        // transition to `Applying`, suspend the TUI, run `$EDITOR`, read
-        // the result back, and send `Apply { target, yaml }`. The response
-        // (a `CommandResult` flash) will pop the edit route. Failures
-        // along the way pop the route immediately and flash the error.
-        if let crate::app::Route::EditingResource {
-            ref target,
-            state: crate::app::EditState::EditorReady { ref temp_path },
-        } = app.route {
-            let target = target.clone();
-            let temp_path = temp_path.clone();
-            // Mark the route as Applying *before* the suspend so any
-            // CommandResult that arrives during the editor session
-            // (which can't happen — the loop is parked — but for
-            // future-proofing) lands in the right state.
-            app.route = crate::app::Route::EditingResource {
-                target: target.clone(),
-                state: crate::app::EditState::Applying,
+        // into `EditState::EditorReady { temp_path, original }`. Run the
+        // editor, validate the result, and send Apply. On server error,
+        // the CommandResult handler loops back to EditorReady (re-open).
+        // Check if we're in EditorReady before taking the route out.
+        let is_editor_ready = matches!(
+            app.route,
+            crate::app::Route::EditingResource {
+                state: crate::app::EditState::EditorReady { .. }, ..
+            }
+        );
+        if is_editor_ready {
+            // Take the route out so we own TempFile (move, not borrow).
+            // TempFile::Drop deletes the file, so on abort paths we just
+            // let it drop. On the apply path we move it to Applying.
+            let old_route = std::mem::replace(&mut app.route, crate::app::Route::Resources);
+            let (target, temp_file, original) = match old_route {
+                crate::app::Route::EditingResource {
+                    target,
+                    state: crate::app::EditState::EditorReady { temp_file, original },
+                } => (target, temp_file, original),
+                _ => unreachable!(),
             };
 
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-            let path_arg = temp_path.to_string_lossy().to_string();
+            let path_arg = temp_file.path().to_string_lossy().to_string();
             let args = vec![path_arg];
-            run_interactive_local(
+            let exit_status = match run_interactive_local(
                 &mut terminal, &mut app, &editor, &args,
                 crate::kube::session_commands::InteractiveKind::Editor,
                 &input_suspend, &mut input_suspend_ack,
-            ).await?;
-
-            // Read the edited file back, send Apply, then delete the temp.
-            let read_result = std::fs::read_to_string(&temp_path);
-            let _ = std::fs::remove_file(&temp_path);
-            match read_result {
-                Ok(yaml) => {
-                    if let Err(e) = data_source.apply(&target, yaml) {
-                        app.flash = Some(crate::app::FlashMessage::error(
-                            format!("Apply failed: {}", e)
-                        ));
-                        app.pop_route();
-                    }
+            ).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // TempFile drops here → deletes the file.
+                    app.flash = Some(crate::app::FlashMessage::error(
+                        format!("Editor failed: {}", e)
+                    ));
+                    needs_redraw = true;
+                    continue;
                 }
+            };
+
+            // Editor non-zero exit (vim `:cq`) → abort. TempFile drops.
+            if exit_status.is_some_and(|s| !s.success()) {
+                app.flash = Some(crate::app::FlashMessage::info(
+                    "Edit aborted.".to_string()
+                ));
+                needs_redraw = true;
+                continue;
+            }
+
+            // Read the edited file back.
+            let edited = match std::fs::read_to_string(temp_file.path()) {
+                Ok(s) => s,
                 Err(e) => {
                     app.flash = Some(crate::app::FlashMessage::error(
                         format!("Failed to read edited file: {}", e)
                     ));
-                    app.pop_route();
+                    needs_redraw = true;
+                    continue;
                 }
+            };
+
+            let stripped = strip_leading_comments(&edited);
+
+            // Unchanged → abort. TempFile drops.
+            if stripped.trim() == original.trim() {
+                app.flash = Some(crate::app::FlashMessage::info(
+                    "Edit cancelled, no changes made.".to_string()
+                ));
+                needs_redraw = true;
+                continue;
+            }
+
+            // Empty → abort. TempFile drops.
+            if stripped.trim().is_empty() {
+                app.flash = Some(crate::app::FlashMessage::info(
+                    "Edit cancelled, file is empty.".to_string()
+                ));
+                needs_redraw = true;
+                continue;
+            }
+
+            // Send Apply. Move TempFile to Applying state — keeps file alive
+            // for re-open on error. TempFile only drops when edit completes.
+            let target_clone = target.clone();
+            app.route = crate::app::Route::EditingResource {
+                target,
+                state: crate::app::EditState::Applying {
+                    temp_file,
+                    original,
+                },
+            };
+            if let Err(e) = data_source.apply(&target_clone, stripped.to_string()) {
+                app.flash = Some(crate::app::FlashMessage::error(
+                    format!("Apply failed: {}", e)
+                ));
+                app.pop_route();
             }
             needs_redraw = true;
             continue;
@@ -375,8 +621,30 @@ pub async fn session_main(
             Some(ct_event) = input_rx.recv() => {
                 match ct_event {
                     CtEvent::Key(key) => {
+                        // Shell route: forward ALL keys as raw bytes to the
+                        // daemon's PTY. Shell exits only when the remote
+                        // process exits (ExecEnded event), not on Esc.
+                        if let crate::app::Route::Shell(ref mut shell) = app.route {
+                            if let Some(ref mut w) = shell.writer {
+                                let bytes = crossterm_key_to_bytes(key);
+                                if !bytes.is_empty() {
+                                    let frame = crate::kube::protocol::ExecFrame::Data(bytes);
+                                    if crate::kube::protocol::write_bincode(w, &frame).await.is_err() {
+                                        app.pop_route();
+                                        app.flash = Some(crate::app::FlashMessage::error(
+                                            "Shell disconnected".to_string()
+                                        ));
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+                                }
+                            }
+                            needs_redraw = true;
+                            continue;
+                        }
+
                         // Input mode handlers — each returns true if the key was consumed.
-                        if handle_command_key(&mut app, key, &mut data_source, &mut log_stream, &event_tx) {
+                        if handle_command_key(&mut app, key, &mut data_source, &event_tx) {
                             needs_redraw = true;
                             continue;
                         }
@@ -425,39 +693,56 @@ pub async fn session_main(
                                 action,
                                 &event_tx,
                                 &mut data_source,
-                                &mut log_stream,
                             );
                             match result {
                                 ActionResult::Shell(target) => {
-                                    let args = build_shell_args(&target.pod, &target.namespace, &target.container, &target.context);
-                                    let kind = crate::kube::session_commands::InteractiveKind::Shell {
-                                        pod: target.pod.clone(),
-                                        container: target.container.clone(),
+                                    let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+                                    let mut kubectl_args = vec![
+                                        "exec".to_string(), "-it".to_string(),
+                                        "-n".to_string(), target.namespace.clone(),
+                                        target.pod.clone(),
+                                    ];
+                                    if !target.container.is_empty() {
+                                        kubectl_args.push("-c".to_string());
+                                        kubectl_args.push(target.container.clone());
+                                    }
+                                    kubectl_args.push("--".to_string());
+                                    kubectl_args.push("sh".to_string());
+                                    let title = format!("{}/{}", target.pod, target.container);
+                                    let exec_init = crate::kube::protocol::ExecInit {
+                                        kubectl_args,
+                                        term_width: tw,
+                                        term_height: th,
                                     };
-                                    run_interactive_local(
-                                        &mut terminal, &mut app, "kubectl", &args, kind,
-                                        &input_suspend, &mut input_suspend_ack,
-                                    ).await?;
+                                    if let Err(e) = open_exec_route(
+                                        &mut app, &data_source, exec_init, title, &event_tx,
+                                    ).await {
+                                        app.flash = Some(crate::app::FlashMessage::error(
+                                            format!("Shell failed: {}", e)
+                                        ));
+                                    }
                                 }
-                                ActionResult::NodeShell { node, context } => {
-                                    let mut args = vec![
+                                ActionResult::NodeShell { node, .. } => {
+                                    let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+                                    let kubectl_args = vec![
                                         "debug".to_string(),
                                         format!("node/{}", node),
                                         "-it".to_string(),
                                         "--image=busybox".to_string(),
                                     ];
-                                    if !context.is_empty() {
-                                        args.push("--context".to_string());
-                                        args.push(context.to_string());
-                                    }
-                                    let kind = crate::kube::session_commands::InteractiveKind::Shell {
-                                        pod: format!("node/{}", node),
-                                        container: String::new(),
+                                    let title = format!("node/{}", node);
+                                    let exec_init = crate::kube::protocol::ExecInit {
+                                        kubectl_args,
+                                        term_width: tw,
+                                        term_height: th,
                                     };
-                                    run_interactive_local(
-                                        &mut terminal, &mut app, "kubectl", &args, kind,
-                                        &input_suspend, &mut input_suspend_ack,
-                                    ).await?;
+                                    if let Err(e) = open_exec_route(
+                                        &mut app, &data_source, exec_init, title, &event_tx,
+                                    ).await {
+                                        app.flash = Some(crate::app::FlashMessage::error(
+                                            format!("Node shell failed: {}", e)
+                                        ));
+                                    }
                                 }
                                 ActionResult::None => {}
                             }
@@ -465,7 +750,17 @@ pub async fn session_main(
                     }
                     // Pure-keyboard TUI by design — mouse events are
                     // intentionally dropped (see ~/.config/claude memory).
-                    CtEvent::Resize(_, _) => {
+                    CtEvent::Resize(w, h) => {
+                        // Forward resize to daemon's PTY when in shell view.
+                        if let crate::app::Route::Shell(ref mut shell) = app.route {
+                            // Update local parser first so the render matches
+                            // even if the daemon write fails.
+                            shell.parser.set_size(h, w);
+                            if let Some(ref mut wr) = shell.writer {
+                                let frame = crate::kube::protocol::ExecFrame::Resize { width: w, height: h };
+                                let _ = crate::kube::protocol::write_bincode(wr, &frame).await;
+                            }
+                        }
                         needs_redraw = true;
                     }
                     _ => {}
@@ -501,8 +796,6 @@ pub async fn session_main(
         }
     }
 
-    // Cleanup — dropping log_stream closes the substream.
-    drop(log_stream);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),

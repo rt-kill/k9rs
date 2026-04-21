@@ -38,7 +38,6 @@ pub(crate) fn handle_action(
     action: crate::app::actions::Action,
     event_tx: &mpsc::Sender<AppEvent>,
     data_source: &mut ClientSession,
-    log_stream: &mut Option<crate::kube::client_session::LogStream>,
 ) -> ActionResult {
     use crate::app::actions::Action;
     use crate::app::Route;
@@ -49,15 +48,13 @@ pub(crate) fn handle_action(
             app.should_quit = true;
         }
         Action::Back => {
-            // Cancel any active log stream — drop closes the substream.
-            *log_stream = None;
-            // Pop the route stack to go back — old route (with its state) is dropped
+            // Pop the route stack — old route (with its state + stream) is dropped
             if let Some(route) = app.route_stack.pop() {
                 app.route = route;
             }
         }
         Action::Help => {
-            if app.route == Route::Help {
+            if matches!(app.route, Route::Help) {
                 // Toggle: pressing ? while in help goes back
                 if let Some(route) = app.route_stack.pop() {
                     app.route = route;
@@ -65,8 +62,7 @@ pub(crate) fn handle_action(
                     app.route = Route::Resources;
                 }
             } else {
-                app.push_route(app.route.clone());
-                app.route = Route::Help;
+                app.navigate_to(Route::Help);
             }
         }
         Action::NextTab => {
@@ -204,14 +200,14 @@ pub(crate) fn handle_action(
             }
         }
         Action::Enter => {
-            let result = handle_enter(app, data_source, log_stream);
+            let result = handle_enter(app, data_source);
             if !matches!(result, ActionResult::None) {
                 return result;
             }
         }
         Action::Describe => handle_describe(app, data_source),
         Action::Yaml => handle_yaml(app, data_source),
-        Action::Logs => handle_logs(app, data_source, log_stream),
+        Action::Logs => handle_logs(app, data_source),
         Action::Shell => {
             if app.current_capabilities().supports(crate::kube::protocol::OperationKind::Shell) {
                 if let Some(row) = app.data.unified.get(&rid(BuiltInKind::Pod)).and_then(|t| t.selected_item()) {
@@ -243,65 +239,51 @@ pub(crate) fn handle_action(
                     );
                     if containers.len() > 1 {
                         // Multi-container pod: show container selector.
-                        app.push_route(app.route.clone());
-                        app.route = Route::ContainerSelect {
+                        app.navigate_to(Route::ContainerSelect {
                             target,
                             selected: 0,
                             action: crate::app::ContainerAction::Shell,
-                        };
+                        });
                     } else {
                         let container = containers.first().map(|c| c.name.clone()).unwrap_or_default();
-                        let context = app.context.clone();
                         return ActionResult::Shell(crate::kube::session::ExecTarget {
                             pod: pod_name,
                             namespace: pod_ns,
                             container,
-                            context,
                         });
                     }
                 }
             }
         }
         Action::Delete => {
-            // Local resources skip the confirm dialog (cheap to recreate).
-            // The wire command (`SessionCommand::Delete`) is the same for
-            // both local and K8s — the server routes by `is_local()`.
-            if app.nav.resource_id().is_local() {
-                if let Some(info) = get_selected_resource_info(app) {
-                    let name = info.name.clone();
-                    ds_try!(app, data_source.delete(&info));
-                    app.flash = Some(crate::app::FlashMessage::info(
-                        format!("Stopped {}", name)
-                    ));
-                }
-            } else {
-                let marked = get_marked_resource_infos(app);
-                if !marked.is_empty() {
-                    let count = marked.len();
-                    let resource = marked[0].resource.display_label().to_string();
-                    app.confirm_dialog = Some(crate::app::ConfirmDialog {
-                        message: format!("Delete {} {}s?", count, resource),
-                        pending: crate::app::PendingAction::BatchDelete(marked),
-                        yes_selected: false,
-                    });
-                } else if let Some(info) = get_selected_resource_info(app) {
-                    app.confirm_dialog = Some(crate::app::ConfirmDialog {
-                        message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
-                        pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::Delete, target: info },
-                        yes_selected: false,
-                    });
-                }
+            let marked = get_marked_resource_infos(app);
+            if !marked.is_empty() {
+                let count = marked.len();
+                let resource = marked[0].resource.display_label().to_string();
+                app.confirm_dialog = Some(crate::app::ConfirmDialog {
+                    message: format!("Delete {} {}s?", count, resource),
+                    pending: crate::app::PendingAction::BatchDelete(marked),
+                    yes_selected: false,
+                });
+            } else if let Some(info) = get_selected_resource_info(app) {
+                app.confirm_dialog = Some(crate::app::ConfirmDialog {
+                    message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
+                    pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::Delete, target: info },
+                    yes_selected: false,
+                });
             }
         }
         Action::Edit => {
-            // Unified edit flow: fetch yaml → $EDITOR → apply.
+            if matches!(app.route, crate::app::Route::EditingResource { .. }) {
+                app.flash = Some(crate::app::FlashMessage::warn("Edit already in progress".to_string()));
+                return ActionResult::None;
+            }
             if let Some(info) = get_selected_resource_info(app) {
                 ds_try!(app, data_source.yaml(&info));
-                app.push_route(app.route.clone());
-                app.route = crate::app::Route::EditingResource {
+                app.navigate_to(crate::app::Route::EditingResource {
                     target: info,
                     state: crate::app::EditState::AwaitingYaml,
-                };
+                });
             }
         }
         Action::Scale => {
@@ -310,7 +292,7 @@ pub(crate) fn handle_action(
             }
         }
         Action::Filter(_) => {
-            if app.route == crate::app::Route::Resources {
+            if matches!(app.route, crate::app::Route::Resources) {
                 app.nav.filter_input_mut().active = true;
                 app.nav.filter_input_mut().text.clear();
             } else if let crate::app::Route::Logs { ref mut state, .. } = app.route {
@@ -453,10 +435,10 @@ pub(crate) fn handle_action(
             }
         }
         Action::SwitchNamespace(ns) => {
-            do_switch_namespace(app, data_source, ns, log_stream);
+            do_switch_namespace(app, data_source, ns);
         }
         Action::SwitchContext(ctx) => {
-            begin_context_switch(app, data_source, &ctx, log_stream);
+            begin_context_switch(app, data_source, &ctx);
         }
         Action::Refresh => {
             // Refresh = drop the substream feeding the current view, clear
@@ -705,7 +687,7 @@ pub(crate) fn handle_action(
             }
         }
         Action::PreviousLogs => {
-            handle_previous_logs(app, data_source, log_stream);
+            handle_previous_logs(app, data_source);
         }
         Action::ShowNode => {
             if app.current_capabilities().supports(crate::kube::protocol::OperationKind::ShowNode) {
@@ -736,8 +718,7 @@ pub(crate) fn handle_action(
                 .and_then(|t| t.selected_item())
             {
                 let node = row.name.clone();
-                let context = app.context.clone();
-                return ActionResult::NodeShell { node, context };
+                return ActionResult::NodeShell { node };
             }
         }
         Action::ToggleLastView => {
@@ -828,15 +809,14 @@ pub(crate) fn handle_action(
         }
         Action::DecodeSecret => {
             if let Some(info) = get_selected_resource_info(app) {
-                app.push_route(app.route.clone());
                 let mut state = crate::app::ContentViewState::default();
                 state.set_content(format!("Decoding secret {}/{}...", info.namespace, info.name));
                 ds_try!(app, data_source.decode_secret(&info));
-                app.route = crate::app::Route::Describe {
+                app.navigate_to(crate::app::Route::Describe {
                     target: info,
                     awaiting_response: false,
                     state,
-                };
+                });
             }
         }
         Action::TriggerCronJob => {
@@ -904,16 +884,14 @@ pub(crate) fn handle_action(
             content.push_str("  Ctrl-s                     Save table to file\n");
             let mut state = crate::app::ContentViewState::default();
             state.set_content(content);
-            app.push_route(app.route.clone());
-            app.route = Route::Aliases { state };
+            app.navigate_to(Route::Aliases { state });
         }
         Action::LogSince(ref since) => {
             let since_label = since.as_deref().unwrap_or("tail");
             app.flash = Some(crate::app::FlashMessage::info(format!("Log range: {}", since_label)));
-            // Cancel existing log task
-            *log_stream = None;
-            // Restart with new since/tail parameter
-            if let Route::Logs { ref target, ref mut state } = app.route {
+            // Restart with new since/tail parameter. The old stream is
+            // dropped when we replace it — RAII cleanup.
+            if let Route::Logs { ref target, ref mut state, ref mut stream } = app.route {
                 state.since = since.clone();
                 let tail_lines = state.tail_lines;
                 state.clear();
@@ -924,18 +902,15 @@ pub(crate) fn handle_action(
                 let new_stream = data_source.stream_log_substream(crate::kube::protocol::LogInit {
                     pod: target.pod.clone(),
                     namespace: crate::kube::protocol::Namespace::from_row(&target.namespace),
-                    // The `target.container` is the typed `LogContainer`
-                    // selector — clone it directly, no string round-trip.
                     container: target.container.clone(),
                     follow: true,
                     tail,
                     since: since.clone(),
                     previous: false,
                 });
-                // Stamp the fresh generation so stale lines from the
-                // previous stream get filtered out by the apply check.
                 state.generation = new_stream.generation;
-                *log_stream = Some(new_stream);
+                // Replace the stream in the route — old stream drops (RAII).
+                *stream = Some(new_stream);
             }
         }
         Action::ColLeft => {

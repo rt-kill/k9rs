@@ -37,6 +37,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Route::Logs { .. } => {
             views::log::draw_logs(f, app, area);
         }
+        Route::Shell(ref shell) => {
+            views::shell::draw_shell(f, shell, area, &app.theme);
+        }
         Route::Help => {
             // Draw resource view underneath the help overlay
             views::resource::draw_resources(f, app, area);
@@ -67,7 +70,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 match state {
                     crate::app::EditState::AwaitingYaml => format!("Fetching YAML for {}/{}…", kind, name),
                     crate::app::EditState::EditorReady { .. } => format!("Launching editor for {}/{}…", kind, name),
-                    crate::app::EditState::Applying => format!("Applying {}/{}…", kind, name),
+                    crate::app::EditState::Applying { .. } => format!("Applying {}/{}…", kind, name),
                 }
             } else { String::new() };
             views::resource::draw_resources(f, app, area);

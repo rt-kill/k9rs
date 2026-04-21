@@ -23,19 +23,37 @@ pub(crate) fn apply_event(
             app.flash = Some(flash);
         }
         AppEvent::CommandResult(result) => {
-            // Terminal state of the unified edit flow: when we're waiting
-            // for an `Apply` to come back, the next server `CommandResult`
-            // is *the* result. Pop the edit route so the user lands back
-            // on the resource view, and clear the kubectl cache since the
-            // resource may have changed. Unrelated locally-originated
-            // flashes (batch delete, force-kill, save) go through the
-            // `Flash` arm and don't touch the edit route.
+            // Terminal state of the unified edit flow. Take the route out
+            // Take the route out via mem::replace so we can MOVE the
+            // TempFile (not clone). TempFile::Drop deletes the file, so
+            // moving it to the new EditorReady prevents premature deletion.
+            let old_route = std::mem::replace(&mut app.route, crate::app::Route::Resources);
             if let crate::app::Route::EditingResource {
-                state: crate::app::EditState::Applying,
-                ..
-            } = app.route {
-                app.kubectl_cache.clear();
-                app.pop_route();
+                target,
+                state: crate::app::EditState::Applying { temp_file, original },
+            } = old_route {
+                match &result {
+                    Ok(_) => {
+                        // TempFile drops here → deletes the file.
+                        drop(temp_file);
+                        app.kubectl_cache.clear();
+                    }
+                    Err(msg) => {
+                        let current = std::fs::read_to_string(temp_file.path()).unwrap_or_default();
+                        let with_error = format!(
+                            "# k9rs: Error from server:\n# k9rs: {}\n# k9rs: Save to retry, :cq to abort.\n#\n{}",
+                            msg, current,
+                        );
+                        let _ = std::fs::write(temp_file.path(), &with_error);
+                        // Move TempFile into the new state — no drop, no deletion.
+                        app.route = crate::app::Route::EditingResource {
+                            target,
+                            state: crate::app::EditState::EditorReady { temp_file, original },
+                        };
+                    }
+                }
+            } else {
+                app.route = old_route;
             }
             app.flash = Some(match result {
                 Ok(msg) => crate::app::FlashMessage::info(msg),
@@ -105,6 +123,18 @@ pub(crate) fn apply_event(
         AppEvent::LogStreamEnded => {
             if let crate::app::Route::Logs { ref mut state, .. } = app.route {
                 state.streaming = false;
+            }
+        }
+        AppEvent::ExecData(bytes) => {
+            if let crate::app::Route::Shell(ref mut shell) = app.route {
+                shell.connected = true;
+                shell.parser.process(&bytes);
+            }
+        }
+        AppEvent::ExecEnded => {
+            if matches!(app.route, crate::app::Route::Shell(_)) {
+                app.flash = Some(crate::app::FlashMessage::info("Shell session ended".to_string()));
+                app.pop_route();
             }
         }
         AppEvent::DaemonDisconnected => {
@@ -193,7 +223,10 @@ fn apply_resource_update(
                 if matches!(state, crate::app::EditState::AwaitingYaml) {
                     match write_edit_temp_file(target, &content) {
                         Ok(temp_path) => {
-                            *state = crate::app::EditState::EditorReady { temp_path };
+                            *state = crate::app::EditState::EditorReady {
+                                temp_file: crate::app::TempFile(temp_path),
+                                original: content.clone(),
+                            };
                         }
                         Err(e) => {
                             // Couldn't write the temp file — abort the edit

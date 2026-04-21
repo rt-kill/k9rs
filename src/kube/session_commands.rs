@@ -1,42 +1,15 @@
 use anyhow::Result;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use tokio::sync::mpsc;
 
 use crate::app::App;
 use crate::kube::protocol::ResourceId;
-
-/// Build `kubectl exec -it` args for shelling into a container.
-/// Uses `sh -c "command -v bash && exec bash || exec sh"` (same as k9s)
-/// so it works regardless of where bash/sh are installed.
-pub(crate) fn build_shell_args(pod: &str, namespace: &str, container: &str, context: &crate::kube::protocol::ContextName) -> Vec<String> {
-    let mut args = vec![
-        "exec".to_string(),
-        "-it".to_string(),
-        pod.to_string(),
-        "-n".to_string(),
-        namespace.to_string(),
-        "-c".to_string(),
-        container.to_string(),
-    ];
-    if !context.is_empty() {
-        args.push("--context".to_string());
-        args.push(context.as_str().to_string());
-    }
-    args.push("--".to_string());
-    args.push("sh".to_string());
-    args.push("-c".to_string());
-    args.push("command -v bash >/dev/null && exec bash || exec sh".to_string());
-    args
-}
 
 /// What kind of interactive command we're about to suspend the TUI for.
 /// Determines pre-launch UI (the "Connecting…" box for shells) and
 /// post-launch failure handling. Replaces the previous trick of inspecting
 /// `args.first() == "exec"` to guess the kind from argv.
 pub(crate) enum InteractiveKind {
-    /// `kubectl exec -it pod -c container -- ...`. Shows a centered
-    /// "Connecting…" box and reports a flash on non-zero exit.
-    Shell { pod: String, container: String },
     /// `$EDITOR /tmp/k9rs-edit-...`. No connecting box, no flash on
     /// non-zero exit (the edit flow surfaces its own errors).
     Editor,
@@ -48,60 +21,28 @@ pub(crate) enum InteractiveKind {
 /// to launch.
 pub(crate) async fn run_interactive_local(
     terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
-    app: &mut App,
+    _app: &mut App,
     command: &str,
     args: &[String],
-    kind: InteractiveKind,
+    _kind: InteractiveKind,
     input_suspend: &tokio::sync::watch::Sender<bool>,
     input_suspend_ack: &mut mpsc::Receiver<()>,
-) -> Result<()> {
-    // Suspend the EventStream bridge and wait for it to actually stop reading.
-    let _ = input_suspend.send(true);
-    // Wait for the bridge to ack (with timeout to avoid hanging if bridge died).
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        input_suspend_ack.recv(),
-    ).await;
+) -> Result<Option<std::process::ExitStatus>> {
+    use crate::kube::session::SuspendGuard;
 
-    // Leave the TUI cleanly: disable raw mode, show cursor, leave alt screen.
+    // The guard suspends the TUI and restores it on drop.
+    let mut guard = SuspendGuard::new(terminal, input_suspend, input_suspend_ack).await?;
+
+    // Interactive subprocesses need a normal terminal.
     disable_raw_mode()?;
     crossterm::execute!(
-        terminal.backend_mut(),
+        guard.terminal_mut().backend_mut(),
         crossterm::cursor::Show,
         crossterm::cursor::SetCursorStyle::DefaultUserShape,
-        LeaveAlternateScreen,
     )?;
 
-    if let InteractiveKind::Shell { pod, container } = &kind {
-        let msg = format!("{}/{}", pod, container);
-        // Clear screen and show a centered connecting box.
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        print!("\x1b[2J\x1b[H");
-        let box_w = msg.len() + 6;
-        let x = (cols as usize).saturating_sub(box_w) / 2;
-        // Saturating subtraction guards against tiny terminals where
-        // `rows < 2` would otherwise underflow usize.
-        let y = ((rows as usize) / 2).saturating_sub(1);
-        let pad = " ".repeat(x);
-        let top = format!("{}┌{}┐", pad, "─".repeat(box_w));
-        let mid = format!("{}│  {}  │", pad, msg);
-        let status = format!("{}│  {}  │", pad, "Connecting...");
-        let bot = format!("{}└{}┘", pad, "─".repeat(box_w));
-        for _ in 0..y { println!(); }
-        println!("{}", top);
-        println!("{}", mid);
-        println!("{}", status);
-        println!("{}", bot);
-    }
-
     // Run the subprocess on a blocking thread so the tokio runtime's
-    // worker threads stay unblocked. The blocking call is unavoidable:
-    // `$EDITOR` and `kubectl exec -it` both want a real terminal, so
-    // this is a full tokio::process::Command::status().await away (mode
-    // switching on our terminal) and in practice the TUI is suspended
-    // anyway — but parking an async worker thread can still stall
-    // background tasks on the same runtime (watchers, metrics polling).
-    // `spawn_blocking` puts this on the blocking pool where it belongs.
+    // worker threads stay unblocked.
     let command_owned = command.to_string();
     let args_owned: Vec<String> = args.to_vec();
     let status = tokio::task::spawn_blocking(move || {
@@ -111,33 +52,18 @@ pub(crate) async fn run_interactive_local(
     })
     .await
     .unwrap_or_else(|join_err| {
-        // spawn_blocking only fails if the task panicked. Surface it as
-        // an IO error so the existing match-on-Result logic handles it.
         Err(std::io::Error::other(join_err.to_string()))
     });
 
-    // Report shell failures (the smart shell command already tries bash then sh).
-    if matches!(kind, InteractiveKind::Shell { .. })
-        && (status.is_err() || status.as_ref().is_ok_and(|s| !s.success()))
-    {
-        app.flash = Some(crate::app::FlashMessage::error(
-            "Shell failed — no shell available in container".to_string(),
-        ));
-    }
-
-    // Resume TUI — restore raw mode and alternate screen.
+    // Restore raw mode + hide cursor before guard drops.
     enable_raw_mode()?;
     crossterm::execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
+        guard.terminal_mut().backend_mut(),
         crossterm::cursor::Hide,
     )?;
-    terminal.clear()?;
 
-    // Resume the EventStream bridge.
-    let _ = input_suspend.send(false);
-
-    Ok(())
+    // Guard drops → enter alternate screen, clear, resume input.
+    Ok(status.ok())
 }
 
 /// A classified `:command`. Produced by [`parse_command_input`] and
@@ -343,7 +269,6 @@ pub(crate) fn handle_command_key(
     app: &mut App,
     key: KeyEvent,
     data_source: &mut ClientSession,
-    log_stream: &mut Option<crate::kube::client_session::LogStream>,
     event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
 ) -> bool {
     if !matches!(app.input_mode, InputMode::Command { .. }) {
@@ -367,7 +292,7 @@ pub(crate) fn handle_command_key(
                 }
             }
             app.input_mode = InputMode::Normal;
-            handle_command_submit(app, &raw_cmd, &cmd, data_source, log_stream, event_tx);
+            handle_command_submit(app, &raw_cmd, &cmd, data_source, event_tx);
         }
         KeyCode::Tab => {
             app.accept_completion();
@@ -422,7 +347,6 @@ fn handle_command_submit(
     raw_cmd: &str,
     cmd: &str,
     data_source: &mut ClientSession,
-    log_stream: &mut Option<crate::kube::client_session::LogStream>,
     event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
 ) {
     use crate::kube::session_actions::handle_action;
@@ -438,32 +362,30 @@ fn handle_command_submit(
             app.should_quit = true;
         }
         ParsedCommand::Help => {
-            app.push_route(app.route.clone());
-            app.route = crate::app::Route::Help;
+            app.navigate_to(crate::app::Route::Help);
         }
         ParsedCommand::Aliases => {
             handle_action(
                 app, crate::app::actions::Action::ShowAliases, event_tx,
-                data_source, log_stream,
+                data_source,
             );
         }
         ParsedCommand::Overview => {
             app.route = crate::app::Route::Overview;
         }
         ParsedCommand::ContextList => {
-            app.push_route(app.route.clone());
-            app.route = crate::app::Route::Contexts;
+            app.navigate_to(crate::app::Route::Contexts);
         }
         ParsedCommand::ContextSwitch(ctx_name) => {
-            begin_context_switch(app, data_source, &ctx_name, log_stream);
+            begin_context_switch(app, data_source, &ctx_name);
         }
         ParsedCommand::NamespaceSwitch(ns) => {
-            do_switch_namespace(app, data_source, ns, log_stream);
+            do_switch_namespace(app, data_source, ns);
         }
         ParsedCommand::Resource(rid) => {
             app.route = crate::app::Route::Resources;
             if rid.is_cluster_scoped() && !app.selected_ns.is_all() {
-                do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All, log_stream);
+                do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All);
             }
             let change = app.nav.reset(rid);
             *app.nav.filter_input_mut() = Default::default();
@@ -494,7 +416,7 @@ fn handle_command_submit(
                 // stale (its stream was already dropped and replaced).
                 // Applying it would just churn through clear+resubscribe
                 // a second time on the same rid; skip it.
-                do_switch_namespace(app, data_source, namespace.clone(), log_stream);
+                do_switch_namespace(app, data_source, namespace.clone());
             } else {
                 apply_nav_change(app, data_source, change);
             }
@@ -505,7 +427,7 @@ fn handle_command_submit(
         ParsedCommand::CrdInNamespace { crd, namespace } => {
             app.route = crate::app::Route::Resources;
             if namespace != app.selected_ns {
-                do_switch_namespace(app, data_source, namespace.clone(), log_stream);
+                do_switch_namespace(app, data_source, namespace.clone());
             }
             let crd_rid = ResourceId::crd(
                 crd.group.clone(), crd.version.clone(),
@@ -538,7 +460,7 @@ fn handle_command_submit(
             };
             app.route = crate::app::Route::Resources;
             if scope == crate::kube::protocol::ResourceScope::Cluster && !app.selected_ns.is_all() {
-                do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All, log_stream);
+                do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All);
             }
             let change = app.nav.reset(crd_rid);
             apply_nav_change(app, data_source, change);

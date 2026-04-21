@@ -271,7 +271,7 @@ impl ContainerRef {
 // Route
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Route {
     Overview,
     Resources,
@@ -288,10 +288,19 @@ pub enum Route {
     Logs {
         target: ContainerRef,
         state: Box<LogState>,
+        /// The log stream permit. When this route is dropped (navigation
+        /// away, pop, tab switch), the stream drops → bridge aborts →
+        /// daemon's log handler exits. Impossible to leak: the stream's
+        /// lifetime IS the route's lifetime.
+        stream: Option<crate::kube::client_session::LogStream>,
     },
-    // `Route::Shell` was removed — shell is `Action::Shell` → `ActionResult::Shell`
-    // which suspends the TUI and runs `kubectl exec` as a subprocess.
-    // Never a long-lived route.
+    /// Live shell session rendered inside the TUI. The daemon spawns
+    /// kubectl in a PTY and proxies bytes over yamux. The vt100 parser
+    /// maintains the screen buffer; the TUI renders it every frame.
+    /// `writer` sends keystrokes to the daemon. A background bridge task
+    /// reads from the yamux substream and delivers `AppEvent::ExecData`.
+    /// Drop aborts the bridge (same RAII as LogStream).
+    Shell(Box<ShellState>),
     /// In-progress edit on `target`. The unified edit flow:
     ///
     ///   1. `Action::Edit` enters this route in `EditState::AwaitingYaml`
@@ -327,6 +336,31 @@ pub enum Route {
     Aliases { state: ContentViewState },
 }
 
+/// State for a live shell session rendered inside the TUI.
+pub struct ShellState {
+    pub title: String,
+    pub parser: vt100::Parser,
+    pub writer: Option<tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>>,
+    pub _bridge: Option<tokio::task::AbortHandle>,
+    /// False until the first ExecData arrives from the daemon. The
+    /// renderer shows a loading indicator while connecting.
+    pub connected: bool,
+}
+
+impl std::fmt::Debug for ShellState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShellState").field("title", &self.title).finish_non_exhaustive()
+    }
+}
+
+impl Drop for ShellState {
+    fn drop(&mut self) {
+        if let Some(handle) = self._bridge.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// What the user is going to do with the container picked from
 /// [`Route::ContainerSelect`]. Each variant names one intent so call
 /// sites don't have to thread a separate boolean (e.g. `previous`)
@@ -342,17 +376,36 @@ pub enum ContainerAction {
 }
 
 /// Where we are in the unified edit flow. See `Route::EditingResource`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// RAII wrapper for an edit temp file. Drop deletes the file. Ownership
+/// moves between EditState variants without triggering cleanup — only
+/// when the TempFile is truly dropped (route popped, context switch, quit)
+/// does the file get removed. Prevents the premature-deletion bug that
+/// Clone+Drop on EditState would cause.
+#[derive(Debug)]
+pub struct TempFile(pub std::path::PathBuf);
+
+impl TempFile {
+    pub fn path(&self) -> &std::path::Path { &self.0 }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[derive(Debug)]
 pub enum EditState {
     /// Sent the `Yaml(target)` command, waiting for the server's response.
     AwaitingYaml,
     /// YAML on disk, ready for the session loop to suspend + exec the
-    /// editor. The temp file path is owned by this state — the loop
-    /// reads the file back and deletes it after the editor exits.
-    EditorReady { temp_path: std::path::PathBuf },
+    /// editor. `original` is the unmodified YAML for diff comparison.
+    EditorReady { temp_file: TempFile, original: String },
     /// Sent the `Apply { target, yaml }` command, waiting for the
-    /// `CommandResult` to know whether the apply succeeded.
-    Applying,
+    /// `CommandResult` to know whether the apply succeeded. Carries
+    /// the temp file and original YAML so the editor can re-open on
+    /// server error (same UX as `kubectl edit`).
+    Applying { temp_file: TempFile, original: String },
 }
 
 // ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream", "serde"] }
 
 # Kubernetes
-kube = { version = "0.98", features = ["client", "runtime", "derive", "ws"] }
+kube = { version = "0.98", features = ["client", "runtime", "derive"] }
 k8s-openapi = { version = "0.24", features = ["latest"] }
 http = "1"
 
@@ -42,6 +42,7 @@ unicode-width = "0.2"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 rand = "0.9"
 libc = "0.2"
+vt100 = "0.15"
 dashmap = "6"
 
 # Multiplexer: per-subscription substreams over the single Unix socket

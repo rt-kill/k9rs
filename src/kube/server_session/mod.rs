@@ -892,6 +892,10 @@ async fn handle_data_substream(
             tracing::info!(session = sid, sub = sub_id, "log: pod={} container={:?}", log_init.pod, log_init.container);
             handle_log_substream(log_init, writer, ctx).await;
         }
+        protocol::SubstreamInit::Exec(exec_init) => {
+            tracing::info!(session = sid, sub = sub_id, "exec: {:?}", exec_init.kubectl_args);
+            handle_exec_substream(exec_init, reader, writer, ctx).await;
+        }
     }
 }
 
@@ -1268,3 +1272,217 @@ async fn stream_logs_via_kubectl(
         if writer.flush().await.is_err() { break; }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Exec substream handler — kubectl + PTY
+// ---------------------------------------------------------------------------
+
+/// Spawn `kubectl exec -it` inside a PTY and bridge terminal bytes over
+/// the yamux substream. Uses SPDY (via kubectl) which works on all
+/// clusters, including those behind proxies that reject WebSocket.
+async fn handle_exec_substream(
+    init: protocol::ExecInit,
+    mut reader: tokio::io::BufReader<tokio::io::ReadHalf<crate::kube::mux::MuxedStream>>,
+    mut writer: tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
+    ctx: Arc<SessionContext>,
+) {
+    // The TUI sends the full kubectl args. The daemon only adds --context
+    // from the session's active context (the TUI doesn't know the daemon's
+    // context identity).
+    let mut args = Vec::with_capacity(init.kubectl_args.len() + 2);
+    if !ctx.context.name.is_empty() {
+        args.push("--context".to_string());
+        args.push(ctx.context.name.to_string());
+    }
+    args.extend(init.kubectl_args);
+
+    // Create PTY with initial terminal size.
+    let mut pty = match Pty::open(init.term_width, init.term_height) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("PTY open failed: {}", e);
+            let msg = format!("exec failed: PTY: {}\r\n", e);
+            let _ = protocol::write_bincode(&mut writer, &protocol::ExecFrame::Data(msg.into_bytes())).await;
+            return;
+        }
+    };
+
+    // Spawn kubectl with the slave PTY as its controlling terminal.
+    let mut child = match pty.spawn("kubectl", &args) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("kubectl spawn failed: {}", e);
+            let msg = format!("exec failed: {}\r\n", e);
+            let _ = protocol::write_bincode(&mut writer, &protocol::ExecFrame::Data(msg.into_bytes())).await;
+            return;
+        }
+    };
+
+    // Transfer master fd ownership from Pty to File. consume_master_fd
+    // marks the fd as transferred so Pty::drop skips closing it.
+    let master_fd = pty.consume_master_fd();
+    let master_file = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    drop(pty); // Only closes slave (master already consumed).
+    let master = match tokio::io::unix::AsyncFd::new(master_file) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("AsyncFd setup failed: {}", e);
+            let msg = format!("exec failed: {}\r\n", e);
+            let _ = protocol::write_bincode(&mut writer, &protocol::ExecFrame::Data(msg.into_bytes())).await;
+            let _ = child.kill();
+            return;
+        }
+    };
+
+    // Bidirectional bridge: yamux ↔ PTY master.
+    let yamux_to_pty = async {
+        loop {
+            let frame: protocol::ExecFrame = match protocol::read_bincode(&mut reader).await {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            match frame {
+                protocol::ExecFrame::Data(bytes) => {
+                    loop {
+                        let mut guard = match master.writable().await {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        };
+                        match guard.try_io(|inner| {
+                            use std::io::Write;
+                            inner.get_ref().write_all(&bytes)
+                        }) {
+                            Ok(Ok(())) => break,
+                            Ok(Err(_)) => return,
+                            Err(_would_block) => continue,
+                        }
+                    }
+                }
+                protocol::ExecFrame::Resize { width, height } if width > 0 && height > 0 => {
+                    let ws = libc::winsize {
+                        ws_row: height, ws_col: width,
+                        ws_xpixel: 0, ws_ypixel: 0,
+                    };
+                    unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws); }
+                }
+                protocol::ExecFrame::Resize { .. } => {} // zero dimensions ignored
+            }
+        }
+    };
+
+    let pty_to_yamux = async {
+        let mut buf = [0u8; 4096];
+        loop {
+            let mut guard = match master.readable().await {
+                Ok(g) => g,
+                Err(_) => break,
+            };
+            match guard.try_io(|inner| {
+                use std::io::Read;
+                inner.get_ref().read(&mut buf)
+            }) {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    let frame = protocol::ExecFrame::Data(buf[..n].to_vec());
+                    if protocol::write_bincode(&mut writer, &frame).await.is_err() { break; }
+                }
+                Ok(Err(_)) => break,
+                Err(_would_block) => continue,
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = yamux_to_pty => {}
+        _ = pty_to_yamux => {}
+    }
+
+    // Close master PTY → kubectl gets SIGHUP. Then explicitly kill + reap
+    // to avoid zombie processes if SIGHUP is somehow ignored.
+    drop(master);
+    let _ = child.kill();
+    let _ = child.wait();
+    tracing::debug!("exec substream ended");
+}
+
+/// Minimal PTY wrapper using raw libc. No external crate needed.
+struct Pty {
+    master: std::os::unix::io::RawFd,
+    slave: std::os::unix::io::RawFd,
+}
+
+use std::os::unix::io::{FromRawFd, RawFd};
+
+impl Pty {
+    fn open(cols: u16, rows: u16) -> std::io::Result<Self> {
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let ws = libc::winsize {
+            ws_row: rows, ws_col: cols,
+            ws_xpixel: 0, ws_ypixel: 0,
+        };
+        let ret = unsafe {
+            libc::openpty(
+                &mut master, &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &ws as *const libc::winsize as *mut libc::winsize,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Set master to non-blocking for async I/O.
+        let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(master); libc::close(slave); }
+            return Err(err);
+        }
+        Ok(Pty { master, slave })
+    }
+
+    /// Transfer ownership of the master fd. After this call, Drop will
+    /// NOT close the master — the caller owns it (typically via File).
+    fn consume_master_fd(&mut self) -> RawFd {
+        let fd = self.master;
+        self.master = -1; // Sentinel: Drop skips -1.
+        fd
+    }
+
+    /// Spawn a process with the slave PTY as its controlling terminal.
+    fn spawn(&mut self, cmd: &str, args: &[String]) -> std::io::Result<std::process::Child> {
+        use std::os::unix::process::CommandExt;
+        let slave = self.slave;
+        let master = self.master;
+        let mut command = std::process::Command::new(cmd);
+        command.args(args);
+        unsafe {
+            command.pre_exec(move || {
+                // New session → detach from parent's controlling terminal.
+                libc::setsid();
+                // Set the slave PTY as the controlling terminal.
+                libc::ioctl(slave, libc::TIOCSCTTY as libc::c_ulong, 0);
+                libc::dup2(slave, 0);
+                libc::dup2(slave, 1);
+                libc::dup2(slave, 2);
+                if slave > 2 { libc::close(slave); }
+                libc::close(master);
+                Ok(())
+            });
+        }
+        let child = command.spawn()?;
+        // Close slave on parent side — only kubectl should hold it.
+        unsafe { libc::close(self.slave); }
+        self.slave = -1; // Mark as consumed.
+        Ok(child)
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        if self.master >= 0 { unsafe { libc::close(self.master); } }
+        if self.slave >= 0 { unsafe { libc::close(self.slave); } }
+    }
+}
+

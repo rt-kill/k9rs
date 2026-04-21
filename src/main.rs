@@ -179,7 +179,7 @@ async fn main() -> Result<()> {
     // auto-subscribed by the client via `open_core_subscriptions` on
     // `ConnectionEstablished`, so we skip them here to avoid opening
     // a duplicate substream for the same table.
-    if app.route == crate::app::Route::Resources {
+    if matches!(app.route, crate::app::Route::Resources) {
         let initial_rid = app.nav.resource_id().clone();
         let is_core = initial_rid.built_in_kind()
             .map(|k| crate::kube::resource_defs::REGISTRY.by_kind(k).is_core())

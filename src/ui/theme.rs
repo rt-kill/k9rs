@@ -167,6 +167,8 @@ pub struct Theme {
 
     // Marked/selected rows (gold/yellow text)
     pub marked_row: Style,
+    // Cursor on a marked row: gold text, inherits cursor bg from fill
+    pub selected_marked: Style,
 
     // Delta tracking: rows that changed since last update
     pub delta_changed: Style,
@@ -338,6 +340,10 @@ impl Default for Theme {
 
             // Marked/selected rows: gold/yellow text bold
             marked_row: Style::default()
+                .fg(Color::Rgb(255, 215, 0)) // Gold
+                .add_modifier(Modifier::BOLD),
+            // Cursor on a marked row: gold text, bg inherited from fill
+            selected_marked: Style::default()
                 .fg(Color::Rgb(255, 215, 0)) // Gold
                 .add_modifier(Modifier::BOLD),
 

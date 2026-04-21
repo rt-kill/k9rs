@@ -821,6 +821,8 @@ pub enum SubstreamInit {
     Subscribe(SubscriptionInit),
     /// Start streaming logs for a pod/container.
     Log(LogInit),
+    /// Open an interactive exec session into a pod container.
+    Exec(ExecInit),
 }
 
 /// Subscribe handshake payload.
@@ -872,6 +874,27 @@ pub enum LogContainer {
     Named(String),
     /// Let kubectl pick the default container (omit `-c`).
     Default,
+}
+
+/// Handshake for an exec substream. The daemon spawns `kubectl` with the
+/// provided args in a PTY and bridges terminal bytes over yamux. Covers
+/// both `kubectl exec` (pod shell) and `kubectl debug` (node shell).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecInit {
+    /// Full kubectl argument list (everything after `kubectl`).
+    /// The daemon prepends `--context` from the session's active context.
+    pub kubectl_args: Vec<String>,
+    pub term_width: u16,
+    pub term_height: u16,
+}
+
+/// Frames exchanged on an exec substream after the handshake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ExecFrame {
+    /// Raw terminal bytes (bidirectional).
+    Data(Vec<u8>),
+    /// Terminal resize event (TUI → daemon only).
+    Resize { width: u16, height: u16 },
 }
 
 /// First (and only) message the TUI writes to a **log substream**. Each
