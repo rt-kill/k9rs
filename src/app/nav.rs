@@ -211,6 +211,12 @@ pub struct NavStep {
     /// the first subscribe or for steps that don't own a subscription
     /// (grep filters on the same rid reuse the parent's stream).
     pub stream: Option<crate::kube::client_session::SubscriptionStream>,
+    /// NavStep-owned table for non-globally-stored resources. When this
+    /// step is popped, the table dies (RAII). Globally stored resources
+    /// (Namespace, Node, CRD) keep their tables in `AppData::unified`.
+    pub table: Option<crate::app::table::StatefulTable<crate::kube::resources::row::ResourceRow>>,
+    /// NavStep-owned descriptor for non-globally-stored resources.
+    pub descriptor: Option<crate::app::TableDescriptor>,
     /// Link to the step one level down (`None` at the root). Private —
     /// callers can't reach into the chain; they navigate through
     /// [`NavStack::pop`] or ancestor-aware methods on `NavStack`.
@@ -225,6 +231,8 @@ impl NavStep {
             saved_selected: 0,
             filter_input: FilterInputState::default(),
             stream: None,
+            table: None,
+            descriptor: None,
             parent: None,
         }
     }
@@ -239,6 +247,8 @@ impl NavStep {
             saved_selected: 0,
             filter_input: FilterInputState::default(),
             stream: None,
+            table: None,
+            descriptor: None,
             parent: None,
         }
     }
@@ -305,7 +315,7 @@ impl NavStack {
     /// **Invariant:** same-rid pushes only ever carry **client-side**
     /// filters (`Grep`, `Fault`) whose `to_subscription_filter()` is
     /// `None`. They inherit the parent step's substream — the data is
-    /// already flowing through `app.data.unified[rid]`, and the new
+    /// already flowing through the table (global or NavStep), and the new
     /// step just narrows what the table widget renders.
     ///
     /// A same-rid push that introduced a *server-side* filter would be
@@ -472,7 +482,13 @@ impl NavStack {
     /// and the caller must open a new one via `apply_nav_change`.
     pub fn reset(&mut self, rid: ResourceId) -> NavChange {
         self.prev_root = Some(self.root_resource_id().clone());
-        self.top = NavStep::root(rid.clone());
+        let mut step = NavStep::root(rid.clone());
+        // For non-globally-stored resources, create the table on the root
+        // step so snapshot data lands on the NavStep (RAII ownership).
+        if !is_globally_stored(&rid) {
+            step.table = Some(crate::app::table::StatefulTable::new());
+        }
+        self.top = step;
         NavChange {
             subscribe: Some(rid),
             subscription_filter: None,
@@ -562,6 +578,71 @@ impl NavStack {
         self.prev_root.as_ref()
     }
 
+    /// Walk from the top through the parent chain and return the first step
+    /// where `step.resource == *rid` and `step.table.is_some()`.
+    pub fn find_table_for_resource(&self, rid: &ResourceId) -> Option<&crate::app::table::StatefulTable<crate::kube::resources::row::ResourceRow>> {
+        let mut node = &self.top;
+        loop {
+            if node.resource == *rid {
+                if let Some(ref t) = node.table {
+                    return Some(t);
+                }
+            }
+            match node.parent.as_deref() {
+                Some(p) => node = p,
+                None => return None,
+            }
+        }
+    }
+
+    /// Mutable version of [`find_table_for_resource`].
+    pub fn find_table_for_resource_mut(&mut self, rid: &ResourceId) -> Option<&mut crate::app::table::StatefulTable<crate::kube::resources::row::ResourceRow>> {
+        let mut node: &mut NavStep = &mut self.top;
+        loop {
+            if node.resource == *rid && node.table.is_some() {
+                return node.table.as_mut();
+            }
+            match node.parent.as_deref_mut() {
+                Some(p) => node = p,
+                None => return None,
+            }
+        }
+    }
+
+    /// Walk from the top through the parent chain and return the first
+    /// descriptor where `step.resource == *rid` and `step.descriptor.is_some()`.
+    pub fn find_descriptor_for_resource(&self, rid: &ResourceId) -> Option<&crate::app::TableDescriptor> {
+        let mut node = &self.top;
+        loop {
+            if node.resource == *rid {
+                if let Some(ref d) = node.descriptor {
+                    return Some(d);
+                }
+            }
+            match node.parent.as_deref() {
+                Some(p) => node = p,
+                None => return None,
+            }
+        }
+    }
+
+    /// Set the descriptor on the first step that owns a table for `rid`.
+    /// Used by `apply_resource_update` to co-locate the descriptor with
+    /// the table data on the same NavStep.
+    pub fn set_descriptor_for_resource(&mut self, rid: &ResourceId, descriptor: crate::app::TableDescriptor) {
+        let mut node: &mut NavStep = &mut self.top;
+        loop {
+            if node.resource == *rid && node.table.is_some() {
+                node.descriptor = Some(descriptor);
+                return;
+            }
+            match node.parent.as_deref_mut() {
+                Some(p) => node = p,
+                None => return,
+            }
+        }
+    }
+
     /// The current step's filter input state.
     pub fn filter_input(&self) -> &FilterInputState {
         &self.top.filter_input
@@ -641,4 +722,17 @@ pub struct FilterInputState {
 /// typos become E0599, not runtime panics.
 pub fn rid(kind: crate::kube::resource_def::BuiltInKind) -> ResourceId {
     ResourceId::BuiltIn(kind)
+}
+
+/// Returns `true` for resources whose tables live in the global
+/// `AppData::unified` store rather than on a `NavStep`. These are
+/// long-lived resources the TUI always needs (namespace list for the
+/// picker, node list for ShowNode drill, CRD list for command
+/// completion and `:crd` browsing).
+pub fn is_globally_stored(rid: &ResourceId) -> bool {
+    use crate::kube::resource_def::BuiltInKind;
+    matches!(
+        rid.built_in_kind(),
+        Some(BuiltInKind::Namespace | BuiltInKind::Node | BuiltInKind::CustomResourceDefinition)
+    )
 }

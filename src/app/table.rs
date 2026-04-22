@@ -102,8 +102,7 @@ impl<T: Clone + KubeResource> TableNav for StatefulTable<T> {
     fn nav_selected(&self) -> usize { self.selected }
     fn nav_col_left(&mut self) { self.col_left(); }
     fn nav_col_right(&mut self) {
-        // Use 100 as upper bound; the render path clamps.
-        self.col_right(100);
+        self.col_right(self.num_cols);
     }
 }
 
@@ -141,6 +140,9 @@ pub struct StatefulTable<T: Clone> {
     /// Error message if the subscription failed (e.g., resource doesn't exist).
     /// When set, the UI shows this instead of the loading spinner.
     pub error: Option<String>,
+    /// Number of columns in the table (from headers/descriptor). Used to
+    /// clamp `selected_col` so it can't drift past the last column.
+    pub num_cols: usize,
     /// Marked/selected rows, keyed by stable identity (namespace + name) so
     /// marks survive data refreshes and sort changes. The render path checks
     /// this set directly via row_keys — no intermediate bitmap cache.
@@ -163,6 +165,7 @@ impl<T: Clone> Default for StatefulTable<T> {
             has_data: false,
             loading: false,
             error: None,
+            num_cols: 0,
             marked: HashSet::new(),
         }
     }

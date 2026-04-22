@@ -194,10 +194,11 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
     }
 
     // Ctrl-K: force-kill — only if the resource declares it.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
-        if app.current_capabilities().supports(OperationKind::ForceKill) {
-            return Some(Action::ForceKill);
-        }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('k')
+        && app.current_capabilities().supports(OperationKind::ForceKill)
+    {
+        return Some(Action::ForceKill);
     }
 
     match key.code {

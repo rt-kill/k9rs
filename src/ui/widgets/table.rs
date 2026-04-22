@@ -187,7 +187,7 @@ impl<'a> ResourceTable<'a> {
             text.to_string()
         };
         buf.set_string(x, y, "│", border_style);
-        buf.set_string(x + 1, y, &format!(" {:<width$} ", display, width = inner), style);
+        buf.set_string(x + 1, y, format!(" {:<width$} ", display, width = inner), style);
     }
 
     fn build_title_spans(&self, row_count: usize) -> Line<'a> {
@@ -295,7 +295,7 @@ impl StatefulWidget for ResourceTable<'_> {
 
         // --- Header row ---
         let header_y = inner.y;
-        let header_strs: Vec<&str> = self.headers.iter().copied().collect();
+        let header_strs: Vec<&str> = self.headers.to_vec();
 
         // Base header render.
         let header_style = self.theme.header;

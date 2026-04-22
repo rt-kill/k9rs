@@ -7,8 +7,6 @@ use ratatui::{
 };
 
 use crate::app::{App, InputMode};
-use crate::app::nav::rid;
-use crate::kube::resource_def::BuiltInKind;
 use crate::ui::header;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::TabBar;
@@ -68,18 +66,21 @@ pub fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     use crate::kube::resources::row::RowHealth;
-    let nodes_table = app.data.unified.get(&rid(BuiltInKind::Node));
-    let node_count = nodes_table.map(|t| t.items.len()).unwrap_or(0);
-    // Use the typed `row.health` field instead of substring-matching on
-    // the STATUS cell — the converter already classified the node, and
-    // coupling the overview to the cell column order would silently
-    // break if the node row schema changed.
-    let node_ready = nodes_table.map(|t| t.items.iter()
-        .filter(|row| matches!(row.health, RowHealth::Normal))
-        .count()).unwrap_or(0);
-    let node_not_ready = node_count - node_ready;
-    let ns_count = app.data.unified.get(&rid(BuiltInKind::Namespace))
-        .map(|t| t.items.len()).unwrap_or(0);
+
+    // Gather stats for all core resources dynamically from the registry.
+    let mut core_stats: Vec<(&str, usize, usize)> = Vec::new();
+    for def in crate::kube::resource_defs::REGISTRY.all() {
+        if !def.is_core() { continue; }
+        let rid = def.resource_id();
+        let label = def.short_label();
+        if let Some(table) = app.data.unified.get(&rid) {
+            let total = table.items.len();
+            let healthy = table.items.iter()
+                .filter(|r| matches!(r.health, RowHealth::Normal))
+                .count();
+            core_stats.push((label, total, healthy));
+        }
+    }
 
     // Big centered title
     let mut lines: Vec<Line> = vec![
@@ -96,7 +97,7 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     ];
 
     // Cluster info — centered block
-    let ctx_display = if app.context.is_empty() { "connecting…" } else { app.context.as_str() };
+    let ctx_display = if app.context.is_empty() { "connecting..." } else { app.context.as_str() };
     let cluster_display = if app.identity.cluster.is_empty() { "n/a" } else { &app.identity.cluster };
     let user_display = if app.identity.user.is_empty() { "n/a" } else { &app.identity.user };
     let ctx_line = format!("Context: {}  |  Cluster: {}  |  User: {}", ctx_display, cluster_display, user_display);
@@ -105,21 +106,25 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     ).alignment(Alignment::Center));
     lines.push(Line::from(""));
 
-    // Stats
-    let node_status = if node_not_ready > 0 {
-        format!("Nodes: {} ({} Ready, {} NotReady)", node_count, node_ready, node_not_ready)
-    } else if node_count > 0 {
-        format!("Nodes: {} (all Ready)", node_count)
+    // Stats — built dynamically from core resources
+    let mut has_unhealthy = false;
+    let stats = if core_stats.is_empty() {
+        "Loading...".to_string()
     } else {
-        "Nodes: loading...".to_string()
+        let parts: Vec<String> = core_stats.iter().map(|(label, total, healthy)| {
+            let unhealthy = total - healthy;
+            if unhealthy > 0 {
+                has_unhealthy = true;
+                format!("{}: {} ({} healthy, {} unhealthy)", label, total, healthy, unhealthy)
+            } else if *total > 0 {
+                format!("{}: {} (all healthy)", label, total)
+            } else {
+                format!("{}: loading...", label)
+            }
+        }).collect();
+        parts.join("  |  ")
     };
-    let ns_status = if ns_count > 0 {
-        format!("Namespaces: {}", ns_count)
-    } else {
-        "Namespaces: loading...".to_string()
-    };
-    let stats = format!("{}  |  {}", node_status, ns_status);
-    let stats_style = if node_not_ready > 0 { theme.status_pending } else { theme.status_running };
+    let stats_style = if has_unhealthy { theme.status_pending } else { theme.status_running };
     lines.push(Line::from(
         Span::styled(stats, stats_style)
     ).alignment(Alignment::Center));

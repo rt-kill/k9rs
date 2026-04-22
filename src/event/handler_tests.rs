@@ -93,24 +93,28 @@ fn test_resource_view_describe_yaml() {
 
 #[test]
 fn test_pods_logs_key() {
+    // Logs are Shift+L (uppercase), plain 'l' is column-right.
     let mut app = make_resource_app();
     app.nav.reset(rid(crate::kube::resource_def::BuiltInKind::Pod));
     assert!(matches!(
-        handle_key_event(&app, make_key(KeyCode::Char('l'))),
+        handle_key_event(&app, make_key(KeyCode::Char('L'))),
         Some(Action::Logs)
+    ));
+    // Plain 'l' should be ColRight, not Logs.
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char('l'))),
+        Some(Action::ColRight)
     ));
 }
 
 #[test]
 fn test_workload_types_have_logs() {
     use crate::kube::resource_def::BuiltInKind::*;
-    // All workload-related resource tabs should support logs.
-    // Services are excluded because kubectl logs doesn't work on services.
     for kind in [Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob] {
         let mut app = make_resource_app();
         app.nav.reset(rid(kind));
         assert!(
-            matches!(handle_key_event(&app, make_key(KeyCode::Char('l'))), Some(Action::Logs)),
+            matches!(handle_key_event(&app, make_key(KeyCode::Char('L'))), Some(Action::Logs)),
             "Expected Logs action for {:?}",
             kind,
         );
@@ -120,13 +124,11 @@ fn test_workload_types_have_logs() {
 #[test]
 fn test_non_workload_no_logs() {
     use crate::kube::resource_def::BuiltInKind::*;
-    // Non-workload resource tabs should NOT produce a Logs action.
-    // Instead they produce a FlashInfo message.
     for kind in [Service, Node, Namespace, ConfigMap, Secret] {
         let mut app = make_resource_app();
         app.nav.reset(rid(kind));
         assert!(
-            !matches!(handle_key_event(&app, make_key(KeyCode::Char('l'))), Some(Action::Logs)),
+            !matches!(handle_key_event(&app, make_key(KeyCode::Char('L'))), Some(Action::Logs)),
             "Expected no Logs action for {:?}",
             kind,
         );

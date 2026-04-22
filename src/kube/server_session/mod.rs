@@ -323,12 +323,18 @@ impl ServerSession {
 
         let init = match protocol::read_bincode::<_, SessionCommand>(&mut reader).await {
             Ok(SessionCommand::Init {
-                context, namespace, readonly,
+                protocol_version, context, namespace, readonly,
                 kubeconfig_yaml, env_vars, identity,
-            }) => InitParams {
-                context, namespace, readonly,
-                kubeconfig_yaml, env_vars, identity,
-            },
+            }) => {
+                if protocol_version != protocol::PROTOCOL_VERSION {
+                    let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
+                        format!("Protocol mismatch: TUI v{} != daemon v{}. Restart the daemon.",
+                            protocol_version, protocol::PROTOCOL_VERSION),
+                    )).await;
+                    return;
+                }
+                InitParams { context, namespace, readonly, kubeconfig_yaml, env_vars, identity }
+            }
             Ok(_) => {
                 let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
                     "Expected Init command as first message".to_string(),
@@ -358,12 +364,18 @@ impl ServerSession {
 
         let init = match first_cmd {
             SessionCommand::Init {
-                context, namespace, readonly,
+                protocol_version, context, namespace, readonly,
                 kubeconfig_yaml, env_vars, identity,
-            } => InitParams {
-                context, namespace, readonly,
-                kubeconfig_yaml, env_vars, identity,
-            },
+            } => {
+                if protocol_version != protocol::PROTOCOL_VERSION {
+                    let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
+                        format!("Protocol mismatch: TUI v{} != daemon v{}. Restart the daemon.",
+                            protocol_version, protocol::PROTOCOL_VERSION),
+                    )).await;
+                    return;
+                }
+                InitParams { context, namespace, readonly, kubeconfig_yaml, env_vars, identity }
+            }
             _ => {
                 let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
                     "Expected Init command".to_string(),
@@ -387,12 +399,18 @@ impl ServerSession {
         let mut buf_writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
         let init = match protocol::read_bincode::<_, SessionCommand>(&mut reader).await {
             Ok(SessionCommand::Init {
-                context, namespace, readonly,
+                protocol_version, context, namespace, readonly,
                 kubeconfig_yaml, env_vars, identity,
-            }) => InitParams {
-                context, namespace, readonly,
-                kubeconfig_yaml, env_vars, identity,
-            },
+            }) => {
+                if protocol_version != protocol::PROTOCOL_VERSION {
+                    let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
+                        format!("Protocol mismatch: TUI v{} != daemon v{}. Restart the daemon.",
+                            protocol_version, protocol::PROTOCOL_VERSION),
+                    )).await;
+                    return;
+                }
+                InitParams { context, namespace, readonly, kubeconfig_yaml, env_vars, identity }
+            }
             Ok(_) => {
                 let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
                     "Expected Init command as first message".to_string(),

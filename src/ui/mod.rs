@@ -137,7 +137,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 /// Draw the help overlay on top of the current view.
 fn draw_help_overlay(f: &mut Frame, app: &App) {
     let theme = &app.theme;
-    let help = HelpOverlay::new(theme, app.help_scroll);
+    let help = HelpOverlay::new(theme, app.help_scroll, Some(app.current_capabilities()));
     f.render_widget(help, f.area());
 }
 
@@ -217,7 +217,12 @@ fn draw_container_select(
     // `kind` discriminant rather than carried as a string prefix in
     // `name` like the older shape.
     use crate::kube::resources::row::ContainerKind;
-    let containers: Vec<String> = app.data.unified.get(&target.resource)
+    let table = if crate::app::nav::is_globally_stored(&target.resource) {
+        app.data.unified.get(&target.resource)
+    } else {
+        app.nav.find_table_for_resource(&target.resource)
+    };
+    let containers: Vec<String> = table
         .and_then(|t| t.items.iter().find(|p| {
             p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
         }))

@@ -296,11 +296,21 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let cl = app.column_level;
     let current_rid = app.nav.resource_id().clone();
     let title = current_rid.short_label().to_string();
-    let desc = app.data.descriptors.get(&current_rid).cloned();
-    // Split-borrow `App` at the field level: we need `&mut app.data.unified`
-    // and `app.deltas` simultaneously, and they're disjoint fields.
+    let is_global = crate::app::nav::is_globally_stored(&current_rid);
+    // Descriptor lookup: global store for globally-stored resources, nav stack otherwise.
+    let desc = if is_global {
+        app.data.descriptors.get(&current_rid).cloned()
+    } else {
+        app.nav.find_descriptor_for_resource(&current_rid).cloned()
+    };
     let changed_rows = app.deltas.changed_rows();
-    if let Some(table) = app.data.unified.get_mut(&current_rid) {
+    // Table lookup: global store for globally-stored resources, nav stack otherwise.
+    let table_ref = if is_global {
+        app.data.unified.get_mut(&current_rid)
+    } else {
+        app.nav.find_table_for_resource_mut(&current_rid)
+    };
+    if let Some(table) = table_ref {
         draw_unified_table(f, table_area, &title, table, &ns, theme, desc.as_ref(), cl, changed_rows, &current_rid);
     } else {
         // Table doesn't exist yet (e.g., CRD not yet discovered). Show loading bar.

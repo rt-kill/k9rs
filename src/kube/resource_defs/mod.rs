@@ -5,10 +5,7 @@
 //! provides lookup by plural name or alias, and stores a type-erased
 //! watcher spawner per resource for dispatch without string matching.
 
-pub mod cluster;
-pub mod core;
 pub mod registry;
-pub mod workloads;
 
 use std::sync::LazyLock;
 
@@ -35,13 +32,48 @@ use registry::ResourceRegistry;
 
 /// Global registry of all built-in resource types. Built once at first
 /// access. Stores both `dyn ResourceDef` metadata and type-erased watcher
-/// spawners — the single source of truth for resource dispatch.
+/// spawners -- the single source of truth for resource dispatch.
 pub static REGISTRY: LazyLock<ResourceRegistry> = LazyLock::new(build_registry);
 
 fn build_registry() -> ResourceRegistry {
-    use cluster::*;
-    use self::core::*;
-    use workloads::*;
+    // Workload defs (in crate::kube::resources::*)
+    use crate::kube::resources::pods::PodDef;
+    use crate::kube::resources::deployments::DeploymentDef;
+    use crate::kube::resources::statefulsets::StatefulSetDef;
+    use crate::kube::resources::daemonsets::DaemonSetDef;
+    use crate::kube::resources::replicasets::ReplicaSetDef;
+    use crate::kube::resources::jobs::JobDef;
+    use crate::kube::resources::cronjobs::CronJobDef;
+
+    // Cluster-scoped defs (moved from resource_defs/cluster.rs)
+    use crate::kube::resources::namespaces::NamespaceDef;
+    use crate::kube::resources::nodes::NodeDef;
+    use crate::kube::resources::pvs::PvDef;
+    use crate::kube::resources::storageclasses::StorageClassDef;
+    use crate::kube::resources::priorityclasses::PriorityClassDef;
+    use crate::kube::resources::clusterroles::ClusterRoleDef;
+    use crate::kube::resources::clusterrolebindings::ClusterRoleBindingDef;
+    use crate::kube::resources::webhooks::{ValidatingWebhookDef, MutatingWebhookDef};
+    use crate::kube::resources::crds::CrdDef;
+    use crate::kube::resources::roles::RoleDef;
+    use crate::kube::resources::rolebindings::RoleBindingDef;
+
+    // Core/networking defs (moved from resource_defs/core.rs)
+    use crate::kube::resources::services::ServiceDef;
+    use crate::kube::resources::configmaps::ConfigMapDef;
+    use crate::kube::resources::secrets::SecretDef;
+    use crate::kube::resources::serviceaccounts::ServiceAccountDef;
+    use crate::kube::resources::ingresses::IngressDef;
+    use crate::kube::resources::networkpolicies::NetworkPolicyDef;
+    use crate::kube::resources::hpa::HpaDef;
+    use crate::kube::resources::endpoints::EndpointsDef;
+    use crate::kube::resources::endpointslices::EndpointSliceDef;
+    use crate::kube::resources::limitranges::LimitRangeDef;
+    use crate::kube::resources::resourcequotas::ResourceQuotaDef;
+    use crate::kube::resources::pdb::PodDisruptionBudgetDef;
+    use crate::kube::resources::events::EventDef;
+    use crate::kube::resources::pvcs::PvcDef;
+    use crate::kube::resources::leases::LeaseDef;
 
     let mut r = ResourceRegistry::new();
 
@@ -83,7 +115,7 @@ fn build_registry() -> ResourceRegistry {
     r.register_cluster::<_, MutatingWebhookConfiguration>(MutatingWebhookDef);
     r.register_cluster::<_, CustomResourceDefinition>(CrdDef);
 
-    // RBAC (namespaced despite living in the cluster module)
+    // RBAC (namespaced despite being grouped with cluster resources)
     r.register_namespaced::<_, Role>(RoleDef);
     r.register_namespaced::<_, RoleBinding>(RoleBindingDef);
 

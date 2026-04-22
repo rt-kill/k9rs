@@ -127,13 +127,13 @@ pub struct AppData {
 impl Default for AppData {
     fn default() -> Self {
         let mut unified = std::collections::HashMap::new();
-        // Pre-populate entries for all known K8s resource types.
+        // Only pre-populate entries for globally-stored resources (Namespace,
+        // Node, CRD). All other resources have their tables on NavStep.
         for def in crate::kube::resource_defs::REGISTRY.all() {
-            unified.insert(def.resource_id(), StatefulTable::new());
-        }
-        // Pre-populate entries for all known local resource types (port-forwards, etc.).
-        for kind in crate::kube::local::LocalResourceKind::all() {
-            unified.insert(kind.to_resource_id(), StatefulTable::new());
+            let rid = def.resource_id();
+            if nav::is_globally_stored(&rid) {
+                unified.insert(rid, StatefulTable::new());
+            }
         }
         Self {
             unified,
@@ -324,14 +324,26 @@ impl App {
         }
     }
 
+    /// Look up the ResourceId for a given MetricsKind via the registry.
+    /// Returns `None` if no registered def declares this metrics kind.
+    fn rid_for_metrics(kind: crate::kube::resource_def::MetricsKind) -> Option<crate::kube::protocol::ResourceId> {
+        crate::kube::resource_defs::REGISTRY.all()
+            .find(|d| d.metrics_kind() == Some(kind))
+            .map(|d| d.resource_id())
+    }
+
     /// Find the column index tagged with the given `MetricsColumn` on a
-    /// built-in resource def. Returns `None` for CRDs/locals (no metrics
-    /// overlay) or if the def doesn't declare that metrics column.
-    fn metrics_col_index(kind: crate::kube::resource_def::BuiltInKind, target: MetricsColumn) -> Option<usize> {
-        crate::kube::resource_defs::REGISTRY.by_kind(kind)
-            .column_defs()
-            .iter()
-            .position(|c| c.metrics == Some(target))
+    /// resource def identified by MetricsKind. Returns `None` if no def
+    /// matches the metrics kind, or if the def doesn't declare that metrics
+    /// column.
+    fn metrics_col_index_by_metrics_kind(mk: crate::kube::resource_def::MetricsKind, target: MetricsColumn) -> Option<usize> {
+        crate::kube::resource_defs::REGISTRY.all()
+            .find(|d| d.metrics_kind() == Some(mk))
+            .and_then(|d| {
+                d.column_defs()
+                    .iter()
+                    .position(|c| c.metrics == Some(target))
+            })
     }
 
     /// Apply stored pod metrics to all current pod items.
@@ -339,52 +351,30 @@ impl App {
     /// (%CPU/R, %CPU/L, %MEM/R, %MEM/L) from the row's typed
     /// request/limit fields and the metrics values.
     pub fn apply_pod_metrics(&mut self) {
-        use crate::kube::resource_def::BuiltInKind;
-        let pods_rid = nav::rid(BuiltInKind::Pod);
-        let cpu_col = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::Cpu);
-        let mem_col = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::Mem);
-        let pct_cpu_r = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::CpuPercentRequest);
-        let pct_cpu_l = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::CpuPercentLimit);
-        let pct_mem_r = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::MemPercentRequest);
-        let pct_mem_l = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::MemPercentLimit);
-        if let Some(table) = self.data.unified.get_mut(&pods_rid) {
+        use crate::kube::resource_def::MetricsKind;
+        let Some(pods_rid) = Self::rid_for_metrics(MetricsKind::Pod) else { return };
+        let cpu_col = Self::metrics_col_index_by_metrics_kind(MetricsKind::Pod, MetricsColumn::Cpu);
+        let mem_col = Self::metrics_col_index_by_metrics_kind(MetricsKind::Pod, MetricsColumn::Mem);
+        let pct_cpu_r = Self::metrics_col_index_by_metrics_kind(MetricsKind::Pod, MetricsColumn::CpuPercentRequest);
+        let pct_cpu_l = Self::metrics_col_index_by_metrics_kind(MetricsKind::Pod, MetricsColumn::CpuPercentLimit);
+        let pct_mem_r = Self::metrics_col_index_by_metrics_kind(MetricsKind::Pod, MetricsColumn::MemPercentRequest);
+        let pct_mem_l = Self::metrics_col_index_by_metrics_kind(MetricsKind::Pod, MetricsColumn::MemPercentLimit);
+        // Pod is not globally stored, so search the nav stack.
+        if let Some(table) = self.nav.find_table_for_resource_mut(&pods_rid) {
             for row in &mut table.items {
                 if let Some(usage) = self.pod_metrics.get(&ObjectKey::new(row.namespace.clone().unwrap_or_default(), row.name.clone())) {
                     if let Some(col) = cpu_col { row.set_cell(col, usage.cpu.clone()); }
                     if let Some(col) = mem_col { row.set_cell(col, usage.mem.clone()); }
 
-                    // %CPU/R: (current CPU milli / request milli) * 100
-                    if let Some(col) = pct_cpu_r {
-                        let val = row.cpu_request
-                            .filter(|&r| r > 0)
-                            .map(|r| format!("{}%", usage.cpu_milli.saturating_mul(100) / r))
-                            .unwrap_or_else(|| "n/a".to_string());
-                        row.set_cell(col, val);
+                    fn pct(current: u64, limit: Option<u64>) -> String {
+                        limit.filter(|&l| l > 0)
+                            .map(|l| format!("{}%", current.saturating_mul(100) / l))
+                            .unwrap_or_else(|| "n/a".to_string())
                     }
-                    // %CPU/L: (current CPU milli / limit milli) * 100
-                    if let Some(col) = pct_cpu_l {
-                        let val = row.cpu_limit
-                            .filter(|&l| l > 0)
-                            .map(|l| format!("{}%", usage.cpu_milli.saturating_mul(100) / l))
-                            .unwrap_or_else(|| "n/a".to_string());
-                        row.set_cell(col, val);
-                    }
-                    // %MEM/R: (current MEM bytes / request bytes) * 100
-                    if let Some(col) = pct_mem_r {
-                        let val = row.mem_request
-                            .filter(|&r| r > 0)
-                            .map(|r| format!("{}%", usage.mem_bytes.saturating_mul(100) / r))
-                            .unwrap_or_else(|| "n/a".to_string());
-                        row.set_cell(col, val);
-                    }
-                    // %MEM/L: (current MEM bytes / limit bytes) * 100
-                    if let Some(col) = pct_mem_l {
-                        let val = row.mem_limit
-                            .filter(|&l| l > 0)
-                            .map(|l| format!("{}%", usage.mem_bytes.saturating_mul(100) / l))
-                            .unwrap_or_else(|| "n/a".to_string());
-                        row.set_cell(col, val);
-                    }
+                    if let Some(col) = pct_cpu_r { row.set_cell(col, pct(usage.cpu_milli, row.cpu_request)); }
+                    if let Some(col) = pct_cpu_l { row.set_cell(col, pct(usage.cpu_milli, row.cpu_limit)); }
+                    if let Some(col) = pct_mem_r { row.set_cell(col, pct(usage.mem_bytes, row.mem_request)); }
+                    if let Some(col) = pct_mem_l { row.set_cell(col, pct(usage.mem_bytes, row.mem_limit)); }
                 }
             }
         }
@@ -392,10 +382,10 @@ impl App {
 
     /// Apply stored node metrics to all current node items.
     pub fn apply_node_metrics(&mut self) {
-        use crate::kube::resource_def::BuiltInKind;
-        let nodes_rid = nav::rid(BuiltInKind::Node);
-        let cpu_col = Self::metrics_col_index(BuiltInKind::Node, MetricsColumn::CpuPercent);
-        let mem_col = Self::metrics_col_index(BuiltInKind::Node, MetricsColumn::MemPercent);
+        use crate::kube::resource_def::MetricsKind;
+        let Some(nodes_rid) = Self::rid_for_metrics(MetricsKind::Node) else { return };
+        let cpu_col = Self::metrics_col_index_by_metrics_kind(MetricsKind::Node, MetricsColumn::CpuPercent);
+        let mem_col = Self::metrics_col_index_by_metrics_kind(MetricsKind::Node, MetricsColumn::MemPercent);
         if cpu_col.is_none() && mem_col.is_none() { return; }
         if let Some(table) = self.data.unified.get_mut(&nodes_rid) {
             for row in &mut table.items {
@@ -435,8 +425,12 @@ impl App {
     /// Without this, the first snapshot for the CRD would land on a missing
     /// table in `apply_resource_update` and be dropped on the floor.
     pub fn clear_resource(&mut self, rid: &ResourceId) {
-        let table = self.data.unified.entry(rid.clone()).or_default();
-        table.clear_data();
+        if nav::is_globally_stored(rid) {
+            let table = self.data.unified.entry(rid.clone()).or_default();
+            table.clear_data();
+        } else if let Some(table) = self.nav.find_table_for_resource_mut(rid) {
+            table.clear_data();
+        }
     }
 
     /// Clear every namespace-scoped resource table. Called from
@@ -474,8 +468,7 @@ impl App {
 
     // Delegate navigation to the currently active table
     fn with_active_table<F: FnOnce(&mut dyn table::TableNav)>(&mut self, f: F) {
-        let rid = self.nav.resource_id().clone();
-        if let Some(table) = self.data.unified.get_mut(&rid) {
+        if let Some(table) = self.active_view_table_mut() {
             f(table);
         }
     }
@@ -485,8 +478,7 @@ impl App {
     where
         F: FnOnce(&dyn table::TableNav) -> R,
     {
-        let rid = self.nav.resource_id();
-        if let Some(table) = self.data.unified.get(rid) {
+        if let Some(table) = self.active_view_table() {
             f(table)
         } else {
             // Fallback for unknown CRDs — return default counts
@@ -497,8 +489,51 @@ impl App {
     }
 
     pub fn active_table_selected_col(&self) -> usize {
+        self.active_view_table().map(|t| t.selected_col).unwrap_or(0)
+    }
+
+    /// Get the active view's table (immutable). Checks the global store for
+    /// globally-stored resources, otherwise walks the nav stack.
+    pub fn active_view_table(&self) -> Option<&StatefulTable<crate::kube::resources::row::ResourceRow>> {
         let rid = self.nav.resource_id();
-        self.data.unified.get(rid).map(|t| t.selected_col).unwrap_or(0)
+        if nav::is_globally_stored(rid) {
+            self.data.unified.get(rid)
+        } else {
+            self.nav.find_table_for_resource(rid)
+        }
+    }
+
+    /// Get the active view's table (mutable). Checks the global store for
+    /// globally-stored resources, otherwise walks the nav stack.
+    pub fn active_view_table_mut(&mut self) -> Option<&mut StatefulTable<crate::kube::resources::row::ResourceRow>> {
+        let rid = self.nav.resource_id().clone();
+        if nav::is_globally_stored(&rid) {
+            self.data.unified.get_mut(&rid)
+        } else {
+            self.nav.find_table_for_resource_mut(&rid)
+        }
+    }
+
+    /// Get the active view's descriptor. Checks the global store for
+    /// globally-stored resources, otherwise walks the nav stack.
+    pub fn active_view_descriptor(&self) -> Option<&TableDescriptor> {
+        let rid = self.nav.resource_id();
+        if nav::is_globally_stored(rid) {
+            self.data.descriptors.get(rid)
+        } else {
+            self.nav.find_descriptor_for_resource(rid)
+        }
+    }
+
+    /// Route a table lookup for snapshot routing: checks the global store
+    /// first (for globally-stored resources), then the nav stack. Used by
+    /// `apply_resource_update` to find the right table for incoming data.
+    pub fn route_table_for(&mut self, rid: &ResourceId) -> Option<&mut StatefulTable<crate::kube::resources::row::ResourceRow>> {
+        if nav::is_globally_stored(rid) {
+            self.data.unified.get_mut(rid)
+        } else {
+            self.nav.find_table_for_resource_mut(rid)
+        }
     }
 
     pub fn col_left(&mut self) {
@@ -591,17 +626,17 @@ impl App {
         use crate::app::nav::NavFilter;
         use crate::util::SearchPattern;
 
-        // Collect borrowed references to already-compiled grep patterns
-        // + a flag for the active fault filter. The two pipelines compose:
-        // a row passes if it matches every grep pattern AND every health
-        // predicate.
-        let mut committed: Vec<&SearchPattern> = Vec::new();
-        let mut col_greps: Vec<(&SearchPattern, usize)> = Vec::new();
+        // Collect OWNED copies of compiled grep patterns + a flag for the
+        // active fault filter. Cloning releases the immutable borrow on
+        // `self.nav` before we take the mutable reference to the table
+        // (which may also live on the nav stack).
+        let mut committed: Vec<SearchPattern> = Vec::new();
+        let mut col_greps: Vec<(SearchPattern, usize)> = Vec::new();
         let mut has_fault = false;
         for f in self.nav.active_filters() {
             match f {
-                NavFilter::Grep(g) => committed.push(g.pattern()),
-                NavFilter::ColumnGrep { pattern, col } => col_greps.push((pattern.pattern(), *col)),
+                NavFilter::Grep(g) => committed.push(g.pattern().clone()),
+                NavFilter::ColumnGrep { pattern, col } => col_greps.push((pattern.pattern().clone(), *col)),
                 NavFilter::Fault => has_fault = true,
                 _ => {}
             }
@@ -609,8 +644,8 @@ impl App {
         // Uncommitted draft text from the filter input is compiled fresh
         // here — it changes per keystroke, so caching would just churn.
         let draft: Option<SearchPattern> = {
-            let text = &self.nav.filter_input().text;
-            (!text.is_empty()).then(|| SearchPattern::new(text))
+            let text = self.nav.filter_input().text.clone();
+            (!text.is_empty()).then(|| SearchPattern::new(&text))
         };
 
         if committed.is_empty() && col_greps.is_empty() && draft.is_none() && !has_fault {
@@ -618,8 +653,7 @@ impl App {
             return;
         }
 
-        let rid = self.nav.resource_id().clone();
-        if let Some(table) = self.data.unified.get_mut(&rid) {
+        if let Some(table) = self.active_view_table_mut() {
             table.apply_filter(|item| {
                 // Fault check: typed health predicate, not regex.
                 if has_fault {
@@ -663,13 +697,13 @@ impl App {
         let actual_col = match target {
             crate::app::SortTarget::Column(c) => c,
             crate::app::SortTarget::Last => {
-                self.data.unified.get(&rid)
+                self.active_view_table()
                     .and_then(|t| t.items.first())
                     .map(|item| item.cells.len().saturating_sub(1))
                     .unwrap_or(0)
             }
         };
-        let header = self.data.descriptors.get(&rid)
+        let header = self.active_view_descriptor()
             .and_then(|d| d.headers.get(actual_col).cloned())
             .unwrap_or_default();
         let kind = column_sort_kind_for(&rid, &header);
@@ -708,8 +742,7 @@ impl App {
         // Keep redrawing while a loading state is active (spinner animation).
         if !changed {
             // Resource table loading
-            let rid = self.nav.resource_id();
-            let table_loading = self.data.unified.get(rid)
+            let table_loading = self.active_view_table()
                 .is_none_or(|t| t.items.is_empty() && !t.has_data && t.error.is_none());
             if table_loading {
                 changed = true;

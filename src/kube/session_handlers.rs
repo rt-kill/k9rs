@@ -48,11 +48,19 @@ pub(crate) fn handle_enter(
         // typed `ObjectRef`'s (resource, name, namespace) triple — no
         // flat string re-parse.
         let pod_ns_str = target.namespace.display().to_string();
-        let container_name = app.data.unified.get(&target.resource)
-            .and_then(|t| t.items.iter().find(|p| {
-                p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
-            }))
-            .and_then(|p| p.containers.get(selected).map(|ci| ci.name.clone()));
+        // Look up the pod in the table — check both global and nav stack.
+        let container_name = {
+            let table = if crate::app::nav::is_globally_stored(&target.resource) {
+                app.data.unified.get(&target.resource)
+            } else {
+                app.nav.find_table_for_resource(&target.resource)
+            };
+            table
+                .and_then(|t| t.items.iter().find(|p| {
+                    p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
+                }))
+                .and_then(|p| p.containers.get(selected).map(|ci| ci.name.clone()))
+        };
 
         // If the pod disappeared mid-dialog or the index is out of range,
         // refuse rather than sending an empty container name (which the
@@ -117,8 +125,7 @@ pub(crate) fn handle_enter(
     // converter) and act on it. The client has NO K8s knowledge here —
     // it just blindly executes the server's instructions.
     use crate::kube::resources::row::DrillTarget;
-    let current_rid = app.nav.resource_id().clone();
-    let row_data = app.data.unified.get(&current_rid).and_then(|t| t.selected_item()).cloned();
+    let row_data = app.active_view_table().and_then(|t| t.selected_item()).cloned();
 
     let Some(row) = row_data else {
         handle_describe(app, data_source);
@@ -131,7 +138,7 @@ pub(crate) fn handle_enter(
         }
         Some(DrillTarget::BrowseCrd(crd_ref)) => {
             let kind_label = crd_ref.kind.clone();
-            let sel = app.data.unified.get(&current_rid).map(|t| t.selected).unwrap_or(0);
+            let sel = app.active_view_table().map(|t| t.selected).unwrap_or(0);
             app.nav.save_selected(sel);
             let change = app.nav.push(crate::app::nav::NavStep::new(
                 ResourceId::Crd(crd_ref),
@@ -148,7 +155,7 @@ pub(crate) fn handle_enter(
         }
         Some(DrillTarget::PodsByField(selector)) => {
             let breadcrumb = selector.breadcrumb();
-            let sel = app.data.unified.get(&current_rid).map(|t| t.selected).unwrap_or(0);
+            let sel = app.active_view_table().map(|t| t.selected).unwrap_or(0);
             app.nav.save_selected(sel);
             let change = app.nav.push(crate::app::nav::NavStep::new(
                 rid(BuiltInKind::Pod),
@@ -166,7 +173,7 @@ pub(crate) fn handle_enter(
             // parent `kind` comes from the server — client doesn't
             // assume it's `CronJob` (even though it is today).
             use crate::app::nav::{NavFilter, NavStep};
-            let sel = app.data.unified.get(&current_rid).map(|t| t.selected).unwrap_or(0);
+            let sel = app.active_view_table().map(|t| t.selected).unwrap_or(0);
             app.nav.save_selected(sel);
             let kind_lower = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().kind.to_lowercase();
             let change = app.nav.push(NavStep::new(
@@ -285,44 +292,33 @@ fn open_logs(
     let namespace_typed = info.namespace.clone();
     let namespace_display = namespace_typed.display().to_string();
 
-    // Typed kind check — `built_in_kind() == Pod` is the actual semantic
-    // we want, not "this resource has Shell capability". The two happened
-    // to coincide because Pod is the only Shellable built-in, but coupling
-    // log routing to a marker trait would silently break if a future
-    // resource gained Shell support.
-    let is_pod = info.resource.built_in_kind() == Some(BuiltInKind::Pod);
+    // Get containers from the selected row — resource-type-agnostic.
+    let containers = app.active_view_table()
+        .and_then(|t| t.selected_item())
+        .map(|row| row.containers.clone())
+        .unwrap_or_default();
 
-    // Multi-container pods route through the container picker. The picker
-    // re-enters this flow via the `Route::ContainerSelect` branch of
+    // Multi-container resources route through the container picker. The
+    // picker re-enters this flow via the `Route::ContainerSelect` branch of
     // `handle_enter_key` which threads `previous` through from the
     // ContainerAction variant.
-    if is_pod {
-        let container_count = app.data.unified.get(&rid(BuiltInKind::Pod))
-            .and_then(|t| t.selected_item())
-            .map(|p| p.containers.len())
-            .unwrap_or(0);
-        if container_count > 1 {
-            app.navigate_to(Route::ContainerSelect {
-                target: info.clone(),
-                selected: 0,
-                action: if previous {
-                    crate::app::ContainerAction::PreviousLogs
-                } else {
-                    crate::app::ContainerAction::Logs
-                },
-            });
-            return;
-        }
+    if containers.len() > 1 {
+        app.navigate_to(Route::ContainerSelect {
+            target: info.clone(),
+            selected: 0,
+            action: if previous {
+                crate::app::ContainerAction::PreviousLogs
+            } else {
+                crate::app::ContainerAction::Logs
+            },
+        });
+        return;
     }
 
-
-    // For pods, log the (single) container directly. For workloads, use the
-    // typed `kubectl_target()` ("deployment/foo") and stream all containers.
-    let (log_target, route_pod, route_container) = if is_pod {
-        let container = app.data.unified.get(&rid(BuiltInKind::Pod))
-            .and_then(|t| t.selected_item())
-            .and_then(|p| p.containers.first().map(|ci| ci.name.clone()))
-            .unwrap_or_default();
+    // Single container: log it directly. No containers (workload-level):
+    // use the typed `kubectl_target()` ("deployment/foo") and stream all.
+    let (log_target, route_pod, route_container) = if !containers.is_empty() {
+        let container = containers.first().map(|ci| ci.name.clone()).unwrap_or_default();
         (name.clone(), name.clone(), log_container_from_str(&container))
     } else {
         let target = info.kubectl_target();
@@ -356,9 +352,9 @@ fn open_logs(
 /// Respects column visibility (column_level) so the dump matches what the user sees.
 pub(crate) fn build_table_dump(app: &App) -> String {
     let current_rid = app.nav.resource_id();
-    if let Some(table) = app.data.unified.get(current_rid) {
+    if let Some(table) = app.active_view_table() {
         let skip_ns = !app.selected_ns.is_all();
-        let visible = app.data.descriptors.get(current_rid)
+        let visible = app.active_view_descriptor()
             .map(|d| d.visible_columns(current_rid, app.column_level, skip_ns))
             .unwrap_or_default();
         let visible_indices: Vec<usize> = visible.iter().map(|&(i, _)| i).collect();
@@ -385,15 +381,16 @@ pub(crate) fn build_table_dump(app: &App) -> String {
 /// We don't seed the field with the current replica count — the legacy
 /// `ScaleDialog` didn't either, and it kept the user from accidentally
 /// confirming "scale to current = no-op" by hitting Enter.
-pub(crate) fn build_scale_form(target: ObjectRef) -> crate::app::FormDialog {
+pub(crate) fn build_scale_form(target: ObjectRef, current_replicas: Option<&str>) -> crate::app::FormDialog {
     use crate::app::{FormDialog, FormFieldKind, FormFieldState};
 
     let title = format!("Scale: {}/{}", target.resource.display_label(), target.name);
-    // Namespace::display() is never empty — Named carries a non-empty string
-    // and All renders as "all". Show "all" verbatim so the user sees scope.
     let subtitle = format!("namespace: {}", target.namespace.display());
+    // Default to the current desired replica count so the user can adjust
+    // from the existing value instead of typing from scratch.
+    let default_value = current_replicas.unwrap_or("").to_string();
     FormDialog {
-        kind: crate::app::FormKind::Scale,
+        submit: crate::app::FormSubmit::Scale,
         title,
         subtitle,
         target,
@@ -401,7 +398,7 @@ pub(crate) fn build_scale_form(target: ObjectRef) -> crate::app::FormDialog {
             name: crate::kube::protocol::form_field_name::REPLICAS.into(),
             label: "Replicas".into(),
             kind: FormFieldKind::Number { min: 0, max: 1_000_000 },
-            value: String::new(),
+            value: default_value,
         }],
         focused: 0,
     }
@@ -426,7 +423,7 @@ pub(crate) fn resolve_port_forward_dialog(app: &App) -> Option<crate::app::FormD
     }
 
     let rid_key = app.nav.resource_id().clone();
-    let row = app.data.unified.get(&rid_key)?.selected_item()?;
+    let row = app.active_view_table()?.selected_item()?;
 
     // Ports come from the typed `pf_ports` field set by the converter.
     let ports: Vec<u16> = row.pf_ports.clone();
@@ -472,7 +469,7 @@ pub(crate) fn resolve_port_forward_dialog(app: &App) -> Option<crate::app::FormD
     };
 
     Some(FormDialog {
-        kind: crate::app::FormKind::PortForward,
+        submit: crate::app::FormSubmit::PortForward,
         title,
         subtitle,
         target: target_ref,
@@ -486,7 +483,7 @@ pub(crate) fn get_selected_resource_info(app: &App) -> Option<ObjectRef> {
     use crate::kube::protocol::{Namespace, ObjectRef};
 
     let current_rid = app.nav.resource_id().clone();
-    let table = app.data.unified.get(&current_rid)?;
+    let table = app.active_view_table()?;
     let item = table.selected_item()?;
     Some(ObjectRef::new(
         current_rid,
@@ -503,7 +500,7 @@ pub(crate) fn get_marked_resource_infos(app: &App) -> Vec<ObjectRef> {
 
     let current_rid = app.nav.resource_id().clone();
     let mut result = Vec::new();
-    if let Some(table) = app.data.unified.get(&current_rid) {
+    if let Some(table) = app.active_view_table() {
         for item in &table.items {
             let key = crate::kube::protocol::ObjectKey::new(item.namespace(), item.name());
             if table.marked.contains(&key) {

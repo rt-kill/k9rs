@@ -1,16 +1,8 @@
 //! Core trait hierarchy for the resource type system.
 //!
 //! Every built-in resource implements [`ResourceDef`] for identity and
-//! metadata. Capabilities are expressed as `is_*` boolean overrides
-//! (`is_loggable`, `is_scaleable`, etc.) — the previous Option<&dyn Trait>
-//! downcast machinery was pure ceremony because every marker was empty.
-//!
-//! The supported operation set ([`ResourceDef::operations`]) is **derived**
-//! from which `is_*` flags return `true` — there's no separate list to keep
-//! in sync. Adding a capability to a def is one line
-//! (`fn is_port_forwardable(&self) -> bool { true }`); the drift-guard test
-//! `tests::operations_match_markers` enforces that every def's derived
-//! operation list matches its flags.
+//! metadata. Each def declares its supported [`OperationKind`] set via
+//! [`ResourceDef::operations`]; capability gating uses that set directly.
 //!
 //! The `BuiltInKind` enum and `Gvr` struct are used on BOTH client and
 //! server side — `ResourceId::BuiltIn(kind)` carries them over the wire.

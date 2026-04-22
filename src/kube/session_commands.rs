@@ -515,14 +515,14 @@ pub(crate) fn handle_form_dialog_key(
                 dispatch_form_submit(app, data_source, dialog);
             }
         }
-        KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+        KeyCode::Left | KeyCode::Right => {
             if let Some(ref mut d) = app.form_dialog {
                 if let Some(field) = d.current_field_mut() {
                     if let FormFieldKind::Select { ref options } = field.kind {
                         if !options.is_empty() {
                             let n = options.len();
                             let cur: usize = field.value.parse().unwrap_or(0);
-                            let new = if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) {
+                            let new = if key.code == KeyCode::Left {
                                 (cur + n - 1) % n
                             } else {
                                 (cur + 1) % n
@@ -573,11 +573,11 @@ fn dispatch_form_submit(
     data_source: &mut ClientSession,
     dialog: crate::app::FormDialog,
 ) {
-    use crate::app::{FormDialog, FormFieldKind, FormKind};
+    use crate::app::{FormDialog, FormFieldKind, FormSubmit};
 
-    let FormDialog { kind, target, fields, .. } = dialog;
-    match kind {
-        FormKind::Scale => {
+    let FormDialog { submit, target, fields, .. } = dialog;
+    match submit {
+        FormSubmit::Scale => {
             let replicas_str = fields
                 .iter()
                 .find(|f| f.name == crate::kube::protocol::form_field_name::REPLICAS)
@@ -598,7 +598,7 @@ fn dispatch_form_submit(
                 }
             }
         }
-        FormKind::PortForward => {
+        FormSubmit::PortForward => {
             // container_port may be Select (value = option index → port string)
             // or Port (value = port string directly). Handle both.
             let container_port = fields

@@ -584,24 +584,26 @@ impl SelectOption {
     }
 }
 
-/// Which form-driven operation a [`FormDialog`] represents. The dispatch
-/// site at submit time exhaustively matches this enum to build a typed
-/// `SessionCommand`. Only the operations that actually need user input
-/// are listed — adding a new form-driven op adds a new variant and a new
-/// match arm (compile-error if either is forgotten).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FormKind {
+/// What happens when a form dialog is submitted. Each variant knows how
+/// to extract field values and produce a wire command. The generic dialog
+/// framework just collects input — it never knows what operation it's for.
+///
+/// Adding a new form-driven operation: add a variant here, implement its
+/// `submit` arm in `dispatch_form_submit`, and write a builder function.
+#[derive(Debug, Clone)]
+pub enum FormSubmit {
+    /// Scale a workload: reads the REPLICAS field → SessionCommand::Scale.
     Scale,
+    /// Create a port-forward: reads CONTAINER_PORT + LOCAL_PORT fields
+    /// → SessionCommand::PortForward.
     PortForward,
 }
 
 /// A modal form dialog gathering input for a single operation.
 #[derive(Debug, Clone)]
 pub struct FormDialog {
-    /// Which operation's typed `SessionCommand` we'll build on submit.
-    /// Closed enum — replaces the wider `OperationKind` which made the
-    /// dispatcher need a `_ => unreachable!()` arm.
-    pub kind: FormKind,
+    /// What to do on submit.
+    pub submit: FormSubmit,
     /// Title shown in the dialog border (e.g. "Scale: deploy/nginx").
     pub title: String,
     /// Optional context line under the title (e.g. "namespace: default").

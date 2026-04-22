@@ -77,15 +77,17 @@ pub(crate) fn apply_event(
                 }
             }
             // Move the table entry and descriptor from old key to new key.
-            // The capabilities cache is gone — `current_capabilities()`
-            // reads from `ResourceId::capabilities()` directly, so the
-            // resolved rid automatically gets the right manifest without
-            // any rekey.
-            if let Some(table) = app.data.unified.remove(&original) {
-                app.data.unified.insert(resolved.clone(), table);
-            }
-            if let Some(desc) = app.data.descriptors.remove(&original) {
-                app.data.descriptors.insert(resolved, desc);
+            // For globally-stored resources, this moves entries in the global
+            // maps. For NavStep-owned resources, the step's `resource` field
+            // was already updated above and the table/descriptor live on the
+            // same step — no rekey needed (the find methods walk by identity).
+            if crate::app::nav::is_globally_stored(&original) || crate::app::nav::is_globally_stored(&resolved) {
+                if let Some(table) = app.data.unified.remove(&original) {
+                    app.data.unified.insert(resolved.clone(), table);
+                }
+                if let Some(desc) = app.data.descriptors.remove(&original) {
+                    app.data.descriptors.insert(resolved, desc);
+                }
             }
         }
         AppEvent::SubscriptionFailed { resource, message } => {
@@ -94,9 +96,14 @@ pub(crate) fn apply_event(
             // (the rendering code only shows table.error when items is empty).
             // IMPORTANT: clear_data() first, THEN set error — clear_data() resets
             // error to None, so doing it after would wipe the error we just set.
-            let table = app.data.unified.entry(resource.clone()).or_default();
-            table.clear_data();
-            table.error = Some(message);
+            if crate::app::nav::is_globally_stored(&resource) {
+                let table = app.data.unified.entry(resource.clone()).or_default();
+                table.clear_data();
+                table.error = Some(message);
+            } else if let Some(table) = app.nav.find_table_for_resource_mut(&resource) {
+                table.clear_data();
+                table.error = Some(message);
+            }
             // The bridge task behind the failing subscription has already
             // exited. Drop the stale `SubscriptionStream` handle sitting
             // in the nav stack so a later Esc pop-back past this rid
@@ -181,10 +188,24 @@ fn apply_resource_update(
 ) {
     match update {
         ResourceUpdate::Rows { resource, headers, rows } => {
-            let table = app.data.unified.entry(resource.clone()).or_default();
-            app.deltas.update(&rows);
-            table.set_items_filtered(rows);
-            app.data.descriptors.insert(resource.clone(), crate::app::TableDescriptor { headers });
+            let num_cols = headers.len();
+            let descriptor = crate::app::TableDescriptor { headers };
+            if crate::app::nav::is_globally_stored(&resource) {
+                let table = app.data.unified.entry(resource.clone()).or_default();
+                app.deltas.update(&rows);
+                table.num_cols = num_cols;
+                table.set_items_filtered(rows);
+                app.data.descriptors.insert(resource.clone(), descriptor);
+            } else {
+                if let Some(table) = app.nav.find_table_for_resource_mut(&resource) {
+                    app.deltas.update(&rows);
+                    table.num_cols = num_cols;
+                    table.set_items_filtered(rows);
+                } else {
+                    return;
+                }
+                app.nav.set_descriptor_for_resource(&resource, descriptor);
+            }
             // Apply metrics overlay whenever fresh data arrives. Dispatch
             // through the typed `MetricsKind` enum — no string match on
             // `resource.plural`. Pod and node metrics come from different

@@ -1,6 +1,8 @@
 
 use k8s_openapi::api::core::v1::Pod;
 
+use crate::kube::protocol::{OperationKind, ResourceScope};
+use crate::kube::resource_def::*;
 use crate::kube::resources::row::{ContainerInfo, OwnerRefInfo, ResourceRow, RowHealth};
 
 /// Pod status display + health, computed together in one pass.
@@ -183,8 +185,62 @@ pub(crate) fn compute_pod_status(
     PodStatus { display: status_str, health }
 }
 
-/// Convert a k8s Pod into a generic ResourceRow with containers, labels, and owner refs in extra.
-pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
+// ---------------------------------------------------------------------------
+// PodDef — ResourceDef + ConvertToRow
+// ---------------------------------------------------------------------------
+
+pub struct PodDef;
+
+impl ResourceDef for PodDef {
+    fn kind(&self) -> BuiltInKind { BuiltInKind::Pod }
+    fn gvr(&self) -> &'static Gvr {
+        const G: Gvr = Gvr {
+            group: "", version: "v1", kind: "Pod",
+            plural: "pods", scope: ResourceScope::Namespaced,
+        };
+        &G
+    }
+    fn aliases(&self) -> &[&str] { &["po", "pod", "pods"] }
+    fn short_label(&self) -> &str { "Pods" }
+    fn default_headers(&self) -> Vec<String> {
+        ["NAMESPACE", "NAME", "READY", "STATUS", "RESTARTS", "LAST RESTART",
+         "CPU", "MEM",
+         "CPU/R", "CPU/L", "MEM/R", "MEM/L",
+         "%CPU/R", "%CPU/L", "%MEM/R", "%MEM/L",
+         "IP", "NODE", "NOMINATED NODE",
+         "QOS", "SERVICE-ACCOUNT",
+         "READINESS GATES", "LABELS", "AGE"]
+            .into_iter().map(String::from).collect()
+    }
+    fn metrics_kind(&self) -> Option<MetricsKind> { Some(MetricsKind::Pod) }
+
+    fn column_defs(&self) -> Vec<ColumnDef> {
+        use ColumnDef as C;
+        use MetricsColumn::*;
+        vec![
+            C::new("NAMESPACE"), C::new("NAME"), C::new("READY"), C::new("STATUS"),
+            C::new("RESTARTS"), C::age("LAST RESTART"),
+            C::new("CPU").with_metrics(Cpu), C::new("MEM").with_metrics(Mem),
+            C::extra("CPU/R"), C::extra("CPU/L"), C::extra("MEM/R"), C::extra("MEM/L"),
+            C::extra("%CPU/R").with_metrics(CpuPercentRequest),
+            C::extra("%CPU/L").with_metrics(CpuPercentLimit),
+            C::extra("%MEM/R").with_metrics(MemPercentRequest),
+            C::extra("%MEM/L").with_metrics(MemPercentLimit),
+            C::new("IP"), C::new("NODE"), C::extra("NOMINATED NODE"),
+            C::extra("QOS"),
+            C::extra("SERVICE-ACCOUNT"), C::extra("READINESS GATES"),
+            C::extra("LABELS"), C::age("AGE"),
+        ]
+    }
+
+    fn operations(&self) -> Vec<OperationKind> {
+        use OperationKind::*;
+        vec![Describe, Yaml, Delete, StreamLogs, PreviousLogs, Shell, ShowNode, PortForward, ForceKill]
+    }
+}
+
+impl ConvertToRow<Pod> for PodDef {
+    fn convert(pod: Pod) -> ResourceRow {
     // Pods carry two fields no other resource row needs — `owner_references`
     // (for the owner-chain drill down) and `deletion_timestamp` (for the
     // Terminating pseudo-status). Pluck them off the owned metadata before
@@ -460,5 +516,6 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
         mem_request: if has_mem_req { Some(mem_req_bytes) } else { None },
         mem_limit: if has_mem_lim { Some(mem_lim_bytes) } else { None },
         ..Default::default()
+    }
     }
 }

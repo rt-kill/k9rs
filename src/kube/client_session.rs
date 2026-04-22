@@ -270,6 +270,7 @@ impl ClientSession {
         prepared: &PreparedKubeconfig,
     ) -> SessionCommand {
         SessionCommand::Init {
+            protocol_version: protocol::PROTOCOL_VERSION,
             context: Some(prepared.context_name.clone()),
             namespace: params.namespace.clone(),
             readonly: params.readonly,

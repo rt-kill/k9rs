@@ -17,11 +17,11 @@ const LOG_CHROME_LINES: usize = 4;
 /// help overlay uses at render time so action handlers can store a
 /// stable max and PrevItem decrements move the scroll position
 /// immediately instead of being absorbed by the render-time clamp.
-fn help_max_scroll() -> usize {
+fn help_max_scroll(caps: &crate::kube::protocol::ResourceCapabilities) -> usize {
     let h = crossterm::terminal::size()
         .map(|(_, h)| h)
         .unwrap_or(DEFAULT_TERMINAL_HEIGHT as u16);
-    crate::ui::widgets::HelpOverlay::max_scroll(h)
+    crate::ui::widgets::HelpOverlay::max_scroll(h, Some(caps))
 }
 
 use crate::kube::session_nav::{
@@ -84,6 +84,7 @@ pub(crate) fn handle_action(
             apply_nav_change(app, data_source, change);
         }
         Action::NextItem => {
+            let caps = app.current_capabilities();
             match &mut app.route {
                 Route::Yaml { ref mut state, .. } => {
                     let max = state.line_count().saturating_sub(1);
@@ -94,18 +95,25 @@ pub(crate) fn handle_action(
                     state.scroll = (state.scroll + 1).min(max);
                 }
                 Route::ContainerSelect { ref target, ref mut selected, .. } => {
-                    let container_count = app.data.unified.get(&target.resource)
-                        .and_then(|t| t.items.iter().find(|p| {
-                            p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
-                        }))
-                        .map(|p| p.containers.len())
-                        .unwrap_or(0);
+                    let container_count = {
+                        let table = if crate::app::nav::is_globally_stored(&target.resource) {
+                            app.data.unified.get(&target.resource)
+                        } else {
+                            app.nav.find_table_for_resource(&target.resource)
+                        };
+                        table
+                            .and_then(|t| t.items.iter().find(|p| {
+                                p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
+                            }))
+                            .map(|p| p.containers.len())
+                            .unwrap_or(0)
+                    };
                     if container_count > 0 && *selected + 1 < container_count {
                         *selected += 1;
                     }
                 }
                 Route::Help => {
-                    let max = help_max_scroll();
+                    let max = help_max_scroll(&caps);
                     app.help_scroll = (app.help_scroll + 1).min(max);
                 }
                 _ => app.select_next(),
@@ -139,6 +147,7 @@ pub(crate) fn handle_action(
             }
         }
         Action::PageDown => {
+            let caps = app.current_capabilities();
             match &mut app.route {
                 Route::Logs { ref mut state, .. } => {
                     state.follow = false;
@@ -156,7 +165,7 @@ pub(crate) fn handle_action(
                     state.scroll = (state.scroll + PAGE_SCROLL_LINES).min(max);
                 }
                 Route::Help => {
-                    let max = help_max_scroll();
+                    let max = help_max_scroll(&caps);
                     app.help_scroll = (app.help_scroll + HELP_PAGE_SCROLL_LINES).min(max);
                 }
                 _ => app.page_down(),
@@ -175,6 +184,7 @@ pub(crate) fn handle_action(
             }
         }
         Action::End => {
+            let caps = app.current_capabilities();
             match &mut app.route {
                 Route::Logs { ref mut state, .. } => {
                     let total = state.visible_count();
@@ -194,7 +204,7 @@ pub(crate) fn handle_action(
                     // `total_lines() - 1` left help_scroll well above the
                     // rendered max, so the first ~visible_height keystrokes
                     // produced no visible movement.
-                    app.help_scroll = help_max_scroll();
+                    app.help_scroll = help_max_scroll(&caps);
                 }
                 _ => app.go_end(),
             }
@@ -210,7 +220,8 @@ pub(crate) fn handle_action(
         Action::Logs => handle_logs(app, data_source),
         Action::Shell => {
             if app.current_capabilities().supports(crate::kube::protocol::OperationKind::Shell) {
-                if let Some(row) = app.data.unified.get(&rid(BuiltInKind::Pod)).and_then(|t| t.selected_item()) {
+                let current_rid = app.nav.resource_id().clone();
+                if let Some(row) = app.active_view_table().and_then(|t| t.selected_item()) {
                     // Refuse to shell if the row lacks a namespace string —
                     // mirrors the force-kill guard. Without this, an
                     // unwrap_or_default would pass `-n ""` to kubectl and
@@ -233,7 +244,7 @@ pub(crate) fn handle_action(
                     // multi-container picker route and the single-container
                     // direct exec.
                     let target = crate::kube::protocol::ObjectRef::new(
-                        rid(BuiltInKind::Pod),
+                        current_rid,
                         pod_name.clone(),
                         crate::kube::protocol::Namespace::from_row(&pod_ns),
                     );
@@ -290,7 +301,20 @@ pub(crate) fn handle_action(
         }
         Action::Scale => {
             if let Some(info) = get_selected_resource_info(app) {
-                app.form_dialog = Some(build_scale_form(info));
+                // Extract current desired replicas from the READY cell (format: "available/desired").
+                let current_replicas = {
+                    let ready_col = app.active_view_descriptor()
+                        .and_then(|d| d.col("READY"));
+                    app.active_view_table()
+                        .and_then(|t| t.selected_item())
+                        .and_then(|row| {
+                            ready_col
+                                .and_then(|col| row.cells.get(col))
+                                .and_then(|cell| cell.split('/').nth(1))
+                                .map(|s| s.trim().to_string())
+                        })
+                };
+                app.form_dialog = Some(build_scale_form(info, current_replicas.as_deref()));
             }
         }
         Action::Filter(_) => {
@@ -708,10 +732,10 @@ pub(crate) fn handle_action(
         }
         Action::ShowNode => {
             if app.current_capabilities().supports(crate::kube::protocol::OperationKind::ShowNode) {
-                if let Some(row) = app.data.unified.get(&rid(BuiltInKind::Pod)).and_then(|t| t.selected_item()) {
+                if let Some(row) = app.active_view_table().and_then(|t| t.selected_item()) {
                     let node = row.node.clone().unwrap_or_default();
                     if !node.is_empty() {
-                        let sel = app.data.unified.get(&rid(BuiltInKind::Pod)).map(|t| t.selected).unwrap_or(0);
+                        let sel = app.active_table_selected();
                         app.nav.save_selected(sel);
                         // Escape: node names contain `.` which is a regex
                         // metachar. Without escape the filter matches
@@ -777,8 +801,7 @@ pub(crate) fn handle_action(
             // owner_refs carry the owner's kind/name/uid. We resolve the
             // kind to a ResourceId and drill into that resource filtered
             // by name (grep). If there's no owner, flash a message.
-            let current_rid = app.nav.resource_id().clone();
-            if let Some(row) = app.data.unified.get(&current_rid).and_then(|t| t.selected_item()) {
+            if let Some(row) = app.active_view_table().and_then(|t| t.selected_item()) {
                 if let Some(owner) = row.owner_refs.first() {
                     let owner_kind = owner.kind.clone();
                     let owner_name = owner.name.clone();

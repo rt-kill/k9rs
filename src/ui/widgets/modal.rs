@@ -68,7 +68,12 @@ where
         let h = self.size.height.min(area.height.saturating_sub(2));
 
         let dialog_area = crate::ui::centered_rect(area, w, h);
+        // Fill the entire dialog area (border + interior) with the
+        // guaranteed-visible bg FIRST, then render the border on top.
+        // This ensures the border cells also have the dialog bg, not
+        // the terminal default left by Clear.
         Clear.render(dialog_area, buf);
+        crate::ui::fill_dialog_bg(buf, dialog_area);
 
         let title_str = if self.title.is_empty() {
             String::new()
@@ -78,7 +83,6 @@ where
         let block = Block::bordered()
             .title(Span::styled(&title_str, self.theme.dialog_border))
             .border_style(self.theme.dialog_border)
-            .style(self.theme.dialog_bg)
             .padding(Padding::new(2, 2, 1, 0));
 
         let inner = block.inner(dialog_area);
@@ -87,8 +91,6 @@ where
         if inner.height == 0 || inner.width == 0 {
             return;
         }
-
-        crate::ui::fill_dialog_bg(buf, inner);
 
         // Reserve the bottom row for hints if present.
         let content_area = if self.hints.is_some() && inner.height > 1 {

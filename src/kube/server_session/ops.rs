@@ -201,13 +201,9 @@ impl ServerSession {
     }
 
     /// Capability gate: extracts the target's [`BuiltInKind`] and asserts
-    /// the given per-kind predicate holds. On failure, emits a typed
+    /// it supports the given [`OperationKind`]. On failure, emits a typed
     /// rejection and returns `None` so the caller can `return` cleanly.
-    /// Shared between scale/restart/decode-secret/trigger/toggle handlers
-    /// that previously repeated the same five-line dispatch block.
-    ///
-    /// `predicate` takes the `&dyn ResourceDef` from the registry — the
-    /// call site passes a method reference like `ResourceDef::is_scaleable`.
+    /// Shared between scale/restart/decode-secret/trigger/toggle handlers.
     pub(super) fn require_capability(
         &mut self,
         target: &protocol::ObjectRef,

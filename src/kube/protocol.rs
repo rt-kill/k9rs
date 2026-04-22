@@ -922,6 +922,13 @@ pub struct LogInit {
 // narrowed to one-shot request/response commands + global events)
 // ---------------------------------------------------------------------------
 
+/// Protocol version for the TUI↔daemon wire format. Bump this whenever
+/// `ResourceRow`, `SessionCommand`, `SessionEvent`, or any serialized type
+/// changes in a bincode-incompatible way (new fields, reordering, etc.).
+/// The daemon rejects Init commands with a mismatched version so stale
+/// daemons fail fast instead of producing silent data corruption.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// All commands from any client (TUI session or management CLI).
 /// The first command on a connection determines the connection type:
 /// - `Init` → long-lived TUI session
@@ -932,14 +939,15 @@ pub enum SessionCommand {
 
     /// Start a TUI session with raw kubeconfig + environment variables.
     Init {
+        /// Protocol version — daemon rejects mismatches to prevent silent
+        /// data corruption from stale binaries.
+        #[serde(default)]
+        protocol_version: u32,
         context: Option<ContextName>,
         namespace: Namespace,
         readonly: bool,
         kubeconfig_yaml: String,
         env_vars: HashMap<String, String>,
-        /// Cluster + user labels as resolved from the kubeconfig by the
-        /// client. Sent across so the server can round-trip them back in
-        /// `Ready` without re-parsing the kubeconfig.
         identity: ClusterIdentity,
     },
 

@@ -16,7 +16,7 @@ struct HelpEntry {
 
 /// A section of keybindings.
 struct HelpSection {
-    title: &'static str,
+    title: String,
     entries: Vec<HelpEntry>,
 }
 
@@ -26,18 +26,19 @@ struct HelpSection {
 pub struct HelpOverlay<'a> {
     theme: &'a Theme,
     scroll: usize,
+    caps: Option<crate::kube::protocol::ResourceCapabilities>,
 }
 
 impl<'a> HelpOverlay<'a> {
-    pub fn new(theme: &'a Theme, scroll: usize) -> Self {
-        Self { theme, scroll }
+    pub fn new(theme: &'a Theme, scroll: usize, caps: Option<crate::kube::protocol::ResourceCapabilities>) -> Self {
+        Self { theme, scroll, caps }
     }
 
     /// Total rendered line count for the help content (section titles +
     /// entries + blank separators between sections). Used internally by
     /// [`Self::max_scroll`].
-    fn total_lines() -> usize {
-        let sections = Self::sections();
+    fn total_lines(&self) -> usize {
+        let sections = self.sections();
         let mut total = 0usize;
         for (si, section) in sections.iter().enumerate() {
             total += 1; // section title
@@ -56,19 +57,26 @@ impl<'a> HelpOverlay<'a> {
     /// before they overcome the difference).
     ///
     /// Returns 0 if the content fits without scrolling.
-    pub fn max_scroll(terminal_height: u16) -> usize {
+    pub fn max_scroll(terminal_height: u16, caps: Option<&crate::kube::protocol::ResourceCapabilities>) -> usize {
         // Dialog is `centered_rect(area, 42, 85)` — 85% of terminal height.
         // Block overhead is 3 rows (2 borders + 1 top pad). See render.
         let dialog_height = (terminal_height as usize) * 85 / 100;
         let visible_height = dialog_height.saturating_sub(3).max(1);
-        let total = Self::total_lines();
+        // Compute total lines from a temporary instance. The theme is
+        // only needed for rendering, not for counting lines, so we use
+        // a stack-local theme whose lifetime is confined to this call.
+        let theme = Theme::load();
+        let total = {
+            let tmp = HelpOverlay { theme: &theme, scroll: 0, caps: caps.cloned() };
+            tmp.total_lines()
+        };
         total.saturating_sub(visible_height)
     }
 
-    fn sections() -> Vec<HelpSection> {
+    fn sections(&self) -> Vec<HelpSection> {
         vec![
             HelpSection {
-                title: "Navigation",
+                title: "Navigation".to_string(),
                 entries: vec![
                     HelpEntry {
                         key: "j / \u{2193}",
@@ -105,7 +113,7 @@ impl<'a> HelpOverlay<'a> {
                 ],
             },
             HelpSection {
-                title: "Actions",
+                title: "Actions".to_string(),
                 entries: vec![
                     HelpEntry {
                         key: "Enter",
@@ -150,7 +158,7 @@ impl<'a> HelpOverlay<'a> {
                 ],
             },
             HelpSection {
-                title: "Sorting",
+                title: "Sorting".to_string(),
                 entries: vec![
                     HelpEntry {
                         key: "Shift-O",
@@ -170,42 +178,9 @@ impl<'a> HelpOverlay<'a> {
                     },
                 ],
             },
+            self.resource_actions_section(),
             HelpSection {
-                title: "Pods & Workloads",
-                entries: vec![
-                    HelpEntry {
-                        key: "l",
-                        description: "View logs",
-                    },
-                    HelpEntry {
-                        key: "s",
-                        description: "Shell (pods) / Scale",
-                    },
-                    HelpEntry {
-                        key: "p",
-                        description: "Previous logs (--previous)",
-                    },
-                    HelpEntry {
-                        key: "o",
-                        description: "Show node (pods)",
-                    },
-                ],
-            },
-            HelpSection {
-                title: "Deploy/STS/DS",
-                entries: vec![
-                    HelpEntry {
-                        key: "r",
-                        description: "Restart (deploy/sts/ds)",
-                    },
-                    HelpEntry {
-                        key: "s",
-                        description: "Scale (deploy/sts/rs)",
-                    },
-                ],
-            },
-            HelpSection {
-                title: "Commands",
+                title: "Commands".to_string(),
                 entries: vec![
                     HelpEntry {
                         key: ":",
@@ -262,7 +237,7 @@ impl<'a> HelpOverlay<'a> {
                 ],
             },
             HelpSection {
-                title: "Log View",
+                title: "Log View".to_string(),
                 entries: vec![
                     HelpEntry {
                         key: "s",
@@ -291,7 +266,7 @@ impl<'a> HelpOverlay<'a> {
                 ],
             },
             HelpSection {
-                title: "Detail Views (YAML/Describe)",
+                title: "Detail Views (YAML/Describe)".to_string(),
                 entries: vec![
                     HelpEntry {
                         key: "Ctrl-d",
@@ -316,6 +291,67 @@ impl<'a> HelpOverlay<'a> {
                 ],
             },
         ]
+    }
+
+    /// Build the "Resource Actions" section dynamically from the current
+    /// resource's capabilities. Falls back to a generic section listing
+    /// all possible resource-specific keys when no caps are provided.
+    fn resource_actions_section(&self) -> HelpSection {
+        use crate::kube::protocol::OperationKind;
+
+        let mut entries = Vec::new();
+
+        if let Some(ref caps) = self.caps {
+            if caps.supports(OperationKind::StreamLogs) {
+                entries.push(HelpEntry { key: "Shift-L", description: "View logs" });
+            }
+            if caps.supports(OperationKind::Shell) {
+                entries.push(HelpEntry { key: "s", description: "Shell" });
+            }
+            if caps.supports(OperationKind::Scale) {
+                entries.push(HelpEntry { key: "s", description: "Scale" });
+            }
+            if caps.supports(OperationKind::Restart) {
+                entries.push(HelpEntry { key: "r", description: "Restart" });
+            }
+            if caps.supports(OperationKind::ShowNode) {
+                entries.push(HelpEntry { key: "o", description: "Show node" });
+            }
+            if caps.supports(OperationKind::PreviousLogs) {
+                entries.push(HelpEntry { key: "p", description: "Previous logs" });
+            }
+            if caps.supports(OperationKind::DecodeSecret) {
+                entries.push(HelpEntry { key: "x", description: "Decode" });
+            }
+            if caps.supports(OperationKind::ForceKill) {
+                entries.push(HelpEntry { key: "Ctrl-k", description: "Force kill" });
+            }
+            if caps.supports(OperationKind::PortForward) {
+                entries.push(HelpEntry { key: "f", description: "Port forward" });
+            }
+            if caps.supports(OperationKind::NodeShell) {
+                entries.push(HelpEntry { key: "s", description: "Node shell" });
+            }
+            if caps.supports(OperationKind::TriggerCronJob) {
+                entries.push(HelpEntry { key: "t", description: "Trigger job" });
+            }
+            if caps.supports(OperationKind::ToggleSuspendCronJob) {
+                entries.push(HelpEntry { key: "s", description: "Toggle suspend" });
+            }
+        } else {
+            // No caps available — show a generic combined section
+            entries.push(HelpEntry { key: "Shift-L", description: "View logs" });
+            entries.push(HelpEntry { key: "s", description: "Shell / Scale" });
+            entries.push(HelpEntry { key: "r", description: "Restart" });
+            entries.push(HelpEntry { key: "p", description: "Previous logs" });
+            entries.push(HelpEntry { key: "o", description: "Show node" });
+            entries.push(HelpEntry { key: "f", description: "Port forward" });
+        }
+
+        HelpSection {
+            title: "Resource Actions".to_string(),
+            entries,
+        }
     }
 
     fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
@@ -345,7 +381,7 @@ impl Widget for HelpOverlay<'_> {
         Clear.render(dialog_area, buf);
 
         // Build all lines first to know total count
-        let sections = Self::sections();
+        let sections = self.sections();
         let mut all_lines: Vec<Line<'_>> = Vec::new();
 
         for (si, section) in sections.iter().enumerate() {

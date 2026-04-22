@@ -26,7 +26,7 @@ impl<'a> ConfirmDialogWidget<'a> {
 impl Widget for ConfirmDialogWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let msg_len = self.dialog.message.width() as u16 + 8;
-        let cancel_text = format!(" Cancel ");
+        let cancel_text = " Cancel ".to_string();
         let action_text = format!(" {} ", self.dialog.action_label);
         let button_width = cancel_text.len() as u16 + action_text.len() as u16 + 4;
         let w = msg_len.max(button_width + 8).clamp(36, 64);
@@ -101,20 +101,28 @@ impl Widget for FormDialogWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let label_w = self.dialog.fields.iter()
             .map(|f| f.label.width() as u16).max().unwrap_or(0);
-        let w = (label_w + 30).max(50);
         let n = self.dialog.fields.len() as u16;
-        let h = n + 9; // subtitle + blank + fields + blank + button + blank + hint + borders + pad
+        let h = n + 9;
 
-        let hints = Line::from(vec![
+        // Only show arrow-key hints if the form has Select fields.
+        let has_select = self.dialog.fields.iter().any(|f| matches!(f.kind, FormFieldKind::Select { .. }));
+        let mut hint_spans = vec![
             Span::styled("<Tab>", self.theme.status_bar_key),
             Span::styled(" next  ", self.theme.help_desc),
-            Span::styled("<\u{2190}/\u{2192}>", self.theme.status_bar_key),
-            Span::styled(" select  ", self.theme.help_desc),
-            Span::styled("<Enter>", self.theme.status_bar_key),
-            Span::styled(" submit  ", self.theme.help_desc),
-            Span::styled("<Esc>", self.theme.status_bar_key),
-            Span::styled(" cancel", self.theme.help_desc),
-        ]);
+        ];
+        if has_select {
+            hint_spans.push(Span::styled("<\u{2190}/\u{2192}>", self.theme.status_bar_key));
+            hint_spans.push(Span::styled(" select  ", self.theme.help_desc));
+        }
+        hint_spans.push(Span::styled("<Enter>", self.theme.status_bar_key));
+        hint_spans.push(Span::styled(" ok  ", self.theme.help_desc));
+        hint_spans.push(Span::styled("<Esc>", self.theme.status_bar_key));
+        hint_spans.push(Span::styled(" cancel", self.theme.help_desc));
+        let hints = Line::from(hint_spans);
+
+        // Size dialog to fit hints + content, with room for padding.
+        let hint_width = hints.width() as u16 + 8; // +8 for padding
+        let w = (label_w + 30).max(50).max(hint_width);
 
         let theme = self.theme;
         let dialog = self.dialog;
