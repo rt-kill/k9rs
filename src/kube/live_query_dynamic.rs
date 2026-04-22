@@ -259,6 +259,7 @@ fn build_dynamic_snapshot(
                 health: RowHealth::Normal,
                 crd_info: None,
                 drill_target: None,
+                ..Default::default()
             })
         })
         .collect();

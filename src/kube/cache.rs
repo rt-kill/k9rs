@@ -115,6 +115,7 @@ pub fn cached_crds_to_rows(cached: &[CachedCrd]) -> Vec<ResourceRow> {
                 health: RowHealth::Normal,
                 crd_info,
                 drill_target,
+                ..Default::default()
             }
         })
         .collect()
@@ -255,6 +256,7 @@ pub fn cached_namespaces_to_rows(names: &[String]) -> Vec<crate::kube::resources
             drill_target: Some(DrillTarget::SwitchNamespace(
                 crate::kube::protocol::Namespace::Named(name.clone()),
             )),
+            ..Default::default()
         })
         .collect()
 }

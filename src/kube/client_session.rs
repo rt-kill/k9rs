@@ -647,6 +647,8 @@ impl ClientSession {
         let event_tx = self.event_tx.clone();
         let init = protocol::SubstreamInit::Log(log_init);
         let handle = tokio::spawn(async move {
+            let panic_tx = event_tx.clone();
+            let result = std::panic::AssertUnwindSafe(async {
             // Yield the MuxHandle out of the wait loop so the "is Some"
             // check and the binding are one step — no post-loop `.unwrap()`.
             let mux_handle = loop {
@@ -657,6 +659,7 @@ impl ClientSession {
             let stream = match mux_handle.open().await {
                 Ok(s) => s,
                 Err(e) => {
+                    let _ = event_tx.send(AppEvent::LogStreamEnded).await;
                     let _ = event_tx.send(AppEvent::Flash(FlashMessage::error(
                         format!("log substream open failed: {}", e),
                     ))).await;
@@ -670,6 +673,10 @@ impl ClientSession {
             );
 
             if protocol::write_bincode(&mut write_half, &init).await.is_err() {
+                let _ = event_tx.send(AppEvent::LogStreamEnded).await;
+                let _ = event_tx.send(AppEvent::Flash(FlashMessage::error(
+                    "Log init handshake failed".to_string(),
+                ))).await;
                 return;
             }
 
@@ -693,6 +700,20 @@ impl ClientSession {
                         break;
                     }
                 }
+            }
+            });
+            if let Err(panic) = futures::FutureExt::catch_unwind(result).await {
+                let msg = if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = panic.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown panic".to_string()
+                };
+                let _ = panic_tx.send(AppEvent::LogStreamEnded).await;
+                let _ = panic_tx.send(AppEvent::Flash(FlashMessage::error(
+                    format!("log bridge panicked: {}", msg),
+                ))).await;
             }
         });
         LogStream {
@@ -799,6 +820,9 @@ impl ClientSession {
         let event_tx = self.event_tx.clone();
         let rid = resource.clone();
         let handle = tokio::spawn(async move {
+            let panic_tx = event_tx.clone();
+            let panic_rid = rid.clone();
+            let result = std::panic::AssertUnwindSafe(async {
             // Wait for the MuxHandle to become available (connection established)
             // and yield it out of the loop — no post-loop `.unwrap()` documenting
             // an invariant the loop just proved.
@@ -833,7 +857,11 @@ impl ClientSession {
                 filter,
                 force,
             });
-            if protocol::write_bincode(&mut write_half, &init).await.is_err() {
+            if let Err(e) = protocol::write_bincode(&mut write_half, &init).await {
+                let _ = event_tx.send(AppEvent::SubscriptionFailed {
+                    resource: rid,
+                    message: format!("subscription init failed: {}", e),
+                }).await;
                 return;
             }
 
@@ -848,27 +876,53 @@ impl ClientSession {
             // this, a SubscriptionFailed arriving after Resolved would
             // write to a stale table entry that no longer exists.
             let mut current_rid = rid.clone();
-            while let Ok(event) = protocol::read_bincode::<_, protocol::StreamEvent>(&mut reader).await {
-                let app_event = match event {
-                    protocol::StreamEvent::Snapshot(update) => {
-                        AppEvent::ResourceUpdate(update)
-                    }
-                    protocol::StreamEvent::Error(msg) => {
-                        AppEvent::SubscriptionFailed {
-                            resource: current_rid.clone(),
-                            message: msg,
+            loop {
+                match protocol::read_bincode::<_, protocol::StreamEvent>(&mut reader).await {
+                    Ok(event) => {
+                        let app_event = match event {
+                            protocol::StreamEvent::Snapshot(update) => {
+                                AppEvent::ResourceUpdate(update)
+                            }
+                            protocol::StreamEvent::Error(msg) => {
+                                AppEvent::SubscriptionFailed {
+                                    resource: current_rid.clone(),
+                                    message: msg,
+                                }
+                            }
+                            protocol::StreamEvent::Resolved { original, resolved } => {
+                                current_rid = resolved.clone();
+                                AppEvent::ResourceResolved { original, resolved }
+                            }
+                        };
+                        if event_tx.send(app_event).await.is_err() {
+                            break;
                         }
                     }
-                    protocol::StreamEvent::Resolved { original, resolved } => {
-                        current_rid = resolved.clone();
-                        AppEvent::ResourceResolved { original, resolved }
+                    Err(e) => {
+                        tracing::warn!("subscription bridge read failed for {}: {}", current_rid.plural(), e);
+                        let _ = event_tx.send(AppEvent::SubscriptionFailed {
+                            resource: current_rid.clone(),
+                            message: format!("read error: {}", e),
+                        }).await;
+                        break;
                     }
-                };
-                if event_tx.send(app_event).await.is_err() {
-                    break;
                 }
             }
-            // Substream closed (EOF or error) — subscription ended.
+            });
+            let result: Result<(), Box<dyn std::any::Any + Send>> = futures::FutureExt::catch_unwind(result).await;
+            if let Err(panic) = result {
+                let msg = if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = panic.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown panic".to_string()
+                };
+                let _ = panic_tx.send(AppEvent::SubscriptionFailed {
+                    resource: panic_rid,
+                    message: format!("bridge panicked: {}", msg),
+                }).await;
+            }
         });
         SubscriptionStream {
             _bridge: handle.abort_handle(),

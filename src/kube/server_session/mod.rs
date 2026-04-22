@@ -428,8 +428,8 @@ impl ServerSession {
         session_ctx_tx: Option<watch::Sender<Option<Arc<SessionContext>>>>,
         session_id: u64,
     ) {
-        info!(
-            "Session init: context={:?}, namespace={:?}, readonly={}",
+        debug!(
+            "session init: context={:?}, namespace={:?}, readonly={}",
             init.context, init.namespace, init.readonly
         );
 
@@ -448,7 +448,7 @@ impl ServerSession {
         // 3. Create kube::Client from kubeconfig + env vars.
         let (client, client_config) = match Self::create_client_from_init(&init, &shared).await {
             Ok(c) => {
-                info!("Created kube::Client for context '{}'", context_name);
+                debug!("created kube::Client for context '{}'", context_name);
                 c
             }
             Err(e) => {
@@ -517,11 +517,11 @@ impl ServerSession {
         // Spawn metrics polling.
         session.spawn_metrics_poller();
 
-        info!("Session ready, entering command loop (context={})", session.context.name);
+        info!("session ready, entering command loop (context={})", session.context.name);
         if let Err(e) = session.run(reader).await {
-            info!("Session ended: {}", e);
+            info!("session ended: {}", e);
         } else {
-            info!("Session ended cleanly");
+            debug!("session ended cleanly");
         }
     }
 
@@ -635,8 +635,8 @@ impl ServerSession {
 
     async fn handle_command(&mut self, cmd: SessionCommand) -> anyhow::Result<()> {
         match &cmd {
-            SessionCommand::Init { .. } => info!("Session cmd: Init"),
-            other => debug!("Session cmd: {:?}", other),
+            SessionCommand::Init { .. } => debug!("session cmd: Init"),
+            other => debug!("session cmd: {:?}", other),
         }
 
         // Single readonly gate — classified by the typed `is_mutating`
@@ -889,11 +889,11 @@ async fn handle_data_substream(
             handle_subscription_substream_inner(sub_init, writer, ctx, sid, sub_id).await;
         }
         protocol::SubstreamInit::Log(log_init) => {
-            tracing::info!(session = sid, sub = sub_id, "log: pod={} container={:?}", log_init.pod, log_init.container);
+            tracing::debug!(session = sid, sub = sub_id, "log: pod={} container={:?}", log_init.pod, log_init.container);
             handle_log_substream(log_init, writer, ctx).await;
         }
         protocol::SubstreamInit::Exec(exec_init) => {
-            tracing::info!(session = sid, sub = sub_id, "exec: {:?}", exec_init.kubectl_args);
+            tracing::debug!(session = sid, sub = sub_id, "exec: {:?}", exec_init.kubectl_args);
             handle_exec_substream(exec_init, reader, writer, ctx).await;
         }
     }
@@ -911,7 +911,7 @@ async fn handle_subscription_substream_inner(
 
     let rid = init.resource.clone();
     let filter = init.filter.clone();
-    tracing::info!(session = session_id, sub = sub_id, "subscribe: {}({}) filter={:?}",
+    tracing::debug!(session = session_id, sub = sub_id, "subscribe: {}({}) filter={:?}",
         rid.plural(), init.namespace.display(), filter);
 
     // Local resources branch out into the LocalResourceSource pipeline.
@@ -1050,12 +1050,18 @@ async fn handle_subscription_substream_inner(
     // `ResourceId::capabilities()` method, so the wire round-trip and
     // client-side cache were redundant.
 
-    // Bridge: watcher → StreamEvent frames on the substream.
+    // Bridge: watcher -> StreamEvent frames on the substream.
     // Send current snapshot immediately if available.
     if let Some(update) = sub.current() {
         let update = apply_owner_filter_inline(update, &filter);
-        let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await;
-        let _ = writer.flush().await;
+        if let Err(e) = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await {
+            tracing::warn!(session = session_id, sub = sub_id, "initial snapshot write failed for {}: {}", rid.plural(), e);
+            return;
+        }
+        if let Err(e) = writer.flush().await {
+            tracing::warn!(session = session_id, sub = sub_id, "initial snapshot flush failed for {}: {}", rid.plural(), e);
+            return;
+        }
     }
 
     loop {
@@ -1074,10 +1080,14 @@ async fn handle_subscription_substream_inner(
             break;
         };
         let update = apply_owner_filter_inline(update, &filter);
-        if protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await.is_err() {
+        if let Err(e) = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await {
+            tracing::warn!(session = session_id, sub = sub_id, "bridge write failed for {}: {}", rid.plural(), e);
             break;
         }
-        if writer.flush().await.is_err() { break; }
+        if let Err(e) = writer.flush().await {
+            tracing::warn!(session = session_id, sub = sub_id, "bridge flush failed for {}: {}", rid.plural(), e);
+            break;
+        }
     }
 }
 

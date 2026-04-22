@@ -128,6 +128,9 @@ pub enum NavFilter {
         /// Display name of the owner resource.
         display_name: String,
     },
+    /// Column-restricted grep: matches only the cell at a specific column
+    /// index. Opened with `~` (tilde) — filters the hovered column only.
+    ColumnGrep { pattern: CompiledGrep, col: usize },
     /// The "fault" filter — show only rows whose typed [`crate::kube::resources::row::RowHealth`]
     /// is `Failed` or `Pending`. The classification happens on the server
     /// (in the row converter), so the filter runs as `row.health != Normal`
@@ -140,7 +143,7 @@ impl NavFilter {
     /// Grep and Fault are client-side only and return None.
     pub fn to_subscription_filter(&self) -> Option<SubscriptionFilter> {
         match self {
-            NavFilter::Grep(_) | NavFilter::Fault => None,
+            NavFilter::Grep(_) | NavFilter::ColumnGrep { .. } | NavFilter::Fault => None,
             NavFilter::Labels(labels) => Some(SubscriptionFilter::Labels(labels.clone())),
             NavFilter::Field(sel) => Some(SubscriptionFilter::Field(sel.to_wire())),
             NavFilter::OwnerChain { uid, .. } => {
@@ -591,6 +594,7 @@ impl NavStack {
             }
             match &step.filter {
                 Some(NavFilter::Grep(g)) => parts.push(format!("/{}", g.source())),
+                Some(NavFilter::ColumnGrep { pattern, col }) => parts.push(format!("~{}:{}", col, pattern.source())),
                 Some(NavFilter::Fault) => parts.push("⚠ fault".to_string()),
                 Some(NavFilter::Labels(labels)) => {
                     let label_str: Vec<String> = labels.iter()
@@ -625,6 +629,9 @@ pub struct FilterInputState {
     pub active: bool,
     /// The text being typed (not yet committed to NavStack).
     pub text: String,
+    /// If Some, the filter is restricted to this column index (opened via `~`).
+    /// When committed, produces `NavFilter::ColumnGrep` instead of `NavFilter::Grep`.
+    pub column: Option<usize>,
 }
 
 /// Convenience helper: build a built-in `ResourceId` from a typed

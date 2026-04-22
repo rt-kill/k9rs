@@ -92,9 +92,11 @@ pub(crate) fn apply_event(
             // Mark the table as errored so the UI shows the error instead of spinner.
             // Clear items so the error is visible even if data was previously loaded
             // (the rendering code only shows table.error when items is empty).
+            // IMPORTANT: clear_data() first, THEN set error — clear_data() resets
+            // error to None, so doing it after would wipe the error we just set.
             let table = app.data.unified.entry(resource.clone()).or_default();
-            table.error = Some(message);
             table.clear_data();
+            table.error = Some(message);
             // The bridge task behind the failing subscription has already
             // exited. Drop the stale `SubscriptionStream` handle sitting
             // in the nav stack so a later Esc pop-back past this rid
@@ -179,9 +181,6 @@ fn apply_resource_update(
 ) {
     match update {
         ResourceUpdate::Rows { resource, headers, rows } => {
-            // Create the table entry on demand. CRD entries aren't pre-
-            // populated in `unified` (only BuiltInKind + LocalResourceKind
-            // are), so the first snapshot for a CRD needs to create it.
             let table = app.data.unified.entry(resource.clone()).or_default();
             app.deltas.update(&rows);
             table.set_items_filtered(rows);

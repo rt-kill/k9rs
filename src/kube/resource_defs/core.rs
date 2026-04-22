@@ -2,7 +2,7 @@
 //! ServiceAccount, Ingress, NetworkPolicy, HPA, Endpoints, EndpointSlice,
 //! LimitRange, ResourceQuota, PodDisruptionBudget, Event, PVC, Lease.
 
-use crate::kube::protocol::ResourceScope;
+use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::row::ResourceRow;
 
@@ -39,7 +39,20 @@ impl ResourceDef for ServiceDef {
             .into_iter().map(String::from).collect()
     }
 
-    fn is_port_forwardable(&self) -> bool { true }
+    fn column_defs(&self) -> Vec<ColumnDef> {
+        use ColumnDef as C;
+        vec![
+            C::new("NAMESPACE"), C::new("NAME"), C::new("TYPE"),
+            C::new("CLUSTER-IP"), C::new("EXTERNAL-IP"),
+            C::extra("SELECTOR"), C::new("PORT(S)"),
+            C::extra("LABELS"), C::age("AGE"),
+        ]
+    }
+
+    fn operations(&self) -> Vec<OperationKind> {
+        use OperationKind::*;
+        vec![Describe, Yaml, Delete, PortForward]
+    }
 }
 
 impl ConvertToRow<Service> for ServiceDef {
@@ -99,7 +112,10 @@ impl ResourceDef for SecretDef {
             .into_iter().map(String::from).collect()
     }
 
-    fn is_secret_like(&self) -> bool { true }
+    fn operations(&self) -> Vec<OperationKind> {
+        use OperationKind::*;
+        vec![Describe, Yaml, Delete, DecodeSecret]
+    }
 }
 
 impl ConvertToRow<Secret> for SecretDef {
@@ -329,7 +345,8 @@ impl ResourceDef for PodDisruptionBudgetDef {
     fn aliases(&self) -> &[&str] { &["pdb", "poddisruptionbudget", "poddisruptionbudgets"] }
     fn short_label(&self) -> &str { "PDB" }
     fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "MIN AVAILABLE", "MAX UNAVAILABLE", "ALLOWED DISRUPTIONS", "AGE"]
+        ["NAMESPACE", "NAME", "MIN AVAILABLE", "MAX UNAVAILABLE",
+         "ALLOWED DISRUPTIONS", "CURRENT", "DESIRED", "EXPECTED", "AGE"]
             .into_iter().map(String::from).collect()
     }
 }
@@ -360,6 +377,15 @@ impl ResourceDef for EventDef {
     fn default_headers(&self) -> Vec<String> {
         ["NAMESPACE", "TYPE", "REASON", "OBJECT", "MESSAGE", "SOURCE", "COUNT", "AGE"]
             .into_iter().map(String::from).collect()
+    }
+
+    fn column_defs(&self) -> Vec<ColumnDef> {
+        use ColumnDef as C;
+        vec![
+            C::new("NAMESPACE"), C::new("TYPE"), C::new("REASON"),
+            C::new("OBJECT"), C::new("MESSAGE"), C::extra("SOURCE"),
+            C::new("COUNT"), C::age("AGE"),
+        ]
     }
 }
 

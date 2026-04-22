@@ -295,10 +295,21 @@ pub(crate) fn handle_action(
         }
         Action::Filter(_) => {
             if matches!(app.route, crate::app::Route::Resources) {
-                app.nav.filter_input_mut().active = true;
-                app.nav.filter_input_mut().text.clear();
+                let fi = app.nav.filter_input_mut();
+                fi.active = true;
+                fi.text.clear();
+                fi.column = None;
             } else if let crate::app::Route::Logs { ref mut state, .. } = app.route {
                 state.start_filter();
+            }
+        }
+        Action::ColumnFilter => {
+            if matches!(app.route, crate::app::Route::Resources) {
+                let col = app.active_table_selected_col();
+                let fi = app.nav.filter_input_mut();
+                fi.active = true;
+                fi.text.clear();
+                fi.column = Some(col);
             }
         }
         Action::ClearFilter => {

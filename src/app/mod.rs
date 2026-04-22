@@ -335,17 +335,56 @@ impl App {
     }
 
     /// Apply stored pod metrics to all current pod items.
+    /// Writes the CPU/MEM usage cells and computes percentage columns
+    /// (%CPU/R, %CPU/L, %MEM/R, %MEM/L) from the row's typed
+    /// request/limit fields and the metrics values.
     pub fn apply_pod_metrics(&mut self) {
         use crate::kube::resource_def::BuiltInKind;
         let pods_rid = nav::rid(BuiltInKind::Pod);
         let cpu_col = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::Cpu);
         let mem_col = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::Mem);
-        if cpu_col.is_none() && mem_col.is_none() { return; }
+        let pct_cpu_r = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::CpuPercentRequest);
+        let pct_cpu_l = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::CpuPercentLimit);
+        let pct_mem_r = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::MemPercentRequest);
+        let pct_mem_l = Self::metrics_col_index(BuiltInKind::Pod, MetricsColumn::MemPercentLimit);
         if let Some(table) = self.data.unified.get_mut(&pods_rid) {
             for row in &mut table.items {
                 if let Some(usage) = self.pod_metrics.get(&ObjectKey::new(row.namespace.clone().unwrap_or_default(), row.name.clone())) {
                     if let Some(col) = cpu_col { row.set_cell(col, usage.cpu.clone()); }
                     if let Some(col) = mem_col { row.set_cell(col, usage.mem.clone()); }
+
+                    // %CPU/R: (current CPU milli / request milli) * 100
+                    if let Some(col) = pct_cpu_r {
+                        let val = row.cpu_request
+                            .filter(|&r| r > 0)
+                            .map(|r| format!("{}%", usage.cpu_milli.saturating_mul(100) / r))
+                            .unwrap_or_else(|| "n/a".to_string());
+                        row.set_cell(col, val);
+                    }
+                    // %CPU/L: (current CPU milli / limit milli) * 100
+                    if let Some(col) = pct_cpu_l {
+                        let val = row.cpu_limit
+                            .filter(|&l| l > 0)
+                            .map(|l| format!("{}%", usage.cpu_milli.saturating_mul(100) / l))
+                            .unwrap_or_else(|| "n/a".to_string());
+                        row.set_cell(col, val);
+                    }
+                    // %MEM/R: (current MEM bytes / request bytes) * 100
+                    if let Some(col) = pct_mem_r {
+                        let val = row.mem_request
+                            .filter(|&r| r > 0)
+                            .map(|r| format!("{}%", usage.mem_bytes.saturating_mul(100) / r))
+                            .unwrap_or_else(|| "n/a".to_string());
+                        row.set_cell(col, val);
+                    }
+                    // %MEM/L: (current MEM bytes / limit bytes) * 100
+                    if let Some(col) = pct_mem_l {
+                        let val = row.mem_limit
+                            .filter(|&l| l > 0)
+                            .map(|l| format!("{}%", usage.mem_bytes.saturating_mul(100) / l))
+                            .unwrap_or_else(|| "n/a".to_string());
+                        row.set_cell(col, val);
+                    }
                 }
             }
         }
@@ -457,6 +496,11 @@ impl App {
         }
     }
 
+    pub fn active_table_selected_col(&self) -> usize {
+        let rid = self.nav.resource_id();
+        self.data.unified.get(rid).map(|t| t.selected_col).unwrap_or(0)
+    }
+
     pub fn col_left(&mut self) {
         self.with_active_table(|t| t.nav_col_left());
     }
@@ -552,13 +596,14 @@ impl App {
         // a row passes if it matches every grep pattern AND every health
         // predicate.
         let mut committed: Vec<&SearchPattern> = Vec::new();
+        let mut col_greps: Vec<(&SearchPattern, usize)> = Vec::new();
         let mut has_fault = false;
         for f in self.nav.active_filters() {
-            if let Some(g) = f.as_grep() {
-                committed.push(g.pattern());
-            }
-            if matches!(f, NavFilter::Fault) {
-                has_fault = true;
+            match f {
+                NavFilter::Grep(g) => committed.push(g.pattern()),
+                NavFilter::ColumnGrep { pattern, col } => col_greps.push((pattern.pattern(), *col)),
+                NavFilter::Fault => has_fault = true,
+                _ => {}
             }
         }
         // Uncommitted draft text from the filter input is compiled fresh
@@ -568,7 +613,7 @@ impl App {
             (!text.is_empty()).then(|| SearchPattern::new(text))
         };
 
-        if committed.is_empty() && draft.is_none() && !has_fault {
+        if committed.is_empty() && col_greps.is_empty() && draft.is_none() && !has_fault {
             self.clear_filter();
             return;
         }
@@ -589,6 +634,11 @@ impl App {
                     item.cells().iter().any(|cell| pat.is_match(cell))
                 });
                 if !committed_ok { return false; }
+                // Column-restricted greps: each must match its specific cell.
+                let col_ok = col_greps.iter().all(|(pat, col)| {
+                    item.cells().get(*col).is_some_and(|cell| pat.is_match(cell))
+                });
+                if !col_ok { return false; }
                 if let Some(ref d) = draft {
                     if !item.cells().iter().any(|cell| d.is_match(cell)) {
                         return false;
@@ -660,7 +710,7 @@ impl App {
             // Resource table loading
             let rid = self.nav.resource_id();
             let table_loading = self.data.unified.get(rid)
-                .is_none_or(|t| t.items.is_empty() && !t.has_data);
+                .is_none_or(|t| t.items.is_empty() && !t.has_data && t.error.is_none());
             if table_loading {
                 changed = true;
             }

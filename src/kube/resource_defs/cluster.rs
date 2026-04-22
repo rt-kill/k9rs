@@ -6,7 +6,7 @@
 //! Note: Role and RoleBinding are Namespaced scope despite being grouped here
 //! with cluster-level resources.
 
-use crate::kube::protocol::ResourceScope;
+use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::row::ResourceRow;
 
@@ -67,24 +67,29 @@ impl ResourceDef for NodeDef {
     fn aliases(&self) -> &[&str] { &["no", "node", "nodes"] }
     fn short_label(&self) -> &str { "Nodes" }
     fn default_headers(&self) -> Vec<String> {
-        ["NAME", "STATUS", "ROLES", "TAINTS", "VERSION", "INTERNAL-IP",
-         "EXTERNAL-IP", "PODS", "CPU%", "MEM%", "ARCH", "LABELS", "AGE"]
+        ["NAME", "STATUS", "ROLES", "TAINTS", "VERSION",
+         "OS-IMAGE", "KERNEL",
+         "INTERNAL-IP", "EXTERNAL-IP", "PODS",
+         "CPU%", "MEM%", "ARCH", "LABELS", "AGE"]
             .into_iter().map(String::from).collect()
     }
     fn is_core(&self) -> bool { true }
-    fn is_node_shellable(&self) -> bool { true }
     fn metrics_kind(&self) -> Option<MetricsKind> { Some(MetricsKind::Node) }
-
+    fn operations(&self) -> Vec<OperationKind> {
+        use OperationKind::*;
+        vec![Describe, Yaml, Delete, NodeShell]
+    }
     fn column_defs(&self) -> Vec<ColumnDef> {
         use ColumnDef as C;
         use MetricsColumn::*;
         vec![
             C::new("NAME"), C::new("STATUS"), C::new("ROLES"),
-            C::extra("TAINTS"), C::new("VERSION"),
-            C::extra("INTERNAL-IP"), C::extra("EXTERNAL-IP"),
+            C::new("TAINTS"), C::new("VERSION"),
+            C::extra("OS-IMAGE"), C::extra("KERNEL"),
+            C::new("INTERNAL-IP"), C::extra("EXTERNAL-IP"),
             C::new("PODS"),
-            C::extra("CPU%").with_metrics(CpuPercent),
-            C::extra("MEM%").with_metrics(MemPercent),
+            C::new("CPU%").with_metrics(CpuPercent),
+            C::new("MEM%").with_metrics(MemPercent),
             C::extra("ARCH"), C::extra("LABELS"), C::age("AGE"),
         ]
     }

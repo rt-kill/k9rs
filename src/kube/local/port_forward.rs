@@ -590,6 +590,7 @@ pub fn pf_to_row(entry: &PortForwardEntry) -> ResourceRow {
         health,
         crd_info: None,
         drill_target: None,
+        ..Default::default()
     }
 }
 

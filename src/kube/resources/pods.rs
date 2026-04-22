@@ -334,6 +334,90 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
         }
     };
 
+    // Nominated node (set when pod preempts other pods but can't schedule yet)
+    let nominated_node = status.nominated_node_name.unwrap_or_default();
+
+    // --- Resource requests & limits ---
+    // Sum across regular containers + sidecar init containers (restartPolicy=Always).
+    let mut cpu_req_nano: u64 = 0;
+    let mut cpu_lim_nano: u64 = 0;
+    let mut mem_req_bytes: u64 = 0;
+    let mut mem_lim_bytes: u64 = 0;
+    let mut has_cpu_req = false;
+    let mut has_cpu_lim = false;
+    let mut has_mem_req = false;
+    let mut has_mem_lim = false;
+
+    // Helper closure to accumulate resources from a container's ResourceRequirements.
+    let mut accum_resources = |res: &Option<k8s_openapi::api::core::v1::ResourceRequirements>| {
+        if let Some(ref rr) = res {
+            if let Some(ref requests) = rr.requests {
+                if let Some(q) = requests.get("cpu") {
+                    cpu_req_nano = cpu_req_nano.saturating_add(
+                        crate::kube::metrics::parse_cpu_to_nano(&q.0),
+                    );
+                    has_cpu_req = true;
+                }
+                if let Some(q) = requests.get("memory") {
+                    mem_req_bytes = mem_req_bytes.saturating_add(
+                        crate::kube::metrics::parse_mem_to_bytes(&q.0),
+                    );
+                    has_mem_req = true;
+                }
+            }
+            if let Some(ref limits) = rr.limits {
+                if let Some(q) = limits.get("cpu") {
+                    cpu_lim_nano = cpu_lim_nano.saturating_add(
+                        crate::kube::metrics::parse_cpu_to_nano(&q.0),
+                    );
+                    has_cpu_lim = true;
+                }
+                if let Some(q) = limits.get("memory") {
+                    mem_lim_bytes = mem_lim_bytes.saturating_add(
+                        crate::kube::metrics::parse_mem_to_bytes(&q.0),
+                    );
+                    has_mem_lim = true;
+                }
+            }
+        }
+    };
+
+    // Regular containers
+    for c in &spec.containers {
+        accum_resources(&c.resources);
+    }
+    // Sidecar init containers (restartPolicy=Always) contribute to running
+    // resource usage just like regular containers.
+    for c in init_containers_spec {
+        if c.restart_policy.as_deref() == Some("Always") {
+            accum_resources(&c.resources);
+        }
+    }
+
+    let cpu_req_milli = cpu_req_nano / 1_000_000;
+    let cpu_lim_milli = cpu_lim_nano / 1_000_000;
+
+    let cpu_req_display = if has_cpu_req {
+        crate::util::format_cpu(&format!("{}n", cpu_req_nano))
+    } else {
+        String::new()
+    };
+    let cpu_lim_display = if has_cpu_lim {
+        crate::util::format_cpu(&format!("{}n", cpu_lim_nano))
+    } else {
+        String::new()
+    };
+    let mem_req_display = if has_mem_req {
+        crate::util::format_mem(&mem_req_bytes.to_string())
+    } else {
+        String::new()
+    };
+    let mem_lim_display = if has_mem_lim {
+        crate::util::format_mem(&mem_lim_bytes.to_string())
+    } else {
+        String::new()
+    };
+
     // `health` was computed by `compute_pod_status` above — no string
     // round-trip re-classification.
 
@@ -347,8 +431,17 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
             last_restart_str,
             "n/a".to_string(), // CPU (filled by metrics overlay)
             "n/a".to_string(), // MEM (filled by metrics overlay)
+            cpu_req_display,
+            cpu_lim_display,
+            mem_req_display,
+            mem_lim_display,
+            "n/a".to_string(), // %CPU/R (filled by metrics overlay)
+            "n/a".to_string(), // %CPU/L (filled by metrics overlay)
+            "n/a".to_string(), // %MEM/R (filled by metrics overlay)
+            "n/a".to_string(), // %MEM/L (filled by metrics overlay)
             pod_ip,
             node_display,
+            nominated_node,
             qos_short.to_string(),
             service_account,
             readiness_gates,
@@ -362,6 +455,10 @@ pub(crate) fn pod_to_row(pod: Pod) -> ResourceRow {
         pf_ports,
         node,
         health,
+        cpu_request: if has_cpu_req { Some(cpu_req_milli) } else { None },
+        cpu_limit: if has_cpu_lim { Some(cpu_lim_milli) } else { None },
+        mem_request: if has_mem_req { Some(mem_req_bytes) } else { None },
+        mem_limit: if has_mem_lim { Some(mem_lim_bytes) } else { None },
         ..Default::default()
     }
 }

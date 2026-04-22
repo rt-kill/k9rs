@@ -1,7 +1,7 @@
 //! Workload resource definitions: Pod, Deployment, StatefulSet, DaemonSet,
 //! ReplicaSet, Job, CronJob.
 
-use crate::kube::protocol::ResourceScope;
+use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::row::ResourceRow;
 
@@ -28,7 +28,11 @@ impl ResourceDef for PodDef {
     fn short_label(&self) -> &str { "Pods" }
     fn default_headers(&self) -> Vec<String> {
         ["NAMESPACE", "NAME", "READY", "STATUS", "RESTARTS", "LAST RESTART",
-         "CPU", "MEM", "IP", "NODE", "QOS", "SERVICE-ACCOUNT",
+         "CPU", "MEM",
+         "CPU/R", "CPU/L", "MEM/R", "MEM/L",
+         "%CPU/R", "%CPU/L", "%MEM/R", "%MEM/L",
+         "IP", "NODE", "NOMINATED NODE",
+         "QOS", "SERVICE-ACCOUNT",
          "READINESS GATES", "LABELS", "AGE"]
             .into_iter().map(String::from).collect()
     }
@@ -39,18 +43,24 @@ impl ResourceDef for PodDef {
         use MetricsColumn::*;
         vec![
             C::new("NAMESPACE"), C::new("NAME"), C::new("READY"), C::new("STATUS"),
-            C::new("RESTARTS"), C::extra_age("LAST RESTART"),
-            C::extra("CPU").with_metrics(Cpu), C::extra("MEM").with_metrics(Mem),
-            C::new("IP"), C::extra("NODE"), C::extra("QOS"),
+            C::new("RESTARTS"), C::age("LAST RESTART"),
+            C::new("CPU").with_metrics(Cpu), C::new("MEM").with_metrics(Mem),
+            C::extra("CPU/R"), C::extra("CPU/L"), C::extra("MEM/R"), C::extra("MEM/L"),
+            C::extra("%CPU/R").with_metrics(CpuPercentRequest),
+            C::extra("%CPU/L").with_metrics(CpuPercentLimit),
+            C::extra("%MEM/R").with_metrics(MemPercentRequest),
+            C::extra("%MEM/L").with_metrics(MemPercentLimit),
+            C::new("IP"), C::new("NODE"), C::extra("NOMINATED NODE"),
+            C::extra("QOS"),
             C::extra("SERVICE-ACCOUNT"), C::extra("READINESS GATES"),
             C::extra("LABELS"), C::age("AGE"),
         ]
     }
 
-    fn is_loggable(&self) -> bool { true }
-    fn is_shellable(&self) -> bool { true }
-    fn is_show_nodeable(&self) -> bool { true }
-    fn is_port_forwardable(&self) -> bool { true }
+    fn operations(&self) -> Vec<OperationKind> {
+        use OperationKind::*;
+        vec![Describe, Yaml, Delete, StreamLogs, PreviousLogs, Shell, ShowNode, PortForward, ForceKill]
+    }
 }
 
 impl ConvertToRow<Pod> for PodDef {
@@ -82,10 +92,10 @@ impl ResourceDef for DeploymentDef {
             .into_iter().map(String::from).collect()
     }
 
-    fn is_loggable(&self) -> bool { true }
-    fn is_scaleable(&self) -> bool { true }
-    fn is_restartable(&self) -> bool { true }
-    fn is_port_forwardable(&self) -> bool { true }
+    fn operations(&self) -> Vec<OperationKind> {
+        use OperationKind::*;
+        vec![Describe, Yaml, Delete, StreamLogs, PreviousLogs, Scale, Restart, PortForward]
+    }
 }
 
 impl ConvertToRow<Deployment> for DeploymentDef {
@@ -116,10 +126,10 @@ impl ResourceDef for StatefulSetDef {
             .into_iter().map(String::from).collect()
     }
 
-    fn is_loggable(&self) -> bool { true }
-    fn is_scaleable(&self) -> bool { true }
-    fn is_restartable(&self) -> bool { true }
-    fn is_port_forwardable(&self) -> bool { true }
+    fn operations(&self) -> Vec<OperationKind> {
+        use OperationKind::*;
+        vec![Describe, Yaml, Delete, StreamLogs, PreviousLogs, Scale, Restart, PortForward]
+    }
 }
 
 impl ConvertToRow<StatefulSet> for StatefulSetDef {
@@ -151,9 +161,10 @@ impl ResourceDef for DaemonSetDef {
             .into_iter().map(String::from).collect()
     }
 
-    fn is_loggable(&self) -> bool { true }
-    fn is_restartable(&self) -> bool { true }
-    fn is_port_forwardable(&self) -> bool { true }
+    fn operations(&self) -> Vec<OperationKind> {
+        use OperationKind::*;
+        vec![Describe, Yaml, Delete, StreamLogs, PreviousLogs, Restart, PortForward]
+    }
 }
 
 impl ConvertToRow<DaemonSet> for DaemonSetDef {
@@ -180,13 +191,15 @@ impl ResourceDef for ReplicaSetDef {
     fn aliases(&self) -> &[&str] { &["rs", "replicaset", "replicasets"] }
     fn short_label(&self) -> &str { "RS" }
     fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "DESIRED", "CURRENT", "READY", "LABELS", "AGE"]
+        ["NAMESPACE", "NAME", "DESIRED", "CURRENT", "READY",
+         "CONTAINERS", "IMAGES", "LABELS", "AGE"]
             .into_iter().map(String::from).collect()
     }
 
-    fn is_loggable(&self) -> bool { true }
-    fn is_scaleable(&self) -> bool { true }
-    fn is_port_forwardable(&self) -> bool { true }
+    fn operations(&self) -> Vec<OperationKind> {
+        use OperationKind::*;
+        vec![Describe, Yaml, Delete, StreamLogs, PreviousLogs, Scale, PortForward]
+    }
 }
 
 impl ConvertToRow<ReplicaSet> for ReplicaSetDef {
@@ -217,8 +230,10 @@ impl ResourceDef for JobDef {
             .into_iter().map(String::from).collect()
     }
 
-    fn is_loggable(&self) -> bool { true }
-    fn is_port_forwardable(&self) -> bool { true }
+    fn operations(&self) -> Vec<OperationKind> {
+        use OperationKind::*;
+        vec![Describe, Yaml, Delete, StreamLogs, PreviousLogs, PortForward]
+    }
 }
 
 impl ConvertToRow<Job> for JobDef {
@@ -250,7 +265,10 @@ impl ResourceDef for CronJobDef {
             .into_iter().map(String::from).collect()
     }
 
-    fn is_loggable(&self) -> bool { true }
+    fn operations(&self) -> Vec<OperationKind> {
+        use OperationKind::*;
+        vec![Describe, Yaml, Delete, StreamLogs, PreviousLogs, TriggerCronJob, ToggleSuspendCronJob]
+    }
 }
 
 impl ConvertToRow<CronJob> for CronJobDef {

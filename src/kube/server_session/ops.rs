@@ -211,7 +211,7 @@ impl ServerSession {
     pub(super) fn require_capability(
         &mut self,
         target: &protocol::ObjectRef,
-        predicate: fn(&dyn crate::kube::resource_def::ResourceDef) -> bool,
+        required_op: protocol::OperationKind,
         action: &str,
     ) -> Option<BuiltInKind> {
         let Some(kind) = target.resource.built_in_kind() else {
@@ -219,7 +219,7 @@ impl ServerSession {
             return None;
         };
         let def = crate::kube::resource_defs::REGISTRY.by_kind(kind);
-        if !predicate(def) {
+        if !def.operations().contains(&required_op) {
             self.reject_async(format!("{} not supported on {}", action, def.gvr().plural));
             return None;
         }
@@ -281,7 +281,7 @@ impl ServerSession {
         if self.reject_if_namespace_unresolved(target, "Scale") { return; }
         let Some(kind) = self.require_capability(
             target,
-            |d| d.is_scaleable(),
+            protocol::OperationKind::Scale,
             "Scale",
         ) else { return; };
         let patch_body = ScalePatch { spec: ScaleSpec { replicas } };
@@ -307,7 +307,7 @@ impl ServerSession {
 
         let Some(kind) = self.require_capability(
             target,
-            |d| d.is_restartable(),
+            protocol::OperationKind::Restart,
             "Restart",
         ) else { return; };
         let patch_body = RestartPatch {
@@ -358,7 +358,7 @@ impl ServerSession {
             return;
         };
         let def = crate::kube::resource_defs::REGISTRY.by_kind(kind);
-        if !def.is_secret_like() {
+        if !def.operations().contains(&protocol::OperationKind::DecodeSecret) {
             let tx = self.event_tx.clone();
             let plural = def.gvr().plural;
             self.track_task(async move {

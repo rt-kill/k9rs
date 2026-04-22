@@ -385,7 +385,10 @@ fn handle_command_submit(
         ParsedCommand::Resource(rid) => {
             app.route = crate::app::Route::Resources;
             if rid.is_cluster_scoped() && !app.selected_ns.is_all() {
-                do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All);
+                // Just update the namespace — don't call do_switch_namespace
+                // which would nav.reset + subscribe (creating a subscription
+                // that nav.reset below immediately replaces = broken pipe).
+                app.selected_ns = crate::kube::protocol::Namespace::All;
             }
             let change = app.nav.reset(rid);
             *app.nav.filter_input_mut() = Default::default();
@@ -646,14 +649,23 @@ pub(crate) fn handle_filter_key(
         }
         KeyCode::Enter => {
             let text = std::mem::take(&mut app.nav.filter_input_mut().text);
+            let col = app.nav.filter_input_mut().column.take();
             app.nav.filter_input_mut().active = false;
             if !text.is_empty() {
                 let current_rid = app.nav.resource_id().clone();
+                let filter = if let Some(c) = col {
+                    crate::app::nav::NavFilter::ColumnGrep {
+                        pattern: crate::app::nav::CompiledGrep::new(text),
+                        col: c,
+                    }
+                } else {
+                    crate::app::nav::NavFilter::Grep(
+                        crate::app::nav::CompiledGrep::new(text),
+                    )
+                };
                 let change = app.nav.push(crate::app::nav::NavStep::new(
                     current_rid,
-                    Some(crate::app::nav::NavFilter::Grep(
-                        crate::app::nav::CompiledGrep::new(text),
-                    )),
+                    Some(filter),
                 ));
                 apply_nav_change(app, data_source, change);
             }

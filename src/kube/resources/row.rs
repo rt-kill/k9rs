@@ -51,6 +51,24 @@ pub struct ResourceRow {
     /// directly instead of parsing cells per resource type.
     #[serde(default)]
     pub health: RowHealth,
+    /// Summed CPU request across all containers, in millicores (pods only).
+    /// Used by the metrics overlay to compute %CPU/R.
+    ///
+    /// NOTE: no `skip_serializing_if` — bincode is positional, so skipping a
+    /// field shifts every subsequent field and deserialization reads garbage.
+    /// The `#[serde(default)]` is harmless (bincode ignores it) but left for
+    /// forward-compat with JSON snapshots.
+    #[serde(default)]
+    pub cpu_request: Option<u64>,
+    /// Summed CPU limit across all containers, in millicores (pods only).
+    #[serde(default)]
+    pub cpu_limit: Option<u64>,
+    /// Summed memory request across all containers, in bytes (pods only).
+    #[serde(default)]
+    pub mem_request: Option<u64>,
+    /// Summed memory limit across all containers, in bytes (pods only).
+    #[serde(default)]
+    pub mem_limit: Option<u64>,
 }
 
 /// CRD definition metadata (for rows in the `crds` table). Type alias over

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::kube::protocol::{OperationKind, ResourceId, ResourceScope};
 use crate::kube::resources::row::ResourceRow;
 
+
 /// The flavor of metrics-server overlay a resource receives. Different
 /// kinds are merged from different APIs into different columns, so the
 /// session event loop dispatches on this enum instead of string-matching
@@ -48,6 +49,10 @@ pub enum MetricsColumn {
     Mem,
     CpuPercent,
     MemPercent,
+    CpuPercentRequest,
+    CpuPercentLimit,
+    MemPercentRequest,
+    MemPercentLimit,
 }
 
 /// Display level for table columns. A column is visible when the user's
@@ -305,56 +310,13 @@ pub trait ResourceDef: Send + Sync + 'static {
     /// for everything else.
     fn metrics_kind(&self) -> Option<MetricsKind> { None }
 
-    // -- Capability flags -----------------------------------------------------
-    //
-    // Each def overrides the corresponding `is_*` to return `true`. The
-    // defaults opt out. The handlers used to dispatch through `as_*`
-    // downcasts returning `Option<&dyn Trait>`, but every marker trait was
-    // empty (no methods) so the trait-object indirection was pure ceremony.
-    // Collapsed to `bool` for clarity.
-
-    fn is_loggable(&self) -> bool { false }
-    fn is_shellable(&self) -> bool { false }
-    fn is_node_shellable(&self) -> bool { false }
-    fn is_show_nodeable(&self) -> bool { false }
-    fn is_scaleable(&self) -> bool { false }
-    fn is_restartable(&self) -> bool { false }
-    fn is_port_forwardable(&self) -> bool { false }
-    fn is_secret_like(&self) -> bool { false }
-
-    // Note: there is no `is_force_killable` or `is_cron_like` flag. Force-kill
-    // is pod-specific (the handler uses the typed `kube::Api<Pod>` directly,
-    // so "a future workload becomes force-killable" would silently mis-decode
-    // the body), and cron ops are CronJob-specific (the handler uses the
-    // typed `kube::Api<CronJob>`). The `operations()` default below checks
-    // `self.kind()` for these two directly — no fake-general flag that
-    // exactly one def returns `true` for.
-
-    /// The operations this resource supports. Derived from which `is_*`
-    /// flags return `true`, plus direct kind checks for pod/cronjob-only
-    /// ops. Every resource gets Describe/Yaml/Delete. Defs do not override
-    /// this — they override `is_*` instead.
+    /// Operations this resource supports. Each resource def overrides this
+    /// to declare its own operations. Every resource gets Describe/Yaml/Delete
+    /// by default.
     fn operations(&self) -> Vec<OperationKind> {
-        use OperationKind::*;
-        let mut ops = vec![Describe, Yaml, Delete];
-        if self.is_loggable() {
-            ops.extend_from_slice(&[StreamLogs, PreviousLogs]);
-        }
-        if self.is_shellable() { ops.push(Shell); }
-        if self.is_node_shellable() { ops.push(NodeShell); }
-        if self.is_show_nodeable() { ops.push(ShowNode); }
-        if self.is_scaleable() { ops.push(Scale); }
-        if self.is_restartable() { ops.push(Restart); }
-        if self.is_port_forwardable() { ops.push(PortForward); }
-        if self.is_secret_like() { ops.push(DecodeSecret); }
-        // Pod-only: force-kill.
-        if self.kind() == BuiltInKind::Pod { ops.push(ForceKill); }
-        // CronJob-only: manual trigger + toggle-suspend.
-        if self.kind() == BuiltInKind::CronJob {
-            ops.extend_from_slice(&[TriggerCronJob, ToggleSuspendCronJob]);
-        }
-        ops
+        vec![OperationKind::Describe, OperationKind::Yaml, OperationKind::Delete]
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -390,37 +352,18 @@ mod tests {
     use crate::kube::resource_defs::REGISTRY;
     use crate::kube::protocol::OperationKind;
 
-    /// Drift guard: every def's derived `operations()` list must contain
-    /// exactly the ops that correspond to its capability flags AND the
-    /// per-kind direct checks (ForceKill on Pod, TriggerCronJob /
-    /// ToggleSuspendCronJob on CronJob). Fails if someone adds a new
-    /// marker method without threading it through `operations()`, or if
-    /// the pod/cronjob-specific branches drift.
+    /// Every resource must include the base operations (Describe, Yaml, Delete).
     #[test]
-    fn operations_match_markers() {
-        use crate::kube::resource_def::BuiltInKind;
+    fn all_resources_have_base_operations() {
         for def in REGISTRY.all() {
             let ops = def.operations();
-            let check = |kind: OperationKind, present: bool, name: &str| {
-                assert_eq!(
-                    ops.contains(&kind), present,
-                    "def `{}` has_{} mismatch: operations = {:?}",
-                    def.gvr().kind, name, ops,
+            for base in [OperationKind::Describe, OperationKind::Yaml, OperationKind::Delete] {
+                assert!(
+                    ops.contains(&base),
+                    "def `{}` missing base operation {:?}",
+                    def.gvr().kind, base,
                 );
-            };
-            check(OperationKind::StreamLogs,   def.is_loggable(),         "loggable");
-            check(OperationKind::Shell,        def.is_shellable(),        "shellable");
-            check(OperationKind::ShowNode,     def.is_show_nodeable(),    "show_nodeable");
-            check(OperationKind::Scale,        def.is_scaleable(),        "scaleable");
-            check(OperationKind::Restart,      def.is_restartable(),      "restartable");
-            check(OperationKind::PortForward,  def.is_port_forwardable(), "port_forwardable");
-            check(OperationKind::DecodeSecret, def.is_secret_like(),      "secret_like");
-            // Pod-only: force-kill.
-            check(OperationKind::ForceKill, def.kind() == BuiltInKind::Pod, "pod_force_kill");
-            // CronJob-only: trigger + toggle-suspend.
-            let is_cron = def.kind() == BuiltInKind::CronJob;
-            check(OperationKind::TriggerCronJob,      is_cron, "cronjob_trigger");
-            check(OperationKind::ToggleSuspendCronJob, is_cron, "cronjob_toggle_suspend");
+            }
         }
     }
 }

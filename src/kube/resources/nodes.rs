@@ -76,6 +76,12 @@ pub(crate) fn node_to_row(node: Node) -> ResourceRow {
     let arch = node_info
         .map(|info| info.architecture.clone())
         .unwrap_or_default();
+    let os_image = node_info
+        .map(|info| info.os_image.clone())
+        .unwrap_or_default();
+    let kernel = node_info
+        .map(|info| info.kernel_version.clone())
+        .unwrap_or_default();
 
     // Addresses
     let addresses = status_val.addresses.unwrap_or_default();
@@ -103,7 +109,7 @@ pub(crate) fn node_to_row(node: Node) -> ResourceRow {
         .map(|q| q.0.clone())
         .unwrap_or_default();
 
-    // CPU (col 8) and MEMORY (col 9) are initially n/a — mutated by apply_node_metrics.
+    // CPU% and MEM% are initially n/a — mutated by apply_node_metrics.
     let drill_target = Some(DrillTarget::PodsByField(
         crate::app::nav::K8sFieldSelector::SpecNodeName(meta.name.clone()),
     ));
@@ -115,6 +121,8 @@ pub(crate) fn node_to_row(node: Node) -> ResourceRow {
             roles,
             taints.to_string(),
             version,
+            os_image,
+            kernel,
             internal_ip,
             external_ip,
             pods_capacity,

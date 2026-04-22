@@ -273,14 +273,14 @@ impl WatcherCache {
         if let Some(weak) = self.entries.get(&key) {
             if let Some(arc) = weak.upgrade() {
                 if !arc.task.is_finished() {
-                    tracing::info!("WatcherCache: reusing existing {} watcher for {:?}", label, key);
+                    tracing::debug!("WatcherCache: reusing existing {} watcher for {:?}", label, key);
                     return Subscription {
                         key,
                         snapshot_rx: arc.snapshot_tx.subscribe(),
                         _keepalive: arc,
                     };
                 }
-                tracing::info!("WatcherCache: existing {} watcher is dead, replacing for {:?}", label, key);
+                tracing::debug!("WatcherCache: existing {} watcher is dead, replacing for {:?}", label, key);
             }
         }
 
@@ -288,7 +288,7 @@ impl WatcherCache {
             Entry::Occupied(mut e) => {
                 if let Some(arc) = e.get().upgrade() {
                     if !arc.task.is_finished() {
-                        tracing::info!("WatcherCache: reusing {} watcher (race winner) for {:?}", label, key);
+                        tracing::debug!("WatcherCache: reusing {} watcher (race winner) for {:?}", label, key);
                         return Subscription {
                             key,
                             snapshot_rx: arc.snapshot_tx.subscribe(),
@@ -296,13 +296,13 @@ impl WatcherCache {
                         };
                     }
                 }
-                tracing::info!("WatcherCache: creating new {} watcher for {:?}", label, key);
+                tracing::debug!("WatcherCache: creating new {} watcher for {:?}", label, key);
                 let (live_query, snapshot_rx) = create(&key);
                 e.insert(Arc::downgrade(&live_query));
                 Subscription { key, snapshot_rx, _keepalive: live_query }
             }
             Entry::Vacant(e) => {
-                tracing::info!("WatcherCache: creating new {} watcher for {:?}", label, key);
+                tracing::debug!("WatcherCache: creating new {} watcher for {:?}", label, key);
                 let (live_query, snapshot_rx) = create(&key);
                 e.insert(Arc::downgrade(&live_query));
                 Subscription { key, snapshot_rx, _keepalive: live_query }

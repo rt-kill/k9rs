@@ -8,6 +8,29 @@ use crate::app::nav::rid;
 use crate::app::ContainerRef;
 use crate::kube::protocol::OperationKind;
 
+/// Map a key press to an action using the current resource's declared operations.
+/// Returns the action if the resource supports the corresponding operation, None otherwise.
+fn lookup_resource_op_key(app: &App, key: char) -> Option<Action> {
+    let rid = app.nav.resource_id();
+    let kind = rid.built_in_kind()?;
+    let def = crate::kube::resource_defs::REGISTRY.by_kind(kind);
+    let ops = def.operations();
+    let has = |op: OperationKind| ops.contains(&op);
+    match key {
+        'L' if has(OperationKind::StreamLogs) => Some(Action::Logs),
+        'p' if has(OperationKind::PreviousLogs) => Some(Action::PreviousLogs),
+        's' if has(OperationKind::Shell) => Some(Action::Shell),
+        's' if has(OperationKind::Scale) => Some(Action::Scale),
+        's' if has(OperationKind::ToggleSuspendCronJob) => Some(Action::SuspendCronJob),
+        's' if has(OperationKind::NodeShell) => Some(Action::NodeShell),
+        'r' if has(OperationKind::Restart) => Some(Action::Restart),
+        'x' if has(OperationKind::DecodeSecret) => Some(Action::DecodeSecret),
+        't' if has(OperationKind::TriggerCronJob) => Some(Action::TriggerCronJob),
+        'o' if has(OperationKind::ShowNode) => Some(Action::ShowNode),
+        _ => None,
+    }
+}
+
 /// Maps a `KeyEvent` to an `Action` based on the current application state.
 /// Returns `None` if the key has no binding in the current context.
 ///
@@ -127,12 +150,11 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(Action::ToggleWide);
     }
 
-    // Ctrl-H / Ctrl-L: column cursor left/right.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
-        return Some(Action::ColLeft);
-    }
+    // Ctrl-L: logs — dispatched via resource operations (same as Shift+L).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
-        return Some(Action::ColRight);
+        if let Some(action) = lookup_resource_op_key(app, 'L') {
+            return Some(action);
+        }
     }
 
     // Ctrl-Space: span-mark (select range).
@@ -171,12 +193,11 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(Action::Delete);
     }
 
-    // Ctrl-K: force-kill pod.
+    // Ctrl-K: force-kill — only if the resource declares it.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
-        if !app.current_capabilities().supports(OperationKind::ForceKill) {
-            return Some(Action::FlashInfo("Force-kill is only available on Pods".to_string()));
+        if app.current_capabilities().supports(OperationKind::ForceKill) {
+            return Some(Action::ForceKill);
         }
-        return Some(Action::ForceKill);
     }
 
     match key.code {
@@ -202,6 +223,8 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Navigation.
         KeyCode::Down | KeyCode::Char('j') => Some(Action::NextItem),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::PrevItem),
+        KeyCode::Left | KeyCode::Char('h') => Some(Action::ColLeft),
+        KeyCode::Right | KeyCode::Char('l') => Some(Action::ColRight),
         KeyCode::PageDown => Some(Action::PageDown),
         KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::Home | KeyCode::Char('g') => Some(Action::Home),
@@ -214,48 +237,11 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('d') => Some(Action::Describe),
         KeyCode::Char('y') => Some(Action::Yaml),
         KeyCode::Char('e') => Some(Action::Edit),
-
-        KeyCode::Char('l') => {
-            if app.current_capabilities().supports(OperationKind::StreamLogs) {
-                Some(Action::Logs)
-            } else {
-                Some(Action::FlashInfo("Logs not available for this resource type".to_string()))
-            }
-        }
-        KeyCode::Char('s') => {
-            let caps = app.current_capabilities();
-            if caps.supports(OperationKind::Shell) {
-                Some(Action::Shell)
-            } else if caps.supports(OperationKind::NodeShell) {
-                Some(Action::NodeShell)
-            } else if caps.supports(OperationKind::Scale) {
-                Some(Action::Scale)
-            } else if caps.supports(OperationKind::ToggleSuspendCronJob) {
-                Some(Action::SuspendCronJob)
-            } else {
-                None
-            }
-        }
-        KeyCode::Char('x') => {
-            if app.current_capabilities().supports(OperationKind::DecodeSecret) {
-                Some(Action::DecodeSecret)
-            } else {
-                None
-            }
-        }
-        KeyCode::Char('t') => {
-            if app.current_capabilities().supports(OperationKind::TriggerCronJob) {
-                Some(Action::TriggerCronJob)
-            } else {
-                None
-            }
-        }
-        KeyCode::Char('r') => {
-            if app.current_capabilities().supports(OperationKind::Restart) {
-                Some(Action::Restart)
-            } else {
-                None
-            }
+        // Resource-specific keys: dispatched via the resource def's operations().
+        // The resource declares which operations it supports; the mapping from
+        // key to action is derived from those operations.
+        KeyCode::Char(c @ ('L' | 's' | 'x' | 't' | 'r' | 'p' | 'o')) => {
+            lookup_resource_op_key(app, c)
         }
 
         // F: create a new port-forward (opens dialog).
@@ -263,29 +249,14 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // f: show active port-forwards for this resource.
         KeyCode::Char('f') => Some(Action::ShowPortForwards),
 
-        // Previous logs: available on pods and workload types.
-        KeyCode::Char('p') => {
-            if app.current_capabilities().supports(OperationKind::PreviousLogs) {
-                Some(Action::PreviousLogs)
-            } else {
-                Some(Action::FlashInfo("Logs not available for this resource type".to_string()))
-            }
-        }
-
-        // Show node for a pod.
-        KeyCode::Char('o') => {
-            if app.current_capabilities().supports(OperationKind::ShowNode) {
-                Some(Action::ShowNode)
-            } else {
-                Some(Action::FlashInfo("Show node is only available on Pods".to_string()))
-            }
-        }
-
         // Jump to owner (Shift+J). Navigates up the ownerReferences chain.
         KeyCode::Char('J') => Some(Action::JumpToOwner),
 
         // UsedBy (U). Shows which resources reference the selected row.
         KeyCode::Char('U') => Some(Action::UsedBy),
+
+        // Column-restricted grep: filter by hovered column only.
+        KeyCode::Char('~') => Some(Action::ColumnFilter),
 
         // Toggle between last two views.
         KeyCode::Char('-') => Some(Action::ToggleLastView),
@@ -302,18 +273,6 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
 
         // Sort by AGE (last column — resolved at apply time).
         KeyCode::Char('A') => Some(Action::Sort(crate::app::SortTarget::Last)),
-
-        // Sort by STATUS — pod-only (column 3 of the Pod schema). Gated on
-        // the typed `BuiltInKind::Pod` discriminant rather than "supports
-        // Shell" — the latter happens to coincide today (Pod is the only
-        // Shellable built-in) but is fragile: if any future resource gained
-        // Shell support, this would silently sort the wrong column.
-        KeyCode::Char('S')
-            if app.nav.resource_id().built_in_kind()
-                == Some(crate::kube::resource_def::BuiltInKind::Pod) =>
-        {
-            Some(Action::Sort(crate::app::SortTarget::Column(3)))
-        }
 
         // Copy.
         KeyCode::Char('c') => Some(Action::Copy),

@@ -186,6 +186,8 @@ pub(crate) async fn open_exec_route(
     let crate::kube::client_session::ExecStream { reader, writer } = stream;
     let tx = event_tx.clone();
     let bridge = tokio::spawn(async move {
+        let panic_tx = tx.clone();
+        let result = std::panic::AssertUnwindSafe(async {
         let mut reader = reader;
         loop {
             match crate::kube::protocol::read_bincode::<_, crate::kube::protocol::ExecFrame>(&mut reader).await {
@@ -198,6 +200,13 @@ pub(crate) async fn open_exec_route(
                     break;
                 }
             }
+        }
+        });
+        if let Err(_panic) = futures::FutureExt::catch_unwind(result).await {
+            let _ = panic_tx.send(crate::event::AppEvent::ExecEnded).await;
+            let _ = panic_tx.send(crate::event::AppEvent::Flash(
+                crate::app::FlashMessage::error("exec bridge panicked".to_string()),
+            )).await;
         }
     });
 

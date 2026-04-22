@@ -623,6 +623,12 @@ impl std::fmt::Display for NodeName {
 pub struct MetricsUsage {
     pub cpu: String,
     pub mem: String,
+    /// Raw CPU usage in millicores (for percentage computations).
+    #[serde(default)]
+    pub cpu_milli: u64,
+    /// Raw memory usage in bytes (for percentage computations).
+    #[serde(default)]
+    pub mem_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,11 +1108,39 @@ mod tests {
             health: RowHealth::Normal,
             crd_info: None,
             drill_target: None,
+            ..Default::default()
         };
         let bytes = bincode::serialize(&row).unwrap();
         let decoded: ResourceRow = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.name, "test-pod");
         assert_eq!(decoded.cells.len(), 4);
+        assert_eq!(decoded.cpu_request, None);
+        assert_eq!(decoded.cpu_limit, None);
+        assert_eq!(decoded.mem_request, None);
+        assert_eq!(decoded.mem_limit, None);
+    }
+
+    /// Verify that resource-request/limit fields survive a bincode
+    /// roundtrip. Bincode is positional and ignores `#[serde(default)]`
+    /// / `skip_serializing_if` — these fields are always on the wire.
+    #[test]
+    fn test_resource_row_bincode_roundtrip_with_metrics_fields() {
+        let row = ResourceRow {
+            cells: vec!["default".into(), "busy-pod".into()],
+            name: "busy-pod".into(),
+            namespace: Some("default".into()),
+            cpu_request: Some(500),
+            cpu_limit: Some(1000),
+            mem_request: Some(128 * 1024 * 1024),
+            mem_limit: Some(256 * 1024 * 1024),
+            ..Default::default()
+        };
+        let bytes = bincode::serialize(&row).unwrap();
+        let decoded: ResourceRow = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.cpu_request, Some(500));
+        assert_eq!(decoded.cpu_limit, Some(1000));
+        assert_eq!(decoded.mem_request, Some(128 * 1024 * 1024));
+        assert_eq!(decoded.mem_limit, Some(256 * 1024 * 1024));
     }
 
     #[test]
@@ -1123,6 +1157,7 @@ mod tests {
             health: RowHealth::Normal,
             crd_info: None,
             drill_target: None,
+            ..Default::default()
         };
         let update = ResourceUpdate::Rows {
             resource: rid.clone(),
@@ -1159,6 +1194,7 @@ mod tests {
                 health: RowHealth::Normal,
                 crd_info: None,
                 drill_target: None,
+                ..Default::default()
             }],
         };
         // StreamEvent (substream wire type) bincode roundtrip.

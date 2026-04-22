@@ -73,9 +73,10 @@ pub fn parse_pod_metrics_usage(data: &serde_json::Value) -> crate::kube::protoco
         }
     }
 
+    let cpu_milli = total_cpu_nano / 1_000_000;
     let cpu = crate::util::format_cpu(&format!("{}n", total_cpu_nano));
     let mem = crate::util::format_mem(&total_mem_bytes.to_string());
-    crate::kube::protocol::MetricsUsage { cpu, mem }
+    crate::kube::protocol::MetricsUsage { cpu, mem, cpu_milli, mem_bytes: total_mem_bytes }
 }
 
 /// Parse node metrics from a DynamicObject's data field.
@@ -92,14 +93,21 @@ pub fn parse_node_metrics_usage(data: &serde_json::Value) -> crate::kube::protoc
         .map(crate::util::format_mem)
         .unwrap_or_else(|| "n/a".to_string());
 
-    crate::kube::protocol::MetricsUsage { cpu, mem }
+    let cpu_milli = metrics.usage.cpu.as_deref()
+        .map(|s| parse_cpu_to_nano(s) / 1_000_000)
+        .unwrap_or(0);
+    let mem_bytes = metrics.usage.memory.as_deref()
+        .map(parse_mem_to_bytes)
+        .unwrap_or(0);
+
+    crate::kube::protocol::MetricsUsage { cpu, mem, cpu_milli, mem_bytes }
 }
 
 // ---------------------------------------------------------------------------
 // Unit parsing helpers
 // ---------------------------------------------------------------------------
 
-fn parse_cpu_to_nano(s: &str) -> u64 {
+pub fn parse_cpu_to_nano(s: &str) -> u64 {
     let s = s.trim();
     // K8s Quantity (for CPU) accepts:
     //   "500n"  → nanocores
@@ -127,7 +135,7 @@ fn parse_cpu_to_nano(s: &str) -> u64 {
     }
 }
 
-fn parse_mem_to_bytes(s: &str) -> u64 {
+pub fn parse_mem_to_bytes(s: &str) -> u64 {
     // K8s Quantity permits BOTH binary (Ki/Mi/Gi/Ti, base-1024) AND
     // decimal (K/M/G/T, base-1000) suffixes. Older code only handled the
     // binary ones, so decimal payloads fell through and silently rendered

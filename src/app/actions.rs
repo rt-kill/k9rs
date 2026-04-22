@@ -131,6 +131,8 @@ pub enum Action {
     ColLeft,
     /// Move the column cursor right.
     ColRight,
+    /// Open the filter input restricted to the currently hovered column.
+    ColumnFilter,
     /// Toggle wide column mode.
     ToggleWide,
     /// Toggle fault filter (show only unhealthy resources).
