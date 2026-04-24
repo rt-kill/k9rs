@@ -2,8 +2,9 @@ use k8s_openapi::api::core::v1::PersistentVolume;
 
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
+use crate::kube::resources::k8s_const::*;
 use crate::kube::resources::{CommonMeta, access_mode_short};
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
 // ---------------------------------------------------------------------------
 // PvDef
@@ -41,7 +42,7 @@ impl ConvertToRow<PersistentVolume> for PvDef {
             .map(|modes| modes.iter().map(|m| access_mode_short(m)).collect::<Vec<_>>().join(","))
             .unwrap_or_default();
         let reclaim_policy = spec.persistent_volume_reclaim_policy.unwrap_or_else(|| "Retain".to_string());
-        let status = pv.status.and_then(|s| s.phase).unwrap_or_else(|| "Available".to_string());
+        let status = pv.status.and_then(|s| s.phase).unwrap_or_else(|| PHASE_AVAILABLE.to_string());
         let claim = spec.claim_ref
             .map(|cr| {
                 let cns = cr.namespace.unwrap_or_default();
@@ -50,14 +51,25 @@ impl ConvertToRow<PersistentVolume> for PvDef {
             })
             .unwrap_or_default();
         let storage_class = spec.storage_class_name.unwrap_or_default();
-        ResourceRow {
-            cells: vec![
-                meta.name.clone(),
-                capacity, access_modes, reclaim_policy, status, claim, storage_class,
-                crate::util::format_age(meta.age),
-            ],
+        let health = match status.as_str() {
+            PHASE_BOUND => RowHealth::Normal,
+            PHASE_AVAILABLE | "Released" => RowHealth::Pending,
+            _ => RowHealth::Failed,
+        };
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(capacity),
+            CellValue::Text(access_modes),
+            CellValue::Text(reclaim_policy),
+            CellValue::Status { text: status, health },
+            CellValue::Text(claim),
+            CellValue::Text(storage_class),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: None,
+            health,
+            cells,
             ..Default::default()
         }
     }

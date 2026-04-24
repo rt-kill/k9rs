@@ -3,7 +3,7 @@ use k8s_openapi::api::core::v1::Event;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // EventDef
@@ -58,14 +58,19 @@ impl ConvertToRow<Event> for EventDef {
             format!("{}/{}", kind.to_lowercase(), obj_name)
         };
         let source = ev.source.and_then(|s| s.component).unwrap_or_default();
-        ResourceRow {
-            cells: vec![
-                meta.namespace.clone(),
-                event_type, reason, involved_object.clone(), message, source,
-                count.to_string(), crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(event_type),
+            CellValue::Text(reason),
+            CellValue::Text(involved_object.clone()),
+            CellValue::Text(message),
+            CellValue::Text(source),
+            CellValue::Count(count as i64),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: involved_object,
             namespace: Some(meta.namespace),
+            cells,
             ..Default::default()
         }
     }

@@ -9,7 +9,7 @@ use ratatui::{
 use crate::ui::theme::Theme;
 
 /// State for the YAML viewer widget. Pure data — the authoritative state
-/// lives in [`crate::app::ContentViewState`] (inside `Route::Yaml`); this
+/// lives in [`crate::app::ContentViewState`] (inside `Route::ContentView`); this
 /// struct is just the per-frame snapshot that satisfies
 /// `StatefulWidget::State`. The view function builds it via struct literal
 /// each draw, so impl methods would be dead weight.
@@ -40,7 +40,8 @@ impl<'a> YamlViewer<'a> {
         }
     }
 
-    /// Classify and style a single line of YAML.
+    /// Classify and style a single line of YAML. All spans borrow from
+    /// the input `line` — zero heap allocations per call.
     fn style_yaml_line<'b>(line: &'b str, theme: &'b Theme) -> Vec<Span<'b>> {
         let trimmed = line.trim();
 
@@ -52,34 +53,33 @@ impl<'a> YamlViewer<'a> {
         // Lines with key: value
         if let Some(colon_pos) = find_yaml_colon(line) {
             let (key_part, rest) = line.split_at(colon_pos);
-            let mut spans = vec![Span::styled(key_part.to_string(), theme.yaml_key)];
+            let mut spans = vec![Span::styled(key_part, theme.yaml_key)];
 
-            // The colon
             if rest.len() > 1 {
-                spans.push(Span::styled(":".to_string(), theme.yaml_key));
+                spans.push(Span::styled(":", theme.yaml_key));
                 let value = &rest[1..]; // skip ':'
                 let value_trimmed = value.trim();
 
                 if value_trimmed.is_empty() {
-                    spans.push(Span::styled(value.to_string(), theme.row_normal));
+                    spans.push(Span::styled(value, theme.row_normal));
                 } else if value_trimmed.starts_with('"')
                     || value_trimmed.starts_with('\'')
                     || value_trimmed.starts_with('|')
                     || value_trimmed.starts_with('>')
                 {
-                    spans.push(Span::styled(value.to_string(), theme.yaml_string));
+                    spans.push(Span::styled(value, theme.yaml_string));
                 } else if value_trimmed == "true"
                     || value_trimmed == "false"
                     || value_trimmed == "null"
                     || value_trimmed == "~"
                     || value_trimmed.parse::<f64>().is_ok()
                 {
-                    spans.push(Span::styled(value.to_string(), theme.yaml_number));
+                    spans.push(Span::styled(value, theme.yaml_number));
                 } else {
-                    spans.push(Span::styled(value.to_string(), theme.yaml_string));
+                    spans.push(Span::styled(value, theme.yaml_string));
                 }
             } else {
-                spans.push(Span::styled(":".to_string(), theme.yaml_key));
+                spans.push(Span::styled(":", theme.yaml_key));
             }
 
             return spans;
@@ -91,8 +91,8 @@ impl<'a> YamlViewer<'a> {
             let indent = &line[..indent_len];
             let rest = &line[indent_len..];
             return vec![
-                Span::styled(indent.to_string(), theme.row_normal),
-                Span::styled(rest.to_string(), theme.yaml_string),
+                Span::styled(indent, theme.row_normal),
+                Span::styled(rest, theme.yaml_string),
             ];
         }
 
@@ -101,7 +101,7 @@ impl<'a> YamlViewer<'a> {
             return vec![Span::styled(line, theme.border)];
         }
 
-        vec![Span::styled(line.to_string(), theme.row_normal)]
+        vec![Span::styled(line, theme.row_normal)]
     }
 }
 

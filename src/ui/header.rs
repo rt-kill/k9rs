@@ -44,9 +44,9 @@ pub fn draw_header(
         return;
     }
 
-    let ctx = if app.context.is_empty() { "connecting..." } else { app.context.as_str() };
-    let cluster = if app.identity.cluster.is_empty() { "n/a" } else { &app.identity.cluster };
-    let user = if app.identity.user.is_empty() { "n/a" } else { &app.identity.user };
+    let ctx = if app.kube.context.is_empty() { "connecting..." } else { app.kube.context.as_str() };
+    let cluster = if app.kube.identity.cluster.is_empty() { "n/a" } else { &app.kube.identity.cluster };
+    let user = if app.kube.identity.user.is_empty() { "n/a" } else { &app.kube.identity.user };
 
     let logo_width = LOGO.iter().map(|l| l.len()).max().unwrap_or(0) as u16 + 2;
     let cols = Layout::horizontal([
@@ -89,26 +89,26 @@ pub fn draw_cluster_info(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled(" Context:   ", theme.info_label),
-            if app.context.is_empty() {
+            if app.kube.context.is_empty() {
                 Span::styled("connecting…", theme.info_na)
             } else {
-                Span::styled(app.context.as_str(), theme.info_value)
+                Span::styled(app.kube.context.as_str(), theme.info_value)
             },
         ]),
         Line::from(vec![
             Span::styled(" Cluster:   ", theme.info_label),
-            if app.identity.cluster.is_empty() {
+            if app.kube.identity.cluster.is_empty() {
                 Span::styled("n/a", theme.info_na)
             } else {
-                Span::styled(&app.identity.cluster, theme.info_value)
+                Span::styled(&app.kube.identity.cluster, theme.info_value)
             },
         ]),
         Line::from(vec![
             Span::styled(" User:      ", theme.info_label),
-            if app.identity.user.is_empty() {
+            if app.kube.identity.user.is_empty() {
                 Span::styled("n/a", theme.info_na)
             } else {
-                Span::styled(&app.identity.user, theme.info_value)
+                Span::styled(&app.kube.identity.user, theme.info_value)
             },
         ]),
         Line::from(vec![
@@ -121,7 +121,8 @@ pub fn draw_cluster_info(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         if i as u16 >= area.height {
             break;
         }
-        f.render_widget(line.clone(), Rect::new(area.x, area.y + i as u16, area.width, 1));
+        let y = area.y + i as u16;
+        f.buffer_mut().set_line(area.x, y, line, area.width);
     }
 }
 

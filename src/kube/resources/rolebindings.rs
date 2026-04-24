@@ -3,7 +3,7 @@ use k8s_openapi::api::rbac::v1::RoleBinding;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // RoleBindingDef
@@ -35,13 +35,16 @@ impl ConvertToRow<RoleBinding> for RoleBindingDef {
         let subjects = rb.subjects
             .map(|subs| subs.iter().map(|s| format!("{}:{}", s.kind, s.name)).collect::<Vec<_>>().join(","))
             .unwrap_or_default();
-        ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                role_ref, subjects, crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(role_ref),
+            CellValue::Text(subjects),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: Some(meta.namespace),
+            cells,
             ..Default::default()
         }
     }

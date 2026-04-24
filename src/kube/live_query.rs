@@ -262,7 +262,7 @@ impl WatcherCache {
     {
         use dashmap::mapref::entry::Entry;
 
-        let label = if matches!(&key.resource, crate::kube::protocol::ResourceId::Crd(_)) {
+        let label = if matches!(&key.resource, crate::kube::protocol::ResourceId::Crd(_) | crate::kube::protocol::ResourceId::CrdUnresolved(_)) {
             "dynamic"
         } else {
             "typed"

@@ -3,7 +3,7 @@ use k8s_openapi::api::scheduling::v1::PriorityClass;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // PriorityClassDef
@@ -31,17 +31,19 @@ impl ResourceDef for PriorityClassDef {
 impl ConvertToRow<PriorityClass> for PriorityClassDef {
     fn convert(pc: PriorityClass) -> ResourceRow {
         let meta = CommonMeta::from_k8s(pc.metadata);
-        let value = pc.value.to_string();
-        let global_default = if pc.global_default.unwrap_or(false) { "true" } else { "false" };
+        let _value = pc.value.to_string();
+        let _global_default = if pc.global_default.unwrap_or(false) { "true" } else { "false" };
         let preemption = pc.preemption_policy.unwrap_or_else(|| "PreemptLowerPriority".to_string());
-        ResourceRow {
-            cells: vec![
-                meta.name.clone(),
-                value, global_default.to_string(), preemption,
-                crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.name.clone()),
+            CellValue::Count(pc.value as i64),
+            CellValue::Bool(pc.global_default.unwrap_or(false)),
+            CellValue::Text(preemption),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: None,
+            cells,
             ..Default::default()
         }
     }

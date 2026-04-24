@@ -70,44 +70,49 @@ fn key_hints_for_resource(caps: &ResourceCapabilities) -> Vec<crate::ui::header:
 // Render a generic resource table given headers and row data.
 // ---------------------------------------------------------------------------
 
-/// Render a resource table. Returns the new `(offset, page_size)` so the
-/// caller can write them back to the `StatefulTable` after the immutable
-/// borrow is released — avoids the `&mut table` + `&table.marked`
-/// borrow conflict that would otherwise force a per-frame allocation.
+/// Snapshot of table state extracted before the mutable borrow for rendering.
+/// Groups the 15+ parameters that `draw_unified_table` passes to the widget,
+/// avoiding the 17-arg function that was here before.
+struct TableSnapshot<'a> {
+    headers: Vec<&'a str>,
+    rows: &'a [Vec<String>],
+    selected: usize,
+    offset: usize,
+    selected_col: usize,
+    col_offset: u16,
+    sort_ascending: bool,
+    display_sort_col: Option<usize>,
+    namespace: &'a str,
+    marked: &'a std::collections::HashSet<crate::kube::protocol::ObjectKey>,
+    changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
+    row_keys: &'a [crate::kube::protocol::ObjectKey],
+    row_health: &'a [crate::kube::resources::row::RowHealth],
+}
+
+/// Render a resource table from a pre-built snapshot. Returns the new
+/// `(offset, page_size, col_offset)` for the caller to write back.
 fn draw_resource_table(
     f: &mut Frame,
     area: Rect,
     title: &str,
-    headers: Vec<&str>,
-    rows: &[Vec<String>],
-    selected: usize,
-    initial_offset: usize,
-    selected_col: usize,
-    col_offset: u16,
-    sort_ascending: bool,
-    namespace: &str,
+    snap: &TableSnapshot<'_>,
     theme: &Theme,
-    marked: &std::collections::HashSet<crate::kube::protocol::ObjectKey>,
-    display_sort_col: Option<usize>,
-    changed_rows: &std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
-    row_keys: &[crate::kube::protocol::ObjectKey],
-    row_health: &[crate::kube::resources::row::RowHealth],
 ) -> (usize, usize, u16) {
     let visible_height = (area.height as usize).saturating_sub(3);
 
-    let rt = ResourceTable::new(headers, rows, title, theme)
-        .sort(display_sort_col, sort_ascending)
-        .namespace(namespace)
-        .marked(marked)
-        .changed_rows(changed_rows)
-        .row_keys(row_keys)
-        .row_health(row_health);
+    let rt = ResourceTable::new(snap.headers.clone(), snap.rows, title, theme)
+        .sort(snap.display_sort_col, snap.sort_ascending)
+        .namespace(snap.namespace)
+        .marked(snap.marked)
+        .changed_rows(snap.changed_rows)
+        .row_keys(snap.row_keys)
+        .row_health(snap.row_health);
 
     let mut state = ResourceTableState {
-        selected,
-        offset: initial_offset,
-        selected_col,
-        col_offset,
+        selected: snap.selected,
+        offset: snap.offset,
+        selected_col: snap.selected_col,
+        col_offset: snap.col_offset,
         filtered_count: 0,
     };
 
@@ -158,6 +163,10 @@ fn draw_unified_table(
     let visible_indices: Vec<usize> = visible.iter().map(|&(i, _)| i).collect();
     let headers: Vec<&str> = visible.iter().map(|&(_, name)| name).collect();
 
+    // Update num_cols to reflect VISIBLE column count (not total).
+    // This ensures col_left/col_right navigation stays within bounds.
+    table.set_num_cols(visible.len());
+
     if table.items.is_empty() {
         let loading_text = if let Some(ref err) = table.error {
             format!("Error: {}", err)
@@ -193,25 +202,37 @@ fn draw_unified_table(
     // StatefulTable — no manual index arithmetic in the render path.
     let view = table.prepare_view(&visible_indices);
 
-    let selected = table.selected;
-    let initial_offset = table.offset;
-    let selected_col = table.selected_col;
-    let col_offset = table.col_offset;
-    let sort_ascending = table.sort_ascending;
-    let display_sort_col = visible_indices.iter().position(|&i| i == table.sort_column);
+    let selected = table.selected();
+    let initial_offset = table.offset();
+    let selected_col = table.selected_col();
+    let col_offset = table.col_offset();
+    let sort_ascending = table.sort_ascending();
+    let display_sort_col = visible_indices.iter().position(|&i| i == table.sort_column());
     let marked: &std::collections::HashSet<crate::kube::protocol::ObjectKey> = &table.marked;
 
     let ns_label = if namespace.is_all() { "" } else { namespace.display() };
+    let snap = TableSnapshot {
+        headers,
+        rows: &view.rows,
+        selected,
+        offset: initial_offset,
+        selected_col,
+        col_offset,
+        sort_ascending,
+        display_sort_col,
+        namespace: ns_label,
+        marked,
+        changed_rows,
+        row_keys: &view.keys,
+        row_health: &view.health,
+    };
     let (new_offset, new_page_size, new_col_offset) = draw_resource_table(
-        f, area, title, headers, &view.rows,
-        selected, initial_offset, selected_col, col_offset,
-        sort_ascending, ns_label, theme,
-        marked, display_sort_col, changed_rows, &view.keys, &view.health,
+        f, area, title, &snap, theme,
     );
 
-    table.offset = new_offset;
-    table.page_size = new_page_size;
-    table.col_offset = new_col_offset;
+    table.set_offset(new_offset);
+    table.set_page_size(new_page_size);
+    table.set_col_offset(new_col_offset);
 }
 
 // ---------------------------------------------------------------------------
@@ -234,11 +255,11 @@ fn draw_unified_table(
 /// +--flash (1 line)--------------------------------------------+
 /// ```
 pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
-    let theme = &app.theme;
+    let theme = &app.ui.theme;
 
     // Determine dynamic section heights
-    let header_height: u16 = if app.show_header { crate::ui::HEADER_HEIGHT } else { 0 };
-    let command_height: u16 = if app.input_mode.is_active() { 3 } else { 0 };
+    let header_height: u16 = if app.ui.show_header { crate::ui::HEADER_HEIGHT } else { 0 };
+    let command_height: u16 = if app.ui.input_mode.is_active() { 3 } else { 0 };
     // Only show the filter bar box while actively typing; when committed
     // (inactive but text non-empty), the table title shows `</:filter_text>`.
     let filter_visible = app.nav.filter_input().active;
@@ -262,7 +283,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let flash_area = chunks[5];
 
     // 1. Header section: 3 columns (only when visible)
-    if app.show_header {
+    if app.ui.show_header {
         let caps = app.current_capabilities();
         header::draw_header(f, app, header_area, theme, |f, area, theme| {
             draw_key_hints(f, &caps, area, theme);
@@ -270,7 +291,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // 2. Command prompt (only when command mode active)
-    if app.input_mode.is_active() {
+    if app.ui.input_mode.is_active() {
         draw_command_prompt(f, app, command_area, theme);
     }
 
@@ -291,22 +312,22 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     // 4. Resource table. Collect the borrows we need into locals *before*
     // taking the mutable reference to the table so the borrow checker stays
     // happy.
-    let ns_display = app.selected_ns.display();
-    let ns = app.selected_ns.clone();
-    let cl = app.column_level;
+    let ns_display = app.kube.selected_ns.display();
+    let ns = app.kube.selected_ns.clone();
+    let cl = app.ui.column_level;
     let current_rid = app.nav.resource_id().clone();
-    let title = current_rid.short_label().to_string();
+    let title = current_rid.short_label().to_lowercase();
     let is_global = crate::app::nav::is_globally_stored(&current_rid);
-    // Descriptor lookup: global store for globally-stored resources, nav stack otherwise.
     let desc = if is_global {
         app.data.descriptors.get(&current_rid).cloned()
     } else {
         app.nav.find_descriptor_for_resource(&current_rid).cloned()
     };
-    let changed_rows = app.deltas.changed_rows();
-    // Table lookup: global store for globally-stored resources, nav stack otherwise.
+    let changed_rows = app.ui.deltas.changed_rows();
+    // Manual routing (not `active_view_table_mut()`) to avoid borrow
+    // conflict with `theme` — `&mut self` would conflict with `&app.ui.theme`.
     let table_ref = if is_global {
-        app.data.unified.get_mut(&current_rid)
+        app.data.tables.get_mut(&current_rid)
     } else {
         app.nav.find_table_for_resource_mut(&current_rid)
     };
@@ -381,7 +402,7 @@ pub fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) 
         return;
     }
 
-    let input = app.input_mode.input().unwrap_or("");
+    let input = app.ui.input_mode.input().unwrap_or("");
     let ghost: String = app.best_completion()
         .and_then(|c| c.strip_prefix(input).map(str::to_string))
         .unwrap_or_default();
@@ -389,7 +410,7 @@ pub fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) 
     // Fish-style rendering: typed text (bright) followed immediately by ghost
     // text (dim/italic) with no block cursor in between. The terminal cursor
     // is placed right after the typed text via set_cursor_position.
-    let prefix = app.input_mode.prompt();
+    let prefix = app.ui.input_mode.prompt();
     let prefix_len: u16 = prefix.width() as u16;
     let typed_len = input.width() as u16;
 

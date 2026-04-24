@@ -90,8 +90,13 @@ pub const LOCAL_GROUP: &str = "k9rs.local";
 ///   with (Pod, Deployment, etc.). Carries only the typed [`BuiltInKind`]
 ///   discriminant; group/version/kind/plural/scope are fetched on demand
 ///   from the registry's `&'static Gvr`. No allocation.
-/// - [`ResourceId::Crd`]: a runtime-discovered CRD. Carries the GVR strings
-///   in a [`CrdRef`] because CRDs are not statically known.
+/// - [`ResourceId::Crd`]: a runtime-discovered CRD with fully resolved GVR.
+///   Carries the GVR strings in a [`CrdRef`] because CRDs are not statically
+///   known.
+/// - [`ResourceId::CrdUnresolved`]: a CRD referenced by plural name only
+///   (e.g. user typed `:nodeclaims`). The daemon resolves this to `Crd` via
+///   API discovery. Compile-time distinct from `Crd` so code that expects
+///   a resolved GVR cannot accidentally receive a placeholder.
 /// - [`ResourceId::Local`]: a daemon-owned local resource (port-forwards,
 ///   etc.). Like built-ins, carries only the typed [`LocalResourceKind`]
 ///   discriminant.
@@ -105,8 +110,16 @@ pub enum ResourceId {
     /// Closed-set, statically-known K8s resource. Carries only the typed
     /// kind — the full GVR is looked up from the registry.
     BuiltIn(BuiltInKind),
-    /// Runtime-discovered CRD with raw GVR strings.
+    /// Runtime-discovered CRD with raw GVR strings. Always fully resolved
+    /// (group, version, kind, plural, scope all populated).
     Crd(CrdRef),
+    /// Placeholder for a CRD the user referenced by plural name (e.g.
+    /// `:nodeclaims`) before discovery has filled in the full GVR. The
+    /// daemon resolves this to `Crd(CrdRef)` via API discovery and sends
+    /// a `StreamEvent::Resolved` back to the TUI. Compile-time distinct
+    /// from `Crd` so code that expects a resolved GVR cannot accidentally
+    /// receive an unresolved placeholder.
+    CrdUnresolved(String),
     /// Daemon-owned local resource (port-forwards, etc.).
     Local(LocalResourceKind),
 }
@@ -161,30 +174,6 @@ impl CrdRef {
         }
     }
 
-    /// Build a "please resolve me" placeholder CrdRef for cases where the
-    /// client only knows the plural / kind and the daemon needs to fill in
-    /// group + version via discovery (e.g. user types `:nodeclaims`,
-    /// owner-chain drill-down where the owner kind isn't in the registry).
-    /// The daemon's `api_resource_for` recognizes this shape via
-    /// [`Self::is_unresolved`] and walks discovery.
-    pub fn unresolved(plural: impl Into<String>) -> Self {
-        let plural = plural.into();
-        Self {
-            group: String::new(),
-            version: String::new(),
-            kind: plural.clone(),
-            plural,
-            scope: ResourceScope::Namespaced,
-        }
-    }
-
-    /// True if this is an unresolved placeholder produced by
-    /// [`Self::unresolved`]. Replaces the open-coded
-    /// `crd_ref.group.is_empty() && crd_ref.version.is_empty()` checks
-    /// at every dispatch site.
-    pub fn is_unresolved(&self) -> bool {
-        self.group.is_empty() && self.version.is_empty()
-    }
 }
 
 impl From<BuiltInKind> for ResourceId {
@@ -251,9 +240,9 @@ impl ResourceId {
         matches!(self, ResourceId::Local(_))
     }
 
-    /// True if this is a runtime-discovered CRD.
+    /// True if this is a CRD (resolved or unresolved).
     pub fn is_crd(&self) -> bool {
-        matches!(self, ResourceId::Crd(_))
+        matches!(self, ResourceId::Crd(_) | ResourceId::CrdUnresolved(_))
     }
 
     /// Extract the typed [`BuiltInKind`] if this is a built-in. Useful for
@@ -291,6 +280,14 @@ impl ResourceId {
                 // CRDs have no def-defined short label; fall back to kind.
                 short_label: &r.kind,
                 scope: r.scope,
+            },
+            ResourceId::CrdUnresolved(plural) => IdentityData {
+                group: "",
+                version: "",
+                kind_str: plural,
+                plural,
+                short_label: plural,
+                scope: ResourceScope::Namespaced,
             },
             ResourceId::Local(k) => IdentityData {
                 group: LOCAL_GROUP,
@@ -344,7 +341,7 @@ impl ResourceId {
                 crate::kube::resource_defs::REGISTRY.by_kind(*k).operations()
             }
             ResourceId::Local(k) => k.operations(),
-            ResourceId::Crd(_) => {
+            ResourceId::Crd(_) | ResourceId::CrdUnresolved(_) => {
                 vec![OperationKind::Describe, OperationKind::Yaml, OperationKind::Delete]
             }
         };
@@ -927,7 +924,7 @@ pub struct LogInit {
 /// changes in a bincode-incompatible way (new fields, reordering, etc.).
 /// The daemon rejects Init commands with a mismatched version so stale
 /// daemons fail fast instead of producing silent data corruption.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// All commands from any client (TUI session or management CLI).
 /// The first command on a connection determines the connection type:
@@ -1101,12 +1098,17 @@ pub enum SessionEvent {
 mod tests {
     use super::*;
     use crate::event::ResourceUpdate;
-    use crate::kube::resources::row::{ResourceRow, RowHealth};
+    use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
     #[test]
     fn test_resource_row_bincode_roundtrip() {
         let row = ResourceRow {
-            cells: vec!["default".into(), "test-pod".into(), "1/1".into(), "Running".into()],
+            cells: vec![
+                CellValue::Text("default".into()),
+                CellValue::Text("test-pod".into()),
+                CellValue::Text("1/1".into()),
+                CellValue::Text("Running".into()),
+            ],
             name: "test-pod".into(),
             namespace: Some("default".into()),
             containers: Vec::new(),
@@ -1134,7 +1136,10 @@ mod tests {
     #[test]
     fn test_resource_row_bincode_roundtrip_with_metrics_fields() {
         let row = ResourceRow {
-            cells: vec!["default".into(), "busy-pod".into()],
+            cells: vec![
+                CellValue::Text("default".into()),
+                CellValue::Text("busy-pod".into()),
+            ],
             name: "busy-pod".into(),
             namespace: Some("default".into()),
             cpu_request: Some(500),
@@ -1155,7 +1160,10 @@ mod tests {
     fn test_resource_update_rows_bincode_roundtrip() {
         let rid = ResourceId::BuiltIn(BuiltInKind::Pod);
         let row = ResourceRow {
-            cells: vec!["default".into(), "test".into()],
+            cells: vec![
+                CellValue::Text("default".into()),
+                CellValue::Text("test".into()),
+            ],
             name: "test".into(),
             namespace: Some("default".into()),
             containers: Vec::new(),
@@ -1192,7 +1200,11 @@ mod tests {
             resource: rid,
             headers: vec!["NAMESPACE".into(), "NAME".into(), "READY".into()],
             rows: vec![ResourceRow {
-                cells: vec!["prod".into(), "web".into(), "3/3".into()],
+                cells: vec![
+                    CellValue::Text("prod".into()),
+                    CellValue::Text("web".into()),
+                    CellValue::Text("3/3".into()),
+                ],
                 name: "web".into(),
                 namespace: Some("prod".into()),
                 containers: Vec::new(),

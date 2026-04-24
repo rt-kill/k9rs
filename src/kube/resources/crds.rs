@@ -3,7 +3,7 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomRe
 use crate::kube::protocol::{CrdRef, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::{DrillTarget, ResourceRow};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // CrdDef
@@ -44,19 +44,19 @@ impl ConvertToRow<CustomResourceDefinition> for CrdDef {
         let gvr = CrdRef::new(spec.group, version, spec.names.kind, spec.names.plural, scope);
         let scope_label = scope.k8s_label();
 
-        ResourceRow {
-            cells: vec![
-                meta.name.clone(),
-                gvr.group.clone(),
-                gvr.version.clone(),
-                gvr.kind.clone(),
-                scope_label.to_string(),
-                crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(gvr.group.clone()),
+            CellValue::Text(gvr.version.clone()),
+            CellValue::Text(gvr.kind.clone()),
+            CellValue::Text(scope_label.to_string()),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: None,
             crd_info: Some(gvr.clone()),
             drill_target: Some(DrillTarget::BrowseCrd(gvr)),
+            cells,
             ..Default::default()
         }
     }

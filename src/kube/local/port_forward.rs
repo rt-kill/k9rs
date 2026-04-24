@@ -18,7 +18,7 @@ use crate::event::ResourceUpdate;
 use crate::kube::protocol::{
     Namespace, ObjectRef, ResourceId,
 };
-use crate::kube::resources::row::{ResourceRow, RowHealth};
+use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
 use super::LocalResourceSource;
 
@@ -570,17 +570,22 @@ pub fn pf_to_row(entry: &PortForwardEntry) -> ResourceRow {
         PortForwardState::Failed => RowHealth::Failed,
         _ => RowHealth::Pending,
     };
-    ResourceRow {
-        cells: vec![
-            row_name.clone(),
-            entry.kubectl_target.clone(),
-            if entry.namespace.is_empty() { "-".into() } else { entry.namespace.clone() },
-            entry.local_port.to_string(),
-            entry.remote_port.to_string(),
-            entry.state.as_str().to_string(),
-            age,
-            entry.last_message.clone(),
-        ],
+    let state_health = match entry.state {
+        PortForwardState::Active => RowHealth::Normal,
+        PortForwardState::Starting => RowHealth::Pending,
+        PortForwardState::Failed => RowHealth::Failed,
+        _ => RowHealth::Pending,
+    };
+    let cells: Vec<CellValue> = vec![
+        CellValue::Text(row_name.clone()),
+        CellValue::Text(entry.kubectl_target.clone()),
+        CellValue::Text(if entry.namespace.is_empty() { "-".into() } else { entry.namespace.clone() }),
+        CellValue::Count(entry.local_port as i64),
+        CellValue::Count(entry.remote_port as i64),
+        CellValue::Status { text: entry.state.as_str().to_string(), health: state_health },
+        CellValue::Text(age),
+        CellValue::Text(entry.last_message.clone()),
+    ];    ResourceRow {
         name: row_name,
         namespace: Some(entry.namespace.clone()),
         containers: Vec::new(),
@@ -590,6 +595,7 @@ pub fn pf_to_row(entry: &PortForwardEntry) -> ResourceRow {
         health,
         crd_info: None,
         drill_target: None,
+        cells,
         ..Default::default()
     }
 }

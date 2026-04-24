@@ -234,18 +234,18 @@ impl StatefulWidget for LogViewer<'_> {
             // In wrap mode, window the content starting at scroll offset to
             // avoid u16 overflow in Paragraph::scroll for large log buffers.
             let start_line = state.scroll.min(self.lines.len().saturating_sub(1));
-            let mut text_lines: Vec<Line<'_>> = Vec::new();
+            let mut text_lines: Vec<Line<'_>> = Vec::with_capacity(visible_height);
             for line_idx in start_line..self.lines.len() {
                 let line = self.lines[line_idx];
                 if state.show_timestamps {
                     if let Some(LogTimestamp { timestamp: ts, content }) = Self::parse_timestamp(line) {
                         text_lines.push(Line::from(vec![
-                            Span::styled(ts.to_string(), self.theme.log_timestamp),
+                            Span::styled(ts, self.theme.log_timestamp),
                             Span::styled(" ", self.theme.log_text),
-                            Span::styled(content.to_string(), self.theme.log_text),
+                            Span::styled(content, self.theme.log_text),
                         ]));
                     } else {
-                        text_lines.push(Line::from(Span::styled(line.to_string(), self.theme.log_text)));
+                        text_lines.push(Line::from(Span::styled(line, self.theme.log_text)));
                     }
                 } else {
                     let content = if let Some(LogTimestamp { content, .. }) = Self::parse_timestamp(line) {
@@ -253,7 +253,7 @@ impl StatefulWidget for LogViewer<'_> {
                     } else {
                         line
                     };
-                    text_lines.push(Line::from(Span::styled(content.to_string(), self.theme.log_text)));
+                    text_lines.push(Line::from(Span::styled(content, self.theme.log_text)));
                 }
             }
             // Windowing already handled — render from offset 0

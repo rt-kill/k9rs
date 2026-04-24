@@ -4,7 +4,7 @@ use k8s_openapi::api::apps::v1::DaemonSet;
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::{CommonMeta, WorkloadContainers};
-use crate::kube::resources::row::{DrillTarget, ResourceRow, RowHealth};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
 
 // ---------------------------------------------------------------------------
 // DaemonSetDef — ResourceDef + ConvertToRow
@@ -73,15 +73,20 @@ impl ConvertToRow<DaemonSet> for DaemonSetDef {
             else if ready < desired { RowHealth::Failed }
             else { RowHealth::Normal };
 
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Count(desired as i64),
+            CellValue::Count(current as i64),
+            CellValue::Count(ready as i64),
+            CellValue::Count(up_to_date as i64),
+            CellValue::Count(available as i64),
+            CellValue::Text(node_selector),
+            CellValue::from_comma_str(&meta.labels_str),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];
         ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                desired.to_string(), current.to_string(), ready.to_string(),
-                up_to_date.to_string(), available.to_string(),
-                node_selector,
-                meta.labels_str,
-                crate::util::format_age(meta.age),
-            ],
+            cells,
             name: meta.name,
             namespace: Some(meta.namespace),
             pf_ports: containers.tcp_ports,

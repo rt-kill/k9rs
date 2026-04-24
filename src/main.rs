@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
     let data_source = ClientSession::new(
         crate::kube::client_session::ConnectionParams {
             context: cli_context.clone(),
-            namespace: app.selected_ns.clone(),
+            namespace: app.kube.selected_ns.clone(),
             readonly: cli.readonly,
             no_daemon: cli.no_daemon,
         },
@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
         if !is_core {
             let filter = app.nav.current().filter.as_ref()
                 .and_then(|f| f.to_subscription_filter());
-            let stream = data_source.subscribe_stream(initial_rid, app.selected_ns.clone(), filter);
+            let stream = data_source.subscribe_stream(initial_rid, app.kube.selected_ns.clone(), filter);
             app.nav.current_mut().stream = Some(stream);
         }
     }

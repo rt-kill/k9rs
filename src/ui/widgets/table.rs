@@ -55,6 +55,12 @@ impl ColumnLayout {
         }
     }
 
+    /// Rebuild the viewport without recomputing positions/widths.
+    fn reposition(&mut self, col_offset: u16, viewport_width: u16) {
+        self.viewport_left = col_offset;
+        self.viewport_right = col_offset + viewport_width;
+    }
+
     /// Is column `i` at least partially visible in the viewport?
     fn is_visible(&self, i: usize) -> bool {
         let start = self.positions[i];
@@ -146,7 +152,7 @@ impl<'a> ResourceTable<'a> {
     }
 
     /// Compute natural column widths from content. No scaling.
-    fn compute_col_widths(&self, rows: &[&Vec<String>]) -> Vec<u16> {
+    fn compute_col_widths(&self, rows: &[Vec<String>]) -> Vec<u16> {
         if self.headers.is_empty() { return Vec::new(); }
         let mut widths: Vec<u16> = self.headers.iter()
             .map(|h| h.width() as u16 + 2) // +2 for sort indicator
@@ -192,10 +198,10 @@ impl<'a> ResourceTable<'a> {
 
     fn build_title_spans(&self, row_count: usize) -> Line<'a> {
         let mut spans = Vec::new();
-        spans.push(Span::styled(format!(" {}", self.title.to_lowercase()), self.theme.title));
+        spans.push(Span::styled(format!(" {}", self.title), self.theme.title));
         if !self.namespace.is_empty() {
             spans.push(Span::styled("(", self.theme.title));
-            spans.push(Span::styled(self.namespace.to_string(), self.theme.title_namespace));
+            spans.push(Span::styled(self.namespace, self.theme.title_namespace));
             spans.push(Span::styled(")", self.theme.title));
         }
         spans.push(Span::styled(format!("[{}]", row_count), self.theme.title_counter));
@@ -221,19 +227,19 @@ impl<'a> ResourceTable<'a> {
     }
 
     /// Render a row of cells (header or data) using the shared layout.
-    fn render_row(
+    fn render_row<S: AsRef<str>>(
         &self,
         buf: &mut Buffer,
         y: u16,
-        cells: &[&str],
+        cells: &[S],
         base_style: Style,
         is_row_selected: bool,
         layout: &ColumnLayout,
     ) {
-        for (i, &cell) in cells.iter().enumerate() {
+        for (i, cell) in cells.iter().enumerate() {
             if i >= layout.widths.len() || !layout.is_visible(i) { continue; }
             let (content_style, border_style) = self.cell_styles(base_style, i, is_row_selected, layout);
-            Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell, content_style, border_style);
+            Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style);
         }
         // Trailing │ after last column.
         if let Some(tx) = layout.trailing_border_x() {
@@ -251,19 +257,19 @@ impl StatefulWidget for ResourceTable<'_> {
     type State = ResourceTableState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let all_rows: Vec<&Vec<String>> = self.rows.iter().collect();
-        state.filtered_count = all_rows.len();
+        let row_count = self.rows.len();
+        state.filtered_count = row_count;
 
         // Clamp row selection.
-        if all_rows.is_empty() {
+        if row_count == 0 {
             state.selected = 0;
             state.offset = 0;
-        } else if state.selected >= all_rows.len() {
-            state.selected = all_rows.len() - 1;
+        } else if state.selected >= row_count {
+            state.selected = row_count - 1;
         }
 
         // Draw bordered block with title.
-        let title_line = self.build_title_spans(all_rows.len());
+        let title_line = self.build_title_spans(row_count);
         let block = Block::bordered()
             .title(title_line)
             .border_style(self.theme.border);
@@ -272,7 +278,7 @@ impl StatefulWidget for ResourceTable<'_> {
         if inner.height == 0 || inner.width == 0 { return; }
 
         // Column layout.
-        let col_widths = self.compute_col_widths(&all_rows);
+        let col_widths = self.compute_col_widths(self.rows);
         if col_widths.is_empty() { return; }
 
         // Clamp column selection.
@@ -280,26 +286,24 @@ impl StatefulWidget for ResourceTable<'_> {
             state.selected_col = col_widths.len().saturating_sub(1);
         }
 
-        // Build layout and adjust horizontal scroll.
+        // Build layout and adjust horizontal scroll. Positions are computed
+        // once; only the viewport shifts when col_offset changes.
         let mut layout = ColumnLayout::new(col_widths, state.selected_col, state.col_offset, inner.width, inner.x);
         let sel_start = layout.positions[state.selected_col];
         let sel_end = sel_start + layout.widths[state.selected_col];
         if sel_start < state.col_offset {
             state.col_offset = sel_start;
-            layout = ColumnLayout::new(layout.widths, state.selected_col, state.col_offset, inner.width, inner.x);
+            layout.reposition(state.col_offset, inner.width);
         }
         if sel_end > state.col_offset + inner.width {
             state.col_offset = sel_end.saturating_sub(inner.width);
-            layout = ColumnLayout::new(layout.widths, state.selected_col, state.col_offset, inner.width, inner.x);
+            layout.reposition(state.col_offset, inner.width);
         }
 
         // --- Header row ---
         let header_y = inner.y;
-        let header_strs: Vec<&str> = self.headers.to_vec();
-
-        // Base header render.
         let header_style = self.theme.header;
-        self.render_row(buf, header_y, &header_strs, header_style, false, &layout);
+        self.render_row(buf, header_y, &self.headers, header_style, false, &layout);
 
         // Sort indicator overlay (on top of the header cell).
         if let Some(sort_i) = self.sort_col {
@@ -324,12 +328,12 @@ impl StatefulWidget for ResourceTable<'_> {
             state.offset = state.selected - visible_height + 1;
         }
 
-        let end = (state.offset + visible_height).min(all_rows.len());
+        let end = (state.offset + visible_height).min(row_count);
         for (vi, row_idx) in (state.offset..end).enumerate() {
             let y = data_start_y + vi as u16;
             if y >= inner.y + inner.height { break; }
 
-            let row = all_rows[row_idx];
+            let row = &self.rows[row_idx];
             let is_selected = row_idx == state.selected;
             let is_marked = !self.marked.is_empty()
                 && self.row_keys.get(row_idx).is_some_and(|k| self.marked.contains(k));
@@ -364,8 +368,7 @@ impl StatefulWidget for ResourceTable<'_> {
                 }
             };
 
-            let cell_strs: Vec<&str> = row.iter().map(|s| s.as_str()).collect();
-            self.render_row(buf, y, &cell_strs, cell_style, is_selected, &layout);
+            self.render_row(buf, y, row, cell_style, is_selected, &layout);
         }
     }
 }

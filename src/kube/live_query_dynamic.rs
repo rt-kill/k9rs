@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 use crate::event::ResourceUpdate;
 use crate::kube::cache::PrinterColumn;
 use crate::kube::protocol::{ObjectKey, ResourceScope};
-use crate::kube::resources::row::RowHealth;
+use crate::kube::resources::row::{CellValue, RowHealth};
 
 use super::live_query::{INIT_FLUSH_INTERVAL_MS, INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, MAX_ELAPSED_MS, WATCHER_PAGE_SIZE, WatcherSnapshot};
 
@@ -236,20 +236,18 @@ fn build_dynamic_snapshot(
             let mut cells = Vec::with_capacity(all_columns.len());
             for col in &all_columns {
                 let raw = resolve_json_path(&json_val, &col.json_path);
-                let val = if col.column_type.is_date() {
-                    // Format dates as age strings.
+                let cell = if col.column_type.is_date() {
+                    // Date columns become Age cells with epoch seconds.
                     if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&raw) {
-                        crate::util::format_age(Some(ts.with_timezone(&chrono::Utc)))
+                        CellValue::Age(Some(ts.with_timezone(&chrono::Utc).timestamp()))
                     } else {
-                        raw
+                        CellValue::Text(raw)
                     }
                 } else {
-                    raw
+                    CellValue::Text(raw)
                 };
-                cells.push(val);
-            }
-            Some(crate::kube::resources::row::ResourceRow {
-                cells,
+                cells.push(cell);
+            }            Some(crate::kube::resources::row::ResourceRow {
                 name,
                 namespace: Some(namespace),
                 containers: Vec::new(),
@@ -259,6 +257,7 @@ fn build_dynamic_snapshot(
                 health: RowHealth::Normal,
                 crd_info: None,
                 drill_target: None,
+                cells,
                 ..Default::default()
             })
         })

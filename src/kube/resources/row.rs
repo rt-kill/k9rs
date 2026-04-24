@@ -1,11 +1,16 @@
 use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::fmt;
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
+
+use crate::util::{format_age_secs, format_cpu, format_mem};
 
 /// Row health indicator, computed server-side by each converter.
 /// The client reads this for row coloring — no resource-type-specific
 /// knowledge needed on the client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum RowHealth {
     /// Healthy / running / ready.
     #[default]
@@ -16,12 +21,166 @@ pub enum RowHealth {
     Failed,
 }
 
+// ---------------------------------------------------------------------------
+// CellValue — typed cell representation
+// ---------------------------------------------------------------------------
+
+/// Unit of a quantity cell, used to select the right formatter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QuantityUnit {
+    Millicores,
+    Bytes,
+}
+
+/// A typed cell value. Variant order is **load-bearing** for bincode
+/// (positional encoding) — do NOT reorder or insert between existing
+/// variants after Phase 1 is merged.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CellValue {
+    Text(String),
+    Ratio { num: u32, denom: u32 },
+    Quantity { value: u64, unit: QuantityUnit },
+    Age(Option<i64>),
+    Count(i64),
+    Bool(bool),
+    List(Vec<String>),
+    Status { text: String, health: RowHealth },
+    Percentage(Option<u64>),
+    Placeholder,
+}
+
+impl CellValue {
+    /// Build a `List` from a pre-joined comma-separated string.
+    /// Returns an empty list if the input is empty.
+    pub fn from_comma_str(s: &str) -> Self {
+        if s.is_empty() {
+            CellValue::List(vec![])
+        } else {
+            CellValue::List(s.split(',').filter(|p| !p.is_empty()).map(String::from).collect())
+        }
+    }
+}
+
+// ---- Display ----------------------------------------------------------------
+
+impl fmt::Display for CellValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CellValue::Text(s) => f.write_str(s),
+            CellValue::Ratio { num, denom } => write!(f, "{}/{}", num, denom),
+            CellValue::Quantity { value, unit } => match unit {
+                QuantityUnit::Millicores => {
+                    let formatted = format_cpu(&format!("{}m", value));
+                    f.write_str(&formatted)
+                }
+                QuantityUnit::Bytes => {
+                    let formatted = format_mem(&value.to_string());
+                    f.write_str(&formatted)
+                }
+            },
+            CellValue::Age(Some(epoch_secs)) => {
+                let elapsed = Utc::now().timestamp() - epoch_secs;
+                let formatted = format_age_secs(elapsed);
+                f.write_str(&formatted)
+            }
+            CellValue::Age(None) => f.write_str("<unknown>"),
+            CellValue::Count(n) => write!(f, "{}", n),
+            CellValue::Bool(b) => f.write_str(if *b { "true" } else { "false" }),
+            CellValue::List(items) => f.write_str(&items.join(",")),
+            CellValue::Status { text, .. } => f.write_str(text),
+            CellValue::Percentage(Some(v)) => write!(f, "{}%", v),
+            CellValue::Percentage(None) => f.write_str("n/a"),
+            CellValue::Placeholder => f.write_str("n/a"),
+        }
+    }
+}
+
+// ---- Ordering ---------------------------------------------------------------
+
+/// Returns a discriminant index for cross-variant comparison.
+/// Mirrors the declaration order in the enum.
+fn cell_discriminant(v: &CellValue) -> u8 {
+    match v {
+        CellValue::Text(_) => 0,
+        CellValue::Ratio { .. } => 1,
+        CellValue::Quantity { .. } => 2,
+        CellValue::Age(_) => 3,
+        CellValue::Count(_) => 4,
+        CellValue::Bool(_) => 5,
+        CellValue::List(_) => 6,
+        CellValue::Status { .. } => 7,
+        CellValue::Percentage(_) => 8,
+        CellValue::Placeholder => 9,
+    }
+}
+
+impl Ord for CellValue {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (CellValue::Text(a), CellValue::Text(b)) => a.cmp(b),
+
+            (CellValue::Ratio { num: an, denom: ad }, CellValue::Ratio { num: bn, denom: bd }) => {
+                let fa = *an as f64 / (*ad).max(1) as f64;
+                let fb = *bn as f64 / (*bd).max(1) as f64;
+                fa.partial_cmp(&fb).unwrap_or(an.cmp(bn))
+            }
+
+            (CellValue::Quantity { value: a, .. }, CellValue::Quantity { value: b, .. }) => {
+                a.cmp(b)
+            }
+
+            // Age: Some sorts before None. Larger epoch (more recent) sorts later.
+            (CellValue::Age(a), CellValue::Age(b)) => match (a, b) {
+                (Some(a_val), Some(b_val)) => a_val.cmp(b_val),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+
+            (CellValue::Count(a), CellValue::Count(b)) => a.cmp(b),
+
+            (CellValue::Bool(a), CellValue::Bool(b)) => a.cmp(b),
+
+            (CellValue::List(a), CellValue::List(b)) => {
+                a.len().cmp(&b.len()).then_with(|| {
+                    let ja = a.join(",");
+                    let jb = b.join(",");
+                    ja.cmp(&jb)
+                })
+            }
+
+            (CellValue::Status { text: a, .. }, CellValue::Status { text: b, .. }) => a.cmp(b),
+
+            // Percentage: Some sorts before None.
+            (CellValue::Percentage(a), CellValue::Percentage(b)) => match (a, b) {
+                (Some(a_val), Some(b_val)) => a_val.cmp(b_val),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+
+            (CellValue::Placeholder, CellValue::Placeholder) => Ordering::Equal,
+
+            // Cross-variant: compare by discriminant (deterministic but meaningless).
+            _ => cell_discriminant(self).cmp(&cell_discriminant(other)),
+        }
+    }
+}
+
+impl PartialOrd for CellValue {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// A single resource row in the unified table model.
 /// Replaces all 28 typed Kube* structs with a generic representation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRow {
-    /// Display columns, matching the header order.
-    pub cells: Vec<String>,
+    /// Typed cell values, in header order. Sort, filter, and render all
+    /// operate on these directly via `CellValue::cmp()` and
+    /// `CellValue::to_string()`.
+    pub cells: Vec<CellValue>,
     /// Resource name (cached for O(1) access in sorts/filters).
     pub name: String,
     /// Resource namespace. `None` for cluster-scoped resources.
@@ -167,7 +326,7 @@ pub enum DrillTarget {
 }
 
 impl super::KubeResource for ResourceRow {
-    fn cells(&self) -> &[String] {
+    fn cells(&self) -> &[CellValue] {
         &self.cells
     }
 
@@ -181,10 +340,291 @@ impl super::KubeResource for ResourceRow {
 }
 
 impl ResourceRow {
-    /// Mutate a cell in-place (e.g., for metrics overlay).
-    pub fn set_cell(&mut self, col: usize, value: String) {
+    /// Mutate a cell in-place (e.g., for metrics overlay). No-op if `col`
+    /// is out of bounds.
+    pub fn set_cell(&mut self, col: usize, value: CellValue) {
         if col < self.cells.len() {
             self.cells[col] = value;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    // ---- Display ------------------------------------------------------------
+
+    #[test]
+    fn display_text() {
+        assert_eq!(CellValue::Text("hello".into()).to_string(), "hello");
+    }
+
+    #[test]
+    fn display_ratio() {
+        assert_eq!(
+            CellValue::Ratio { num: 3, denom: 5 }.to_string(),
+            "3/5"
+        );
+    }
+
+    #[test]
+    fn display_quantity_millicores() {
+        // 500m stays as "500m"
+        assert_eq!(
+            CellValue::Quantity { value: 500, unit: QuantityUnit::Millicores }.to_string(),
+            "500m"
+        );
+        // 2000m normalizes to "2" (whole cores)
+        assert_eq!(
+            CellValue::Quantity { value: 2000, unit: QuantityUnit::Millicores }.to_string(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn display_quantity_bytes() {
+        // 1 GiB in bytes
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            CellValue::Quantity { value: gib, unit: QuantityUnit::Bytes }.to_string(),
+            "1Gi"
+        );
+    }
+
+    #[test]
+    fn display_age_none() {
+        assert_eq!(CellValue::Age(None).to_string(), "<unknown>");
+    }
+
+    #[test]
+    fn display_count() {
+        assert_eq!(CellValue::Count(42).to_string(), "42");
+        assert_eq!(CellValue::Count(-1).to_string(), "-1");
+    }
+
+    #[test]
+    fn display_bool() {
+        assert_eq!(CellValue::Bool(true).to_string(), "true");
+        assert_eq!(CellValue::Bool(false).to_string(), "false");
+    }
+
+    #[test]
+    fn display_list() {
+        assert_eq!(
+            CellValue::List(vec!["a".into(), "b".into(), "c".into()]).to_string(),
+            "a,b,c"
+        );
+        assert_eq!(CellValue::List(vec![]).to_string(), "");
+    }
+
+    #[test]
+    fn display_status() {
+        assert_eq!(
+            CellValue::Status { text: "Running".into(), health: RowHealth::Normal }.to_string(),
+            "Running"
+        );
+    }
+
+    #[test]
+    fn display_percentage() {
+        assert_eq!(CellValue::Percentage(Some(85)).to_string(), "85%");
+        assert_eq!(CellValue::Percentage(None).to_string(), "n/a");
+    }
+
+    #[test]
+    fn display_placeholder() {
+        assert_eq!(CellValue::Placeholder.to_string(), "n/a");
+    }
+
+    // ---- Ordering -----------------------------------------------------------
+
+    #[test]
+    fn ord_text() {
+        let a = CellValue::Text("alpha".into());
+        let b = CellValue::Text("beta".into());
+        assert_eq!(a.cmp(&b), Ordering::Less);
+    }
+
+    #[test]
+    fn ord_count_numeric() {
+        let c2 = CellValue::Count(2);
+        let c10 = CellValue::Count(10);
+        // Numeric, not lexicographic: 2 < 10
+        assert_eq!(c2.cmp(&c10), Ordering::Less);
+    }
+
+    #[test]
+    fn ord_ratio_by_fraction() {
+        // 1/3 < 1/2
+        let r1 = CellValue::Ratio { num: 1, denom: 3 };
+        let r2 = CellValue::Ratio { num: 1, denom: 2 };
+        assert_eq!(r1.cmp(&r2), Ordering::Less);
+
+        // 3/4 > 2/4
+        let r3 = CellValue::Ratio { num: 3, denom: 4 };
+        let r4 = CellValue::Ratio { num: 2, denom: 4 };
+        assert_eq!(r3.cmp(&r4), Ordering::Greater);
+    }
+
+    #[test]
+    fn ord_age_some_before_none() {
+        let some_age = CellValue::Age(Some(1000));
+        let no_age = CellValue::Age(None);
+        // Some sorts before None
+        assert_eq!(some_age.cmp(&no_age), Ordering::Less);
+    }
+
+    #[test]
+    fn ord_age_larger_epoch_sorts_later() {
+        let older = CellValue::Age(Some(1000));
+        let newer = CellValue::Age(Some(2000));
+        assert_eq!(older.cmp(&newer), Ordering::Less);
+    }
+
+    #[test]
+    fn ord_bool_false_lt_true() {
+        assert_eq!(CellValue::Bool(false).cmp(&CellValue::Bool(true)), Ordering::Less);
+    }
+
+    #[test]
+    fn ord_percentage_some_before_none() {
+        let some_pct = CellValue::Percentage(Some(50));
+        let no_pct = CellValue::Percentage(None);
+        assert_eq!(some_pct.cmp(&no_pct), Ordering::Less);
+    }
+
+    #[test]
+    fn ord_percentage_numeric() {
+        let low = CellValue::Percentage(Some(10));
+        let high = CellValue::Percentage(Some(90));
+        assert_eq!(low.cmp(&high), Ordering::Less);
+    }
+
+    #[test]
+    fn ord_quantity() {
+        let small = CellValue::Quantity { value: 100, unit: QuantityUnit::Millicores };
+        let big = CellValue::Quantity { value: 500, unit: QuantityUnit::Millicores };
+        assert_eq!(small.cmp(&big), Ordering::Less);
+    }
+
+    #[test]
+    fn ord_list_by_length_then_content() {
+        let short = CellValue::List(vec!["a".into()]);
+        let long = CellValue::List(vec!["a".into(), "b".into()]);
+        assert_eq!(short.cmp(&long), Ordering::Less);
+
+        // Same length: compare by joined content
+        let ab = CellValue::List(vec!["a".into(), "b".into()]);
+        let ac = CellValue::List(vec!["a".into(), "c".into()]);
+        assert_eq!(ab.cmp(&ac), Ordering::Less);
+    }
+
+    #[test]
+    fn ord_placeholder_equal() {
+        assert_eq!(CellValue::Placeholder.cmp(&CellValue::Placeholder), Ordering::Equal);
+    }
+
+    #[test]
+    fn ord_cross_variant_deterministic() {
+        let text = CellValue::Text("z".into());
+        let count = CellValue::Count(0);
+        // Text (disc 0) < Count (disc 4)
+        assert_eq!(text.cmp(&count), Ordering::Less);
+    }
+
+    // ---- Bincode roundtrip --------------------------------------------------
+
+    #[test]
+    fn bincode_roundtrip() {
+        let values = vec![
+            CellValue::Text("hello".into()),
+            CellValue::Ratio { num: 3, denom: 5 },
+            CellValue::Quantity { value: 500, unit: QuantityUnit::Millicores },
+            CellValue::Quantity { value: 1024 * 1024, unit: QuantityUnit::Bytes },
+            CellValue::Age(Some(1713600000)),
+            CellValue::Age(None),
+            CellValue::Count(42),
+            CellValue::Bool(true),
+            CellValue::List(vec!["a".into(), "b".into()]),
+            CellValue::Status { text: "Running".into(), health: RowHealth::Normal },
+            CellValue::Percentage(Some(85)),
+            CellValue::Percentage(None),
+            CellValue::Placeholder,
+        ];
+
+        for val in &values {
+            let encoded = bincode::serialize(val).expect("serialize");
+            let decoded: CellValue = bincode::deserialize(&encoded).expect("deserialize");
+            assert_eq!(&decoded, val, "roundtrip failed for {:?}", val);
+        }
+    }
+
+    // ---- set_cell -------------------------------------------------------------
+
+    #[test]
+    fn set_cell_in_bounds() {
+        let mut row = ResourceRow {
+            cells: vec![CellValue::Placeholder, CellValue::Placeholder],
+            ..Default::default()
+        };
+        row.set_cell(1, CellValue::Count(7));
+        assert_eq!(row.cells[1], CellValue::Count(7));
+    }
+
+    #[test]
+    fn set_cell_out_of_bounds_noop() {
+        let mut row = ResourceRow {
+            cells: vec![CellValue::Placeholder],
+            ..Default::default()
+        };
+        // Should not panic
+        row.set_cell(5, CellValue::Count(99));
+        assert_eq!(row.cells.len(), 1);
+    }
+
+    // ---- Default cells is empty ---------------------------------------
+
+    #[test]
+    fn default_cells_empty() {
+        let row = ResourceRow::default();
+        assert!(row.cells.is_empty());
+    }
+
+    // ---- from_comma_str --------------------------------------------------
+
+    #[test]
+    fn from_comma_str_empty() {
+        assert_eq!(CellValue::from_comma_str(""), CellValue::List(vec![]));
+    }
+
+    #[test]
+    fn from_comma_str_single() {
+        assert_eq!(
+            CellValue::from_comma_str("foo"),
+            CellValue::List(vec!["foo".into()])
+        );
+    }
+
+    #[test]
+    fn from_comma_str_multiple() {
+        assert_eq!(
+            CellValue::from_comma_str("a,b,c"),
+            CellValue::List(vec!["a".into(), "b".into(), "c".into()])
+        );
+    }
+
+    #[test]
+    fn from_comma_str_trailing_comma() {
+        // Trailing comma should not produce an empty entry.
+        assert_eq!(
+            CellValue::from_comma_str("a,b,"),
+            CellValue::List(vec!["a".into(), "b".into()])
+        );
     }
 }

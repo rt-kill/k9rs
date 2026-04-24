@@ -93,7 +93,6 @@ pub struct Theme {
     pub header: Style,
     pub selected: Style,
     pub row_normal: Style,
-    pub row_alt: Style,
 
     // Status colors
     pub status_running: Style,
@@ -177,10 +176,6 @@ pub struct Theme {
     // selected column (header + all visible rows). Must not interfere
     // with foreground colors (red/yellow/green health indicators).
     pub col_highlight: Style,
-
-    // Legacy aliases (kept for compat with other views)
-    pub tab_active: Style,
-    pub tab_inactive: Style,
 }
 
 impl Default for Theme {
@@ -197,9 +192,6 @@ impl Default for Theme {
                 .add_modifier(Modifier::BOLD),
             // Normal row text: dodgerblue on black
             row_normal: Style::default()
-                .fg(DODGER_BLUE),
-            // Alternating row: slightly dimmer
-            row_alt: Style::default()
                 .fg(DODGER_BLUE),
 
             // Status colors
@@ -357,13 +349,6 @@ impl Default for Theme {
             col_highlight: Style::default()
                 .bg(Color::Rgb(35, 38, 45)),
 
-            // Legacy tab styles (breadcrumbs now)
-            tab_active: Style::default()
-                .fg(Color::Black)
-                .bg(ORANGE),
-            tab_inactive: Style::default()
-                .fg(Color::Black)
-                .bg(STEEL_BLUE),
         }
     }
 }
@@ -435,7 +420,6 @@ impl Theme {
             let bg = yaml_color(body, "bgColor");
             // Body fg/bg affects general text styles
             theme.row_normal = with_bg(with_fg(theme.row_normal, fg), bg);
-            theme.row_alt = with_bg(with_fg(theme.row_alt, fg), bg);
             theme.info_value = with_fg(theme.info_value, fg);
             if let Some(logo_color) = yaml_color(body, "logoColor") {
                 theme.logo = theme.logo.fg(logo_color);
@@ -508,10 +492,8 @@ impl Theme {
                 let fg = yaml_color(crumbs, "fgColor");
                 let bg = yaml_color(crumbs, "bgColor");
                 theme.breadcrumb_inactive = with_bg(with_fg(theme.breadcrumb_inactive, fg), bg);
-                theme.tab_inactive = with_bg(with_fg(theme.tab_inactive, fg), bg);
                 if let Some(active) = yaml_color(crumbs, "activeColor") {
                     theme.breadcrumb_active = with_fg(theme.breadcrumb_active, fg).bg(active);
-                    theme.tab_active = with_fg(theme.tab_active, fg).bg(active);
                 }
             }
 
@@ -561,7 +543,6 @@ impl Theme {
                 let fg = yaml_color(table, "fgColor");
                 let bg = yaml_color(table, "bgColor");
                 theme.row_normal = with_bg(with_fg(theme.row_normal, fg), bg);
-                theme.row_alt = with_bg(with_fg(theme.row_alt, fg), bg);
 
                 if let Some(cursor_fg) = yaml_color(table, "cursorFgColor") {
                     theme.selected = theme.selected.fg(cursor_fg);

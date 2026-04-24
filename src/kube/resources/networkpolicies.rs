@@ -3,7 +3,7 @@ use k8s_openapi::api::networking::v1::NetworkPolicy;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // NetworkPolicyDef
@@ -43,14 +43,16 @@ impl ConvertToRow<NetworkPolicy> for NetworkPolicyDef {
                 (sel, types)
             })
             .unwrap_or_else(|| ("<none>".to_string(), String::new()));
-        ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                pod_selector, policy_types,
-                crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(pod_selector),
+            CellValue::Text(policy_types),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: Some(meta.namespace),
+            cells,
             ..Default::default()
         }
     }

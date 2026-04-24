@@ -4,7 +4,7 @@ use k8s_openapi::api::apps::v1::Deployment;
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::{CommonMeta, WorkloadContainers};
-use crate::kube::resources::row::{DrillTarget, ResourceRow, RowHealth};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
 
 // ---------------------------------------------------------------------------
 // DeploymentDef — ResourceDef + ConvertToRow
@@ -48,9 +48,6 @@ impl ConvertToRow<Deployment> for DeploymentDef {
         let up_to_date = status.updated_replicas.unwrap_or(0);
         let available = status.available_replicas.unwrap_or(0);
 
-        // READY uses available (ready for minReadySeconds), matching kubectl.
-        let ready = format!("{}/{}", available, desired);
-
         // Drill-down: deployment -> pods by selector labels.
         let drill_target = if !selector_labels.is_empty() {
             Some(DrillTarget::PodsByLabels {
@@ -65,14 +62,19 @@ impl ConvertToRow<Deployment> for DeploymentDef {
             else if available < desired { RowHealth::Failed }
             else { RowHealth::Normal };
 
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Ratio { num: available as u32, denom: desired as u32 },
+            CellValue::Count(up_to_date as i64),
+            CellValue::Count(available as i64),
+            CellValue::from_comma_str(&containers.names),
+            CellValue::from_comma_str(&containers.images),
+            CellValue::from_comma_str(&meta.labels_str),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];
         ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(), ready,
-                up_to_date.to_string(), available.to_string(),
-                containers.names, containers.images,
-                meta.labels_str,
-                crate::util::format_age(meta.age),
-            ],
+            cells,
             name: meta.name,
             namespace: Some(meta.namespace),
             pf_ports: containers.tcp_ports,

@@ -15,7 +15,7 @@ use crate::app::{App, Route};
 /// - Scrollable text content with search highlighting
 /// - Bottom bar with keybindings (or search input)
 pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
-    let theme = &app.theme;
+    let theme = &app.ui.theme;
 
     let chunks = Layout::vertical([
         Constraint::Fill(1),   // describe content
@@ -28,8 +28,8 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
 
     // Extract state and resource type/name from route
     let (describe, resource_type, resource_name) = match &app.route {
-        Route::Describe { ref target, ref state, .. } => (state, target.resource.display_label(), target.name.as_str()),
-        Route::Aliases { ref state, .. } => (state, "aliases", ""),
+        Route::ContentView { kind: crate::app::ContentViewKind::Aliases, ref state, .. } => (state, "aliases", ""),
+        Route::ContentView { target: Some(ref target), ref state, .. } => (state, target.resource.display_label(), target.name.as_str()),
         _ => return, // Not a describe view — nothing to draw
     };
 
@@ -110,9 +110,9 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
                             let key = &trimmed[..colon_pos];
                             let value = &trimmed[colon_pos..];
                             Line::from(vec![
-                                Span::styled(indent.to_string(), theme.row_normal),
-                                Span::styled(key.to_string(), theme.yaml_key),
-                                Span::styled(value.to_string(), theme.row_normal),
+                                Span::styled(indent, theme.row_normal),
+                                Span::styled(key, theme.yaml_key),
+                                Span::styled(value, theme.row_normal),
                             ])
                         } else {
                             Line::from(Span::styled(line, theme.row_normal))
@@ -141,26 +141,11 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
             .border_style(theme.border);
         let inner = block.inner(content_area);
         f.render_widget(block, content_area);
-        if inner.height > 0 && inner.width > 0 {
-            let loading_text = crate::util::loading_bar("Loading...");
-            let text_len = loading_text.width() as u16;
-            let loading = Line::from(Span::styled(
-                loading_text,
-                theme.status_pending,
-            ));
-            let center_y = inner.y + inner.height / 2;
-            let center_x = inner.x + inner.width.saturating_sub(text_len) / 2;
-            f.render_widget(
-                loading,
-                Rect::new(center_x, center_y, inner.width, 1),
-            );
-        }
+        crate::ui::draw_centered_loading(f, inner, "Loading...", theme.status_pending);
     }
 
     // Bottom bar: search input or keybinding hints
-    let bg = " ".repeat(bar_area.width as usize);
-    let bg_line = Line::styled(bg, theme.status_bar);
-    f.render_widget(bg_line, bar_area);
+    crate::ui::fill_line_bg(f, bar_area, theme.status_bar);
 
     if describe.search_input_active {
         // Show search input prompt

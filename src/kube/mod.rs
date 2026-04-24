@@ -22,7 +22,5 @@ pub mod server_session;
 pub mod table;
 pub mod session;
 pub mod session_actions;
-pub mod session_handlers;
 pub mod session_commands;
 pub mod session_events;
-pub mod session_nav;

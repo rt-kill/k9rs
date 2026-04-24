@@ -1,6 +1,9 @@
 //! Namespace switching, describe/YAML, and mutating operations (delete,
 //! scale, restart, secret decode, CronJob trigger/suspend).
 
+/// Field manager identity for server-side apply and strategic merge patches.
+/// Passed to `PatchParams::apply(...)` so K8s attributes the change to k9rs.
+const MANAGER_IDENTITY: &str = "k9rs";
 
 use crate::kube::protocol::{self, SessionEvent};
 use crate::kube::resource_def::BuiltInKind;
@@ -86,7 +89,7 @@ impl ServerSession {
                 let parsed: DynamicObject = serde_yaml::from_str(&yaml)
                     .map_err(|e| anyhow::anyhow!("yaml parse error: {}", e))?;
 
-                api.patch(&target.name, &PatchParams::apply("k9rs").force(), &Patch::Apply(&parsed))
+                api.patch(&target.name, &PatchParams::apply(MANAGER_IDENTITY).force(), &Patch::Apply(&parsed))
                     .await?;
                 Ok(())
             }
@@ -105,24 +108,47 @@ impl ServerSession {
     // -----------------------------------------------------------------------
 
     pub(super) fn handle_describe_async(&mut self, target: &protocol::ObjectRef) {
-        let client = self.client.clone();
-        let tx = self.event_tx.clone();
-        let context = self.context.name.clone();
-        let target = target.clone();
-        self.track_task(async move {
-            let content = crate::kube::describe::fetch_describe(&client, &target, &context).await;
-            let _ = tx.send(SessionEvent::DescribeResult { target, content }).await;
-        });
+        self.fetch_and_emit(
+            target,
+            |c, t, ctx| Box::pin(crate::kube::describe::fetch_describe(c, t, ctx)),
+            |target, content| SessionEvent::DescribeResult { target, content },
+        );
     }
 
     pub(super) fn handle_yaml_async(&mut self, target: &protocol::ObjectRef) {
+        self.fetch_and_emit(
+            target,
+            |c, t, ctx| Box::pin(crate::kube::describe::fetch_yaml(c, t, ctx)),
+            |target, content| SessionEvent::YamlResult { target, content },
+        );
+    }
+
+    /// Shared helper for describe/yaml: clones the session state, spawns a
+    /// task that calls `fetch_fn`, wraps the result via `make_event`, and
+    /// sends it back on the event channel.
+    fn fetch_and_emit<F, E>(
+        &mut self,
+        target: &protocol::ObjectRef,
+        fetch_fn: F,
+        make_event: E,
+    )
+    where
+        F: for<'a> FnOnce(
+                &'a kube::Client,
+                &'a protocol::ObjectRef,
+                &'a protocol::ContextName,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>
+            + Send
+            + 'static,
+        E: FnOnce(protocol::ObjectRef, String) -> SessionEvent + Send + 'static,
+    {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let context = self.context.name.clone();
         let target = target.clone();
         self.track_task(async move {
-            let content = crate::kube::describe::fetch_yaml(&client, &target, &context).await;
-            let _ = tx.send(SessionEvent::YamlResult { target, content }).await;
+            let content = fetch_fn(&client, &target, &context).await;
+            let _ = tx.send(make_event(target, content)).await;
         });
     }
 
@@ -290,7 +316,7 @@ impl ServerSession {
         self.track_task(async move {
             use ::kube::api::{Patch, PatchParams};
             let api = dynamic_api_for_kind(&client, kind, &namespace);
-            let event = match api.patch(&n, &PatchParams::apply("k9rs"), &Patch::Merge(&patch_body)).await {
+            let event = match api.patch(&n, &PatchParams::apply(MANAGER_IDENTITY), &Patch::Merge(&patch_body)).await {
                 Ok(_) => SessionEvent::CommandResult(Ok(format!("Scaled {}/{} to {} replicas", display, n, replicas))),
                 Err(e) => SessionEvent::CommandResult(Err(format!("Scale failed: {}", e))),
             };

@@ -15,7 +15,7 @@ use crate::ui::widgets::{YamlViewer, YamlViewState};
 /// - YAML content with line numbers and syntax highlighting
 /// - Bottom bar with keybindings (or search input)
 pub fn draw_yaml(f: &mut Frame, app: &App, area: Rect) {
-    let theme = &app.theme;
+    let theme = &app.ui.theme;
 
     let chunks = Layout::vertical([
         Constraint::Fill(1),   // YAML content
@@ -28,13 +28,13 @@ pub fn draw_yaml(f: &mut Frame, app: &App, area: Rect) {
 
     // Extract resource type and name from route
     let (resource_type, resource_name) = match &app.route {
-        Route::Yaml { ref target, .. } => (target.resource.display_label(), target.name.as_str()),
+        Route::ContentView { target: Some(ref target), .. } => (target.resource.display_label(), target.name.as_str()),
         _ => ("unknown", "unknown"),
     };
     let yaml_title = format!("YAML: {}/{}", resource_type, resource_name);
 
     let yaml = match &app.route {
-        Route::Yaml { ref state, .. } => state,
+        Route::ContentView { ref state, .. } => state,
         _ => return, // Not a yaml view — nothing to draw
     };
 
@@ -60,26 +60,11 @@ pub fn draw_yaml(f: &mut Frame, app: &App, area: Rect) {
             .border_style(theme.border);
         let inner = block.inner(content_area);
         f.render_widget(block, content_area);
-        if inner.height > 0 && inner.width > 0 {
-            let loading_text = crate::util::loading_bar("Loading...");
-            let text_len = loading_text.width() as u16;
-            let loading = Line::from(Span::styled(
-                loading_text,
-                theme.status_pending,
-            ));
-            let center_y = inner.y + inner.height / 2;
-            let center_x = inner.x + inner.width.saturating_sub(text_len) / 2;
-            f.render_widget(
-                loading,
-                Rect::new(center_x, center_y, inner.width, 1),
-            );
-        }
+        crate::ui::draw_centered_loading(f, inner, "Loading...", theme.status_pending);
     }
 
     // Bottom bar: search input or keybinding hints
-    let bg = " ".repeat(bar_area.width as usize);
-    let bg_line = Line::styled(bg, theme.status_bar);
-    f.render_widget(bg_line, bar_area);
+    crate::ui::fill_line_bg(f, bar_area, theme.status_bar);
 
     if yaml.search_input_active {
         // Show search input prompt

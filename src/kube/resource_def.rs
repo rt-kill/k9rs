@@ -35,7 +35,7 @@ pub enum MetricsKind {
 /// Which metrics overlay column this is, if any. Used by
 /// `apply_pod_metrics` / `apply_node_metrics` to find the column index
 /// by typed tag instead of by header string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MetricsColumn {
     Cpu,
     Mem,
@@ -72,17 +72,6 @@ impl ColumnLevel {
     }
 }
 
-/// How a sort comparator interprets cell values for a column. Declared
-/// per-column rather than inferred from content so `3d5h` is correctly
-/// sorted as an age even if a different column's values happen to look
-/// similar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ColumnSortKind {
-    Age,
-    #[default]
-    StringOrNumber,
-}
-
 /// Metadata for a single table column. Each def declares its columns as
 /// a `&'static [ColumnDef]` array (via the default impl on `ResourceDef`,
 /// which infers from the header strings using the same classification
@@ -94,22 +83,21 @@ pub enum ColumnSortKind {
 pub struct ColumnDef {
     pub header: &'static str,
     pub level: ColumnLevel,
-    pub sort_kind: ColumnSortKind,
     pub metrics: Option<MetricsColumn>,
 }
 
 impl ColumnDef {
     pub const fn new(header: &'static str) -> Self {
-        Self { header, level: ColumnLevel::Default, sort_kind: ColumnSortKind::StringOrNumber, metrics: None }
+        Self { header, level: ColumnLevel::Default, metrics: None }
     }
     pub const fn extra(header: &'static str) -> Self {
-        Self { header, level: ColumnLevel::Extra, sort_kind: ColumnSortKind::StringOrNumber, metrics: None }
+        Self { header, level: ColumnLevel::Extra, metrics: None }
     }
     pub const fn age(header: &'static str) -> Self {
-        Self { header, level: ColumnLevel::Default, sort_kind: ColumnSortKind::Age, metrics: None }
+        Self { header, level: ColumnLevel::Default, metrics: None }
     }
     pub const fn extra_age(header: &'static str) -> Self {
-        Self { header, level: ColumnLevel::Extra, sort_kind: ColumnSortKind::Age, metrics: None }
+        Self { header, level: ColumnLevel::Extra, metrics: None }
     }
     pub const fn with_metrics(self, m: MetricsColumn) -> Self {
         Self { metrics: Some(m), ..self }
@@ -129,14 +117,9 @@ impl ColumnDef {
             | "NODE SELECTOR" | "INTERNAL-IP" | "EXTERNAL-IP" | "ARCH"
             | "TAINTS" | "CPU" | "MEM" | "CPU%" | "MEM%" | "MESSAGE"
         );
-        let is_age = matches!(
-            upper.as_str(),
-            "AGE" | "LAST RESTART" | "DURATION" | "LAST SCHEDULE"
-        );
         Self {
             header: "",
             level: if is_extra { ColumnLevel::Extra } else { ColumnLevel::Default },
-            sort_kind: if is_age { ColumnSortKind::Age } else { ColumnSortKind::StringOrNumber },
             metrics: None,
         }
     }

@@ -3,7 +3,7 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // ConfigMapDef
@@ -33,14 +33,16 @@ impl ConvertToRow<ConfigMap> for ConfigMapDef {
         let meta = CommonMeta::from_k8s(cm.metadata);
         let data_count = cm.data.map(|d| d.len()).unwrap_or(0)
             + cm.binary_data.map(|d| d.len()).unwrap_or(0);
-        ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                data_count.to_string(),
-                meta.labels_str, crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Count(data_count as i64),
+            CellValue::Text(meta.labels_str),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: Some(meta.namespace),
+            cells,
             ..Default::default()
         }
     }

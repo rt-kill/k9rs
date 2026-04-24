@@ -33,6 +33,33 @@ pub fn centered_rect(area: ratatui::layout::Rect, width: u16, height: u16) -> ra
     horiz[1]
 }
 
+/// Render a centered loading spinner+text inside an area. Used by yaml,
+/// describe, resource, and log views when awaiting initial data.
+pub fn draw_centered_loading(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    message: &str,
+    style: ratatui::style::Style,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let text = crate::util::loading_bar(message);
+    let text_len = UnicodeWidthStr::width(text.as_str()) as u16;
+    let line = ratatui::text::Line::from(ratatui::text::Span::styled(text, style));
+    let center_y = area.y + area.height / 2;
+    let center_x = area.x + area.width.saturating_sub(text_len) / 2;
+    f.render_widget(line, ratatui::layout::Rect::new(center_x, center_y, area.width, 1));
+}
+
+/// Fill a single-row area with a background style without allocating a string.
+pub fn fill_line_bg(f: &mut ratatui::Frame, area: ratatui::layout::Rect, style: ratatui::style::Style) {
+    let buf = f.buffer_mut();
+    for x in area.x..area.x + area.width {
+        buf[(x, area.y)].set_style(style);
+    }
+}
+
 use unicode_width::UnicodeWidthStr;
 
 use ratatui::layout::Rect;
@@ -58,17 +85,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Route::Resources => {
             views::resource::draw_resources(f, app, area);
         }
-        Route::Yaml { .. } => {
+        Route::ContentView { kind: crate::app::ContentViewKind::Yaml, .. } => {
             views::yaml::draw_yaml(f, app, area);
         }
-        Route::Describe { .. } => {
+        Route::ContentView { .. } => {
+            // Describe and Aliases both use the describe view
             views::describe::draw_describe(f, app, area);
         }
         Route::Logs { .. } => {
             views::log::draw_logs(f, app, area);
         }
         Route::Shell(ref shell) => {
-            views::shell::draw_shell(f, shell, area, &app.theme);
+            views::shell::draw_shell(f, shell, area, &app.ui.theme);
         }
         Route::Help => {
             // Draw resource view underneath the help overlay
@@ -84,14 +112,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             views::resource::draw_resources(f, app, area);
             draw_container_select(f, app, &target, sel);
         }
-        Route::Aliases { .. } => {
-            // Reuse the describe view to show alias content
-            views::describe::draw_describe(f, app, area);
-        }
         Route::EditingResource { .. } => {
             // Snapshot the label first (immutable borrow on `app.route`),
             // then run the resource view (mutable borrow on `app`), then
-            // draw the overlay (immutable borrow on `app.theme`). The
+            // draw the overlay (immutable borrow on `app.ui.theme`). The
             // borrows are disjoint in time so the borrow checker accepts
             // them in this order.
             let label = if let Route::EditingResource { ref target, ref state } = app.route {
@@ -104,7 +128,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 }
             } else { String::new() };
             views::resource::draw_resources(f, app, area);
-            draw_centered_overlay(f, &label, &app.theme);
+            draw_centered_overlay(f, &label, &app.ui.theme);
         }
     }
 
@@ -113,7 +137,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // (logs, describe, yaml) we need to draw it as an overlay so the user can
     // see what they're typing.
     if !matches!(app.route, Route::Resources | Route::Contexts | Route::Overview) {
-        if app.input_mode.is_active() {
+        if app.ui.input_mode.is_active() {
             draw_command_overlay(f, app);
         }
         if app.nav.filter_input().active {
@@ -128,16 +152,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_confirm_dialog(f, app);
 
     // Draw the generic form dialog if present (Scale, PortForward, …).
-    if let Some(ref dialog) = app.form_dialog {
-        let widget = FormDialogWidget::new(dialog, &app.theme);
+    if let Some(ref dialog) = app.ui.form_dialog {
+        let widget = FormDialogWidget::new(dialog, &app.ui.theme);
         f.render_widget(widget, f.area());
     }
 }
 
 /// Draw the help overlay on top of the current view.
 fn draw_help_overlay(f: &mut Frame, app: &App) {
-    let theme = &app.theme;
-    let help = HelpOverlay::new(theme, app.help_scroll, Some(app.current_capabilities()));
+    let theme = &app.ui.theme;
+    let help = HelpOverlay::new(theme, app.ui.help_scroll, Some(app.current_capabilities()));
     f.render_widget(help, f.area());
 }
 
@@ -173,12 +197,12 @@ fn draw_centered_overlay(f: &mut Frame, label: &str, theme: &crate::ui::theme::T
 
 /// Draw flash messages at the bottom of the screen.
 fn draw_flash(f: &mut Frame, app: &App) {
-    if let Some(ref flash) = app.flash {
+    if let Some(ref flash) = app.ui.flash {
         if flash.is_expired() {
             return;
         }
 
-        let theme = &app.theme;
+        let theme = &app.ui.theme;
         let area = f.area();
 
         // Position flash at the very bottom line
@@ -208,7 +232,7 @@ fn draw_container_select(
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Clear};
 
-    let theme = &app.theme;
+    let theme = &app.ui.theme;
     let area = f.area();
 
     // Find the pod's containers (typed field on ResourceRow). Init
@@ -217,12 +241,7 @@ fn draw_container_select(
     // `kind` discriminant rather than carried as a string prefix in
     // `name` like the older shape.
     use crate::kube::resources::row::ContainerKind;
-    let table = if crate::app::nav::is_globally_stored(&target.resource) {
-        app.data.unified.get(&target.resource)
-    } else {
-        app.nav.find_table_for_resource(&target.resource)
-    };
-    let containers: Vec<String> = table
+    let containers: Vec<String> = app.table_for(&target.resource)
         .and_then(|t| t.items.iter().find(|p| {
             p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
         }))
@@ -306,8 +325,8 @@ fn draw_container_select(
 
 /// Draw the confirmation dialog overlay.
 fn draw_confirm_dialog(f: &mut Frame, app: &App) {
-    if let Some(ref dialog) = app.confirm_dialog {
-        let theme = &app.theme;
+    if let Some(ref dialog) = app.ui.confirm_dialog {
+        let theme = &app.ui.theme;
         let dialog_widget = ConfirmDialogWidget::new(dialog, theme);
         f.render_widget(dialog_widget, f.area());
     }
@@ -321,7 +340,7 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
     if area.height < 5 {
         return;
     }
-    let theme = &app.theme;
+    let theme = &app.ui.theme;
 
     // 3-line box at the bottom, above the last 2 lines (indicator/flash)
     let overlay_y = area.y + area.height.saturating_sub(5);
@@ -339,12 +358,12 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
         return;
     }
 
-    let input = app.input_mode.input().unwrap_or("");
+    let input = app.ui.input_mode.input().unwrap_or("");
     let ghost: String = app.best_completion()
         .and_then(|c| c.strip_prefix(input).map(str::to_string))
         .unwrap_or_default();
 
-    let prefix = app.input_mode.prompt();
+    let prefix = app.ui.input_mode.prompt();
     let prefix_len: u16 = prefix.width() as u16;
     let typed_len = input.width() as u16;
 
@@ -378,7 +397,7 @@ fn draw_filter_overlay(f: &mut Frame, app: &App) {
     if area.height < 5 {
         return;
     }
-    let theme = &app.theme;
+    let theme = &app.ui.theme;
 
     let overlay_y = area.y + area.height.saturating_sub(5);
     let overlay_area = Rect::new(area.x, overlay_y, area.width, 3);

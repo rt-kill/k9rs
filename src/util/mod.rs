@@ -258,7 +258,7 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> &str {
 /// Formats a total-seconds count into the `2d3h`/`5m10s`/`30s` age string.
 /// Shared backend for [`format_age`] (timestamp-based) and
 /// [`format_age_duration`] (`Duration`-based).
-fn format_age_secs(total_secs: i64) -> String {
+pub fn format_age_secs(total_secs: i64) -> String {
     if total_secs < 0 {
         return "0s".to_string();
     }

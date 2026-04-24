@@ -4,7 +4,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 fn int_or_string_display(v: &IntOrString) -> String {
     match v {
@@ -60,17 +60,22 @@ impl ConvertToRow<PodDisruptionBudget> for PodDisruptionBudgetDef {
             .map(|s| s.desired_healthy.to_string())
             .unwrap_or_else(|| "0".to_string());
         let expected_pods = status
-            .map(|s| s.expected_pods.to_string())
-            .unwrap_or_else(|| "0".to_string());
-        ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                min_available, max_unavailable, allowed_disruptions,
-                current_healthy, desired_healthy, expected_pods,
-                crate::util::format_age(meta.age),
-            ],
+            .map(|s| s.expected_pods)
+            .unwrap_or(0);
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(min_available),
+            CellValue::Text(max_unavailable),
+            CellValue::Count(allowed_disruptions.parse::<i64>().unwrap_or(0)),
+            CellValue::Count(current_healthy.parse::<i64>().unwrap_or(0)),
+            CellValue::Count(desired_healthy.parse::<i64>().unwrap_or(0)),
+            CellValue::Count(expected_pods as i64),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: Some(meta.namespace),
+            cells,
             ..Default::default()
         }
     }

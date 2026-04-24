@@ -4,7 +4,7 @@ use k8s_openapi::api::batch::v1::Job;
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::{CommonMeta, WorkloadContainers};
-use crate::kube::resources::row::{DrillTarget, ResourceRow, RowHealth};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
 
 // ---------------------------------------------------------------------------
 // JobDef — ResourceDef + ConvertToRow
@@ -44,8 +44,6 @@ impl ConvertToRow<Job> for JobDef {
 
         let status_obj = job.status.unwrap_or_default();
         let succeeded = status_obj.succeeded.unwrap_or(0);
-        let completions = format!("{}/{}", succeeded, desired_completions);
-
         let duration = match status_obj.start_time {
             Some(ref start) => {
                 let end = status_obj.completion_time.as_ref().map(|t| t.0).unwrap_or_else(chrono::Utc::now);
@@ -78,13 +76,18 @@ impl ConvertToRow<Job> for JobDef {
         let health = if succeeded >= desired_completions { RowHealth::Normal }
             else { RowHealth::Pending };
 
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Ratio { num: succeeded as u32, denom: desired_completions as u32 },
+            CellValue::Text(duration),
+            CellValue::from_comma_str(&containers.names),
+            CellValue::from_comma_str(&containers.images),
+            CellValue::from_comma_str(&meta.labels_str),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];
         ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                completions, duration,
-                containers.names, containers.images,
-                meta.labels_str, crate::util::format_age(meta.age),
-            ],
+            cells,
             name: meta.name,
             namespace: Some(meta.namespace),
             health,

@@ -4,7 +4,7 @@ use k8s_openapi::api::batch::v1::CronJob;
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::{CommonMeta, WorkloadContainers};
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // CronJobDef — ResourceDef + ConvertToRow
@@ -64,15 +64,20 @@ impl ConvertToRow<CronJob> for CronJobDef {
             None
         };
 
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(schedule),
+            CellValue::Bool(suspend),
+            CellValue::Count(active as i64),
+            CellValue::Age(last_schedule.map(|t| t.timestamp())),
+            CellValue::from_comma_str(&containers.names),
+            CellValue::from_comma_str(&containers.images),
+            CellValue::from_comma_str(&meta.labels_str),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];
         ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                schedule, suspend.to_string(),
-                active.to_string(), crate::util::format_age(last_schedule),
-                containers.names, containers.images,
-                meta.labels_str,
-                crate::util::format_age(meta.age),
-            ],
+            cells,
             name: meta.name,
             namespace: Some(meta.namespace),
             drill_target: drill,

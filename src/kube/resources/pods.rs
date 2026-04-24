@@ -3,7 +3,14 @@ use k8s_openapi::api::core::v1::Pod;
 
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
-use crate::kube::resources::row::{ContainerInfo, OwnerRefInfo, ResourceRow, RowHealth};
+use crate::kube::resources::k8s_const::*;
+use crate::kube::resources::row::{CellValue, ContainerInfo, OwnerRefInfo, QuantityUnit, ResourceRow, RowHealth};
+
+// Pod-specific K8s API reason / condition strings used more than once in this
+// file but not referenced by other resource converters.
+const COND_POD_SCHEDULED: &str = "PodScheduled";
+const REASON_SCHEDULING_GATED: &str = "SchedulingGated";
+const REASON_NODE_LOST: &str = "NodeLost";
 
 /// Pod status display + health, computed together in one pass.
 ///
@@ -33,11 +40,11 @@ impl PodStatus {
 /// re-classify a display string afterwards.
 fn classify_pod_reason(reason: &str) -> RowHealth {
     match reason {
-        "Running" | "Succeeded" | "Completed" => RowHealth::Normal,
-        "Pending" | "ContainerCreating" | "PodInitializing" | "Terminating"
-        | "SchedulingGated" | "NotReady" | "Unknown" => RowHealth::Pending,
+        PHASE_RUNNING | PHASE_SUCCEEDED | PHASE_COMPLETED => RowHealth::Normal,
+        PHASE_PENDING | "ContainerCreating" | "PodInitializing" | REASON_TERMINATING
+        | REASON_SCHEDULING_GATED | REASON_NOT_READY | PHASE_UNKNOWN => RowHealth::Pending,
         "Failed" | "Error" | "CrashLoopBackOff" | "ImagePullBackOff"
-        | "ErrImagePull" | "OOMKilled" | "Evicted" | "NodeLost"
+        | "ErrImagePull" | "OOMKilled" | "Evicted" | REASON_NODE_LOST
         | "CreateContainerConfigError" => RowHealth::Failed,
         // Unknown reason string — treat as pending so the row is visible
         // but not flagged as healthy. Previously defaulted to Normal which
@@ -60,8 +67,6 @@ pub(crate) fn compute_pod_status(
     reason: &Option<String>,
     has_deletion_timestamp: bool,
 ) -> PodStatus {
-    const NODE_UNREACHABLE: &str = "NodeLost";
-
     // Start with the pod-level reason or phase.
     let mut status_str = if let Some(r) = reason {
         if !r.is_empty() { r.clone() } else { phase.to_string() }
@@ -71,10 +76,10 @@ pub(crate) fn compute_pod_status(
 
     // Check for SchedulingGated condition (K8s 1.26+).
     for cond in conditions {
-        if cond.type_ == "PodScheduled" {
+        if cond.type_ == COND_POD_SCHEDULED {
             if let Some(ref r) = cond.reason {
-                if r == "SchedulingGated" {
-                    status_str = "SchedulingGated".to_string();
+                if r == REASON_SCHEDULING_GATED {
+                    status_str = REASON_SCHEDULING_GATED.to_string();
                 }
             }
         }
@@ -87,7 +92,7 @@ pub(crate) fn compute_pod_status(
     for (i, ics) in init_container_statuses.iter().enumerate() {
         let is_sidecar = init_containers_spec.get(i)
             .and_then(|c| c.restart_policy.as_deref())
-            .is_some_and(|p| p == "Always");
+            .is_some_and(|p| p == RESTART_ALWAYS);
 
         if let Some(ref state) = ics.state {
             if let Some(ref terminated) = state.terminated {
@@ -162,17 +167,17 @@ pub(crate) fn compute_pod_status(
     }
 
     // Completed phase with running+ready containers: check PodReady condition.
-    if status_str == "Completed" && has_running {
-        let pod_ready = conditions.iter().any(|c| c.type_ == "Ready" && c.status == "True");
-        status_str = if pod_ready { "Running".to_string() } else { "NotReady".to_string() };
+    if status_str == PHASE_COMPLETED && has_running {
+        let pod_ready = conditions.iter().any(|c| c.type_ == COND_READY && c.status == STATUS_TRUE);
+        status_str = if pod_ready { PHASE_RUNNING.to_string() } else { REASON_NOT_READY.to_string() };
     }
 
     // Deletion timestamp handling.
     if has_deletion_timestamp {
-        if reason.as_deref() == Some(NODE_UNREACHABLE) {
-            return PodStatus::pending("Unknown");
+        if reason.as_deref() == Some(REASON_NODE_LOST) {
+            return PodStatus::pending(PHASE_UNKNOWN);
         }
-        return PodStatus::pending("Terminating");
+        return PodStatus::pending(REASON_TERMINATING);
     }
 
     // Exit code terminated states are always failed — catch them via
@@ -283,7 +288,7 @@ impl ConvertToRow<Pod> for PodDef {
     let init_containers_spec = spec.init_containers.as_deref().unwrap_or(&[]);
     let status = pod.status.unwrap_or_default();
     let pod_ip = status.pod_ip.unwrap_or_default();
-    let phase = status.phase.clone().unwrap_or_else(|| "Unknown".to_string());
+    let phase = status.phase.clone().unwrap_or_else(|| PHASE_UNKNOWN.to_string());
     let container_statuses = status.container_statuses.unwrap_or_default();
     let init_container_statuses = status.init_container_statuses.unwrap_or_default();
     let conditions = status.conditions.as_deref().unwrap_or(&[]);
@@ -303,26 +308,24 @@ impl ConvertToRow<Pod> for PodDef {
     // Ready count: denominator from spec (not status), includes sidecar init containers.
     // This matches k9s which uses spec.containers.len() + sidecar init count.
     let sidecar_count = init_containers_spec.iter()
-        .filter(|c| c.restart_policy.as_deref() == Some("Always"))
+        .filter(|c| c.restart_policy.as_deref() == Some(RESTART_ALWAYS))
         .count();
     let sidecar_ready = init_container_statuses.iter()
         .enumerate()
         .filter(|(i, cs)| {
             cs.ready && init_containers_spec.get(*i)
                 .and_then(|c| c.restart_policy.as_deref())
-                .is_some_and(|p| p == "Always")
+                .is_some_and(|p| p == RESTART_ALWAYS)
         })
         .count();
     let total = (spec.containers.len() + sidecar_count) as i32;
     let ready_count = container_statuses.iter().filter(|cs| cs.ready).count() as i32 + sidecar_ready as i32;
-    let ready = format!("{}/{}", ready_count, total);
-
     // Restarts: include sidecar init container restarts.
     let sidecar_restarts: i32 = init_container_statuses.iter()
         .enumerate()
         .filter(|(i, _)| init_containers_spec.get(*i)
             .and_then(|c| c.restart_policy.as_deref())
-            .is_some_and(|p| p == "Always"))
+            .is_some_and(|p| p == RESTART_ALWAYS))
         .map(|(_, cs)| cs.restart_count)
         .sum();
     let restarts: i32 = container_statuses.iter().map(|cs| cs.restart_count).sum::<i32>() + sidecar_restarts;
@@ -371,7 +374,6 @@ impl ConvertToRow<Pod> for PodDef {
         .filter_map(|cs| cs.last_state.as_ref()?.terminated.as_ref()?.finished_at.as_ref())
         .map(|t| t.0)
         .max();
-    let last_restart_str = crate::util::format_age(last_restart);
 
     // Readiness gates
     let readiness_gates = {
@@ -380,7 +382,7 @@ impl ConvertToRow<Pod> for PodDef {
             let ready_gates = status.conditions.as_ref().map(|conds| {
                 conds.iter().filter(|c| {
                     spec.readiness_gates.as_ref().is_some_and(|gates| {
-                        gates.iter().any(|g| g.condition_type == c.type_ && c.status == "True")
+                        gates.iter().any(|g| g.condition_type == c.type_ && c.status == STATUS_TRUE)
                     })
                 }).count()
             }).unwrap_or(0);
@@ -445,7 +447,7 @@ impl ConvertToRow<Pod> for PodDef {
     // Sidecar init containers (restartPolicy=Always) contribute to running
     // resource usage just like regular containers.
     for c in init_containers_spec {
-        if c.restart_policy.as_deref() == Some("Always") {
+        if c.restart_policy.as_deref() == Some(RESTART_ALWAYS) {
             accum_resources(&c.resources);
         }
     }
@@ -453,57 +455,37 @@ impl ConvertToRow<Pod> for PodDef {
     let cpu_req_milli = cpu_req_nano / 1_000_000;
     let cpu_lim_milli = cpu_lim_nano / 1_000_000;
 
-    let cpu_req_display = if has_cpu_req {
-        crate::util::format_cpu(&format!("{}n", cpu_req_nano))
-    } else {
-        String::new()
-    };
-    let cpu_lim_display = if has_cpu_lim {
-        crate::util::format_cpu(&format!("{}n", cpu_lim_nano))
-    } else {
-        String::new()
-    };
-    let mem_req_display = if has_mem_req {
-        crate::util::format_mem(&mem_req_bytes.to_string())
-    } else {
-        String::new()
-    };
-    let mem_lim_display = if has_mem_lim {
-        crate::util::format_mem(&mem_lim_bytes.to_string())
-    } else {
-        String::new()
-    };
-
     // `health` was computed by `compute_pod_status` above — no string
     // round-trip re-classification.
 
+    let cells: Vec<CellValue> = vec![
+        CellValue::Text(namespace.clone()),
+        CellValue::Text(name.clone()),
+        CellValue::Ratio { num: ready_count as u32, denom: total as u32 },
+        CellValue::Status { text: effective_status, health },
+        CellValue::Count(restarts as i64),
+        CellValue::Age(last_restart.map(|t| t.timestamp())),
+        CellValue::Placeholder,                                     // CPU (metrics overlay)
+        CellValue::Placeholder,                                     // MEM (metrics overlay)
+        if has_cpu_req { CellValue::Quantity { value: cpu_req_milli, unit: QuantityUnit::Millicores } } else { CellValue::Text(String::new()) },
+        if has_cpu_lim { CellValue::Quantity { value: cpu_lim_milli, unit: QuantityUnit::Millicores } } else { CellValue::Text(String::new()) },
+        if has_mem_req { CellValue::Quantity { value: mem_req_bytes, unit: QuantityUnit::Bytes } } else { CellValue::Text(String::new()) },
+        if has_mem_lim { CellValue::Quantity { value: mem_lim_bytes, unit: QuantityUnit::Bytes } } else { CellValue::Text(String::new()) },
+        CellValue::Percentage(None),                                // %CPU/R (metrics overlay)
+        CellValue::Percentage(None),                                // %CPU/L (metrics overlay)
+        CellValue::Percentage(None),                                // %MEM/R (metrics overlay)
+        CellValue::Percentage(None),                                // %MEM/L (metrics overlay)
+        CellValue::Text(pod_ip),
+        CellValue::Text(node_display),
+        CellValue::Text(nominated_node),
+        CellValue::Text(qos_short.to_string()),
+        CellValue::Text(service_account),
+        CellValue::Text(readiness_gates),
+        CellValue::from_comma_str(&labels_str),
+        CellValue::Age(age.map(|t| t.timestamp())),
+    ];
     ResourceRow {
-        cells: vec![
-            namespace.clone(),
-            name.clone(),
-            ready,
-            effective_status,
-            restarts.to_string(),
-            last_restart_str,
-            "n/a".to_string(), // CPU (filled by metrics overlay)
-            "n/a".to_string(), // MEM (filled by metrics overlay)
-            cpu_req_display,
-            cpu_lim_display,
-            mem_req_display,
-            mem_lim_display,
-            "n/a".to_string(), // %CPU/R (filled by metrics overlay)
-            "n/a".to_string(), // %CPU/L (filled by metrics overlay)
-            "n/a".to_string(), // %MEM/R (filled by metrics overlay)
-            "n/a".to_string(), // %MEM/L (filled by metrics overlay)
-            pod_ip,
-            node_display,
-            nominated_node,
-            qos_short.to_string(),
-            service_account,
-            readiness_gates,
-            labels_str,
-            crate::util::format_age(age),
-        ],
+        cells,
         name,
         namespace: Some(namespace),
         containers: containers_vec,

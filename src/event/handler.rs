@@ -41,14 +41,14 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     // -----------------------------------------------------------------------
     // Confirmation dialog: only y/n/Enter/Esc.
     // -----------------------------------------------------------------------
-    if app.confirm_dialog.is_some() {
+    if app.ui.confirm_dialog.is_some() {
         return handle_confirm_dialog(app, key);
     }
 
     // -----------------------------------------------------------------------
     // Detail views and log view override `/` to start search instead of filter.
     // -----------------------------------------------------------------------
-    if matches!(app.route, Route::Yaml { .. } | Route::Describe { .. } | Route::Aliases { .. } | Route::Logs { .. })
+    if matches!(app.route, Route::ContentView { .. } | Route::Logs { .. })
         && key.code == KeyCode::Char('/')
     {
         return Some(Action::SearchStart);
@@ -67,12 +67,11 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     match &app.route {
         Route::Overview => handle_overview_keys(key),
         Route::Resources => handle_resource_view_keys(app, key),
-        Route::Yaml { .. } | Route::Describe { .. } => handle_detail_view_keys(key),
+        Route::ContentView { .. } => handle_detail_view_keys(key),
         Route::Logs { .. } => handle_log_view_keys(app, key),
         Route::Help => handle_help_view_keys(key),
         Route::Contexts => handle_contexts_view_keys(key),
         Route::ContainerSelect { .. } => handle_container_select_keys(key),
-        Route::Aliases { .. } => handle_detail_view_keys(key),
         // Edit flow is modal — keys are blocked while we wait for the
         // server response or the editor subprocess. The session loop
         // drives transitions; the user is either looking at a "loading"
@@ -100,7 +99,7 @@ fn handle_confirm_dialog(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Enter => {
             // Confirm or cancel based on which button is selected
-            if app.confirm_dialog.as_ref().is_some_and(|d| d.action_focused) {
+            if app.ui.confirm_dialog.as_ref().is_some_and(|d| d.action_focused) {
                 Some(Action::Confirm)
             } else {
                 Some(Action::Cancel)
@@ -135,9 +134,13 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(Action::ToggleHeader);
     }
 
-    // Ctrl-S: save/dump table to file.
+    // Ctrl-S: save logs (in log view) or save table (everywhere else).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-        return Some(Action::SaveTable);
+        return if matches!(app.route, Route::Logs { .. }) {
+            Some(Action::SaveLogs)
+        } else {
+            Some(Action::SaveTable)
+        };
     }
 
     // Ctrl-A: show aliases view.
@@ -334,10 +337,6 @@ fn handle_detail_view_keys(key: KeyEvent) -> Option<Action> {
 // ---------------------------------------------------------------------------
 
 fn handle_log_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
-    // Ctrl+S: save logs to file.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-        return Some(Action::SaveLogs);
-    }
     // Shift-C: clear logs.
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Char('C') {
         return Some(Action::ClearLogs);

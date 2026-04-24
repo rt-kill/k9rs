@@ -3,7 +3,7 @@ use k8s_openapi::api::core::v1::ResourceQuota;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // ResourceQuotaDef
@@ -39,13 +39,16 @@ impl ConvertToRow<ResourceQuota> for ResourceQuotaDef {
         };
         let hard = rq.spec.as_ref().map(|s| format_qmap(&s.hard)).unwrap_or_default();
         let used = rq.status.as_ref().map(|s| format_qmap(&s.used)).unwrap_or_default();
-        ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                hard, used, crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(hard),
+            CellValue::Text(used),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: Some(meta.namespace),
+            cells,
             ..Default::default()
         }
     }

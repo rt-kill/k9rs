@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::kube::protocol::{ContextId, ContextName, CrdRef, ResourceScope};
-use crate::kube::resources::row::{DrillTarget, ResourceRow, RowHealth};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
 
 /// A printer column from a CRD's additionalPrinterColumns spec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,11 +101,14 @@ pub fn cached_crds_to_rows(cached: &[CachedCrd]) -> Vec<ResourceRow> {
             // stack — handler does `ResourceId::Crd(crd_ref)` from this.
             let drill_target = Some(DrillTarget::BrowseCrd(c.gvr.clone()));
             let scope_label = c.gvr.scope.k8s_label();
-            ResourceRow {
-                cells: vec![
-                    c.name.clone(), c.gvr.group.clone(), c.gvr.version.clone(),
-                    c.gvr.kind.clone(), scope_label.to_string(), String::new(), // no age from cache
-                ],
+            let cells: Vec<CellValue> = vec![
+                CellValue::Text(c.name.clone()),
+                CellValue::Text(c.gvr.group.clone()),
+                CellValue::Text(c.gvr.version.clone()),
+                CellValue::Text(c.gvr.kind.clone()),
+                CellValue::Text(scope_label.to_string()),
+                CellValue::Age(None), // no age from cache
+            ];            ResourceRow {
                 name: c.name.clone(),
                 namespace: None,
                 containers: Vec::new(),
@@ -115,6 +118,7 @@ pub fn cached_crds_to_rows(cached: &[CachedCrd]) -> Vec<ResourceRow> {
                 health: RowHealth::Normal,
                 crd_info,
                 drill_target,
+                cells,
                 ..Default::default()
             }
         })
@@ -238,25 +242,31 @@ impl DiscoveryCache {
 pub fn cached_namespaces_to_rows(names: &[String]) -> Vec<crate::kube::resources::row::ResourceRow> {
     names
         .iter()
-        .map(|name| crate::kube::resources::row::ResourceRow {
-            cells: vec![name.clone(), "Active".to_string(), String::new()],
-            name: name.clone(),
-            namespace: None,
-            containers: Vec::new(),
-            owner_refs: Vec::new(),
-            pf_ports: Vec::new(),
-            node: None,
-            health: RowHealth::Normal,
-            crd_info: None,
-            // Namespace name comes from the K8s API's NamespaceList — it's
-            // a real identifier, never the literal string "all". Use the
-            // typed `Named` constructor directly: routing this through
-            // `from_user_command` would silently switch into all-namespaces
-            // mode if a cluster ever had a namespace literally named `all`.
-            drill_target: Some(DrillTarget::SwitchNamespace(
-                crate::kube::protocol::Namespace::Named(name.clone()),
-            )),
-            ..Default::default()
+        .map(|name| {
+            let cells: Vec<CellValue> = vec![
+                CellValue::Text(name.clone()),
+                CellValue::Status { text: "Active".to_string(), health: RowHealth::Normal },
+                CellValue::Age(None), // no age from cache
+            ];            crate::kube::resources::row::ResourceRow {
+                name: name.clone(),
+                namespace: None,
+                containers: Vec::new(),
+                owner_refs: Vec::new(),
+                pf_ports: Vec::new(),
+                node: None,
+                health: RowHealth::Normal,
+                crd_info: None,
+                // Namespace name comes from the K8s API's NamespaceList — it's
+                // a real identifier, never the literal string "all". Use the
+                // typed `Named` constructor directly: routing this through
+                // `from_user_command` would silently switch into all-namespaces
+                // mode if a cluster ever had a namespace literally named `all`.
+                drill_target: Some(DrillTarget::SwitchNamespace(
+                    crate::kube::protocol::Namespace::Named(name.clone()),
+                )),
+                cells,
+                ..Default::default()
+            }
         })
         .collect()
 }

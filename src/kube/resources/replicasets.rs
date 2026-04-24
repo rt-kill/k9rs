@@ -4,7 +4,7 @@ use k8s_openapi::api::apps::v1::ReplicaSet;
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::{CommonMeta, WorkloadContainers};
-use crate::kube::resources::row::{DrillTarget, ResourceRow, RowHealth};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
 
 // ---------------------------------------------------------------------------
 // ReplicaSetDef — ResourceDef + ConvertToRow
@@ -61,13 +61,19 @@ impl ConvertToRow<ReplicaSet> for ReplicaSetDef {
             else if ready < desired { RowHealth::Failed }
             else { RowHealth::Normal };
 
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Count(desired as i64),
+            CellValue::Count(current as i64),
+            CellValue::Count(ready as i64),
+            CellValue::from_comma_str(&containers.names),
+            CellValue::from_comma_str(&containers.images),
+            CellValue::from_comma_str(&meta.labels_str),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];
         ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                desired.to_string(), current.to_string(), ready.to_string(),
-                containers.names, containers.images,
-                meta.labels_str, crate::util::format_age(meta.age),
-            ],
+            cells,
             name: meta.name,
             namespace: Some(meta.namespace),
             pf_ports: containers.tcp_ports,

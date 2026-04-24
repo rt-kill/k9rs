@@ -1,3 +1,37 @@
+// ---------------------------------------------------------------------------
+// Shared K8s API value constants — strings that the Kubernetes API returns as
+// condition types, condition statuses, phase names, address types, etc.
+// Only values referenced by two or more resource converter files live here;
+// single-file constants stay file-local.
+// ---------------------------------------------------------------------------
+pub(crate) mod k8s_const {
+    // -- Condition types --
+    pub const COND_READY: &str = "Ready";
+
+    // -- Condition / field statuses --
+    pub const STATUS_TRUE: &str = "True";
+
+    // -- Pod / namespace phases & reasons --
+    pub const PHASE_RUNNING: &str = "Running";
+    pub const PHASE_PENDING: &str = "Pending";
+    pub const PHASE_SUCCEEDED: &str = "Succeeded";
+    pub const PHASE_COMPLETED: &str = "Completed";
+    pub const PHASE_UNKNOWN: &str = "Unknown";
+    pub const REASON_NOT_READY: &str = "NotReady";
+    pub const REASON_TERMINATING: &str = "Terminating";
+
+    // -- PV / PVC phases --
+    pub const PHASE_BOUND: &str = "Bound";
+    pub const PHASE_AVAILABLE: &str = "Available";
+
+    // -- Restart policy --
+    pub const RESTART_ALWAYS: &str = "Always";
+
+    // -- Node address types --
+    pub const ADDR_INTERNAL_IP: &str = "InternalIP";
+    pub const ADDR_EXTERNAL_IP: &str = "ExternalIP";
+}
+
 pub mod row;
 pub mod pods;
 pub mod deployments;
@@ -38,8 +72,8 @@ pub mod webhooks;
 /// generic table machinery (`StatefulTable<T>`, `live_query`'s sort
 /// helpers) so they don't have to depend on the concrete row type.
 pub trait KubeResource: Clone + std::fmt::Debug + Send + Sync + 'static {
-    /// The display columns for this row, in header order.
-    fn cells(&self) -> &[String];
+    /// The typed cell values for this row, in header order.
+    fn cells(&self) -> &[row::CellValue];
     /// Resource name (cached for O(1) access in sorts/filters).
     fn name(&self) -> &str;
     /// Resource namespace, or `""` for cluster-scoped rows.

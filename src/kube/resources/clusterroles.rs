@@ -3,7 +3,7 @@ use k8s_openapi::api::rbac::v1::ClusterRole;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // ClusterRoleDef
@@ -32,14 +32,14 @@ impl ConvertToRow<ClusterRole> for ClusterRoleDef {
     fn convert(cr: ClusterRole) -> ResourceRow {
         let meta = CommonMeta::from_k8s(cr.metadata);
         let rules_count = cr.rules.map(|r| r.len()).unwrap_or(0);
-        ResourceRow {
-            cells: vec![
-                meta.name.clone(),
-                rules_count.to_string(),
-                crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.name.clone()),
+            CellValue::Count(rules_count as i64),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: None,
+            cells,
             ..Default::default()
         }
     }

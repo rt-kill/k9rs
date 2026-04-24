@@ -3,7 +3,7 @@ use k8s_openapi::api::core::v1::Service;
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::{DrillTarget, ResourceRow};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // ServiceDef
@@ -105,17 +105,22 @@ impl ConvertToRow<Service> for ServiceDef {
             Some(DrillTarget::PodsByNameGrep(meta.name.clone()))
         };
 
-        ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                service_type, cluster_ip, external_ip,
-                selector_str, ports_str, meta.labels_str,
-                crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(service_type),
+            CellValue::Text(cluster_ip),
+            CellValue::Text(external_ip),
+            CellValue::Text(selector_str),
+            CellValue::Text(ports_str),
+            CellValue::Text(meta.labels_str),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: Some(meta.namespace),
             pf_ports: port_list,
             drill_target,
+            cells,
             ..Default::default()
         }
     }

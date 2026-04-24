@@ -736,3 +736,261 @@ pub fn is_globally_stored(rid: &ResourceId) -> bool {
         Some(BuiltInKind::Namespace | BuiltInKind::Node | BuiltInKind::CustomResourceDefinition)
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kube::resource_def::BuiltInKind;
+
+    fn pod_rid() -> ResourceId { rid(BuiltInKind::Pod) }
+    fn deploy_rid() -> ResourceId { rid(BuiltInKind::Deployment) }
+    fn svc_rid() -> ResourceId { rid(BuiltInKind::Service) }
+
+    // -----------------------------------------------------------------------
+    // push / pop basics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn push_changes_resource_id() {
+        let mut stack = NavStack::new(pod_rid());
+        assert_eq!(stack.resource_id(), &pod_rid());
+
+        let step = NavStep::new(deploy_rid(), None);
+        let change = stack.push(step);
+        assert_eq!(stack.resource_id(), &deploy_rid());
+        assert!(change.subscribe.is_some(), "cross-rid push should subscribe");
+    }
+
+    #[test]
+    fn pop_restores_previous_resource() {
+        let mut stack = NavStack::new(pod_rid());
+        stack.push(NavStep::new(deploy_rid(), None));
+
+        let result = stack.pop();
+        assert!(result.is_some());
+        assert_eq!(stack.resource_id(), &pod_rid());
+    }
+
+    #[test]
+    fn pop_at_root_returns_none() {
+        let mut stack = NavStack::new(pod_rid());
+        assert!(stack.pop().is_none());
+    }
+
+    #[test]
+    fn push_same_rid_no_subscribe() {
+        let mut stack = NavStack::new(pod_rid());
+        let grep = NavFilter::Grep(CompiledGrep::new("nginx"));
+        let step = NavStep::new(pod_rid(), Some(grep));
+        let change = stack.push(step);
+        assert!(change.subscribe.is_none(), "same-rid push should not subscribe");
+    }
+
+    #[test]
+    fn multi_push_pop_sequence() {
+        let mut stack = NavStack::new(pod_rid());
+        stack.push(NavStep::new(deploy_rid(), None));
+        stack.push(NavStep::new(svc_rid(), None));
+        assert_eq!(stack.resource_id(), &svc_rid());
+        assert_eq!(stack.depth(), 3);
+
+        stack.pop();
+        assert_eq!(stack.resource_id(), &deploy_rid());
+        stack.pop();
+        assert_eq!(stack.resource_id(), &pod_rid());
+        assert!(stack.pop().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // reset
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reset_clears_stack_and_changes_resource() {
+        let mut stack = NavStack::new(pod_rid());
+        stack.push(NavStep::new(deploy_rid(), None));
+        assert_eq!(stack.depth(), 2);
+
+        let change = stack.reset(svc_rid());
+        assert_eq!(stack.resource_id(), &svc_rid());
+        assert_eq!(stack.depth(), 1);
+        assert!(!stack.is_drilled());
+        assert!(change.subscribe.is_some());
+    }
+
+    #[test]
+    fn reset_tracks_prev_root() {
+        let mut stack = NavStack::new(pod_rid());
+        assert!(stack.prev_root().is_none());
+
+        stack.reset(deploy_rid());
+        assert_eq!(stack.prev_root(), Some(&pod_rid()));
+
+        stack.reset(svc_rid());
+        assert_eq!(stack.prev_root(), Some(&deploy_rid()));
+    }
+
+    // -----------------------------------------------------------------------
+    // filter inheritance / is_drilled
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn grep_push_marks_drilled() {
+        let mut stack = NavStack::new(pod_rid());
+        assert!(!stack.is_drilled());
+
+        let grep = NavFilter::Grep(CompiledGrep::new("nginx"));
+        stack.push(NavStep::new(pod_rid(), Some(grep)));
+        assert!(stack.is_drilled());
+    }
+
+    #[test]
+    fn pop_removes_grep_filter() {
+        let mut stack = NavStack::new(pod_rid());
+        let grep = NavFilter::Grep(CompiledGrep::new("nginx"));
+        stack.push(NavStep::new(pod_rid(), Some(grep)));
+
+        assert_eq!(stack.active_filters().len(), 1);
+        stack.pop();
+        assert!(stack.active_filters().is_empty());
+        assert!(!stack.is_drilled());
+    }
+
+    #[test]
+    fn active_filters_stacks_same_rid() {
+        let mut stack = NavStack::new(pod_rid());
+        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Grep(CompiledGrep::new("a")))));
+        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Grep(CompiledGrep::new("b")))));
+
+        let filters = stack.active_filters();
+        assert_eq!(filters.len(), 2);
+        // Root-first order: "a" was pushed first, so it appears first.
+        assert_eq!(filters[0].as_grep().unwrap().source(), "a");
+        assert_eq!(filters[1].as_grep().unwrap().source(), "b");
+    }
+
+    #[test]
+    fn active_filters_stops_at_rid_boundary() {
+        let mut stack = NavStack::new(pod_rid());
+        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Grep(CompiledGrep::new("x")))));
+        // Push a different resource -- the pod grep should not appear in active_filters.
+        stack.push(NavStep::new(deploy_rid(), Some(NavFilter::Grep(CompiledGrep::new("y")))));
+
+        let filters = stack.active_filters();
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].as_grep().unwrap().source(), "y");
+    }
+
+    #[test]
+    fn fault_filter_push_and_pop() {
+        let mut stack = NavStack::new(pod_rid());
+        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Fault)));
+        assert!(stack.has_fault_filter());
+
+        assert!(stack.pop_fault_filter());
+        assert!(!stack.has_fault_filter());
+    }
+
+    // -----------------------------------------------------------------------
+    // breadcrumb
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn breadcrumb_root_only() {
+        let stack = NavStack::new(pod_rid());
+        let bc = stack.breadcrumb();
+        // Root with no filter shows the short_label (e.g. "po" for pods).
+        assert!(!bc.is_empty());
+    }
+
+    #[test]
+    fn breadcrumb_with_grep() {
+        let mut stack = NavStack::new(pod_rid());
+        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Grep(CompiledGrep::new("nginx")))));
+        let bc = stack.breadcrumb();
+        assert!(bc.contains("/nginx"), "breadcrumb should contain grep pattern, got: {}", bc);
+    }
+
+    #[test]
+    fn breadcrumb_with_drill() {
+        let mut stack = NavStack::new(pod_rid());
+        stack.push(NavStep::new(deploy_rid(), None));
+        let bc = stack.breadcrumb();
+        // Should contain " > " separator between two resource labels.
+        assert!(bc.contains(" > "), "breadcrumb should contain separator, got: {}", bc);
+    }
+
+    #[test]
+    fn breadcrumb_fault_filter() {
+        let mut stack = NavStack::new(pod_rid());
+        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Fault)));
+        let bc = stack.breadcrumb();
+        assert!(bc.contains("fault"), "breadcrumb should contain fault, got: {}", bc);
+    }
+
+    #[test]
+    fn breadcrumb_field_selector() {
+        let mut stack = NavStack::new(deploy_rid());
+        let field = NavFilter::Field(K8sFieldSelector::SpecNodeName("node-1".into()));
+        // Field selector is a server-side filter, so it must be a cross-rid push.
+        stack.push(NavStep::new(pod_rid(), Some(field)));
+        let bc = stack.breadcrumb();
+        assert!(bc.contains("node=node-1"), "breadcrumb should contain field selector, got: {}", bc);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_table_for_resource
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_table_on_step_with_table() {
+        let mut stack = NavStack::new(pod_rid());
+        let mut step = NavStep::new(deploy_rid(), None);
+        step.table = Some(crate::app::table::StatefulTable::new());
+        stack.push(step);
+
+        assert!(stack.find_table_for_resource(&deploy_rid()).is_some());
+        assert!(stack.find_table_for_resource(&pod_rid()).is_none());
+    }
+
+    #[test]
+    fn find_table_walks_parent_chain() {
+        let mut stack = NavStack::new(pod_rid());
+        let mut step = NavStep::new(deploy_rid(), None);
+        step.table = Some(crate::app::table::StatefulTable::new());
+        stack.push(step);
+        // Push another step on top (same rid, no table).
+        stack.push(NavStep::new(deploy_rid(), Some(NavFilter::Grep(CompiledGrep::new("x")))));
+
+        // Should walk past the grep step and find the table on the parent.
+        assert!(stack.find_table_for_resource(&deploy_rid()).is_some());
+    }
+
+    #[test]
+    fn find_table_returns_none_when_absent() {
+        let stack = NavStack::new(pod_rid());
+        assert!(stack.find_table_for_resource(&svc_rid()).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // root_resource_id / depth / save_selected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn root_resource_id_after_pushes() {
+        let mut stack = NavStack::new(pod_rid());
+        stack.push(NavStep::new(deploy_rid(), None));
+        stack.push(NavStep::new(svc_rid(), None));
+        assert_eq!(stack.root_resource_id(), &pod_rid());
+    }
+
+    #[test]
+    fn save_and_restore_selected() {
+        let mut stack = NavStack::new(pod_rid());
+        stack.save_selected(42);
+        stack.push(NavStep::new(deploy_rid(), None));
+
+        let (_, _) = stack.pop().unwrap();
+        assert_eq!(stack.current().saved_selected, 42);
+    }
+}

@@ -3,7 +3,7 @@ use k8s_openapi::api::core::v1::Endpoints;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // EndpointsDef
@@ -47,13 +47,15 @@ impl ConvertToRow<Endpoints> for EndpointsDef {
             .collect::<Vec<_>>()
             .join(",");
         let endpoints = if endpoints.is_empty() { "<none>".to_string() } else { endpoints };
-        ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                endpoints, crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(endpoints),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: Some(meta.namespace),
+            cells,
             ..Default::default()
         }
     }

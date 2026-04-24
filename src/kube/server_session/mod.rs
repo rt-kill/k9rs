@@ -314,6 +314,13 @@ impl ServerSession {
     /// Reads Init command via bincode, creates kube::Client, sends Ready,
     /// then enters the binary command loop.
     /// Used by local mode (--no-daemon) where the client writes Init to the stream.
+    ///
+    /// NOTE: The protocol version check below is duplicated across the three
+    /// `init_and_run*` entry points. It's only 5 lines per site (if/write/return)
+    /// and is embedded inside match arms that destructure different input shapes
+    /// (read-from-stream vs already-parsed enum), so extracting a helper would
+    /// add more ceremony (mutable writer ref, Option<InitParams> return) than
+    /// the duplication it removes. If a fourth entry point appears, reconsider.
     pub async fn init_and_run(
         mut reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
         writer: Box<dyn AsyncWrite + Unpin + Send>,
@@ -362,6 +369,7 @@ impl ServerSession {
     ) {
         let mut buf_writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
 
+        // See NOTE on `init_and_run` re: duplicated protocol version check.
         let init = match first_cmd {
             SessionCommand::Init {
                 protocol_version, context, namespace, readonly,
@@ -397,6 +405,7 @@ impl ServerSession {
         session_id: u64,
     ) {
         let mut buf_writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
+        // See NOTE on `init_and_run` re: duplicated protocol version check.
         let init = match protocol::read_bincode::<_, SessionCommand>(&mut reader).await {
             Ok(SessionCommand::Init {
                 protocol_version, context, namespace, readonly,
@@ -772,30 +781,35 @@ impl ServerSession {
     }
 
     /// Render a describe view for a local-resource row by dispatching to the
-    /// owning per-context `LocalResourceSource`. The error path returns a
-    /// user-readable string so the TUI can show it in the describe panel
-    /// directly.
+    /// owning per-context `LocalResourceSource`.
     fn describe_local(&self, rid: &protocol::ResourceId, name: &str) -> String {
-        let Some(source) = self.shared.local_registry.get(&self.context.name, rid) else {
-            return format!("Unknown local resource type: {}", rid.plural());
-        };
-        match source.describe(name) {
-            Some(Ok(content)) => content,
-            Some(Err(e)) => format!("Error: {}", e),
-            None => format!("describe is not supported on {}", rid.plural()),
-        }
+        self.local_view(rid, name, "describe", |s, n| s.describe(n))
     }
 
     /// Render a YAML view for a local-resource row by dispatching to the
-    /// owning per-context `LocalResourceSource`. Mirrors `describe_local`.
+    /// owning per-context `LocalResourceSource`.
     fn yaml_local(&self, rid: &protocol::ResourceId, name: &str) -> String {
+        self.local_view(rid, name, "yaml", |s, n| s.yaml(n))
+    }
+
+    /// Shared helper for describe/yaml on local resources: looks up the
+    /// source, calls the accessor, and formats the error/unsupported
+    /// fallback. The `view_name` is only used in the "not supported"
+    /// message.
+    fn local_view(
+        &self,
+        rid: &protocol::ResourceId,
+        name: &str,
+        view_name: &str,
+        accessor: fn(&dyn crate::kube::local::LocalResourceSource, &str) -> Option<Result<String, String>>,
+    ) -> String {
         let Some(source) = self.shared.local_registry.get(&self.context.name, rid) else {
             return format!("Unknown local resource type: {}", rid.plural());
         };
-        match source.yaml(name) {
+        match accessor(&*source, name) {
             Some(Ok(content)) => content,
             Some(Err(e)) => format!("Error: {}", e),
-            None => format!("yaml is not supported on {}", rid.plural()),
+            None => format!("{} is not supported on {}", view_name, rid.plural()),
         }
     }
 
@@ -989,49 +1003,66 @@ async fn handle_subscription_substream_inner(
         ctx.client.clone()
     };
 
-    let mut sub = match &rid {
+    // CRD arms (resolved and unresolved) produce a (gvk, plural, scope)
+    // tuple for the shared subscribe_dynamic path. Built-ins subscribe
+    // directly via the typed registry.
+    enum CrdOrSub {
+        BuiltIn(crate::kube::live_query::Subscription),
+        Crd(kube::api::GroupVersionKind, String, protocol::ResourceScope),
+    }
+
+    let crd_or_sub = match &rid {
         protocol::ResourceId::BuiltIn(kind) => {
             // Built-ins go through the typed registry path — the watcher
             // factory is dispatched on the typed kind, no string match.
             // Hand the destructured `kind` in so the cache doesn't have to
             // re-extract it at runtime.
-            if init.force {
-                ctx.shared.watcher_cache.subscribe_force(key, *kind, &watcher_client)
+            CrdOrSub::BuiltIn(if init.force {
+                ctx.shared.watcher_cache.subscribe_force(key.clone(), *kind, &watcher_client)
             } else {
-                ctx.shared.watcher_cache.subscribe(key, *kind, &watcher_client)
-            }
+                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, &watcher_client)
+            })
         }
         protocol::ResourceId::Crd(crd_ref) => {
-            // CRD: resolve GVR via the typed `api_resource_for` helper —
-            // it already handles both populated and incomplete (group/version
-            // empty) shapes, falling back to discovery for the latter. We
-            // only need to notify the TUI of the resolved identity when
-            // the original was incomplete.
-            let was_incomplete = crd_ref.is_unresolved();
-            let (gvk, plural, scope) = match crate::kube::describe::api_resource_for(&watcher_client, &rid).await {
+            // Resolved CRD: GVR is fully populated, use it directly.
+            let gvk = kube::api::GroupVersionKind::gvk(&crd_ref.group, &crd_ref.version, &crd_ref.kind);
+            CrdOrSub::Crd(gvk, crd_ref.plural.clone(), crd_ref.scope)
+        }
+        protocol::ResourceId::CrdUnresolved(plural_name) => {
+            // Unresolved CRD: the client only knows the plural name.
+            // Resolve via API discovery and notify the TUI of the
+            // resolved identity.
+            match crate::kube::describe::api_resource_for(&watcher_client, &rid).await {
                 Ok((ar, resolved_scope)) => {
                     let gvk = kube::api::GroupVersionKind::gvk(&ar.group, &ar.version, &ar.kind);
-                    if was_incomplete {
-                        let resolved_rid = protocol::ResourceId::crd(
-                            ar.group.clone(), ar.version.clone(),
-                            ar.kind.clone(), ar.plural.clone(), resolved_scope,
-                        );
-                        let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Resolved {
-                            original: rid.clone(),
-                            resolved: resolved_rid,
-                        }).await;
-                    }
-                    (gvk, ar.plural, resolved_scope)
+                    let resolved_rid = protocol::ResourceId::crd(
+                        ar.group.clone(), ar.version.clone(),
+                        ar.kind.clone(), ar.plural.clone(), resolved_scope,
+                    );
+                    let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Resolved {
+                        original: rid.clone(),
+                        resolved: resolved_rid,
+                    }).await;
+                    CrdOrSub::Crd(gvk, ar.plural, resolved_scope)
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to resolve resource '{}': {}", crd_ref.plural, e);
+                    tracing::warn!("Failed to resolve resource '{}': {}", plural_name, e);
                     let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Error(
-                        format!("Unknown resource: {}", crd_ref.plural)
+                        format!("Unknown resource: {}", plural_name)
                     )).await;
                     return;
                 }
-            };
+            }
+        }
+        protocol::ResourceId::Local(_) => {
+            // Unreachable — we early-returned above for locals.
+            unreachable!("local rids are handled by the early-return branch");
+        }
+    };
 
+    let mut sub = match crd_or_sub {
+        CrdOrSub::BuiltIn(sub) => sub,
+        CrdOrSub::Crd(gvk, plural, scope) => {
             // Rebuild the QueryKey with the resolved GVR so the cache key
             // matches on subsequent navigations (where the TUI sends the
             // resolved ResourceId with populated group/version).
@@ -1056,10 +1087,6 @@ async fn handle_subscription_substream_inner(
             ctx.shared.watcher_cache.subscribe_dynamic(
                 resolved_key, &watcher_client, gvk, plural, scope, printer_columns,
             )
-        }
-        protocol::ResourceId::Local(_) => {
-            // Unreachable — we early-returned above for locals.
-            unreachable!("local rids are handled by the early-return branch");
         }
     };
 
@@ -1210,7 +1237,7 @@ async fn stream_logs_via_api(
     let reader = match api.log_stream(&init.pod, &params).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("log API failed for pod={}: {}, falling back to kubectl", init.pod, e);
+            tracing::debug!("log API failed for pod={}: {}, falling back to kubectl", init.pod, e);
             return Err(());
         }
     };

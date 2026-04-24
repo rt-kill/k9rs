@@ -17,9 +17,9 @@ use crate::util::truncate_to_width;
 /// Uses the same layout as the resource view: header, table area,
 /// breadcrumb bar, and flash line.  Enter to switch, Esc/q to go back.
 pub fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
-    let theme = &app.theme;
+    let theme = &app.ui.theme;
 
-    let header_height: u16 = if app.show_header { crate::ui::HEADER_HEIGHT } else { 0 };
+    let header_height: u16 = if app.ui.show_header { crate::ui::HEADER_HEIGHT } else { 0 };
 
     let chunks = Layout::vertical([
         Constraint::Length(header_height), // header
@@ -35,7 +35,7 @@ pub fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
     let flash_area = chunks[3];
 
     // 1. Header (shared with resource view, context-specific key hints)
-    if app.show_header {
+    if app.ui.show_header {
         header::draw_header(f, app, header_area, theme, |f, area, theme| {
             draw_context_key_hints(f, area, theme);
         });
@@ -75,7 +75,7 @@ fn draw_context_key_hints(f: &mut Frame, area: Rect, theme: &Theme) {
 
 fn draw_context_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let table = &app.data.contexts;
-    let selected = table.selected;
+    let selected = table.selected();
     let total = table.len();
 
     let title = format!(" Contexts [{}/{}] ", selected.saturating_add(1).min(total), total);
@@ -117,7 +117,7 @@ fn draw_context_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     }
 
     let visible = table.visible_items();
-    let offset = table.offset;
+    let offset = table.offset();
 
     for (vi, ctx) in visible.iter().enumerate() {
         if vi >= visible_height {
@@ -127,10 +127,10 @@ fn draw_context_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         let is_selected = vi + offset == selected;
 
         let current_marker = if ctx.is_current { "\u{2713}" } else { " " };
-        let cluster_display: String = if ctx.identity.cluster.is_empty() {
-            ctx.name.to_string()
+        let cluster_display: &str = if ctx.identity.cluster.is_empty() {
+            ctx.name.as_str()
         } else {
-            ctx.identity.cluster.clone()
+            &ctx.identity.cluster
         };
         let line_text = format!(
             " {} {:<nw$} {:<cw$}",
@@ -181,7 +181,7 @@ fn draw_context_breadcrumbs(f: &mut Frame, app: &App, area: Rect, theme: &Theme)
         return;
     }
 
-    let ctx_label = format!(" ctx: {} ", app.context);
+    let ctx_label = format!(" ctx: {} ", app.kube.context);
 
     let hints = vec![
         ("j/k", "navigate"),
@@ -190,9 +190,7 @@ fn draw_context_breadcrumbs(f: &mut Frame, app: &App, area: Rect, theme: &Theme)
     ];
 
     // Fill background
-    let bg = " ".repeat(area.width as usize);
-    let bg_line = Line::styled(bg, theme.status_bar);
-    f.render_widget(bg_line, area);
+    crate::ui::fill_line_bg(f, area, theme.status_bar);
 
     // Build the bar: prefix with context label, then shared keybinding hints
     let keybinding_line = header::render_keybinding_bar(&hints, theme);

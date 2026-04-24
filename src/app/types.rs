@@ -7,6 +7,47 @@ use crate::kube::protocol::{LogContainer, ObjectRef};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+// ---------------------------------------------------------------------------
+// UiState — pure display/interaction state
+// ---------------------------------------------------------------------------
+
+/// Pure display and interaction state, factored out of `App` to reduce the
+/// god-object surface. Fields here are only read/written by the UI layer
+/// and the action handlers that respond to user input — they have no
+/// cluster data semantics.
+pub struct UiState {
+    pub flash: Option<FlashMessage>,
+    pub confirm_dialog: Option<ConfirmDialog>,
+    pub form_dialog: Option<FormDialog>,
+    pub input_mode: InputMode,
+    pub help_scroll: usize,
+    pub show_header: bool,
+    pub theme: crate::ui::theme::Theme,
+    pub tick_count: usize,
+    pub column_level: crate::kube::resource_def::ColumnLevel,
+    /// Row-change flash highlights. Lives in UiState because it's a purely
+    /// visual concern (which rows to highlight), not cluster data.
+    pub deltas: DeltaTracker,
+}
+
+// ---------------------------------------------------------------------------
+// KubeState — cluster/data state
+// ---------------------------------------------------------------------------
+
+/// Cluster and data state, factored out of `App`. Fields here are populated
+/// from daemon events and read by the UI for display — they represent the
+/// current cluster identity, namespace selection, metrics, and caches.
+pub struct KubeState {
+    pub context: crate::kube::protocol::ContextName,
+    pub identity: crate::kube::protocol::ClusterIdentity,
+    pub selected_ns: crate::kube::protocol::Namespace,
+    pub context_switch: ContextSwitchState,
+    pub pod_metrics: HashMap<crate::kube::protocol::ObjectKey, crate::kube::protocol::MetricsUsage>,
+    pub node_metrics: HashMap<crate::kube::protocol::NodeName, crate::kube::protocol::MetricsUsage>,
+    pub core_streams: Vec<crate::kube::client_session::SubscriptionStream>,
+    pub kubectl_cache: KubectlCache,
+}
+
 // Named constants for configurable limits.
 const MAX_LOG_LINES: usize = 50_000;
 const KUBECTL_CACHE_CAPACITY: usize = 100;
@@ -202,23 +243,6 @@ pub fn handle_search_key(
     }
 }
 
-/// Parse a formatted age string like "5m", "2h3m", "3d5h" to total seconds.
-/// Used for correct age-column sorting (lexicographic comparison gets it wrong).
-pub(crate) fn parse_age_seconds(s: &str) -> u64 {
-    let mut total: u64 = 0;
-    let mut num: u64 = 0;
-    for c in s.chars() {
-        match c {
-            '0'..='9' => num = num * 10 + (c as u64 - '0' as u64),
-            'd' => { total += num * 86400; num = 0; }
-            'h' => { total += num * 3600; num = 0; }
-            'm' => { total += num * 60; num = 0; }
-            's' => { total += num; num = 0; }
-            _ => {}
-        }
-    }
-    total + num // handle trailing number without suffix
-}
 
 // ---------------------------------------------------------------------------
 // CrdInfo — lightweight CRD metadata extracted from unified ResourceRow
@@ -275,13 +299,13 @@ impl ContainerRef {
 pub enum Route {
     Overview,
     Resources,
-    Yaml {
-        target: ObjectRef,
-        awaiting_response: bool,
-        state: ContentViewState,
-    },
-    Describe {
-        target: ObjectRef,
+    /// Unified content view for YAML, Describe, and Aliases. All three share
+    /// `ContentViewState` for scrolling/search — collapsing them eliminates
+    /// 11+ multi-arm match patterns throughout the codebase.
+    ContentView {
+        kind: ContentViewKind,
+        /// The resource being viewed. `None` for Aliases.
+        target: Option<ObjectRef>,
         awaiting_response: bool,
         state: ContentViewState,
     },
@@ -333,7 +357,14 @@ pub enum Route {
         selected: usize,
         action: ContainerAction,
     },
-    Aliases { state: ContentViewState },
+}
+
+/// Which kind of content is being displayed in a `Route::ContentView`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentViewKind {
+    Yaml,
+    Describe,
+    Aliases,
 }
 
 /// State for a live shell session rendered inside the TUI.
@@ -475,7 +506,12 @@ impl FlashMessage {
         Self { message: msg.into(), level: FlashLevel::Error, created: Instant::now() }
     }
     pub fn is_expired(&self) -> bool {
-        self.created.elapsed().as_secs() >= FLASH_EXPIRY_SECS
+        let lifetime_secs = match self.level {
+            FlashLevel::Info => 3,
+            FlashLevel::Warn => FLASH_EXPIRY_SECS,
+            FlashLevel::Error => FLASH_EXPIRY_SECS * 2,
+        };
+        self.created.elapsed().as_secs() >= lifetime_secs
     }
 }
 
@@ -654,7 +690,7 @@ impl FormFieldState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LogState {
     pub lines: VecDeque<String>,
     pub max_lines: usize,
@@ -669,6 +705,9 @@ pub struct LogState {
     pub filters: Vec<String>,
     /// Draft filter being typed (live preview). None = not in filter input mode.
     pub draft_filter: Option<String>,
+    /// Compiled patterns for committed + draft filters. Rebuilt only when
+    /// filters change, not on every log line push.
+    compiled_patterns: Vec<crate::util::SearchPattern>,
     /// Indices into `lines` that pass all filters (committed + draft).
     pub filtered_indices: Vec<usize>,
     /// Generation id stamped by the client_session when this log stream
@@ -694,6 +733,7 @@ impl Default for LogState {
             tail_lines: 500,
             filters: Vec::new(),
             draft_filter: None,
+            compiled_patterns: Vec::new(),
             filtered_indices: Vec::new(),
             generation: 0,
         }
@@ -719,14 +759,9 @@ impl LogState {
             });
         }
         self.lines.push_back(line);
-        // Incrementally check the new line against active filters.
+        // Incrementally check the new line against cached compiled patterns.
         let new_idx = self.lines.len() - 1;
-        let patterns: Vec<crate::util::SearchPattern> = self.filters.iter()
-            .chain(self.draft_filter.iter())
-            .filter(|s| !s.is_empty())
-            .map(|s| crate::util::SearchPattern::new(s))
-            .collect();
-        if patterns.is_empty() || patterns.iter().all(|p| p.is_match(&self.lines[new_idx])) {
+        if self.compiled_patterns.is_empty() || self.compiled_patterns.iter().all(|p| p.is_match(&self.lines[new_idx])) {
             self.filtered_indices.push(new_idx);
         }
     }
@@ -738,21 +773,27 @@ impl LogState {
         self.draft_filter = None;
     }
 
-    /// Rebuild filtered_indices from all committed filters + draft.
-    pub fn rebuild_filter(&mut self) {
-        let all_patterns: Vec<crate::util::SearchPattern> = self.filters.iter()
+    /// Recompile cached patterns from committed filters + draft.
+    /// Called only when filters change, not on every log line.
+    fn recompile_patterns(&mut self) {
+        self.compiled_patterns = self.filters.iter()
             .chain(self.draft_filter.iter())
             .filter(|s| !s.is_empty())
             .map(|s| crate::util::SearchPattern::new(s))
             .collect();
+    }
 
-        if all_patterns.is_empty() {
+    /// Rebuild filtered_indices from cached compiled patterns.
+    pub fn rebuild_filter(&mut self) {
+        self.recompile_patterns();
+
+        if self.compiled_patterns.is_empty() {
             self.filtered_indices = (0..self.lines.len()).collect();
         } else {
             self.filtered_indices = (0..self.lines.len())
                 .filter(|&i| {
                     let line = &self.lines[i];
-                    all_patterns.iter().all(|p| p.is_match(line))
+                    self.compiled_patterns.iter().all(|p| p.is_match(line))
                 })
                 .collect();
         }

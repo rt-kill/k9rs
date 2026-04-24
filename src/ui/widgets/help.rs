@@ -1,6 +1,6 @@
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     style::Modifier,
     text::{Line, Span},
     widgets::{Block, Clear, Padding, Widget},
@@ -16,7 +16,7 @@ struct HelpEntry {
 
 /// A section of keybindings.
 struct HelpSection {
-    title: String,
+    title: &'static str,
     entries: Vec<HelpEntry>,
 }
 
@@ -76,7 +76,7 @@ impl<'a> HelpOverlay<'a> {
     fn sections(&self) -> Vec<HelpSection> {
         vec![
             HelpSection {
-                title: "Navigation".to_string(),
+                title: "Navigation",
                 entries: vec![
                     HelpEntry {
                         key: "j / \u{2193}",
@@ -113,7 +113,7 @@ impl<'a> HelpOverlay<'a> {
                 ],
             },
             HelpSection {
-                title: "Actions".to_string(),
+                title: "Actions",
                 entries: vec![
                     HelpEntry {
                         key: "Enter",
@@ -158,7 +158,7 @@ impl<'a> HelpOverlay<'a> {
                 ],
             },
             HelpSection {
-                title: "Sorting".to_string(),
+                title: "Sorting",
                 entries: vec![
                     HelpEntry {
                         key: "Shift-O",
@@ -180,7 +180,7 @@ impl<'a> HelpOverlay<'a> {
             },
             self.resource_actions_section(),
             HelpSection {
-                title: "Commands".to_string(),
+                title: "Commands",
                 entries: vec![
                     HelpEntry {
                         key: ":",
@@ -237,7 +237,7 @@ impl<'a> HelpOverlay<'a> {
                 ],
             },
             HelpSection {
-                title: "Log View".to_string(),
+                title: "Log View",
                 entries: vec![
                     HelpEntry {
                         key: "s",
@@ -266,7 +266,7 @@ impl<'a> HelpOverlay<'a> {
                 ],
             },
             HelpSection {
-                title: "Detail Views (YAML/Describe)".to_string(),
+                title: "Detail Views (YAML/Describe)",
                 entries: vec![
                     HelpEntry {
                         key: "Ctrl-d",
@@ -349,36 +349,23 @@ impl<'a> HelpOverlay<'a> {
         }
 
         HelpSection {
-            title: "Resource Actions".to_string(),
+            title: "Resource Actions",
             entries,
         }
     }
 
-    fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-        let vert = Layout::vertical([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-        let horiz = Layout::horizontal([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vert[1]);
-
-        horiz[1]
-    }
 }
 
 impl Widget for HelpOverlay<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let dialog_area = Self::centered_rect(area, 42, 85);
+        // Percentage-based centering (42% width, 85% height).
+        let w = (area.width as u32 * 42 / 100) as u16;
+        let h = (area.height as u32 * 85 / 100) as u16;
+        let dialog_area = crate::ui::centered_rect(area, w, h);
 
-        // Clear background fully so table doesn't bleed through
+        // Clear + guaranteed-visible bg (consistent with ModalOverlay).
         Clear.render(dialog_area, buf);
+        crate::ui::fill_dialog_bg(buf, dialog_area);
 
         // Build all lines first to know total count
         let sections = self.sections();

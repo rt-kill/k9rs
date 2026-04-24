@@ -3,7 +3,7 @@ use k8s_openapi::api::networking::v1::Ingress;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // IngressDef
@@ -44,14 +44,19 @@ impl ConvertToRow<Ingress> for IngressDef {
             .unwrap_or_default();
         let has_tls = spec.tls.map(|t| !t.is_empty()).unwrap_or(false);
         let ports = if has_tls { "80, 443".to_string() } else { "80".to_string() };
-        ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                class, hosts, address, ports,
-                meta.labels_str, crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(class),
+            CellValue::Text(hosts),
+            CellValue::Text(address),
+            CellValue::Text(ports),
+            CellValue::Text(meta.labels_str),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: Some(meta.namespace),
+            cells,
             ..Default::default()
         }
     }

@@ -90,14 +90,13 @@ pub async fn api_resource_for(
             Ok((ApiResource::from_gvk_with_plural(&gvk, g.plural), g.scope))
         }
         ResourceId::Crd(crd_ref) => {
-            if !crd_ref.is_unresolved() {
-                let gvk = GroupVersionKind::gvk(&crd_ref.group, &crd_ref.version, &crd_ref.kind);
-                Ok((ApiResource::from_gvk_with_plural(&gvk, &crd_ref.plural), crd_ref.scope))
-            } else {
-                // Incomplete CRD ref (e.g. user typed `:nodeclaims` without
-                // group): fall back to discovery to fill in the GVR.
-                resolve_via_discovery(client, &crd_ref.plural).await
-            }
+            let gvk = GroupVersionKind::gvk(&crd_ref.group, &crd_ref.version, &crd_ref.kind);
+            Ok((ApiResource::from_gvk_with_plural(&gvk, &crd_ref.plural), crd_ref.scope))
+        }
+        ResourceId::CrdUnresolved(plural) => {
+            // Unresolved CRD ref (e.g. user typed `:nodeclaims` without
+            // group): fall back to discovery to fill in the GVR.
+            resolve_via_discovery(client, plural).await
         }
         ResourceId::Local(_) => {
             anyhow::bail!("local resources have no K8s API resource descriptor")

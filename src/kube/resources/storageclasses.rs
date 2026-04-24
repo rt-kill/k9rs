@@ -3,7 +3,7 @@ use k8s_openapi::api::storage::v1::StorageClass;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // StorageClassDef
@@ -35,16 +35,18 @@ impl ConvertToRow<StorageClass> for StorageClassDef {
         let provisioner = sc.provisioner;
         let reclaim_policy = sc.reclaim_policy.unwrap_or_else(|| "Delete".to_string());
         let volume_binding_mode = sc.volume_binding_mode.unwrap_or_else(|| "Immediate".to_string());
-        let allow_expansion = if sc.allow_volume_expansion.unwrap_or(false) { "true" } else { "false" };
-        ResourceRow {
-            cells: vec![
-                meta.name.clone(),
-                provisioner, reclaim_policy, volume_binding_mode,
-                allow_expansion.to_string(),
-                crate::util::format_age(meta.age),
-            ],
+        let allow_expansion = sc.allow_volume_expansion.unwrap_or(false);
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(provisioner),
+            CellValue::Text(reclaim_policy),
+            CellValue::Text(volume_binding_mode),
+            CellValue::Bool(allow_expansion),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: None,
+            cells,
             ..Default::default()
         }
     }

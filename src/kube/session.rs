@@ -24,7 +24,7 @@ use crate::kube::session_commands::{
 macro_rules! ds_try {
     ($app:expr, $expr:expr) => {
         if let Err(e) = $expr {
-            $app.flash = Some(crate::app::FlashMessage::error(format!("Connection error: {}", e)));
+            $app.ui.flash = Some(crate::app::FlashMessage::error(format!("Connection error: {}", e)));
         }
     };
 }
@@ -288,6 +288,165 @@ impl<B: ratatui::backend::Backend + std::io::Write> Drop for SuspendGuard<'_, B>
 }
 
 
+/// Run the editor flow when the route is `EditState::EditorReady`.
+/// Returns `true` if the editor was launched (the caller should `continue`
+/// the main loop regardless of outcome — success, abort, or error).
+async fn run_editor_flow(
+    app: &mut App,
+    terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
+    data_source: &mut ClientSession,
+    input_suspend: &tokio::sync::watch::Sender<bool>,
+    input_suspend_ack: &mut mpsc::Receiver<()>,
+) -> bool {
+    let is_editor_ready = matches!(
+        app.route,
+        crate::app::Route::EditingResource {
+            state: crate::app::EditState::EditorReady { .. }, ..
+        }
+    );
+    if !is_editor_ready {
+        return false;
+    }
+
+    // Take the route out so we own TempFile (move, not borrow).
+    let old_route = std::mem::replace(&mut app.route, crate::app::Route::Resources);
+    let (target, temp_file, original) = match old_route {
+        crate::app::Route::EditingResource {
+            target,
+            state: crate::app::EditState::EditorReady { temp_file, original },
+        } => (target, temp_file, original),
+        _ => unreachable!(),
+    };
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let path_arg = temp_file.path().to_string_lossy().to_string();
+    let args = vec![path_arg];
+    let exit_status = match run_interactive_local(
+        terminal, app, &editor, &args,
+        crate::kube::session_commands::InteractiveKind::Editor,
+        input_suspend, input_suspend_ack,
+    ).await {
+        Ok(s) => s,
+        Err(e) => {
+            app.ui.flash = Some(crate::app::FlashMessage::error(
+                format!("Editor failed: {}", e)
+            ));
+            return true;
+        }
+    };
+
+    // Editor non-zero exit (vim `:cq`) -> abort. TempFile drops.
+    if exit_status.is_some_and(|s| !s.success()) {
+        app.ui.flash = Some(crate::app::FlashMessage::info(
+            "Edit aborted.".to_string()
+        ));
+        return true;
+    }
+
+    // Read the edited file back.
+    let edited = match std::fs::read_to_string(temp_file.path()) {
+        Ok(s) => s,
+        Err(e) => {
+            app.ui.flash = Some(crate::app::FlashMessage::error(
+                format!("Failed to read edited file: {}", e)
+            ));
+            return true;
+        }
+    };
+
+    let stripped = strip_leading_comments(&edited);
+
+    // Unchanged -> abort.
+    if stripped.trim() == original.trim() {
+        app.ui.flash = Some(crate::app::FlashMessage::info(
+            "Edit cancelled, no changes made.".to_string()
+        ));
+        return true;
+    }
+
+    // Empty -> abort.
+    if stripped.trim().is_empty() {
+        app.ui.flash = Some(crate::app::FlashMessage::info(
+            "Edit cancelled, file is empty.".to_string()
+        ));
+        return true;
+    }
+
+    // Send Apply. Move TempFile to Applying state.
+    let target_clone = target.clone();
+    app.route = crate::app::Route::EditingResource {
+        target,
+        state: crate::app::EditState::Applying {
+            temp_file,
+            original,
+        },
+    };
+    if let Err(e) = data_source.apply(&target_clone, stripped.to_string()) {
+        app.ui.flash = Some(crate::app::FlashMessage::error(
+            format!("Apply failed: {}", e)
+        ));
+        app.pop_route();
+    }
+    true
+}
+
+/// Handle an `ActionResult` that requires opening an exec session.
+async fn handle_action_result(
+    result: ActionResult,
+    app: &mut App,
+    data_source: &ClientSession,
+    event_tx: &mpsc::Sender<AppEvent>,
+) {
+    match result {
+        ActionResult::Shell(target) => {
+            let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+            let mut kubectl_args = vec![
+                "exec".to_string(), "-it".to_string(),
+                "-n".to_string(), target.namespace.clone(),
+                target.pod.clone(),
+            ];
+            if !target.container.is_empty() {
+                kubectl_args.push("-c".to_string());
+                kubectl_args.push(target.container.clone());
+            }
+            kubectl_args.push("--".to_string());
+            kubectl_args.push("sh".to_string());
+            let title = format!("{}/{}", target.pod, target.container);
+            let exec_init = crate::kube::protocol::ExecInit {
+                kubectl_args,
+                term_width: tw,
+                term_height: th,
+            };
+            if let Err(e) = open_exec_route(app, data_source, exec_init, title, event_tx).await {
+                app.ui.flash = Some(crate::app::FlashMessage::error(
+                    format!("Shell failed: {}", e)
+                ));
+            }
+        }
+        ActionResult::NodeShell { node, .. } => {
+            let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+            let kubectl_args = vec![
+                "debug".to_string(),
+                format!("node/{}", node),
+                "-it".to_string(),
+                "--image=busybox".to_string(),
+            ];
+            let title = format!("node/{}", node);
+            let exec_init = crate::kube::protocol::ExecInit {
+                kubectl_args,
+                term_width: tw,
+                term_height: th,
+            };
+            if let Err(e) = open_exec_route(app, data_source, exec_init, title, event_tx).await {
+                app.ui.flash = Some(crate::app::FlashMessage::error(
+                    format!("Node shell failed: {}", e)
+                ));
+            }
+        }
+        ActionResult::None => {}
+    }
+}
+
 pub(crate) fn open_core_subscriptions(app: &mut App, data_source: &ClientSession) {
     for def in crate::kube::resource_defs::REGISTRY.all() {
         if def.is_core() {
@@ -297,7 +456,7 @@ pub(crate) fn open_core_subscriptions(app: &mut App, data_source: &ClientSession
                 crate::kube::protocol::Namespace::All,
                 None,
             );
-            app.core_streams.push(stream);
+            app.kube.core_streams.push(stream);
         }
     }
 }
@@ -309,7 +468,7 @@ fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: App
             apply_event(app, event);
             // Transition: InFlight → Stable. The new session is live; a
             // subsequent `begin_context_switch` is now allowed.
-            app.context_switch.mark_stable();
+            app.kube.context_switch.mark_stable();
             // Open core resource substreams now that the connection is ready.
             // The user lands on Overview (the default route) with only the
             // mandatory subscriptions (namespaces, nodes). They navigate to
@@ -318,6 +477,39 @@ fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: App
         }
         other => apply_event(app, other),
     }
+}
+
+/// Unified input mode handler. Checks all active input modes in priority
+/// order and returns true if the key was consumed. This keeps the main
+/// loop's key handling path linear:
+///   Shell → input modes → normal key dispatch → action handler
+fn try_handle_input_mode(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    data_source: &mut ClientSession,
+    event_tx: &mpsc::Sender<AppEvent>,
+) -> bool {
+    // 1. Command mode (`:` prompt)
+    if handle_command_key(app, key, data_source, event_tx) {
+        return true;
+    }
+    // 2. Form dialog (Scale, PortForward, etc.)
+    if handle_form_dialog_key(app, key, data_source) {
+        return true;
+    }
+    // 3. Resource filter input (`/` in resource view)
+    if handle_filter_key(app, key, data_source) {
+        return true;
+    }
+    // 4. Log filter input (`/` in log view)
+    if handle_log_filter_key(app, key) {
+        return true;
+    }
+    // 5. Content search input (`/` in yaml/describe view)
+    if handle_content_search_key(app, key) {
+        return true;
+    }
+    false
 }
 
 /// Capture a keystroke into the log filter input draft (`/`-prompt within
@@ -357,13 +549,7 @@ fn handle_log_filter_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool
 fn handle_content_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     use crate::app::SearchInputResult;
     let state = match app.route {
-        crate::app::Route::Yaml { ref mut state, .. } if state.search_input_active => state,
-        crate::app::Route::Describe { ref mut state, .. }
-        | crate::app::Route::Aliases { ref mut state, .. }
-            if state.search_input_active =>
-        {
-            state
-        }
+        crate::app::Route::ContentView { ref mut state, .. } if state.search_input_active => state,
         _ => return false,
     };
     match crate::app::handle_search_key(&mut state.search_input, key.code) {
@@ -411,7 +597,7 @@ pub(crate) fn apply_nav_change(app: &mut App, data_source: &mut ClientSession, c
         }
         let stream = data_source.subscribe_stream(
             new.clone(),
-            app.selected_ns.clone(),
+            app.kube.selected_ns.clone(),
             change.subscription_filter.clone(),
         );
         app.nav.current_mut().stream = Some(stream);
@@ -454,7 +640,7 @@ pub async fn session_main(
         // call fired between this line and `mark_stable()` (in
         // `dispatch_app_event` on `ConnectionEstablished`) will be rejected
         // by the `is_stable()` check.
-        if let Some(new_ctx) = app.context_switch.take_requested() {
+        if let Some(new_ctx) = app.kube.context_switch.take_requested() {
             let no_daemon = data_source.is_no_daemon();
             // 1. Drop the old session — closes the socket, aborts bridge tasks.
             drop(data_source);
@@ -471,7 +657,7 @@ pub async fn session_main(
             // 5. Create a fresh session with the new channel.
             let new_params = crate::kube::client_session::ConnectionParams {
                 context: Some(new_ctx),
-                namespace: app.selected_ns.clone(),
+                namespace: app.kube.selected_ns.clone(),
                 readonly: app.read_only,
                 no_daemon,
             };
@@ -496,14 +682,13 @@ pub async fn session_main(
 
             // Set cursor style based on input mode: bar for text input, block otherwise
             let route_has_text_input = match &app.route {
-                crate::app::Route::Yaml { ref state, .. } => state.search_input_active,
-                crate::app::Route::Describe { ref state, .. } | crate::app::Route::Aliases { ref state, .. } => state.search_input_active,
+                crate::app::Route::ContentView { ref state, .. } => state.search_input_active,
                 crate::app::Route::Logs { ref state, .. } => state.is_filtering(),
                 _ => false,
             };
-            let in_input_mode = matches!(app.input_mode, InputMode::Command { .. })
-                || app.form_dialog.as_ref().is_some_and(|d| {
-                    d.fields.get(d.focused).is_some_and(|f| f.is_text_input())
+            let in_input_mode = matches!(app.ui.input_mode, InputMode::Command { .. })
+                || app.ui.form_dialog.as_ref().is_some_and(|d| {
+                    d.fields.get(d.focused).is_some_and(|field| field.is_text_input())
                 })
                 || app.nav.filter_input().active
                 || route_has_text_input;
@@ -516,107 +701,11 @@ pub async fn session_main(
             needs_redraw = false;
         }
 
-        // Unified edit flow, stage 2: if the YAML for an in-flight edit
-        // arrived since the last loop iteration, the event handler put us
-        // into `EditState::EditorReady { temp_path, original }`. Run the
-        // editor, validate the result, and send Apply. On server error,
-        // the CommandResult handler loops back to EditorReady (re-open).
-        // Check if we're in EditorReady before taking the route out.
-        let is_editor_ready = matches!(
-            app.route,
-            crate::app::Route::EditingResource {
-                state: crate::app::EditState::EditorReady { .. }, ..
-            }
-        );
-        if is_editor_ready {
-            // Take the route out so we own TempFile (move, not borrow).
-            // TempFile::Drop deletes the file, so on abort paths we just
-            // let it drop. On the apply path we move it to Applying.
-            let old_route = std::mem::replace(&mut app.route, crate::app::Route::Resources);
-            let (target, temp_file, original) = match old_route {
-                crate::app::Route::EditingResource {
-                    target,
-                    state: crate::app::EditState::EditorReady { temp_file, original },
-                } => (target, temp_file, original),
-                _ => unreachable!(),
-            };
-
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-            let path_arg = temp_file.path().to_string_lossy().to_string();
-            let args = vec![path_arg];
-            let exit_status = match run_interactive_local(
-                &mut terminal, &mut app, &editor, &args,
-                crate::kube::session_commands::InteractiveKind::Editor,
-                &input_suspend, &mut input_suspend_ack,
-            ).await {
-                Ok(s) => s,
-                Err(e) => {
-                    // TempFile drops here → deletes the file.
-                    app.flash = Some(crate::app::FlashMessage::error(
-                        format!("Editor failed: {}", e)
-                    ));
-                    needs_redraw = true;
-                    continue;
-                }
-            };
-
-            // Editor non-zero exit (vim `:cq`) → abort. TempFile drops.
-            if exit_status.is_some_and(|s| !s.success()) {
-                app.flash = Some(crate::app::FlashMessage::info(
-                    "Edit aborted.".to_string()
-                ));
-                needs_redraw = true;
-                continue;
-            }
-
-            // Read the edited file back.
-            let edited = match std::fs::read_to_string(temp_file.path()) {
-                Ok(s) => s,
-                Err(e) => {
-                    app.flash = Some(crate::app::FlashMessage::error(
-                        format!("Failed to read edited file: {}", e)
-                    ));
-                    needs_redraw = true;
-                    continue;
-                }
-            };
-
-            let stripped = strip_leading_comments(&edited);
-
-            // Unchanged → abort. TempFile drops.
-            if stripped.trim() == original.trim() {
-                app.flash = Some(crate::app::FlashMessage::info(
-                    "Edit cancelled, no changes made.".to_string()
-                ));
-                needs_redraw = true;
-                continue;
-            }
-
-            // Empty → abort. TempFile drops.
-            if stripped.trim().is_empty() {
-                app.flash = Some(crate::app::FlashMessage::info(
-                    "Edit cancelled, file is empty.".to_string()
-                ));
-                needs_redraw = true;
-                continue;
-            }
-
-            // Send Apply. Move TempFile to Applying state — keeps file alive
-            // for re-open on error. TempFile only drops when edit completes.
-            let target_clone = target.clone();
-            app.route = crate::app::Route::EditingResource {
-                target,
-                state: crate::app::EditState::Applying {
-                    temp_file,
-                    original,
-                },
-            };
-            if let Err(e) = data_source.apply(&target_clone, stripped.to_string()) {
-                app.flash = Some(crate::app::FlashMessage::error(
-                    format!("Apply failed: {}", e)
-                ));
-                app.pop_route();
-            }
+        // Unified edit flow: if route is EditorReady, run the editor.
+        if run_editor_flow(
+            &mut app, &mut terminal, &mut data_source,
+            &input_suspend, &mut input_suspend_ack,
+        ).await {
             needs_redraw = true;
             continue;
         }
@@ -639,7 +728,7 @@ pub async fn session_main(
                                     let frame = crate::kube::protocol::ExecFrame::Data(bytes);
                                     if crate::kube::protocol::write_bincode(w, &frame).await.is_err() {
                                         app.pop_route();
-                                        app.flash = Some(crate::app::FlashMessage::error(
+                                        app.ui.flash = Some(crate::app::FlashMessage::error(
                                             "Shell disconnected".to_string()
                                         ));
                                         needs_redraw = true;
@@ -651,33 +740,11 @@ pub async fn session_main(
                             continue;
                         }
 
-                        // Input mode handlers — each returns true if the key was consumed.
-                        if handle_command_key(&mut app, key, &mut data_source, &event_tx) {
-                            needs_redraw = true;
-                            continue;
-                        }
-                        // Generic form dialog (Scale, PortForward, …) — one
-                        // handler for every operation that needs user input.
-                        if handle_form_dialog_key(&mut app, key, &mut data_source) {
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        if handle_filter_key(&mut app, key, &mut data_source) {
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        // Log filter input capture — must come before the
-                        // yaml/describe search handler so it intercepts keys
-                        // while the user is typing a filter pattern.
-                        if handle_log_filter_key(&mut app, key) {
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        // Search input capture for yaml and describe views.
-                        if handle_content_search_key(&mut app, key) {
+                        // Input modes get priority over normal key handling.
+                        // Each mode handler returns true if the key was consumed.
+                        if try_handle_input_mode(
+                            &mut app, key, &mut data_source, &event_tx,
+                        ) {
                             needs_redraw = true;
                             continue;
                         }
@@ -693,7 +760,7 @@ pub async fn session_main(
                             // server still refuses. This is polish, not a
                             // second source of truth.
                             if app.read_only && action.is_mutating() {
-                                app.flash = Some(crate::app::FlashMessage::info("Read-only mode".to_string()));
+                                app.ui.flash = Some(crate::app::FlashMessage::info("Read-only mode".to_string()));
                                 continue;
                             }
                             let result = handle_action(
@@ -702,58 +769,9 @@ pub async fn session_main(
                                 &event_tx,
                                 &mut data_source,
                             );
-                            match result {
-                                ActionResult::Shell(target) => {
-                                    let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
-                                    let mut kubectl_args = vec![
-                                        "exec".to_string(), "-it".to_string(),
-                                        "-n".to_string(), target.namespace.clone(),
-                                        target.pod.clone(),
-                                    ];
-                                    if !target.container.is_empty() {
-                                        kubectl_args.push("-c".to_string());
-                                        kubectl_args.push(target.container.clone());
-                                    }
-                                    kubectl_args.push("--".to_string());
-                                    kubectl_args.push("sh".to_string());
-                                    let title = format!("{}/{}", target.pod, target.container);
-                                    let exec_init = crate::kube::protocol::ExecInit {
-                                        kubectl_args,
-                                        term_width: tw,
-                                        term_height: th,
-                                    };
-                                    if let Err(e) = open_exec_route(
-                                        &mut app, &data_source, exec_init, title, &event_tx,
-                                    ).await {
-                                        app.flash = Some(crate::app::FlashMessage::error(
-                                            format!("Shell failed: {}", e)
-                                        ));
-                                    }
-                                }
-                                ActionResult::NodeShell { node, .. } => {
-                                    let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
-                                    let kubectl_args = vec![
-                                        "debug".to_string(),
-                                        format!("node/{}", node),
-                                        "-it".to_string(),
-                                        "--image=busybox".to_string(),
-                                    ];
-                                    let title = format!("node/{}", node);
-                                    let exec_init = crate::kube::protocol::ExecInit {
-                                        kubectl_args,
-                                        term_width: tw,
-                                        term_height: th,
-                                    };
-                                    if let Err(e) = open_exec_route(
-                                        &mut app, &data_source, exec_init, title, &event_tx,
-                                    ).await {
-                                        app.flash = Some(crate::app::FlashMessage::error(
-                                            format!("Node shell failed: {}", e)
-                                        ));
-                                    }
-                                }
-                                ActionResult::None => {}
-                            }
+                            handle_action_result(
+                                result, &mut app, &data_source, &event_tx,
+                            ).await;
                         }
                     }
                     // Pure-keyboard TUI by design — mouse events are

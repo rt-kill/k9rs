@@ -3,7 +3,7 @@ use k8s_openapi::api::core::v1::Secret;
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::ResourceRow;
+use crate::kube::resources::row::{CellValue, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // SecretDef
@@ -38,14 +38,17 @@ impl ConvertToRow<Secret> for SecretDef {
         let meta = CommonMeta::from_k8s(secret.metadata);
         let secret_type = secret.type_.unwrap_or_else(|| "Opaque".to_string());
         let data_count = secret.data.map(|d| d.len()).unwrap_or(0);
-        ResourceRow {
-            cells: vec![
-                meta.namespace.clone(), meta.name.clone(),
-                secret_type, data_count.to_string(),
-                meta.labels_str, crate::util::format_age(meta.age),
-            ],
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.namespace.clone()),
+            CellValue::Text(meta.name.clone()),
+            CellValue::Text(secret_type),
+            CellValue::Count(data_count as i64),
+            CellValue::Text(meta.labels_str),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];        ResourceRow {
             name: meta.name,
             namespace: Some(meta.namespace),
+            cells,
             ..Default::default()
         }
     }

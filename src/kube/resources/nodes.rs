@@ -2,8 +2,9 @@ use k8s_openapi::api::core::v1::Node;
 
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
+use crate::kube::resources::k8s_const::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::{DrillTarget, ResourceRow, RowHealth};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
 
 // ---------------------------------------------------------------------------
 // NodeDef
@@ -94,16 +95,16 @@ impl ConvertToRow<Node> for NodeDef {
         // both the display string AND the RowHealth from them.
         let is_ready = status_val.conditions.as_deref().unwrap_or(&[])
             .iter()
-            .any(|cond| cond.type_ == "Ready" && cond.status == "True");
+            .any(|cond| cond.type_ == COND_READY && cond.status == STATUS_TRUE);
         let is_scheduling_disabled = spec.as_ref()
             .and_then(|s| s.unschedulable)
             .unwrap_or(false);
 
         let status = match (is_ready, is_scheduling_disabled) {
-            (true, true) => "Ready,SchedulingDisabled".to_string(),
-            (true, false) => "Ready".to_string(),
-            (false, true) => "NotReady,SchedulingDisabled".to_string(),
-            (false, false) => "NotReady".to_string(),
+            (true, true) => format!("{},SchedulingDisabled", COND_READY),
+            (true, false) => COND_READY.to_string(),
+            (false, true) => format!("{},SchedulingDisabled", REASON_NOT_READY),
+            (false, false) => REASON_NOT_READY.to_string(),
         };
         let health = if !is_ready {
             RowHealth::Failed
@@ -130,21 +131,21 @@ impl ConvertToRow<Node> for NodeDef {
         // Addresses
         let addresses = status_val.addresses.unwrap_or_default();
         let internal_ip = addresses.iter()
-            .find(|a| a.type_ == "InternalIP")
+            .find(|a| a.type_ == ADDR_INTERNAL_IP)
             .map(|a| a.address.clone())
             .unwrap_or_else(|| "<none>".to_string());
         let external_ip = addresses.iter()
-            .find(|a| a.type_ == "ExternalIP")
+            .find(|a| a.type_ == ADDR_EXTERNAL_IP)
             .map(|a| a.address.clone())
             .unwrap_or_else(|| "<none>".to_string());
 
         // Capacity resources
         let capacity = status_val.capacity.unwrap_or_default();
-        let cpu_capacity = capacity
+        let _cpu_capacity = capacity
             .get("cpu")
             .map(|q| q.0.clone())
             .unwrap_or_default();
-        let mem_capacity = capacity
+        let _mem_capacity = capacity
             .get("memory")
             .map(|q| q.0.clone())
             .unwrap_or_default();
@@ -158,28 +159,29 @@ impl ConvertToRow<Node> for NodeDef {
             crate::app::nav::K8sFieldSelector::SpecNodeName(meta.name.clone()),
         ));
 
+        let cells: Vec<CellValue> = vec![
+            CellValue::Text(meta.name.clone()),
+            CellValue::Status { text: status, health },
+            CellValue::Text(roles),
+            CellValue::Count(taints as i64),
+            CellValue::Text(version),
+            CellValue::Text(os_image),
+            CellValue::Text(kernel),
+            CellValue::Text(internal_ip),
+            CellValue::Text(external_ip),
+            CellValue::Text(pods_capacity),
+            CellValue::Placeholder, // CPU% — filled by metrics overlay
+            CellValue::Placeholder, // MEM% — filled by metrics overlay
+            CellValue::Text(arch),
+            CellValue::Text(meta.labels_str),
+            CellValue::Age(meta.age.map(|t| t.timestamp())),
+        ];
         ResourceRow {
-            cells: vec![
-                meta.name.clone(),
-                status,
-                roles,
-                taints.to_string(),
-                version,
-                os_image,
-                kernel,
-                internal_ip,
-                external_ip,
-                pods_capacity,
-                format!("n/a/{}", cpu_capacity),
-                format!("n/a/{}", mem_capacity),
-                arch,
-                meta.labels_str,
-                crate::util::format_age(meta.age),
-            ],
             name: meta.name,
             namespace: None,
             health,
             drill_target,
+            cells,
             ..Default::default()
         }
     }

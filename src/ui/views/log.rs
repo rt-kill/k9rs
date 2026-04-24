@@ -14,7 +14,7 @@ use crate::ui::widgets::LogViewer;
 /// - Indicator bar showing toggle states
 /// - Bottom bar showing keybindings
 pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
-    let theme = &app.theme;
+    let theme = &app.ui.theme;
 
     let chunks = Layout::vertical([
         Constraint::Fill(1),   // log content
@@ -151,23 +151,13 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             .border_style(theme.border);
         let inner = block.inner(log_area);
         f.render_widget(block, log_area);
-        if inner.height > 0 && inner.width > 0 {
-            let message = if logs.streaming {
-                crate::util::loading_bar("Waiting for logs...")
-            } else {
-                "No logs.".to_string()
-            };
-            let text_len = message.len() as u16;
-            let waiting = ratatui::text::Line::from(Span::styled(
-                message,
-                theme.status_pending,
-            ));
-            let center_y = inner.y + inner.height / 2;
-            let center_x = inner.x + inner.width.saturating_sub(text_len) / 2;
-            f.render_widget(
-                waiting,
-                ratatui::layout::Rect::new(center_x, center_y, inner.width, 1),
-            );
+        if logs.streaming {
+            crate::ui::draw_centered_loading(f, inner, "Waiting for logs...", theme.status_pending);
+        } else if inner.height > 0 && inner.width > 0 {
+            let line = ratatui::text::Line::from(Span::styled("No logs.", theme.status_pending));
+            let cx = inner.x + inner.width.saturating_sub(8) / 2;
+            let cy = inner.y + inner.height / 2;
+            f.render_widget(line, ratatui::layout::Rect::new(cx, cy, inner.width, 1));
         }
     }
 
@@ -191,9 +181,7 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     ];
 
     // Fill indicator bar background
-    let ind_bg = " ".repeat(indicator_area.width as usize);
-    let ind_bg_line = Line::styled(ind_bg, theme.status_bar);
-    f.render_widget(ind_bg_line, indicator_area);
+    crate::ui::fill_line_bg(f, indicator_area, theme.status_bar);
     let indicator_line = Line::from(indicator_spans);
     f.render_widget(indicator_line, indicator_area);
 
@@ -213,9 +201,7 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     ];
 
     // Fill background
-    let bg = " ".repeat(bar_area.width as usize);
-    let bg_line = Line::styled(bg, theme.status_bar);
-    f.render_widget(bg_line, bar_area);
+    crate::ui::fill_line_bg(f, bar_area, theme.status_bar);
 
     let line = crate::ui::header::render_keybinding_bar(&hints, theme);
     f.render_widget(line, bar_area);
