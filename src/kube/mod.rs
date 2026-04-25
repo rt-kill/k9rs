@@ -14,6 +14,7 @@ pub mod live_query_dynamic;
 pub mod local;
 pub mod metrics;
 pub mod ops;
+pub mod overlay;
 pub mod protocol;
 pub mod resource_def;
 pub mod resource_defs;

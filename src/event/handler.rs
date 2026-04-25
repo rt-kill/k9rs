@@ -31,6 +31,14 @@ fn lookup_resource_op_key(app: &App, key: char) -> Option<Action> {
     }
 }
 
+/// Look up a key binding from user-defined overlays for the current resource.
+/// Maps key → capability name. No implementation details leak into the action.
+fn lookup_overlay_key(app: &App, key: char) -> Option<Action> {
+    let overlay = crate::kube::overlay::overlay_for(app.nav.resource_id().plural())?;
+    let cap_name = overlay.bindings.get(&key)?;
+    Some(Action::OverlayCapability(cap_name.clone()))
+}
+
 /// Maps a `KeyEvent` to an `Action` based on the current application state.
 /// Returns `None` if the key has no binding in the current context.
 ///
@@ -246,6 +254,7 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // key to action is derived from those operations.
         KeyCode::Char(c @ ('L' | 's' | 'x' | 't' | 'r' | 'p' | 'o')) => {
             lookup_resource_op_key(app, c)
+                .or_else(|| lookup_overlay_key(app, c))
         }
 
         // F: create a new port-forward (opens dialog).
@@ -290,6 +299,9 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Tab cycling.
         KeyCode::Tab => Some(Action::NextTab),
         KeyCode::BackTab => Some(Action::PrevTab),
+
+        // Overlay-defined key bindings (any key not caught above).
+        KeyCode::Char(c) => lookup_overlay_key(app, c),
 
         _ => None,
     }

@@ -224,10 +224,21 @@ where
             api,
             args.snapshot_tx,
             convert,
-            move |rows| ResourceUpdate::Rows {
-                resource: resource_id.clone(),
-                headers: headers.clone(),
-                rows,
+            move |mut rows| {
+                // Apply overlay coloring rules for built-in resources.
+                if let Some(overlay) = crate::kube::overlay::overlay_for(resource_id.plural()) {
+                    if !overlay.coloring.is_empty() {
+                        let hdrs = &headers;
+                        for row in &mut rows {
+                            crate::kube::overlay::evaluate_coloring(row, hdrs, &overlay.coloring);
+                        }
+                    }
+                }
+                ResourceUpdate::Rows {
+                    resource: resource_id.clone(),
+                    headers: headers.clone(),
+                    rows,
+                }
             },
             &args.namespace,
             args.filter,

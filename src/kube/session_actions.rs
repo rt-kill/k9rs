@@ -122,7 +122,8 @@ pub(crate) fn handle_action(
         }
 
         // --- Drill-down navigation ---
-        a @ (Action::ShowNode | Action::UsedBy | Action::JumpToOwner | Action::NodeShell) => {
+        a @ (Action::ShowNode | Action::UsedBy | Action::JumpToOwner | Action::NodeShell
+            | Action::OverlayCapability(_)) => {
             return handle_drill(app, a, data_source);
         }
 
@@ -875,6 +876,49 @@ fn handle_drill(
             {
                 let node = row.name.clone();
                 return ActionResult::NodeShell { node };
+            }
+        }
+        Action::OverlayCapability(ref cap_name) => {
+            let plural = app.nav.resource_id().plural().to_owned();
+            let overlay = crate::kube::overlay::overlay_for(&plural);
+            let cap = overlay.and_then(|o| o.capabilities.get(cap_name));
+            match cap {
+                Some(crate::kube::overlay::OverlayCapability::Drill { target, column }) => {
+                    let target_rid = crate::kube::protocol::ResourceId::from_alias(target)
+                        .unwrap_or_else(|| crate::kube::protocol::ResourceId::CrdUnresolved(target.clone()));
+                    let filter_value = app.active_view_table()
+                        .and_then(|t| t.selected_item())
+                        .and_then(|row| {
+                            let desc = app.active_view_descriptor()?;
+                            let col_idx = desc.headers.iter()
+                                .position(|h| h.eq_ignore_ascii_case(column))?;
+                            row.cells.get(col_idx).map(|c| c.to_string())
+                        });
+                    if let Some(value) = filter_value.filter(|v| !v.is_empty()) {
+                        let sel = app.active_table_selected();
+                        app.nav.save_selected(sel);
+                        let change = app.nav.push(crate::app::nav::NavStep::new(
+                            target_rid,
+                            Some(crate::app::nav::NavFilter::Grep(
+                                crate::app::nav::CompiledGrep::new(regex::escape(&value)),
+                            )),
+                        ));
+                        apply_nav_change(app, data_source, change);
+                        app.reapply_nav_filters();
+                        app.ui.flash = Some(crate::app::FlashMessage::info(
+                            format!("{} matching: {}", target, value)
+                        ));
+                    } else {
+                        app.ui.flash = Some(crate::app::FlashMessage::warn(
+                            format!("No value in column '{}' for '{}'", column, cap_name)
+                        ));
+                    }
+                }
+                None => {
+                    app.ui.flash = Some(crate::app::FlashMessage::warn(
+                        format!("Unknown overlay capability: {}", cap_name)
+                    ));
+                }
             }
         }
         _ => {}

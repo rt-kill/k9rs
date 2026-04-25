@@ -92,7 +92,7 @@ pub(crate) async fn run_dynamic_live_watcher(
                                 backoff_ms = INITIAL_BACKOFF_MS;
                                 backoff_start = std::time::Instant::now();
                                 debug!("live_query dynamic: initial list complete, {} items", store.len());
-                                let snap = build_dynamic_snapshot(&store, &printer_columns, scope);
+                                let snap = build_dynamic_snapshot(&store, &printer_columns, scope, &plural);
                                 let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
                                     resource: resource_id.clone(),
                                     headers: snap.headers,
@@ -141,7 +141,7 @@ pub(crate) async fn run_dynamic_live_watcher(
             _ = flush_timer.tick() => {
                 if init_dirty && !store.is_empty() && store.len() <= super::live_query::INIT_FLUSH_ROW_LIMIT {
                     init_dirty = false;
-                    let snap = build_dynamic_snapshot(&store, &printer_columns, scope);
+                    let snap = build_dynamic_snapshot(&store, &printer_columns, scope, &plural);
                     let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
                         resource: resource_id.clone(),
                         headers: snap.headers,
@@ -150,7 +150,7 @@ pub(crate) async fn run_dynamic_live_watcher(
                 }
                 if steady_dirty {
                     steady_dirty = false;
-                    let snap = build_dynamic_snapshot(&store, &printer_columns, scope);
+                    let snap = build_dynamic_snapshot(&store, &printer_columns, scope, &plural);
                     let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
                         resource: resource_id.clone(),
                         headers: snap.headers,
@@ -181,6 +181,7 @@ fn build_dynamic_snapshot(
     store: &HashMap<ObjectKey, DynamicObject>,
     printer_columns: &[PrinterColumn],
     scope: ResourceScope,
+    plural: &str,
 ) -> DynamicSnapshot {
     // Use the authoritative scope from API discovery, not guessed from data.
     let is_namespaced = scope == ResourceScope::Namespaced;
@@ -202,6 +203,20 @@ fn build_dynamic_snapshot(
         let upper = pc.name.to_uppercase();
         if upper == "NAME" || upper == "NAMESPACE" || upper == "AGE" { continue; }
         all_columns.push(pc.clone());
+    }
+    // Append user-defined overlay columns, skipping any that duplicate
+    // an existing column name (case-insensitive).
+    if let Some(overlay) = crate::kube::overlay::overlay_for(plural) {
+        for oc in &overlay.columns {
+            let upper = oc.header.to_uppercase();
+            let already_exists = all_columns.iter().any(|c| c.name.to_uppercase() == upper);
+            if already_exists { continue; }
+            all_columns.push(PrinterColumn {
+                name: oc.header.clone(),
+                json_path: oc.jsonpath.clone(),
+                column_type: crate::kube::cache::PrinterColumnType::String,
+            });
+        }
     }
     all_columns.push(PrinterColumn {
         name: "AGE".into(),
@@ -263,6 +278,16 @@ fn build_dynamic_snapshot(
         })
         .collect();
     items.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+
+    // Apply overlay coloring rules (Phase 1).
+    if let Some(overlay) = crate::kube::overlay::overlay_for(plural) {
+        if !overlay.coloring.is_empty() {
+            for row in &mut items {
+                crate::kube::overlay::evaluate_coloring(row, &headers, &overlay.coloring);
+            }
+        }
+    }
+
     DynamicSnapshot { headers, rows: items }
 }
 
