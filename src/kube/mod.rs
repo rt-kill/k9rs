@@ -8,6 +8,7 @@ pub mod client_session;
 pub(crate) const GRACE_PERIOD_SECS: u64 = 300;
 pub mod mux;
 pub mod daemon;
+pub mod daemon_config;
 pub mod describe;
 pub mod live_query;
 pub mod live_query_dynamic;

@@ -8,7 +8,6 @@ use crate::kube::protocol::{self, ObjectRef};
 use crate::kube::resource_def::BuiltInKind;
 use crate::kube::session::{ds_try, ActionResult, apply_nav_change};
 
-const PAGE_SCROLL_LINES: usize = 40;
 const HELP_PAGE_SCROLL_LINES: usize = 10;
 const DEFAULT_TERMINAL_HEIGHT: usize = 24;
 const CHROME_LINES: usize = 5;
@@ -235,9 +234,9 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
             match &mut app.route {
                 Route::Logs { ref mut state, .. } => {
                     state.follow = false;
-                    state.scroll = state.scroll.saturating_sub(PAGE_SCROLL_LINES);
+                    state.scroll = state.scroll.saturating_sub(app.config.ui.page_scroll_lines);
                 }
-                Route::ContentView { ref mut state, .. } => state.scroll = state.scroll.saturating_sub(PAGE_SCROLL_LINES),
+                Route::ContentView { ref mut state, .. } => state.scroll = state.scroll.saturating_sub(app.config.ui.page_scroll_lines),
                 Route::Help => {
                     app.ui.help_scroll = app.ui.help_scroll.saturating_sub(HELP_PAGE_SCROLL_LINES);
                 }
@@ -252,11 +251,11 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
                     let total = state.visible_count();
                     let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CHROME_LINES);
                     let max = total.saturating_sub(visible);
-                    state.scroll = (state.scroll + PAGE_SCROLL_LINES).min(max);
+                    state.scroll = (state.scroll + app.config.ui.page_scroll_lines).min(max);
                 }
                 Route::ContentView { ref mut state, .. } => {
                     let max = state.line_count().saturating_sub(1);
-                    state.scroll = (state.scroll + PAGE_SCROLL_LINES).min(max);
+                    state.scroll = (state.scroll + app.config.ui.page_scroll_lines).min(max);
                 }
                 Route::Help => {
                     let max = help_max_scroll(&caps);
@@ -1144,7 +1143,7 @@ pub(crate) fn handle_enter(
 
         let previous = matches!(action, crate::app::ContainerAction::PreviousLogs);
 
-        let mut log_state = crate::app::LogState::new();
+        let mut log_state = crate::app::LogState::from_config(&app.config.ui.logs);
         log_state.follow = !previous;
         log_state.streaming = true;
         let tail = Some(log_state.tail_lines);
@@ -1350,7 +1349,7 @@ fn open_logs(
         (target.clone(), target, protocol::LogContainer::All)
     };
 
-    let mut log_state = crate::app::LogState::new();
+    let mut log_state = crate::app::LogState::from_config(&app.config.ui.logs);
     log_state.follow = !previous;
     log_state.streaming = true;
     let tail = Some(log_state.tail_lines);

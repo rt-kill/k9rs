@@ -34,6 +34,7 @@ pub fn all_overlays() -> &'static HashMap<String, ResourceOverlay> {
 
 /// A single overlay file targeting one resource type.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceOverlay {
     /// Plural name of the resource (e.g. "nodeclaims", "pods").
     pub resource: String,
@@ -68,6 +69,7 @@ pub enum OverlayCapability {
 
 /// An extra column defined by JSONPath extraction.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OverlayColumn {
     /// Column header name.
     pub header: String,
@@ -103,6 +105,7 @@ fn default_level() -> OverlayColumnLevel {
 
 /// Coloring rules for a specific column.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColumnColorRule {
     /// Column header name to match against.
     pub column: String,
@@ -112,6 +115,7 @@ pub struct ColumnColorRule {
 
 /// A single coloring rule: predicate + resulting health level.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColorRule {
     /// Exact text match on the cell's display value.
     #[serde(rename = "match")]
@@ -423,12 +427,9 @@ coloring:
         assert_eq!(overlay.resource, "nodeclaims");
         assert_eq!(overlay.bindings.get(&'o'), Some(&"show-node".to_string()));
         assert!(overlay.capabilities.contains_key("show-node"));
-        if let OverlayCapability::Drill { ref target, ref column } = overlay.capabilities["show-node"] {
-            assert_eq!(target, "nodes");
-            assert_eq!(column, "NODE");
-        } else {
-            panic!("expected Drill capability");
-        }
+        let OverlayCapability::Drill { ref target, ref column } = overlay.capabilities["show-node"];
+        assert_eq!(target, "nodes");
+        assert_eq!(column, "NODE");
         assert_eq!(overlay.columns.len(), 1);
         assert_eq!(overlay.columns[0].header, "INSTANCE TYPE");
         assert_eq!(overlay.coloring.len(), 1);

@@ -48,10 +48,8 @@ pub struct KubeState {
     pub kubectl_cache: KubectlCache,
 }
 
-// Named constants for configurable limits.
+// Default for LogState when no config is available (tests, etc.).
 const MAX_LOG_LINES: usize = 50_000;
-const KUBECTL_CACHE_CAPACITY: usize = 100;
-const FLASH_EXPIRY_SECS: u64 = 5;
 
 /// Duration a row-change flash highlight stays visible.
 pub const CHANGE_HIGHLIGHT_DURATION: Duration = Duration::from_secs(5);
@@ -141,10 +139,94 @@ impl DeltaTracker {
 }
 
 /// User config settings (loaded from ~/.config/k9rs/config.yaml).
-#[derive(Debug, Clone, Copy)]
+/// All fields use `#[serde(default)]` so missing keys use defaults.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct AppConfig {
     pub no_exit_on_ctrl_c: bool,
     pub read_only: bool,
+    pub ui: UiConfig,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            no_exit_on_ctrl_c: false,
+            read_only: false,
+            ui: UiConfig::default(),
+        }
+    }
+}
+
+/// TUI rendering and interaction preferences.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct UiConfig {
+    /// Skin name (loaded by theme.rs separately).
+    #[serde(default)]
+    pub skin: Option<String>,
+    pub max_column_width: u16,
+    pub page_scroll_lines: usize,
+    pub search_context_lines: usize,
+    pub command_history_size: usize,
+    pub change_highlight_secs: u64,
+    pub cache_capacity: usize,
+    pub flash: FlashConfig,
+    pub logs: LogConfig,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            skin: None,
+            max_column_width: 64,
+            page_scroll_lines: 40,
+            search_context_lines: 10,
+            command_history_size: 50,
+            change_highlight_secs: 5,
+            cache_capacity: 100,
+            flash: FlashConfig::default(),
+            logs: LogConfig::default(),
+        }
+    }
+}
+
+/// Flash message auto-dismiss durations.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct FlashConfig {
+    pub info_secs: u64,
+    pub warn_secs: u64,
+    pub error_secs: u64,
+}
+
+impl Default for FlashConfig {
+    fn default() -> Self {
+        Self { info_secs: 3, warn_secs: 5, error_secs: 10 }
+    }
+}
+
+/// Log view defaults.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct LogConfig {
+    pub max_lines: usize,
+    pub tail_lines: u64,
+    pub default_follow: bool,
+    pub default_timestamps: bool,
+    pub default_wrap: bool,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            max_lines: 50_000,
+            tail_lines: 500,
+            default_follow: true,
+            default_timestamps: true,
+            default_wrap: false,
+        }
+    }
 }
 
 /// The three-state lifecycle of a context switch. Replaces the prior pair
@@ -505,11 +587,11 @@ impl FlashMessage {
     pub fn error(msg: impl Into<String>) -> Self {
         Self { message: msg.into(), level: FlashLevel::Error, created: Instant::now() }
     }
-    pub fn is_expired(&self) -> bool {
+    pub fn is_expired(&self, flash_config: &FlashConfig) -> bool {
         let lifetime_secs = match self.level {
-            FlashLevel::Info => 3,
-            FlashLevel::Warn => FLASH_EXPIRY_SECS,
-            FlashLevel::Error => FLASH_EXPIRY_SECS * 2,
+            FlashLevel::Info => flash_config.info_secs,
+            FlashLevel::Warn => flash_config.warn_secs,
+            FlashLevel::Error => flash_config.error_secs,
         };
         self.created.elapsed().as_secs() >= lifetime_secs
     }
@@ -743,6 +825,17 @@ impl Default for LogState {
 impl LogState {
     pub fn new() -> Self {
         Self { follow: true, show_timestamps: true, streaming: false, ..Default::default() }
+    }
+    /// Create a LogState with user-configured defaults.
+    pub fn from_config(log_config: &LogConfig) -> Self {
+        Self {
+            max_lines: log_config.max_lines,
+            tail_lines: log_config.tail_lines,
+            follow: log_config.default_follow,
+            show_timestamps: log_config.default_timestamps,
+            wrap: log_config.default_wrap,
+            ..Default::default()
+        }
     }
     pub fn push(&mut self, line: String) {
         let evicted = self.lines.len() >= self.max_lines;
@@ -978,12 +1071,12 @@ pub struct KubectlCache {
 }
 
 impl KubectlCache {
-    pub fn new(ttl: Duration) -> Self {
+    pub fn new(ttl: Duration, capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
             insertion_order: Vec::new(),
             ttl,
-            max_capacity: KUBECTL_CACHE_CAPACITY,
+            max_capacity: capacity,
         }
     }
 

@@ -198,7 +198,7 @@ fn draw_centered_overlay(f: &mut Frame, label: &str, theme: &crate::ui::theme::T
 /// Draw flash messages at the bottom of the screen.
 fn draw_flash(f: &mut Frame, app: &App) {
     if let Some(ref flash) = app.ui.flash {
-        if flash.is_expired() {
+        if flash.is_expired(&app.config.ui.flash) {
             return;
         }
 

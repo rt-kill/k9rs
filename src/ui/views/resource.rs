@@ -87,6 +87,7 @@ struct TableSnapshot<'a> {
     changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
     row_keys: &'a [crate::kube::protocol::ObjectKey],
     row_health: &'a [crate::kube::resources::row::RowHealth],
+    max_col_width: u16,
 }
 
 /// Render a resource table from a pre-built snapshot. Returns the new
@@ -106,7 +107,8 @@ fn draw_resource_table(
         .marked(snap.marked)
         .changed_rows(snap.changed_rows)
         .row_keys(snap.row_keys)
-        .row_health(snap.row_health);
+        .row_health(snap.row_health)
+        .max_col_width(snap.max_col_width);
 
     let mut state = ResourceTableState {
         selected: snap.selected,
@@ -140,6 +142,7 @@ fn draw_unified_table(
     column_level: crate::app::ColumnLevel,
     changed_rows: &std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
     rid: &crate::kube::protocol::ResourceId,
+    max_col_width: u16,
 ) {
     let display_title = if table.loading {
         format!("{} (loading...)", title)
@@ -225,6 +228,7 @@ fn draw_unified_table(
         changed_rows,
         row_keys: &view.keys,
         row_health: &view.health,
+        max_col_width,
     };
     let (new_offset, new_page_size, new_col_offset) = draw_resource_table(
         f, area, title, &snap, theme,
@@ -332,7 +336,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         app.nav.find_table_for_resource_mut(&current_rid)
     };
     if let Some(table) = table_ref {
-        draw_unified_table(f, table_area, &title, table, &ns, theme, desc.as_ref(), cl, changed_rows, &current_rid);
+        draw_unified_table(f, table_area, &title, table, &ns, theme, desc.as_ref(), cl, changed_rows, &current_rid, app.config.ui.max_column_width);
     } else {
         // Table doesn't exist yet (e.g., CRD not yet discovered). Show loading bar.
         let loading_text = crate::util::loading_bar("Loading...");
@@ -354,7 +358,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    // 5. Breadcrumb bar — always shows the navigation path
+    // 5. Breadcrumb bar — nav path on left, ? help hint on right
     let bc = app.nav.breadcrumb();
     let mut spans = Vec::new();
     spans.push(Span::styled(format!(" {} ", bc), theme.title));
@@ -363,8 +367,12 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::styled("Esc", theme.title_filter_indicator));
         spans.push(Span::styled(" back", theme.info_label));
     }
-    let line = Line::from(spans);
-    f.render_widget(line, breadcrumb_area);
+    let left = Line::from(spans);
+    f.render_widget(left, breadcrumb_area);
+    // Right-aligned help hint
+    let hint = " ? help ";
+    let hint_x = breadcrumb_area.x + breadcrumb_area.width.saturating_sub(hint.len() as u16);
+    f.buffer_mut().set_string(hint_x, breadcrumb_area.y, hint, theme.info_label);
 
     // 6. Flash message area (handled by ui/mod.rs overlay, but we reserve the line)
     // Draw a subtle flash area background

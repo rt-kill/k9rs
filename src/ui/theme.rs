@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use ratatui::style::{Color, Modifier, Style};
+use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
 // Default color palette (approximate RGB values)
@@ -65,11 +66,6 @@ fn parse_color(s: &str) -> Option<Color> {
     }
 }
 
-/// Helper: extract a color from a YAML mapping by key name.
-fn yaml_color(map: &serde_yaml::Value, key: &str) -> Option<Color> {
-    map.get(key)?.as_str().and_then(parse_color)
-}
-
 /// Helper: set fg on a style if the color is present.
 fn with_fg(style: Style, color: Option<Color>) -> Style {
     match color {
@@ -83,6 +79,320 @@ fn with_bg(style: Style, color: Option<Color>) -> Style {
     match color {
         Some(c) => style.bg(c),
         None => style,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serde-based skin YAML schema
+// ---------------------------------------------------------------------------
+
+/// A color value from a skin YAML. Deserializes from a string like "#FF0000",
+/// "red", or "default".
+#[derive(Debug, Clone)]
+struct SkinColor(Color);
+
+impl SkinColor {
+    fn get(&self) -> Color {
+        self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SkinColor {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        parse_color(&s)
+            .map(SkinColor)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid color: {}", s)))
+    }
+}
+
+/// Helper to extract an `Option<Color>` from an `Option<SkinColor>`.
+fn skin_color(sc: &Option<SkinColor>) -> Option<Color> {
+    sc.as_ref().map(|c| c.get())
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SkinSchema {
+    body: SkinBody,
+    prompt: SkinPrompt,
+    info: SkinInfo,
+    dialog: SkinDialog,
+    frame: SkinFrame,
+    views: SkinViews,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinBody {
+    fg_color: Option<SkinColor>,
+    bg_color: Option<SkinColor>,
+    logo_color: Option<SkinColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinPrompt {
+    fg_color: Option<SkinColor>,
+    suggest_color: Option<SkinColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinInfo {
+    fg_color: Option<SkinColor>,
+    section_color: Option<SkinColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinDialog {
+    bg_color: Option<SkinColor>,
+    button_focus_fg_color: Option<SkinColor>,
+    button_focus_bg_color: Option<SkinColor>,
+    button_fg_color: Option<SkinColor>,
+    button_bg_color: Option<SkinColor>,
+    label_fg_color: Option<SkinColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SkinFrame {
+    border: SkinFrameBorder,
+    menu: SkinFrameMenu,
+    crumbs: SkinFrameCrumbs,
+    status: SkinFrameStatus,
+    title: SkinFrameTitle,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinFrameBorder {
+    fg_color: Option<SkinColor>,
+    focus_color: Option<SkinColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinFrameMenu {
+    fg_color: Option<SkinColor>,
+    key_color: Option<SkinColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinFrameCrumbs {
+    fg_color: Option<SkinColor>,
+    bg_color: Option<SkinColor>,
+    active_color: Option<SkinColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinFrameStatus {
+    new_color: Option<SkinColor>,
+    add_color: Option<SkinColor>,
+    modify_color: Option<SkinColor>,
+    error_color: Option<SkinColor>,
+    completed_color: Option<SkinColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinFrameTitle {
+    fg_color: Option<SkinColor>,
+    highlight_color: Option<SkinColor>,
+    counter_color: Option<SkinColor>,
+    filter_color: Option<SkinColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SkinViews {
+    table: SkinViewsTable,
+    yaml: SkinViewsYaml,
+    logs: SkinViewsLogs,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinViewsTable {
+    fg_color: Option<SkinColor>,
+    bg_color: Option<SkinColor>,
+    cursor_fg_color: Option<SkinColor>,
+    cursor_bg_color: Option<SkinColor>,
+    header: SkinViewsTableHeader,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinViewsTableHeader {
+    fg_color: Option<SkinColor>,
+    bg_color: Option<SkinColor>,
+    sorter_color: Option<SkinColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinViewsYaml {
+    key_color: Option<SkinColor>,
+    value_color: Option<SkinColor>,
+    colon_color: Option<SkinColor>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct SkinViewsLogs {
+    fg_color: Option<SkinColor>,
+    bg_color: Option<SkinColor>,
+}
+
+impl SkinSchema {
+    /// Apply skin overrides to an existing theme.
+    fn apply_to(&self, theme: &mut Theme) {
+        // -- body --
+        let fg = skin_color(&self.body.fg_color);
+        let bg = skin_color(&self.body.bg_color);
+        theme.row_normal = with_bg(with_fg(theme.row_normal, fg), bg);
+        theme.info_value = with_fg(theme.info_value, fg);
+        if let Some(c) = skin_color(&self.body.logo_color) {
+            theme.logo = theme.logo.fg(c);
+        }
+
+        // -- prompt --
+        theme.command = with_fg(theme.command, skin_color(&self.prompt.fg_color));
+        if let Some(c) = skin_color(&self.prompt.suggest_color) {
+            theme.command_suggestion = theme.command_suggestion.fg(c);
+        }
+
+        // -- info --
+        theme.info_value = with_fg(theme.info_value, skin_color(&self.info.fg_color));
+        if let Some(c) = skin_color(&self.info.section_color) {
+            theme.info_label = theme.info_label.fg(c);
+        }
+
+        // -- dialog --
+        theme.dialog_bg = with_bg(theme.dialog_bg, skin_color(&self.dialog.bg_color));
+        if let Some(c) = skin_color(&self.dialog.button_focus_fg_color) {
+            theme.dialog_button_active = theme.dialog_button_active.fg(c);
+        }
+        if let Some(c) = skin_color(&self.dialog.button_focus_bg_color) {
+            theme.dialog_button_active = theme.dialog_button_active.bg(c);
+        }
+        if let Some(c) = skin_color(&self.dialog.button_fg_color) {
+            theme.dialog_button_inactive = theme.dialog_button_inactive.fg(c);
+        }
+        if let Some(c) = skin_color(&self.dialog.button_bg_color) {
+            theme.dialog_button_inactive = theme.dialog_button_inactive.bg(c);
+        }
+        if let Some(c) = skin_color(&self.dialog.label_fg_color) {
+            theme.dialog_border = theme.dialog_border.fg(c);
+        }
+
+        // -- frame.border --
+        if let Some(c) = skin_color(&self.frame.border.fg_color) {
+            theme.border = theme.border.fg(c);
+        }
+        if let Some(c) = skin_color(&self.frame.border.focus_color) {
+            theme.border_focused = theme.border_focused.fg(c);
+        }
+
+        // -- frame.menu --
+        theme.status_bar = with_fg(theme.status_bar, skin_color(&self.frame.menu.fg_color));
+        if let Some(c) = skin_color(&self.frame.menu.key_color) {
+            theme.status_bar_key = theme.status_bar_key.fg(c);
+            theme.help_key = theme.help_key.fg(c);
+        }
+
+        // -- frame.crumbs --
+        let crumb_fg = skin_color(&self.frame.crumbs.fg_color);
+        let crumb_bg = skin_color(&self.frame.crumbs.bg_color);
+        theme.breadcrumb_inactive =
+            with_bg(with_fg(theme.breadcrumb_inactive, crumb_fg), crumb_bg);
+        if let Some(c) = skin_color(&self.frame.crumbs.active_color) {
+            theme.breadcrumb_active = with_fg(theme.breadcrumb_active, crumb_fg).bg(c);
+        }
+
+        // -- frame.status --
+        if let Some(c) = skin_color(&self.frame.status.new_color) {
+            theme.status_running = theme.status_running.fg(c);
+        }
+        if let Some(c) = skin_color(&self.frame.status.add_color) {
+            theme.flash_info = theme.flash_info.fg(c);
+        }
+        if let Some(c) = skin_color(&self.frame.status.modify_color) {
+            theme.status_pending = theme.status_pending.fg(c);
+            theme.flash_warn = theme.flash_warn.fg(c);
+        }
+        if let Some(c) = skin_color(&self.frame.status.error_color) {
+            theme.status_failed = theme.status_failed.fg(c);
+            theme.flash_error = theme.flash_error.fg(c);
+        }
+        if let Some(c) = skin_color(&self.frame.status.completed_color) {
+            theme.status_succeeded = theme.status_succeeded.fg(c);
+        }
+
+        // -- frame.title --
+        theme.title = with_fg(theme.title, skin_color(&self.frame.title.fg_color));
+        if let Some(c) = skin_color(&self.frame.title.highlight_color) {
+            theme.title_namespace = theme.title_namespace.fg(c);
+            theme.namespace_label = theme.namespace_label.fg(c);
+        }
+        if let Some(c) = skin_color(&self.frame.title.counter_color) {
+            theme.title_counter = theme.title_counter.fg(c);
+        }
+        if let Some(c) = skin_color(&self.frame.title.filter_color) {
+            theme.title_filter_indicator = theme.title_filter_indicator.fg(c);
+            theme.filter = theme.filter.fg(c);
+        }
+
+        // -- views.table --
+        let table_fg = skin_color(&self.views.table.fg_color);
+        let table_bg = skin_color(&self.views.table.bg_color);
+        theme.row_normal = with_bg(with_fg(theme.row_normal, table_fg), table_bg);
+        if let Some(c) = skin_color(&self.views.table.cursor_fg_color) {
+            theme.selected = theme.selected.fg(c);
+        }
+        if let Some(c) = skin_color(&self.views.table.cursor_bg_color) {
+            theme.selected = theme.selected.bg(c);
+        }
+
+        // -- views.table.header --
+        let hdr_fg = skin_color(&self.views.table.header.fg_color);
+        let hdr_bg = skin_color(&self.views.table.header.bg_color);
+        theme.header = with_bg(with_fg(theme.header, hdr_fg), hdr_bg);
+        if let Some(c) = skin_color(&self.views.table.header.sorter_color) {
+            theme.sort_indicator = theme.sort_indicator.fg(c);
+        }
+
+        // -- views.yaml --
+        if let Some(c) = skin_color(&self.views.yaml.key_color) {
+            theme.yaml_key = theme.yaml_key.fg(c);
+        }
+        if let Some(c) = skin_color(&self.views.yaml.value_color) {
+            theme.yaml_string = theme.yaml_string.fg(c);
+        }
+        if let Some(c) = skin_color(&self.views.yaml.colon_color) {
+            theme.yaml_number = theme.yaml_number.fg(c);
+        }
+
+        // -- views.logs --
+        let log_fg = skin_color(&self.views.logs.fg_color);
+        let log_bg = skin_color(&self.views.logs.bg_color);
+        theme.log_text = with_bg(with_fg(theme.log_text, log_fg), log_bg);
     }
 }
 
@@ -360,49 +670,27 @@ impl Theme {
     /// 2. Look for `~/.config/k9rs/skins/<name>.yaml`.
     /// 3. If found, parse it and override colors.
     /// 4. Fall back to `Theme::default()`.
-    pub fn load() -> Self {
+    /// Load the theme. The skin name comes from AppConfig (already
+    /// deserialized via serde). Searches k9rs then k9s skins dirs.
+    pub fn load(skin_name: Option<&str>) -> Self {
+        let Some(name) = skin_name.filter(|s| !s.is_empty()) else {
+            return Self::default();
+        };
         let home = match std::env::var("HOME") {
             Ok(h) => h,
             Err(_) => return Self::default(),
         };
-        // Try k9rs config first, fall back to k9s for compatibility.
-        let (skin_name, base_dir) = Self::find_skin_config(&home)
-            .unwrap_or_default();
-        if skin_name.is_empty() {
-            return Self::default();
+        // Try k9rs skins dir first, fall back to k9s.
+        let skin_file = format!("{}.yaml", name);
+        let k9rs_path = Path::new(&home).join(".config/k9rs/skins").join(&skin_file);
+        if k9rs_path.exists() {
+            return Self::from_skin_file(&k9rs_path).unwrap_or_default();
         }
-        let skin_path = Path::new(&base_dir)
-            .join("skins")
-            .join(format!("{}.yaml", skin_name));
-        Self::from_skin_file(&skin_path).unwrap_or_default()
-    }
-
-    /// Find skin name and config base directory, trying k9rs then k9s.
-    fn find_skin_config(home: &str) -> Option<(String, String)> {
-        // Try ~/.config/k9rs/ first
-        let k9rs_dir = Path::new(home).join(".config/k9rs");
-        let k9rs_config = k9rs_dir.join("config.yaml");
-        if let Some(name) = Self::read_skin_name(&k9rs_config, "k9rs") {
-            return Some((name, k9rs_dir.to_string_lossy().to_string()));
+        let k9s_path = Path::new(&home).join(".config/k9s/skins").join(&skin_file);
+        if k9s_path.exists() {
+            return Self::from_skin_file(&k9s_path).unwrap_or_default();
         }
-        // Fall back to ~/.config/k9s/
-        let k9s_dir = Path::new(home).join(".config/k9s");
-        let k9s_config = k9s_dir.join("config.yaml");
-        if let Some(name) = Self::read_skin_name(&k9s_config, "k9s") {
-            return Some((name, k9s_dir.to_string_lossy().to_string()));
-        }
-        None
-    }
-
-    /// Read the skin name from a config.yaml file under the given YAML key.
-    fn read_skin_name(path: &Path, key: &str) -> Option<String> {
-        let content = std::fs::read_to_string(path).ok()?;
-        let yaml: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
-        yaml.get(key)?
-            .get("ui")?
-            .get("skin")?
-            .as_str()
-            .map(|s| s.to_string())
+        Self::default()
     }
 
     /// Load a skin YAML file (compatible with k9s skin format) and produce a Theme
@@ -410,179 +698,11 @@ impl Theme {
     pub fn from_skin_file(path: &Path) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
         let yaml: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
-        let k9s = yaml.get("k9s")?;
+        let k9s_val = yaml.get("k9s")?.clone();
+        let skin: SkinSchema = serde_yaml::from_value(k9s_val).ok()?;
 
         let mut theme = Self::default();
-
-        // -- body --
-        if let Some(body) = k9s.get("body") {
-            let fg = yaml_color(body, "fgColor");
-            let bg = yaml_color(body, "bgColor");
-            // Body fg/bg affects general text styles
-            theme.row_normal = with_bg(with_fg(theme.row_normal, fg), bg);
-            theme.info_value = with_fg(theme.info_value, fg);
-            if let Some(logo_color) = yaml_color(body, "logoColor") {
-                theme.logo = theme.logo.fg(logo_color);
-            }
-        }
-
-        // -- prompt --
-        if let Some(prompt) = k9s.get("prompt") {
-            let fg = yaml_color(prompt, "fgColor");
-            theme.command = with_fg(theme.command, fg);
-            if let Some(suggest) = yaml_color(prompt, "suggestColor") {
-                theme.command_suggestion = theme.command_suggestion.fg(suggest);
-            }
-        }
-
-        // -- info --
-        if let Some(info) = k9s.get("info") {
-            let fg = yaml_color(info, "fgColor");
-            theme.info_value = with_fg(theme.info_value, fg);
-            if let Some(section) = yaml_color(info, "sectionColor") {
-                theme.info_label = theme.info_label.fg(section);
-            }
-        }
-
-        // -- dialog --
-        if let Some(dialog) = k9s.get("dialog") {
-            let bg = yaml_color(dialog, "bgColor");
-            theme.dialog_bg = with_bg(theme.dialog_bg, bg);
-            if let Some(focus_fg) = yaml_color(dialog, "buttonFocusFgColor") {
-                theme.dialog_button_active = theme.dialog_button_active.fg(focus_fg);
-            }
-            if let Some(focus_bg) = yaml_color(dialog, "buttonFocusBgColor") {
-                theme.dialog_button_active = theme.dialog_button_active.bg(focus_bg);
-            }
-            if let Some(btn_fg) = yaml_color(dialog, "buttonFgColor") {
-                theme.dialog_button_inactive = theme.dialog_button_inactive.fg(btn_fg);
-            }
-            if let Some(btn_bg) = yaml_color(dialog, "buttonBgColor") {
-                theme.dialog_button_inactive = theme.dialog_button_inactive.bg(btn_bg);
-            }
-            if let Some(label_fg) = yaml_color(dialog, "labelFgColor") {
-                theme.dialog_border = theme.dialog_border.fg(label_fg);
-            }
-        }
-
-        // -- frame --
-        if let Some(frame) = k9s.get("frame") {
-            // frame.border
-            if let Some(border) = frame.get("border") {
-                if let Some(fg) = yaml_color(border, "fgColor") {
-                    theme.border = theme.border.fg(fg);
-                }
-                if let Some(focus) = yaml_color(border, "focusColor") {
-                    theme.border_focused = theme.border_focused.fg(focus);
-                }
-            }
-
-            // frame.menu
-            if let Some(menu) = frame.get("menu") {
-                let fg = yaml_color(menu, "fgColor");
-                theme.status_bar = with_fg(theme.status_bar, fg);
-                if let Some(key_color) = yaml_color(menu, "keyColor") {
-                    theme.status_bar_key = theme.status_bar_key.fg(key_color);
-                    theme.help_key = theme.help_key.fg(key_color);
-                }
-            }
-
-            // frame.crumbs
-            if let Some(crumbs) = frame.get("crumbs") {
-                let fg = yaml_color(crumbs, "fgColor");
-                let bg = yaml_color(crumbs, "bgColor");
-                theme.breadcrumb_inactive = with_bg(with_fg(theme.breadcrumb_inactive, fg), bg);
-                if let Some(active) = yaml_color(crumbs, "activeColor") {
-                    theme.breadcrumb_active = with_fg(theme.breadcrumb_active, fg).bg(active);
-                }
-            }
-
-            // frame.status
-            if let Some(status) = frame.get("status") {
-                if let Some(c) = yaml_color(status, "newColor") {
-                    theme.status_running = theme.status_running.fg(c);
-                }
-                if let Some(c) = yaml_color(status, "addColor") {
-                    theme.flash_info = theme.flash_info.fg(c);
-                }
-                if let Some(c) = yaml_color(status, "modifyColor") {
-                    theme.status_pending = theme.status_pending.fg(c);
-                    theme.flash_warn = theme.flash_warn.fg(c);
-                }
-                if let Some(c) = yaml_color(status, "errorColor") {
-                    theme.status_failed = theme.status_failed.fg(c);
-                    theme.flash_error = theme.flash_error.fg(c);
-                }
-                if let Some(c) = yaml_color(status, "completedColor") {
-                    theme.status_succeeded = theme.status_succeeded.fg(c);
-                }
-            }
-
-            // frame.title
-            if let Some(title) = frame.get("title") {
-                let fg = yaml_color(title, "fgColor");
-                theme.title = with_fg(theme.title, fg);
-                if let Some(hl) = yaml_color(title, "highlightColor") {
-                    theme.title_namespace = theme.title_namespace.fg(hl);
-                    theme.namespace_label = theme.namespace_label.fg(hl);
-                }
-                if let Some(counter) = yaml_color(title, "counterColor") {
-                    theme.title_counter = theme.title_counter.fg(counter);
-                }
-                if let Some(filter) = yaml_color(title, "filterColor") {
-                    theme.title_filter_indicator = theme.title_filter_indicator.fg(filter);
-                    theme.filter = theme.filter.fg(filter);
-                }
-            }
-        }
-
-        // -- views --
-        if let Some(views) = k9s.get("views") {
-            // views.table
-            if let Some(table) = views.get("table") {
-                let fg = yaml_color(table, "fgColor");
-                let bg = yaml_color(table, "bgColor");
-                theme.row_normal = with_bg(with_fg(theme.row_normal, fg), bg);
-
-                if let Some(cursor_fg) = yaml_color(table, "cursorFgColor") {
-                    theme.selected = theme.selected.fg(cursor_fg);
-                }
-                if let Some(cursor_bg) = yaml_color(table, "cursorBgColor") {
-                    theme.selected = theme.selected.bg(cursor_bg);
-                }
-
-                // views.table.header
-                if let Some(header) = table.get("header") {
-                    let hfg = yaml_color(header, "fgColor");
-                    let hbg = yaml_color(header, "bgColor");
-                    theme.header = with_bg(with_fg(theme.header, hfg), hbg);
-                    if let Some(sorter) = yaml_color(header, "sorterColor") {
-                        theme.sort_indicator = theme.sort_indicator.fg(sorter);
-                    }
-                }
-            }
-
-            // views.yaml
-            if let Some(yaml) = views.get("yaml") {
-                if let Some(key) = yaml_color(yaml, "keyColor") {
-                    theme.yaml_key = theme.yaml_key.fg(key);
-                }
-                if let Some(value) = yaml_color(yaml, "valueColor") {
-                    theme.yaml_string = theme.yaml_string.fg(value);
-                }
-                if let Some(colon) = yaml_color(yaml, "colonColor") {
-                    theme.yaml_number = theme.yaml_number.fg(colon);
-                }
-            }
-
-            // views.logs
-            if let Some(logs) = views.get("logs") {
-                let fg = yaml_color(logs, "fgColor");
-                let bg = yaml_color(logs, "bgColor");
-                theme.log_text = with_bg(with_fg(theme.log_text, fg), bg);
-            }
-        }
-
+        skin.apply_to(&mut theme);
         Some(theme)
     }
 }

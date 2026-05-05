@@ -38,8 +38,7 @@ pub(crate) use ds_try;
 
 /// Maximum events to drain per iteration to prevent UI freezes during bursts.
 const EVENT_DRAIN_CAP: usize = 200;
-/// Scroll offset when jumping to a search match (lines of context above match).
-const SEARCH_SCROLL_CONTEXT: usize = 10;
+// (SEARCH_SCROLL_CONTEXT moved to app.config.ui.search_context_lines)
 
 /// Result returned from `handle_action` to signal the main loop about actions
 /// that require terminal access (suspend/resume TUI for interactive commands).
@@ -567,7 +566,7 @@ fn handle_content_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> 
                 state.update_search();
                 if let Some(&t) = state.search_matches.first() {
                     state.current_match = 0;
-                    state.scroll = t.saturating_sub(SEARCH_SCROLL_CONTEXT);
+                    state.scroll = t.saturating_sub(app.config.ui.search_context_lines);
                 }
             }
             true
@@ -621,6 +620,14 @@ pub async fn session_main(
 
     let mut tick_interval = tokio::time::interval(tick_rate);
     let mut last_tick = std::time::Instant::now();
+
+    // Listen for SIGTERM so `pkill k9rs` triggers a clean shutdown instead
+    // of killing the process without running TerminalGuard::drop. The
+    // handler sets should_quit, and the normal exit path restores the
+    // terminal (disable raw mode, leave alternate screen, show cursor).
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    ).expect("failed to install SIGTERM handler");
 
     // Main event loop — only redraw when state changes
     let mut needs_redraw = true; // draw the first frame immediately
@@ -812,8 +819,10 @@ pub async fn session_main(
                 if app.tick() {
                     needs_redraw = true;
                 }
-                // Log stream end is signalled by the bridge task via
-                // AppEvent::LogStreamEnded — no polling needed here.
+            }
+            _ = sigterm.recv() => {
+                app.exit_reason = Some(crate::app::ExitReason::UserQuit);
+                app.should_quit = true;
             }
         }
 

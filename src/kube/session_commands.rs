@@ -261,8 +261,7 @@ use crate::kube::client_session::ClientSession;
 use crate::kube::session::{ds_try, apply_nav_change};
 use crate::kube::session_actions::do_switch_namespace;
 
-/// Maximum command history entries.
-const COMMAND_HISTORY_LIMIT: usize = 50;
+// (COMMAND_HISTORY_LIMIT moved to app.config.ui.command_history_size)
 
 /// Handle a keystroke while in `:command` mode. Returns true if consumed.
 pub(crate) fn handle_command_key(
@@ -287,7 +286,7 @@ pub(crate) fn handle_command_key(
             let cmd = raw_cmd.to_lowercase();
             if !cmd.is_empty() {
                 app.command_history.push(raw_cmd.clone());
-                if app.command_history.len() > COMMAND_HISTORY_LIMIT {
+                if app.command_history.len() > app.config.ui.command_history_size {
                     app.command_history.remove(0);
                 }
             }

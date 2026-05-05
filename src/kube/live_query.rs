@@ -118,22 +118,24 @@ pub struct Subscription {
 /// Page size for the initial LIST request. Each page is a single HTTP response;
 /// too large and the connection drops mid-transfer, too small and continue tokens
 /// expire before all pages are fetched. 1000 items ≈ 3MB per page.
-pub(crate) const WATCHER_PAGE_SIZE: u32 = 1000;
+/// Watcher page size — loaded from daemon config at runtime.
+pub(crate) fn watcher_page_size() -> u32 {
+    crate::kube::daemon_config::daemon_config().watcher_page_size
+}
 /// Interval for flushing intermediate snapshots during the initial list.
 pub(crate) const INIT_FLUSH_INTERVAL_MS: u64 = 200;
-/// Maximum store size for which intermediate flushes fire during the
-/// initial list. Above this threshold we skip intermediate snapshots and
-/// wait for `InitDone` — cloning + sorting + serializing thousands of rows
-/// every 200ms produces multi-MB payloads that choke the yamux pipe with
-/// diminishing UX return (the table just shows a blur of growing data).
-/// The full snapshot after `InitDone` still delivers all the data.
+/// Maximum store size for intermediate flushes.
 pub(crate) const INIT_FLUSH_ROW_LIMIT: usize = 2_000;
-/// Initial backoff duration for watcher retries (milliseconds).
-pub(crate) const INITIAL_BACKOFF_MS: u64 = 300;
-/// Maximum single-sleep backoff cap (milliseconds).
-pub(crate) const MAX_BACKOFF_MS: u64 = 30_000;
-/// Maximum total elapsed time before giving up on retries (milliseconds).
-pub(crate) const MAX_ELAPSED_MS: u64 = 120_000;
+/// Backoff config — loaded from daemon config at runtime.
+pub(crate) fn initial_backoff_ms() -> u64 {
+    crate::kube::daemon_config::daemon_config().backoff.initial_ms
+}
+pub(crate) fn max_backoff_ms() -> u64 {
+    crate::kube::daemon_config::daemon_config().backoff.max_ms
+}
+pub(crate) fn max_elapsed_ms() -> u64 {
+    crate::kube::daemon_config::daemon_config().backoff.max_elapsed_ms
+}
 
 impl Drop for Subscription {
     fn drop(&mut self) {
@@ -487,7 +489,7 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
     W: Fn(Vec<T>) -> ResourceUpdate + Send + 'static,
 {
     let mut watcher_config = watcher::Config::default()
-        .page_size(WATCHER_PAGE_SIZE)
+        .page_size(watcher_page_size())
         .any_semantic();      // serve from API server cache (resourceVersion=0), much faster
     // Apply server-side filters to the watcher (pushed to K8s API).
     // OwnerUid is NOT applied here — it's post-filtered after snapshot creation
@@ -505,7 +507,7 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
     let mut stream = watcher::watcher(api, watcher_config).boxed();
 
     let mut store: HashMap<ObjectKey, T> = HashMap::new();
-    let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
+    let mut backoff_ms: u64 = initial_backoff_ms();
     let mut backoff_start = std::time::Instant::now();
     // Track whether we've ever received data successfully. If the initial
     // LIST fails (RBAC, wrong resource, etc.), fail immediately instead of
@@ -553,7 +555,7 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
                             }
                             WatcherEvent::InitDone => {
                                 had_success = true;
-                                backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_ms = initial_backoff_ms();
                                 backoff_start = std::time::Instant::now();
                                 info!("live_query: initial list complete for {}({}), {} items", rt, ns_label, store.len());
                                 // Publish immediately — the user is waiting
@@ -563,7 +565,7 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
                             }
                             WatcherEvent::Apply(obj) => {
                                 had_success = true;
-                                backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_ms = initial_backoff_ms();
                                 backoff_start = std::time::Instant::now();
                                 let key = obj_key(&obj);
                                 store.insert(key, convert(obj));
@@ -571,7 +573,7 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
                             }
                             WatcherEvent::Delete(obj) => {
                                 had_success = true;
-                                backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_ms = initial_backoff_ms();
                                 backoff_start = std::time::Instant::now();
                                 let key = obj_key(&obj);
                                 store.remove(&key);
@@ -591,14 +593,14 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
                             exit_reason = Some(format!("{}", e));
                             break;
                         }
-                        if backoff_start.elapsed().as_millis() as u64 > MAX_ELAPSED_MS {
+                        if backoff_start.elapsed().as_millis() as u64 > max_elapsed_ms() {
                             warn!("live_query: watcher for {} failed for over 2 minutes, giving up: {}", rt, e);
                             exit_reason = Some(format!("{}", e));
                             break;
                         }
                         warn!("live_query: watcher error for {}: {}, retrying in {}ms", rt, e, backoff_ms);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                        backoff_ms = (backoff_ms * 2).min(max_backoff_ms());
                     }
                 }
             }

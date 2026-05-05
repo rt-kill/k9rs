@@ -93,6 +93,7 @@ impl ResourceRegistry {
             + std::fmt::Debug
             + Send
             + Sync
+            + serde::Serialize
             + serde::de::DeserializeOwned
             + 'static,
     {
@@ -122,6 +123,7 @@ impl ResourceRegistry {
             + std::fmt::Debug
             + Send
             + Sync
+            + serde::Serialize
             + serde::de::DeserializeOwned
             + 'static,
     {
@@ -216,27 +218,64 @@ where
         + std::fmt::Debug
         + Send
         + Sync
+        + serde::Serialize
         + serde::de::DeserializeOwned
         + 'static,
 {
+    // Resolve overlay columns once at spawn time — zero overhead per object
+    // if the resource has no overlay.
+    let overlay_columns: Vec<crate::kube::overlay::OverlayColumn> =
+        crate::kube::overlay::overlay_for(resource_id.plural())
+            .map(|o| o.columns.clone())
+            .unwrap_or_default();
+    let has_overlay_cols = !overlay_columns.is_empty();
+
+    // Wrap the typed converter to also extract overlay columns via JSONPath.
+    // Serializes &obj BEFORE conversion consumes it — no clone needed.
+    let convert_with_overlay = move |obj: K| {
+        let overlay_cells = if has_overlay_cols {
+            serde_json::to_value(&obj).ok().map(|json| {
+                overlay_columns.iter()
+                    .map(|oc| {
+                        use crate::kube::resources::row::CellValue;
+                        CellValue::Text(crate::kube::live_query_dynamic::resolve_json_path(&json, &oc.jsonpath))
+                    })
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            None
+        };
+        let mut row = convert(obj);
+        if let Some(cells) = overlay_cells {
+            row.cells.extend(cells);
+        }
+        row
+    };
+
+    // Build extended headers: base headers + overlay column names.
+    let overlay_header_names: Vec<String> = crate::kube::overlay::overlay_for(resource_id.plural())
+        .map(|o| o.columns.iter().map(|c| c.header.clone()).collect())
+        .unwrap_or_default();
+
     tokio::spawn(async move {
         crate::kube::live_query::run_typed_watcher(
             api,
             args.snapshot_tx,
-            convert,
+            convert_with_overlay,
             move |mut rows| {
+                let mut full_headers = headers.clone();
+                full_headers.extend(overlay_header_names.iter().cloned());
                 // Apply overlay coloring rules for built-in resources.
                 if let Some(overlay) = crate::kube::overlay::overlay_for(resource_id.plural()) {
                     if !overlay.coloring.is_empty() {
-                        let hdrs = &headers;
                         for row in &mut rows {
-                            crate::kube::overlay::evaluate_coloring(row, hdrs, &overlay.coloring);
+                            crate::kube::overlay::evaluate_coloring(row, &full_headers, &overlay.coloring);
                         }
                     }
                 }
                 ResourceUpdate::Rows {
                     resource: resource_id.clone(),
-                    headers: headers.clone(),
+                    headers: full_headers,
                     rows,
                 }
             },

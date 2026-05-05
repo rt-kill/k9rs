@@ -17,7 +17,7 @@ use crate::kube::cache::PrinterColumn;
 use crate::kube::protocol::{ObjectKey, ResourceScope};
 use crate::kube::resources::row::{CellValue, RowHealth};
 
-use super::live_query::{INIT_FLUSH_INTERVAL_MS, INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, MAX_ELAPSED_MS, WATCHER_PAGE_SIZE, WatcherSnapshot};
+use super::live_query::{INIT_FLUSH_INTERVAL_MS, initial_backoff_ms, max_backoff_ms, max_elapsed_ms, watcher_page_size, WatcherSnapshot};
 
 /// Extracts the ObjectKey from a DynamicObject.
 fn dyn_obj_key(obj: &DynamicObject) -> ObjectKey {
@@ -55,12 +55,12 @@ pub(crate) async fn run_dynamic_live_watcher(
     );
 
     let watcher_config = watcher::Config::default()
-        .page_size(WATCHER_PAGE_SIZE)
+        .page_size(watcher_page_size())
         .any_semantic();      // serve from API server cache (resourceVersion=0), much faster
     let mut stream = watcher::watcher(api, watcher_config).boxed();
 
     let mut store: HashMap<ObjectKey, DynamicObject> = HashMap::new();
-    let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
+    let mut backoff_ms: u64 = initial_backoff_ms();
     let mut backoff_start = std::time::Instant::now();
     let mut init_dirty = false;
     let mut steady_dirty = false;
@@ -89,7 +89,7 @@ pub(crate) async fn run_dynamic_live_watcher(
                             }
                             WatcherEvent::InitDone => {
                                 had_success = true;
-                                backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_ms = initial_backoff_ms();
                                 backoff_start = std::time::Instant::now();
                                 debug!("live_query dynamic: initial list complete, {} items", store.len());
                                 let snap = build_dynamic_snapshot(&store, &printer_columns, scope, &plural);
@@ -101,7 +101,7 @@ pub(crate) async fn run_dynamic_live_watcher(
                             }
                             WatcherEvent::Apply(obj) => {
                                 had_success = true;
-                                backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_ms = initial_backoff_ms();
                                 backoff_start = std::time::Instant::now();
                                 let key = dyn_obj_key(&obj);
                                 store.insert(key, obj);
@@ -109,7 +109,7 @@ pub(crate) async fn run_dynamic_live_watcher(
                             }
                             WatcherEvent::Delete(obj) => {
                                 had_success = true;
-                                backoff_ms = INITIAL_BACKOFF_MS;
+                                backoff_ms = initial_backoff_ms();
                                 backoff_start = std::time::Instant::now();
                                 let key = dyn_obj_key(&obj);
                                 store.remove(&key);
@@ -127,14 +127,14 @@ pub(crate) async fn run_dynamic_live_watcher(
                             exit_reason = Some(format!("{}", e));
                             break;
                         }
-                        if backoff_start.elapsed().as_millis() as u64 > MAX_ELAPSED_MS {
+                        if backoff_start.elapsed().as_millis() as u64 > max_elapsed_ms() {
                             warn!("live_query dynamic: watcher failed for over 2 minutes, giving up: {}", e);
                             exit_reason = Some(format!("{}", e));
                             break;
                         }
                         warn!("live_query dynamic: watcher error: {}, retrying in {}ms", e, backoff_ms);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                        backoff_ms = (backoff_ms * 2).min(max_backoff_ms());
                     }
                 }
             }
@@ -314,7 +314,7 @@ fn build_dynamic_snapshot(
 /// `DynamicObject` that must be walked untyped. The value is local to
 /// this function and immediately collapsed to a cell string — no `Value`
 /// propagates into long-lived state.
-fn resolve_json_path(obj: &serde_json::Value, path: &str) -> String {
+pub(crate) fn resolve_json_path(obj: &serde_json::Value, path: &str) -> String {
     let mut current: Option<&serde_json::Value> = Some(obj);
     let mut remaining = path.trim_start_matches('.');
 

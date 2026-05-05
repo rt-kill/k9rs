@@ -104,8 +104,8 @@ impl ColumnLayout {
     }
 }
 
-/// Maximum column width in characters.
-const MAX_COL_WIDTH: u16 = 64;
+/// Default maximum column width in characters.
+const DEFAULT_MAX_COL_WIDTH: u16 = 64;
 
 pub struct ResourceTable<'a> {
     headers: Vec<&'a str>,
@@ -119,6 +119,7 @@ pub struct ResourceTable<'a> {
     changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
     row_keys: &'a [crate::kube::protocol::ObjectKey],
     row_health: &'a [crate::kube::resources::row::RowHealth],
+    max_col_width: u16,
 }
 
 impl<'a> ResourceTable<'a> {
@@ -137,6 +138,7 @@ impl<'a> ResourceTable<'a> {
             changed_rows: &EMPTY_MAP,
             row_keys: &[],
             row_health: &[],
+            max_col_width: DEFAULT_MAX_COL_WIDTH,
         }
     }
 
@@ -146,6 +148,7 @@ impl<'a> ResourceTable<'a> {
     pub fn sort(mut self, col: Option<usize>, ascending: bool) -> Self { self.sort_col = col; self.sort_asc = ascending; self }
     pub fn namespace(mut self, ns: &'a str) -> Self { self.namespace = ns; self }
     pub fn changed_rows(mut self, changed: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>) -> Self { self.changed_rows = changed; self }
+    pub fn max_col_width(mut self, w: u16) -> Self { self.max_col_width = w; self }
 
     fn health_at(&self, idx: usize) -> crate::kube::resources::row::RowHealth {
         self.row_health.get(idx).copied().unwrap_or_default()
@@ -165,7 +168,7 @@ impl<'a> ResourceTable<'a> {
             }
         }
         // +3 per column: │(1) + pad(1) + content + pad(1).
-        for w in &mut widths { *w = (*w + 3).min(MAX_COL_WIDTH); }
+        for w in &mut widths { *w = (*w + 3).min(self.max_col_width); }
         widths
     }
 

@@ -20,7 +20,9 @@ use super::{ServerSession, SessionSharedState};
 /// How often the background refresher re-runs discovery. 5 minutes is a
 /// balance between catching new namespaces / CRDs promptly and not hammering
 /// the API server — discovery is cheap but not free (two full-cluster lists).
-const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+fn discovery_refresh_interval() -> Duration {
+    Duration::from_secs(crate::kube::daemon_config::daemon_config().discovery_refresh_secs)
+}
 
 impl ServerSession {
     // -----------------------------------------------------------------------
@@ -44,7 +46,7 @@ impl ServerSession {
         });
     }
 
-    /// Background loop: re-runs discovery every [`DISCOVERY_REFRESH_INTERVAL`]
+    /// Background loop: re-runs discovery every [`discovery_refresh_interval()`]
     /// so new namespaces / new CRDs reach the client without a reconnect.
     /// Skips the first tick — the eager call in `run_session_inner` already
     /// covers t=0.
@@ -55,7 +57,7 @@ impl ServerSession {
         let context = self.context.clone();
         let handle = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(DISCOVERY_REFRESH_INTERVAL).await;
+                tokio::time::sleep(discovery_refresh_interval()).await;
                 run_discovery_once(&client, &tx, &shared, &context).await;
             }
         });

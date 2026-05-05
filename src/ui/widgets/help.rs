@@ -65,7 +65,7 @@ impl<'a> HelpOverlay<'a> {
         // Compute total lines from a temporary instance. The theme is
         // only needed for rendering, not for counting lines, so we use
         // a stack-local theme whose lifetime is confined to this call.
-        let theme = Theme::load();
+        let theme = Theme::default();
         let total = {
             let tmp = HelpOverlay { theme: &theme, scroll: 0, caps: caps.cloned() };
             tmp.total_lines()

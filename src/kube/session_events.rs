@@ -311,7 +311,7 @@ fn apply_resource_update(
     app.reapply_nav_filters();
 
     // Expire old change highlights.
-    app.ui.deltas.expire(crate::app::CHANGE_HIGHLIGHT_DURATION);
+    app.ui.deltas.expire(std::time::Duration::from_secs(app.config.ui.change_highlight_secs));
 }
 
 

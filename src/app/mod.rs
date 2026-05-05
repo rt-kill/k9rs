@@ -166,6 +166,9 @@ pub struct App {
     /// When true, destructive actions (delete, edit, scale, restart, force-kill, shell) are disabled.
     pub read_only: bool,
 
+    /// User config loaded from ~/.config/k9rs/config.yaml.
+    pub config: AppConfig,
+
     /// Pure display/interaction state (flash, dialogs, input mode, theme, …).
     pub ui: UiState,
     /// Cluster/data state (context, namespace, metrics, caches, …).
@@ -175,6 +178,8 @@ pub struct App {
 impl App {
     pub fn new(context: crate::kube::protocol::ContextName, namespace: String) -> Self {
         let config = Self::load_config();
+        let cache_capacity = config.ui.cache_capacity;
+        let skin_name = config.ui.skin.clone();
         Self {
             should_quit: false,
             exit_reason: None,
@@ -186,11 +191,12 @@ impl App {
             command_history: Vec::new(),
             no_exit_on_ctrl_c: config.no_exit_on_ctrl_c,
             read_only: config.read_only,
+            config,
             ui: UiState {
                 flash: None,
                 confirm_dialog: None,
                 form_dialog: None,
-                theme: crate::ui::theme::Theme::load(),
+                theme: crate::ui::theme::Theme::load(skin_name.as_deref()),
                 input_mode: InputMode::Normal,
                 help_scroll: 0,
                 show_header: true,
@@ -206,47 +212,19 @@ impl App {
                 pod_metrics: HashMap::new(),
                 node_metrics: HashMap::new(),
                 core_streams: Vec::new(),
-                kubectl_cache: KubectlCache::new(Duration::from_secs(30)),
+                kubectl_cache: KubectlCache::new(Duration::from_secs(30), cache_capacity),
             },
         }
     }
 
-    /// Load settings from config file. Tries `~/.config/k9rs/config.yaml` first,
-    /// falls back to `~/.config/k9s/config.yaml` for compatibility.
+    /// Load settings from `~/.config/k9rs/config.yaml`. Uses the shared
+    /// `load_section` helper and serde deserialization — adding a new config
+    /// field is just adding a struct field with `#[serde(default)]`.
     fn load_config() -> AppConfig {
-        let default = AppConfig { no_exit_on_ctrl_c: false, read_only: false };
-        let home = match std::env::var("HOME") {
-            Ok(h) => h,
-            Err(_) => return default,
-        };
-        // Try k9rs config first, fall back to k9s config for compatibility.
-        let (content, key) = {
-            let k9rs_path = std::path::Path::new(&home).join(".config/k9rs/config.yaml");
-            if let Ok(c) = std::fs::read_to_string(&k9rs_path) {
-                (c, "k9rs")
-            } else {
-                let k9s_path = std::path::Path::new(&home).join(".config/k9s/config.yaml");
-                match std::fs::read_to_string(&k9s_path) {
-                    Ok(c) => (c, "k9s"),
-                    Err(_) => return default,
-                }
-            }
-        };
-        let yaml: serde_yaml::Value = match serde_yaml::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => return default,
-        };
-        let section = yaml.get(key);
-        AppConfig {
-            no_exit_on_ctrl_c: section
-                .and_then(|v| v.get("noExitOnCtrlC"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            read_only: section
-                .and_then(|v| v.get("readOnly"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-        }
+        // The top-level k9rs section deserializes directly into AppConfig
+        // because AppConfig uses `#[serde(rename_all = "camelCase", default)]`.
+        crate::kube::daemon_config::load_section::<AppConfig>("")
+            .unwrap_or_default()
     }
 
     /// Navigate to a new route: swaps the current route into the stack and
@@ -674,13 +652,13 @@ impl App {
         let mut changed = false;
         // Expire flash messages
         if let Some(ref flash) = self.ui.flash {
-            if flash.is_expired() {
+            if flash.is_expired(&self.config.ui.flash) {
                 self.ui.flash = None;
                 changed = true;
             }
         }
         // Expire row-level change highlights.
-        if self.ui.deltas.expire(CHANGE_HIGHLIGHT_DURATION) {
+        if self.ui.deltas.expire(Duration::from_secs(self.config.ui.change_highlight_secs)) {
             changed = true;
         }
         // Keep redrawing while a loading state is active (spinner animation).
