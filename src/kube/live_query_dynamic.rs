@@ -208,12 +208,15 @@ fn build_dynamic_snapshot(
     // an existing column name (case-insensitive).
     if let Some(overlay) = crate::kube::overlay::overlay_for(plural) {
         for oc in &overlay.columns {
+            // Only columns with a jsonpath add data (CRDs). Columns without
+            // jsonpath are level overrides for built-in resources — skip here.
+            let Some(ref jp) = oc.jsonpath else { continue };
             let upper = oc.header.to_uppercase();
             let already_exists = all_columns.iter().any(|c| c.name.to_uppercase() == upper);
             if already_exists { continue; }
             all_columns.push(PrinterColumn {
                 name: oc.header.clone(),
-                json_path: oc.jsonpath.clone(),
+                json_path: jp.clone(),
                 column_type: crate::kube::cache::PrinterColumnType::String,
             });
         }

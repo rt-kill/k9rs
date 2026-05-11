@@ -190,8 +190,9 @@ impl From<CrdRef> for ResourceId {
 
 /// A borrowed view over a resource's identity metadata. Built once per
 /// [`ResourceId::identity`] call, with fields borrowing either `&'static`
-/// data (for built-ins and locals — both of which point into `const`
-/// tables) or the receiver itself (for CRDs, which own their strings).
+/// data (for built-ins — which point into `const` tables), the enum
+/// variant's owned data (for locals), or the receiver itself (for CRDs,
+/// which own their strings).
 ///
 /// The per-variant dispatch on `ResourceId` lives in [`ResourceId::identity`]
 /// — exactly ONE place. Every accessor (`group`, `plural`, `scope`, …)
@@ -645,7 +646,7 @@ pub struct MetricsUsage {
 /// corresponds to either a `SessionCommand` variant or a purely client-side
 /// action that nonetheless requires server-known facts (like "this row is a
 /// pod, you can `kubectl exec` into it").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OperationKind {
     // Always-on (the server can satisfy these for any K8s row, plus locals
     // that opt in).
@@ -672,6 +673,194 @@ pub enum OperationKind {
     DecodeSecret,
     TriggerCronJob,
     ToggleSuspendCronJob,
+
+    /// User-defined operation from overlay config.
+    Custom(String),
+}
+
+// ---------------------------------------------------------------------------
+// Form schemas — declarative field definitions for operation dialogs
+// ---------------------------------------------------------------------------
+
+/// Declarative schema for the form dialog an operation needs.
+/// Per-operation, not per-resource — Scale always needs a Replicas field.
+pub struct FormSchema {
+    pub title_template: &'static str,
+    pub fields: &'static [FormFieldSchema],
+}
+
+pub struct FormFieldSchema {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub kind: FormFieldSchemaKind,
+}
+
+pub enum FormFieldSchemaKind {
+    /// Integer input with bounds. Default value extracted from a column.
+    Number { min: i64, max: i64, default_column: Option<&'static str> },
+    /// Port number input.
+    Port,
+    /// Select populated from row data (e.g., container ports). Falls back
+    /// to a simple input if no options available.
+    DynamicSelect { fallback: DynamicSelectFallback },
+}
+
+pub enum DynamicSelectFallback {
+    Port,
+}
+
+static SCALE_SCHEMA: FormSchema = FormSchema {
+    title_template: "Scale: {{kind}}/{{name}}",
+    fields: &[FormFieldSchema {
+        name: "replicas",
+        label: "Replicas",
+        kind: FormFieldSchemaKind::Number {
+            min: 0, max: 1_000_000,
+            default_column: Some("READY"),
+        },
+    }],
+};
+
+static PORT_FORWARD_SCHEMA: FormSchema = FormSchema {
+    title_template: "Port forward: {{kind}}/{{name}}",
+    fields: &[
+        FormFieldSchema {
+            name: "container_port",
+            label: "Container port",
+            kind: FormFieldSchemaKind::DynamicSelect {
+                fallback: DynamicSelectFallback::Port,
+            },
+        },
+        FormFieldSchema {
+            name: "local_port",
+            label: "Local port",
+            kind: FormFieldSchemaKind::Port,
+        },
+    ],
+};
+
+impl OperationKind {
+    /// The form schema for this operation, if it needs user input.
+    pub fn form_schema(&self) -> Option<&'static FormSchema> {
+        match self {
+            OperationKind::Scale => Some(&SCALE_SCHEMA),
+            OperationKind::PortForward => Some(&PORT_FORWARD_SCHEMA),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exec templates — declarative kubectl argument construction
+// ---------------------------------------------------------------------------
+
+/// Template for building kubectl exec arguments.
+pub struct ExecTemplate {
+    pub args: &'static [ExecArg],
+    pub title_template: &'static str,
+}
+
+pub enum ExecArg {
+    Literal(&'static str),
+    Placeholder(ExecPlaceholder),
+    /// Literal + placeholder pair, included only if placeholder is non-empty.
+    ConditionalPair(&'static str, ExecPlaceholder),
+}
+
+#[derive(Clone, Copy)]
+pub enum ExecPlaceholder {
+    Namespace,
+    PodName,
+    Container,
+    NodeName,
+}
+
+static SHELL_TEMPLATE: ExecTemplate = ExecTemplate {
+    args: &[
+        ExecArg::Literal("exec"), ExecArg::Literal("-it"),
+        ExecArg::Literal("-n"), ExecArg::Placeholder(ExecPlaceholder::Namespace),
+        ExecArg::Placeholder(ExecPlaceholder::PodName),
+        ExecArg::ConditionalPair("-c", ExecPlaceholder::Container),
+        ExecArg::Literal("--"), ExecArg::Literal("sh"),
+    ],
+    title_template: "{{pod}}/{{container}}",
+};
+
+static NODE_SHELL_TEMPLATE: ExecTemplate = ExecTemplate {
+    args: &[
+        ExecArg::Literal("debug"),
+        ExecArg::Placeholder(ExecPlaceholder::NodeName),
+        ExecArg::Literal("-it"),
+        ExecArg::Literal("--image=busybox"),
+    ],
+    title_template: "node/{{node}}",
+};
+
+impl OperationKind {
+    /// The exec template for this operation, if it launches an interactive session.
+    pub fn exec_template(&self) -> Option<&'static ExecTemplate> {
+        match self {
+            OperationKind::Shell => Some(&SHELL_TEMPLATE),
+            OperationKind::NodeShell => Some(&NODE_SHELL_TEMPLATE),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Operation descriptors — unified metadata per operation
+// ---------------------------------------------------------------------------
+
+/// Per-operation metadata: key binding, label, form schema, exec template.
+pub struct OperationDescriptor {
+    pub label: &'static str,
+    pub default_key: Option<char>,
+}
+
+impl OperationKind {
+    pub fn descriptor(&self) -> OperationDescriptor {
+        match self {
+            OperationKind::Describe => OperationDescriptor { label: "Describe", default_key: Some('d') },
+            OperationKind::Yaml => OperationDescriptor { label: "YAML", default_key: Some('y') },
+            OperationKind::Delete => OperationDescriptor { label: "Delete", default_key: None }, // Ctrl-D
+            OperationKind::Restart => OperationDescriptor { label: "Restart", default_key: Some('r') },
+            OperationKind::Scale => OperationDescriptor { label: "Scale", default_key: Some('s') },
+            OperationKind::StreamLogs => OperationDescriptor { label: "Logs", default_key: Some('L') },
+            OperationKind::PreviousLogs => OperationDescriptor { label: "Previous logs", default_key: Some('p') },
+            OperationKind::PortForward => OperationDescriptor { label: "Port forward", default_key: None }, // Shift-F hardcoded
+            OperationKind::Shell => OperationDescriptor { label: "Shell", default_key: Some('s') },
+            OperationKind::ShowNode => OperationDescriptor { label: "Show node", default_key: Some('o') },
+            OperationKind::ForceKill => OperationDescriptor { label: "Force kill", default_key: None }, // Ctrl-K
+            OperationKind::NodeShell => OperationDescriptor { label: "Node shell", default_key: Some('s') },
+            OperationKind::DecodeSecret => OperationDescriptor { label: "Decode", default_key: Some('x') },
+            OperationKind::TriggerCronJob => OperationDescriptor { label: "Trigger", default_key: Some('t') },
+            OperationKind::ToggleSuspendCronJob => OperationDescriptor { label: "Toggle suspend", default_key: Some('s') },
+            OperationKind::Custom(ref _name) => OperationDescriptor { label: "Custom", default_key: None },
+        }
+    }
+
+    /// Map this operation to its corresponding Action variant.
+    pub fn to_action(&self) -> crate::app::actions::Action {
+        use crate::app::actions::Action;
+        match self {
+            OperationKind::Describe => Action::Describe,
+            OperationKind::Yaml => Action::Yaml,
+            OperationKind::Delete => Action::Delete,
+            OperationKind::Restart => Action::Restart,
+            OperationKind::Scale => Action::Scale,
+            OperationKind::StreamLogs => Action::Logs,
+            OperationKind::PreviousLogs => Action::PreviousLogs,
+            OperationKind::PortForward => Action::PortForward,
+            OperationKind::Shell => Action::Shell,
+            OperationKind::ShowNode => Action::ShowNode,
+            OperationKind::ForceKill => Action::ForceKill,
+            OperationKind::NodeShell => Action::NodeShell,
+            OperationKind::DecodeSecret => Action::DecodeSecret,
+            OperationKind::TriggerCronJob => Action::TriggerCronJob,
+            OperationKind::ToggleSuspendCronJob => Action::SuspendCronJob,
+            OperationKind::Custom(ref name) => Action::OverlayCapability(name.clone()),
+        }
+    }
 }
 
 /// Single source of truth for client-side form-field name strings.
@@ -924,7 +1113,7 @@ pub struct LogInit {
 /// changes in a bincode-incompatible way (new fields, reordering, etc.).
 /// The daemon rejects Init commands with a mismatched version so stale
 /// daemons fail fast instead of producing silent data corruption.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// All commands from any client (TUI session or management CLI).
 /// The first command on a connection determines the connection type:
@@ -1269,5 +1458,49 @@ mod tests {
         // Even though the CRD's strings happen to match Pod's GVR, the
         // tagged variants are distinct types — they must never compare equal.
         assert_ne!(built_in, crd);
+    }
+
+    #[test]
+    fn all_builtin_ops_have_descriptors() {
+        use super::OperationKind::*;
+        let ops = [Describe, Yaml, Delete, Restart, Scale, StreamLogs,
+                   PreviousLogs, PortForward, Shell, ShowNode, ForceKill,
+                   NodeShell, DecodeSecret, TriggerCronJob, ToggleSuspendCronJob];
+        for op in ops {
+            assert!(!op.descriptor().label.is_empty(), "{:?} has no label", op);
+        }
+    }
+
+    #[test]
+    fn custom_operation_descriptor() {
+        let op = OperationKind::Custom("my-op".into());
+        let desc = op.descriptor();
+        assert_eq!(desc.default_key, None);
+        // to_action should produce OverlayCapability
+        let action = op.to_action();
+        assert!(matches!(action, crate::app::actions::Action::OverlayCapability(ref s) if s == "my-op"));
+    }
+
+    #[test]
+    fn custom_operation_has_no_schema_or_template() {
+        let op = OperationKind::Custom("test".into());
+        assert!(op.form_schema().is_none());
+        assert!(op.exec_template().is_none());
+    }
+
+    #[test]
+    fn custom_operation_bincode_roundtrip() {
+        let op = OperationKind::Custom("my-custom-op".into());
+        let bytes = bincode::serialize(&op).unwrap();
+        let decoded: OperationKind = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, op);
+    }
+
+    #[test]
+    fn custom_local_kind_bincode_roundtrip() {
+        let rid = ResourceId::Local(crate::kube::local::LocalResourceKind::Custom("my-resource".into()));
+        let bytes = bincode::serialize(&rid).unwrap();
+        let decoded: ResourceId = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, rid);
     }
 }

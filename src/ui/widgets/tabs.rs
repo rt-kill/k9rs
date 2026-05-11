@@ -16,6 +16,7 @@ use crate::ui::theme::Theme;
 pub struct TabBar<'a> {
     active: &'a ResourceId,
     namespace: &'a str,
+    item_count: Option<usize>,
     theme: &'a Theme,
 }
 
@@ -27,12 +28,18 @@ impl<'a> TabBar<'a> {
         Self {
             active,
             namespace: "",
+            item_count: None,
             theme,
         }
     }
 
     pub fn namespace(mut self, ns: &'a str) -> Self {
         self.namespace = ns;
+        self
+    }
+
+    pub fn item_count(mut self, count: usize) -> Self {
+        self.item_count = Some(count);
         self
     }
 }
@@ -55,7 +62,11 @@ impl Widget for TabBar<'_> {
             buf.set_string(x, area.y, " ", self.theme.breadcrumb_inactive);
             x += 1;
         }
-        let crumb_text = format!("<{}>", resource_label);
+        let crumb_text = if let Some(count) = self.item_count {
+            format!("<{}[{}]>", resource_label, count)
+        } else {
+            format!("<{}>", resource_label)
+        };
         let crumb_len = crumb_text.len().min((max_x - x) as usize);
         if crumb_len > 0 {
             buf.set_string(x, area.y, &crumb_text[..crumb_len], crumb_style);

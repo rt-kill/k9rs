@@ -574,11 +574,11 @@ impl ClientSession {
     // `do_switch_namespace` in session_nav.rs handles everything locally.
 
     pub fn describe(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::Describe(target.clone()))
+        self.send_command(SessionCommand::Describe(target.clone()))
     }
 
     pub fn yaml(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::Yaml(target.clone()))
+        self.send_command(SessionCommand::Yaml(target.clone()))
     }
 
     /// Submit edited YAML for `target`. The server routes by
@@ -587,7 +587,7 @@ impl ClientSession {
     /// `Action::Edit` fetches via `yaml()`, the user edits in `$EDITOR`,
     /// and the result is sent back via `apply()`.
     pub fn apply(&mut self, target: &protocol::ObjectRef, yaml: String) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::Apply { target: target.clone(), yaml })
+        self.send_command(SessionCommand::Apply { target: target.clone(), yaml })
     }
 
     /// Open an exec substream. Returns the raw split stream so the TUI
@@ -612,22 +612,22 @@ impl ClientSession {
     }
 
     pub fn delete(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::Delete(target.clone()))
+        self.send_command(SessionCommand::Delete(target.clone()))
     }
 
     pub fn force_kill(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::ForceKill(target.clone()))
+        self.send_command(SessionCommand::ForceKill(target.clone()))
     }
 
     pub fn scale(&mut self, target: &protocol::ObjectRef, replicas: u32) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::Scale {
+        self.send_command(SessionCommand::Scale {
             target: target.clone(),
             replicas,
         })
     }
 
     pub fn restart(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::Restart(target.clone()))
+        self.send_command(SessionCommand::Restart(target.clone()))
     }
 
     /// Open a log substream. Same shape as `subscribe_stream` — spawns a
@@ -724,19 +724,19 @@ impl ClientSession {
     }
 
     pub fn get_discovery(&mut self) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::GetDiscovery)
+        self.send_command(SessionCommand::GetDiscovery)
     }
 
     pub fn decode_secret(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::DecodeSecret(target.clone()))
+        self.send_command(SessionCommand::DecodeSecret(target.clone()))
     }
 
     pub fn trigger_cronjob(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::TriggerCronJob(target.clone()))
+        self.send_command(SessionCommand::TriggerCronJob(target.clone()))
     }
 
     pub fn toggle_suspend_cronjob(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::ToggleSuspendCronJob(target.clone()))
+        self.send_command(SessionCommand::ToggleSuspendCronJob(target.clone()))
     }
 
     pub fn port_forward(
@@ -745,7 +745,7 @@ impl ClientSession {
         local_port: u16,
         container_port: u16,
     ) -> anyhow::Result<()> {
-        self.send_command(&SessionCommand::PortForward {
+        self.send_command(SessionCommand::PortForward {
             target: target.clone(),
             local_port,
             container_port,
@@ -756,12 +756,12 @@ impl ClientSession {
     // Internal
     // -----------------------------------------------------------------------
 
-    fn send_command(&mut self, cmd: &SessionCommand) -> anyhow::Result<()> {
+    pub fn send_command(&mut self, cmd: SessionCommand) -> anyhow::Result<()> {
         // try_send never blocks: if the channel is full (writer stalled),
         // surface an error so the caller sees "daemon is behind" rather
         // than silently buffering multi-MB Apply payloads. Previously the
         // channel was unbounded and queued without backpressure.
-        self.cmd_tx.try_send(cmd.clone())
+        self.cmd_tx.try_send(cmd)
             .map_err(|e| match e {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => {
                     anyhow::anyhow!("Daemon writer task is stalled — command queue full")

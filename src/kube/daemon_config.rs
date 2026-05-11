@@ -24,6 +24,10 @@ pub struct DaemonConfig {
     pub watcher_page_size: u32,
     pub discovery_refresh_secs: u64,
     pub backoff: BackoffConfig,
+    /// Exec-backed local resource sources. Each entry defines a command
+    /// that is periodically run; its JSON stdout is parsed into table rows.
+    #[serde(default)]
+    pub exec_resources: Vec<crate::kube::local::exec_source::ExecSourceConfig>,
 }
 
 impl Default for DaemonConfig {
@@ -32,6 +36,7 @@ impl Default for DaemonConfig {
             watcher_page_size: 1000,
             discovery_refresh_secs: 300,
             backoff: BackoffConfig::default(),
+            exec_resources: Vec::new(),
         }
     }
 }

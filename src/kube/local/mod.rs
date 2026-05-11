@@ -20,7 +20,7 @@
 //!
 //! Local resources use the sentinel group `"k9rs.local"` (see
 //! [`crate::kube::protocol::LOCAL_GROUP`]). Metadata lives on the closed
-//! [`LocalResourceKind`] enum via exhaustive-match `const fn` accessors;
+//! [`LocalResourceKind`] enum via exhaustive-match `fn` accessors;
 //! the alias lookup ([`find_by_alias`]) consults it after the K8s `REGISTRY`
 //! so `:pf` resolves the same way as `:pods`. No parallel static table.
 //!
@@ -42,7 +42,7 @@
 //!
 //! # Adding a new local resource type
 //!
-//! 1. Add a variant to [`LocalResourceKind`] — every `const fn` accessor
+//! 1. Add a variant to [`LocalResourceKind`] — every `fn` accessor
 //!    becomes a compile error on the missing arm; fill in name, version,
 //!    kind_str, plural, scope, aliases, short_label, and add the variant
 //!    to [`LocalResourceKind::all`].
@@ -54,6 +54,7 @@
 //!    `*_for(context)` accessor (mirror `port_forwards_for`); add a match
 //!    arm in `LocalRegistry::get` for the new kind.
 
+pub mod exec_source;
 pub mod port_forward;
 pub mod registry;
 pub mod subscription;

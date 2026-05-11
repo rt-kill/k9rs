@@ -74,7 +74,10 @@ pub struct OverlayColumn {
     /// Column header name.
     pub header: String,
     /// JSONPath expression to extract from the raw K8s object.
-    pub jsonpath: String,
+    /// Required for CRDs (no compile-time schema). Omitted for built-in
+    /// resources where the column references an existing converter field.
+    #[serde(default)]
+    pub jsonpath: Option<String>,
     /// Visibility level (default or extra).
     #[serde(default = "default_level")]
     pub level: OverlayColumnLevel,
@@ -196,6 +199,23 @@ pub fn load_overlays() -> HashMap<String, ResourceOverlay> {
                             tracing::debug!(
                                 "overlay: capability '{}' references column '{}' not in overlay columns (may be built-in) in {}",
                                 cap_name, column, path.display()
+                            );
+                        }
+                    }
+                    // Check column/jsonpath consistency.
+                    let is_builtin = crate::kube::resource_defs::REGISTRY
+                        .by_alias(&overlay.resource).is_some();
+                    for oc in &overlay.columns {
+                        if is_builtin && oc.jsonpath.is_some() {
+                            warn!(
+                                "overlay: column '{}' has jsonpath on built-in resource '{}' — jsonpath is ignored for built-ins (use level to control visibility) in {}",
+                                oc.header, overlay.resource, path.display()
+                            );
+                        }
+                        if !is_builtin && oc.jsonpath.is_none() {
+                            warn!(
+                                "overlay: column '{}' has no jsonpath on CRD '{}' — column will have no data in {}",
+                                oc.header, overlay.resource, path.display()
                             );
                         }
                     }

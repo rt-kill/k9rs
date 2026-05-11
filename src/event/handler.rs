@@ -10,25 +10,19 @@ use crate::kube::protocol::OperationKind;
 
 /// Map a key press to an action using the current resource's declared operations.
 /// Returns the action if the resource supports the corresponding operation, None otherwise.
+/// Map a key to an action via the resource's declared operations.
+/// Data-driven: reads `descriptor().default_key` from each operation.
+/// First match wins — resources control priority via `operations()` order.
 fn lookup_resource_op_key(app: &App, key: char) -> Option<Action> {
     let rid = app.nav.resource_id();
     let kind = rid.built_in_kind()?;
     let def = crate::kube::resource_defs::REGISTRY.by_kind(kind);
-    let ops = def.operations();
-    let has = |op: OperationKind| ops.contains(&op);
-    match key {
-        'L' if has(OperationKind::StreamLogs) => Some(Action::Logs),
-        'p' if has(OperationKind::PreviousLogs) => Some(Action::PreviousLogs),
-        's' if has(OperationKind::Shell) => Some(Action::Shell),
-        's' if has(OperationKind::Scale) => Some(Action::Scale),
-        's' if has(OperationKind::ToggleSuspendCronJob) => Some(Action::SuspendCronJob),
-        's' if has(OperationKind::NodeShell) => Some(Action::NodeShell),
-        'r' if has(OperationKind::Restart) => Some(Action::Restart),
-        'x' if has(OperationKind::DecodeSecret) => Some(Action::DecodeSecret),
-        't' if has(OperationKind::TriggerCronJob) => Some(Action::TriggerCronJob),
-        'o' if has(OperationKind::ShowNode) => Some(Action::ShowNode),
-        _ => None,
+    for op in def.operations() {
+        if op.descriptor().default_key == Some(key) {
+            return Some(op.to_action());
+        }
     }
+    None
 }
 
 /// Look up a key binding from user-defined overlays for the current resource.
@@ -249,14 +243,6 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('d') => Some(Action::Describe),
         KeyCode::Char('y') => Some(Action::Yaml),
         KeyCode::Char('e') => Some(Action::Edit),
-        // Resource-specific keys: dispatched via the resource def's operations().
-        // The resource declares which operations it supports; the mapping from
-        // key to action is derived from those operations.
-        KeyCode::Char(c @ ('L' | 's' | 'x' | 't' | 'r' | 'p' | 'o')) => {
-            lookup_resource_op_key(app, c)
-                .or_else(|| lookup_overlay_key(app, c))
-        }
-
         // F: create a new port-forward (opens dialog).
         KeyCode::Char('F') => Some(Action::PortForward),
         // f: show active port-forwards for this resource.
@@ -300,8 +286,12 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Tab => Some(Action::NextTab),
         KeyCode::BackTab => Some(Action::PrevTab),
 
-        // Overlay-defined key bindings (any key not caught above).
-        KeyCode::Char(c) => lookup_overlay_key(app, c),
+        // Resource-specific keys: data-driven from operation descriptors.
+        // Falls through to overlay bindings if no operation matches.
+        KeyCode::Char(c) => {
+            lookup_resource_op_key(app, c)
+                .or_else(|| lookup_overlay_key(app, c))
+        }
 
         _ => None,
     }

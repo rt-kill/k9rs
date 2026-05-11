@@ -10,7 +10,7 @@ use crate::ui::theme::Theme;
 
 /// A keybinding entry for the help overlay.
 struct HelpEntry {
-    key: &'static str,
+    key: String,
     description: &'static str,
 }
 
@@ -79,35 +79,35 @@ impl<'a> HelpOverlay<'a> {
                 title: "Navigation",
                 entries: vec![
                     HelpEntry {
-                        key: "j / \u{2193}",
+                        key: "j / \u{2193}".into(),
                         description: "Move down",
                     },
                     HelpEntry {
-                        key: "k / \u{2191}",
+                        key: "k / \u{2191}".into(),
                         description: "Move up",
                     },
                     HelpEntry {
-                        key: "PgDn / PgUp",
+                        key: "PgDn / PgUp".into(),
                         description: "Page down / up",
                     },
                     HelpEntry {
-                        key: "g",
+                        key: "g".into(),
                         description: "Home / top",
                     },
                     HelpEntry {
-                        key: "G",
+                        key: "G".into(),
                         description: "End / bottom",
                     },
                     HelpEntry {
-                        key: "Esc",
+                        key: "Esc".into(),
                         description: "Back / clear filter",
                     },
                     HelpEntry {
-                        key: "-",
+                        key: "-".into(),
                         description: "Toggle last view",
                     },
                     HelpEntry {
-                        key: "0",
+                        key: "0".into(),
                         description: "All namespaces",
                     },
                 ],
@@ -116,43 +116,43 @@ impl<'a> HelpOverlay<'a> {
                 title: "Actions",
                 entries: vec![
                     HelpEntry {
-                        key: "Enter",
+                        key: "Enter".into(),
                         description: "View / drill-down",
                     },
                     HelpEntry {
-                        key: "d",
+                        key: "d".into(),
                         description: "Describe resource",
                     },
                     HelpEntry {
-                        key: "y",
+                        key: "y".into(),
                         description: "View YAML",
                     },
                     HelpEntry {
-                        key: "e",
+                        key: "e".into(),
                         description: "Edit resource",
                     },
                     HelpEntry {
-                        key: "Ctrl-d",
+                        key: "Ctrl-d".into(),
                         description: "Delete resource",
                     },
                     HelpEntry {
-                        key: "Ctrl-k",
+                        key: "Ctrl-k".into(),
                         description: "Force-kill (pods)",
                     },
                     HelpEntry {
-                        key: "Ctrl-r",
+                        key: "Ctrl-r".into(),
                         description: "Refresh",
                     },
                     HelpEntry {
-                        key: "f",
+                        key: "f".into(),
                         description: "Port forward (pods/deploy/sts/ds/svc)",
                     },
                     HelpEntry {
-                        key: "c",
+                        key: "c".into(),
                         description: "Copy",
                     },
                     HelpEntry {
-                        key: "Space",
+                        key: "Space".into(),
                         description: "Mark / select row",
                     },
                 ],
@@ -161,19 +161,19 @@ impl<'a> HelpOverlay<'a> {
                 title: "Sorting",
                 entries: vec![
                     HelpEntry {
-                        key: "Shift-O",
+                        key: "Shift-O".into(),
                         description: "Sort / toggle direction",
                     },
                     HelpEntry {
-                        key: "Shift-N",
+                        key: "Shift-N".into(),
                         description: "Sort by name",
                     },
                     HelpEntry {
-                        key: "Shift-A",
+                        key: "Shift-A".into(),
                         description: "Sort by age",
                     },
                     HelpEntry {
-                        key: "Shift-S",
+                        key: "Shift-S".into(),
                         description: "Sort by status (pods)",
                     },
                 ],
@@ -183,55 +183,55 @@ impl<'a> HelpOverlay<'a> {
                 title: "Commands",
                 entries: vec![
                     HelpEntry {
-                        key: ":",
+                        key: ":".into(),
                         description: "Command mode",
                     },
                     HelpEntry {
-                        key: "/",
+                        key: "/".into(),
                         description: "Filter",
                     },
                     HelpEntry {
-                        key: "q",
+                        key: "q".into(),
                         description: "Back / clear filter",
                     },
                     HelpEntry {
-                        key: "Ctrl-c",
+                        key: "Ctrl-c".into(),
                         description: "Quit",
                     },
                     HelpEntry {
-                        key: "Ctrl-e",
+                        key: "Ctrl-e".into(),
                         description: "Toggle header",
                     },
                     HelpEntry {
-                        key: "Ctrl-s",
+                        key: "Ctrl-s".into(),
                         description: "Save table to file",
                     },
                     HelpEntry {
-                        key: "Ctrl-w",
+                        key: "Ctrl-w".into(),
                         description: "Toggle wide mode",
                     },
                     HelpEntry {
-                        key: "Ctrl-z",
+                        key: "Ctrl-z".into(),
                         description: "Toggle fault filter",
                     },
                     HelpEntry {
-                        key: "Ctrl-a",
+                        key: "Ctrl-a".into(),
                         description: "Show aliases",
                     },
                     HelpEntry {
-                        key: "Ctrl-l",
+                        key: "Ctrl-l".into(),
                         description: "Toggle full-fetch mode",
                     },
                     HelpEntry {
-                        key: "?",
+                        key: "?".into(),
                         description: "Help",
                     },
                     HelpEntry {
-                        key: ":ctx",
+                        key: ":ctx".into(),
                         description: "Switch context",
                     },
                     HelpEntry {
-                        key: ":ns name",
+                        key: ":ns name".into(),
                         description: "Switch namespace",
                     },
                 ],
@@ -240,27 +240,27 @@ impl<'a> HelpOverlay<'a> {
                 title: "Log View",
                 entries: vec![
                     HelpEntry {
-                        key: "s",
+                        key: "s".into(),
                         description: "Toggle follow",
                     },
                     HelpEntry {
-                        key: "w",
+                        key: "w".into(),
                         description: "Toggle wrap",
                     },
                     HelpEntry {
-                        key: "t",
+                        key: "t".into(),
                         description: "Toggle timestamps",
                     },
                     HelpEntry {
-                        key: "Shift-C",
+                        key: "Shift-C".into(),
                         description: "Clear logs",
                     },
                     HelpEntry {
-                        key: "0-6",
+                        key: "0-6".into(),
                         description: "Set log time range (0:tail, 1:1m, 2:5m, 3:15m, 4:30m, 5:1h, 6:24h)",
                     },
                     HelpEntry {
-                        key: "q",
+                        key: "q".into(),
                         description: "Back",
                     },
                 ],
@@ -269,23 +269,23 @@ impl<'a> HelpOverlay<'a> {
                 title: "Detail Views (YAML/Describe)",
                 entries: vec![
                     HelpEntry {
-                        key: "Ctrl-d",
+                        key: "Ctrl-d".into(),
                         description: "Half-page down",
                     },
                     HelpEntry {
-                        key: "Ctrl-u",
+                        key: "Ctrl-u".into(),
                         description: "Half-page up",
                     },
                     HelpEntry {
-                        key: "/",
+                        key: "/".into(),
                         description: "Search",
                     },
                     HelpEntry {
-                        key: "n",
+                        key: "n".into(),
                         description: "Next search match",
                     },
                     HelpEntry {
-                        key: "N",
+                        key: "N".into(),
                         description: "Prev search match",
                     },
                 ],
@@ -297,55 +297,44 @@ impl<'a> HelpOverlay<'a> {
     /// resource's capabilities. Falls back to a generic section listing
     /// all possible resource-specific keys when no caps are provided.
     fn resource_actions_section(&self) -> HelpSection {
-        use crate::kube::protocol::OperationKind;
-
         let mut entries = Vec::new();
 
         if let Some(ref caps) = self.caps {
-            if caps.supports(OperationKind::StreamLogs) {
-                entries.push(HelpEntry { key: "Shift-L", description: "View logs" });
+            // Data-driven: read label and key from each operation's descriptor.
+            // Skip always-on ops (Describe, Yaml, Delete) — they're in the
+            // Actions section already. Also skip ops with no default_key
+            // (PortForward uses Shift-F hardcoded outside the descriptor).
+            for op in &caps.operations {
+                let desc = op.descriptor();
+                if matches!(op,
+                    crate::kube::protocol::OperationKind::Describe
+                    | crate::kube::protocol::OperationKind::Yaml
+                    | crate::kube::protocol::OperationKind::Delete
+                ) {
+                    continue;
+                }
+                if let Some(key) = desc.default_key {
+                    let key_display = if key.is_uppercase() {
+                        format!("Shift-{}", key)
+                    } else {
+                        key.to_string()
+                    };
+                    // Leak to &'static str — help entries require 'static lifetime.
+                    // Acceptable: help section is rebuilt per render, leaked strings
+                    // are tiny and bounded by the number of operations.
+                    entries.push(HelpEntry {
+                        key: key_display,
+                        description: desc.label,
+                    });
+                }
             }
-            if caps.supports(OperationKind::Shell) {
-                entries.push(HelpEntry { key: "s", description: "Shell" });
+            // Hardcoded special keys not in descriptors
+            if caps.supports(crate::kube::protocol::OperationKind::ForceKill) {
+                entries.push(HelpEntry { key: "Ctrl-k".into(), description: "Force kill" });
             }
-            if caps.supports(OperationKind::Scale) {
-                entries.push(HelpEntry { key: "s", description: "Scale" });
+            if caps.supports(crate::kube::protocol::OperationKind::PortForward) {
+                entries.push(HelpEntry { key: "Shift-F".into(), description: "Port forward" });
             }
-            if caps.supports(OperationKind::Restart) {
-                entries.push(HelpEntry { key: "r", description: "Restart" });
-            }
-            if caps.supports(OperationKind::ShowNode) {
-                entries.push(HelpEntry { key: "o", description: "Show node" });
-            }
-            if caps.supports(OperationKind::PreviousLogs) {
-                entries.push(HelpEntry { key: "p", description: "Previous logs" });
-            }
-            if caps.supports(OperationKind::DecodeSecret) {
-                entries.push(HelpEntry { key: "x", description: "Decode" });
-            }
-            if caps.supports(OperationKind::ForceKill) {
-                entries.push(HelpEntry { key: "Ctrl-k", description: "Force kill" });
-            }
-            if caps.supports(OperationKind::PortForward) {
-                entries.push(HelpEntry { key: "f", description: "Port forward" });
-            }
-            if caps.supports(OperationKind::NodeShell) {
-                entries.push(HelpEntry { key: "s", description: "Node shell" });
-            }
-            if caps.supports(OperationKind::TriggerCronJob) {
-                entries.push(HelpEntry { key: "t", description: "Trigger job" });
-            }
-            if caps.supports(OperationKind::ToggleSuspendCronJob) {
-                entries.push(HelpEntry { key: "s", description: "Toggle suspend" });
-            }
-        } else {
-            // No caps available — show a generic combined section
-            entries.push(HelpEntry { key: "Shift-L", description: "View logs" });
-            entries.push(HelpEntry { key: "s", description: "Shell / Scale" });
-            entries.push(HelpEntry { key: "r", description: "Restart" });
-            entries.push(HelpEntry { key: "p", description: "Previous logs" });
-            entries.push(HelpEntry { key: "o", description: "Show node" });
-            entries.push(HelpEntry { key: "f", description: "Port forward" });
         }
 
         HelpSection {

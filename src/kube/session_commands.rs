@@ -572,61 +572,17 @@ fn dispatch_form_submit(
     data_source: &mut ClientSession,
     dialog: crate::app::FormDialog,
 ) {
-    use crate::app::{FormDialog, FormFieldKind, FormSubmit};
-
-    let FormDialog { submit, target, fields, .. } = dialog;
-    match submit {
-        FormSubmit::Scale => {
-            let replicas_str = fields
-                .iter()
-                .find(|f| f.name == crate::kube::protocol::form_field_name::REPLICAS)
-                .map(|f| f.value.trim().to_string())
-                .unwrap_or_default();
-            match replicas_str.parse::<u32>() {
-                Ok(replicas) => {
-                    app.kube.kubectl_cache.clear();
-                    ds_try!(app, data_source.scale(&target, replicas));
-                    app.ui.flash = Some(crate::app::FlashMessage::info(
-                        format!("Scaling to {} replicas", replicas)
-                    ));
-                }
-                Err(_) => {
-                    app.ui.flash = Some(crate::app::FlashMessage::warn(
-                        format!("Invalid replica count: {}", replicas_str)
-                    ));
-                }
-            }
+    match dialog.submit.build_command(&dialog.target, &dialog.fields) {
+        Ok(cmd) => {
+            app.kube.kubectl_cache.clear();
+            ds_try!(app, data_source.send_command(cmd));
+            let label = dialog.submit.from_operation_label();
+            app.ui.flash = Some(crate::app::FlashMessage::info(
+                format!("{}: {}", label, dialog.target.name)
+            ));
         }
-        FormSubmit::PortForward => {
-            // container_port may be Select (value = option index → port string)
-            // or Port (value = port string directly). Handle both.
-            let container_port = fields
-                .iter()
-                .find(|f| f.name == crate::kube::protocol::form_field_name::CONTAINER_PORT)
-                .and_then(|f| match &f.kind {
-                    FormFieldKind::Select { options } => {
-                        let idx: usize = f.value.parse().ok()?;
-                        options.get(idx).and_then(|opt| opt.value.parse::<u16>().ok())
-                    }
-                    _ => f.value.trim().parse::<u16>().ok(),
-                });
-            let local_port = fields
-                .iter()
-                .find(|f| f.name == crate::kube::protocol::form_field_name::LOCAL_PORT)
-                .and_then(|f| f.value.trim().parse::<u16>().ok());
-            match (container_port, local_port) {
-                (Some(cp), Some(lp)) => {
-                    ds_try!(app, data_source.port_forward(&target, lp, cp));
-                    app.ui.flash = Some(crate::app::FlashMessage::info(
-                        format!("Port-forwarding {}:{} → {}", lp, cp, target.name)
-                    ));
-                }
-                _ => {
-                    app.ui.flash = Some(crate::app::FlashMessage::warn(
-                        "Invalid port numbers".to_string()
-                    ));
-                }
-            }
+        Err(msg) => {
+            app.ui.flash = Some(crate::app::FlashMessage::warn(msg));
         }
     }
 }

@@ -51,8 +51,6 @@ pub struct KubeState {
 // Default for LogState when no config is available (tests, etc.).
 const MAX_LOG_LINES: usize = 50_000;
 
-/// Duration a row-change flash highlight stays visible.
-pub const CHANGE_HIGHLIGHT_DURATION: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // DeltaTracker — atomic ownership of row-change detection state
@@ -717,6 +715,80 @@ pub enum FormSubmit {
     PortForward,
 }
 
+impl FormSubmit {
+    /// Map an `OperationKind` to the corresponding `FormSubmit` variant.
+    pub fn from_operation(op: crate::kube::protocol::OperationKind) -> Option<Self> {
+        match op {
+            crate::kube::protocol::OperationKind::Scale => Some(FormSubmit::Scale),
+            crate::kube::protocol::OperationKind::PortForward => Some(FormSubmit::PortForward),
+            _ => None,
+        }
+    }
+
+    /// Human-readable label for flash messages.
+    pub fn from_operation_label(&self) -> &'static str {
+        match self {
+            FormSubmit::Scale => "Scaling",
+            FormSubmit::PortForward => "Port-forwarding",
+        }
+    }
+
+    /// Build the wire command from form field values. Each variant knows
+    /// which fields to extract and how to parse them. Returns the command
+    /// to send to the daemon, or an error message for the user.
+    pub fn build_command(
+        &self,
+        target: &crate::kube::protocol::ObjectRef,
+        fields: &[FormFieldState],
+    ) -> Result<crate::kube::protocol::SessionCommand, String> {
+        use crate::kube::protocol::{SessionCommand, form_field_name};
+        match self {
+            FormSubmit::Scale => {
+                let val = find_field_value(fields, form_field_name::REPLICAS)?;
+                let replicas = val.parse::<u32>()
+                    .map_err(|_| format!("Invalid replica count: {}", val))?;
+                Ok(SessionCommand::Scale { target: target.clone(), replicas })
+            }
+            FormSubmit::PortForward => {
+                let cp = parse_port_field(fields, form_field_name::CONTAINER_PORT)?;
+                let lp = parse_port_field(fields, form_field_name::LOCAL_PORT)?;
+                Ok(SessionCommand::PortForward {
+                    target: target.clone(),
+                    local_port: lp,
+                    container_port: cp,
+                })
+            }
+        }
+    }
+}
+
+/// Extract a field's trimmed value by name.
+fn find_field_value(fields: &[FormFieldState], name: &str) -> Result<String, String> {
+    fields.iter()
+        .find(|f| f.name == name)
+        .map(|f| f.value.trim().to_string())
+        .ok_or_else(|| format!("Missing field: {}", name))
+}
+
+/// Parse a port field — handles both Select (value is option index) and
+/// direct Port input (value is the port number string).
+fn parse_port_field(fields: &[FormFieldState], name: &str) -> Result<u16, String> {
+    let field = fields.iter()
+        .find(|f| f.name == name)
+        .ok_or_else(|| format!("Missing field: {}", name))?;
+    match &field.kind {
+        FormFieldKind::Select { options } => {
+            let idx: usize = field.value.parse()
+                .map_err(|_| "Invalid port selection".to_string())?;
+            options.get(idx)
+                .and_then(|opt| opt.value.parse::<u16>().ok())
+                .ok_or_else(|| "Invalid port selection".to_string())
+        }
+        _ => field.value.trim().parse::<u16>()
+            .map_err(|_| format!("Invalid port: {}", field.value.trim())),
+    }
+}
+
 /// A modal form dialog gathering input for a single operation.
 #[derive(Debug, Clone)]
 pub struct FormDialog {
@@ -1184,5 +1256,77 @@ mod context_switch_tests {
         assert_eq!(s, ContextSwitchState::InFlight);
         s.mark_stable();
         assert!(s.is_stable());
+    }
+}
+
+#[cfg(test)]
+mod form_submit_tests {
+    use super::*;
+    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
+    use crate::kube::resource_def::BuiltInKind;
+
+    fn pod_target() -> ObjectRef {
+        ObjectRef::new(
+            ResourceId::BuiltIn(BuiltInKind::Pod),
+            "test-pod",
+            Namespace::from_user_command("default"),
+        )
+    }
+
+    #[test]
+    fn scale_build_command_valid() {
+        let target = pod_target();
+        let fields = vec![FormFieldState {
+            name: "replicas".into(),
+            label: "Replicas".into(),
+            kind: FormFieldKind::Number { min: 0, max: 100 },
+            value: "3".into(),
+        }];
+        let cmd = FormSubmit::Scale.build_command(&target, &fields).unwrap();
+        match cmd {
+            crate::kube::protocol::SessionCommand::Scale { replicas, .. } => {
+                assert_eq!(replicas, 3);
+            }
+            _ => panic!("expected Scale command"),
+        }
+    }
+
+    #[test]
+    fn scale_build_command_invalid() {
+        let target = pod_target();
+        let fields = vec![FormFieldState {
+            name: "replicas".into(),
+            label: "Replicas".into(),
+            kind: FormFieldKind::Number { min: 0, max: 100 },
+            value: "abc".into(),
+        }];
+        assert!(FormSubmit::Scale.build_command(&target, &fields).is_err());
+    }
+
+    #[test]
+    fn port_forward_build_command_valid() {
+        let target = pod_target();
+        let fields = vec![
+            FormFieldState {
+                name: "container_port".into(),
+                label: "".into(),
+                kind: FormFieldKind::Port,
+                value: "8080".into(),
+            },
+            FormFieldState {
+                name: "local_port".into(),
+                label: "".into(),
+                kind: FormFieldKind::Port,
+                value: "9090".into(),
+            },
+        ];
+        let cmd = FormSubmit::PortForward.build_command(&target, &fields).unwrap();
+        match cmd {
+            crate::kube::protocol::SessionCommand::PortForward { local_port, container_port, .. } => {
+                assert_eq!(container_port, 8080);
+                assert_eq!(local_port, 9090);
+            }
+            _ => panic!("expected PortForward command"),
+        }
     }
 }

@@ -13,7 +13,6 @@ use std::time::Duration;
 use crate::kube::protocol::{ObjectKey, ResourceId};
 use crate::kube::resources::KubeResource;
 
-pub use types::CHANGE_HIGHLIGHT_DURATION;
 pub use crate::kube::resource_def::{ColumnDef, ColumnLevel, MetricsColumn};
 
 // ---------------------------------------------------------------------------
@@ -56,6 +55,15 @@ pub struct KubeContext {
 /// resource is a built-in; falls back to `ColumnDef::infer` for CRDs
 /// and locals (which have no registered def or no override).
 pub fn column_level_for(rid: &ResourceId, name: &str) -> ColumnLevel {
+    // Overlay level overrides take priority (e.g., promote QOS from Extra to Default).
+    if let Some(overlay) = crate::kube::overlay::overlay_for(rid.plural()) {
+        for oc in &overlay.columns {
+            if oc.header.eq_ignore_ascii_case(name) && oc.jsonpath.is_none() {
+                return oc.level.into();
+            }
+        }
+    }
+    // Fall back to built-in def column metadata.
     if let Some(k) = rid.built_in_kind() {
         let def = crate::kube::resource_defs::REGISTRY.by_kind(k);
         for col in def.column_defs() {
@@ -793,7 +801,7 @@ fn resource_commands() -> Vec<&'static str> {
         .all()
         .flat_map(|def| def.aliases().iter().copied())
         .collect();
-    for kind in crate::kube::local::LocalResourceKind::all() {
+    for kind in &crate::kube::local::LocalResourceKind::all() {
         v.extend(kind.aliases().iter().copied());
     }
     v.extend(["alias", "aliases", "a"]);

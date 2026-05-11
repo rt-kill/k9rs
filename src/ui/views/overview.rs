@@ -59,8 +59,10 @@ pub fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
     draw_content(f, app, content_area, theme);
 
     // 4. Tab bar (same as resource view — shows available resources)
+    let count = app.active_view_table().map(|t| t.items.len()).unwrap_or(0);
     let tab_bar = TabBar::new(app.nav.resource_id(), theme)
-        .namespace(app.kube.selected_ns.display());
+        .namespace(app.kube.selected_ns.display())
+        .item_count(count);
     f.render_widget(tab_bar, tab_bar_area);
 }
 

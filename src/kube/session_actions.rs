@@ -158,8 +158,20 @@ pub(crate) fn handle_action(
         }
         Action::ShowPortForwards => handle_show_port_forwards(app, data_source),
         Action::PortForward => {
-            if let Some(dialog) = resolve_port_forward_dialog(app) {
-                app.ui.form_dialog = Some(dialog);
+            if !app.current_capabilities().supports(crate::kube::protocol::OperationKind::PortForward) {
+                return ActionResult::None;
+            }
+            let schema = crate::kube::protocol::OperationKind::PortForward.form_schema().unwrap();
+            let row = app.active_view_table().and_then(|t| t.selected_item());
+            let desc = app.active_view_descriptor();
+            if let Some(info) = get_selected_resource_info(app) {
+                if let Some(dialog) = build_form_from_schema(schema, crate::kube::protocol::OperationKind::PortForward, info, row, desc) {
+                    app.ui.form_dialog = Some(dialog);
+                } else {
+                    app.ui.flash = Some(crate::app::FlashMessage::error(
+                        "No target found for port-forward".to_string()
+                    ));
+                }
             } else {
                 app.ui.flash = Some(crate::app::FlashMessage::error(
                     "No target found for port-forward".to_string()
@@ -364,11 +376,11 @@ fn handle_resource_op(
                         });
                     } else {
                         let container = containers.first().map(|c| c.name.clone()).unwrap_or_default();
-                        return ActionResult::Shell(crate::kube::session::ExecTarget {
+                        return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget {
                             pod: pod_name,
                             namespace: pod_ns,
                             container,
-                        });
+                        } };
                     }
                 }
             }
@@ -408,22 +420,12 @@ fn handle_resource_op(
         }
         Action::Scale => {
             if let Some(info) = get_selected_resource_info(app) {
-                let current_replicas = {
-                    let ready_col = app.active_view_descriptor()
-                        .and_then(|d| d.col("READY"));
-                    app.active_view_table()
-                        .and_then(|t| t.selected_item())
-                        .and_then(|row| {
-                            ready_col
-                                .and_then(|col| row.cells.get(col))
-                                .map(|cell| {
-                                    let s = cell.to_string();
-                                    s.split('/').nth(1).unwrap_or("").trim().to_string()
-                                })
-                                .filter(|s| !s.is_empty())
-                        })
-                };
-                app.ui.form_dialog = Some(build_scale_form(info, current_replicas.as_deref()));
+                let schema = crate::kube::protocol::OperationKind::Scale.form_schema().unwrap();
+                let row = app.active_view_table().and_then(|t| t.selected_item());
+                let desc = app.active_view_descriptor();
+                if let Some(dialog) = build_form_from_schema(schema, crate::kube::protocol::OperationKind::Scale, info, row, desc) {
+                    app.ui.form_dialog = Some(dialog);
+                }
             }
         }
         Action::Restart => {
@@ -874,7 +876,14 @@ fn handle_drill(
                 .and_then(|t| t.selected_item())
             {
                 let node = row.name.clone();
-                return ActionResult::NodeShell { node };
+                return ActionResult::Exec {
+                    op: crate::kube::protocol::OperationKind::NodeShell,
+                    target: crate::kube::session::ExecTarget {
+                        pod: node,
+                        namespace: String::new(),
+                        container: String::new(),
+                    },
+                };
             }
         }
         Action::OverlayCapability(ref cap_name) => {
@@ -1134,11 +1143,11 @@ pub(crate) fn handle_enter(
 
         if matches!(action, crate::app::ContainerAction::Shell) {
             app.route = app.route_stack.pop().unwrap_or(Route::Resources);
-            return ActionResult::Shell(crate::kube::session::ExecTarget {
+            return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget {
                 pod: target.name,
                 namespace: pod_ns_str,
                 container: container_name,
-            });
+            } };
         }
 
         let previous = matches!(action, crate::app::ContainerAction::PreviousLogs);
@@ -1398,86 +1407,105 @@ pub(crate) fn build_table_dump(app: &App) -> String {
     }
 }
 
-/// Build a Scale `FormDialog` for the given target.
-pub(crate) fn build_scale_form(target: ObjectRef, current_replicas: Option<&str>) -> crate::app::FormDialog {
-    use crate::app::{FormDialog, FormFieldKind, FormFieldState};
+/// Build a `FormDialog` from a declarative `FormSchema`.
+///
+/// Each `FormFieldSchema` in the schema maps to a `FormFieldState`:
+/// - `Number { default_column }` reads the default from the row's cell
+///   (splitting on '/' to get the denominator, e.g. "2/3" -> "3").
+/// - `Port` uses the first port from `row.pf_ports`, or 8080.
+/// - `DynamicSelect` builds a `Select` from `row.pf_ports` if non-empty,
+///   otherwise falls back to a `Port` input.
+///
+/// Title is derived from `title_template` with `{{kind}}` and `{{name}}`
+/// substitutions. Subtitle comes from the target namespace.
+pub(crate) fn build_form_from_schema(
+    schema: &crate::kube::protocol::FormSchema,
+    op: crate::kube::protocol::OperationKind,
+    target: ObjectRef,
+    row: Option<&crate::kube::resources::row::ResourceRow>,
+    desc: Option<&crate::app::TableDescriptor>,
+) -> Option<crate::app::FormDialog> {
+    use crate::app::{FormDialog, FormFieldKind, FormFieldState, FormSubmit};
+    use crate::kube::protocol::{FormFieldSchemaKind, DynamicSelectFallback};
 
-    let title = format!("Scale: {}/{}", target.resource.display_label(), target.name);
-    let subtitle = format!("namespace: {}", target.namespace.display());
-    let default_value = current_replicas.unwrap_or("").to_string();
-    FormDialog {
-        submit: crate::app::FormSubmit::Scale,
+    let submit = FormSubmit::from_operation(op)?;
+
+    let title = schema.title_template
+        .replace("{{kind}}", &target.resource.short_label().to_lowercase())
+        .replace("{{name}}", &target.name);
+
+    let subtitle = match &target.namespace {
+        crate::kube::protocol::Namespace::Named(ns) if !ns.is_empty() => {
+            format!("namespace: {}", ns)
+        }
+        _ => String::new(),
+    };
+
+    let fields: Vec<FormFieldState> = schema.fields.iter().map(|field_schema| {
+        match &field_schema.kind {
+            FormFieldSchemaKind::Number { min, max, default_column } => {
+                let default_value = default_column
+                    .and_then(|col_name| {
+                        let col_idx = desc.and_then(|d| d.col(col_name))?;
+                        let r = row?;
+                        let cell = r.cells.get(col_idx)?;
+                        let s = cell.to_string();
+                        let denom = s.split('/').nth(1)?.trim().to_string();
+                        if denom.is_empty() { None } else { Some(denom) }
+                    })
+                    .unwrap_or_default();
+                FormFieldState {
+                    name: field_schema.name.into(),
+                    label: field_schema.label.into(),
+                    kind: FormFieldKind::Number { min: *min, max: *max },
+                    value: default_value,
+                }
+            }
+            FormFieldSchemaKind::Port => {
+                let default_port = row
+                    .and_then(|r| r.pf_ports.first().copied())
+                    .unwrap_or(8080);
+                FormFieldState {
+                    name: field_schema.name.into(),
+                    label: field_schema.label.into(),
+                    kind: FormFieldKind::Port,
+                    value: default_port.to_string(),
+                }
+            }
+            FormFieldSchemaKind::DynamicSelect { fallback } => {
+                let ports = row.map(|r| &r.pf_ports[..]).unwrap_or(&[]);
+                if ports.is_empty() {
+                    let default_port = match fallback {
+                        DynamicSelectFallback::Port => 8080,
+                    };
+                    FormFieldState {
+                        name: field_schema.name.into(),
+                        label: field_schema.label.into(),
+                        kind: FormFieldKind::Port,
+                        value: default_port.to_string(),
+                    }
+                } else {
+                    let options: Vec<crate::app::SelectOption> = ports
+                        .iter()
+                        .map(|p| crate::app::SelectOption::new(p.to_string(), p.to_string()))
+                        .collect();
+                    FormFieldState {
+                        name: field_schema.name.into(),
+                        label: field_schema.label.into(),
+                        kind: FormFieldKind::Select { options },
+                        value: "0".into(),
+                    }
+                }
+            }
+        }
+    }).collect();
+
+    Some(FormDialog {
+        submit,
         title,
         subtitle,
         target,
-        fields: vec![FormFieldState {
-            name: crate::kube::protocol::form_field_name::REPLICAS.into(),
-            label: "Replicas".into(),
-            kind: FormFieldKind::Number { min: 0, max: 1_000_000 },
-            value: default_value,
-        }],
-        focused: 0,
-    }
-}
-
-/// Build a port-forward `FormDialog` for the currently-selected row.
-pub(crate) fn resolve_port_forward_dialog(app: &App) -> Option<crate::app::FormDialog> {
-    use crate::app::{FormDialog, FormFieldKind, FormFieldState};
-    use crate::kube::protocol::{Namespace, OperationKind};
-
-    if !app.current_capabilities().supports(OperationKind::PortForward) {
-        return None;
-    }
-
-    let rid_key = app.nav.resource_id().clone();
-    let row = app.active_view_table()?.selected_item()?;
-
-    let ports: Vec<u16> = row.pf_ports.clone();
-    let first_port = ports.first().copied().unwrap_or(8080);
-
-    let short = rid_key.short_label().to_lowercase();
-    let title = format!("Port forward: {}/{}", short, row.name);
-    let ns = row.namespace.clone().unwrap_or_default();
-    let subtitle = if ns.is_empty() {
-        String::new()
-    } else {
-        format!("namespace: {}", ns)
-    };
-    let target_ref = ObjectRef::new(rid_key, row.name.clone(), Namespace::from_row(ns.as_str()));
-
-    let container_field = if ports.is_empty() {
-        FormFieldState {
-            name: crate::kube::protocol::form_field_name::CONTAINER_PORT.into(),
-            label: "Container port".into(),
-            kind: FormFieldKind::Port,
-            value: first_port.to_string(),
-        }
-    } else {
-        let options: Vec<crate::app::SelectOption> = ports
-            .iter()
-            .map(|p| crate::app::SelectOption::new(p.to_string(), p.to_string()))
-            .collect();
-        FormFieldState {
-            name: crate::kube::protocol::form_field_name::CONTAINER_PORT.into(),
-            label: "Container port".into(),
-            kind: FormFieldKind::Select { options },
-            value: "0".into(),
-        }
-    };
-
-    let local_field = FormFieldState {
-        name: crate::kube::protocol::form_field_name::LOCAL_PORT.into(),
-        label: "Local port".into(),
-        kind: FormFieldKind::Port,
-        value: first_port.to_string(),
-    };
-
-    Some(FormDialog {
-        submit: crate::app::FormSubmit::PortForward,
-        title,
-        subtitle,
-        target: target_ref,
-        fields: vec![container_field, local_field],
+        fields,
         focused: 0,
     })
 }

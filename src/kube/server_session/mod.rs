@@ -89,7 +89,9 @@ impl SessionSharedState {
         tokio::spawn(client_builder_loop(rx));
         Self {
             watcher_cache: WatcherCache::new(),
-            local_registry: Arc::new(crate::kube::local::LocalRegistry::new()),
+            local_registry: Arc::new(crate::kube::local::LocalRegistry::new(
+                crate::kube::daemon_config::daemon_config().exec_resources.clone(),
+            )),
             discovery_cache: super::cache::DiscoveryCache::new(),
             client_builder_tx: tx,
             next_session_id: std::sync::atomic::AtomicU64::new(1),

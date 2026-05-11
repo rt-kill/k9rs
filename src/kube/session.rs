@@ -50,11 +50,12 @@ const EVENT_DRAIN_CAP: usize = 200;
 pub(crate) enum ActionResult {
     /// No special handling needed.
     None,
-    /// Suspend the TUI and run `kubectl exec -it` into a pod shell.
-    Shell(ExecTarget),
-    /// Suspend the TUI and run `kubectl debug node/<name> -it` via the
-    /// daemon's PTY exec substream.
-    NodeShell { node: String },
+    /// Launch an interactive exec session. The `op` identifies the operation
+    /// (Shell, NodeShell) whose `exec_template()` defines the kubectl args.
+    Exec {
+        op: crate::kube::protocol::OperationKind,
+        target: ExecTarget,
+    },
 }
 
 /// Identifies a pod + container for an interactive exec session via
@@ -390,6 +391,47 @@ async fn run_editor_flow(
 }
 
 /// Handle an `ActionResult` that requires opening an exec session.
+/// Build ExecInit from an exec template and target. Resolves placeholders
+/// from the target fields. Template-driven — no hardcoded kubectl args.
+fn build_exec_init(
+    template: &crate::kube::protocol::ExecTemplate,
+    target: &ExecTarget,
+) -> (crate::kube::protocol::ExecInit, String) {
+    use crate::kube::protocol::ExecArg;
+    let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut args = Vec::new();
+    for arg in template.args {
+        match arg {
+            ExecArg::Literal(s) => args.push(s.to_string()),
+            ExecArg::Placeholder(p) => {
+                args.push(resolve_placeholder(p, target));
+            }
+            ExecArg::ConditionalPair(lit, p) => {
+                let val = resolve_placeholder(p, target);
+                if !val.is_empty() {
+                    args.push(lit.to_string());
+                    args.push(val);
+                }
+            }
+        }
+    }
+    let title = template.title_template
+        .replace("{{pod}}", &target.pod)
+        .replace("{{container}}", &target.container)
+        .replace("{{node}}", &target.pod);
+    (crate::kube::protocol::ExecInit { kubectl_args: args, term_width: tw, term_height: th }, title)
+}
+
+fn resolve_placeholder(p: &crate::kube::protocol::ExecPlaceholder, target: &ExecTarget) -> String {
+    use crate::kube::protocol::ExecPlaceholder;
+    match p {
+        ExecPlaceholder::Namespace => target.namespace.clone(),
+        ExecPlaceholder::PodName => target.pod.clone(),
+        ExecPlaceholder::Container => target.container.clone(),
+        ExecPlaceholder::NodeName => format!("node/{}", target.pod),
+    }
+}
+
 async fn handle_action_result(
     result: ActionResult,
     app: &mut App,
@@ -397,48 +439,18 @@ async fn handle_action_result(
     event_tx: &mpsc::Sender<AppEvent>,
 ) {
     match result {
-        ActionResult::Shell(target) => {
-            let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
-            let mut kubectl_args = vec![
-                "exec".to_string(), "-it".to_string(),
-                "-n".to_string(), target.namespace.clone(),
-                target.pod.clone(),
-            ];
-            if !target.container.is_empty() {
-                kubectl_args.push("-c".to_string());
-                kubectl_args.push(target.container.clone());
-            }
-            kubectl_args.push("--".to_string());
-            kubectl_args.push("sh".to_string());
-            let title = format!("{}/{}", target.pod, target.container);
-            let exec_init = crate::kube::protocol::ExecInit {
-                kubectl_args,
-                term_width: tw,
-                term_height: th,
-            };
-            if let Err(e) = open_exec_route(app, data_source, exec_init, title, event_tx).await {
+        ActionResult::Exec { op, target } => {
+            let Some(template) = op.exec_template() else {
                 app.ui.flash = Some(crate::app::FlashMessage::error(
-                    format!("Shell failed: {}", e)
+                    format!("No exec template for {:?}", op)
                 ));
-            }
-        }
-        ActionResult::NodeShell { node, .. } => {
-            let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
-            let kubectl_args = vec![
-                "debug".to_string(),
-                format!("node/{}", node),
-                "-it".to_string(),
-                "--image=busybox".to_string(),
-            ];
-            let title = format!("node/{}", node);
-            let exec_init = crate::kube::protocol::ExecInit {
-                kubectl_args,
-                term_width: tw,
-                term_height: th,
+                return;
             };
+            let (exec_init, title) = build_exec_init(template, &target);
+            let label = op.descriptor().label;
             if let Err(e) = open_exec_route(app, data_source, exec_init, title, event_tx).await {
                 app.ui.flash = Some(crate::app::FlashMessage::error(
-                    format!("Node shell failed: {}", e)
+                    format!("{} failed: {}", label, e)
                 ));
             }
         }
