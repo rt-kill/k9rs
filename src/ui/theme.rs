@@ -4,29 +4,38 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
-// Default color palette (approximate RGB values)
+// Default color palette — Nord theme (matches k9s "foot" skin)
 // ---------------------------------------------------------------------------
 
-/// DodgerBlue: #1E90FF
-const DODGER_BLUE: Color = Color::Rgb(30, 144, 255);
-/// Aqua/Cyan: #00FFFF
-const AQUA: Color = Color::Rgb(0, 255, 255);
-/// Orange: #FFA500
-const ORANGE: Color = Color::Rgb(255, 165, 0);
-/// Fuchsia/Magenta: #FF00FF
-const FUCHSIA: Color = Color::Rgb(255, 0, 255);
-/// PapayaWhip: #FFEFD5
-const PAPAYA_WHIP: Color = Color::Rgb(255, 239, 213);
-/// SteelBlue: #4682B4
-const STEEL_BLUE: Color = Color::Rgb(70, 130, 180);
-/// LawnGreen: #7CFC00
-const LAWN_GREEN: Color = Color::Rgb(124, 252, 0);
-/// OrangeRed: #FF4500
-const ORANGE_RED: Color = Color::Rgb(255, 69, 0);
-/// DarkOrange: #FF8C00
-const DARK_ORANGE: Color = Color::Rgb(255, 140, 0);
-/// CadetBlue: #5F9EA0
-const CADET_BLUE: Color = Color::Rgb(95, 158, 160);
+// Nord Polar Night (backgrounds/dark accents)
+/// Dark background accent: #2f343f
+const POLAR_DARK: Color = Color::Rgb(47, 52, 63);
+/// Muted border/separator: #4b5262
+const POLAR_MUTED: Color = Color::Rgb(75, 82, 98);
+
+// Nord Snow Storm (text)
+/// Primary text: #d8dee8
+const SNOW_PRIMARY: Color = Color::Rgb(216, 222, 232);
+/// Bright text (headers): #e5e9f0
+const SNOW_BRIGHT: Color = Color::Rgb(229, 233, 240);
+
+// Nord Frost (blues)
+/// Frost blue (accent, selection, links): #81a1c1
+const FROST_BLUE: Color = Color::Rgb(129, 161, 193);
+/// Suggestion/muted blue: #81a1c1
+const FROST_SUGGEST: Color = Color::Rgb(129, 161, 193);
+
+// Nord Aurora (semantic colors)
+/// Aurora green (success, running): #a3be8c
+const AURORA_GREEN: Color = Color::Rgb(163, 190, 140);
+/// Aurora teal (new, sort indicator): #89d0ba
+const AURORA_TEAL: Color = Color::Rgb(137, 208, 186);
+/// Aurora yellow (warning, modify): #ebcb8b
+const AURORA_YELLOW: Color = Color::Rgb(235, 203, 139);
+/// Aurora red (error, failed): #bf616a
+const AURORA_RED: Color = Color::Rgb(191, 97, 106);
+/// Aurora mauve (logo, active breadcrumb): #b48ead
+const AURORA_MAUVE: Color = Color::Rgb(180, 142, 173);
 
 // ---------------------------------------------------------------------------
 // Helpers to parse colors from skin YAML
@@ -491,174 +500,166 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            // Table header: white bold on black
+            // Table header: bright snow, bold
             header: Style::default()
-                .fg(Color::White)
+                .fg(SNOW_BRIGHT)
                 .add_modifier(Modifier::BOLD),
-            // Selected row: black text on aqua, bold
+            // Selected row: dark text on frost blue, bold
             selected: Style::default()
-                .fg(Color::Black)
-                .bg(AQUA)
+                .fg(POLAR_DARK)
+                .bg(FROST_BLUE)
                 .add_modifier(Modifier::BOLD),
-            // Normal row text: dodgerblue on black
+            // Normal row text: primary snow
             row_normal: Style::default()
-                .fg(DODGER_BLUE),
+                .fg(SNOW_PRIMARY),
 
-            // Status colors
+            // Status colors (Aurora palette)
             status_running: Style::default()
-                .fg(LAWN_GREEN),
+                .fg(AURORA_GREEN),
             status_pending: Style::default()
-                .fg(DARK_ORANGE),
+                .fg(AURORA_YELLOW),
             status_failed: Style::default()
-                .fg(ORANGE_RED),
+                .fg(AURORA_RED),
             status_succeeded: Style::default()
-                .fg(LAWN_GREEN)
+                .fg(AURORA_GREEN)
                 .add_modifier(Modifier::DIM),
 
-            // Borders: dodgerblue, focused = aqua
+            // Borders: muted polar, focused = frost blue
             border: Style::default()
-                .fg(DODGER_BLUE),
+                .fg(POLAR_MUTED),
             border_focused: Style::default()
-                .fg(AQUA),
+                .fg(FROST_BLUE),
 
-            // Table title: aqua text
+            // Table title: snow primary
             title: Style::default()
-                .fg(AQUA)
+                .fg(SNOW_PRIMARY)
                 .add_modifier(Modifier::BOLD),
-            // Namespace highlight in title: fuchsia
+            // Namespace highlight in title: aurora yellow
             title_namespace: Style::default()
-                .fg(FUCHSIA)
+                .fg(AURORA_YELLOW)
                 .add_modifier(Modifier::BOLD),
-            // Counter in title: papayawhip
+            // Counter in title: aurora mauve
             title_counter: Style::default()
-                .fg(PAPAYA_WHIP),
-            // Filter indicator in title: steelblue
+                .fg(AURORA_MAUVE),
+            // Filter indicator in title: aurora green
             title_filter_indicator: Style::default()
-                .fg(STEEL_BLUE),
-            // Sort indicator: orange
+                .fg(AURORA_GREEN),
+            // Sort indicator: aurora teal
             sort_indicator: Style::default()
-                .fg(ORANGE)
+                .fg(AURORA_TEAL)
                 .add_modifier(Modifier::BOLD),
 
-            // Filter prompt: steelblue
+            // Filter prompt: frost blue
             filter: Style::default()
-                .fg(STEEL_BLUE),
+                .fg(FROST_BLUE),
 
             // Flash messages
             flash_info: Style::default()
-                .fg(Color::Rgb(255, 222, 173)) // NavajoWhite
+                .fg(AURORA_TEAL)
                 .add_modifier(Modifier::BOLD),
             flash_warn: Style::default()
-                .fg(DARK_ORANGE)
+                .fg(AURORA_YELLOW)
                 .add_modifier(Modifier::BOLD),
             flash_error: Style::default()
-                .fg(ORANGE_RED)
+                .fg(AURORA_RED)
                 .add_modifier(Modifier::BOLD),
 
-            // Breadcrumbs
+            // Breadcrumbs: dark text on frost blue / active on mauve
             breadcrumb_active: Style::default()
-                .fg(Color::Black)
-                .bg(ORANGE),
+                .fg(POLAR_DARK)
+                .bg(AURORA_MAUVE),
             breadcrumb_inactive: Style::default()
-                .fg(Color::Black)
-                .bg(STEEL_BLUE),
+                .fg(POLAR_DARK)
+                .bg(FROST_BLUE),
 
-            // YAML
+            // YAML syntax (frost + aurora)
             yaml_key: Style::default()
-                .fg(AQUA),
+                .fg(FROST_BLUE),
             yaml_string: Style::default()
-                .fg(LAWN_GREEN),
+                .fg(AURORA_GREEN),
             yaml_number: Style::default()
-                .fg(FUCHSIA),
+                .fg(AURORA_MAUVE),
 
             // Command prompt
             command: Style::default()
-                .fg(CADET_BLUE),
+                .fg(SNOW_PRIMARY),
             command_suggestion: Style::default()
-                .fg(DODGER_BLUE),
+                .fg(FROST_SUGGEST),
 
             // Status bar
             status_bar: Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(30, 30, 40)),
+                .fg(SNOW_PRIMARY),
             status_bar_key: Style::default()
-                .fg(AQUA)
-                .bg(Color::Rgb(30, 30, 40))
+                .fg(AURORA_MAUVE)
                 .add_modifier(Modifier::BOLD),
 
-            // Header panel
+            // Header panel (cluster info)
             info_label: Style::default()
-                .fg(DODGER_BLUE)
+                .fg(FROST_BLUE)
                 .add_modifier(Modifier::BOLD),
             info_value: Style::default()
-                .fg(DODGER_BLUE),
+                .fg(SNOW_PRIMARY),
             logo: Style::default()
-                .fg(ORANGE)
+                .fg(AURORA_MAUVE)
                 .add_modifier(Modifier::BOLD),
 
             // Namespace/context labels
             namespace_label: Style::default()
-                .fg(FUCHSIA)
+                .fg(AURORA_YELLOW)
                 .add_modifier(Modifier::BOLD),
             context_label: Style::default()
-                .fg(DODGER_BLUE)
+                .fg(FROST_BLUE)
                 .add_modifier(Modifier::BOLD),
 
             // Help overlay
             help_key: Style::default()
-                .fg(DODGER_BLUE)
+                .fg(AURORA_MAUVE)
                 .add_modifier(Modifier::BOLD),
             help_desc: Style::default()
-                .fg(Color::White),
+                .fg(SNOW_PRIMARY),
 
-            // Dialog — dark bg pops from terminal, not pure black
+            // Dialog
             dialog_border: Style::default()
-                .fg(ORANGE_RED),
+                .fg(FROST_BLUE),
             dialog_bg: Style::default()
-                .bg(Color::Rgb(25, 28, 38)),
+                .bg(POLAR_DARK),
             dialog_button_active: Style::default()
-                .fg(Color::Black)
-                .bg(AQUA)
+                .fg(POLAR_DARK)
+                .bg(FROST_BLUE)
                 .add_modifier(Modifier::BOLD),
             dialog_button_inactive: Style::default()
-                .fg(Color::DarkGray),
+                .fg(POLAR_MUTED),
 
             // Log viewer
             log_timestamp: Style::default()
-                .fg(STEEL_BLUE),
+                .fg(POLAR_MUTED),
             log_text: Style::default()
-                .fg(DODGER_BLUE),
+                .fg(SNOW_PRIMARY),
             line_number: Style::default()
-                .fg(Color::DarkGray),
+                .fg(POLAR_MUTED),
             search_match: Style::default()
-                .fg(Color::Black)
-                .bg(ORANGE),
+                .fg(POLAR_DARK)
+                .bg(AURORA_YELLOW),
 
             // Info "n/a" values
             info_na: Style::default()
-                .fg(ORANGE_RED)
-                .add_modifier(Modifier::BOLD),
+                .fg(POLAR_MUTED),
 
-            // Marked/selected rows: gold/yellow text bold
+            // Marked/selected rows: aurora yellow bold
             marked_row: Style::default()
-                .fg(Color::Rgb(255, 215, 0)) // Gold
+                .fg(AURORA_YELLOW)
                 .add_modifier(Modifier::BOLD),
-            // Cursor on a marked row: gold text, bg inherited from fill
             selected_marked: Style::default()
-                .fg(Color::Rgb(255, 215, 0)) // Gold
+                .fg(AURORA_YELLOW)
                 .add_modifier(Modifier::BOLD),
 
-            // Delta changed rows: italic with a subtle color tint
+            // Delta changed rows: aurora yellow highlight
             delta_changed: Style::default()
-                .fg(Color::Rgb(135, 206, 250)) // LightSkyBlue
-                .add_modifier(Modifier::ITALIC),
+                .fg(AURORA_YELLOW),
 
-            // Column cursor: very subtle dark-gray background. Doesn't
-            // change foreground color so red/yellow/green health text
-            // stays readable.
+            // Column cursor: subtle polar background tint
             col_highlight: Style::default()
-                .bg(Color::Rgb(35, 38, 45)),
-
+                .bg(Color::Rgb(40, 44, 55)),
         }
     }
 }
@@ -670,6 +671,7 @@ impl Theme {
     /// 2. Look for `~/.config/k9rs/skins/<name>.yaml`.
     /// 3. If found, parse it and override colors.
     /// 4. Fall back to `Theme::default()`.
+    ///
     /// Load the theme. The skin name comes from AppConfig (already
     /// deserialized via serde). Searches k9rs then k9s skins dirs.
     pub fn load(skin_name: Option<&str>) -> Self {

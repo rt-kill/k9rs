@@ -138,22 +138,12 @@ impl DeltaTracker {
 
 /// User config settings (loaded from ~/.config/k9rs/config.yaml).
 /// All fields use `#[serde(default)]` so missing keys use defaults.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct AppConfig {
     pub no_exit_on_ctrl_c: bool,
     pub read_only: bool,
     pub ui: UiConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            no_exit_on_ctrl_c: false,
-            read_only: false,
-            ui: UiConfig::default(),
-        }
-    }
 }
 
 /// TUI rendering and interaction preferences.
@@ -846,7 +836,11 @@ impl FormFieldState {
 
 #[derive(Debug, Clone)]
 pub struct LogState {
-    pub lines: VecDeque<String>,
+    /// Log line buffer. Private — external code reads via [`lines()`] and
+    /// mutates via [`push()`], which maintains the `filtered_indices`
+    /// invariant (adjusting indices on eviction). Direct mutation would
+    /// corrupt `filtered_indices`.
+    lines: VecDeque<String>,
     pub max_lines: usize,
     pub scroll: usize,
     pub follow: bool,
@@ -855,15 +849,18 @@ pub struct LogState {
     pub streaming: bool,
     pub since: Option<String>,
     pub tail_lines: u64,
-    /// Stack of committed grep filters. Each narrows the visible lines further.
-    pub filters: Vec<String>,
+    /// Stack of committed grep filters. Private — external code reads via
+    /// [`filters()`] and mutates via [`commit_filter()`] / [`pop_filter()`],
+    /// which rebuild compiled patterns and filtered indices.
+    filters: Vec<String>,
     /// Draft filter being typed (live preview). None = not in filter input mode.
     pub draft_filter: Option<String>,
     /// Compiled patterns for committed + draft filters. Rebuilt only when
     /// filters change, not on every log line push.
     compiled_patterns: Vec<crate::util::SearchPattern>,
     /// Indices into `lines` that pass all filters (committed + draft).
-    pub filtered_indices: Vec<usize>,
+    /// Private — external code reads via [`filtered_indices()`].
+    filtered_indices: Vec<usize>,
     /// Generation id stamped by the client_session when this log stream
     /// was opened. The bridge tags every emitted `LogLine` with the same
     /// id; the apply path drops lines whose id doesn't match. Without
@@ -898,6 +895,19 @@ impl LogState {
     pub fn new() -> Self {
         Self { follow: true, show_timestamps: true, streaming: false, ..Default::default() }
     }
+
+    // -- Read-only accessors for private fields ------------------------------
+
+    /// The log line buffer. Use [`push()`] to append lines — it maintains
+    /// the `filtered_indices` invariant on eviction.
+    pub fn lines(&self) -> &VecDeque<String> { &self.lines }
+
+    /// Committed filter patterns (source text). Use [`commit_filter()`] /
+    /// [`pop_filter()`] to mutate — they rebuild compiled patterns.
+    pub fn filters(&self) -> &[String] { &self.filters }
+
+    /// Indices into `lines` that pass all active filters.
+    pub fn filtered_indices(&self) -> &[usize] { &self.filtered_indices }
     /// Create a LogState with user-configured defaults.
     pub fn from_config(log_config: &LogConfig) -> Self {
         Self {

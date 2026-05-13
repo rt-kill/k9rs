@@ -107,7 +107,9 @@ async fn main() -> Result<()> {
     // "connecting…" placeholders until the connection manager publishes the
     // resolved values via `AppEvent::KubeconfigLoaded` (fast, from disk) and
     // then `AppEvent::ConnectionEstablished` (authoritative, from the daemon).
-    let namespace = cli.namespace.unwrap_or_else(|| "all".to_string());
+    let namespace = crate::kube::protocol::Namespace::from_user_command(
+        cli.namespace.as_deref().unwrap_or("all"),
+    );
     let cli_context: Option<crate::kube::protocol::ContextName> = cli.context.clone().map(Into::into);
     let mut app = App::new(crate::kube::protocol::ContextName::default(), namespace);
     if cli.readonly {
@@ -246,10 +248,12 @@ async fn main() -> Result<()> {
         terminal,
         event_tx,
         event_rx,
-        input_rx,
         tick_rate,
-        suspend_tx,
-        suspend_ack_rx,
+        crate::kube::session::InputChannels {
+            input_rx,
+            suspend_tx,
+            suspend_ack_rx,
+        },
     )
     .await?;
 

@@ -87,6 +87,7 @@ struct TableSnapshot<'a> {
     changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
     row_keys: &'a [crate::kube::protocol::ObjectKey],
     row_health: &'a [crate::kube::resources::row::RowHealth],
+    cell_style: &'a [Vec<Option<crate::kube::resources::row::RowHealth>>],
     max_col_width: u16,
 }
 
@@ -108,6 +109,7 @@ fn draw_resource_table(
         .changed_rows(snap.changed_rows)
         .row_keys(snap.row_keys)
         .row_health(snap.row_health)
+        .cell_style(snap.cell_style)
         .max_col_width(snap.max_col_width);
 
     let mut state = ResourceTableState {
@@ -124,6 +126,20 @@ fn draw_resource_table(
 }
 
 
+/// Rendering context for [`draw_unified_table`]. Bundles the read-only
+/// parameters that come from `App` state — separating them from the mutable
+/// `table` and the `Frame` avoids a 11-parameter function signature.
+struct TableRenderCtx<'a> {
+    title: &'a str,
+    namespace: &'a crate::kube::protocol::Namespace,
+    theme: &'a Theme,
+    descriptor: Option<&'a crate::app::TableDescriptor>,
+    column_level: crate::app::ColumnLevel,
+    changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
+    rid: &'a crate::kube::protocol::ResourceId,
+    max_col_width: u16,
+}
+
 /// Draw function for unified ResourceRow tables. Uses runtime column headers
 /// from the TableDescriptor instead of a static `T::headers()`.
 ///
@@ -134,32 +150,20 @@ fn draw_resource_table(
 fn draw_unified_table(
     f: &mut Frame,
     area: Rect,
-    title: &str,
     table: &mut StatefulTable<crate::kube::resources::row::ResourceRow>,
-    namespace: &crate::kube::protocol::Namespace,
-    theme: &Theme,
-    descriptor: Option<&crate::app::TableDescriptor>,
-    column_level: crate::app::ColumnLevel,
-    changed_rows: &std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
-    rid: &crate::kube::protocol::ResourceId,
-    max_col_width: u16,
+    ctx: &TableRenderCtx<'_>,
 ) {
-    let display_title = if table.loading {
-        format!("{} (loading...)", title)
-    } else {
-        title.to_string()
-    };
-    let title = &display_title;
+    let title = ctx.title;
 
     // Hide the NAMESPACE column when viewing a single namespace —
     // `visible_columns` walks columns by name, so the first-column gate the
     // old code added was redundant (and would have masked any future
     // descriptor that put NAMESPACE at a non-zero index).
-    let skip_ns = !namespace.is_all();
+    let skip_ns = !ctx.namespace.is_all();
 
     // Compute which columns (by data index) are visible at the current level.
-    let visible: Vec<(usize, &str)> = if let Some(desc) = descriptor {
-        desc.visible_columns(rid, column_level, skip_ns)
+    let visible: Vec<(usize, &str)> = if let Some(desc) = ctx.descriptor {
+        desc.visible_columns(ctx.rid, ctx.column_level, skip_ns)
     } else {
         vec![(0, "NAME")]
     };
@@ -171,22 +175,20 @@ fn draw_unified_table(
     table.set_num_cols(visible.len());
 
     if table.items.is_empty() {
-        let loading_text = if let Some(ref err) = table.error {
-            format!("Error: {}", err)
-        } else if table.has_data {
-            format!("No {} found.", title.to_lowercase())
-        } else {
-            crate::util::loading_bar("Loading...")
+        let loading_text = match &table.data_state {
+            crate::app::table::TableDataState::Failed(err) => format!("Error: {}", err),
+            crate::app::table::TableDataState::Ready => format!("No {} found.", title.to_lowercase()),
+            crate::app::table::TableDataState::Initializing => crate::util::loading_bar("Loading..."),
         };
-        let loading_line = Line::from(Span::styled(loading_text, theme.info_value));
-        let title_ns = if namespace.is_all() {
+        let loading_line = Line::from(Span::styled(loading_text, ctx.theme.info_value));
+        let title_ns = if ctx.namespace.is_all() {
             format!(" {}[0]", title.to_lowercase())
         } else {
-            format!(" {}({})[0]", title.to_lowercase(), namespace.display())
+            format!(" {}({})[0]", title.to_lowercase(), ctx.namespace.display())
         };
         let block = Block::bordered()
-            .title(Span::styled(title_ns, theme.title))
-            .border_style(theme.border);
+            .title(Span::styled(title_ns, ctx.theme.title))
+            .border_style(ctx.theme.border);
         let inner = block.inner(area);
         f.render_widget(block, area);
         if inner.height > 0 && inner.width > 0 {
@@ -201,9 +203,13 @@ fn draw_unified_table(
         return;
     }
 
-    // Build the parallel arrays the widget needs in one pass inside
-    // StatefulTable — no manual index arithmetic in the render path.
-    let view = table.prepare_view(&visible_indices);
+    // Column render rules are cached on the descriptor (built once when
+    // the descriptor arrives, not per frame). Empty slice if no descriptor.
+    static EMPTY_RULES: &[crate::kube::overlay::ColumnRenderRules] = &[];
+    let column_rules = ctx.descriptor
+        .map(|d| d.column_rules())
+        .unwrap_or(EMPTY_RULES);
+    let view = table.prepare_view(&visible_indices, column_rules);
 
     let selected = table.selected();
     let initial_offset = table.offset();
@@ -213,7 +219,7 @@ fn draw_unified_table(
     let display_sort_col = visible_indices.iter().position(|&i| i == table.sort_column());
     let marked: &std::collections::HashSet<crate::kube::protocol::ObjectKey> = &table.marked;
 
-    let ns_label = if namespace.is_all() { "" } else { namespace.display() };
+    let ns_label = if ctx.namespace.is_all() { "" } else { ctx.namespace.display() };
     let snap = TableSnapshot {
         headers,
         rows: &view.rows,
@@ -225,13 +231,14 @@ fn draw_unified_table(
         display_sort_col,
         namespace: ns_label,
         marked,
-        changed_rows,
+        changed_rows: ctx.changed_rows,
         row_keys: &view.keys,
         row_health: &view.health,
-        max_col_width,
+        cell_style: &view.cell_style,
+        max_col_width: ctx.max_col_width,
     };
     let (new_offset, new_page_size, new_col_offset) = draw_resource_table(
-        f, area, title, &snap, theme,
+        f, area, title, &snap, ctx.theme,
     );
 
     table.set_offset(new_offset);
@@ -266,7 +273,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let command_height: u16 = if app.ui.input_mode.is_active() { 3 } else { 0 };
     // Only show the filter bar box while actively typing; when committed
     // (inactive but text non-empty), the table title shows `</:filter_text>`.
-    let filter_visible = app.nav.filter_input().active;
+    let filter_visible = app.nav.filter_input().active();
     let filter_height: u16 = if filter_visible { 3 } else { 0 };
 
     let chunks = Layout::vertical([
@@ -302,10 +309,10 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     // 3. Filter prompt
     if filter_visible {
         let counts = app.active_table_items_count();
-        let match_count = if app.nav.filter_input().text.is_empty() && !app.nav.is_drilled() { counts.total } else { counts.filtered };
+        let match_count = if app.nav.filter_input().text().is_empty() && !app.nav.is_drilled() { counts.total } else { counts.filtered };
         let filter_bar = FilterBar::new(
-            app.nav.filter_input().active,
-            &app.nav.filter_input().text,
+            app.nav.filter_input().active(),
+            app.nav.filter_input().text(),
             match_count,
             counts.total,
             theme,
@@ -336,7 +343,17 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         app.nav.find_table_for_resource_mut(&current_rid)
     };
     if let Some(table) = table_ref {
-        draw_unified_table(f, table_area, &title, table, &ns, theme, desc.as_ref(), cl, changed_rows, &current_rid, app.config.ui.max_column_width);
+        let ctx = TableRenderCtx {
+            title: &title,
+            namespace: &ns,
+            theme,
+            descriptor: desc.as_ref(),
+            column_level: cl,
+            changed_rows,
+            rid: &current_rid,
+            max_col_width: app.config.ui.max_column_width,
+        };
+        draw_unified_table(f, table_area, table, &ctx);
     } else {
         // Table doesn't exist yet (e.g., CRD not yet discovered). Show loading bar.
         let loading_text = crate::util::loading_bar("Loading...");

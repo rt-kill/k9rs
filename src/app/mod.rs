@@ -79,13 +79,38 @@ pub fn column_level_for(rid: &ResourceId, name: &str) -> ColumnLevel {
 // TableDescriptor — runtime column headers for a resource type
 // ---------------------------------------------------------------------------
 
-/// Runtime column headers for a resource type (from the server).
+/// Runtime column headers and pre-resolved render rules for a resource
+/// type. Built once when the server sends a descriptor (snapshot with
+/// headers). The `column_rules` cache is rebuilt whenever `set_headers`
+/// is called — same pattern as `FormFieldState { value, kind }` where
+/// `kind` is set once at construction.
 #[derive(Debug, Clone, Default)]
 pub struct TableDescriptor {
-    pub headers: Vec<String>,
+    headers: Vec<String>,
+    /// Pre-resolved overlay coloring rules, indexed by data column
+    /// position (parallel to `headers`). Built once from overlay config
+    /// when the descriptor arrives — not per frame.
+    column_rules: Vec<crate::kube::overlay::ColumnRenderRules>,
 }
 
 impl TableDescriptor {
+    /// Create a descriptor with headers and pre-resolved column render
+    /// rules. Rules are built once from overlay config — not per frame.
+    pub fn new(headers: Vec<String>, resource_plural: &str) -> Self {
+        let column_rules = crate::kube::overlay::build_column_rules(&headers, resource_plural);
+        Self { headers, column_rules }
+    }
+
+    /// Column headers (from the server's resource snapshot).
+    pub fn headers(&self) -> &[String] {
+        &self.headers
+    }
+
+    /// Pre-resolved column render rules (from overlay config).
+    pub fn column_rules(&self) -> &[crate::kube::overlay::ColumnRenderRules] {
+        &self.column_rules
+    }
+
     /// Find the column index for a header name (case-insensitive).
     /// Returns an index into the *full* cell array (not the visible subset).
     pub fn col(&self, name: &str) -> Option<usize> {
@@ -184,7 +209,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(context: crate::kube::protocol::ContextName, namespace: String) -> Self {
+    pub fn new(context: crate::kube::protocol::ContextName, namespace: crate::kube::protocol::Namespace) -> Self {
         let config = Self::load_config();
         let cache_capacity = config.ui.cache_capacity;
         let skin_name = config.ui.skin.clone();
@@ -215,7 +240,7 @@ impl App {
             kube: KubeState {
                 context,
                 identity: crate::kube::protocol::ClusterIdentity::default(),
-                selected_ns: crate::kube::protocol::Namespace::from_user_command(&namespace),
+                selected_ns: namespace,
                 context_switch: ContextSwitchState::Stable,
                 pod_metrics: HashMap::new(),
                 node_metrics: HashMap::new(),
@@ -589,7 +614,7 @@ impl App {
         // Uncommitted draft text from the filter input is compiled fresh
         // here — it changes per keystroke, so caching would just churn.
         let draft: Option<SearchPattern> = {
-            let text = self.nav.filter_input().text.clone();
+            let text = self.nav.filter_input().text().to_string();
             (!text.is_empty()).then(|| SearchPattern::new(&text))
         };
 
@@ -673,14 +698,14 @@ impl App {
         if !changed {
             // Resource table loading
             let table_loading = self.active_view_table()
-                .is_none_or(|t| t.items.is_empty() && !t.has_data && t.error.is_none());
+                .is_none_or(|t| t.items.is_empty() && matches!(t.data_state, crate::app::table::TableDataState::Initializing));
             if table_loading {
                 changed = true;
             }
             // Log view: animate while streaming with no lines yet
             if !changed {
                 if let Route::Logs { ref state, .. } = self.route {
-                    if state.streaming && state.lines.is_empty() {
+                    if state.streaming && state.lines().is_empty() {
                         changed = true;
                     }
                 }

@@ -167,17 +167,6 @@ impl NavFilter {
         }
     }
 
-    /// True if this filter is active and the row's health passes its
-    /// predicate. Returns `true` for filter variants that don't filter on
-    /// health (so they don't reject rows here — they're handled by other
-    /// pipelines).
-    pub fn keep_by_health(&self, health: crate::kube::resources::row::RowHealth) -> bool {
-        use crate::kube::resources::row::RowHealth;
-        match self {
-            NavFilter::Fault => !matches!(health, RowHealth::Normal),
-            _ => true,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -704,15 +693,75 @@ impl NavStack {
 // ---------------------------------------------------------------------------
 
 /// Tracks the filter input widget state, separate from committed nav filters.
+/// Fields are private — mutation goes through typed methods that enforce
+/// valid transitions (same pattern as LogState's encapsulated fields).
 #[derive(Debug, Default, Clone)]
 pub struct FilterInputState {
-    /// Whether the filter bar is in edit mode (listening for keystrokes).
-    pub active: bool,
-    /// The text being typed (not yet committed to NavStack).
+    active: bool,
+    text: String,
+    column: Option<usize>,
+}
+
+/// Committed filter text + optional column restriction, returned by
+/// [`FilterInputState::commit`].
+#[derive(Debug)]
+pub(crate) struct CommittedFilter {
     pub text: String,
-    /// If Some, the filter is restricted to this column index (opened via `~`).
-    /// When committed, produces `NavFilter::ColumnGrep` instead of `NavFilter::Grep`.
     pub column: Option<usize>,
+}
+
+impl FilterInputState {
+    // -- Read-only accessors --------------------------------------------------
+
+    /// Whether the filter bar is in edit mode (listening for keystrokes).
+    pub fn active(&self) -> bool { self.active }
+    /// The text being typed (not yet committed to NavStack).
+    pub fn text(&self) -> &str { &self.text }
+    /// Column restriction index, if any (`~` mode).
+    pub fn column(&self) -> Option<usize> { self.column }
+
+    // -- State transitions ----------------------------------------------------
+
+    /// Enter filter mode for all columns (`/`).
+    pub fn start(&mut self) {
+        self.active = true;
+        self.text.clear();
+        self.column = None;
+    }
+
+    /// Enter column-restricted filter mode (`~`).
+    pub fn start_column(&mut self, col: usize) {
+        self.active = true;
+        self.text.clear();
+        self.column = Some(col);
+    }
+
+    /// Cancel without committing — discards text, resets column, exits
+    /// edit mode. Full reset so no state lingers from a cancelled `~`
+    /// column filter into the next `/` invocation.
+    pub fn cancel(&mut self) {
+        self.text.clear();
+        self.column = None;
+        self.active = false;
+    }
+
+    /// Commit the typed text. Takes the text and column, exits edit mode.
+    /// Returns `None` if text is empty (nothing to commit).
+    pub(crate) fn commit(&mut self) -> Option<CommittedFilter> {
+        self.active = false;
+        let text = std::mem::take(&mut self.text);
+        let column = self.column.take();
+        if text.is_empty() {
+            None
+        } else {
+            Some(CommittedFilter { text, column })
+        }
+    }
+
+    // -- Keystroke handling ---------------------------------------------------
+
+    pub fn push_char(&mut self, c: char) { self.text.push(c); }
+    pub fn pop_char(&mut self) { self.text.pop(); }
 }
 
 /// Convenience helper: build a built-in `ResourceId` from a typed
@@ -992,5 +1041,121 @@ mod tests {
 
         let (_, _) = stack.pop().unwrap();
         assert_eq!(stack.current().saved_selected, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // NavFilter::to_subscription_filter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn grep_filter_returns_none() {
+        let f = NavFilter::Grep(CompiledGrep::new("nginx"));
+        assert!(f.to_subscription_filter().is_none());
+    }
+
+    #[test]
+    fn fault_filter_returns_none() {
+        let f = NavFilter::Fault;
+        assert!(f.to_subscription_filter().is_none());
+    }
+
+    #[test]
+    fn column_grep_filter_returns_none() {
+        let f = NavFilter::ColumnGrep { pattern: CompiledGrep::new("x"), col: 2 };
+        assert!(f.to_subscription_filter().is_none());
+    }
+
+    #[test]
+    fn labels_filter_returns_subscription_labels() {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("app".into(), "web".into());
+        let f = NavFilter::Labels(labels.clone());
+        assert_eq!(
+            f.to_subscription_filter(),
+            Some(SubscriptionFilter::Labels(labels)),
+        );
+    }
+
+    #[test]
+    fn field_filter_returns_subscription_field() {
+        let f = NavFilter::Field(K8sFieldSelector::SpecNodeName("node1".into()));
+        assert_eq!(
+            f.to_subscription_filter(),
+            Some(SubscriptionFilter::Field("spec.nodeName=node1".into())),
+        );
+    }
+
+    #[test]
+    fn owner_chain_filter_returns_subscription_owner_uid() {
+        let f = NavFilter::OwnerChain {
+            uid: "abc-123".into(),
+            kind: BuiltInKind::Deployment,
+            display_name: "my-deploy".into(),
+        };
+        assert_eq!(
+            f.to_subscription_filter(),
+            Some(SubscriptionFilter::OwnerUid("abc-123".into())),
+        );
+    }
+
+    // -- FilterInputState tests -----------------------------------------------
+
+    #[test]
+    fn filter_start_resets_state() {
+        let mut fi = FilterInputState::default();
+        fi.start();
+        assert!(fi.active());
+        assert!(fi.text().is_empty());
+        assert!(fi.column().is_none());
+    }
+
+    #[test]
+    fn filter_start_column_sets_column() {
+        let mut fi = FilterInputState::default();
+        fi.start_column(3);
+        assert!(fi.active());
+        assert_eq!(fi.column(), Some(3));
+    }
+
+    #[test]
+    fn filter_cancel_resets_all_fields() {
+        let mut fi = FilterInputState::default();
+        fi.start_column(5);
+        fi.push_char('x');
+        fi.cancel();
+        assert!(!fi.active());
+        assert!(fi.text().is_empty());
+        assert!(fi.column().is_none(), "cancel must reset column");
+    }
+
+    #[test]
+    fn filter_commit_returns_text_and_column() {
+        let mut fi = FilterInputState::default();
+        fi.start_column(2);
+        fi.push_char('a');
+        fi.push_char('b');
+        let c = fi.commit().expect("non-empty text should commit");
+        assert_eq!(c.text, "ab");
+        assert_eq!(c.column, Some(2));
+        assert!(!fi.active());
+    }
+
+    #[test]
+    fn filter_commit_returns_none_on_empty_text() {
+        let mut fi = FilterInputState::default();
+        fi.start();
+        assert!(fi.commit().is_none());
+        assert!(!fi.active());
+    }
+
+    #[test]
+    fn filter_push_pop_char() {
+        let mut fi = FilterInputState::default();
+        fi.start();
+        fi.push_char('h');
+        fi.push_char('i');
+        assert_eq!(fi.text(), "hi");
+        fi.pop_char();
+        assert_eq!(fi.text(), "h");
     }
 }

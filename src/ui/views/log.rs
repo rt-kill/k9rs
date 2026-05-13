@@ -46,9 +46,9 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     // a Vec for all 50k lines every frame.
     //
     // When filters are active, iterate filtered_indices instead of raw lines.
-    let filtered = &logs.filtered_indices;
-    let is_filtered = !logs.filters.is_empty() || logs.draft_filter.is_some();
-    let effective_total = if is_filtered { filtered.len() } else { logs.lines.len() };
+    let filtered = logs.filtered_indices();
+    let is_filtered = !logs.filters().is_empty() || logs.draft_filter.is_some();
+    let effective_total = if is_filtered { filtered.len() } else { logs.lines().len() };
 
     if effective_total > 0 {
         let total = effective_total;
@@ -59,9 +59,9 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             // When wrap is enabled, pass all visible lines to the widget and let
             // ratatui's Paragraph handle wrapping and scrolling internally.
             let all_lines: Vec<&str> = if is_filtered {
-                filtered.iter().map(|&i| logs.lines[i].as_str()).collect()
+                filtered.iter().map(|&i| logs.lines()[i].as_str()).collect()
             } else {
-                logs.lines.iter().map(|s| s.as_str()).collect()
+                logs.lines().iter().map(|s| s.as_str()).collect()
             };
 
             let log_viewer = LogViewer::new(
@@ -93,7 +93,7 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
                 filter_input_active: logs.is_filtering(),
                 filter_input: logs.draft_filter.clone().unwrap_or_default(),
                 visible_count: logs.visible_count(),
-                committed_filter_count: logs.filters.len(),
+                committed_filter_count: logs.filters().len(),
             };
 
             f.render_stateful_widget(log_viewer, log_area, &mut view_state);
@@ -108,9 +108,9 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             let end = (start + height).min(total);
 
             let visible_lines: Vec<&str> = if is_filtered {
-                filtered[start..end].iter().map(|&i| logs.lines[i].as_str()).collect()
+                filtered[start..end].iter().map(|&i| logs.lines()[i].as_str()).collect()
             } else {
-                logs.lines.range(start..end).map(|s| s.as_str()).collect()
+                logs.lines().range(start..end).map(|s| s.as_str()).collect()
             };
 
             let log_viewer = LogViewer::new(
@@ -133,7 +133,7 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
                 filter_input_active: logs.is_filtering(),
                 filter_input: logs.draft_filter.clone().unwrap_or_default(),
                 visible_count: logs.visible_count(),
-                committed_filter_count: logs.filters.len(),
+                committed_filter_count: logs.filters().len(),
             };
 
             f.render_stateful_widget(log_viewer, log_area, &mut view_state);

@@ -119,6 +119,9 @@ pub struct ResourceTable<'a> {
     changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
     row_keys: &'a [crate::kube::protocol::ObjectKey],
     row_health: &'a [crate::kube::resources::row::RowHealth],
+    /// Per-cell rendering style. `cell_style[row][col]` = `Some(h)` means
+    /// that cell has its own coloring; `None` = inherit row style.
+    cell_style: &'a [Vec<Option<crate::kube::resources::row::RowHealth>>],
     max_col_width: u16,
 }
 
@@ -138,12 +141,14 @@ impl<'a> ResourceTable<'a> {
             changed_rows: &EMPTY_MAP,
             row_keys: &[],
             row_health: &[],
+            cell_style: &[],
             max_col_width: DEFAULT_MAX_COL_WIDTH,
         }
     }
 
     pub fn row_keys(mut self, keys: &'a [crate::kube::protocol::ObjectKey]) -> Self { self.row_keys = keys; self }
     pub fn row_health(mut self, health: &'a [crate::kube::resources::row::RowHealth]) -> Self { self.row_health = health; self }
+    pub fn cell_style(mut self, ch: &'a [Vec<Option<crate::kube::resources::row::RowHealth>>]) -> Self { self.cell_style = ch; self }
     pub fn marked(mut self, marked: &'a std::collections::HashSet<crate::kube::protocol::ObjectKey>) -> Self { self.marked = marked; self }
     pub fn sort(mut self, col: Option<usize>, ascending: bool) -> Self { self.sort_col = col; self.sort_asc = ascending; self }
     pub fn namespace(mut self, ns: &'a str) -> Self { self.namespace = ns; self }
@@ -353,8 +358,8 @@ impl StatefulWidget for ResourceTable<'_> {
                 }
             }
 
-            // Cell style priority: selected > marked > changed > health.
-            let cell_style = if is_selected && is_marked {
+            // Row-level base style: selected > marked > changed > row health.
+            let row_base = if is_selected && is_marked {
                 self.theme.selected_marked
             } else if is_selected {
                 self.theme.selected
@@ -371,7 +376,36 @@ impl StatefulWidget for ResourceTable<'_> {
                 }
             };
 
-            self.render_row(buf, y, row, cell_style, is_selected, &layout);
+            // Per-cell coloring: if this row has cell-level health overrides
+            // and the row isn't selected/marked/changed (those take priority
+            // over cell coloring), resolve per-cell styles.
+            let has_cell_overrides = !is_selected && !is_marked && !is_changed
+                && self.cell_style.get(row_idx).is_some_and(|ch| ch.iter().any(|c| c.is_some()));
+
+            if has_cell_overrides {
+                let cell_styles = &self.cell_style[row_idx];
+                for (i, cell) in row.iter().enumerate() {
+                    if i >= layout.widths.len() || !layout.is_visible(i) { continue; }
+                    let style = if let Some(Some(h)) = cell_styles.get(i) {
+                        use crate::kube::resources::row::RowHealth;
+                        match h {
+                            RowHealth::Failed => self.theme.status_failed,
+                            RowHealth::Pending => self.theme.status_pending,
+                            RowHealth::Normal => row_base,
+                        }
+                    } else {
+                        row_base
+                    };
+                    let (content_style, border_style) = self.cell_styles(style, i, is_selected, &layout);
+                    Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style);
+                }
+                // Trailing border.
+                if let Some(tx) = layout.trailing_border_x() {
+                    buf.set_string(tx, y, "│", self.theme.border);
+                }
+            } else {
+                self.render_row(buf, y, row, row_base, is_selected, &layout);
+            }
         }
     }
 }

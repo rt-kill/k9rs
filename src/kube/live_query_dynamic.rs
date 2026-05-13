@@ -282,14 +282,8 @@ fn build_dynamic_snapshot(
         .collect();
     items.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
 
-    // Apply overlay coloring rules (Phase 1).
-    if let Some(overlay) = crate::kube::overlay::overlay_for(plural) {
-        if !overlay.coloring.is_empty() {
-            for row in &mut items {
-                crate::kube::overlay::evaluate_coloring(row, &headers, &overlay.coloring);
-            }
-        }
-    }
+    // Overlay coloring evaluation moved to client-side (prepare_view)
+    // so it runs against final cell values including metrics overlays.
 
     DynamicSnapshot { headers, rows: items }
 }

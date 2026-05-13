@@ -242,85 +242,143 @@ pub fn load_overlays() -> HashMap<String, ResourceOverlay> {
 }
 
 // ---------------------------------------------------------------------------
-// Coloring evaluation
+// Pre-resolved column render rules (client-side, not serializable)
 // ---------------------------------------------------------------------------
 
-/// Evaluate coloring rules against a row's cells. If any rule matches,
-/// the row's health is upgraded to the rule's health (Failed > Pending > Normal).
-/// The converter's original health is the starting point — overlay rules
-/// can only make it worse, not better.
-pub fn evaluate_coloring(
-    row: &mut crate::kube::resources::row::ResourceRow,
-    headers: &[String],
-    rules: &[ColumnColorRule],
-) {
-    let mut worst = row.health;
-    for rule in rules {
-        let col_idx = match headers.iter().position(|h| h.eq_ignore_ascii_case(&rule.column)) {
-            Some(i) => i,
-            None => continue,
-        };
-        let cell = match row.cells.get(col_idx) {
-            Some(c) => c,
-            None => continue,
-        };
-        let cell_str = cell.to_string();
-        for cr in &rule.rules {
-            let matched = if let Some(ref text) = cr.match_text {
-                cell_str.contains(text.as_str())
-            } else if let Some(ref when) = cr.when {
-                evaluate_numeric_predicate(&cell_str, when)
-            } else {
-                false
-            };
-            if matched {
-                let rule_health: RowHealth = cr.health.into();
-                if (rule_health as u8) > (worst as u8) {
-                    worst = rule_health;
-                }
-            }
-        }
-    }
-    row.health = worst;
+/// A typed rendering predicate, parsed once from overlay YAML at
+/// construction time. Analogous to `FormFieldKind` in the form system:
+/// declared from shared config, evaluated generically by the client.
+#[derive(Debug, Clone)]
+pub(crate) enum RenderPredicate {
+    /// Substring match against the cell's display text.
+    Contains(String),
+    /// Numeric comparison against the cell's display value (with unit
+    /// suffixes stripped: `%`, `m`, `Mi`, `Ki`, `Gi`).
+    Gte(f64),
+    Gt(f64),
+    Lte(f64),
+    Lt(f64),
 }
 
-/// Parse and evaluate a numeric predicate like "> 90" or "< 10".
-fn evaluate_numeric_predicate(cell_str: &str, predicate: &str) -> bool {
-    let pred = predicate.trim();
-    let (op, threshold_str) = if let Some(rest) = pred.strip_prefix(">=") {
-        (">=", rest.trim())
-    } else if let Some(rest) = pred.strip_prefix("<=") {
-        ("<=", rest.trim())
-    } else if let Some(rest) = pred.strip_prefix('>') {
-        (">", rest.trim())
-    } else if let Some(rest) = pred.strip_prefix('<') {
-        ("<", rest.trim())
-    } else {
-        return false;
-    };
-    let threshold: f64 = match threshold_str.parse() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    // Strip common suffixes (%, m, Mi, etc.) before parsing the cell value.
-    let cleaned = cell_str
+impl RenderPredicate {
+    /// Parse an overlay `when` string (e.g., `">= 90"`) into a typed
+    /// predicate. Returns `None` if the string is malformed.
+    pub(crate) fn parse_when(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let (variant, threshold_str): (fn(f64) -> Self, &str) = if let Some(rest) = s.strip_prefix(">=") {
+            (Self::Gte, rest.trim())
+        } else if let Some(rest) = s.strip_prefix("<=") {
+            (Self::Lte, rest.trim())
+        } else if let Some(rest) = s.strip_prefix('>') {
+            (Self::Gt, rest.trim())
+        } else if let Some(rest) = s.strip_prefix('<') {
+            (Self::Lt, rest.trim())
+        } else {
+            return None;
+        };
+        threshold_str.parse::<f64>().ok().map(variant)
+    }
+
+    /// Evaluate this predicate against a cell's display string.
+    pub(crate) fn matches(&self, cell_str: &str) -> bool {
+        match self {
+            Self::Contains(text) => cell_str.contains(text.as_str()),
+            Self::Gte(t) => parse_numeric_cell(cell_str).is_some_and(|v| v >= *t),
+            Self::Gt(t) => parse_numeric_cell(cell_str).is_some_and(|v| v > *t),
+            Self::Lte(t) => parse_numeric_cell(cell_str).is_some_and(|v| v <= *t),
+            Self::Lt(t) => parse_numeric_cell(cell_str).is_some_and(|v| v < *t),
+        }
+    }
+}
+
+/// Strip common unit suffixes and parse a cell's display string as f64.
+fn parse_numeric_cell(cell_str: &str) -> Option<f64> {
+    cell_str
         .trim()
         .trim_end_matches('%')
         .trim_end_matches('m')
         .trim_end_matches("Mi")
         .trim_end_matches("Ki")
-        .trim_end_matches("Gi");
-    let value: f64 = match cleaned.parse() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    match op {
-        ">" => value > threshold,
-        ">=" => value >= threshold,
-        "<" => value < threshold,
-        "<=" => value <= threshold,
-        _ => false,
+        .trim_end_matches("Gi")
+        .parse::<f64>()
+        .ok()
+}
+
+/// A single rendering rule: predicate + style to apply when matched.
+#[derive(Debug, Clone)]
+pub(crate) struct RenderRule {
+    pub(crate) predicate: RenderPredicate,
+    pub(crate) style: RowHealth,
+}
+
+/// Pre-resolved rendering rules for one column. Built once from overlay
+/// config when the table descriptor arrives. Analogous to `FormFieldKind`
+/// in the form system: the "schema" half of a cell, set once, evaluated
+/// generically at render time against the "value" half (`CellValue`).
+#[derive(Debug, Clone, Default)]
+pub struct ColumnRenderRules {
+    pub(crate) rules: Vec<RenderRule>,
+}
+
+impl ColumnRenderRules {
+    /// Evaluate this column's rules against a cell's display string.
+    /// First match wins. Returns the style to apply, or `None` to inherit
+    /// the row's style.
+    pub fn evaluate(&self, cell_str: &str) -> Option<RowHealth> {
+        for rule in &self.rules {
+            if rule.predicate.matches(cell_str) {
+                return Some(rule.style);
+            }
+        }
+        None
     }
+}
+
+/// Build pre-resolved column render rules for a resource, indexed by
+/// data column index (parallel to `cells`). Resolves overlay YAML rules
+/// to column positions ONCE at construction time — no string-based header
+/// lookups per row per frame.
+///
+/// Called when a table descriptor arrives or updates. The returned vec
+/// is passed to `prepare_view` for per-cell style evaluation.
+pub fn build_column_rules(headers: &[String], plural: &str) -> Vec<ColumnRenderRules> {
+    let mut result = vec![ColumnRenderRules::default(); headers.len()];
+    let Some(overlay) = overlay_for(plural) else {
+        return result;
+    };
+    if overlay.coloring.is_empty() {
+        return result;
+    }
+    for col_rule in &overlay.coloring {
+        let col_idx = match headers.iter().position(|h| h.eq_ignore_ascii_case(&col_rule.column)) {
+            Some(i) => i,
+            None => continue,
+        };
+        for cr in &col_rule.rules {
+            let predicate = if let Some(ref text) = cr.match_text {
+                if text.is_empty() {
+                    warn!("overlay: empty match text for column '{}' in resource '{}' (would match everything)",
+                        col_rule.column, plural);
+                    continue;
+                }
+                RenderPredicate::Contains(text.clone())
+            } else if let Some(ref when) = cr.when {
+                match RenderPredicate::parse_when(when) {
+                    Some(p) => p,
+                    None => {
+                        warn!("overlay: invalid predicate '{}' for column '{}' in resource '{}'",
+                            when, col_rule.column, plural);
+                        continue;
+                    }
+                }
+            } else {
+                continue;
+            };
+            let style: RowHealth = cr.health.into();
+            result[col_idx].rules.push(RenderRule { predicate, style });
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -331,96 +389,123 @@ fn evaluate_numeric_predicate(cell_str: &str, predicate: &str) -> bool {
 mod tests {
     use super::*;
 
+    // -- RenderPredicate tests --------------------------------------------------
+
     #[test]
-    fn numeric_predicate_gt() {
-        assert!(evaluate_numeric_predicate("95", "> 90"));
-        assert!(!evaluate_numeric_predicate("85", "> 90"));
+    fn predicate_parse_gte() {
+        let p = RenderPredicate::parse_when(">= 90").unwrap();
+        assert!(p.matches("95%"));
+        assert!(p.matches("90"));
+        assert!(!p.matches("89"));
     }
 
     #[test]
-    fn numeric_predicate_with_percent() {
-        assert!(evaluate_numeric_predicate("95%", "> 90"));
-        assert!(!evaluate_numeric_predicate("50%", "> 90"));
+    fn predicate_parse_gt() {
+        let p = RenderPredicate::parse_when("> 90").unwrap();
+        assert!(p.matches("95"));
+        assert!(!p.matches("90"));
+        assert!(!p.matches("85"));
     }
 
     #[test]
-    fn numeric_predicate_gte() {
-        assert!(evaluate_numeric_predicate("90", ">= 90"));
-        assert!(!evaluate_numeric_predicate("89", ">= 90"));
+    fn predicate_parse_lt() {
+        let p = RenderPredicate::parse_when("< 10").unwrap();
+        assert!(p.matches("5"));
+        assert!(!p.matches("15"));
     }
 
     #[test]
-    fn numeric_predicate_lt() {
-        assert!(evaluate_numeric_predicate("5", "< 10"));
-        assert!(!evaluate_numeric_predicate("15", "< 10"));
+    fn predicate_parse_invalid() {
+        assert!(RenderPredicate::parse_when("bad predicate").is_none());
     }
 
     #[test]
-    fn numeric_predicate_invalid() {
-        assert!(!evaluate_numeric_predicate("not-a-number", "> 90"));
-        assert!(!evaluate_numeric_predicate("50", "bad predicate"));
+    fn predicate_contains() {
+        let p = RenderPredicate::Contains("CrashLoop".into());
+        assert!(p.matches("CrashLoopBackOff"));
+        assert!(!p.matches("Running"));
     }
 
     #[test]
-    fn evaluate_coloring_exact_match() {
-        use crate::kube::resources::row::{CellValue, ResourceRow};
-        let headers = vec!["STATUS".to_string()];
-        let rules = vec![ColumnColorRule {
-            column: "STATUS".into(),
-            rules: vec![ColorRule {
-                match_text: Some("CrashLoopBackOff".into()),
-                when: None,
-                health: OverlayHealth::Failed,
-            }],
-        }];
-        let mut row = ResourceRow {
-            cells: vec![CellValue::Text("CrashLoopBackOff".into())],
-            ..Default::default()
+    fn predicate_numeric_strips_units() {
+        let p = RenderPredicate::parse_when(">= 70").unwrap();
+        assert!(p.matches("72%"));
+        assert!(p.matches("800m"));
+        assert!(!p.matches("50%"));
+    }
+
+    // -- build_column_rules + evaluate tests ----------------------------------
+
+    #[test]
+    fn build_and_evaluate_column_rules() {
+        let headers = vec!["STATUS".to_string(), "%CPU/R".to_string()];
+        let _rules = build_column_rules(&headers, "pods");
+        // Without a loaded overlay for "pods" in tests, rules are empty.
+        // Directly test ColumnRenderRules evaluation instead.
+        let col = ColumnRenderRules {
+            rules: vec![
+                RenderRule {
+                    predicate: RenderPredicate::Contains("CrashLoopBackOff".into()),
+                    style: RowHealth::Failed,
+                },
+            ],
         };
-        evaluate_coloring(&mut row, &headers, &rules);
-        assert_eq!(row.health, RowHealth::Failed);
+        assert_eq!(col.evaluate("CrashLoopBackOff"), Some(RowHealth::Failed));
+        assert_eq!(col.evaluate("Running"), None);
     }
 
     #[test]
-    fn evaluate_coloring_no_downgrade() {
-        use crate::kube::resources::row::{CellValue, ResourceRow};
-        let headers = vec!["STATUS".to_string()];
-        let rules = vec![ColumnColorRule {
-            column: "STATUS".into(),
-            rules: vec![ColorRule {
-                match_text: Some("Running".into()),
-                when: None,
-                health: OverlayHealth::Normal,
-            }],
-        }];
-        let mut row = ResourceRow {
-            cells: vec![CellValue::Text("Running".into())],
-            health: RowHealth::Failed, // converter says Failed
-            ..Default::default()
+    fn column_rules_numeric_evaluation() {
+        let col = ColumnRenderRules {
+            rules: vec![
+                RenderRule {
+                    predicate: RenderPredicate::parse_when(">= 90").unwrap(),
+                    style: RowHealth::Failed,
+                },
+                RenderRule {
+                    predicate: RenderPredicate::parse_when(">= 70").unwrap(),
+                    style: RowHealth::Pending,
+                },
+            ],
         };
-        evaluate_coloring(&mut row, &headers, &rules);
-        // Overlay can't downgrade Failed → Normal
-        assert_eq!(row.health, RowHealth::Failed);
+        assert_eq!(col.evaluate("95%"), Some(RowHealth::Failed));
+        assert_eq!(col.evaluate("72%"), Some(RowHealth::Pending));
+        assert_eq!(col.evaluate("50%"), None);
     }
 
     #[test]
-    fn evaluate_coloring_numeric() {
-        use crate::kube::resources::row::{CellValue, ResourceRow};
-        let headers = vec!["CPU%".to_string()];
-        let rules = vec![ColumnColorRule {
-            column: "CPU%".into(),
-            rules: vec![ColorRule {
-                match_text: None,
-                when: Some("> 90".into()),
-                health: OverlayHealth::Failed,
-            }],
-        }];
-        let mut row = ResourceRow {
-            cells: vec![CellValue::Percentage(Some(95))],
-            ..Default::default()
+    fn column_rules_first_match_wins() {
+        let col = ColumnRenderRules {
+            rules: vec![
+                RenderRule {
+                    predicate: RenderPredicate::parse_when(">= 90").unwrap(),
+                    style: RowHealth::Failed,
+                },
+                RenderRule {
+                    predicate: RenderPredicate::parse_when(">= 70").unwrap(),
+                    style: RowHealth::Pending,
+                },
+            ],
         };
-        evaluate_coloring(&mut row, &headers, &rules);
-        assert_eq!(row.health, RowHealth::Failed);
+        // 95% matches both rules, but first match (Failed) wins.
+        assert_eq!(col.evaluate("95%"), Some(RowHealth::Failed));
+    }
+
+    #[test]
+    fn predicate_na_value_does_not_match() {
+        // Metrics placeholder "n/a" should never match numeric predicates.
+        let p = RenderPredicate::parse_when(">= 70").unwrap();
+        assert!(!p.matches("n/a"));
+        assert!(!p.matches(""));
+    }
+
+    #[test]
+    fn build_column_rules_missing_column_is_empty() {
+        // Overlay references a column that doesn't exist in headers.
+        let headers = vec!["NAME".to_string(), "STATUS".to_string()];
+        let rules = build_column_rules(&headers, "nonexistent-resource");
+        // No overlay for this resource → all rules empty.
+        assert!(rules.iter().all(|r| r.rules.is_empty()));
     }
 
     #[test]

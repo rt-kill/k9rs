@@ -224,15 +224,9 @@ where
             api,
             args.snapshot_tx,
             convert,
-            move |mut rows| {
-                // Apply overlay coloring rules for built-in resources.
-                if let Some(overlay) = crate::kube::overlay::overlay_for(resource_id.plural()) {
-                    if !overlay.coloring.is_empty() {
-                        for row in &mut rows {
-                            crate::kube::overlay::evaluate_coloring(row, &headers, &overlay.coloring);
-                        }
-                    }
-                }
+            move |rows| {
+                // Overlay coloring evaluation moved to client side
+                // (prepare_view) where metrics are already populated.
                 ResourceUpdate::Rows {
                     resource: resource_id.clone(),
                     headers: headers.clone(),

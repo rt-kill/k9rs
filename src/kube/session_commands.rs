@@ -593,29 +593,25 @@ pub(crate) fn handle_filter_key(
     key: KeyEvent,
     data_source: &mut ClientSession,
 ) -> bool {
-    if !app.nav.filter_input().active {
+    if !app.nav.filter_input().active() {
         return false;
     }
     match key.code {
         KeyCode::Esc => {
-            app.nav.filter_input_mut().text.clear();
-            app.nav.filter_input_mut().active = false;
+            app.nav.filter_input_mut().cancel();
             app.reapply_nav_filters();
         }
         KeyCode::Enter => {
-            let text = std::mem::take(&mut app.nav.filter_input_mut().text);
-            let col = app.nav.filter_input_mut().column.take();
-            app.nav.filter_input_mut().active = false;
-            if !text.is_empty() {
+            if let Some(committed) = app.nav.filter_input_mut().commit() {
                 let current_rid = app.nav.resource_id().clone();
-                let filter = if let Some(c) = col {
+                let filter = if let Some(c) = committed.column {
                     crate::app::nav::NavFilter::ColumnGrep {
-                        pattern: crate::app::nav::CompiledGrep::new(text),
+                        pattern: crate::app::nav::CompiledGrep::new(committed.text),
                         col: c,
                     }
                 } else {
                     crate::app::nav::NavFilter::Grep(
-                        crate::app::nav::CompiledGrep::new(text),
+                        crate::app::nav::CompiledGrep::new(committed.text),
                     )
                 };
                 let change = app.nav.push(crate::app::nav::NavStep::new(
@@ -626,12 +622,12 @@ pub(crate) fn handle_filter_key(
             }
             app.reapply_nav_filters();
         }
-        KeyCode::Backspace | KeyCode::Char(_) => {
-            match key.code {
-                KeyCode::Backspace => { app.nav.filter_input_mut().text.pop(); }
-                KeyCode::Char(c) => { app.nav.filter_input_mut().text.push(c); }
-                _ => {}
-            }
+        KeyCode::Backspace => {
+            app.nav.filter_input_mut().pop_char();
+            app.reapply_nav_filters();
+        }
+        KeyCode::Char(c) => {
+            app.nav.filter_input_mut().push_char(c);
             // The nav layer is the only source of truth for filter text;
             // re-derive the visible row set from the updated input. This
             // also refreshes the marked-visible cache.
@@ -649,7 +645,7 @@ mod parser_tests {
     use crate::kube::resource_def::BuiltInKind;
 
     fn make_app() -> App {
-        App::new(crate::kube::protocol::ContextName::default(), String::new())
+        App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All)
     }
 
     fn parse(input: &str) -> ParsedCommand {

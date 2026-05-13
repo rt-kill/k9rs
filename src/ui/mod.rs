@@ -140,7 +140,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if app.ui.input_mode.is_active() {
             draw_command_overlay(f, app);
         }
-        if app.nav.filter_input().active {
+        if app.nav.filter_input().active() {
             draw_filter_overlay(f, app);
         }
     }
@@ -405,10 +405,10 @@ fn draw_filter_overlay(f: &mut Frame, app: &App) {
     Clear.render(overlay_area, f.buffer_mut());
 
     let counts = app.active_table_items_count();
-    let match_count = if app.nav.filter_input().text.is_empty() { counts.total } else { counts.filtered };
+    let match_count = if app.nav.filter_input().text().is_empty() { counts.total } else { counts.filtered };
     let filter_bar = FilterBar::new(
-        app.nav.filter_input().active,
-        &app.nav.filter_input().text,
+        app.nav.filter_input().active(),
+        app.nav.filter_input().text(),
         match_count,
         counts.total,
         theme,

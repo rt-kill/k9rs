@@ -161,7 +161,8 @@ pub(crate) fn handle_action(
             if !app.current_capabilities().supports(crate::kube::protocol::OperationKind::PortForward) {
                 return ActionResult::None;
             }
-            let schema = crate::kube::protocol::OperationKind::PortForward.form_schema().unwrap();
+            let schema = crate::kube::protocol::OperationKind::PortForward.form_schema()
+                .expect("PortForward always has a form schema");
             let row = app.active_view_table().and_then(|t| t.selected_item());
             let desc = app.active_view_descriptor();
             if let Some(info) = get_selected_resource_info(app) {
@@ -376,7 +377,7 @@ fn handle_resource_op(
                         });
                     } else {
                         let container = containers.first().map(|c| c.name.clone()).unwrap_or_default();
-                        return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget {
+                        return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget::Pod {
                             pod: pod_name,
                             namespace: pod_ns,
                             container,
@@ -420,7 +421,8 @@ fn handle_resource_op(
         }
         Action::Scale => {
             if let Some(info) = get_selected_resource_info(app) {
-                let schema = crate::kube::protocol::OperationKind::Scale.form_schema().unwrap();
+                let schema = crate::kube::protocol::OperationKind::Scale.form_schema()
+                    .expect("Scale always has a form schema");
                 let row = app.active_view_table().and_then(|t| t.selected_item());
                 let desc = app.active_view_descriptor();
                 if let Some(dialog) = build_form_from_schema(schema, crate::kube::protocol::OperationKind::Scale, info, row, desc) {
@@ -567,10 +569,7 @@ fn handle_filter_search(
     match action {
         Action::Filter(_) => {
             if matches!(app.route, Route::Resources) {
-                let fi = app.nav.filter_input_mut();
-                fi.active = true;
-                fi.text.clear();
-                fi.column = None;
+                app.nav.filter_input_mut().start();
             } else if let Route::Logs { ref mut state, .. } = app.route {
                 state.start_filter();
             }
@@ -578,17 +577,14 @@ fn handle_filter_search(
         Action::ColumnFilter => {
             if matches!(app.route, Route::Resources) {
                 let col = app.active_table_selected_col();
-                let fi = app.nav.filter_input_mut();
-                fi.active = true;
-                fi.text.clear();
-                fi.column = Some(col);
+                app.nav.filter_input_mut().start_column(col);
             }
         }
         Action::ClearFilter => {
             if let Route::Logs { ref mut state, .. } = app.route {
                 if state.is_filtering() {
                     state.cancel_filter();
-                } else if !state.filters.is_empty() {
+                } else if !state.filters().is_empty() {
                     state.pop_filter();
                 }
             } else if let Some((popped, change)) = app.nav.pop() {
@@ -645,12 +641,12 @@ fn handle_filter_search(
                 }
                 Route::Logs { ref mut state, .. } => {
                     let current_scroll = state.scroll;
-                    if let Some(&next_idx) = state.filtered_indices.iter()
+                    if let Some(&next_idx) = state.filtered_indices().iter()
                         .find(|&&idx| idx > current_scroll)
                     {
                         state.scroll = next_idx;
                         state.follow = false;
-                    } else if let Some(&first) = state.filtered_indices.first() {
+                    } else if let Some(&first) = state.filtered_indices().first() {
                         state.scroll = first;
                         state.follow = false;
                     }
@@ -665,12 +661,12 @@ fn handle_filter_search(
                 }
                 Route::Logs { ref mut state, .. } => {
                     let current_scroll = state.scroll;
-                    if let Some(&prev_idx) = state.filtered_indices.iter().rev()
+                    if let Some(&prev_idx) = state.filtered_indices().iter().rev()
                         .find(|&&idx| idx < current_scroll)
                     {
                         state.scroll = prev_idx;
                         state.follow = false;
-                    } else if let Some(&last) = state.filtered_indices.last() {
+                    } else if let Some(&last) = state.filtered_indices().last() {
                         state.scroll = last;
                         state.follow = false;
                     }
@@ -770,7 +766,7 @@ fn handle_log_action(
                     safe(&target.pod), safe(target.container_label()),
                     chrono::Utc::now().format("%Y%m%d-%H%M%S"),
                 );
-                let content: String = state.lines.iter()
+                let content: String = state.lines().iter()
                     .cloned()
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -878,11 +874,7 @@ fn handle_drill(
                 let node = row.name.clone();
                 return ActionResult::Exec {
                     op: crate::kube::protocol::OperationKind::NodeShell,
-                    target: crate::kube::session::ExecTarget {
-                        pod: node,
-                        namespace: String::new(),
-                        container: String::new(),
-                    },
+                    target: crate::kube::session::ExecTarget::Node { node },
                 };
             }
         }
@@ -898,7 +890,7 @@ fn handle_drill(
                         .and_then(|t| t.selected_item())
                         .and_then(|row| {
                             let desc = app.active_view_descriptor()?;
-                            let col_idx = desc.headers.iter()
+                            let col_idx = desc.headers().iter()
                                 .position(|h| h.eq_ignore_ascii_case(column))?;
                             row.cells.get(col_idx).map(|c| c.to_string())
                         });
@@ -959,11 +951,11 @@ fn handle_io(
                     }
                 }
                 Route::Logs { ref state, .. } => {
-                    if state.lines.is_empty() {
+                    if state.lines().is_empty() {
                         (String::new(), String::new())
                     } else {
-                        let joined: String = state.lines.iter().cloned().collect::<Vec<_>>().join("\n");
-                        let count = state.lines.len();
+                        let joined: String = state.lines().iter().cloned().collect::<Vec<_>>().join("\n");
+                        let count = state.lines().len();
                         (joined, format!("Copied {} lines to clipboard", count))
                     }
                 }
@@ -1143,7 +1135,7 @@ pub(crate) fn handle_enter(
 
         if matches!(action, crate::app::ContainerAction::Shell) {
             app.route = app.route_stack.pop().unwrap_or(Route::Resources);
-            return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget {
+            return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget::Pod {
                 pod: target.name,
                 namespace: pod_ns_str,
                 container: container_name,

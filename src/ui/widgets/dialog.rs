@@ -143,7 +143,7 @@ impl Widget for FormDialogWidget<'_> {
             for (idx, field) in dialog.fields.iter().enumerate() {
                 if y >= content.y + content.height { break; }
                 let focused = dialog.focused == idx;
-                render_form_field(buf, content.x, y, content.width, label_col, field, focused, theme);
+                render_form_field(buf, FieldLayout { x: content.x, y, width: content.width, label_col }, field, focused, theme);
                 y += 1;
             }
             y += 1;
@@ -166,29 +166,38 @@ impl Widget for FormDialogWidget<'_> {
     }
 }
 
+/// Layout parameters for rendering a form field row. Bundles the
+/// positional values so `render_form_field` stays under the arg limit.
+struct FieldLayout {
+    x: u16,
+    y: u16,
+    width: u16,
+    label_col: u16,
+}
+
 /// Render a single form field row: label + input control.
 fn render_form_field(
     buf: &mut Buffer,
-    x: u16, y: u16, width: u16, label_col: u16,
+    layout: FieldLayout,
     field: &FormFieldState, focused: bool, theme: &Theme,
 ) {
-    buf.set_line(x, y, &Line::from(Span::styled(field.label.as_str(), theme.info_label)), width);
-    let vx = x + label_col;
-    let vw = width.saturating_sub(label_col);
+    buf.set_line(layout.x, layout.y, &Line::from(Span::styled(field.label.as_str(), theme.info_label)), layout.width);
+    let vx = layout.x + layout.label_col;
+    let vw = layout.width.saturating_sub(layout.label_col);
     if vw == 0 { return; }
     match &field.kind {
         FormFieldKind::Text { .. } | FormFieldKind::Number { .. } | FormFieldKind::Port => {
             let style = if focused { theme.filter } else { theme.info_value };
             let mut spans = vec![Span::styled(field.value.as_str(), style)];
             if focused { spans.push(Span::styled("\u{2588}", theme.filter)); }
-            buf.set_line(vx, y, &Line::from(spans), vw);
+            buf.set_line(vx, layout.y, &Line::from(spans), vw);
         }
         FormFieldKind::Select { options } => {
             let idx: usize = field.value.parse().unwrap_or(0);
             let display = options.get(idx).map(|o| o.label.as_str()).unwrap_or("(none)");
             let style = if focused { theme.filter } else { theme.info_value };
             let arrows = if focused { (" \u{25c0} ", " \u{25b6}") } else { ("   ", "  ") };
-            buf.set_line(vx, y, &Line::from(vec![
+            buf.set_line(vx, layout.y, &Line::from(vec![
                 Span::styled(arrows.0, theme.info_label),
                 Span::styled(display, style),
                 Span::styled(arrows.1, theme.info_label),

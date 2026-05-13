@@ -351,7 +351,7 @@ fn handle_log_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Esc => {
             let has_log_filters = match &app.route {
                 Route::Logs { ref state, .. } => {
-                    state.is_filtering() || !state.filters.is_empty()
+                    state.is_filtering() || !state.filters().is_empty()
                 }
                 _ => false,
             };

@@ -208,10 +208,11 @@ impl ResourceDef for PodDef {
     fn aliases(&self) -> &[&str] { &["po", "pod", "pods"] }
     fn short_label(&self) -> &str { "Pods" }
     fn default_headers(&self) -> Vec<String> {
+        // Order must match column_defs() and the cells vec in convert().
         ["NAMESPACE", "NAME", "READY", "STATUS", "RESTARTS", "LAST RESTART",
-         "CPU", "MEM",
+         "CPU", "%CPU/R", "%CPU/L",
+         "MEM", "%MEM/R", "%MEM/L",
          "CPU/R", "CPU/L", "MEM/R", "MEM/L",
-         "%CPU/R", "%CPU/L", "%MEM/R", "%MEM/L",
          "IP", "NODE", "NOMINATED NODE",
          "QOS", "SERVICE-ACCOUNT",
          "READINESS GATES", "LABELS", "AGE"]
@@ -222,15 +223,18 @@ impl ResourceDef for PodDef {
     fn column_defs(&self) -> Vec<ColumnDef> {
         use ColumnDef as C;
         use MetricsColumn::*;
+        // Column levels match k9s: percentage metrics are default-visible,
+        // absolute request/limit and lifecycle details are extra/wide.
         vec![
             C::new("NAMESPACE"), C::new("NAME"), C::new("READY"), C::new("STATUS"),
-            C::new("RESTARTS"), C::age("LAST RESTART"),
-            C::new("CPU").with_metrics(Cpu), C::new("MEM").with_metrics(Mem),
+            C::new("RESTARTS"), C::extra_age("LAST RESTART"),
+            C::new("CPU").with_metrics(Cpu),
+            C::new("%CPU/R").with_metrics(CpuPercentRequest),
+            C::new("%CPU/L").with_metrics(CpuPercentLimit),
+            C::new("MEM").with_metrics(Mem),
+            C::new("%MEM/R").with_metrics(MemPercentRequest),
+            C::new("%MEM/L").with_metrics(MemPercentLimit),
             C::extra("CPU/R"), C::extra("CPU/L"), C::extra("MEM/R"), C::extra("MEM/L"),
-            C::extra("%CPU/R").with_metrics(CpuPercentRequest),
-            C::extra("%CPU/L").with_metrics(CpuPercentLimit),
-            C::extra("%MEM/R").with_metrics(MemPercentRequest),
-            C::extra("%MEM/L").with_metrics(MemPercentLimit),
             C::new("IP"), C::new("NODE"), C::extra("NOMINATED NODE"),
             C::extra("QOS"),
             C::extra("SERVICE-ACCOUNT"), C::extra("READINESS GATES"),
@@ -458,6 +462,7 @@ impl ConvertToRow<Pod> for PodDef {
     // `health` was computed by `compute_pod_status` above — no string
     // round-trip re-classification.
 
+    // Cell order must match default_headers() and column_defs().
     let cells: Vec<CellValue> = vec![
         CellValue::Text(namespace.clone()),
         CellValue::Text(name.clone()),
@@ -466,15 +471,15 @@ impl ConvertToRow<Pod> for PodDef {
         CellValue::Count(restarts as i64),
         CellValue::Age(last_restart.map(|t| t.timestamp())),
         CellValue::Placeholder,                                     // CPU (metrics overlay)
+        CellValue::Percentage(None),                                // %CPU/R (metrics overlay)
+        CellValue::Percentage(None),                                // %CPU/L (metrics overlay)
         CellValue::Placeholder,                                     // MEM (metrics overlay)
+        CellValue::Percentage(None),                                // %MEM/R (metrics overlay)
+        CellValue::Percentage(None),                                // %MEM/L (metrics overlay)
         if has_cpu_req { CellValue::Quantity { value: cpu_req_milli, unit: QuantityUnit::Millicores } } else { CellValue::Text(String::new()) },
         if has_cpu_lim { CellValue::Quantity { value: cpu_lim_milli, unit: QuantityUnit::Millicores } } else { CellValue::Text(String::new()) },
         if has_mem_req { CellValue::Quantity { value: mem_req_bytes, unit: QuantityUnit::Bytes } } else { CellValue::Text(String::new()) },
         if has_mem_lim { CellValue::Quantity { value: mem_lim_bytes, unit: QuantityUnit::Bytes } } else { CellValue::Text(String::new()) },
-        CellValue::Percentage(None),                                // %CPU/R (metrics overlay)
-        CellValue::Percentage(None),                                // %CPU/L (metrics overlay)
-        CellValue::Percentage(None),                                // %MEM/R (metrics overlay)
-        CellValue::Percentage(None),                                // %MEM/L (metrics overlay)
         CellValue::Text(pod_ip),
         CellValue::Text(node_display),
         CellValue::Text(nominated_node),

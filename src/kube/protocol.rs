@@ -767,7 +767,7 @@ pub enum ExecArg {
     ConditionalPair(&'static str, ExecPlaceholder),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum ExecPlaceholder {
     Namespace,
     PodName,

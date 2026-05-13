@@ -20,16 +20,46 @@ pub struct SearchPattern {
     case_insensitive: bool,
 }
 
+/// Escape characters that are regex metacharacters in PCRE/Rust but
+/// literal in vim's default magic mode. Vim magic treats `. * ^ $ [ ] \`
+/// as special (same as PCRE), but `+ ? { } ( ) |` are literal in vim
+/// (they require `\+`, `\(`, etc. to be special). This function escapes
+/// the latter set so the regex engine treats them as literal, matching
+/// vim's behavior.
+fn vim_magic_escape(pattern: &str) -> String {
+    let mut result = String::with_capacity(pattern.len() + 8);
+    for ch in pattern.chars() {
+        match ch {
+            '+' | '?' | '{' | '}' | '(' | ')' | '|' => {
+                result.push('\\');
+                result.push(ch);
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
 impl SearchPattern {
-    /// Compile a search pattern with smartcase.
+    /// Compile a search pattern with vim-style smartcase and magic mode.
+    ///
+    /// Smartcase: pattern is case-insensitive unless it contains an
+    /// uppercase letter (same as vim's `set smartcase`).
+    ///
+    /// Magic mode: `. * ^ $ [ ] \` are regex-special (same as vim),
+    /// but `+ ? { } ( ) |` are treated as literals (vim requires `\+`
+    /// etc. to make them special). Users get intuitive substring search
+    /// with basic regex power (`.` = any, `*` = repeat, `^`/`$` = anchors)
+    /// without PCRE surprises.
     pub fn new(pattern: &str) -> Self {
         let has_upper = pattern.chars().any(|c| c.is_uppercase());
         let case_insensitive = !has_upper;
 
+        let escaped = vim_magic_escape(pattern);
         let regex_pattern = if case_insensitive {
-            format!("(?i){}", pattern)
+            format!("(?i){}", escaped)
         } else {
-            pattern.to_string()
+            escaped
         };
 
         let regex = regex::Regex::new(&regex_pattern).ok();
@@ -563,5 +593,67 @@ mod tests {
     #[test]
     fn test_truncate_zero() {
         assert_eq!(truncate("hello", 0), "");
+    }
+
+    // -- vim magic mode tests -------------------------------------------------
+
+    #[test]
+    fn vim_magic_literal_dash() {
+        let pat = SearchPattern::new("-wal");
+        assert!(pat.is_match("kube-wallet"));
+        assert!(!pat.is_match("firewall-proxy")); // wall-, not -wal
+    }
+
+    #[test]
+    fn vim_magic_dot_is_special() {
+        let pat = SearchPattern::new("foo.bar");
+        assert!(pat.is_match("foo-bar")); // . matches any char
+        assert!(pat.is_match("foo.bar"));
+    }
+
+    #[test]
+    fn vim_magic_star_is_special() {
+        let pat = SearchPattern::new("ng.*proxy");
+        assert!(pat.is_match("nginx-proxy"));
+        assert!(pat.is_match("ngproxy")); // .* matches zero chars
+    }
+
+    #[test]
+    fn vim_magic_parens_are_literal() {
+        let pat = SearchPattern::new("foo(bar)");
+        assert!(pat.is_match("foo(bar)"));
+        assert!(!pat.is_match("foobar")); // parens NOT a capture group
+    }
+
+    #[test]
+    fn vim_magic_plus_is_literal() {
+        let pat = SearchPattern::new("a+b");
+        assert!(pat.is_match("a+b"));
+        assert!(!pat.is_match("aab")); // + NOT a quantifier
+    }
+
+    #[test]
+    fn vim_magic_pipe_is_literal() {
+        let pat = SearchPattern::new("a|b");
+        assert!(pat.is_match("a|b"));
+        assert!(!pat.is_match("a")); // | NOT alternation
+        assert!(!pat.is_match("b"));
+    }
+
+    #[test]
+    fn vim_magic_question_is_literal() {
+        let pat = SearchPattern::new("a?b");
+        assert!(pat.is_match("a?b"));
+        assert!(!pat.is_match("ab")); // ? NOT optional
+        assert!(!pat.is_match("b"));
+    }
+
+    #[test]
+    fn vim_magic_smartcase() {
+        let lower = SearchPattern::new("nginx");
+        assert!(lower.is_match("NGINX")); // case-insensitive
+        let upper = SearchPattern::new("Nginx");
+        assert!(!upper.is_match("nginx")); // case-sensitive
+        assert!(upper.is_match("Nginx"));
     }
 }

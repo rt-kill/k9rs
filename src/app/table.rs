@@ -6,6 +6,34 @@ use crate::kube::resources::KubeResource;
 use super::types::ItemCounts;
 
 // ---------------------------------------------------------------------------
+// TableDataState — lifecycle state for table data
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state of a resource table. Replaces the prior triple of
+/// `has_data: bool` + `loading: bool` + `error: Option<String>` — same
+/// pattern as [`crate::app::ContextSwitchState`] and
+/// [`crate::app::EditState`].
+///
+/// Transitions:
+/// - `Initializing` → `Ready` (first snapshot arrives via `set_items_filtered`)
+/// - `Ready` → `Initializing` (context switch / namespace switch clears data)
+/// - `Ready` → `Failed` (subscription error arrives)
+/// - `Failed` → `Initializing` (clear_data resets)
+/// - `Initializing` → `Failed` (subscription fails before first snapshot)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TableDataState {
+    /// No snapshot received yet. The UI shows a loading spinner.
+    #[default]
+    Initializing,
+    /// At least one snapshot has been received. The table may be empty
+    /// (zero matching resources), but the server has responded.
+    Ready,
+    /// The subscription failed. The UI shows this error message instead
+    /// of the loading spinner.
+    Failed(String),
+}
+
+// ---------------------------------------------------------------------------
 // TableNav trait — allows App to dispatch navigation to any StatefulTable
 // ---------------------------------------------------------------------------
 
@@ -120,15 +148,12 @@ pub struct StatefulTable<T: Clone> {
     sort_column: usize,
     sort_ascending: bool,
     page_size: usize,
-    /// Whether this table has received any response from the watcher.
-    /// Used to distinguish "loading" (false) from "empty" (true + no items) in the UI.
-    pub has_data: bool,
-    /// Whether the initial list is still streaming in (InitApply phase).
-    /// When true, the title shows a loading indicator alongside the count.
-    pub loading: bool,
-    /// Error message if the subscription failed (e.g., resource doesn't exist).
-    /// When set, the UI shows this instead of the loading spinner.
-    pub error: Option<String>,
+    /// Lifecycle state of this table's data. Replaces the prior triple of
+    /// `has_data: bool` + `loading: bool` + `error: Option<String>` with a
+    /// single source of truth — same pattern as `ContextSwitchState` and
+    /// `EditState`. Impossible states (e.g. "has data AND has error") are
+    /// unrepresentable.
+    pub data_state: TableDataState,
     /// Number of columns in the table (from headers/descriptor). Used to
     /// clamp `selected_col` so it can't drift past the last column.
     num_cols: usize,
@@ -150,9 +175,7 @@ impl<T: Clone> Default for StatefulTable<T> {
             sort_column: 0,
             sort_ascending: true,
             page_size: 40,
-            has_data: false,
-            loading: false,
-            error: None,
+            data_state: TableDataState::Initializing,
             num_cols: 0,
             marked: HashSet::new(),
         }
@@ -257,7 +280,7 @@ impl<T: Clone> StatefulTable<T> {
     }
 
     pub fn set_items(&mut self, items: Vec<T>) {
-        self.has_data = true;
+        self.data_state = TableDataState::Ready;
         self.items = items;
         self.filtered_indices = (0..self.items.len()).collect();
         self.clamp_selection();
@@ -273,15 +296,13 @@ impl<T: Clone> StatefulTable<T> {
         self.adjust_offset();
     }
 
-    /// Clear all data and reset `has_data` to false.
+    /// Clear all data and reset to `Initializing` state.
     pub fn clear_data(&mut self) {
         self.items.clear();
         self.filtered_indices.clear();
         self.selected = 0;
         self.offset = 0;
-        self.has_data = false;
-        self.loading = false;
-        self.error = None;
+        self.data_state = TableDataState::Initializing;
         self.marked.clear();
     }
 
@@ -378,19 +399,10 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
         self.adjust_offset();
     }
 
-    /// Mark the table as having received data. `loading` becomes false on
-    /// the first snapshot — the user sees the count increasing in the title
-    /// as the initial list streams in, which is sufficient progress feedback.
-    ///
-    /// The previous heuristic tried to detect "still streaming" by checking
-    /// whether the item count was still growing, and only cleared `loading`
-    /// when the count stopped increasing. This broke on large initial lists
-    /// (9k+ pods) because after the final snapshot no further snapshots
-    /// arrive in steady state — the "count stopped growing" condition never
-    /// fires and the table stays in "loading" forever.
+    /// Mark the table as having received data. Transitions from
+    /// `Initializing` (or `Failed`) to `Ready`.
     fn update_loading(&mut self, _new_count: usize) {
-        self.loading = false;
-        self.has_data = true;
+        self.data_state = TableDataState::Ready;
     }
 
     /// Sort items by the current sort column with a stable tiebreaker.
@@ -438,16 +450,28 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
 pub struct PreparedView {
     pub rows: Vec<Vec<String>>,
     pub health: Vec<crate::kube::resources::row::RowHealth>,
+    /// Per-cell rendering style. `cell_style[row][col]` is `Some(h)` if
+    /// that specific cell has its own coloring (from overlay rules or
+    /// `CellValue::Status`), `None` to inherit the row's style.
+    pub cell_style: Vec<Vec<Option<crate::kube::resources::row::RowHealth>>>,
     pub keys: Vec<crate::kube::protocol::ObjectKey>,
 }
 
 impl StatefulTable<crate::kube::resources::row::ResourceRow> {
-    /// Prepare the visible rows for rendering. Walks `filtered_indices`,
-    /// projects each row's cells through `visible_col_indices` (the
-    /// display-level-filtered column set), and collects health + identity
-    /// keys alongside. The caller passes the result to the table widget
-    /// — no index arithmetic or ObjectKey allocation in the render path.
-    pub fn prepare_view(&self, visible_col_indices: &[usize]) -> PreparedView {
+    /// Prepare the visible rows for rendering. Evaluates pre-resolved
+    /// column render rules against final cell values (including metrics).
+    ///
+    /// Follows the form system pattern: rules are resolved once from
+    /// shared overlay config (analogous to `FormSchema`), passed in as
+    /// `column_rules` (analogous to `FormFieldKind`), and evaluated
+    /// generically against each cell's display value.
+    pub fn prepare_view(
+        &self,
+        visible_col_indices: &[usize],
+        column_rules: &[crate::kube::overlay::ColumnRenderRules],
+    ) -> PreparedView {
+        use crate::kube::resources::row::{CellValue, RowHealth};
+
         let items: Vec<&crate::kube::resources::row::ResourceRow> = self.filtered_indices.iter()
             .filter_map(|&i| self.items.get(i))
             .collect();
@@ -456,6 +480,29 @@ impl StatefulTable<crate::kube::resources::row::ResourceRow> {
                 visible_col_indices.iter()
                     .map(|&ci| r.cells.get(ci).map(|c| c.to_string()).unwrap_or_default())
                     .collect()
+            }).collect(),
+            // Per-cell rendering: zip each visible cell with its column's
+            // pre-resolved rules, evaluate, then check CellValue::Status.
+            cell_style: items.iter().map(|r| {
+                visible_col_indices.iter().map(|&ci| {
+                    // 1. Column render rules (from overlay config).
+                    if let Some(col_rules) = column_rules.get(ci) {
+                        if let Some(cell) = r.cells.get(ci) {
+                            let cell_str = cell.to_string();
+                            if let Some(style) = col_rules.evaluate(&cell_str) {
+                                return Some(style);
+                            }
+                        }
+                    }
+                    // 2. CellValue::Status { health } from the converter.
+                    if let Some(CellValue::Status { health, .. }) = r.cells.get(ci) {
+                        if *health != RowHealth::Normal {
+                            return Some(*health);
+                        }
+                    }
+                    // 3. None = inherit row style.
+                    None
+                }).collect()
             }).collect(),
             health: items.iter().map(|r| r.health).collect(),
             keys: items.iter().map(|r| {
@@ -888,7 +935,7 @@ mod tests {
         t.set_items(vec![row("a", "ns"), row("b", "ns")]);
         assert_eq!(t.len(), 2);
         assert_eq!(t.total(), 2);
-        assert!(t.has_data);
+        assert!(matches!(t.data_state, TableDataState::Ready));
     }
 
     #[test]
@@ -910,7 +957,7 @@ mod tests {
         assert_eq!(t.len(), 0);
         assert_eq!(t.selected(), 0);
         assert_eq!(t.offset(), 0);
-        assert!(!t.has_data);
+        assert!(matches!(t.data_state, TableDataState::Initializing));
         assert!(t.marked.is_empty());
     }
 

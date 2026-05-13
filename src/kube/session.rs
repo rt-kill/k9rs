@@ -58,14 +58,22 @@ pub(crate) enum ActionResult {
     },
 }
 
-/// Identifies a pod + container for an interactive exec session via
-/// `kubectl exec`. Uses SPDY protocol which works universally, unlike
-/// kube-rs's WebSocket-only exec which fails on many proxied clusters.
+/// Target for an interactive exec session. Two disjoint shapes — a pod
+/// shell needs `(pod, namespace, container)` while a node debug shell
+/// needs only the node name. The enum makes this distinction structural
+/// instead of encoding "not applicable" as empty strings.
 #[derive(Debug, Clone)]
-pub(crate) struct ExecTarget {
-    pub pod: String,
-    pub namespace: String,
-    pub container: String,
+pub(crate) enum ExecTarget {
+    /// `kubectl exec -it -n <ns> <pod> -c <container> -- sh`
+    Pod {
+        pod: String,
+        namespace: String,
+        container: String,
+    },
+    /// `kubectl debug node/<node> -it --image=busybox`
+    Node {
+        node: String,
+    },
 }
 
 /// Auto-subscriptions that the TUI opens once the daemon connection is ready.
@@ -404,31 +412,43 @@ fn build_exec_init(
         match arg {
             ExecArg::Literal(s) => args.push(s.to_string()),
             ExecArg::Placeholder(p) => {
-                args.push(resolve_placeholder(p, target));
+                if let Some(val) = resolve_placeholder(p, target) {
+                    args.push(val);
+                }
             }
             ExecArg::ConditionalPair(lit, p) => {
-                let val = resolve_placeholder(p, target);
-                if !val.is_empty() {
-                    args.push(lit.to_string());
-                    args.push(val);
+                if let Some(val) = resolve_placeholder(p, target) {
+                    if !val.is_empty() {
+                        args.push(lit.to_string());
+                        args.push(val);
+                    }
                 }
             }
         }
     }
-    let title = template.title_template
-        .replace("{{pod}}", &target.pod)
-        .replace("{{container}}", &target.container)
-        .replace("{{node}}", &target.pod);
+    let title = match target {
+        ExecTarget::Pod { pod, container, .. } => template.title_template
+            .replace("{{pod}}", pod)
+            .replace("{{container}}", container),
+        ExecTarget::Node { node } => template.title_template
+            .replace("{{node}}", node),
+    };
     (crate::kube::protocol::ExecInit { kubectl_args: args, term_width: tw, term_height: th }, title)
 }
 
-fn resolve_placeholder(p: &crate::kube::protocol::ExecPlaceholder, target: &ExecTarget) -> String {
+/// Resolve a placeholder against the exec target. Returns `None` if the
+/// placeholder doesn't apply to this target variant (e.g., `Namespace`
+/// on a `Node` target) — the caller skips it instead of inserting an
+/// empty string.
+fn resolve_placeholder(p: &crate::kube::protocol::ExecPlaceholder, target: &ExecTarget) -> Option<String> {
     use crate::kube::protocol::ExecPlaceholder;
-    match p {
-        ExecPlaceholder::Namespace => target.namespace.clone(),
-        ExecPlaceholder::PodName => target.pod.clone(),
-        ExecPlaceholder::Container => target.container.clone(),
-        ExecPlaceholder::NodeName => format!("node/{}", target.pod),
+    match (p, target) {
+        (ExecPlaceholder::Namespace, ExecTarget::Pod { namespace, .. }) => Some(namespace.clone()),
+        (ExecPlaceholder::PodName, ExecTarget::Pod { pod, .. }) => Some(pod.clone()),
+        (ExecPlaceholder::Container, ExecTarget::Pod { container, .. }) => Some(container.clone()),
+        (ExecPlaceholder::NodeName, ExecTarget::Node { node }) => Some(format!("node/{}", node)),
+        // Placeholder doesn't apply to this target variant.
+        _ => None,
     }
 }
 
@@ -615,16 +635,77 @@ pub(crate) fn apply_nav_change(app: &mut App, data_source: &mut ClientSession, c
     }
 }
 
+/// Channels for the input bridge: keypress delivery and suspend/resume.
+/// Bundles the three related channels so `session_main` stays under the
+/// arg limit.
+#[derive(Debug)]
+pub struct InputChannels {
+    pub input_rx: mpsc::Receiver<CtEvent>,
+    pub suspend_tx: tokio::sync::watch::Sender<bool>,
+    pub suspend_ack_rx: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kube::protocol::ExecPlaceholder;
+
+    fn pod_target() -> ExecTarget {
+        ExecTarget::Pod {
+            pod: "my-pod".into(),
+            namespace: "default".into(),
+            container: "nginx".into(),
+        }
+    }
+
+    fn node_target() -> ExecTarget {
+        ExecTarget::Node { node: "worker-1".into() }
+    }
+
+    #[test]
+    fn resolve_namespace_on_pod() {
+        let result = resolve_placeholder(&ExecPlaceholder::Namespace, &pod_target());
+        assert_eq!(result, Some("default".into()));
+    }
+
+    #[test]
+    fn resolve_namespace_on_node_returns_none() {
+        let result = resolve_placeholder(&ExecPlaceholder::Namespace, &node_target());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_node_name_on_node() {
+        let result = resolve_placeholder(&ExecPlaceholder::NodeName, &node_target());
+        assert_eq!(result, Some("node/worker-1".into()));
+    }
+
+    #[test]
+    fn resolve_pod_name_on_node_returns_none() {
+        let result = resolve_placeholder(&ExecPlaceholder::PodName, &node_target());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_container_on_pod_with_empty_container() {
+        let target = ExecTarget::Pod {
+            pod: "p".into(),
+            namespace: "ns".into(),
+            container: String::new(),
+        };
+        let result = resolve_placeholder(&ExecPlaceholder::Container, &target);
+        assert_eq!(result, Some(String::new()), "empty container is valid — ConditionalPair skips it");
+    }
+}
+
 pub async fn session_main(
     mut app: App,
     mut data_source: ClientSession,
     mut terminal: ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
     mut event_tx: mpsc::Sender<AppEvent>,
     mut event_rx: mpsc::Receiver<AppEvent>,
-    mut input_rx: mpsc::Receiver<CtEvent>,
     tick_rate: Duration,
-    input_suspend: tokio::sync::watch::Sender<bool>,
-    mut input_suspend_ack: mpsc::Receiver<()>,
+    mut input: InputChannels,
 ) -> Result<Option<crate::app::ExitReason>> {
     // Track active log streaming substream so we can cancel on Back.
     // Drop = close substream = daemon kills kubectl = log stream ended.
@@ -709,7 +790,7 @@ pub async fn session_main(
                 || app.ui.form_dialog.as_ref().is_some_and(|d| {
                     d.fields.get(d.focused).is_some_and(|field| field.is_text_input())
                 })
-                || app.nav.filter_input().active
+                || app.nav.filter_input().active()
                 || route_has_text_input;
             if in_input_mode {
                 execute!(terminal.backend_mut(), SetCursorStyle::SteadyBar)?;
@@ -723,7 +804,7 @@ pub async fn session_main(
         // Unified edit flow: if route is EditorReady, run the editor.
         if run_editor_flow(
             &mut app, &mut terminal, &mut data_source,
-            &input_suspend, &mut input_suspend_ack,
+            &input.suspend_tx, &mut input.suspend_ack_rx,
         ).await {
             needs_redraw = true;
             continue;
@@ -734,7 +815,7 @@ pub async fn session_main(
             // autoscroll) takes effect before processing queued data events.
             biased;
 
-            Some(ct_event) = input_rx.recv() => {
+            Some(ct_event) = input.input_rx.recv() => {
                 match ct_event {
                     CtEvent::Key(key) => {
                         // Shell route: forward ALL keys as raw bytes to the

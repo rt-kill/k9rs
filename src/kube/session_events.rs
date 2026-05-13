@@ -91,23 +91,29 @@ pub(crate) fn apply_event(
                     app.data.tables.insert(resolved.clone(), table);
                 }
                 if let Some(desc) = app.data.descriptors.remove(&original) {
-                    app.data.descriptors.insert(resolved, desc);
+                    // Rebuild descriptor with the resolved plural so
+                    // column_rules resolve overlay lookups against the
+                    // canonical resource name, not the user-typed alias.
+                    let rebuilt = crate::app::TableDescriptor::new(
+                        desc.headers().to_vec(),
+                        resolved.plural(),
+                    );
+                    app.data.descriptors.insert(resolved, rebuilt);
                 }
             }
         }
         AppEvent::SubscriptionFailed { resource, message } => {
             // Mark the table as errored so the UI shows the error instead of spinner.
-            // Clear items so the error is visible even if data was previously loaded
-            // (the rendering code only shows table.error when items is empty).
-            // IMPORTANT: clear_data() first, THEN set error — clear_data() resets
-            // error to None, so doing it after would wipe the error we just set.
+            // Clear items first (rendering only shows the error when items is empty),
+            // then transition to Failed. clear_data() resets to Initializing, so the
+            // Failed transition must come after.
             if crate::app::nav::is_globally_stored(&resource) {
                 let table = app.data.tables.entry(resource.clone()).or_default();
                 table.clear_data();
-                table.error = Some(message.clone());
+                table.data_state = crate::app::table::TableDataState::Failed(message.clone());
             } else if let Some(table) = app.nav.find_table_for_resource_mut(&resource) {
                 table.clear_data();
-                table.error = Some(message.clone());
+                table.data_state = crate::app::table::TableDataState::Failed(message.clone());
             }
             // The bridge task behind the failing subscription has already
             // exited. Drop the stale `SubscriptionStream` handle sitting
@@ -116,8 +122,8 @@ pub(crate) fn apply_event(
             // live owner.
             app.nav.clear_dead_subscription_for(&resource);
             // Flash the error so the user sees it regardless of which
-            // view is active — table.error is only visible when viewing
-            // that specific resource.
+            // view is active — the Failed state is only visible when
+            // viewing that specific resource's table.
             app.ui.flash = Some(crate::app::FlashMessage::error(
                 format!("{}: {}", resource.short_label(), message)
             ));
@@ -200,7 +206,7 @@ fn apply_resource_update(
     match update {
         ResourceUpdate::Rows { resource, headers, rows } => {
             let num_cols = headers.len();
-            let descriptor = crate::app::TableDescriptor { headers };
+            let descriptor = crate::app::TableDescriptor::new(headers, resource.plural());
             if crate::app::nav::is_globally_stored(&resource) {
                 // Set descriptor BEFORE populating table data so column-
                 // restricted greps see the correct column count.
