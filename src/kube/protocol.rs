@@ -781,7 +781,10 @@ static SHELL_TEMPLATE: ExecTemplate = ExecTemplate {
         ExecArg::Literal("-n"), ExecArg::Placeholder(ExecPlaceholder::Namespace),
         ExecArg::Placeholder(ExecPlaceholder::PodName),
         ExecArg::ConditionalPair("-c", ExecPlaceholder::Container),
-        ExecArg::Literal("--"), ExecArg::Literal("sh"),
+        // k9s pattern: start sh, try to upgrade to bash, fall back to sh.
+        // Works on any container that has at least sh.
+        ExecArg::Literal("--"), ExecArg::Literal("sh"), ExecArg::Literal("-c"),
+        ExecArg::Literal("command -v bash >/dev/null && exec bash || exec sh"),
     ],
     title_template: "{{pod}}/{{container}}",
 };

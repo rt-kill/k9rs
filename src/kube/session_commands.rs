@@ -508,10 +508,15 @@ pub(crate) fn handle_form_dialog_key(
             }
         }
         KeyCode::Enter => {
-            // Take the dialog out so the dispatcher can consume it without
-            // borrowing app twice.
-            if let Some(dialog) = app.ui.form_dialog.take() {
-                dispatch_form_submit(app, data_source, dialog);
+            if let Some(ref d) = app.ui.form_dialog {
+                if d.ok_focused() {
+                    // OK button focused — submit.
+                    let dialog = app.ui.form_dialog.take().unwrap();
+                    dispatch_form_submit(app, data_source, dialog);
+                } else {
+                    // Field focused — advance to next field.
+                    app.ui.form_dialog.as_mut().unwrap().focus_next();
+                }
             }
         }
         KeyCode::Left | KeyCode::Right => {

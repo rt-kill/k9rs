@@ -9,7 +9,6 @@ use ratatui::{
 use crate::app::{App, InputMode};
 use crate::ui::header;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::TabBar;
 
 /// Draw the cluster overview landing page.
 ///
@@ -58,12 +57,14 @@ pub fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
     // 3. Main content — cluster overview
     draw_content(f, app, content_area, theme);
 
-    // 4. Tab bar (same as resource view — shows available resources)
-    let count = app.active_view_table().map(|t| t.items.len()).unwrap_or(0);
-    let tab_bar = TabBar::new(app.nav.resource_id(), theme)
-        .namespace(app.kube.selected_ns.display())
-        .item_count(count);
-    f.render_widget(tab_bar, tab_bar_area);
+    // 4. Tab bar — show "overview" label, not the nav stack's resource
+    // (which defaults to pods but has no active subscription here).
+    let status_line = Line::from(vec![
+        Span::styled(" overview ", theme.breadcrumb_active),
+        Span::styled(" ", theme.status_bar),
+        Span::styled(format!(" {} ", app.kube.selected_ns.display()), theme.breadcrumb_inactive),
+    ]);
+    f.render_widget(status_line, tab_bar_area);
 }
 
 fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {

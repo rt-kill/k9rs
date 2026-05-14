@@ -105,6 +105,14 @@ impl ConvertToRow<Service> for ServiceDef {
             Some(DrillTarget::PodsByNameGrep(meta.name.clone()))
         };
 
+        // LoadBalancer services with no external IP are pending.
+        use crate::kube::resources::row::RowHealth;
+        let health = if service_type == "LoadBalancer" && (external_ip == "<none>" || external_ip.is_empty()) {
+            RowHealth::Pending
+        } else {
+            RowHealth::Normal
+        };
+
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.namespace.clone()),
             CellValue::Text(meta.name.clone()),
@@ -121,6 +129,7 @@ impl ConvertToRow<Service> for ServiceDef {
             pf_ports: port_list,
             drill_target,
             cells,
+            health,
             ..Default::default()
         }
     }

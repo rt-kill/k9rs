@@ -76,11 +76,18 @@ impl ConvertToRow<CronJob> for CronJobDef {
             CellValue::from_comma_str(&meta.labels_str),
             CellValue::Age(meta.age.map(|t| t.timestamp())),
         ];
+        // Suspended CronJobs are visually flagged.
+        let health = if suspend {
+            crate::kube::resources::row::RowHealth::Pending
+        } else {
+            crate::kube::resources::row::RowHealth::Normal
+        };
         ResourceRow {
             cells,
             name: meta.name,
             namespace: Some(meta.namespace),
             drill_target: drill,
+            health,
             ..Default::default()
         }
     }

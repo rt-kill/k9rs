@@ -1514,6 +1514,10 @@ impl Pty {
         let master = self.master;
         let mut command = std::process::Command::new(cmd);
         command.args(args);
+        // kubectl forwards TERM to the remote container. Without this,
+        // readline disables tab completion and programs disable syntax
+        // highlighting because the remote shell thinks it's a dumb terminal.
+        command.env("TERM", "xterm-256color");
         unsafe {
             command.pre_exec(move || {
                 // New session → detach from parent's controlling terminal.
