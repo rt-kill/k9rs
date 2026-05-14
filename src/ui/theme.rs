@@ -273,10 +273,9 @@ impl SkinSchema {
     /// Apply skin overrides to an existing theme.
     fn apply_to(&self, theme: &mut Theme) {
         // -- body --
-        let fg = skin_color(&self.body.fg_color);
-        let bg = skin_color(&self.body.bg_color);
-        theme.row_normal = with_bg(with_fg(theme.row_normal, fg), bg);
-        theme.info_value = with_fg(theme.info_value, fg);
+        // body.fgColor applies to info/text, NOT row_normal.
+        // k9s sets StdColor (row default) from frame.status.newColor.
+        theme.info_value = with_fg(theme.info_value, skin_color(&self.body.fg_color));
         if let Some(c) = skin_color(&self.body.logo_color) {
             theme.logo = theme.logo.fg(c);
         }
@@ -336,7 +335,10 @@ impl SkinSchema {
         }
 
         // -- frame.status --
+        // k9s uses newColor as StdColor (default row color for all
+        // healthy resources). Maps to both row_normal and status_running.
         if let Some(c) = skin_color(&self.frame.status.new_color) {
+            theme.row_normal = theme.row_normal.fg(c);
             theme.status_running = theme.status_running.fg(c);
         }
         if let Some(c) = skin_color(&self.frame.status.add_color) {
@@ -369,9 +371,8 @@ impl SkinSchema {
         }
 
         // -- views.table --
-        let table_fg = skin_color(&self.views.table.fg_color);
-        let table_bg = skin_color(&self.views.table.bg_color);
-        theme.row_normal = with_bg(with_fg(theme.row_normal, table_fg), table_bg);
+        // views.table.fgColor does NOT map to row_normal — k9s uses
+        // frame.status.newColor as StdColor (row default).
         if let Some(c) = skin_color(&self.views.table.cursor_fg_color) {
             theme.selected = theme.selected.fg(c);
         }
@@ -509,9 +510,10 @@ impl Default for Theme {
                 .fg(POLAR_DARK)
                 .bg(FROST_BLUE)
                 .add_modifier(Modifier::BOLD),
-            // Normal row text: primary snow
+            // Normal row text: aurora teal (k9s uses frame.status.newColor
+            // as StdColor — the default row color for healthy resources).
             row_normal: Style::default()
-                .fg(SNOW_PRIMARY),
+                .fg(AURORA_TEAL),
 
             // Status colors (Aurora palette)
             status_running: Style::default()

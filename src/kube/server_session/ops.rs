@@ -1,9 +1,9 @@
 //! Namespace switching, describe/YAML, and mutating operations (delete,
 //! scale, restart, secret decode, CronJob trigger/suspend).
 
-/// Field manager identity for server-side apply and strategic merge patches.
-/// Passed to `PatchParams::apply(...)` so K8s attributes the change to k9rs.
-const MANAGER_IDENTITY: &str = "k9rs";
+// No field manager identity — k9rs uses plain merge patches so it
+// doesn't claim SSA ownership of fields. This avoids conflicts with
+// GitOps tools (Pulumi, ArgoCD, Flux) that use their own field managers.
 
 use crate::kube::protocol::{self, SessionEvent};
 use crate::kube::resource_def::BuiltInKind;
@@ -82,14 +82,13 @@ impl ServerSession {
                     crate::kube::describe::api_resource_for(&client, &target.resource).await?;
                 let api = crate::kube::describe::dynamic_api_for(&client, &ar, scope, &target.namespace);
 
-                // Parse the user's YAML into an untyped `DynamicObject` so
-                // server-side apply can handle any kind. The user is editing
-                // the same shape kube-rs would have produced via
-                // `kubectl get -o yaml`, so this round-trips cleanly.
+                // Parse the user's YAML and apply as a strategic merge patch.
+                // No SSA (no field manager) — avoids claiming field ownership
+                // that would conflict with GitOps tools.
                 let parsed: DynamicObject = serde_yaml::from_str(&yaml)
                     .map_err(|e| anyhow::anyhow!("yaml parse error: {}", e))?;
 
-                api.patch(&target.name, &PatchParams::apply(MANAGER_IDENTITY).force(), &Patch::Apply(&parsed))
+                api.patch(&target.name, &PatchParams::default(), &Patch::Merge(&parsed))
                     .await?;
                 Ok(())
             }
@@ -306,7 +305,6 @@ impl ServerSession {
             protocol::OperationKind::Scale,
             "Scale",
         ) else { return; };
-        let patch_body = ScalePatch { spec: ScaleSpec { replicas } };
 
         let client = self.client.clone();
         let tx = self.event_tx.clone();
@@ -314,11 +312,41 @@ impl ServerSession {
         let namespace = target.namespace.clone();
         let display = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().plural;
         self.track_task(async move {
-            use ::kube::api::{Patch, PatchParams};
-            let api = dynamic_api_for_kind(&client, kind, &namespace);
-            let event = match api.patch(&n, &PatchParams::apply(MANAGER_IDENTITY), &Patch::Merge(&patch_body)).await {
-                Ok(_) => SessionEvent::CommandResult(Ok(format!("Scaled {}/{} to {} replicas", display, n, replicas))),
-                Err(e) => SessionEvent::CommandResult(Err(format!("Scale failed: {}", e))),
+            // Use the /scale subresource (same as kubectl scale / k9s).
+            // This doesn't interact with SSA field management — no field
+            // ownership is claimed on spec.replicas.
+            let gvr = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr();
+            let ar = kube::api::ApiResource {
+                group: gvr.group.to_string(),
+                version: gvr.version.to_string(),
+                kind: gvr.kind.to_string(),
+                api_version: if gvr.group.is_empty() {
+                    gvr.version.to_string()
+                } else {
+                    format!("{}/{}", gvr.group, gvr.version)
+                },
+                plural: gvr.plural.to_string(),
+            };
+            let api: kube::Api<kube::api::DynamicObject> = match &namespace {
+                protocol::Namespace::Named(ns) => kube::Api::namespaced_with(client, ns, &ar),
+                protocol::Namespace::All => kube::Api::all_with(client, &ar),
+            };
+            let event = match api.get_scale(&n).await {
+                Ok(mut scale) => {
+                    if let Some(s) = scale.spec.as_mut() { s.replicas = Some(replicas as i32); }
+                    let body = serde_json::to_vec(&scale).unwrap_or_default();
+                    match api.replace_scale(&n, &kube::api::PostParams::default(), body).await {
+                        Ok(_) => SessionEvent::CommandResult(Ok(
+                            format!("Scaled {}/{} to {} replicas", display, n, replicas),
+                        )),
+                        Err(e) => SessionEvent::CommandResult(Err(
+                            format!("Scale failed: {}", e),
+                        )),
+                    }
+                }
+                Err(e) => SessionEvent::CommandResult(Err(
+                    format!("Scale failed: {}", e),
+                )),
             };
             let _ = tx.send(event).await;
         });
@@ -636,11 +664,6 @@ fn toggle_cron_suspend(
 // the shapes below are typed structs: invalid patches can't be built, and
 // the untyped→JSON conversion happens inside kube-rs/serde at the true API
 // boundary instead of in our handler.
-
-#[derive(Debug, serde::Serialize)]
-struct ScalePatch { spec: ScaleSpec }
-#[derive(Debug, serde::Serialize)]
-struct ScaleSpec { replicas: u32 }
 
 #[derive(Debug, serde::Serialize)]
 struct RestartPatch { spec: RestartSpec }

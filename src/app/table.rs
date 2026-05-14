@@ -172,7 +172,7 @@ impl<T: Clone> Default for StatefulTable<T> {
             offset: 0,
             selected_col: 0,
             col_offset: 0,
-            sort_column: 1, // NAME column (k9s default)
+            sort_column: 0,
             sort_ascending: true,
             page_size: 40,
             data_state: TableDataState::Initializing,
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn sort_column_default() {
         let t = table_with_rows(3);
-        assert_eq!(t.sort_column(), 1); // NAME column (k9s default)
+        assert_eq!(t.sort_column(), 0);
         assert!(t.sort_ascending());
     }
 
@@ -823,22 +823,21 @@ mod tests {
     #[test]
     fn sort_by_same_column_toggles_direction() {
         let mut t = table_with_rows(3);
-        // Use column 2 (not 1, which is the default) so first click sets, not toggles.
-        t.sort_by_column(crate::app::SortTarget::Column(2));
+        t.sort_by_column(crate::app::SortTarget::Column(1));
         assert!(t.sort_ascending());
-        t.sort_by_column(crate::app::SortTarget::Column(2));
+        t.sort_by_column(crate::app::SortTarget::Column(1));
         assert!(!t.sort_ascending(), "second click should toggle to descending");
-        t.sort_by_column(crate::app::SortTarget::Column(2));
+        t.sort_by_column(crate::app::SortTarget::Column(1));
         assert!(t.sort_ascending(), "third click should toggle back to ascending");
     }
 
     #[test]
     fn sort_by_different_column_resets_ascending() {
         let mut t = table_with_rows(3);
-        t.sort_by_column(crate::app::SortTarget::Column(2));
-        t.sort_by_column(crate::app::SortTarget::Column(2)); // descending
+        t.sort_by_column(crate::app::SortTarget::Column(1));
+        t.sort_by_column(crate::app::SortTarget::Column(1)); // descending
         assert!(!t.sort_ascending());
-        t.sort_by_column(crate::app::SortTarget::Column(3));
+        t.sort_by_column(crate::app::SortTarget::Column(2));
         assert!(t.sort_ascending(), "switching columns should reset to ascending");
     }
 
