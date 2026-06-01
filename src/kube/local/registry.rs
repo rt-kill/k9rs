@@ -1,18 +1,16 @@
 //! `LocalRegistry` — the daemon-wide directory of *per-context* local
 //! resource sources.
 //!
-//! Lives on `SessionSharedState` next to `WatcherCache` and uses the same
-//! `Weak<Arc>` lifetime model:
+//! Two lifetime models coexist:
 //!
-//! - Sources are constructed **lazily per context** the first time a
-//!   session subscribes for that `(context, rid)` pair.
-//! - The registry stores only `Weak` refs. The strong `Arc` lives in the
-//!   subscriber-side `LocalSubscription` (via the bridge task).
-//! - When the last `LocalSubscription` for a `(context, rid)` drops, its
-//!   `Drop` impl starts a grace-period timer holding the `Arc`. If a new
-//!   subscriber appears within the grace period the `Weak` upgrades and
-//!   reuses the same source. After the grace period the inner `Arc` is
-//!   released; on the next subscribe the registry constructs a fresh source.
+//! - **Port forwards** — held strongly by the registry. Port forwards are
+//!   user-created side effects with running subprocesses; their lifetime is
+//!   "until explicitly stopped or daemon exits". Subscribing/unsubscribing
+//!   only affects whether the TUI sees the list, not whether the kubectl
+//!   processes run. Port forwards survive context switches and nav pops.
+//!
+//! - **Exec resources** — `Weak<Arc>` + grace period (same model as the K8s
+//!   watcher cache). Demand-driven and safe to recreate on resubscribe.
 
 use std::sync::{Arc, Weak};
 
@@ -28,7 +26,12 @@ use super::SharedLocalSource;
 
 /// Daemon-wide registry of per-context local resource sources.
 pub struct LocalRegistry {
-    port_forwards: DashMap<ContextName, Weak<PortForwardSource>>,
+    /// Port forward sources are held **strongly** (not `Weak`). Port forwards
+    /// are user-created side effects with running subprocesses — their
+    /// lifetime is "until explicitly stopped or daemon exits", not
+    /// demand-driven like watchers. This means port forwards survive
+    /// context switches, nav-stack pops, and any period without subscribers.
+    port_forwards: DashMap<ContextName, Arc<PortForwardSource>>,
     /// Per-(context, config-name) cache of ExecSources. Each config
     /// produces its own resource keyed by `Custom(name)`.
     exec_resources: DashMap<(ContextName, String), Weak<ExecSource>>,
@@ -61,29 +64,13 @@ impl LocalRegistry {
     }
 
     /// Get (or lazily create) the `PortForwardSource` for a context.
+    /// The registry holds a strong Arc, so the source survives even when
+    /// no TUI session is viewing the port-forward list.
     pub fn port_forwards_for(&self, context: &ContextName) -> Arc<PortForwardSource> {
-        self.port_forwards.retain(|_, weak| weak.strong_count() > 0);
-
-        if let Some(weak) = self.port_forwards.get(context) {
-            if let Some(arc) = weak.upgrade() {
-                return arc;
-            }
-        }
-        match self.port_forwards.entry(context.clone()) {
-            Entry::Occupied(mut e) => {
-                if let Some(arc) = e.get().upgrade() {
-                    return arc;
-                }
-                let arc = PortForwardSource::for_context(context.clone());
-                e.insert(Arc::downgrade(&arc));
-                arc
-            }
-            Entry::Vacant(e) => {
-                let arc = PortForwardSource::for_context(context.clone());
-                e.insert(Arc::downgrade(&arc));
-                arc
-            }
-        }
+        self.port_forwards
+            .entry(context.clone())
+            .or_insert_with(|| PortForwardSource::for_context(context.clone()))
+            .clone()
     }
 
     /// Get (or lazily create) the `ExecSource` for a specific config name

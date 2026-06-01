@@ -123,6 +123,9 @@ pub struct ResourceTable<'a> {
     /// that cell has its own coloring; `None` = inherit row style.
     cell_style: &'a [Vec<Option<crate::kube::resources::row::RowHealth>>],
     max_col_width: u16,
+    /// Active search patterns for match highlighting. When non-empty,
+    /// matched regions within cells are rendered with `theme.search_match`.
+    search_patterns: &'a [crate::util::SearchPattern],
 }
 
 impl<'a> ResourceTable<'a> {
@@ -143,6 +146,7 @@ impl<'a> ResourceTable<'a> {
             row_health: &[],
             cell_style: &[],
             max_col_width: DEFAULT_MAX_COL_WIDTH,
+            search_patterns: &[],
         }
     }
 
@@ -154,6 +158,7 @@ impl<'a> ResourceTable<'a> {
     pub fn namespace(mut self, ns: &'a str) -> Self { self.namespace = ns; self }
     pub fn changed_rows(mut self, changed: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>) -> Self { self.changed_rows = changed; self }
     pub fn max_col_width(mut self, w: u16) -> Self { self.max_col_width = w; self }
+    pub fn search_patterns(mut self, pats: &'a [crate::util::SearchPattern]) -> Self { self.search_patterns = pats; self }
 
     fn health_at(&self, idx: usize) -> crate::kube::resources::row::RowHealth {
         self.row_health.get(idx).copied().unwrap_or_default()
@@ -179,29 +184,82 @@ impl<'a> ResourceTable<'a> {
 
     /// Render a single cell: `│ text  ` (left border + padded content).
     /// The right edge is the next column's left `│` (or the trailing `│`
-    /// for the last column). Content is left-padded to fill the full
-    /// inner width so background styles extend edge-to-edge.
-    fn render_cell(buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style, border_style: Style) {
+    /// for the last column). When `match_ranges` is non-empty, matched
+    /// character positions are rendered with `match_style` instead of the
+    /// base style.
+    #[allow(clippy::too_many_arguments)]
+    fn render_cell(
+        buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str,
+        style: Style, border_style: Style,
+        match_ranges: &[(usize, usize)], match_style: Style,
+    ) {
         if width < 3 { return; }
         let inner = (width as usize) - 3;
         let text_width = text.width();
-        let display = if text_width > inner {
-            let mut result = String::new();
-            let mut w = 0;
-            let target = inner.saturating_sub(1);
-            for ch in text.chars() {
-                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                if w + cw > target { break; }
-                result.push(ch);
-                w += cw;
-            }
-            result.push('\u{2026}');
-            result
-        } else {
-            text.to_string()
-        };
+        let truncated = text_width > inner;
+
         buf.set_string(x, y, "│", border_style);
-        buf.set_string(x + 1, y, format!(" {:<width$} ", display, width = inner), style);
+
+        if match_ranges.is_empty() {
+            // Fast path: no highlighting — single formatted string.
+            let display = if truncated {
+                let mut result = String::new();
+                let mut w = 0;
+                let target = inner.saturating_sub(1);
+                for ch in text.chars() {
+                    let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if w + cw > target { break; }
+                    result.push(ch);
+                    w += cw;
+                }
+                result.push('\u{2026}');
+                result
+            } else {
+                text.to_string()
+            };
+            buf.set_string(x + 1, y, format!(" {:<width$} ", display, width = inner), style);
+        } else {
+            // Highlighted path: render character by character, applying
+            // match_style to matched regions. Uses a sorted pointer walk
+            // over match_ranges so the total cost is O(chars + ranges).
+            let target = if truncated { inner.saturating_sub(1) } else { inner };
+            let mut sx = x + 2; // past │ and left pad
+            let mut dw = 0usize;
+            let mut ri = 0; // index into match_ranges
+
+            // Left pad.
+            buf.set_string(x + 1, y, " ", style);
+
+            for (byte_pos, ch) in text.char_indices() {
+                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if dw + cw > target { break; }
+
+                // Advance past match ranges that end before this byte.
+                while ri < match_ranges.len() && match_ranges[ri].1 <= byte_pos {
+                    ri += 1;
+                }
+                let in_match = ri < match_ranges.len()
+                    && byte_pos >= match_ranges[ri].0
+                    && byte_pos < match_ranges[ri].1;
+
+                let s = if in_match { match_style } else { style };
+                let ch_str: String = ch.to_string();
+                buf.set_string(sx, y, &ch_str, s);
+                sx += cw as u16;
+                dw += cw;
+            }
+
+            // Ellipsis (if truncated).
+            if truncated {
+                buf.set_string(sx, y, "\u{2026}", style);
+                sx += 1;
+                dw += 1;
+            }
+
+            // Right padding + trailing pad space to fill the cell.
+            let total_pad = inner.saturating_sub(dw) + 1;
+            buf.set_string(sx, y, " ".repeat(total_pad), style);
+        }
     }
 
     fn build_title_spans(&self, row_count: usize) -> Line<'a> {
@@ -244,10 +302,12 @@ impl<'a> ResourceTable<'a> {
         is_row_selected: bool,
         layout: &ColumnLayout,
     ) {
+        let hl = self.theme.search_match;
         for (i, cell) in cells.iter().enumerate() {
             if i >= layout.widths.len() || !layout.is_visible(i) { continue; }
             let (content_style, border_style) = self.cell_styles(base_style, i, is_row_selected, layout);
-            Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style);
+            let ranges = self.cell_match_ranges(cell.as_ref());
+            Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style, &ranges, hl);
         }
         // Trailing │ after last column.
         if let Some(tx) = layout.trailing_border_x() {
@@ -258,6 +318,19 @@ impl<'a> ResourceTable<'a> {
             };
             buf.set_string(tx, y, "│", border);
         }
+    }
+
+    /// Collect sorted match ranges for a cell's text against all active
+    /// search patterns. Returns an empty Vec (no allocation) when there
+    /// are no patterns.
+    fn cell_match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
+        if self.search_patterns.is_empty() { return Vec::new(); }
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for pat in self.search_patterns {
+            ranges.extend(pat.find_all(text));
+        }
+        if ranges.len() > 1 { ranges.sort_unstable(); }
+        ranges
     }
 }
 
@@ -384,6 +457,7 @@ impl StatefulWidget for ResourceTable<'_> {
 
             if has_cell_overrides {
                 let cell_styles = &self.cell_style[row_idx];
+                let hl = self.theme.search_match;
                 for (i, cell) in row.iter().enumerate() {
                     if i >= layout.widths.len() || !layout.is_visible(i) { continue; }
                     let style = if let Some(Some(h)) = cell_styles.get(i) {
@@ -397,7 +471,8 @@ impl StatefulWidget for ResourceTable<'_> {
                         row_base
                     };
                     let (content_style, border_style) = self.cell_styles(style, i, is_selected, &layout);
-                    Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style);
+                    let ranges = self.cell_match_ranges(cell.as_ref());
+                    Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style, &ranges, hl);
                 }
                 // Trailing border.
                 if let Some(tx) = layout.trailing_border_x() {

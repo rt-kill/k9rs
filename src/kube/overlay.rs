@@ -292,14 +292,25 @@ impl RenderPredicate {
 }
 
 /// Strip common unit suffixes and parse a cell's display string as f64.
+/// Handles: `%`, `m` (millicores), binary SI (`Ki`, `Mi`, `Gi`, `Ti`),
+/// and decimal SI (`K`/`k`, `M`, `G`, `T`).
 fn parse_numeric_cell(cell_str: &str) -> Option<f64> {
     cell_str
         .trim()
         .trim_end_matches('%')
         .trim_end_matches('m')
+        // Binary SI (must come before single-char decimal to avoid
+        // partial stripping: "Mi" stripped as "i" then "M").
+        .trim_end_matches("Ti")
+        .trim_end_matches("Gi")
         .trim_end_matches("Mi")
         .trim_end_matches("Ki")
-        .trim_end_matches("Gi")
+        // Decimal SI
+        .trim_end_matches('T')
+        .trim_end_matches('G')
+        .trim_end_matches('M')
+        .trim_end_matches('K')
+        .trim_end_matches('k')
         .parse::<f64>()
         .ok()
 }

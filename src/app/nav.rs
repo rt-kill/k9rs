@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::view::ViewId;
 use crate::kube::protocol::{ResourceId, SubscriptionFilter};
 use crate::util::SearchPattern;
 
@@ -186,8 +187,13 @@ impl NavFilter {
 /// chain internally — never through a public `step(i)` accessor.
 #[derive(Debug)]
 pub struct NavStep {
-    /// What resource this step is viewing (universal identity).
-    pub resource: ResourceId,
+    /// What view this step is looking at (resource type or derived view type).
+    pub view: ViewId,
+    /// Instance context for derived views — the parent row this view was
+    /// derived from (e.g., the pod whose containers are being viewed).
+    /// `None` for resource views. Used for breadcrumbs ("pod-name > Containers")
+    /// and to scope actions back to the parent.
+    pub source: Option<crate::kube::protocol::ObjectRef>,
     /// The filter applied at this level (if any).
     pub filter: Option<NavFilter>,
     /// Saved table selection index so "back" restores cursor position.
@@ -215,7 +221,25 @@ pub struct NavStep {
 impl NavStep {
     fn root(rid: ResourceId) -> Self {
         Self {
-            resource: rid,
+            view: ViewId::Resource(rid),
+            source: None,
+            filter: None,
+            saved_selected: 0,
+            filter_input: FilterInputState::default(),
+            stream: None,
+            table: None,
+            descriptor: None,
+            parent: None,
+        }
+    }
+
+    /// Build a derived view step. `source` is the parent row (e.g., the
+    /// pod whose containers are being viewed). Table and descriptor are
+    /// populated by the caller after construction.
+    pub fn derived(kind: crate::app::view::DerivedViewKind, source: crate::kube::protocol::ObjectRef) -> Self {
+        Self {
+            view: ViewId::Derived(kind),
+            source: Some(source),
             filter: None,
             saved_selected: 0,
             filter_input: FilterInputState::default(),
@@ -231,7 +255,8 @@ impl NavStep {
     /// the chain directly.
     pub fn new(resource: ResourceId, filter: Option<NavFilter>) -> Self {
         Self {
-            resource,
+            view: ViewId::Resource(resource),
+            source: None,
             filter,
             saved_selected: 0,
             filter_input: FilterInputState::default(),
@@ -260,9 +285,9 @@ pub struct NavStack {
     /// The current top of the stack. Always present — the chain is
     /// never empty because `pop()` refuses to remove the root.
     top: NavStep,
-    /// The root resource before the last `reset()`, used for
+    /// The root view before the last `reset()`, used for
     /// "toggle last view" (Ctrl-^).
-    prev_root: Option<ResourceId>,
+    prev_root: Option<ViewId>,
 }
 
 impl NavStack {
@@ -284,19 +309,31 @@ impl NavStack {
         &mut self.top
     }
 
-    /// The current resource id.
-    pub fn resource_id(&self) -> &ResourceId {
-        &self.top.resource
+    /// The current view id.
+    pub fn view_id(&self) -> &ViewId {
+        &self.top.view
     }
 
-    /// The root resource id (bottom of the stack). Walks the parent
+    /// Convenience: the underlying `ResourceId` if the current view is
+    /// a resource view. Returns `None` for derived views.
+    pub fn resource_id(&self) -> Option<&ResourceId> {
+        self.view_id().resource_id()
+    }
+
+    /// The root view id (bottom of the stack). Walks the parent
     /// chain to the last link.
-    pub fn root_resource_id(&self) -> &ResourceId {
+    pub fn root_view_id(&self) -> &ViewId {
         let mut node = &self.top;
         while let Some(ref p) = node.parent {
             node = p;
         }
-        &node.resource
+        &node.view
+    }
+
+    /// Convenience: the root `ResourceId`, if the root view is a
+    /// resource view. Returns `None` for derived views.
+    pub fn root_resource_id(&self) -> Option<&ResourceId> {
+        self.root_view_id().resource_id()
     }
 
     /// Push a new step (grep or drill-down). Returns subscription changes.
@@ -318,20 +355,35 @@ impl NavStack {
             "NavStack::push: caller constructed a NavStep with a parent chain \
              — callers own only the top, the stack owns the history",
         );
-        let old = self.top.resource.clone();
+        let old = self.top.view.clone();
         let sub_filter = step.filter.as_ref().and_then(|f| f.to_subscription_filter());
         // Splice the old top in as the new step's parent, then install
-        // the new step as the top.
-        let old_top = std::mem::replace(&mut self.top, NavStep::root(old.clone()));
+        // the new step as the top. We need a placeholder ResourceId for
+        // the temporary root — use a dummy that gets immediately replaced.
+        // Extract a ResourceId from old to keep the placeholder valid.
+        let placeholder_rid = match &old {
+            ViewId::Resource(rid) => rid.clone(),
+            ViewId::Derived(_) => {
+                // For derived views, walk to find the root ResourceId.
+                // This placeholder is immediately replaced, so any rid works.
+                crate::kube::resource_def::BuiltInKind::Pod.into()
+            }
+        };
+        let old_top = std::mem::replace(&mut self.top, NavStep::root(placeholder_rid));
         step.parent = Some(Box::new(old_top));
         self.top = step;
-        let new = self.top.resource.clone();
+        let new = self.top.view.clone();
         if new != old {
-            NavChange { subscribe: Some(new), subscription_filter: sub_filter }
+            // Extract the ResourceId to subscribe to, if the new view is a resource.
+            let subscribe_rid = match &new {
+                ViewId::Resource(rid) => Some(rid.clone()),
+                ViewId::Derived(_) => None,
+            };
+            NavChange { subscribe: subscribe_rid, subscription_filter: sub_filter }
         } else {
             debug_assert!(
                 sub_filter.is_none(),
-                "NavStack::push: same-rid push must not carry a server-side subscription filter \
+                "NavStack::push: same-view push must not carry a server-side subscription filter \
                  (would leak a concurrent watcher and shadow the parent step's filtered data)"
             );
             NavChange { subscribe: None, subscription_filter: None }
@@ -349,14 +401,14 @@ impl NavStack {
         // to pop.
         let parent = self.top.parent.take()?;
 
-        let old = self.top.resource.clone();
+        let old = self.top.view.clone();
         // Install the parent as the new top; the old top is what we return.
         let popped = std::mem::replace(&mut self.top, *parent);
-        let new = self.top.resource.clone();
+        let new = self.top.view.clone();
 
-        // When popping back across a rid change, prefer to inherit the
+        // When popping back across a view change, prefer to inherit the
         // **owner step's** existing substream if it's still alive. The
-        // new top might be a client-side filter over a same-rid ancestor;
+        // new top might be a client-side filter over a same-view ancestor;
         // in that case `current().stream` is `None` but a deeper ancestor
         // still owns the live stream. Skipping re-subscribe here preserves
         // cached rows for instant pop-back; re-subscribing would open a
@@ -365,15 +417,20 @@ impl NavStack {
         let change = if new != old {
             // The new top (restored parent) may still hold its own live
             // subscription stream from before the drill-down. Check the
-            // top's own stream FIRST — `same_rid_ancestor_has_stream` only
+            // top's own stream FIRST — `same_view_ancestor_has_stream` only
             // walks ancestors, missing the top itself. Without this, every
-            // pop-back across a rid change triggered a re-subscribe + data
+            // pop-back across a view change triggered a re-subscribe + data
             // clear, causing a visible "Loading..." flash even though the
             // data was already cached and the stream alive.
-            if self.top.stream.is_some() || self.same_rid_ancestor_has_stream() {
+            if self.top.stream.is_some() || self.same_view_ancestor_has_stream() {
                 NavChange { subscribe: None, subscription_filter: None }
             } else {
-                NavChange { subscribe: Some(new), subscription_filter: sub_filter }
+                // Extract ResourceId if this is a resource view.
+                let subscribe_rid = match &new {
+                    ViewId::Resource(rid) => Some(rid.clone()),
+                    ViewId::Derived(_) => None,
+                };
+                NavChange { subscribe: subscribe_rid, subscription_filter: sub_filter }
             }
         } else {
             NavChange { subscribe: None, subscription_filter: None }
@@ -386,12 +443,12 @@ impl NavStack {
     /// ancestor that holds `stream: Some(_)`. Falls back to 0 if no
     /// same-rid ancestor owns a stream — the top is its own owner.
     fn subscription_owner_depth(&self) -> usize {
-        let current_rid = &self.top.resource;
+        let current_view = &self.top.view;
         let mut depth = 0usize;
         let mut best = 0usize;
         let mut node = &self.top;
         loop {
-            if node.resource != *current_rid { break; }
+            if node.view != *current_view { break; }
             if node.stream.is_some() { best = depth; }
             match node.parent.as_deref() {
                 Some(p) => { depth += 1; node = p; }
@@ -401,17 +458,17 @@ impl NavStack {
         best
     }
 
-    /// True if any same-rid ancestor (strictly ancestor — not the top)
+    /// True if any same-view ancestor (strictly ancestor — not the top)
     /// owns a live subscription stream. Used by `pop` to decide whether
     /// the new top can inherit a parent's stream instead of re-subscribing.
-    fn same_rid_ancestor_has_stream(&self) -> bool {
-        let current_rid = &self.top.resource;
+    fn same_view_ancestor_has_stream(&self) -> bool {
+        let current_view = &self.top.view;
         let mut node = match self.top.parent.as_deref() {
             Some(p) => p,
             None => return false,
         };
         loop {
-            if node.resource != *current_rid { return false; }
+            if node.view != *current_view { return false; }
             if node.stream.is_some() { return true; }
             match node.parent.as_deref() {
                 Some(p) => node = p,
@@ -441,19 +498,20 @@ impl NavStack {
         f(node)
     }
 
-    /// Clear any `stream: Some(_)` handle on steps whose resource matches
+    /// Clear any `stream: Some(_)` handle on steps whose view matches
     /// `rid`. Called when a subscription for this rid has terminated
     /// server-side (error, EOF) — the bridge task is already finished,
     /// but the handle in `NavStep.stream` is still sitting there claiming
     /// "subscription is live". Without this clear, a subsequent Esc
     /// pop-back past the failing rid would consult
-    /// `same_rid_ancestor_has_stream`, find this dead handle, treat it
+    /// `same_view_ancestor_has_stream`, find this dead handle, treat it
     /// as an alive owner, and skip re-subscribing — the view would stay
     /// permanently stale until the user hit Ctrl-R.
     pub fn clear_dead_subscription_for(&mut self, rid: &ResourceId) {
+        let target = ViewId::Resource(rid.clone());
         let mut node: &mut NavStep = &mut self.top;
         loop {
-            if node.resource == *rid && node.stream.is_some() {
+            if node.view == target && node.stream.is_some() {
                 node.stream = None;
             }
             match node.parent.as_deref_mut() {
@@ -470,11 +528,12 @@ impl NavStack {
     /// (e.g., `:pods` while already on pods), the streams were destroyed
     /// and the caller must open a new one via `apply_nav_change`.
     pub fn reset(&mut self, rid: ResourceId) -> NavChange {
-        self.prev_root = Some(self.root_resource_id().clone());
+        self.prev_root = Some(self.root_view_id().clone());
+        let view = ViewId::Resource(rid.clone());
         let mut step = NavStep::root(rid.clone());
         // For non-globally-stored resources, create the table on the root
         // step so snapshot data lands on the NavStep (RAII ownership).
-        if !is_globally_stored(&rid) {
+        if !is_globally_stored(&view) {
             step.table = Some(crate::app::table::StatefulTable::new());
         }
         self.top = step;
@@ -488,11 +547,11 @@ impl NavStack {
     /// (outermost) through leaf (innermost). Walks from top backward
     /// along same-rid ancestors and then reverses.
     pub fn active_filters(&self) -> Vec<&NavFilter> {
-        let current_rid = &self.top.resource;
+        let current_view = &self.top.view;
         let mut filters = Vec::new();
         let mut node = &self.top;
         loop {
-            if node.resource != *current_rid { break; }
+            if node.view != *current_view { break; }
             if let Some(ref f) = node.filter { filters.push(f); }
             match node.parent.as_deref() {
                 Some(p) => node = p,
@@ -563,16 +622,17 @@ impl NavStack {
         self.top.saved_selected = selected;
     }
 
-    pub fn prev_root(&self) -> Option<&ResourceId> {
+    pub fn prev_root(&self) -> Option<&ViewId> {
         self.prev_root.as_ref()
     }
 
     /// Walk from the top through the parent chain and return the first step
-    /// where `step.resource == *rid` and `step.table.is_some()`.
+    /// where `step.view` matches `rid` and `step.table.is_some()`.
     pub fn find_table_for_resource(&self, rid: &ResourceId) -> Option<&crate::app::table::StatefulTable<crate::kube::resources::row::ResourceRow>> {
+        let target = ViewId::Resource(rid.clone());
         let mut node = &self.top;
         loop {
-            if node.resource == *rid {
+            if node.view == target {
                 if let Some(ref t) = node.table {
                     return Some(t);
                 }
@@ -586,9 +646,10 @@ impl NavStack {
 
     /// Mutable version of [`find_table_for_resource`].
     pub fn find_table_for_resource_mut(&mut self, rid: &ResourceId) -> Option<&mut crate::app::table::StatefulTable<crate::kube::resources::row::ResourceRow>> {
+        let target = ViewId::Resource(rid.clone());
         let mut node: &mut NavStep = &mut self.top;
         loop {
-            if node.resource == *rid && node.table.is_some() {
+            if node.view == target && node.table.is_some() {
                 return node.table.as_mut();
             }
             match node.parent.as_deref_mut() {
@@ -599,11 +660,12 @@ impl NavStack {
     }
 
     /// Walk from the top through the parent chain and return the first
-    /// descriptor where `step.resource == *rid` and `step.descriptor.is_some()`.
+    /// descriptor where `step.view` matches `rid` and `step.descriptor.is_some()`.
     pub fn find_descriptor_for_resource(&self, rid: &ResourceId) -> Option<&crate::app::TableDescriptor> {
+        let target = ViewId::Resource(rid.clone());
         let mut node = &self.top;
         loop {
-            if node.resource == *rid {
+            if node.view == target {
                 if let Some(ref d) = node.descriptor {
                     return Some(d);
                 }
@@ -619,9 +681,10 @@ impl NavStack {
     /// Used by `apply_resource_update` to co-locate the descriptor with
     /// the table data on the same NavStep.
     pub fn set_descriptor_for_resource(&mut self, rid: &ResourceId, descriptor: crate::app::TableDescriptor) {
+        let target = ViewId::Resource(rid.clone());
         let mut node: &mut NavStep = &mut self.top;
         loop {
-            if node.resource == *rid && node.table.is_some() {
+            if node.view == target && node.table.is_some() {
                 node.descriptor = Some(descriptor);
                 return;
             }
@@ -659,7 +722,7 @@ impl NavStack {
         let mut parts = Vec::new();
         for (i, step) in steps.iter().enumerate() {
             if i == 0 && step.filter.is_none() {
-                parts.push(step.resource.short_label().to_string());
+                parts.push(step.view.short_label().to_string());
                 continue;
             }
             match &step.filter {
@@ -680,7 +743,11 @@ impl NavStack {
                     parts.push(format!("{}/{}", kind_str, display_name));
                 }
                 None => {
-                    parts.push(step.resource.short_label().to_string());
+                    // Derived views with a source show "parent-name > ViewLabel"
+                    if let Some(ref src) = step.source {
+                        parts.push(src.name.clone());
+                    }
+                    parts.push(step.view.short_label().to_string());
                 }
             }
         }
@@ -773,17 +840,21 @@ pub fn rid(kind: crate::kube::resource_def::BuiltInKind) -> ResourceId {
     ResourceId::BuiltIn(kind)
 }
 
-/// Returns `true` for resources whose tables live in the global
+/// Returns `true` for views whose tables live in the global
 /// `AppData::unified` store rather than on a `NavStep`. These are
 /// long-lived resources the TUI always needs (namespace list for the
 /// picker, node list for ShowNode drill, CRD list for command
-/// completion and `:crd` browsing).
-pub fn is_globally_stored(rid: &ResourceId) -> bool {
+/// completion and `:crd` browsing). Derived views are never globally
+/// stored.
+pub fn is_globally_stored(view: &ViewId) -> bool {
     use crate::kube::resource_def::BuiltInKind;
-    matches!(
-        rid.built_in_kind(),
-        Some(BuiltInKind::Namespace | BuiltInKind::Node | BuiltInKind::CustomResourceDefinition)
-    )
+    match view {
+        ViewId::Resource(rid) => matches!(
+            rid.built_in_kind(),
+            Some(BuiltInKind::Namespace | BuiltInKind::Node | BuiltInKind::CustomResourceDefinition)
+        ),
+        ViewId::Derived(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -795,6 +866,10 @@ mod tests {
     fn deploy_rid() -> ResourceId { rid(BuiltInKind::Deployment) }
     fn svc_rid() -> ResourceId { rid(BuiltInKind::Service) }
 
+    fn pod_view() -> ViewId { ViewId::Resource(pod_rid()) }
+    fn deploy_view() -> ViewId { ViewId::Resource(deploy_rid()) }
+    fn svc_view() -> ViewId { ViewId::Resource(svc_rid()) }
+
     // -----------------------------------------------------------------------
     // push / pop basics
     // -----------------------------------------------------------------------
@@ -802,11 +877,11 @@ mod tests {
     #[test]
     fn push_changes_resource_id() {
         let mut stack = NavStack::new(pod_rid());
-        assert_eq!(stack.resource_id(), &pod_rid());
+        assert_eq!(stack.view_id(), &pod_view());
 
         let step = NavStep::new(deploy_rid(), None);
         let change = stack.push(step);
-        assert_eq!(stack.resource_id(), &deploy_rid());
+        assert_eq!(stack.view_id(), &deploy_view());
         assert!(change.subscribe.is_some(), "cross-rid push should subscribe");
     }
 
@@ -817,7 +892,7 @@ mod tests {
 
         let result = stack.pop();
         assert!(result.is_some());
-        assert_eq!(stack.resource_id(), &pod_rid());
+        assert_eq!(stack.view_id(), &pod_view());
     }
 
     #[test]
@@ -840,13 +915,13 @@ mod tests {
         let mut stack = NavStack::new(pod_rid());
         stack.push(NavStep::new(deploy_rid(), None));
         stack.push(NavStep::new(svc_rid(), None));
-        assert_eq!(stack.resource_id(), &svc_rid());
+        assert_eq!(stack.view_id(), &svc_view());
         assert_eq!(stack.depth(), 3);
 
         stack.pop();
-        assert_eq!(stack.resource_id(), &deploy_rid());
+        assert_eq!(stack.view_id(), &deploy_view());
         stack.pop();
-        assert_eq!(stack.resource_id(), &pod_rid());
+        assert_eq!(stack.view_id(), &pod_view());
         assert!(stack.pop().is_none());
     }
 
@@ -861,7 +936,7 @@ mod tests {
         assert_eq!(stack.depth(), 2);
 
         let change = stack.reset(svc_rid());
-        assert_eq!(stack.resource_id(), &svc_rid());
+        assert_eq!(stack.view_id(), &svc_view());
         assert_eq!(stack.depth(), 1);
         assert!(!stack.is_drilled());
         assert!(change.subscribe.is_some());
@@ -873,10 +948,10 @@ mod tests {
         assert!(stack.prev_root().is_none());
 
         stack.reset(deploy_rid());
-        assert_eq!(stack.prev_root(), Some(&pod_rid()));
+        assert_eq!(stack.prev_root(), Some(&pod_view()));
 
         stack.reset(svc_rid());
-        assert_eq!(stack.prev_root(), Some(&deploy_rid()));
+        assert_eq!(stack.prev_root(), Some(&deploy_view()));
     }
 
     // -----------------------------------------------------------------------
@@ -1030,7 +1105,7 @@ mod tests {
         let mut stack = NavStack::new(pod_rid());
         stack.push(NavStep::new(deploy_rid(), None));
         stack.push(NavStep::new(svc_rid(), None));
-        assert_eq!(stack.root_resource_id(), &pod_rid());
+        assert_eq!(stack.root_view_id(), &pod_view());
     }
 
     #[test]

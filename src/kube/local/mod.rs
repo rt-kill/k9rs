@@ -26,19 +26,18 @@
 //!
 //! # Per-context lifetime
 //!
-//! Local sources are **per context**, not process-wide. The
-//! [`registry::LocalRegistry`] caches them with the same `Weak<Arc>` TTL
-//! pattern as the K8s watcher cache: each session that subscribes holds
-//! a strong [`LocalSubscription`] containing an `Arc` keepalive, and the
-//! registry only stores `Weak` refs. When the last subscription drops,
-//! its `Drop` impl spawns a grace-period task that holds the `Arc` for
-//! a few minutes — re-subscribes within that window upgrade the existing
-//! `Weak` and reuse the same source.
+//! Local sources are **per context**, not process-wide. Two lifetime
+//! models coexist:
 //!
-//! For port-forwards: switching context starts the grace period for the
-//! old context's `PortForwardSource`, leaving its kubectl subprocesses
-//! running until the window expires. Switching back within the window
-//! reuses them; otherwise the source drops and `kill_on_drop` cleans up.
+//! - **Port forwards** — the registry holds a strong `Arc`. Port forwards
+//!   are user-created side effects with running subprocesses; they persist
+//!   until explicitly stopped or the daemon exits. This means port forwards
+//!   survive context switches, nav pops, and any period without subscribers.
+//!
+//! - **Exec resources** — the registry stores `Weak` refs with the same
+//!   grace-period model as the K8s watcher cache: subscribers hold `Arc`
+//!   keepalives, and when the last subscription drops a grace task extends
+//!   the lifetime briefly before the source is released.
 //!
 //! # Adding a new local resource type
 //!

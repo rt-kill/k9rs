@@ -256,6 +256,18 @@ pub struct ContainerInfo {
     /// Init vs regular. Typed so the UI doesn't string-parse `name`.
     #[serde(default)]
     pub kind: ContainerKind,
+    /// Container image (e.g., "nginx:1.25").
+    #[serde(default)]
+    pub image: String,
+    /// Container status: "Running", "Waiting", or "Terminated".
+    #[serde(default)]
+    pub status: String,
+    /// Whether the container is ready.
+    #[serde(default)]
+    pub ready: bool,
+    /// Cumulative restart count.
+    #[serde(default)]
+    pub restart_count: i32,
 }
 
 /// Init vs regular container. Defaults to `Regular` for forward compat
@@ -323,6 +335,12 @@ pub enum DrillTarget {
         kind: crate::kube::resource_def::BuiltInKind,
         name: String,
     },
+    /// Drill into a client-side derived view projected from this row's
+    /// data. The `DerivedViewKind` determines what to project (containers,
+    /// volumes, etc.); the row carries the data to project from.
+    /// Adding a new derived view type never touches DrillTarget — the
+    /// taxonomy lives on [`crate::app::view::DerivedViewKind`].
+    Derived(crate::app::view::DerivedViewKind),
 }
 
 impl super::KubeResource for ResourceRow {

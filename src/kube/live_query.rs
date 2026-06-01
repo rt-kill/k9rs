@@ -126,6 +126,10 @@ pub(crate) fn watcher_page_size() -> u32 {
 pub(crate) const INIT_FLUSH_INTERVAL_MS: u64 = 200;
 /// Maximum store size for intermediate flushes.
 pub(crate) const INIT_FLUSH_ROW_LIMIT: usize = 2_000;
+/// If no kube-rs watch events arrive within this window, the watcher
+/// self-terminates with Dead. The daemon bridge's retry loop creates a
+/// fresh watcher with a new initial list.
+pub(crate) const STALE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// Backoff config — loaded from daemon config at runtime.
 pub(crate) fn initial_backoff_ms() -> u64 {
     crate::kube::daemon_config::daemon_config().backoff.initial_ms
@@ -539,7 +543,15 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
 
     loop {
         tokio::select! {
-            event_result = stream.try_next() => {
+            timeout_result = tokio::time::timeout(STALE_TIMEOUT, stream.try_next()) => {
+                let event_result = match timeout_result {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!("live_query: watcher stale for {}({}), no events in {:?}", rt, ns_label, STALE_TIMEOUT);
+                        exit_reason = Some(format!("watch stale: no events in {:?}", STALE_TIMEOUT));
+                        break;
+                    }
+                };
                 match event_result {
                     Ok(Some(event)) => {
                         match event {

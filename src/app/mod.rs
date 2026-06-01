@@ -1,11 +1,14 @@
 pub mod actions;
+pub mod derived;
 pub mod nav;
 pub mod table;
 pub mod types;
+pub mod view;
 
 pub use actions::SortTarget;
 pub use table::*;
 pub use types::*;
+pub use view::*;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -54,7 +57,11 @@ pub struct KubeContext {
 /// column metadata from the def (via `column_defs()`) when the current
 /// resource is a built-in; falls back to `ColumnDef::infer` for CRDs
 /// and locals (which have no registered def or no override).
-pub fn column_level_for(rid: &ResourceId, name: &str) -> ColumnLevel {
+pub fn column_level_for(view: &crate::app::view::ViewId, name: &str) -> ColumnLevel {
+    // Derived views have no column-level overrides — all columns default-visible.
+    let Some(rid) = view.resource_id() else {
+        return ColumnLevel::Default;
+    };
     // Overlay level overrides take priority (e.g., promote QOS from Extra to Default).
     if let Some(overlay) = crate::kube::overlay::overlay_for(rid.plural()) {
         for oc in &overlay.columns {
@@ -122,13 +129,13 @@ impl TableDescriptor {
     /// viewing a single namespace. Uses the typed column metadata from
     /// the def (when `rid` is a built-in) to determine each column's
     /// level; falls back to `ColumnDef::infer` for CRDs / locals.
-    pub fn visible_columns(&self, rid: &ResourceId, level: ColumnLevel, skip_namespace: bool) -> Vec<(usize, &str)> {
+    pub fn visible_columns(&self, view: &crate::app::view::ViewId, level: ColumnLevel, skip_namespace: bool) -> Vec<(usize, &str)> {
         self.headers.iter().enumerate()
             .filter(|(_, name)| {
                 if skip_namespace && name.eq_ignore_ascii_case("NAMESPACE") {
                     return false;
                 }
-                column_level_for(rid, name) <= level
+                column_level_for(view, name) <= level
             })
             .map(|(i, name)| (i, name.as_str()))
             .collect()
@@ -151,7 +158,7 @@ impl Default for AppData {
         // Node, CRD). All other resources have their tables on NavStep.
         for def in crate::kube::resource_defs::REGISTRY.all() {
             let rid = def.resource_id();
-            if nav::is_globally_stored(&rid) {
+            if nav::is_globally_stored(&ViewId::Resource(rid.clone())) {
                 tables.insert(rid, StatefulTable::new());
             }
         }
@@ -194,6 +201,10 @@ pub struct App {
     /// Command history for `:` command mode (max 50 entries).
     pub command_history: Vec<String>,
 
+    /// Set by DaemonDisconnected to trigger auto-reconnection in the
+    /// main loop. Same mechanism as context switching.
+    pub reconnect_requested: bool,
+
     /// When true, Ctrl-C does not quit the application (`noExitOnCtrlC` config).
     pub no_exit_on_ctrl_c: bool,
     /// When true, destructive actions (delete, edit, scale, restart, force-kill, shell) are disabled.
@@ -224,6 +235,7 @@ impl App {
             command_history: Vec::new(),
             no_exit_on_ctrl_c: config.no_exit_on_ctrl_c,
             read_only: config.read_only,
+            reconnect_requested: false,
             config,
             ui: UiState {
                 flash: None,
@@ -394,7 +406,7 @@ impl App {
     /// Without this, the first snapshot for the CRD would land on a missing
     /// table in `apply_resource_update` and be dropped on the floor.
     pub fn clear_resource(&mut self, rid: &ResourceId) {
-        if nav::is_globally_stored(rid) {
+        if nav::is_globally_stored(&ViewId::Resource(rid.clone())) {
             let table = self.data.tables.entry(rid.clone()).or_default();
             table.clear_data();
         } else if let Some(table) = self.nav.find_table_for_resource_mut(rid) {
@@ -421,7 +433,7 @@ impl App {
             return nav::rid(crate::kube::resource_def::BuiltInKind::Pod);
         }
         let current = self.nav.resource_id();
-        let idx = pinned.iter().position(|r| r == current).unwrap_or(0);
+        let idx = pinned.iter().position(|r| Some(r) == current).unwrap_or(0);
         pinned[(idx + 1) % pinned.len()].clone()
     }
 
@@ -431,7 +443,7 @@ impl App {
             return nav::rid(crate::kube::resource_def::BuiltInKind::Pod);
         }
         let current = self.nav.resource_id();
-        let idx = pinned.iter().position(|r| r == current).unwrap_or(0);
+        let idx = pinned.iter().position(|r| Some(r) == current).unwrap_or(0);
         pinned[if idx == 0 { pinned.len() - 1 } else { idx - 1 }].clone()
     }
 
@@ -463,24 +475,37 @@ impl App {
 
     /// Get the active view's table (immutable).
     pub fn active_view_table(&self) -> Option<&StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        self.table_for(self.nav.resource_id())
+        // Derived views carry their table directly on the nav step.
+        // Resource views route through table_for (global or nav-step lookup).
+        if let Some(rid) = self.nav.resource_id() {
+            self.table_for(rid)
+        } else {
+            self.nav.current().table.as_ref()
+        }
     }
 
     /// Get the active view's table (mutable).
     pub fn active_view_table_mut(&mut self) -> Option<&mut StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        let rid = self.nav.resource_id().clone();
-        self.table_for_mut(&rid)
+        if let Some(rid) = self.nav.resource_id().cloned() {
+            self.table_for_mut(&rid)
+        } else {
+            self.nav.current_mut().table.as_mut()
+        }
     }
 
     /// Get the active view's descriptor.
     pub fn active_view_descriptor(&self) -> Option<&TableDescriptor> {
-        self.descriptor_for(self.nav.resource_id())
+        if let Some(rid) = self.nav.resource_id() {
+            self.descriptor_for(rid)
+        } else {
+            self.nav.current().descriptor.as_ref()
+        }
     }
 
     /// Route a table lookup by ResourceId (immutable). Checks the global
     /// store for globally-stored resources, otherwise walks the nav stack.
     pub fn table_for(&self, rid: &ResourceId) -> Option<&StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        if nav::is_globally_stored(rid) {
+        if nav::is_globally_stored(&ViewId::Resource(rid.clone())) {
             self.data.tables.get(rid)
         } else {
             self.nav.find_table_for_resource(rid)
@@ -490,7 +515,7 @@ impl App {
     /// Route a table lookup by ResourceId (mutable). Checks the global
     /// store for globally-stored resources, otherwise walks the nav stack.
     pub fn table_for_mut(&mut self, rid: &ResourceId) -> Option<&mut StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        if nav::is_globally_stored(rid) {
+        if nav::is_globally_stored(&ViewId::Resource(rid.clone())) {
             self.data.tables.get_mut(rid)
         } else {
             self.nav.find_table_for_resource_mut(rid)
@@ -499,7 +524,7 @@ impl App {
 
     /// Route a descriptor lookup by ResourceId.
     pub fn descriptor_for(&self, rid: &ResourceId) -> Option<&TableDescriptor> {
-        if nav::is_globally_stored(rid) {
+        if nav::is_globally_stored(&ViewId::Resource(rid.clone())) {
             self.data.descriptors.get(rid)
         } else {
             self.nav.find_descriptor_for_resource(rid)
@@ -710,6 +735,14 @@ impl App {
                     }
                 }
             }
+            // Shell view: animate while connecting (waiting for first byte).
+            if !changed {
+                if let Route::Shell(ref shell) = self.route {
+                    if shell.connect_state == crate::app::ShellConnectState::Connecting {
+                        changed = true;
+                    }
+                }
+            }
         }
         changed
     }
@@ -758,7 +791,7 @@ impl App {
     /// - the `AppEvent::ResourceCapabilities` wire round-trip
     /// - every "caps cache missed after resolve" failure mode
     pub fn current_capabilities(&self) -> crate::kube::protocol::ResourceCapabilities {
-        self.nav.resource_id().capabilities()
+        self.nav.view_id().capabilities()
     }
 
     /// Compute health statistics for all core resources. Returns
@@ -784,7 +817,7 @@ impl App {
 
     /// Whether the current nav resource is cluster-scoped (no namespace).
     pub fn current_tab_is_cluster_scoped(&self) -> bool {
-        self.nav.resource_id().is_cluster_scoped()
+        self.nav.view_id().is_cluster_scoped()
     }
 
     /// Find a discovered CRD by its kind name (case-insensitive).

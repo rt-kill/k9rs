@@ -7,7 +7,6 @@ use ratatui::{
 };
 
 use crate::ui::theme::Theme;
-use crate::util::truncate_to_width;
 
 /// Parsed timestamp and content from a Kubernetes log line.
 struct LogTimestamp<'a> {
@@ -46,53 +45,13 @@ fn parse_container_prefix(line: &str) -> Option<(&str, &str)> {
     Some((prefix, &line[space_pos + 1..]))
 }
 
-/// Split a text line into spans, highlighting matches for all active filter
-/// patterns using SearchPattern (smartcase regex).
-fn highlight_filters<'a>(text: &'a str, patterns: &[String], normal: Style, highlight: Style) -> Line<'a> {
-    if patterns.is_empty() {
-        return Line::from(Span::styled(text, normal));
-    }
-    // Collect all match ranges from all patterns.
-    let mut all_matches: Vec<(usize, usize)> = Vec::new();
-    for term in patterns {
-        if term.is_empty() { continue; }
-        let pat = crate::util::SearchPattern::new(term);
-        all_matches.extend(pat.find_all(text));
-    }
-    if all_matches.is_empty() {
-        return Line::from(Span::styled(text, normal));
-    }
-    // Sort by start position, then merge overlapping ranges.
-    all_matches.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for (s, e) in all_matches {
-        if let Some(last) = merged.last_mut() {
-            if s <= last.1 {
-                last.1 = last.1.max(e);
-                continue;
-            }
-        }
-        merged.push((s, e));
-    }
-    let mut spans = Vec::new();
-    let mut last = 0;
-    for (start, end) in merged {
-        if start > last {
-            spans.push(Span::styled(&text[last..start], normal));
-        }
-        spans.push(Span::styled(&text[start..end], highlight));
-        last = end;
-    }
-    if last < text.len() {
-        spans.push(Span::styled(&text[last..], normal));
-    }
-    Line::from(spans)
-}
-
 /// State for the log viewer widget.
 pub struct LogViewState {
     pub scroll: usize,
     pub follow: bool,
+    /// True during initial tail fetch — suppresses follow-mode auto-scroll
+    /// so the view doesn't jump as lines stream in.
+    pub initial_load: bool,
     pub wrap: bool,
     pub show_timestamps: bool,
     pub total_lines: usize,
@@ -218,8 +177,11 @@ impl StatefulWidget for LogViewer<'_> {
 
         let visible_height = inner.height as usize;
 
-        // In follow mode, always show the latest lines
-        if state.follow && self.lines.len() > visible_height {
+        // In follow mode, snap to the latest lines — but skip during
+        // initial_load to prevent the view from jumping as the initial
+        // tail batch streams in. The snap happens once when initial_load
+        // transitions to false.
+        if state.follow && !state.initial_load && self.lines.len() > visible_height {
             state.scroll = self.lines.len() - visible_height;
         }
 
@@ -229,89 +191,115 @@ impl StatefulWidget for LogViewer<'_> {
             state.scroll = max_scroll;
         }
 
-        // Render visible lines
-        if state.wrap {
-            // In wrap mode, window the content starting at scroll offset to
-            // avoid u16 overflow in Paragraph::scroll for large log buffers.
-            let start_line = state.scroll.min(self.lines.len().saturating_sub(1));
-            let mut text_lines: Vec<Line<'_>> = Vec::with_capacity(visible_height);
-            for line_idx in start_line..self.lines.len() {
-                let line = self.lines[line_idx];
-                if state.show_timestamps {
-                    if let Some(LogTimestamp { timestamp: ts, content }) = Self::parse_timestamp(line) {
-                        text_lines.push(Line::from(vec![
-                            Span::styled(ts, self.theme.log_timestamp),
-                            Span::styled(" ", self.theme.log_text),
-                            Span::styled(content, self.theme.log_text),
-                        ]));
-                    } else {
-                        text_lines.push(Line::from(Span::styled(line, self.theme.log_text)));
-                    }
+        // -- Content preparation: single pipeline for both wrap/non-wrap --
+        // Rendering is agnostic — wrap flows lines into a Paragraph,
+        // non-wrap renders line-by-line. Same content logic for both.
+        // Precompile filter patterns ONCE per frame (not per line).
+        let compiled_patterns: Vec<crate::util::SearchPattern> = state.active_patterns.iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| crate::util::SearchPattern::new(s))
+            .collect();
+
+        let prepare_line = |line: &str, theme: &Theme, is_all: bool, show_ts: bool,
+                            compiled: &[crate::util::SearchPattern]| -> Line<'static> {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+
+            // 1. Timestamp (optional prefix).
+            let content = if show_ts {
+                if let Some(LogTimestamp { timestamp: ts, content }) = Self::parse_timestamp(line) {
+                    spans.push(Span::styled(ts.to_string(), theme.log_timestamp));
+                    spans.push(Span::styled(" ".to_string(), theme.log_text));
+                    content
                 } else {
-                    let content = if let Some(LogTimestamp { content, .. }) = Self::parse_timestamp(line) {
-                        content
-                    } else {
-                        line
-                    };
-                    text_lines.push(Line::from(Span::styled(content, self.theme.log_text)));
+                    line
                 }
+            } else if let Some(LogTimestamp { content, .. }) = Self::parse_timestamp(line) {
+                content
+            } else {
+                line
+            };
+
+            // 2. Container prefix (multi-container logs).
+            let body = if is_all {
+                if let Some((prefix, rest)) = parse_container_prefix(content) {
+                    let color = container_color(prefix);
+                    spans.push(Span::styled(format!("{} ", prefix), Style::default().fg(color)));
+                    rest
+                } else {
+                    content
+                }
+            } else {
+                content
+            };
+
+            // 3. Body: ANSI colors preserved, filter highlights overlaid.
+            //    Always parse ANSI first. If filters active, find match
+            //    ranges on stripped text and apply highlight to matching spans.
+            let ansi_spans = crate::util::parse_ansi_line(body, theme.log_text);
+            if !compiled.is_empty() {
+                let stripped = crate::util::strip_ansi(body);
+                let match_ranges = {
+                    let mut ranges = Vec::new();
+                    for pat in compiled {
+                        ranges.extend(pat.find_all(&stripped));
+                    }
+                    ranges.sort_unstable();
+                    ranges
+                };
+                if match_ranges.is_empty() {
+                    // No matches — render with ANSI colors.
+                    spans.extend(ansi_spans.into_iter().map(|s| {
+                        Span::styled(s.content.to_string(), s.style)
+                    }));
+                } else {
+                    // Has matches — override matched portions with highlight style,
+                    // keep ANSI colors on non-matched portions.
+                    let mut char_pos: usize = 0;
+                    for s in &ansi_spans {
+                        // parse_ansi_line returns spans with ONLY visible text
+                        // (ANSI codes already removed) — no double-strip needed.
+                        let span_start = char_pos;
+                        let span_end = char_pos + s.content.len();
+                        let overlaps_match = match_ranges.iter().any(|&(ms, me)| {
+                            ms < span_end && me > span_start
+                        });
+                        if overlaps_match {
+                            spans.push(Span::styled(s.content.to_string(), theme.search_match));
+                        } else {
+                            spans.push(Span::styled(s.content.to_string(), s.style));
+                        }
+                        char_pos = span_end;
+                    }
+                }
+            } else {
+                spans.extend(ansi_spans.into_iter().map(|s| {
+                    Span::styled(s.content.to_string(), s.style)
+                }));
             }
-            // Windowing already handled — render from offset 0
+
+            Line::from(spans)
+        };
+
+        // -- Rendering: wrap vs non-wrap are purely layout concerns --
+        if state.wrap {
+            // Window from scroll position to avoid O(n) preparation of all lines.
+            // In wrap mode, a single logical line may occupy multiple visual rows,
+            // so we prepare a generous window and let Paragraph handle wrapping.
+            let start = state.scroll.min(self.lines.len().saturating_sub(1));
+            let text_lines: Vec<Line<'static>> = self.lines[start..]
+                .iter()
+                .map(|line| prepare_line(line, self.theme, self.is_all_containers, state.show_timestamps, &compiled_patterns))
+                .collect();
             let paragraph = Paragraph::new(text_lines)
                 .wrap(Wrap { trim: false })
                 .scroll((0, 0));
             paragraph.render(inner, buf);
         } else {
-            // No wrap: render each line individually, truncating to width.
-            let patterns = &state.active_patterns;
             let end = (state.scroll + visible_height).min(self.lines.len());
             for (vi, line_idx) in (state.scroll..end).enumerate() {
                 let y = inner.y + vi as u16;
-                let line = self.lines[line_idx];
-
-                let content = if state.show_timestamps {
-                    // Render timestamp prefix + content with filter highlighting.
-                    if let Some(LogTimestamp { timestamp: ts, content }) = Self::parse_timestamp(line) {
-                        let ts_span = Span::styled(format!("{} ", ts), self.theme.log_timestamp);
-                        let content_line = highlight_filters(content, patterns, self.theme.log_text, self.theme.search_match);
-                        let mut spans = vec![ts_span];
-                        spans.extend(content_line.spans);
-                        let styled_line = Line::from(spans);
-                        buf.set_line(inner.x, y, &styled_line, inner.width);
-                        continue;
-                    }
-                    line
-                } else {
-                    if let Some(LogTimestamp { content, .. }) = Self::parse_timestamp(line) {
-                        content
-                    } else {
-                        line
-                    }
-                };
-                // Per-container colored prefix for multi-container logs.
-                let (prefix_span, display_content) = if self.is_all_containers {
-                    if let Some((prefix, rest)) = parse_container_prefix(content) {
-                        let color = container_color(prefix);
-                        (Some(Span::styled(format!("{} ", prefix), Style::default().fg(color))), rest)
-                    } else {
-                        (None, content)
-                    }
-                } else {
-                    (None, content)
-                };
-                let max_w = inner.width as usize;
-                let display = truncate_to_width(display_content, max_w);
-                if patterns.is_empty() && prefix_span.is_none() {
-                    buf.set_string(inner.x, y, display, self.theme.log_text);
-                } else {
-                    let mut spans = Vec::new();
-                    if let Some(ps) = prefix_span {
-                        spans.push(ps);
-                    }
-                    let highlighted = highlight_filters(display, patterns, self.theme.log_text, self.theme.search_match);
-                    spans.extend(highlighted.spans);
-                    buf.set_line(inner.x, y, &Line::from(spans), inner.width);
-                }
+                let styled = prepare_line(self.lines[line_idx], self.theme, self.is_all_containers, state.show_timestamps, &compiled_patterns);
+                buf.set_line(inner.x, y, &styled, inner.width);
             }
         }
 

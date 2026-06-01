@@ -116,12 +116,12 @@ impl Drop for AbortOnDrop {
 /// write stalls and the 10-second connection_write_timeout can fire,
 /// silently killing the substream.
 ///
-/// We bump the window to 16 MB so a single snapshot fits without flow-
-/// control pauses, and extend the write timeout so transient stalls on
-/// very large clusters don't kill the connection.
+/// We bump the window to 64 MB so a single large snapshot fits without
+/// flow-control pauses, and extend the write timeout so transient stalls
+/// on very large clusters don't kill the connection.
 fn mux_config() -> tokio_yamux::Config {
     tokio_yamux::Config {
-        max_stream_window_size: 16 * 1024 * 1024,
+        max_stream_window_size: 64 * 1024 * 1024,
         connection_write_timeout: std::time::Duration::from_secs(60),
         ..tokio_yamux::Config::default()
     }

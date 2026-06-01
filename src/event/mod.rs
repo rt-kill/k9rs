@@ -46,7 +46,8 @@ pub enum AppEvent {
         message: String,
     },
     /// Raw terminal bytes from an exec session (daemon → TUI).
-    /// Fed to the vt100 parser in Route::Shell.
+    /// Buffered during Connecting, written directly to stdout during
+    /// bridge mode.
     ExecData(Vec<u8>),
     /// The exec stream ended (daemon closed the substream).
     ExecEnded,

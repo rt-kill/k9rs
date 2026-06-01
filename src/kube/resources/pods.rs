@@ -180,9 +180,11 @@ pub(crate) fn compute_pod_status(
         return PodStatus::pending(REASON_TERMINATING);
     }
 
-    // Exit code terminated states are always failed — catch them via
-    // classify_pod_reason's default (Pending), then override below.
-    let health = if status_str.starts_with("ExitCode:") || status_str.starts_with("Signal:") {
+    // Terminated with a signal or non-zero exit code is Failed.
+    // ExitCode:0 is a clean exit (e.g. completed Job) — Normal.
+    let health = if status_str == "ExitCode:0" {
+        RowHealth::Normal
+    } else if status_str.starts_with("ExitCode:") || status_str.starts_with("Signal:") {
         RowHealth::Failed
     } else {
         classify_pod_reason(&status_str)
@@ -336,17 +338,31 @@ impl ConvertToRow<Pod> for PodDef {
 
     let init_containers: Vec<ContainerInfo> = init_container_statuses
         .iter()
-        .map(|cs| ContainerInfo {
-            name: cs.name.clone(),
-            kind: crate::kube::resources::row::ContainerKind::Init,
+        .map(|cs| {
+            let (status, ready) = container_status_and_ready(cs);
+            ContainerInfo {
+                name: cs.name.clone(),
+                kind: crate::kube::resources::row::ContainerKind::Init,
+                image: cs.image.clone(),
+                status,
+                ready,
+                restart_count: cs.restart_count,
+            }
         })
         .collect();
 
     let regular_containers: Vec<ContainerInfo> = container_statuses
         .iter()
-        .map(|cs| ContainerInfo {
-            name: cs.name.clone(),
-            kind: crate::kube::resources::row::ContainerKind::Regular,
+        .map(|cs| {
+            let (status, ready) = container_status_and_ready(cs);
+            ContainerInfo {
+                name: cs.name.clone(),
+                kind: crate::kube::resources::row::ContainerKind::Regular,
+                image: cs.image.clone(),
+                status,
+                ready,
+                restart_count: cs.restart_count,
+            }
         })
         .collect();
 
@@ -498,6 +514,9 @@ impl ConvertToRow<Pod> for PodDef {
         pf_ports,
         node,
         health,
+        drill_target: Some(crate::kube::resources::row::DrillTarget::Derived(
+            crate::app::view::DerivedViewKind::Containers,
+        )),
         cpu_request: if has_cpu_req { Some(cpu_req_milli) } else { None },
         cpu_limit: if has_cpu_lim { Some(cpu_lim_milli) } else { None },
         mem_request: if has_mem_req { Some(mem_req_bytes) } else { None },
@@ -505,4 +524,23 @@ impl ConvertToRow<Pod> for PodDef {
         ..Default::default()
     }
     }
+}
+
+/// Extract status string and ready flag from a container status.
+fn container_status_and_ready(cs: &k8s_openapi::api::core::v1::ContainerStatus) -> (String, bool) {
+    let ready = cs.ready;
+    let status = if let Some(ref state) = cs.state {
+        if state.running.is_some() {
+            "Running".to_string()
+        } else if let Some(ref w) = state.waiting {
+            w.reason.clone().unwrap_or_else(|| "Waiting".to_string())
+        } else if let Some(ref t) = state.terminated {
+            t.reason.clone().unwrap_or_else(|| "Terminated".to_string())
+        } else {
+            "Unknown".to_string()
+        }
+    } else {
+        "Unknown".to_string()
+    };
+    (status, ready)
 }

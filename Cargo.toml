@@ -42,7 +42,6 @@ unicode-width = "0.2"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 rand = "0.9"
 libc = "0.2"
-vt100 = "0.15"
 dashmap = "6"
 
 # Multiplexer: per-subscription substreams over the single Unix socket

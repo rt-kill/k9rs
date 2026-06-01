@@ -76,110 +76,12 @@ pub(crate) enum ExecTarget {
     },
 }
 
-/// Auto-subscriptions that the TUI opens once the daemon connection is ready.
-/// These are core resources that the TUI always needs (namespace list for
-/// the namespace picker, node list for ShowNode drill, etc.). Each gets its
-/// own yamux substream — the daemon creates a watcher per substream.
-///
-/// Stored on App so they stay alive for the session's lifetime. Dropped on
-/// context switch (new session = new substreams).
-/// Convert a crossterm key event to raw terminal bytes for forwarding
-/// to a PTY. Handles printable chars, control keys, arrows, etc.
-fn crossterm_key_to_bytes(key: crossterm::event::KeyEvent) -> Vec<u8> {
-    use crossterm::event::{KeyCode, KeyModifiers};
-
-    // Alt wraps the inner key bytes with an ESC prefix.
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        let inner = crossterm_key_to_bytes(crossterm::event::KeyEvent::new(
-            key.code,
-            key.modifiers.difference(KeyModifiers::ALT),
-        ));
-        if !inner.is_empty() {
-            let mut v = vec![0x1b];
-            v.extend(inner);
-            return v;
-        }
-    }
-
-    // Shift modifier for navigation keys: CSI 1;2 <final>.
-    if key.modifiers.contains(KeyModifiers::SHIFT) {
-        let shifted = match key.code {
-            KeyCode::Up => Some(b'A'),
-            KeyCode::Down => Some(b'B'),
-            KeyCode::Right => Some(b'C'),
-            KeyCode::Left => Some(b'D'),
-            KeyCode::Home => Some(b'H'),
-            KeyCode::End => Some(b'F'),
-            _ => None,
-        };
-        if let Some(ch) = shifted {
-            return vec![0x1b, b'[', b'1', b';', b'2', ch];
-        }
-    }
-
-    match key.code {
-        KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                // Ctrl+A..Z → 0x01..0x1a
-                if c.is_ascii_alphabetic() {
-                    let byte = (c.to_ascii_lowercase() as u8) - b'a' + 1;
-                    return vec![byte];
-                }
-                // Ctrl+Space → NUL, Ctrl+[ → ESC, etc.
-                return match c {
-                    ' ' | '2' => vec![0x00],  // Ctrl+Space / Ctrl+2
-                    '[' | '3' => vec![0x1b],  // Ctrl+[
-                    '\\' | '4' => vec![0x1c], // Ctrl+\
-                    ']' | '5' => vec![0x1d],  // Ctrl+]
-                    '^' | '6' => vec![0x1e],  // Ctrl+^
-                    '_' | '7' | '/' => vec![0x1f], // Ctrl+_
-                    _ => vec![],
-                };
-            }
-            let mut buf = [0u8; 4];
-            let s = c.encode_utf8(&mut buf);
-            s.as_bytes().to_vec()
-        }
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
-        KeyCode::Up => vec![0x1b, b'[', b'A'],
-        KeyCode::Down => vec![0x1b, b'[', b'B'],
-        KeyCode::Right => vec![0x1b, b'[', b'C'],
-        KeyCode::Left => vec![0x1b, b'[', b'D'],
-        KeyCode::Home => vec![0x1b, b'[', b'H'],
-        KeyCode::End => vec![0x1b, b'[', b'F'],
-        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
-        KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
-        KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
-        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
-        KeyCode::F(n) => match n {
-            1 => vec![0x1b, b'O', b'P'],
-            2 => vec![0x1b, b'O', b'Q'],
-            3 => vec![0x1b, b'O', b'R'],
-            4 => vec![0x1b, b'O', b'S'],
-            5..=12 => {
-                let codes = [b"15", b"17", b"18", b"19", b"20", b"21", b"23", b"24"];
-                let idx = (n - 5) as usize;
-                if idx < codes.len() {
-                    let mut v = vec![0x1b, b'['];
-                    v.extend_from_slice(codes[idx]);
-                    v.push(b'~');
-                    v
-                } else { vec![] }
-            }
-            _ => vec![],
-        },
-        _ => vec![],
-    }
-}
-
-/// Open an exec session and navigate to Route::Shell. The session renders
-/// inside the TUI — no suspend, no alternate screen exit. The daemon spawns
-/// kubectl in a PTY; bytes flow over yamux and are parsed by vt100 into a
-/// screen buffer that the TUI renders each frame.
+/// Open an exec session and navigate to Route::Shell. The daemon spawns
+/// kubectl in a PTY and proxies bytes over yamux. During the Connecting
+/// phase the TUI shows a loading bar and the user has full navigation
+/// control. Once the first ExecData arrives (Connected), the session
+/// loop suspends the TUI and enters a raw byte bridge — stdin→daemon,
+/// daemon→stdout — with 100% terminal fidelity and no vt100 parsing.
 pub(crate) async fn open_exec_route(
     app: &mut App,
     data_source: &ClientSession,
@@ -188,9 +90,9 @@ pub(crate) async fn open_exec_route(
     event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
 ) -> Result<()> {
     let stream = data_source.open_exec_stream(exec_init.clone()).await?;
-    let parser = vt100::Parser::new(exec_init.term_height, exec_init.term_width, 0);
 
-    // Split: writer stays in Route for keystrokes, reader goes to bridge task.
+    // Split: writer stays in Route for the bridge loop, reader goes to
+    // a background task that delivers ExecData/ExecEnded events.
     let crate::kube::client_session::ExecStream { reader, writer } = stream;
     let tx = event_tx.clone();
     let bridge = tokio::spawn(async move {
@@ -220,10 +122,10 @@ pub(crate) async fn open_exec_route(
 
     app.navigate_to(crate::app::Route::Shell(Box::new(crate::app::ShellState {
         title,
-        parser,
         writer: Some(writer),
         _bridge: Some(bridge.abort_handle()),
-        connected: false,
+        connect_state: crate::app::ShellConnectState::Connecting,
+        pending_output: Vec::new(),
     })));
     Ok(())
 }
@@ -326,6 +228,15 @@ async fn run_editor_flow(
         _ => unreachable!(),
     };
 
+    // Record file mtime BEFORE launching the editor. If the user
+    // exits without saving (:q), the mtime won't change → abort.
+    // This correctly handles the retry-after-failure case: we rewrite
+    // the file with error comments, then open the editor. :q = mtime
+    // unchanged = abort. :wq = mtime newer = apply.
+    let pre_edit_mtime = std::fs::metadata(temp_file.path())
+        .and_then(|m| m.modified())
+        .ok();
+
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
     let path_arg = temp_file.path().to_string_lossy().to_string();
     let args = vec![path_arg];
@@ -351,6 +262,20 @@ async fn run_editor_flow(
         return true;
     }
 
+    // Check if the file was modified by comparing mtime before/after the
+    // editor. :q (no save) = mtime unchanged = abort. :wq = mtime newer = apply.
+    // Handles retry-after-failure: we rewrote the file with error comments
+    // before reopening. :q means "I give up", not "retry same content."
+    let post_edit_mtime = std::fs::metadata(temp_file.path())
+        .and_then(|m| m.modified())
+        .ok();
+    if pre_edit_mtime == post_edit_mtime {
+        app.ui.flash = Some(crate::app::FlashMessage::info(
+            "Edit cancelled (file not saved).".to_string()
+        ));
+        return true;
+    }
+
     // Read the edited file back.
     let edited = match std::fs::read_to_string(temp_file.path()) {
         Ok(s) => s,
@@ -364,7 +289,7 @@ async fn run_editor_flow(
 
     let stripped = strip_leading_comments(&edited);
 
-    // Unchanged -> abort.
+    // Unchanged from original → abort (first edit, no changes made).
     if stripped.trim() == original.trim() {
         app.ui.flash = Some(crate::app::FlashMessage::info(
             "Edit cancelled, no changes made.".to_string()
@@ -396,6 +321,146 @@ async fn run_editor_flow(
         app.pop_route();
     }
     true
+}
+
+/// Suspend the TUI and run a raw byte bridge between stdin/stdout and
+/// the daemon's PTY stream. Called when `Route::Shell` transitions to
+/// `ShellConnectState::Connected`. On return the TUI is restored and the
+/// shell route is popped.
+///
+/// During the bridge:
+/// - Raw stdin bytes → `ExecFrame::Data` → daemon → PTY
+/// - `AppEvent::ExecData` → raw stdout (no vt100 parsing)
+/// - SIGWINCH → `ExecFrame::Resize` → daemon (PTY ioctl)
+///
+/// The bridge exits when `ExecEnded` arrives, the yamux stream errors,
+/// or stdin closes. Terminal state is hard-reset (`\x1bc`) before the
+/// TUI resumes, so nothing the shell did can leak into the restored UI.
+async fn run_shell_bridge(
+    app: &mut App,
+    terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
+    event_rx: &mut mpsc::Receiver<AppEvent>,
+    input_suspend: &tokio::sync::watch::Sender<bool>,
+    input_suspend_ack: &mut mpsc::Receiver<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Extract writer and pending output from ShellState.
+    let (mut writer, pending) = match &mut app.route {
+        crate::app::Route::Shell(ref mut shell) => {
+            let w = shell.writer.take();
+            let p = std::mem::take(&mut shell.pending_output);
+            (w, p)
+        }
+        _ => return,
+    };
+    let Some(ref mut writer) = writer else { return };
+
+    // Send resize with full terminal dimensions (no TUI borders during bridge).
+    let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+    let _ = crate::kube::protocol::write_bincode(
+        writer,
+        &crate::kube::protocol::ExecFrame::Resize { width: tw, height: th },
+    ).await;
+
+    // Suspend TUI: stop the input bridge (releases stdin), leave alternate
+    // screen. Raw mode stays on — we need raw byte passthrough.
+    let _ = input_suspend.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(1), input_suspend_ack.recv()).await;
+    let _ = execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen);
+
+    // Clear the main screen so the user's local shell prompt (visible
+    // underneath the alternate screen) doesn't bleed through.
+    let mut stdout = tokio::io::stdout();
+    let _ = stdout.write_all(b"\x1b[2J\x1b[H").await;
+    let _ = stdout.flush().await;
+
+    // Print a small banner so the shell entry feels intentional.
+    let _ = stdout.write_all(b"\x1b[36m\
+  _     ___\r\n\
+ | | __/ _ \\ _ __ ___\r\n\
+ | |/ / (_) | '__/ __|\r\n\
+ |   < \\__, | |  \\__ \\\r\n\
+ |_|\\_\\  /_/|_|  |___/\r\n\
+\x1b[0m\r\n").await;
+    let _ = stdout.flush().await;
+
+    // Flush any bytes received during the Connecting→Connected transition
+    // (typically the initial shell prompt).
+    if !pending.is_empty() {
+        let _ = stdout.write_all(&pending).await;
+        let _ = stdout.flush().await;
+    }
+
+    // Raw bridge loop.
+    let mut stdin = tokio::io::stdin();
+    let mut buf = [0u8; 4096];
+    let mut sigwinch = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::window_change(),
+    ).expect("SIGWINCH handler");
+
+    loop {
+        tokio::select! {
+            biased;
+            result = stdin.read(&mut buf) => {
+                match result {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let frame = crate::kube::protocol::ExecFrame::Data(buf[..n].to_vec());
+                        if crate::kube::protocol::write_bincode(writer, &frame).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            event = event_rx.recv() => {
+                match event {
+                    Some(AppEvent::ExecData(bytes)) => {
+                        let _ = stdout.write_all(&bytes).await;
+                        let _ = stdout.flush().await;
+                    }
+                    Some(AppEvent::ExecEnded) | None => break,
+                    // Discard non-shell events. The daemon sends fresh
+                    // snapshots when the TUI resumes processing.
+                    Some(_) => {}
+                }
+            }
+            _ = sigwinch.recv() => {
+                if let Ok((w, h)) = crossterm::terminal::size() {
+                    let frame = crate::kube::protocol::ExecFrame::Resize { width: w, height: h };
+                    let _ = crate::kube::protocol::write_bincode(writer, &frame).await;
+                }
+            }
+        }
+    }
+
+    // Reset terminal modes the container shell may have changed, without
+    // nuking the user's terminal state (no RIS). Covers: colors, scroll
+    // region, mouse tracking, bracketed paste, charset, then clear+home.
+    let _ = stdout.write_all(concat!(
+        "\x1b[m",        // SGR 0: reset colors/bold/underline
+        "\x1b[r",        // DECSTBM: reset scroll region
+        "\x1b[?1000l",   // disable mouse tracking (Basic Mouse Mode)
+        "\x1b[?1006l",   // disable SGR mouse extension
+        "\x1b[?2004l",   // disable bracketed paste
+        "\x1b(B",        // select US-ASCII charset for G0
+        "\x1b[2J\x1b[H", // clear screen + cursor home
+    ).as_bytes()).await;
+    let _ = stdout.flush().await;
+
+    // Restore TUI state.
+    let _ = crossterm::terminal::enable_raw_mode();
+    let _ = execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::cursor::Hide,
+    );
+    let _ = terminal.clear();
+    let _ = input_suspend.send(false);
+
+    // Pop the shell route and flash a message.
+    app.pop_route();
+    app.ui.flash = Some(crate::app::FlashMessage::info("Shell session ended".to_string()));
 }
 
 /// Handle an `ActionResult` that requires opening an exec session.
@@ -616,7 +681,7 @@ pub(crate) fn apply_nav_change(app: &mut App, data_source: &mut ClientSession, c
         // For non-globally-stored resources, create the table on the
         // current nav step so snapshot data lands there instead of the
         // global store.
-        if !crate::app::nav::is_globally_stored(new) {
+        if !crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(new.clone())) {
             let step = app.nav.current_mut();
             if step.table.is_none() {
                 step.table = Some(crate::app::StatefulTable::new());
@@ -767,6 +832,33 @@ pub async fn session_main(
             needs_redraw = true;
         }
 
+        // Auto-reconnect on connection loss. Same mechanism as context switch:
+        // drop old session, create new channel, create fresh ClientSession.
+        // The user stays in the TUI — no quit, no restart needed.
+        if app.reconnect_requested {
+            app.reconnect_requested = false;
+            let no_daemon = data_source.is_no_daemon();
+            let ctx = if app.kube.context.is_empty() { None } else { Some(app.kube.context.clone()) };
+            drop(data_source);
+            drop(event_rx);
+            app.clear_data();
+            let (new_tx, new_rx) = mpsc::channel::<AppEvent>(256);
+            event_tx = new_tx;
+            event_rx = new_rx;
+            data_source = ClientSession::new(
+                crate::kube::client_session::ConnectionParams {
+                    context: ctx,
+                    namespace: app.kube.selected_ns.clone(),
+                    readonly: app.read_only,
+                    no_daemon,
+                },
+                event_tx.clone(),
+            );
+            // ConnectionEstablished will fire when ready, triggering
+            // open_core_subscriptions and re-subscribing.
+            needs_redraw = true;
+        }
+
         // Tick check BEFORE select — guarantees animation runs even during event floods.
         if last_tick.elapsed() >= tick_rate {
             if app.tick() {
@@ -810,6 +902,20 @@ pub async fn session_main(
             continue;
         }
 
+        // Shell bridge: when the daemon confirms the shell is connected,
+        // suspend the TUI and enter a raw byte bridge. stdin→daemon,
+        // daemon→stdout, no parsing. Restores TUI on exit.
+        if let crate::app::Route::Shell(ref shell) = app.route {
+            if shell.connect_state == crate::app::ShellConnectState::Connected {
+                run_shell_bridge(
+                    &mut app, &mut terminal, &mut event_rx,
+                    &input.suspend_tx, &mut input.suspend_ack_rx,
+                ).await;
+                needs_redraw = true;
+                continue;
+            }
+        }
+
         tokio::select! {
             // biased: always check key events first so user input (like disabling
             // autoscroll) takes effect before processing queued data events.
@@ -818,28 +924,6 @@ pub async fn session_main(
             Some(ct_event) = input.input_rx.recv() => {
                 match ct_event {
                     CtEvent::Key(key) => {
-                        // Shell route: forward ALL keys as raw bytes to the
-                        // daemon's PTY. Shell exits only when the remote
-                        // process exits (ExecEnded event), not on Esc.
-                        if let crate::app::Route::Shell(ref mut shell) = app.route {
-                            if let Some(ref mut w) = shell.writer {
-                                let bytes = crossterm_key_to_bytes(key);
-                                if !bytes.is_empty() {
-                                    let frame = crate::kube::protocol::ExecFrame::Data(bytes);
-                                    if crate::kube::protocol::write_bincode(w, &frame).await.is_err() {
-                                        app.pop_route();
-                                        app.ui.flash = Some(crate::app::FlashMessage::error(
-                                            "Shell disconnected".to_string()
-                                        ));
-                                        needs_redraw = true;
-                                        continue;
-                                    }
-                                }
-                            }
-                            needs_redraw = true;
-                            continue;
-                        }
-
                         // Input modes get priority over normal key handling.
                         // Each mode handler returns true if the key was consumed.
                         if try_handle_input_mode(
@@ -876,17 +960,7 @@ pub async fn session_main(
                     }
                     // Pure-keyboard TUI by design — mouse events are
                     // intentionally dropped (see ~/.config/claude memory).
-                    CtEvent::Resize(w, h) => {
-                        // Forward resize to daemon's PTY when in shell view.
-                        if let crate::app::Route::Shell(ref mut shell) = app.route {
-                            // Update local parser first so the render matches
-                            // even if the daemon write fails.
-                            shell.parser.set_size(h, w);
-                            if let Some(ref mut wr) = shell.writer {
-                                let frame = crate::kube::protocol::ExecFrame::Resize { width: w, height: h };
-                                let _ = crate::kube::protocol::write_bincode(wr, &frame).await;
-                            }
-                        }
+                    CtEvent::Resize(_w, _h) => {
                         needs_redraw = true;
                     }
                     _ => {}
@@ -904,6 +978,14 @@ pub async fn session_main(
                             drained += 1;
                         }
                         Err(_) => break,
+                    }
+                }
+                // Gap detection for log initial load: if we drained all
+                // pending events and the log view is still in initial_load,
+                // the initial tail batch is complete — snap to bottom.
+                if let crate::app::Route::Logs { ref mut state, .. } = app.route {
+                    if state.initial_load && !state.lines().is_empty() {
+                        state.initial_load = false;
                     }
                 }
                 needs_redraw = true;

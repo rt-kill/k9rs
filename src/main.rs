@@ -182,15 +182,16 @@ async fn main() -> Result<()> {
     // `ConnectionEstablished`, so we skip them here to avoid opening
     // a duplicate substream for the same table.
     if matches!(app.route, crate::app::Route::Resources) {
-        let initial_rid = app.nav.resource_id().clone();
-        let is_core = initial_rid.built_in_kind()
-            .map(|k| crate::kube::resource_defs::REGISTRY.by_kind(k).is_core())
-            .unwrap_or(false);
-        if !is_core {
-            let filter = app.nav.current().filter.as_ref()
-                .and_then(|f| f.to_subscription_filter());
-            let stream = data_source.subscribe_stream(initial_rid, app.kube.selected_ns.clone(), filter);
-            app.nav.current_mut().stream = Some(stream);
+        if let Some(initial_rid) = app.nav.resource_id().cloned() {
+            let is_core = initial_rid.built_in_kind()
+                .map(|k| crate::kube::resource_defs::REGISTRY.by_kind(k).is_core())
+                .unwrap_or(false);
+            if !is_core {
+                let filter = app.nav.current().filter.as_ref()
+                    .and_then(|f| f.to_subscription_filter());
+                let stream = data_source.subscribe_stream(initial_rid, app.kube.selected_ns.clone(), filter);
+                app.nav.current_mut().stream = Some(stream);
+            }
         }
     }
 

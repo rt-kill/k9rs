@@ -900,10 +900,9 @@ impl ResourceCapabilities {
 
 /// Maximum bincode message size on the daemon socket. The largest
 /// legitimate message is a `ResourceUpdate::Rows` snapshot for a busy
-/// cluster — even 5000 pods × 10 containers each lands well under 8 MiB.
-/// The cap is set to 16 MiB to give comfortable headroom while still
+/// cluster. 64 MiB gives headroom for very large clusters while still
 /// rejecting outrageous allocations from a corrupted frame.
-const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Buffer capacity for BufReader/BufWriter on session connections.
 pub const IO_BUFFER_SIZE: usize = 256 * 1024;
@@ -1116,7 +1115,7 @@ pub struct LogInit {
 /// changes in a bincode-incompatible way (new fields, reordering, etc.).
 /// The daemon rejects Init commands with a mismatched version so stale
 /// daemons fail fast instead of producing silent data corruption.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// All commands from any client (TUI session or management CLI).
 /// The first command on a connection determines the connection type:

@@ -85,8 +85,24 @@ impl ServerSession {
                 // Parse the user's YAML and apply as a strategic merge patch.
                 // No SSA (no field manager) — avoids claiming field ownership
                 // that would conflict with GitOps tools.
-                let parsed: DynamicObject = serde_yaml::from_str(&yaml)
+                let mut parsed: DynamicObject = serde_yaml::from_str(&yaml)
                     .map_err(|e| anyhow::anyhow!("yaml parse error: {}", e))?;
+
+                // Validate that the parsed YAML targets the expected resource.
+                // Catches corrupted or mis-edited YAML before it reaches the API.
+                if let Some(ref name) = parsed.metadata.name {
+                    if name != &target.name {
+                        anyhow::bail!(
+                            "metadata.name mismatch: expected '{}', got '{}'",
+                            target.name, name
+                        );
+                    }
+                }
+
+                // Strip resourceVersion — merge patches don't need it, and
+                // including a stale version causes 409 Conflict if anyone
+                // else touched the resource between our fetch and apply.
+                parsed.metadata.resource_version = None;
 
                 api.patch(&target.name, &PatchParams::default(), &Patch::Merge(&parsed))
                     .await?;

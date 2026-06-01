@@ -686,9 +686,11 @@ impl ClientSession {
             loop {
                 match protocol::read_bincode::<_, String>(&mut reader).await {
                     Ok(line) => {
-                        let clean = crate::util::strip_ansi(&line);
+                        // Pass ANSI codes through — the log renderer parses
+                        // SGR sequences into ratatui Styles so application-
+                        // embedded colors are preserved faithfully.
                         let event = AppEvent::ResourceUpdate(
-                            crate::event::ResourceUpdate::LogLine { generation, line: clean },
+                            crate::event::ResourceUpdate::LogLine { generation, line },
                         );
                         if event_tx.send(event).await.is_err() { break; }
                     }
@@ -835,79 +837,104 @@ impl ClientSession {
                 }
             };
 
-            // Open a substream and send the subscription handshake.
-            let stream = match mux_handle.open().await {
-                Ok(s) => s,
-                Err(e) => {
+            // Self-healing bridge: open substream → read events → on
+            // failure, retry with backoff. Same pattern as the daemon
+            // bridge's watcher retry. Natural exit: session death
+            // (open fails) or event channel dropped (reconnection).
+            let mut ever_received_data = false;
+            let mut retry_backoff = std::time::Duration::from_secs(2);
+
+            loop {
+                // Open a substream and send the subscription handshake.
+                let stream = match mux_handle.open().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if ever_received_data {
+                            tracing::warn!("subscription bridge reopen failed for {}: {}", rid.plural(), e);
+                        }
+                        let _ = event_tx.send(AppEvent::SubscriptionFailed {
+                            resource: rid,
+                            message: format!("substream open failed: {}", e),
+                        }).await;
+                        return;
+                    }
+                };
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::with_capacity(
+                    protocol::IO_BUFFER_SIZE,
+                    read_half,
+                );
+
+                let init = protocol::SubstreamInit::Subscribe(protocol::SubscriptionInit {
+                    resource: rid.clone(),
+                    namespace: namespace.clone(),
+                    filter: filter.clone(),
+                    force,
+                });
+                if let Err(e) = protocol::write_bincode(&mut write_half, &init).await {
+                    if ever_received_data {
+                        tracing::warn!("subscription bridge init failed for {}: {}", rid.plural(), e);
+                    }
                     let _ = event_tx.send(AppEvent::SubscriptionFailed {
                         resource: rid,
-                        message: format!("substream open failed: {}", e),
+                        message: format!("subscription init failed: {}", e),
                     }).await;
                     return;
                 }
-            };
-            let (read_half, mut write_half) = tokio::io::split(stream);
-            let mut reader = tokio::io::BufReader::with_capacity(
-                protocol::IO_BUFFER_SIZE,
-                read_half,
-            );
 
-            let init = protocol::SubstreamInit::Subscribe(protocol::SubscriptionInit {
-                resource: rid.clone(),
-                namespace,
-                filter,
-                force,
-            });
-            if let Err(e) = protocol::write_bincode(&mut write_half, &init).await {
-                let _ = event_tx.send(AppEvent::SubscriptionFailed {
-                    resource: rid,
-                    message: format!("subscription init failed: {}", e),
-                }).await;
-                return;
-            }
-
-            // Bridge: read StreamEvents from the substream, convert to
-            // AppEvents, forward into the main event channel.
-            //
-            // `current_rid` tracks the rid as the server resolved it. The
-            // captured `rid` is what the client originally subscribed with;
-            // the server may send `Resolved { original, resolved }` after
-            // discovery, after which subsequent Error/Capabilities events
-            // should refer to the resolved key, not the original. Without
-            // this, a SubscriptionFailed arriving after Resolved would
-            // write to a stale table entry that no longer exists.
-            let mut current_rid = rid.clone();
-            loop {
-                match protocol::read_bincode::<_, protocol::StreamEvent>(&mut reader).await {
-                    Ok(event) => {
-                        let app_event = match event {
-                            protocol::StreamEvent::Snapshot(update) => {
-                                AppEvent::ResourceUpdate(update)
-                            }
-                            protocol::StreamEvent::Error(msg) => {
-                                AppEvent::SubscriptionFailed {
-                                    resource: current_rid.clone(),
-                                    message: msg,
+                // Bridge: read StreamEvents from the substream, convert to
+                // AppEvents, forward into the main event channel.
+                //
+                // `current_rid` tracks the rid as the server resolved it.
+                // Reset on each retry — the daemon re-resolves CRDs.
+                let mut current_rid = rid.clone();
+                loop {
+                    match protocol::read_bincode::<_, protocol::StreamEvent>(&mut reader).await {
+                        Ok(event) => {
+                            ever_received_data = true;
+                            retry_backoff = std::time::Duration::from_secs(2);
+                            let app_event = match event {
+                                protocol::StreamEvent::Snapshot(update) => {
+                                    AppEvent::ResourceUpdate(update)
                                 }
+                                protocol::StreamEvent::Error(msg) => {
+                                    AppEvent::SubscriptionFailed {
+                                        resource: current_rid.clone(),
+                                        message: msg,
+                                    }
+                                }
+                                protocol::StreamEvent::Resolved { original, resolved } => {
+                                    current_rid = resolved.clone();
+                                    AppEvent::ResourceResolved { original, resolved }
+                                }
+                            };
+                            if event_tx.send(app_event).await.is_err() {
+                                return;
                             }
-                            protocol::StreamEvent::Resolved { original, resolved } => {
-                                current_rid = resolved.clone();
-                                AppEvent::ResourceResolved { original, resolved }
-                            }
-                        };
-                        if event_tx.send(app_event).await.is_err() {
+                        }
+                        Err(e) => {
+                            tracing::warn!("subscription bridge read failed for {}: {}", current_rid.plural(), e);
                             break;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("subscription bridge read failed for {}: {}", current_rid.plural(), e);
-                        let _ = event_tx.send(AppEvent::SubscriptionFailed {
-                            resource: current_rid.clone(),
-                            message: format!("read error: {}", e),
-                        }).await;
-                        break;
-                    }
                 }
+
+                if !ever_received_data {
+                    let _ = event_tx.send(AppEvent::SubscriptionFailed {
+                        resource: rid,
+                        message: "substream closed before any data".into(),
+                    }).await;
+                    return;
+                }
+
+                // Transient failure after prior success — retry with
+                // jittered backoff. Session death naturally exits on the
+                // next open() or event_tx.send().
+                let jitter = 0.75 + (rid.plural().len() as f64 % 50.0) / 100.0;
+                let jittered = retry_backoff.mul_f64(jitter);
+                tracing::info!("subscription bridge retrying for {} in {:?}", rid.plural(), jittered);
+                tokio::time::sleep(jittered).await;
+                retry_backoff = (retry_backoff * 2).min(std::time::Duration::from_secs(30));
             }
             });
             let result: Result<(), Box<dyn std::any::Any + Send>> = futures::FutureExt::catch_unwind(result).await;

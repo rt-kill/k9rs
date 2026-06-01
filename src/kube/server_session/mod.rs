@@ -1062,12 +1062,28 @@ async fn handle_subscription_substream_inner(
         }
     };
 
-    let mut sub = match crd_or_sub {
-        CrdOrSub::BuiltIn(sub) => sub,
+    // Capture re-subscription recipe so the bridge can retry after watcher
+    // death. Built-ins need (key, kind); CRDs need the resolved identity.
+    enum ResubInfo {
+        BuiltIn {
+            key: QueryKey,
+            kind: crate::kube::resource_def::BuiltInKind,
+        },
+        Dynamic {
+            key: QueryKey,
+            gvk: kube::api::GroupVersionKind,
+            plural: String,
+            scope: protocol::ResourceScope,
+            printer_columns: Vec<crate::kube::cache::PrinterColumn>,
+        },
+    }
+
+    let (mut sub, resub) = match crd_or_sub {
+        CrdOrSub::BuiltIn(sub) => {
+            let kind = match &rid { protocol::ResourceId::BuiltIn(k) => *k, _ => unreachable!() };
+            (sub, ResubInfo::BuiltIn { key, kind })
+        }
         CrdOrSub::Crd(gvk, plural, scope) => {
-            // Rebuild the QueryKey with the resolved GVR so the cache key
-            // matches on subsequent navigations (where the TUI sends the
-            // resolved ResourceId with populated group/version).
             let resolved_key = QueryKey {
                 context: key.context,
                 namespace: key.namespace,
@@ -1077,29 +1093,36 @@ async fn handle_subscription_substream_inner(
                 ),
                 filter: key.filter,
             };
-
-            // Look up printer columns from the discovery cache for CRD-specific columns.
             let printer_columns = ctx.shared.discovery_cache
                 .printer_columns_for(&ctx.context, &gvk.group, &plural)
                 .unwrap_or_default();
-
             if init.force {
                 ctx.shared.watcher_cache.remove(&resolved_key);
             }
-            ctx.shared.watcher_cache.subscribe_dynamic(
-                resolved_key, &watcher_client, gvk, plural, scope, printer_columns,
-            )
+            let sub = ctx.shared.watcher_cache.subscribe_dynamic(
+                resolved_key.clone(), &watcher_client, gvk.clone(),
+                plural.clone(), scope, printer_columns.clone(),
+            );
+            (sub, ResubInfo::Dynamic { key: resolved_key, gvk, plural, scope, printer_columns })
         }
     };
 
-    // Capabilities used to be emitted here as `StreamEvent::Capabilities`.
-    // Removed — the client computes the identical manifest from the typed
-    // `ResourceId::capabilities()` method, so the wire round-trip and
-    // client-side cache were redundant.
-
     // Bridge: watcher -> StreamEvent frames on the substream.
+    //
+    // If the watcher dies after having delivered data (transient failure —
+    // laptop suspend, VPN drop, token refresh race), re-subscribe with
+    // exponential backoff. WatcherCache detects the dead watcher and spawns
+    // a fresh one. The TUI keeps the last good snapshot while we retry.
+    //
+    // If the watcher dies *before* ever delivering data (RBAC, unknown
+    // resource), the error is almost certainly permanent — send it
+    // immediately and exit.
+    let mut ever_received_data = false;
+    let mut retry_backoff = std::time::Duration::from_secs(5);
+
     // Send current snapshot immediately if available.
     if let Some(update) = sub.current() {
+        ever_received_data = true;
         let update = apply_owner_filter_inline(update, &filter);
         if let Err(e) = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await {
             tracing::warn!(session = session_id, sub = sub_id, "initial snapshot write failed for {}: {}", rid.plural(), e);
@@ -1112,11 +1135,33 @@ async fn handle_subscription_substream_inner(
     }
 
     loop {
-        if sub.changed().await.is_err() {
-            tracing::debug!(session = session_id, sub = sub_id, "watcher closed for {}", rid.plural());
-            break;
+        // Forward snapshots until the watcher dies or the substream breaks.
+        let watcher_died = loop {
+            if sub.changed().await.is_err() {
+                break true;
+            }
+            let Some(update) = sub.current() else {
+                break true;
+            };
+            ever_received_data = true;
+            retry_backoff = std::time::Duration::from_secs(5);
+            let update = apply_owner_filter_inline(update, &filter);
+            if let Err(e) = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await {
+                tracing::warn!(session = session_id, sub = sub_id, "bridge write failed for {}: {}", rid.plural(), e);
+                break false;
+            }
+            if let Err(e) = writer.flush().await {
+                tracing::warn!(session = session_id, sub = sub_id, "bridge flush failed for {}: {}", rid.plural(), e);
+                break false;
+            }
+        };
+
+        if !watcher_died {
+            return; // Substream error — TUI disconnected, nothing to retry.
         }
-        let Some(update) = sub.current() else {
+
+        if !ever_received_data {
+            // First watcher never produced data — likely permanent (RBAC, unknown resource).
             let detail = sub.last_error().unwrap_or_default();
             let msg = if detail.is_empty() {
                 format!("Watcher failed for {}", rid.plural())
@@ -1124,16 +1169,44 @@ async fn handle_subscription_substream_inner(
                 format!("Watcher failed for {}: {}", rid.plural(), detail)
             };
             let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Error(msg)).await;
-            break;
-        };
-        let update = apply_owner_filter_inline(update, &filter);
-        if let Err(e) = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await {
-            tracing::warn!(session = session_id, sub = sub_id, "bridge write failed for {}: {}", rid.plural(), e);
-            break;
+            return;
         }
-        if let Err(e) = writer.flush().await {
-            tracing::warn!(session = session_id, sub = sub_id, "bridge flush failed for {}: {}", rid.plural(), e);
-            break;
+
+        // Transient failure after prior success — retry with jittered backoff.
+        // ±25% jitter prevents thundering herd when many watchers die
+        // simultaneously (e.g., after laptop suspend/resume).
+        let detail = sub.last_error().unwrap_or_default();
+        let jitter_factor = 0.75 + rand::random::<f64>() * 0.5; // 0.75..1.25
+        let jittered = retry_backoff.mul_f64(jitter_factor);
+        tracing::info!(session = session_id, sub = sub_id,
+            "watcher died for {}, retrying in {:?}: {}",
+            rid.plural(), jittered, detail);
+        tokio::time::sleep(jittered).await;
+        retry_backoff = (retry_backoff * 2).min(std::time::Duration::from_secs(60));
+
+        // Re-subscribe — WatcherCache sees the dead watcher and creates a fresh one.
+        sub = match &resub {
+            ResubInfo::BuiltIn { key, kind } => {
+                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, &watcher_client)
+            }
+            ResubInfo::Dynamic { key, gvk, plural, scope, printer_columns } => {
+                ctx.shared.watcher_cache.subscribe_dynamic(
+                    key.clone(), &watcher_client, gvk.clone(),
+                    plural.clone(), *scope, printer_columns.clone(),
+                )
+            }
+        };
+
+        // Deliver the first snapshot from the new watcher if immediately available.
+        if let Some(update) = sub.current() {
+            ever_received_data = true;
+            let update = apply_owner_filter_inline(update, &filter);
+            if protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await.is_err() {
+                return;
+            }
+            if writer.flush().await.is_err() {
+                return;
+            }
         }
     }
 }
@@ -1365,7 +1438,7 @@ async fn handle_exec_substream(
     };
 
     // Spawn kubectl with the slave PTY as its controlling terminal.
-    let mut child = match pty.spawn("kubectl", &args) {
+    let child = match pty.spawn("kubectl", &args) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("kubectl spawn failed: {}", e);
@@ -1374,6 +1447,10 @@ async fn handle_exec_substream(
             return;
         }
     };
+
+    // RAII guard: kills and reaps the child on drop. Ensures cleanup
+    // even if the tokio task is aborted (daemon shutdown).
+    let _child_guard = ChildGuard(Some(child));
 
     // Transfer master fd ownership from Pty to File. consume_master_fd
     // marks the fd as transferred so Pty::drop skips closing it.
@@ -1386,8 +1463,7 @@ async fn handle_exec_substream(
             tracing::warn!("AsyncFd setup failed: {}", e);
             let msg = format!("exec failed: {}\r\n", e);
             let _ = protocol::write_bincode(&mut writer, &protocol::ExecFrame::Data(msg.into_bytes())).await;
-            let _ = child.kill();
-            return;
+            return; // _child_guard drops → kills child
         }
     };
 
@@ -1454,12 +1530,28 @@ async fn handle_exec_substream(
         _ = pty_to_yamux => {}
     }
 
-    // Close master PTY → kubectl gets SIGHUP. Then explicitly kill + reap
-    // to avoid zombie processes if SIGHUP is somehow ignored.
+    // ChildGuard's Drop kills + reaps the child. Whether we get here
+    // normally, or the task is aborted (daemon shutdown), or the daemon
+    // is killed with SIGTERM (Drop runs during unwind), the child dies.
+    // Only SIGKILL bypasses this — nothing survives SIGKILL on any platform.
     drop(master);
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(_child_guard);
     tracing::debug!("exec substream ended");
+}
+
+/// RAII guard for a child process. Kills and reaps on drop — ensures
+/// cleanup even when a tokio task is aborted (daemon shutdown). Same
+/// pattern as `AbortOnDrop`, `SuspendGuard`, `TempFile`. Works on
+/// Linux and macOS (uses `kill` + `wait`, no platform-specific APIs).
+struct ChildGuard(Option<std::process::Child>);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(ref mut child) = self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Minimal PTY wrapper using raw libc. No external crate needed.

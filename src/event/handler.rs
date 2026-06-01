@@ -13,11 +13,12 @@ use crate::kube::protocol::OperationKind;
 /// Map a key to an action via the resource's declared operations.
 /// Data-driven: reads `descriptor().default_key` from each operation.
 /// First match wins — resources control priority via `operations()` order.
-fn lookup_resource_op_key(app: &App, key: char) -> Option<Action> {
-    let rid = app.nav.resource_id();
-    let kind = rid.built_in_kind()?;
-    let def = crate::kube::resource_defs::REGISTRY.by_kind(kind);
-    for op in def.operations() {
+fn lookup_view_op_key(app: &App, key: char) -> Option<Action> {
+    // Use view capabilities (not registry) — works for both resource
+    // and derived views. Derived views declare their own operations
+    // on DerivedViewKind; resource views delegate to ResourceId.
+    let caps = app.nav.view_id().capabilities();
+    for op in &caps.operations {
         if op.descriptor().default_key == Some(key) {
             return Some(op.to_action());
         }
@@ -28,7 +29,7 @@ fn lookup_resource_op_key(app: &App, key: char) -> Option<Action> {
 /// Look up a key binding from user-defined overlays for the current resource.
 /// Maps key → capability name. No implementation details leak into the action.
 fn lookup_overlay_key(app: &App, key: char) -> Option<Action> {
-    let overlay = crate::kube::overlay::overlay_for(app.nav.resource_id().plural())?;
+    let overlay = crate::kube::overlay::overlay_for(app.nav.view_id().plural())?;
     let cap_name = overlay.bindings.get(&key)?;
     Some(Action::OverlayCapability(cap_name.clone()))
 }
@@ -57,6 +58,31 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     }
 
     // -----------------------------------------------------------------------
+    // Modal routes that block ALL keys except Esc. Checked BEFORE global
+    // keys so `:q`, Ctrl-C, etc. can't leak through during edit flow.
+    // -----------------------------------------------------------------------
+    match &app.route {
+        Route::EditingResource { .. } => {
+            return match key.code {
+                KeyCode::Esc => Some(Action::Back),
+                _ => None,
+            };
+        }
+        Route::ContainerSelect { .. } => return handle_container_select_keys(key),
+        Route::Shell(_) => {
+            // During Connecting: Escape cancels, other keys fall through
+            // to global handlers (user has full TUI control).
+            // During bridge mode: the TUI is suspended and this code
+            // path is never reached.
+            return match key.code {
+                KeyCode::Esc => Some(Action::Back),
+                _ => None,
+            };
+        }
+        _ => {}
+    }
+
+    // -----------------------------------------------------------------------
     // Global keys (available in every view).
     // -----------------------------------------------------------------------
     if let Some(action) = handle_global_keys(app, key) {
@@ -74,20 +100,9 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
         Route::Help => handle_help_view_keys(key),
         Route::Contexts => handle_contexts_view_keys(key),
         Route::ContainerSelect { .. } => handle_container_select_keys(key),
-        // Edit flow is modal — keys are blocked while we wait for the
-        // server response or the editor subprocess. The session loop
-        // drives transitions; the user is either looking at a "loading"
-        // screen (AwaitingYaml/Applying) or has been suspended into the
-        // editor (EditorReady). Esc cancels in the AwaitingYaml/Applying
-        // states by popping the route.
-        Route::EditingResource { .. } => match key.code {
-            KeyCode::Esc => Some(Action::Back),
-            _ => None,
-        },
-        // Shell keys are handled directly in the session loop (raw byte
-        // forwarding). The event handler should never see them, but if it
-        // does, swallow them.
-        Route::Shell(_) => None,
+        // EditingResource and Shell are handled in the modal early-return
+        // above — they never reach this match. Listed for exhaustiveness.
+        Route::EditingResource { .. } | Route::Shell(_) => None,
     }
 }
 
@@ -157,7 +172,7 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
 
     // Ctrl-L: logs — dispatched via resource operations (same as Shift+L).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
-        if let Some(action) = lookup_resource_op_key(app, 'L') {
+        if let Some(action) = lookup_view_op_key(app, 'L') {
             return Some(action);
         }
     }
@@ -289,7 +304,7 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Resource-specific keys: data-driven from operation descriptors.
         // Falls through to overlay bindings if no operation matches.
         KeyCode::Char(c) => {
-            lookup_resource_op_key(app, c)
+            lookup_view_op_key(app, c)
                 .or_else(|| lookup_overlay_key(app, c))
         }
 
@@ -454,8 +469,8 @@ fn handle_container_select_keys(key: KeyEvent) -> Option<Action> {
         // `q` or Esc in container select goes back.
         KeyCode::Char('q') | KeyCode::Esc => Some(Action::Back),
 
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::NextItem),
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::PrevItem),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => Some(Action::NextItem),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => Some(Action::PrevItem),
         KeyCode::Enter => Some(Action::Enter),
         _ => None,
     }

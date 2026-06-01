@@ -109,6 +109,9 @@ impl DeltaTracker {
             new_prev.insert(key, new_hash);
         }
         self.prev_hashes = new_prev;
+        // Prune change highlights for rows that no longer exist so stale
+        // entries don't accumulate between expire() ticks.
+        self.changed.retain(|k, _| self.prev_hashes.contains_key(k));
     }
 
     /// Remove change highlights older than `max_age`. Returns `true` if
@@ -209,7 +212,7 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             max_lines: 50_000,
-            tail_lines: 500,
+            tail_lines: 100,
             default_follow: true,
             default_timestamps: true,
             default_wrap: false,
@@ -388,11 +391,9 @@ pub enum Route {
         /// lifetime IS the route's lifetime.
         stream: Option<crate::kube::client_session::LogStream>,
     },
-    /// Live shell session rendered inside the TUI. The daemon spawns
-    /// kubectl in a PTY and proxies bytes over yamux. The vt100 parser
-    /// maintains the screen buffer; the TUI renders it every frame.
-    /// `writer` sends keystrokes to the daemon. A background bridge task
-    /// reads from the yamux substream and delivers `AppEvent::ExecData`.
+    /// Live shell session. During Connecting the TUI shows a loading bar
+    /// and the user has full navigation control. Once connected, the
+    /// session loop suspends the TUI and raw-bridges stdin↔daemon bytes.
     /// Drop aborts the bridge (same RAII as LogStream).
     Shell(Box<ShellState>),
     /// In-progress edit on `target`. The unified edit flow:
@@ -437,20 +438,39 @@ pub enum ContentViewKind {
     Aliases,
 }
 
-/// State for a live shell session rendered inside the TUI.
+/// Shell connection lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellConnectState {
+    /// Waiting for the first byte from the daemon's PTY.
+    #[default]
+    Connecting,
+    /// At least one ExecData frame has arrived — shell is live.
+    /// The main loop will transition to raw bridge mode on the next
+    /// iteration, suspending the TUI and piping bytes directly.
+    Connected,
+}
+
+/// State for a live shell session. During the Connecting phase the TUI
+/// renders a loading bar and the user has full navigation control. Once
+/// the daemon confirms the connection (first ExecData), the session loop
+/// suspends the TUI and enters a raw byte bridge — stdin→daemon,
+/// daemon→stdout — with no parsing. The vt100 crate is not involved.
 pub struct ShellState {
     pub title: String,
-    pub parser: vt100::Parser,
     pub writer: Option<tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>>,
     pub _bridge: Option<tokio::task::AbortHandle>,
-    /// False until the first ExecData arrives from the daemon. The
-    /// renderer shows a loading indicator while connecting.
-    pub connected: bool,
+    pub connect_state: ShellConnectState,
+    /// Bytes received before the bridge loop starts. Written to stdout
+    /// on attach so the initial prompt isn't lost.
+    pub pending_output: Vec<u8>,
 }
 
 impl std::fmt::Debug for ShellState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShellState").field("title", &self.title).finish_non_exhaustive()
+        f.debug_struct("ShellState")
+            .field("title", &self.title)
+            .field("connect_state", &self.connect_state)
+            .finish_non_exhaustive()
     }
 }
 
@@ -868,6 +888,11 @@ pub struct LogState {
     /// bridge has been aborted but whose queued events haven't drained)
     /// would bleed into a freshly-opened log view.
     pub generation: u64,
+    /// True during the initial tail fetch. While true, the render path
+    /// skips follow-mode auto-scroll so the view doesn't jump as lines
+    /// stream in. Set false when the initial batch is complete (detected
+    /// by a gap in line delivery).
+    pub initial_load: bool,
 }
 
 impl Default for LogState {
@@ -881,12 +906,13 @@ impl Default for LogState {
             show_timestamps: true,
             streaming: false,
             since: None,
-            tail_lines: 500,
+            tail_lines: 100,
             filters: Vec::new(),
             draft_filter: None,
             compiled_patterns: Vec::new(),
             filtered_indices: Vec::new(),
             generation: 0,
+            initial_load: false,
         }
     }
 }

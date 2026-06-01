@@ -85,6 +85,7 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             let mut view_state = crate::ui::widgets::LogViewState {
                 scroll,
                 follow: logs.follow,
+                initial_load: logs.initial_load,
                 wrap: logs.wrap,
                 show_timestamps: logs.show_timestamps,
                 total_lines: total,
@@ -125,6 +126,7 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             let mut view_state = crate::ui::widgets::LogViewState {
                 scroll: 0,
                 follow: logs.follow,
+                initial_load: logs.initial_load,
                 wrap: logs.wrap,
                 show_timestamps: logs.show_timestamps,
                 total_lines: total,

@@ -70,8 +70,8 @@ pub(crate) fn apply_event(
             // with incomplete info (e.g., `:nodeclaims` → karpenter.sh/v1/NodeClaim/Cluster).
             // Update the nav step's ResourceId and move the table entry so future
             // snapshots (keyed by resolved rid) find the right table.
-            if *app.nav.resource_id() == original {
-                app.nav.current_mut().resource = resolved.clone();
+            if app.nav.resource_id() == Some(&original) {
+                app.nav.current_mut().view = crate::app::view::ViewId::Resource(resolved.clone());
                 // If the resolved resource is cluster-scoped but we're in a
                 // specific namespace, auto-switch to All. The watcher already
                 // uses Api::all_with (server resolved the scope), so this is
@@ -86,7 +86,7 @@ pub(crate) fn apply_event(
             // maps. For NavStep-owned resources, the step's `resource` field
             // was already updated above and the table/descriptor live on the
             // same step — no rekey needed (the find methods walk by identity).
-            if crate::app::nav::is_globally_stored(&original) || crate::app::nav::is_globally_stored(&resolved) {
+            if crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(original.clone())) || crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(resolved.clone())) {
                 if let Some(table) = app.data.tables.remove(&original) {
                     app.data.tables.insert(resolved.clone(), table);
                 }
@@ -107,7 +107,7 @@ pub(crate) fn apply_event(
             // Clear items first (rendering only shows the error when items is empty),
             // then transition to Failed. clear_data() resets to Initializing, so the
             // Failed transition must come after.
-            if crate::app::nav::is_globally_stored(&resource) {
+            if crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(resource.clone())) {
                 let table = app.data.tables.entry(resource.clone()).or_default();
                 table.clear_data();
                 table.data_state = crate::app::table::TableDataState::Failed(message.clone());
@@ -135,14 +135,14 @@ pub(crate) fn apply_event(
             // filter active on CPU/MEM columns, re-filter so it reflects the
             // updated values. Only needed when viewing a metrics-overlay
             // resource (pods or nodes).
-            if metrics_kind_for(app.nav.resource_id()).is_some() {
+            if app.nav.resource_id().and_then(metrics_kind_for).is_some() {
                 app.reapply_nav_filters();
             }
         }
         AppEvent::NodeMetrics(metrics) => {
             app.kube.node_metrics = metrics;
             app.apply_node_metrics();
-            if metrics_kind_for(app.nav.resource_id()).is_some() {
+            if app.nav.resource_id().and_then(metrics_kind_for).is_some() {
                 app.reapply_nav_filters();
             }
         }
@@ -153,19 +153,33 @@ pub(crate) fn apply_event(
         }
         AppEvent::ExecData(bytes) => {
             if let crate::app::Route::Shell(ref mut shell) = app.route {
-                shell.connected = true;
-                shell.parser.process(&bytes);
+                shell.connect_state = crate::app::ShellConnectState::Connected;
+                // Buffer output until the main loop enters bridge mode.
+                // These bytes (typically the initial shell prompt) will be
+                // flushed to stdout when the TUI suspends.
+                shell.pending_output.extend_from_slice(&bytes);
             }
         }
         AppEvent::ExecEnded => {
+            // During the Connecting phase, ExecEnded means the connection
+            // failed before we entered bridge mode. Pop the route and flash.
+            // During bridge mode this event is consumed directly by the
+            // bridge loop (it never reaches this handler).
             if matches!(app.route, crate::app::Route::Shell(_)) {
-                app.ui.flash = Some(crate::app::FlashMessage::info("Shell session ended".to_string()));
+                app.ui.flash = Some(crate::app::FlashMessage::error(
+                    "Shell connection failed".to_string()
+                ));
                 app.pop_route();
             }
         }
         AppEvent::DaemonDisconnected => {
-            app.exit_reason = Some(crate::app::ExitReason::DaemonDisconnected);
-            app.should_quit = true;
+            // Don't quit — trigger auto-reconnection instead. The main
+            // loop will drop the old session and create a new one, same
+            // as context switching. The user stays in the TUI.
+            app.reconnect_requested = true;
+            app.ui.flash = Some(crate::app::FlashMessage::warn(
+                "Connection lost — reconnecting...".to_string()
+            ));
         }
         AppEvent::ConnectionEstablished { context, identity, namespaces } => {
             // Daemon's view is authoritative — overwrite whatever the
@@ -207,7 +221,7 @@ fn apply_resource_update(
         ResourceUpdate::Rows { resource, headers, rows } => {
             let num_cols = headers.len();
             let descriptor = crate::app::TableDescriptor::new(headers, resource.plural());
-            if crate::app::nav::is_globally_stored(&resource) {
+            if crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(resource.clone())) {
                 // Set descriptor BEFORE populating table data so column-
                 // restricted greps see the correct column count.
                 app.data.descriptors.insert(resource.clone(), descriptor);

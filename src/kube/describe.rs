@@ -28,8 +28,12 @@ pub fn dynamic_api_for(
     namespace: &Namespace,
 ) -> Api<DynamicObject> {
     match (scope, namespace.as_option()) {
-        (ResourceScope::Cluster, _) => Api::all_with(client.clone(), ar),
-        (ResourceScope::Namespaced, None) => Api::default_namespaced_with(client.clone(), ar),
+        (ResourceScope::Cluster, _) | (ResourceScope::Namespaced, None) => {
+            // Cluster-scoped resources always use all(). Namespaced resources
+            // with Namespace::All (as_option() = None) also use all() to
+            // list across all namespaces.
+            Api::all_with(client.clone(), ar)
+        }
         (ResourceScope::Namespaced, Some(ns)) => Api::namespaced_with(client.clone(), ns, ar),
     }
 }

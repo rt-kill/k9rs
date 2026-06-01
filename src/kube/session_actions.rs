@@ -150,8 +150,8 @@ pub(crate) fn handle_action(
         Action::SpanMark => app.span_mark(),
         Action::ClearMarks => app.clear_marks(),
         Action::ToggleLastView => {
-            if let Some(last) = app.nav.prev_root().cloned() {
-                let change = app.nav.reset(last);
+            if let Some(last_rid) = app.nav.prev_root().and_then(|v| v.resource_id()).cloned() {
+                let change = app.nav.reset(last_rid);
                 *app.nav.filter_input_mut() = Default::default();
                 apply_nav_change(app, data_source, change);
             }
@@ -208,7 +208,7 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
                     let container_count = {
                         // Manual dual-path lookup: can't call app.table_for()
                         // because app.route is mutably borrowed by this match.
-                        let table = if crate::app::nav::is_globally_stored(&target.resource) {
+                        let table = if crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(target.resource.clone())) {
                             app.data.tables.get(&target.resource)
                         } else {
                             app.nav.find_table_for_resource(&target.resource)
@@ -345,10 +345,37 @@ fn handle_resource_op(
     use crate::app::actions::Action;
     use crate::app::Route;
 
+    // Derived views (container table, etc.) only support Shell — all other
+    // mutating operations (delete, edit, scale, restart) don't apply to
+    // derived rows. Shell is handled specially below (uses nav.source).
+    if app.nav.view_id().is_derived() && !matches!(action, Action::Shell) {
+        return ActionResult::None;
+    }
+
     match action {
         Action::Shell => {
             if app.current_capabilities().supports(crate::kube::protocol::OperationKind::Shell) {
-                let current_rid = app.nav.resource_id().clone();
+                // Derived view (container table): shell directly into
+                // the selected container using the parent pod as context.
+                if app.nav.view_id().is_derived() {
+                    if let (Some(source), Some(table)) = (app.nav.current().source.clone(), app.active_view_table()) {
+                        if let Some(item) = table.selected_item() {
+                            let ns = source.namespace.display().to_string();
+                            if !ns.is_empty() && ns != "all" {
+                                return ActionResult::Exec {
+                                    op: crate::kube::protocol::OperationKind::Shell,
+                                    target: crate::kube::session::ExecTarget::Pod {
+                                        pod: source.name.clone(),
+                                        namespace: ns,
+                                        container: item.name.clone(),
+                                    },
+                                };
+                            }
+                        }
+                    }
+                    return ActionResult::None;
+                }
+                let Some(current_rid) = app.nav.resource_id().cloned() else { return ActionResult::None; };
                 if let Some(row) = app.active_view_table().and_then(|t| t.selected_item()) {
                     let Some(pod_ns) = row.namespace.clone() else {
                         app.ui.flash = Some(crate::app::FlashMessage::error(
@@ -589,7 +616,7 @@ fn handle_filter_search(
                 }
             } else if let Some((popped, change)) = app.nav.pop() {
                 apply_nav_change(app, data_source, change);
-                if popped.resource != *app.nav.resource_id() {
+                if popped.view != *app.nav.view_id() {
                     let saved = app.nav.current().saved_selected;
                     app.select_in_active_table(saved);
                 }
@@ -600,16 +627,17 @@ fn handle_filter_search(
         }
         Action::ToggleFaultFilter => {
             if !app.nav.has_fault_filter() {
-                let sel = app.active_table_selected();
-                app.nav.save_selected(sel);
-                let current_rid = app.nav.resource_id().clone();
-                let change = app.nav.push(crate::app::nav::NavStep::new(
-                    current_rid,
-                    Some(crate::app::nav::NavFilter::Fault),
-                ));
-                apply_nav_change(app, data_source, change);
-                app.reapply_nav_filters();
-                app.ui.flash = Some(crate::app::FlashMessage::info("Fault filter ON"));
+                if let Some(current_rid) = app.nav.resource_id().cloned() {
+                    let sel = app.active_table_selected();
+                    app.nav.save_selected(sel);
+                    let change = app.nav.push(crate::app::nav::NavStep::new(
+                        current_rid,
+                        Some(crate::app::nav::NavFilter::Fault),
+                    ));
+                    apply_nav_change(app, data_source, change);
+                    app.reapply_nav_filters();
+                    app.ui.flash = Some(crate::app::FlashMessage::info("Fault filter ON"));
+                }
             } else {
                 app.nav.pop_fault_filter();
                 app.reapply_nav_filters();
@@ -743,6 +771,7 @@ fn handle_log_action(
                 state.clear();
                 state.follow = true;
                 state.streaming = true;
+                state.initial_load = true;
                 state.since = since.clone();
                 let tail = if since.is_none() { Some(tail_lines) } else { None };
                 let new_stream = data_source.stream_log_substream(crate::kube::protocol::LogInit {
@@ -879,7 +908,7 @@ fn handle_drill(
             }
         }
         Action::OverlayCapability(ref cap_name) => {
-            let plural = app.nav.resource_id().plural().to_owned();
+            let plural = app.nav.view_id().plural().to_owned();
             let overlay = crate::kube::overlay::overlay_for(&plural);
             let cap = overlay.and_then(|o| o.capabilities.get(cap_name));
             match cap {
@@ -951,20 +980,27 @@ fn handle_io(
                     }
                 }
                 Route::Logs { ref state, .. } => {
-                    if state.lines().is_empty() {
+                    let indices = state.filtered_indices();
+                    if indices.is_empty() {
                         (String::new(), String::new())
                     } else {
-                        let joined: String = state.lines().iter().cloned().collect::<Vec<_>>().join("\n");
-                        let count = state.lines().len();
+                        let lines = state.lines();
+                        let joined: String = indices.iter()
+                            .filter_map(|&i| lines.get(i))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let count = indices.len();
                         (joined, format!("Copied {} lines to clipboard", count))
                     }
                 }
                 _ => {
-                    if let Some(info) = get_selected_resource_info(app) {
-                        let label = format!("Copied: {}", info.name);
-                        (info.name, label)
-                    } else {
+                    let dump = build_table_dump(app);
+                    if dump.is_empty() {
                         (String::new(), String::new())
+                    } else {
+                        let count = dump.lines().count().saturating_sub(1); // exclude header
+                        (dump, format!("Copied {} rows to clipboard", count))
                     }
                 }
             };
@@ -988,7 +1024,7 @@ fn handle_io(
             let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
             let filename = format!(
                 "{}-{}.txt",
-                safe(app.nav.resource_id().short_label()),
+                safe(app.nav.view_id().short_label()),
                 chrono::Utc::now().format("%Y%m%d-%H%M%S")
             );
             let content = build_table_dump(app);
@@ -1031,7 +1067,12 @@ fn handle_show_port_forwards(app: &mut App, data_source: &mut ClientSession) {
 }
 
 fn handle_refresh(app: &mut App, data_source: &mut ClientSession) {
-    let rid = app.nav.resource_id().clone();
+    // Derived views are client-side projections — no subscription to refresh.
+    if app.nav.view_id().is_derived() {
+        app.ui.flash = Some(crate::app::FlashMessage::info("Pop back to refresh the parent view"));
+        return;
+    }
+    let Some(rid) = app.nav.resource_id().cloned() else { return; };
     let filter = app.nav.with_subscription_owner(|owner| {
         let f = owner.filter.as_ref().and_then(|f| f.to_subscription_filter());
         owner.stream = None;
@@ -1096,6 +1137,12 @@ pub(crate) fn handle_enter(
     use crate::app::Route;
     use crate::kube::protocol::ResourceId;
 
+    // Derived view Enter: open logs for the selected container.
+    if app.nav.view_id().is_derived() {
+        open_logs_from_derived(app, data_source, false);
+        return ActionResult::None;
+    }
+
     // Handle context view Enter
     if matches!(app.route, Route::Contexts) {
         if let Some(ctx) = app.data.contexts.selected_item() {
@@ -1110,7 +1157,7 @@ pub(crate) fn handle_enter(
         let target = target.clone();
         let pod_ns_str = target.namespace.display().to_string();
         let container_name = {
-            let table = if crate::app::nav::is_globally_stored(&target.resource) {
+            let table = if crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(target.resource.clone())) {
                 app.data.tables.get(&target.resource)
             } else {
                 app.nav.find_table_for_resource(&target.resource)
@@ -1147,6 +1194,7 @@ pub(crate) fn handle_enter(
         let mut log_state = crate::app::LogState::from_config(&app.config.ui.logs);
         log_state.follow = !previous;
         log_state.streaming = true;
+        log_state.initial_load = true;
         let tail = Some(log_state.tail_lines);
 
         let new_stream = data_source.stream_log_substream(crate::kube::protocol::LogInit {
@@ -1234,6 +1282,33 @@ pub(crate) fn handle_enter(
             app.reapply_nav_filters();
             app.ui.flash = Some(crate::app::FlashMessage::info(format!("Jobs for {}/{}", kind_lower, name)));
         }
+        Some(DrillTarget::Derived(kind)) => {
+            // Generic derived view: project parent row into child rows,
+            // push a client-side view step (no daemon subscription).
+            let Some(current_rid) = app.nav.resource_id().cloned() else {
+                return ActionResult::None;
+            };
+            let row_ns = row.namespace.as_deref().unwrap_or("");
+            let source = ObjectRef::new(
+                current_rid,
+                row.name.clone(),
+                protocol::Namespace::from_row(row_ns),
+            );
+            let child_rows = kind.project(&row);
+            let headers = kind.default_headers();
+
+            let sel = app.active_view_table().map(|t| t.selected()).unwrap_or(0);
+            app.nav.save_selected(sel);
+
+            let mut step = crate::app::nav::NavStep::derived(kind.clone(), source);
+            let mut table = crate::app::StatefulTable::new();
+            table.set_items(child_rows);
+            step.table = Some(table);
+            step.descriptor = Some(crate::app::TableDescriptor::new(headers, kind.plural()));
+
+            let change = app.nav.push(step);
+            apply_nav_change(app, data_source, change);
+        }
         None => {
             handle_describe(app, data_source);
         }
@@ -1319,6 +1394,13 @@ fn open_logs(
 ) {
     use crate::app::Route;
 
+    // Derived view (e.g., container table): the selected row IS the
+    // container, and nav.source IS the parent pod.
+    if app.nav.view_id().is_derived() {
+        open_logs_from_derived(app, data_source, previous);
+        return;
+    }
+
     let Some(info) = get_selected_resource_info(app) else { return; };
     let name = info.name.clone();
     let namespace_typed = info.namespace.clone();
@@ -1353,6 +1435,7 @@ fn open_logs(
     let mut log_state = crate::app::LogState::from_config(&app.config.ui.logs);
     log_state.follow = !previous;
     log_state.streaming = true;
+    log_state.initial_load = true;
     let tail = Some(log_state.tail_lines);
 
     let new_stream = data_source.stream_log_substream(protocol::LogInit {
@@ -1373,13 +1456,57 @@ fn open_logs(
     });
 }
 
+/// Open logs from a derived view (e.g., container table). The selected
+/// row's name is the container, and `nav.source` is the parent pod.
+fn open_logs_from_derived(
+    app: &mut App,
+    data_source: &mut ClientSession,
+    previous: bool,
+) {
+    use crate::kube::resources::KubeResource;
+
+    let Some(source) = app.nav.current().source.clone() else { return; };
+    let Some(table) = app.active_view_table() else { return; };
+    let Some(item) = table.selected_item() else { return; };
+
+    let container_name = item.name().to_string();
+    let pod_name = source.name.clone();
+    let namespace = source.namespace.clone();
+    let ns_display = namespace.display().to_string();
+
+    let container = protocol::LogContainer::Named(container_name.clone());
+
+    let mut log_state = crate::app::LogState::from_config(&app.config.ui.logs);
+    log_state.follow = !previous;
+    log_state.streaming = true;
+    log_state.initial_load = true;
+    let tail = Some(log_state.tail_lines);
+
+    let new_stream = data_source.stream_log_substream(protocol::LogInit {
+        pod: pod_name.clone(),
+        namespace,
+        container: container.clone(),
+        follow: !previous,
+        tail,
+        since: None,
+        previous,
+    });
+    log_state.generation = new_stream.generation;
+
+    app.navigate_to(crate::app::Route::Logs {
+        target: ContainerRef::new(pod_name, ns_display, container),
+        state: Box::new(log_state),
+        stream: Some(new_stream),
+    });
+}
+
 /// Build a tab-separated text dump of the currently visible resource table.
 pub(crate) fn build_table_dump(app: &App) -> String {
-    let current_rid = app.nav.resource_id();
+    let current_view = app.nav.view_id();
     if let Some(table) = app.active_view_table() {
         let skip_ns = !app.kube.selected_ns.is_all();
         let visible = app.active_view_descriptor()
-            .map(|d| d.visible_columns(current_rid, app.ui.column_level, skip_ns))
+            .map(|d| d.visible_columns(current_view, app.ui.column_level, skip_ns))
             .unwrap_or_default();
         let visible_indices: Vec<usize> = visible.iter().map(|&(i, _)| i).collect();
         let headers: String = visible.iter().map(|&(_, name)| name).collect::<Vec<_>>().join("\t");
@@ -1506,7 +1633,7 @@ pub(crate) fn get_selected_resource_info(app: &App) -> Option<ObjectRef> {
     use crate::kube::resources::KubeResource;
     use crate::kube::protocol::Namespace;
 
-    let current_rid = app.nav.resource_id().clone();
+    let current_rid = app.nav.resource_id()?.clone();
     let table = app.active_view_table()?;
     let item = table.selected_item()?;
     Some(ObjectRef::new(
@@ -1521,7 +1648,7 @@ pub(crate) fn get_marked_resource_infos(app: &App) -> Vec<ObjectRef> {
     use crate::kube::resources::KubeResource;
     use crate::kube::protocol::Namespace;
 
-    let current_rid = app.nav.resource_id().clone();
+    let Some(current_rid) = app.nav.resource_id().cloned() else { return Vec::new(); };
     let mut result = Vec::new();
     if let Some(table) = app.active_view_table() {
         for item in &table.items {
@@ -1628,7 +1755,8 @@ pub(crate) fn begin_context_switch(
         .find(|c| c.name == *ctx_name)
         .map(|ctx| ctx.identity.clone())
         .unwrap_or_default();
-    let root = app.nav.root_resource_id().clone();
+    let root = app.nav.root_resource_id().cloned()
+        .unwrap_or_else(|| crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod));
     let _change = app.nav.reset(root);
     *app.nav.filter_input_mut() = Default::default();
     app.kube.kubectl_cache.clear();
@@ -1669,7 +1797,8 @@ pub(crate) fn do_switch_namespace(
     app.kube.kubectl_cache.clear();
     app.ui.deltas.clear();
 
-    let root_rid = app.nav.root_resource_id().clone();
+    let root_rid = app.nav.root_resource_id().cloned()
+        .unwrap_or_else(|| crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod));
     let _change = app.nav.reset(root_rid.clone());
     *app.nav.filter_input_mut() = Default::default();
 

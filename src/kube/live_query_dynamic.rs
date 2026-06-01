@@ -74,7 +74,15 @@ pub(crate) async fn run_dynamic_live_watcher(
 
     loop {
         tokio::select! {
-            event_result = stream.try_next() => {
+            timeout_result = tokio::time::timeout(super::live_query::STALE_TIMEOUT, stream.try_next()) => {
+                let event_result = match timeout_result {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tracing::warn!("live_query dynamic: watcher stale, no events in {:?}", super::live_query::STALE_TIMEOUT);
+                        exit_reason = Some(format!("watch stale: no events in {:?}", super::live_query::STALE_TIMEOUT));
+                        break;
+                    }
+                };
                 match event_result {
                     Ok(Some(event)) => {
                         match event {

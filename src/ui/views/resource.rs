@@ -89,6 +89,7 @@ struct TableSnapshot<'a> {
     row_health: &'a [crate::kube::resources::row::RowHealth],
     cell_style: &'a [Vec<Option<crate::kube::resources::row::RowHealth>>],
     max_col_width: u16,
+    search_patterns: &'a [crate::util::SearchPattern],
 }
 
 /// Render a resource table from a pre-built snapshot. Returns the new
@@ -110,7 +111,8 @@ fn draw_resource_table(
         .row_keys(snap.row_keys)
         .row_health(snap.row_health)
         .cell_style(snap.cell_style)
-        .max_col_width(snap.max_col_width);
+        .max_col_width(snap.max_col_width)
+        .search_patterns(snap.search_patterns);
 
     let mut state = ResourceTableState {
         selected: snap.selected,
@@ -136,8 +138,9 @@ struct TableRenderCtx<'a> {
     descriptor: Option<&'a crate::app::TableDescriptor>,
     column_level: crate::app::ColumnLevel,
     changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
-    rid: &'a crate::kube::protocol::ResourceId,
+    view: &'a crate::app::view::ViewId,
     max_col_width: u16,
+    search_patterns: &'a [crate::util::SearchPattern],
 }
 
 /// Draw function for unified ResourceRow tables. Uses runtime column headers
@@ -163,7 +166,7 @@ fn draw_unified_table(
 
     // Compute which columns (by data index) are visible at the current level.
     let visible: Vec<(usize, &str)> = if let Some(desc) = ctx.descriptor {
-        desc.visible_columns(ctx.rid, ctx.column_level, skip_ns)
+        desc.visible_columns(ctx.view, ctx.column_level, skip_ns)
     } else {
         vec![(0, "NAME")]
     };
@@ -236,6 +239,7 @@ fn draw_unified_table(
         row_health: &view.health,
         cell_style: &view.cell_style,
         max_col_width: ctx.max_col_width,
+        search_patterns: ctx.search_patterns,
     };
     let (new_offset, new_page_size, new_col_offset) = draw_resource_table(
         f, area, title, &snap, ctx.theme,
@@ -326,21 +330,46 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let ns_display = app.kube.selected_ns.display();
     let ns = app.kube.selected_ns.clone();
     let cl = app.ui.column_level;
-    let current_rid = app.nav.resource_id().clone();
-    let title = current_rid.short_label().to_lowercase();
-    let is_global = crate::app::nav::is_globally_stored(&current_rid);
-    let desc = if is_global {
-        app.data.descriptors.get(&current_rid).cloned()
+    let view_id = app.nav.view_id().clone();
+    let title = view_id.short_label().to_lowercase();
+    let current_rid = view_id.resource_id().cloned();
+    let is_global = crate::app::nav::is_globally_stored(&view_id);
+    // For derived views (no ResourceId), table + descriptor live directly
+    // on the NavStep. For resource views, route through global/nav lookup.
+    let desc = if let Some(ref rid) = current_rid {
+        if is_global {
+            app.data.descriptors.get(rid).cloned()
+        } else {
+            app.nav.find_descriptor_for_resource(rid).cloned()
+        }
     } else {
-        app.nav.find_descriptor_for_resource(&current_rid).cloned()
+        // Derived view — descriptor on the nav step itself.
+        app.nav.current().descriptor.clone()
     };
     let changed_rows = app.ui.deltas.changed_rows();
+    // Collect active grep patterns (committed + draft) for match
+    // highlighting. Cloned into owned Vec before the mutable table borrow.
+    let search_patterns: Vec<crate::util::SearchPattern> = {
+        let mut pats: Vec<crate::util::SearchPattern> = app.nav.active_filters().iter()
+            .filter_map(|f| f.as_grep().map(|g| g.pattern().clone()))
+            .collect();
+        let draft = app.nav.filter_input().text();
+        if !draft.is_empty() {
+            pats.push(crate::util::SearchPattern::new(draft));
+        }
+        pats
+    };
     // Manual routing (not `active_view_table_mut()`) to avoid borrow
     // conflict with `theme` — `&mut self` would conflict with `&app.ui.theme`.
-    let table_ref = if is_global {
-        app.data.tables.get_mut(&current_rid)
+    let table_ref = if let Some(ref rid) = current_rid {
+        if is_global {
+            app.data.tables.get_mut(rid)
+        } else {
+            app.nav.find_table_for_resource_mut(rid)
+        }
     } else {
-        app.nav.find_table_for_resource_mut(&current_rid)
+        // Derived view — table on the nav step itself.
+        app.nav.current_mut().table.as_mut()
     };
     if let Some(table) = table_ref {
         let ctx = TableRenderCtx {
@@ -350,8 +379,9 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
             descriptor: desc.as_ref(),
             column_level: cl,
             changed_rows,
-            rid: &current_rid,
+            view: &view_id,
             max_col_width: app.config.ui.max_column_width,
+            search_patterns: &search_patterns,
         };
         draw_unified_table(f, table_area, table, &ctx);
     } else {

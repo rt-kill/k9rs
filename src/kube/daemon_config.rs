@@ -178,7 +178,7 @@ ui:
         assert_eq!(cfg.ui.page_scroll_lines, 20);
         // Nested defaults preserved
         assert_eq!(cfg.ui.flash.info_secs, 3);
-        assert_eq!(cfg.ui.logs.tail_lines, 500);
+        assert_eq!(cfg.ui.logs.tail_lines, 100);
     }
 
     #[test]

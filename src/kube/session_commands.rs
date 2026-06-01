@@ -322,13 +322,15 @@ pub(crate) fn handle_command_key(
             }
         }
         KeyCode::Backspace => {
-            if let InputMode::Command { ref mut input, .. } = app.ui.input_mode {
+            if let InputMode::Command { ref mut input, ref mut history_index } = app.ui.input_mode {
                 input.pop();
+                *history_index = None;
             }
         }
         KeyCode::Char(c) => {
-            if let InputMode::Command { ref mut input, .. } = app.ui.input_mode {
+            if let InputMode::Command { ref mut input, ref mut history_index } = app.ui.input_mode {
                 input.push(c);
+                *history_index = None;
             }
         }
         _ => {}
@@ -508,15 +510,13 @@ pub(crate) fn handle_form_dialog_key(
             }
         }
         KeyCode::Enter => {
-            if let Some(ref d) = app.ui.form_dialog {
-                if d.ok_focused() {
-                    // OK button focused — submit.
-                    let dialog = app.ui.form_dialog.take().unwrap();
+            let ok = app.ui.form_dialog.as_ref().is_some_and(|d| d.ok_focused());
+            if ok {
+                if let Some(dialog) = app.ui.form_dialog.take() {
                     dispatch_form_submit(app, data_source, dialog);
-                } else {
-                    // Field focused — advance to next field.
-                    app.ui.form_dialog.as_mut().unwrap().focus_next();
                 }
+            } else if let Some(ref mut d) = app.ui.form_dialog {
+                d.focus_next();
             }
         }
         KeyCode::Left | KeyCode::Right => {
@@ -562,7 +562,9 @@ pub(crate) fn handle_form_dialog_key(
                 }
             }
         }
-        _ => {}
+        // Don't consume keys we don't handle — let them fall through
+        // to the global handler (e.g., Ctrl-C to quit).
+        _ => return false,
     }
     true
 }
@@ -608,7 +610,10 @@ pub(crate) fn handle_filter_key(
         }
         KeyCode::Enter => {
             if let Some(committed) = app.nav.filter_input_mut().commit() {
-                let current_rid = app.nav.resource_id().clone();
+                let Some(current_rid) = app.nav.resource_id().cloned() else {
+                    app.reapply_nav_filters();
+                    return true;
+                };
                 let filter = if let Some(c) = committed.column {
                     crate::app::nav::NavFilter::ColumnGrep {
                         pattern: crate::app::nav::CompiledGrep::new(committed.text),
@@ -638,7 +643,9 @@ pub(crate) fn handle_filter_key(
             // also refreshes the marked-visible cache.
             app.reapply_nav_filters();
         }
-        _ => {}
+        // Don't consume keys we don't handle — let them fall through
+        // to the global handler (e.g., Ctrl-C to quit).
+        _ => return false,
     }
     true
 }

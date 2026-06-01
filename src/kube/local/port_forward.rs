@@ -94,9 +94,9 @@ struct EntrySlot {
 /// Per-context port-forward source. Each context the daemon serves gets
 /// its own instance via [`crate::kube::local::LocalRegistry::port_forwards_for`].
 /// All `kubectl port-forward` subprocesses spawned by this instance run
-/// against the bound context — switching context in the TUI hands you a
-/// different `PortForwardSource` and the old one's subprocesses go with it
-/// after the registry's grace period.
+/// against the bound context. The registry holds a strong `Arc` — port
+/// forwards survive context switches and nav pops, running until explicitly
+/// stopped or the daemon exits.
 pub struct PortForwardSource {
     id: ResourceId,
     /// Context name this source is bound to. Used as the `--context` arg on
@@ -112,11 +112,6 @@ pub struct PortForwardSource {
     /// they live inside without interior mutability — `create()` needs the
     /// `Arc` to spawn a monitor task that outlives the call.
     self_weak: Weak<Self>,
-    /// Coalesces grace-period tasks: at most ONE in flight per source.
-    /// CAS-set to true in `try_begin_grace`, cleared by the grace task
-    /// before it drops its Arc. Without this, rapid context-switch churn
-    /// stacked one detached 5-minute task per drop.
-    grace_in_flight: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for PortForwardSource {
@@ -151,7 +146,6 @@ impl PortForwardSource {
             tx,
             _keep_rx: rx,
             self_weak: weak.clone(),
-            grace_in_flight: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -241,7 +235,7 @@ impl PortForwardSource {
         Ok(())
     }
 
-    /// The full lifecycle: port probe → spawn kubectl → grace + probe → wait.
+    /// The full lifecycle: port probe → spawn kubectl → probe with backoff → wait.
     /// Holds only a `Weak<Self>` and upgrades on demand; drops the upgrade
     /// before any `await` so the source can be dropped while kubectl runs.
     async fn run_forward(weak: Weak<Self>, id: u64, req: PortForwardRequest) {
@@ -393,16 +387,14 @@ impl LocalResourceSource for PortForwardSource {
     }
 
     fn try_begin_grace(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        // CAS false→true. Only the first drop in a run wins; subsequent
-        // drops see true and skip spawning their own grace tasks.
-        self.grace_in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        // Port forward sources are held strongly by the registry — no grace
+        // period needed. Returning false tells LocalSubscription::Drop to
+        // just drop its Arc without spawning a grace task.
+        false
     }
 
     fn end_grace(&self) {
-        self.grace_in_flight.store(false, std::sync::atomic::Ordering::Release);
+        // No-op: grace is never started for port forwards.
     }
 
     fn subscribe(&self) -> watch::Receiver<ResourceUpdate> {
@@ -570,19 +562,13 @@ pub fn pf_to_row(entry: &PortForwardEntry) -> ResourceRow {
         PortForwardState::Failed => RowHealth::Failed,
         _ => RowHealth::Pending,
     };
-    let state_health = match entry.state {
-        PortForwardState::Active => RowHealth::Normal,
-        PortForwardState::Starting => RowHealth::Pending,
-        PortForwardState::Failed => RowHealth::Failed,
-        _ => RowHealth::Pending,
-    };
     let cells: Vec<CellValue> = vec![
         CellValue::Text(row_name.clone()),
         CellValue::Text(entry.kubectl_target.clone()),
         CellValue::Text(if entry.namespace.is_empty() { "-".into() } else { entry.namespace.clone() }),
         CellValue::Count(entry.local_port as i64),
         CellValue::Count(entry.remote_port as i64),
-        CellValue::Status { text: entry.state.as_str().to_string(), health: state_health },
+        CellValue::Status { text: entry.state.as_str().to_string(), health },
         CellValue::Text(age),
         CellValue::Text(entry.last_message.clone()),
     ];    ResourceRow {
