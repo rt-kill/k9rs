@@ -839,8 +839,8 @@ fn handle_drill(
                         app.nav.save_selected(sel);
                         let change = app.nav.push(crate::app::nav::NavStep::new(
                             rid(BuiltInKind::Node),
-                            Some(crate::app::nav::NavFilter::Grep(
-                                crate::app::nav::CompiledGrep::new(regex::escape(&node)),
+                            Some(crate::app::nav::NavFilter::Field(
+                                crate::app::nav::K8sFieldSelector::MetadataName(node),
                             )),
                         ));
                         apply_nav_change(app, data_source, change);
@@ -881,8 +881,8 @@ fn handle_drill(
                     app.nav.save_selected(sel);
                     let change = app.nav.push(crate::app::nav::NavStep::new(
                         owner_rid,
-                        Some(crate::app::nav::NavFilter::Grep(
-                            crate::app::nav::CompiledGrep::new(regex::escape(&owner_name)),
+                        Some(crate::app::nav::NavFilter::Field(
+                            crate::app::nav::K8sFieldSelector::MetadataName(owner_name.clone()),
                         )),
                     ));
                     apply_nav_change(app, data_source, change);

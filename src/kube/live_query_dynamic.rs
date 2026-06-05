@@ -127,6 +127,14 @@ pub(crate) async fn run_dynamic_live_watcher(
                     }
                     Ok(None) => {
                         debug!("live_query dynamic: stream ended");
+                        if steady_dirty {
+                            let snap = build_dynamic_snapshot(&store, &printer_columns, scope, &plural);
+                            let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
+                                resource: resource_id.clone(),
+                                headers: snap.headers,
+                                rows: snap.rows,
+                            }));
+                        }
                         break;
                     }
                     Err(e) => {

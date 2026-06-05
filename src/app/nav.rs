@@ -53,6 +53,9 @@ impl CompiledGrep {
 /// `Serialize`/`Deserialize` so it can ride the wire inside `DrillTarget`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum K8sFieldSelector {
+    /// `metadata.name=<name>` — exact match on the resource name.
+    /// Universally supported by the K8s API for all resource types.
+    MetadataName(String),
     /// `spec.nodeName=<name>` — pods scheduled on a specific node.
     SpecNodeName(String),
     /// `status.phase=<phase>` — pods in a specific lifecycle phase.
@@ -64,6 +67,7 @@ impl K8sFieldSelector {
     /// (`field.path=value`), suitable for `SubscriptionFilter::Field`.
     pub fn to_wire(&self) -> String {
         match self {
+            Self::MetadataName(v) => format!("metadata.name={}", v),
             Self::SpecNodeName(v) => format!("spec.nodeName={}", v),
             Self::StatusPhase(v) => format!("status.phase={}", v),
         }
@@ -72,6 +76,7 @@ impl K8sFieldSelector {
     /// Short user-facing label for the breadcrumb.
     pub fn breadcrumb(&self) -> String {
         match self {
+            Self::MetadataName(v) => format!("name={}", v),
             Self::SpecNodeName(v) => format!("node={}", v),
             Self::StatusPhase(v) => format!("phase={}", v),
         }

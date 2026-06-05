@@ -826,37 +826,38 @@ impl ClientSession {
             let panic_tx = event_tx.clone();
             let panic_rid = rid.clone();
             let result = std::panic::AssertUnwindSafe(async {
-            // Wait for the MuxHandle to become available (connection established)
-            // and yield it out of the loop — no post-loop `.unwrap()` documenting
-            // an invariant the loop just proved.
-            let mux_handle = loop {
-                if let Some(v) = mux_rx.borrow_and_update().clone() { break v; }
-                if mux_rx.changed().await.is_err() {
-                    // Session dropped before connection established.
-                    return;
-                }
-            };
-
             // Self-healing bridge: open substream → read events → on
             // failure, retry with backoff. Same pattern as the daemon
             // bridge's watcher retry. Natural exit: session death
             // (open fails) or event channel dropped (reconnection).
             let mut ever_received_data = false;
             let mut retry_backoff = std::time::Duration::from_secs(2);
+            let bridge_start = std::time::Instant::now();
 
             loop {
-                // Open a substream and send the subscription handshake.
+                // Re-check the watch channel each iteration so we pick up
+                // a fresh MuxHandle after session reconnection.
+                let mux_handle = loop {
+                    if let Some(v) = mux_rx.borrow_and_update().clone() { break v; }
+                    if mux_rx.changed().await.is_err() { return; }
+                };
+
                 let stream = match mux_handle.open().await {
                     Ok(s) => s,
                     Err(e) => {
-                        if ever_received_data {
-                            tracing::warn!("subscription bridge reopen failed for {}: {}", rid.plural(), e);
+                        if !ever_received_data {
+                            let _ = event_tx.send(AppEvent::SubscriptionFailed {
+                                resource: rid,
+                                message: format!("substream open failed: {}", e),
+                            }).await;
+                            return;
                         }
-                        let _ = event_tx.send(AppEvent::SubscriptionFailed {
-                            resource: rid,
-                            message: format!("substream open failed: {}", e),
-                        }).await;
-                        return;
+                        tracing::warn!("subscription bridge reopen failed for {}: {}", rid.plural(), e);
+                        let jitter = 0.75 + (rid.plural().len() as f64 % 50.0) / 100.0;
+                        let jittered = retry_backoff.mul_f64(jitter);
+                        tokio::time::sleep(jittered).await;
+                        retry_backoff = (retry_backoff * 2).min(std::time::Duration::from_secs(30));
+                        continue;
                     }
                 };
                 let (read_half, mut write_half) = tokio::io::split(stream);
@@ -872,14 +873,15 @@ impl ClientSession {
                     force,
                 });
                 if let Err(e) = protocol::write_bincode(&mut write_half, &init).await {
-                    if ever_received_data {
-                        tracing::warn!("subscription bridge init failed for {}: {}", rid.plural(), e);
+                    if !ever_received_data {
+                        let _ = event_tx.send(AppEvent::SubscriptionFailed {
+                            resource: rid,
+                            message: format!("subscription init failed: {}", e),
+                        }).await;
+                        return;
                     }
-                    let _ = event_tx.send(AppEvent::SubscriptionFailed {
-                        resource: rid,
-                        message: format!("subscription init failed: {}", e),
-                    }).await;
-                    return;
+                    tracing::warn!("subscription bridge init failed for {}: {}, retrying", rid.plural(), e);
+                    continue;
                 }
 
                 // Bridge: read StreamEvents from the substream, convert to
@@ -891,6 +893,10 @@ impl ClientSession {
                 loop {
                     match protocol::read_bincode::<_, protocol::StreamEvent>(&mut reader).await {
                         Ok(event) => {
+                            if !ever_received_data {
+                                tracing::info!("subscription bridge: {} first data in {:?}",
+                                    rid.plural(), bridge_start.elapsed());
+                            }
                             ever_received_data = true;
                             retry_backoff = std::time::Duration::from_secs(2);
                             let app_event = match event {

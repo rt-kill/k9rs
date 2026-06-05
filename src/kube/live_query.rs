@@ -240,10 +240,9 @@ impl WatcherCache {
         &self,
         key: QueryKey,
         kind: crate::kube::resource_def::BuiltInKind,
-        client: &Client,
+        make_client: impl FnOnce() -> Client,
     ) -> Subscription {
-        let client = client.clone();
-        self.subscribe_with(key, move |k| Self::create_watcher(k, kind, &client))
+        self.subscribe_with(key, move |k| Self::create_watcher(k, kind, &make_client()))
     }
 
     /// Shared cache lookup + insert scaffolding for both `subscribe` and
@@ -399,15 +398,14 @@ impl WatcherCache {
     pub fn subscribe_dynamic(
         &self,
         key: QueryKey,
-        client: &Client,
+        make_client: impl FnOnce() -> Client,
         gvk: GroupVersionKind,
         plural: String,
         scope: ResourceScope,
         printer_columns: Vec<PrinterColumn>,
     ) -> Subscription {
-        let client = client.clone();
         self.subscribe_with(key, move |k| {
-            Self::create_dynamic_watcher(k, &client, gvk, plural, scope, printer_columns)
+            Self::create_dynamic_watcher(k, &make_client(), gvk, plural, scope, printer_columns)
         })
     }
 
@@ -595,6 +593,10 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
                     }
                     Ok(None) => {
                         debug!("live_query: stream ended for {}", rt);
+                        if steady_dirty {
+                            let items = sorted_snapshot(&store);
+                            let _ = snapshot_tx.send(WatcherSnapshot::Live(wrap(items)));
+                        }
                         break;
                     }
                     Err(e) => {

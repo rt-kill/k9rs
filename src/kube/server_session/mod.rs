@@ -945,6 +945,7 @@ async fn handle_subscription_substream_inner(
 
     let rid = init.resource.clone();
     let filter = init.filter.clone();
+    let sub_start = std::time::Instant::now();
     tracing::debug!(session = session_id, sub = sub_id, "subscribe: {}({}) filter={:?}",
         rid.plural(), init.namespace.display(), filter);
 
@@ -998,11 +999,15 @@ async fn handle_subscription_substream_inner(
         filter: cache_filter,
     };
 
-    // Create a fresh kube::Client per watcher (avoids pool starvation).
-    let watcher_client = if let Some(ref cfg) = ctx.client_config {
-        kube::Client::try_from(cfg.clone()).unwrap_or_else(|_| ctx.client.clone())
-    } else {
-        ctx.client.clone()
+    // Defer kube::Client creation to cache miss — try_from is expensive
+    // (~800ms with exec-based auth) and unnecessary when reusing an
+    // existing watcher.
+    let make_client = || -> kube::Client {
+        if let Some(ref cfg) = ctx.client_config {
+            kube::Client::try_from(cfg.clone()).unwrap_or_else(|_| ctx.client.clone())
+        } else {
+            ctx.client.clone()
+        }
     };
 
     // CRD arms (resolved and unresolved) produce a (gvk, plural, scope)
@@ -1020,9 +1025,9 @@ async fn handle_subscription_substream_inner(
             // Hand the destructured `kind` in so the cache doesn't have to
             // re-extract it at runtime.
             CrdOrSub::BuiltIn(if init.force {
-                ctx.shared.watcher_cache.subscribe_force(key.clone(), *kind, &watcher_client)
+                ctx.shared.watcher_cache.subscribe_force(key.clone(), *kind, &make_client())
             } else {
-                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, &watcher_client)
+                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, || make_client())
             })
         }
         protocol::ResourceId::Crd(crd_ref) => {
@@ -1034,7 +1039,7 @@ async fn handle_subscription_substream_inner(
             // Unresolved CRD: the client only knows the plural name.
             // Resolve via API discovery and notify the TUI of the
             // resolved identity.
-            match crate::kube::describe::api_resource_for(&watcher_client, &rid).await {
+            match crate::kube::describe::api_resource_for(&make_client(), &rid).await {
                 Ok((ar, resolved_scope)) => {
                     let gvk = kube::api::GroupVersionKind::gvk(&ar.group, &ar.version, &ar.kind);
                     let resolved_rid = protocol::ResourceId::crd(
@@ -1100,7 +1105,7 @@ async fn handle_subscription_substream_inner(
                 ctx.shared.watcher_cache.remove(&resolved_key);
             }
             let sub = ctx.shared.watcher_cache.subscribe_dynamic(
-                resolved_key.clone(), &watcher_client, gvk.clone(),
+                resolved_key.clone(), || make_client(), gvk.clone(),
                 plural.clone(), scope, printer_columns.clone(),
             );
             (sub, ResubInfo::Dynamic { key: resolved_key, gvk, plural, scope, printer_columns })
@@ -1132,6 +1137,13 @@ async fn handle_subscription_substream_inner(
             tracing::warn!(session = session_id, sub = sub_id, "initial snapshot flush failed for {}: {}", rid.plural(), e);
             return;
         }
+        tracing::info!(session = session_id, sub = sub_id,
+            "subscribe: {}({}) snapshot ready in {:?}",
+            rid.plural(), init.namespace.display(), sub_start.elapsed());
+    } else {
+        tracing::info!(session = session_id, sub = sub_id,
+            "subscribe: {}({}) snapshot pending, waiting for watcher",
+            rid.plural(), init.namespace.display());
     }
 
     loop {
@@ -1187,11 +1199,11 @@ async fn handle_subscription_substream_inner(
         // Re-subscribe — WatcherCache sees the dead watcher and creates a fresh one.
         sub = match &resub {
             ResubInfo::BuiltIn { key, kind } => {
-                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, &watcher_client)
+                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, || make_client())
             }
             ResubInfo::Dynamic { key, gvk, plural, scope, printer_columns } => {
                 ctx.shared.watcher_cache.subscribe_dynamic(
-                    key.clone(), &watcher_client, gvk.clone(),
+                    key.clone(), || make_client(), gvk.clone(),
                     plural.clone(), *scope, printer_columns.clone(),
                 )
             }
