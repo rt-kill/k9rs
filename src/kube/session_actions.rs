@@ -801,7 +801,7 @@ fn handle_log_action(
                     chrono::Utc::now().format("%Y%m%d-%H%M%S"),
                 );
                 let content: String = state.lines().iter()
-                    .cloned()
+                    .map(|l| crate::util::strip_ansi(l))
                     .collect::<Vec<_>>()
                     .join("\n");
                 match crate::util::safe_write_temp(&filename, content.as_bytes()) {

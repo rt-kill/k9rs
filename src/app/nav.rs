@@ -526,6 +526,22 @@ impl NavStack {
         }
     }
 
+    /// Drop every `SubscriptionStream` handle in the entire stack.
+    /// Called on session rebuild (context switch or reconnect) — the old
+    /// session is dead so every handle is a no-op `AbortHandle` to a
+    /// finished task, but leaving them in place tricks
+    /// `same_view_ancestor_has_stream()` into skipping re-subscribe.
+    pub fn clear_all_streams(&mut self) {
+        let mut node: &mut NavStep = &mut self.top;
+        loop {
+            node.stream = None;
+            match node.parent.as_deref_mut() {
+                Some(p) => node = p,
+                None => break,
+            }
+        }
+    }
+
     /// Replace the entire stack with a new root. Returns subscription changes.
     ///
     /// Always returns `subscribe: Some(rid)` because resetting drops every

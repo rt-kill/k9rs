@@ -576,6 +576,21 @@ fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: App
             // mandatory subscriptions (namespaces, nodes). They navigate to
             // a resource view explicitly — no automatic pods(all) subscribe.
             open_core_subscriptions(app, data_source);
+            // Re-subscribe the current nav view if it lost its stream
+            // during the rebuild. Without this, reconnect leaves the user
+            // staring at "Loading..." until they manually navigate away
+            // and back.
+            if let Some(rid) = app.nav.resource_id().cloned() {
+                if app.nav.current().stream.is_none() {
+                    let sub_filter = app.nav.current()
+                        .filter.as_ref().and_then(|f| f.to_subscription_filter());
+                    let change = crate::app::nav::NavChange {
+                        subscribe: Some(rid),
+                        subscription_filter: sub_filter,
+                    };
+                    apply_nav_change(app, data_source, change);
+                }
+            }
         }
         other => apply_event(app, other),
     }
@@ -824,6 +839,12 @@ pub async fn session_main(
             drop(data_source);
             drop(event_rx);
             app.clear_data();
+            app.kube.core_streams.clear();
+            app.nav.clear_all_streams();
+            app.kube.pod_metrics.clear();
+            app.kube.node_metrics.clear();
+            app.kube.kubectl_cache.clear();
+            app.ui.deltas.clear();
             let (new_tx, new_rx) = mpsc::channel::<AppEvent>(256);
             event_tx = new_tx;
             event_rx = new_rx;
