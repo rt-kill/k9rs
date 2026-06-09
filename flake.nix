@@ -7,6 +7,12 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
+    let
+      # Home Manager module (`programs.k9rs`). System-independent, so it lives
+      # outside `eachDefaultSystem`. `self` is threaded in so the module can
+      # default its package to this flake's build.
+      hmModule = import ./nix/hm-module.nix self;
+    in
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -40,5 +46,8 @@
           ];
         };
       }
-    );
+    ) // {
+      homeModules.default = hmModule;
+      homeModules.k9rs = hmModule;
+    };
 }
