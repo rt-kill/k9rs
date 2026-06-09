@@ -219,9 +219,7 @@ async fn main() -> Result<()> {
                 _ = suspend_rx.changed() => {
                     if *suspend_rx.borrow() {
                         suspended = true;
-                        drop(event_stream);
                         let _ = suspend_ack_tx.send(()).await;
-                        event_stream = EventStream::new();
                     }
                 }
                 event = event_stream.next() => {

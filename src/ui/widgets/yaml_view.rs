@@ -176,8 +176,7 @@ impl StatefulWidget for YamlViewer<'_> {
 
         let visible_height = inner.height as usize;
 
-        // Clamp scroll
-        let max_scroll = total_lines.saturating_sub(visible_height);
+        let max_scroll = crate::util::content_max_scroll(total_lines, visible_height);
         if state.scroll > max_scroll {
             state.scroll = max_scroll;
         }
@@ -234,7 +233,7 @@ impl StatefulWidget for YamlViewer<'_> {
             let thumb_size = ((visible_height as f64 / total_lines as f64)
                 * scrollbar_height as f64)
                 .max(1.0) as usize;
-            let max_scroll_val = total_lines.saturating_sub(visible_height);
+            let max_scroll_val = crate::util::content_max_scroll(total_lines, visible_height);
             let scroll_pos = state.scroll.min(max_scroll_val);
             let thumb_pos = if max_scroll_val > 0 {
                 ((scroll_pos as f64 / max_scroll_val as f64)

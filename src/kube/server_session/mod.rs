@@ -168,6 +168,7 @@ pub(crate) struct SessionContext {
     pub context: protocol::ContextId,
     /// Session ID for structured logging in substream tasks.
     pub session_id: u64,
+    pub streaming_lists: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -497,10 +498,18 @@ impl ServerSession {
             init.identity.user.clone(),
         );
 
-        // 4. Send Ready.
+        // 4. Fetch K8s server version (best-effort, non-blocking for Ready).
+        let mut identity = init.identity.clone();
+        let streaming_lists = if let Ok(info) = client.apiserver_version().await {
+            identity.k8s_version = info.git_version.clone();
+            parse_k8s_minor(&info.git_version).map_or(false, |minor| minor >= 32)
+        } else {
+            false
+        };
+
         let ready = SessionEvent::Ready {
             context: context_name.clone(),
-            identity: init.identity.clone(),
+            identity,
             namespaces: vec![],
         };
         if protocol::write_bincode(&mut buf_writer, &ready).await.is_err() {
@@ -528,6 +537,7 @@ impl ServerSession {
                 client_config: Some(client_config),
                 context: context_id,
                 session_id,
+                streaming_lists,
             });
             let _ = tx.send(Some(ctx));
         }
@@ -1025,9 +1035,9 @@ async fn handle_subscription_substream_inner(
             // Hand the destructured `kind` in so the cache doesn't have to
             // re-extract it at runtime.
             CrdOrSub::BuiltIn(if init.force {
-                ctx.shared.watcher_cache.subscribe_force(key.clone(), *kind, &make_client())
+                ctx.shared.watcher_cache.subscribe_force(key.clone(), *kind, &make_client(), ctx.streaming_lists)
             } else {
-                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, || make_client())
+                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, &make_client, ctx.streaming_lists)
             })
         }
         protocol::ResourceId::Crd(crd_ref) => {
@@ -1105,8 +1115,8 @@ async fn handle_subscription_substream_inner(
                 ctx.shared.watcher_cache.remove(&resolved_key);
             }
             let sub = ctx.shared.watcher_cache.subscribe_dynamic(
-                resolved_key.clone(), || make_client(), gvk.clone(),
-                plural.clone(), scope, printer_columns.clone(),
+                resolved_key.clone(), &make_client, gvk.clone(),
+                plural.clone(), scope, printer_columns.clone(), ctx.streaming_lists,
             );
             (sub, ResubInfo::Dynamic { key: resolved_key, gvk, plural, scope, printer_columns })
         }
@@ -1188,7 +1198,7 @@ async fn handle_subscription_substream_inner(
         // ±25% jitter prevents thundering herd when many watchers die
         // simultaneously (e.g., after laptop suspend/resume).
         let detail = sub.last_error().unwrap_or_default();
-        let jitter_factor = 0.75 + rand::random::<f64>() * 0.5; // 0.75..1.25
+        let jitter_factor = crate::util::retry_jitter(rid.plural().as_bytes(), retry_backoff.as_millis() as u64);
         let jittered = retry_backoff.mul_f64(jitter_factor);
         tracing::info!(session = session_id, sub = sub_id,
             "watcher died for {}, retrying in {:?}: {}",
@@ -1199,12 +1209,12 @@ async fn handle_subscription_substream_inner(
         // Re-subscribe — WatcherCache sees the dead watcher and creates a fresh one.
         sub = match &resub {
             ResubInfo::BuiltIn { key, kind } => {
-                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, || make_client())
+                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, &make_client, ctx.streaming_lists)
             }
             ResubInfo::Dynamic { key, gvk, plural, scope, printer_columns } => {
                 ctx.shared.watcher_cache.subscribe_dynamic(
-                    key.clone(), || make_client(), gvk.clone(),
-                    plural.clone(), *scope, printer_columns.clone(),
+                    key.clone(), &make_client, gvk.clone(),
+                    plural.clone(), *scope, printer_columns.clone(), ctx.streaming_lists,
                 )
             }
         };
@@ -1648,6 +1658,41 @@ impl Drop for Pty {
     fn drop(&mut self) {
         if self.master >= 0 { unsafe { libc::close(self.master); } }
         if self.slave >= 0 { unsafe { libc::close(self.slave); } }
+    }
+}
+
+fn parse_k8s_minor(git_version: &str) -> Option<u32> {
+    let v = git_version.strip_prefix('v').unwrap_or(git_version);
+    v.split('.').nth(1)?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_k8s_minor;
+
+    #[test]
+    fn parse_standard_versions() {
+        assert_eq!(parse_k8s_minor("v1.32.1"), Some(32));
+        assert_eq!(parse_k8s_minor("v1.30.0"), Some(30));
+        assert_eq!(parse_k8s_minor("v1.28.11"), Some(28));
+    }
+
+    #[test]
+    fn parse_eks_version() {
+        assert_eq!(parse_k8s_minor("v1.30.14-eks-40737a8"), Some(30));
+    }
+
+    #[test]
+    fn parse_no_prefix() {
+        assert_eq!(parse_k8s_minor("1.32.0"), Some(32));
+    }
+
+    #[test]
+    fn parse_edge_cases() {
+        assert_eq!(parse_k8s_minor("v1"), None);
+        assert_eq!(parse_k8s_minor(""), None);
+        assert_eq!(parse_k8s_minor("garbage"), None);
+        assert_eq!(parse_k8s_minor("v1.abc.3"), None);
     }
 }
 

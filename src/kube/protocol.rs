@@ -487,11 +487,12 @@ impl std::fmt::Display for Namespace {
 pub struct ClusterIdentity {
     pub cluster: String,
     pub user: String,
+    pub k8s_version: String,
 }
 
 impl ClusterIdentity {
     pub fn new(cluster: String, user: String) -> Self {
-        Self { cluster, user }
+        Self { cluster, user, k8s_version: String::new() }
     }
 }
 
@@ -773,6 +774,7 @@ pub enum ExecPlaceholder {
     PodName,
     Container,
     NodeName,
+    NodeDebugPodName,
 }
 
 static SHELL_TEMPLATE: ExecTemplate = ExecTemplate {
@@ -794,7 +796,9 @@ static NODE_SHELL_TEMPLATE: ExecTemplate = ExecTemplate {
         ExecArg::Literal("debug"),
         ExecArg::Placeholder(ExecPlaceholder::NodeName),
         ExecArg::Literal("-it"),
+        ExecArg::Literal("--profile=general"),
         ExecArg::Literal("--image=busybox"),
+        ExecArg::ConditionalPair("--pod-name", ExecPlaceholder::NodeDebugPodName),
     ],
     title_template: "node/{{node}}",
 };
@@ -1115,7 +1119,7 @@ pub struct LogInit {
 /// changes in a bincode-incompatible way (new fields, reordering, etc.).
 /// The daemon rejects Init commands with a mismatched version so stale
 /// daemons fail fast instead of producing silent data corruption.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// All commands from any client (TUI session or management CLI).
 /// The first command on a connection determines the connection type:

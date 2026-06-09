@@ -10,8 +10,11 @@ use crate::kube::session::{ds_try, ActionResult, apply_nav_change};
 
 const HELP_PAGE_SCROLL_LINES: usize = 10;
 const DEFAULT_TERMINAL_HEIGHT: usize = 24;
-const CHROME_LINES: usize = 5;
 const LOG_CHROME_LINES: usize = 4;
+const CONTENT_CHROME_LINES: usize = 3;
+
+use crate::util::content_max_scroll;
+
 
 /// Render-clamp-aware max for `help_scroll`. Mirrors the formula the
 /// help overlay uses at render time so action handlers can store a
@@ -201,8 +204,8 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
             let caps = app.current_capabilities();
             match &mut app.route {
                 Route::ContentView { ref mut state, .. } => {
-                    let max = state.line_count().saturating_sub(1);
-                    state.scroll = (state.scroll + 1).min(max);
+                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
+                    state.scroll = (state.scroll + 1).min(content_max_scroll(state.line_count(), visible));
                 }
                 Route::ContainerSelect { ref target, ref mut selected, .. } => {
                     let container_count = {
@@ -262,13 +265,13 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
                 Route::Logs { ref mut state, .. } => {
                     state.follow = false;
                     let total = state.visible_count();
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CHROME_LINES);
+                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(LOG_CHROME_LINES);
                     let max = total.saturating_sub(visible);
                     state.scroll = (state.scroll + app.config.ui.page_scroll_lines).min(max);
                 }
                 Route::ContentView { ref mut state, .. } => {
-                    let max = state.line_count().saturating_sub(1);
-                    state.scroll = (state.scroll + app.config.ui.page_scroll_lines).min(max);
+                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
+                    state.scroll = (state.scroll + app.config.ui.page_scroll_lines).min(content_max_scroll(state.line_count(), visible));
                 }
                 Route::Help => {
                     let max = help_max_scroll(&caps);
@@ -293,12 +296,13 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
             match &mut app.route {
                 Route::Logs { ref mut state, .. } => {
                     let total = state.visible_count();
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CHROME_LINES);
+                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(LOG_CHROME_LINES);
                     state.scroll = total.saturating_sub(visible);
                     state.follow = true;
                 }
                 Route::ContentView { ref mut state, .. } => {
-                    state.scroll = state.line_count().saturating_sub(1);
+                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
+                    state.scroll = content_max_scroll(state.line_count(), visible);
                 }
                 Route::Help => {
                     app.ui.help_scroll = help_max_scroll(&caps);
@@ -310,7 +314,7 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
             if let Route::Logs { ref mut state, .. } = app.route {
                 if state.follow {
                     let total = state.visible_count();
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CHROME_LINES);
+                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(LOG_CHROME_LINES);
                     state.scroll = total.saturating_sub(visible);
                     state.follow = false;
                 }
@@ -321,7 +325,7 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
             if let Route::Logs { ref mut state, .. } = app.route {
                 if !state.follow {
                     let total = state.visible_count();
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CHROME_LINES);
+                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(LOG_CHROME_LINES);
                     let max = total.saturating_sub(visible);
                     state.scroll = (state.scroll + n).min(max);
                 }
@@ -665,7 +669,8 @@ fn handle_filter_search(
         Action::SearchNext => {
             match &mut app.route {
                 Route::ContentView { ref mut state, .. } => {
-                    state.next_match(40);
+                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
+                    state.next_match(visible);
                 }
                 Route::Logs { ref mut state, .. } => {
                     let current_scroll = state.scroll;
@@ -685,7 +690,8 @@ fn handle_filter_search(
         Action::SearchPrev => {
             match &mut app.route {
                 Route::ContentView { ref mut state, .. } => {
-                    state.prev_match(40);
+                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
+                    state.prev_match(visible);
                 }
                 Route::Logs { ref mut state, .. } => {
                     let current_scroll = state.scroll;
@@ -766,9 +772,8 @@ fn handle_log_action(
             let since_label = since.as_deref().unwrap_or("tail");
             app.ui.flash = Some(crate::app::FlashMessage::info(format!("Log range: {}", since_label)));
             if let Route::Logs { ref target, ref mut state, ref mut stream } = app.route {
-                state.since = since.clone();
                 let tail_lines = state.tail_lines;
-                state.clear();
+                state.clear_lines();
                 state.follow = true;
                 state.streaming = true;
                 state.initial_load = true;
@@ -928,8 +933,8 @@ fn handle_drill(
                         app.nav.save_selected(sel);
                         let change = app.nav.push(crate::app::nav::NavStep::new(
                             target_rid,
-                            Some(crate::app::nav::NavFilter::Grep(
-                                crate::app::nav::CompiledGrep::new(regex::escape(&value)),
+                            Some(crate::app::nav::NavFilter::Field(
+                                crate::app::nav::K8sFieldSelector::MetadataName(value.clone()),
                             )),
                         ));
                         apply_nav_change(app, data_source, change);
@@ -987,7 +992,7 @@ fn handle_io(
                         let lines = state.lines();
                         let joined: String = indices.iter()
                             .filter_map(|&i| lines.get(i))
-                            .cloned()
+                            .map(|l| crate::util::strip_ansi(l))
                             .collect::<Vec<_>>()
                             .join("\n");
                         let count = indices.len();
@@ -1067,12 +1072,46 @@ fn handle_show_port_forwards(app: &mut App, data_source: &mut ClientSession) {
 }
 
 fn handle_refresh(app: &mut App, data_source: &mut ClientSession) {
+    use crate::app::{ContentViewKind, Route};
+
+    // If we're inside a describe/yaml view, re-fetch the content directly.
+    let content_refresh = match app.route {
+        Route::ContentView { kind: kind @ (ContentViewKind::Describe | ContentViewKind::Yaml), target: Some(ref target), .. } => {
+            Some((kind, target.clone()))
+        }
+        _ => None,
+    };
+    if let Some((kind, target)) = content_refresh {
+        app.kube.kubectl_cache.clear();
+        let result = if kind == ContentViewKind::Describe {
+            data_source.describe(&target)
+        } else {
+            data_source.yaml(&target)
+        };
+        match result {
+            Ok(()) => {
+                app.route = Route::ContentView {
+                    kind,
+                    target: Some(target),
+                    awaiting_response: true,
+                    state: crate::app::ContentViewState::default(),
+                };
+                app.ui.flash = Some(crate::app::FlashMessage::info("Refreshing..."));
+            }
+            Err(_) => {
+                app.ui.flash = Some(crate::app::FlashMessage::error("Failed to refresh"));
+            }
+        }
+        return;
+    }
+
     // Derived views are client-side projections — no subscription to refresh.
     if app.nav.view_id().is_derived() {
         app.ui.flash = Some(crate::app::FlashMessage::info("Pop back to refresh the parent view"));
         return;
     }
     let Some(rid) = app.nav.resource_id().cloned() else { return; };
+    app.kube.kubectl_cache.clear();
     let filter = app.nav.with_subscription_owner(|owner| {
         let f = owner.filter.as_ref().and_then(|f| f.to_subscription_filter());
         owner.stream = None;

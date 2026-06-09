@@ -37,6 +37,7 @@ pub(crate) async fn run_dynamic_live_watcher(
     plural: String,
     scope: ResourceScope,
     printer_columns: Vec<PrinterColumn>,
+    streaming_lists: bool,
 ) {
     let ar = if plural.is_empty() {
         ApiResource::from_gvk(&gvk)
@@ -54,9 +55,12 @@ pub(crate) async fn run_dynamic_live_watcher(
         gvk.group.clone(), gvk.version.clone(), gvk.kind.clone(), plural.clone(), scope,
     );
 
-    let watcher_config = watcher::Config::default()
+    let mut watcher_config = watcher::Config::default()
         .page_size(watcher_page_size())
-        .any_semantic();      // serve from API server cache (resourceVersion=0), much faster
+        .any_semantic();
+    if streaming_lists {
+        watcher_config = watcher_config.streaming_lists();
+    }
     let mut stream = watcher::watcher(api, watcher_config).boxed();
 
     let mut store: HashMap<ObjectKey, DynamicObject> = HashMap::new();

@@ -122,6 +122,8 @@ pub struct Subscription {
 pub(crate) fn watcher_page_size() -> u32 {
     crate::kube::daemon_config::daemon_config().watcher_page_size
 }
+
+
 /// Interval for flushing intermediate snapshots during the initial list.
 pub(crate) const INIT_FLUSH_INTERVAL_MS: u64 = 200;
 /// Maximum store size for intermediate flushes.
@@ -241,8 +243,9 @@ impl WatcherCache {
         key: QueryKey,
         kind: crate::kube::resource_def::BuiltInKind,
         make_client: impl FnOnce() -> Client,
+        streaming_lists: bool,
     ) -> Subscription {
-        self.subscribe_with(key, move |k| Self::create_watcher(k, kind, &make_client()))
+        self.subscribe_with(key, move |k| Self::create_watcher(k, kind, &make_client(), streaming_lists))
     }
 
     /// Shared cache lookup + insert scaffolding for both `subscribe` and
@@ -327,6 +330,7 @@ impl WatcherCache {
         key: &QueryKey,
         kind: crate::kube::resource_def::BuiltInKind,
         client: &Client,
+        streaming_lists: bool,
     ) -> (Arc<LiveQuery>, watch::Receiver<WatcherSnapshot>) {
         let (snapshot_tx, snapshot_rx) = watch::channel(WatcherSnapshot::Pending);
 
@@ -335,6 +339,7 @@ impl WatcherCache {
             namespace: key.namespace.clone(),
             snapshot_tx: snapshot_tx.clone(),
             filter: key.filter.clone(),
+            streaming_lists,
         };
 
         let task = crate::kube::resource_defs::REGISTRY.spawn_watcher_for_kind(kind, args);
@@ -372,11 +377,11 @@ impl WatcherCache {
         key: QueryKey,
         kind: crate::kube::resource_def::BuiltInKind,
         client: &Client,
+        streaming_lists: bool,
     ) -> Subscription {
-        self.entries.remove(&key);
         self.reap_dead();
 
-        let (live_query, snapshot_rx) = Self::create_watcher(&key, kind, client);
+        let (live_query, snapshot_rx) = Self::create_watcher(&key, kind, client, streaming_lists);
         self.entries.insert(key.clone(), Arc::downgrade(&live_query));
 
         Subscription {
@@ -403,9 +408,10 @@ impl WatcherCache {
         plural: String,
         scope: ResourceScope,
         printer_columns: Vec<PrinterColumn>,
+        streaming_lists: bool,
     ) -> Subscription {
         self.subscribe_with(key, move |k| {
-            Self::create_dynamic_watcher(k, &make_client(), gvk, plural, scope, printer_columns)
+            Self::create_dynamic_watcher(k, &make_client(), gvk, plural, scope, printer_columns, streaming_lists)
         })
     }
 
@@ -417,13 +423,14 @@ impl WatcherCache {
         plural: String,
         scope: ResourceScope,
         printer_columns: Vec<PrinterColumn>,
+        streaming_lists: bool,
     ) -> (Arc<LiveQuery>, watch::Receiver<WatcherSnapshot>) {
         let (snapshot_tx, snapshot_rx) = watch::channel(WatcherSnapshot::Pending);
         let task_client = client.clone();
         let task_ns = key.namespace.clone();
         let task_tx = snapshot_tx.clone();
         let task = tokio::spawn(async move {
-            crate::kube::live_query_dynamic::run_dynamic_live_watcher(task_client, task_ns, task_tx, gvk, plural, scope, printer_columns).await;
+            crate::kube::live_query_dynamic::run_dynamic_live_watcher(task_client, task_ns, task_tx, gvk, plural, scope, printer_columns, streaming_lists).await;
         });
         let live_query = Arc::new(LiveQuery {
             snapshot_tx,
@@ -478,6 +485,7 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
     wrap: W,
     namespace: &crate::kube::protocol::Namespace,
     filter: Option<crate::kube::protocol::SubscriptionFilter>,
+    streaming_lists: bool,
 ) where
     K: Resource<DynamicType = ()>
         + Clone
@@ -492,7 +500,10 @@ pub(crate) async fn run_typed_watcher<K, T, C, W>(
 {
     let mut watcher_config = watcher::Config::default()
         .page_size(watcher_page_size())
-        .any_semantic();      // serve from API server cache (resourceVersion=0), much faster
+        .any_semantic();
+    if streaming_lists {
+        watcher_config = watcher_config.streaming_lists();
+    }
     // Apply server-side filters to the watcher (pushed to K8s API).
     // OwnerUid is NOT applied here — it's post-filtered after snapshot creation
     // because the K8s API doesn't support filtering by ownerReference.

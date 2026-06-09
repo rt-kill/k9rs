@@ -85,14 +85,19 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         Line::from(""),
     ];
 
-    // Cluster info — centered block
-    let ctx_display = if app.kube.context.is_empty() { "connecting..." } else { app.kube.context.as_str() };
-    let cluster_display = if app.kube.identity.cluster.is_empty() { "n/a" } else { &app.kube.identity.cluster };
-    let user_display = if app.kube.identity.user.is_empty() { "n/a" } else { &app.kube.identity.user };
-    let ctx_line = format!("Context: {}  |  Cluster: {}  |  User: {}", ctx_display, cluster_display, user_display);
-    lines.push(Line::from(
-        Span::styled(ctx_line, theme.info_value)
-    ).alignment(Alignment::Center));
+    // Cluster info — centered, one field per line
+    let info_fields: &[(&str, &str)] = &[
+        ("Context: ", if app.kube.context.is_empty() { "connecting..." } else { app.kube.context.as_str() }),
+        ("Cluster: ", if app.kube.identity.cluster.is_empty() { "n/a" } else { &app.kube.identity.cluster }),
+        ("User: ", if app.kube.identity.user.is_empty() { "n/a" } else { &app.kube.identity.user }),
+        ("K8s: ", if app.kube.identity.k8s_version.is_empty() { "n/a" } else { &app.kube.identity.k8s_version }),
+    ];
+    for (label, value) in info_fields {
+        lines.push(Line::from(vec![
+            Span::styled(*label, theme.info_label),
+            Span::styled(*value, theme.info_value),
+        ]).alignment(Alignment::Center));
+    }
     lines.push(Line::from(""));
 
     // Stats — built dynamically from core resources

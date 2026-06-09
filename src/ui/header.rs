@@ -47,6 +47,7 @@ pub fn draw_header(
     let ctx = if app.kube.context.is_empty() { "connecting..." } else { app.kube.context.as_str() };
     let cluster = if app.kube.identity.cluster.is_empty() { "n/a" } else { &app.kube.identity.cluster };
     let user = if app.kube.identity.user.is_empty() { "n/a" } else { &app.kube.identity.user };
+    let k8s_ver = if app.kube.identity.k8s_version.is_empty() { "n/a" } else { &app.kube.identity.k8s_version };
 
     let logo_width = LOGO.iter().map(|l| l.len()).max().unwrap_or(0) as u16 + 2;
     let cols = Layout::horizontal([
@@ -54,7 +55,7 @@ pub fn draw_header(
         Constraint::Length(logo_width),
     ]).split(area);
 
-    // Left: context / cluster / user stacked vertically.
+    // Left: context / cluster / user / k8s version stacked vertically.
     let info = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(" Context: ", theme.info_label),
@@ -67,6 +68,10 @@ pub fn draw_header(
         Line::from(vec![
             Span::styled(" User:    ", theme.info_label),
             Span::styled(user, theme.info_value),
+        ]),
+        Line::from(vec![
+            Span::styled(" K8s:     ", theme.info_label),
+            Span::styled(k8s_ver, theme.info_value),
         ]),
     ]);
     f.render_widget(info, cols[0]);
@@ -109,6 +114,14 @@ pub fn draw_cluster_info(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                 Span::styled("n/a", theme.info_na)
             } else {
                 Span::styled(&app.kube.identity.user, theme.info_value)
+            },
+        ]),
+        Line::from(vec![
+            Span::styled(" K8s:       ", theme.info_label),
+            if app.kube.identity.k8s_version.is_empty() {
+                Span::styled("n/a", theme.info_na)
+            } else {
+                Span::styled(&app.kube.identity.k8s_version, theme.info_value)
             },
         ]),
         Line::from(vec![

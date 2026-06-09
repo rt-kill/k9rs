@@ -73,9 +73,8 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
         if inner.height > 0 && inner.width > 0 {
             let visible_height = inner.height as usize;
 
-            // Only build Line objects for the visible window -- avoids the u16
-            // scroll truncation at 65535 and is much faster for large content.
-            let start = describe.scroll.min(total_lines.saturating_sub(visible_height.max(1)));
+            let max_scroll = crate::util::content_max_scroll(total_lines, visible_height);
+            let start = describe.scroll.min(max_scroll);
             let end = (start + visible_height).min(total_lines);
 
             let visible_lines: Vec<Line> = all_lines[start..end]
@@ -126,11 +125,11 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(paragraph, inner);
         }
 
-        // Scrollbar
         let inner = Block::bordered().inner(content_area);
         if total_lines > inner.height as usize {
-            let mut scrollbar_state = ScrollbarState::new(total_lines)
-                .position(describe.scroll);
+            let max_scroll = crate::util::content_max_scroll(total_lines, inner.height as usize);
+            let mut scrollbar_state = ScrollbarState::new(max_scroll)
+                .position(describe.scroll.min(max_scroll));
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
             f.render_stateful_widget(scrollbar, content_area, &mut scrollbar_state);
         }

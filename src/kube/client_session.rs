@@ -131,10 +131,17 @@ impl Drop for SubscriptionStream {
 
 /// An active exec session backed by a yamux substream. The daemon
 /// spawns kubectl in a PTY; raw terminal bytes flow over yamux.
-/// Drop closes the substream (RST → daemon kills kubectl).
+/// Drop aborts the reader bridge and closes the substream
+/// (RST → daemon kills kubectl).
 pub struct ExecStream {
-    pub reader: tokio::io::BufReader<tokio::io::ReadHalf<crate::kube::mux::MuxedStream>>,
     pub writer: tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
+    _bridge: tokio::task::AbortHandle,
+}
+
+impl Drop for ExecStream {
+    fn drop(&mut self) {
+        self._bridge.abort();
+    }
 }
 
 /// An active log stream backed by its own yamux substream. Same shape as
@@ -590,15 +597,20 @@ impl ClientSession {
         self.send_command(SessionCommand::Apply { target: target.clone(), yaml })
     }
 
-    /// Open an exec substream. Returns the raw split stream so the TUI
-    /// can forward terminal bytes directly.
-    pub async fn open_exec_stream(&self, exec_init: protocol::ExecInit) -> anyhow::Result<ExecStream> {
+    /// Open an exec substream. Spawns a reader bridge that delivers
+    /// `ExecData`/`ExecEnded` events. Drop aborts the bridge and
+    /// closes the substream.
+    pub async fn open_exec_stream(
+        &self,
+        exec_init: protocol::ExecInit,
+        event_tx: mpsc::Sender<AppEvent>,
+    ) -> anyhow::Result<ExecStream> {
         let mux_handle = self.mux_handle_rx.borrow().clone()
             .ok_or_else(|| anyhow::anyhow!("not connected"))?;
         let stream = mux_handle.open().await
             .map_err(|e| anyhow::anyhow!("substream open failed: {}", e))?;
         let (read_half, mut write_half) = tokio::io::split(stream);
-        let reader = tokio::io::BufReader::with_capacity(
+        let mut reader = tokio::io::BufReader::with_capacity(
             protocol::IO_BUFFER_SIZE,
             read_half,
         );
@@ -608,7 +620,30 @@ impl ClientSession {
             protocol::IO_BUFFER_SIZE,
             write_half,
         );
-        Ok(ExecStream { reader, writer })
+        let bridge = tokio::spawn(async move {
+            let panic_tx = event_tx.clone();
+            let result = std::panic::AssertUnwindSafe(async {
+                loop {
+                    match protocol::read_bincode::<_, protocol::ExecFrame>(&mut reader).await {
+                        Ok(protocol::ExecFrame::Data(bytes)) => {
+                            if event_tx.send(AppEvent::ExecData(bytes)).await.is_err() { break; }
+                        }
+                        Ok(protocol::ExecFrame::Resize { .. }) => {}
+                        Err(_) => {
+                            let _ = event_tx.send(AppEvent::ExecEnded).await;
+                            break;
+                        }
+                    }
+                }
+            });
+            if let Err(_panic) = futures::FutureExt::catch_unwind(result).await {
+                let _ = panic_tx.send(AppEvent::ExecEnded).await;
+                let _ = panic_tx.send(AppEvent::Flash(FlashMessage::error(
+                    "exec bridge panicked".to_string(),
+                ))).await;
+            }
+        });
+        Ok(ExecStream { writer, _bridge: bridge.abort_handle() })
     }
 
     pub fn delete(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
@@ -853,7 +888,7 @@ impl ClientSession {
                             return;
                         }
                         tracing::warn!("subscription bridge reopen failed for {}: {}", rid.plural(), e);
-                        let jitter = 0.75 + (rid.plural().len() as f64 % 50.0) / 100.0;
+                        let jitter = crate::util::retry_jitter(rid.plural().as_bytes(), retry_backoff.as_millis() as u64);
                         let jittered = retry_backoff.mul_f64(jitter);
                         tokio::time::sleep(jittered).await;
                         retry_backoff = (retry_backoff * 2).min(std::time::Duration::from_secs(30));
@@ -936,7 +971,7 @@ impl ClientSession {
                 // Transient failure after prior success — retry with
                 // jittered backoff. Session death naturally exits on the
                 // next open() or event_tx.send().
-                let jitter = 0.75 + (rid.plural().len() as f64 % 50.0) / 100.0;
+                let jitter = crate::util::retry_jitter(rid.plural().as_bytes(), retry_backoff.as_millis() as u64);
                 let jittered = retry_backoff.mul_f64(jitter);
                 tracing::info!("subscription bridge retrying for {} in {:?}", rid.plural(), jittered);
                 tokio::time::sleep(jittered).await;

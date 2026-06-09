@@ -1,3 +1,4 @@
+use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -12,6 +13,11 @@ use tokio::sync::mpsc;
 use crate::app::{App, InputMode};
 use crate::event::AppEvent;
 use crate::kube::client_session::ClientSession;
+
+struct RawFd(std::os::unix::io::RawFd);
+impl AsRawFd for RawFd {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd { self.0 }
+}
 
 use crate::kube::session_actions::handle_action;
 use crate::kube::session_events::apply_event;
@@ -89,41 +95,11 @@ pub(crate) async fn open_exec_route(
     title: String,
     event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
 ) -> Result<()> {
-    let stream = data_source.open_exec_stream(exec_init.clone()).await?;
-
-    // Split: writer stays in Route for the bridge loop, reader goes to
-    // a background task that delivers ExecData/ExecEnded events.
-    let crate::kube::client_session::ExecStream { reader, writer } = stream;
-    let tx = event_tx.clone();
-    let bridge = tokio::spawn(async move {
-        let panic_tx = tx.clone();
-        let result = std::panic::AssertUnwindSafe(async {
-        let mut reader = reader;
-        loop {
-            match crate::kube::protocol::read_bincode::<_, crate::kube::protocol::ExecFrame>(&mut reader).await {
-                Ok(crate::kube::protocol::ExecFrame::Data(bytes)) => {
-                    if tx.send(crate::event::AppEvent::ExecData(bytes)).await.is_err() { break; }
-                }
-                Ok(crate::kube::protocol::ExecFrame::Resize { .. }) => {}
-                Err(_) => {
-                    let _ = tx.send(crate::event::AppEvent::ExecEnded).await;
-                    break;
-                }
-            }
-        }
-        });
-        if let Err(_panic) = futures::FutureExt::catch_unwind(result).await {
-            let _ = panic_tx.send(crate::event::AppEvent::ExecEnded).await;
-            let _ = panic_tx.send(crate::event::AppEvent::Flash(
-                crate::app::FlashMessage::error("exec bridge panicked".to_string()),
-            )).await;
-        }
-    });
+    let stream = data_source.open_exec_stream(exec_init.clone(), event_tx.clone()).await?;
 
     app.navigate_to(crate::app::Route::Shell(Box::new(crate::app::ShellState {
         title,
-        writer: Some(writer),
-        _bridge: Some(bridge.abort_handle()),
+        stream: Some(stream),
         connect_state: crate::app::ShellConnectState::Connecting,
         pending_output: Vec::new(),
     })));
@@ -342,19 +318,21 @@ async fn run_shell_bridge(
     event_rx: &mut mpsc::Receiver<AppEvent>,
     input_suspend: &tokio::sync::watch::Sender<bool>,
     input_suspend_ack: &mut mpsc::Receiver<()>,
+    input_rx: &mut mpsc::Receiver<crossterm::event::Event>,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
-    // Extract writer and pending output from ShellState.
-    let (mut writer, pending) = match &mut app.route {
+    // Extract the exec stream and pending output from ShellState.
+    let (mut stream, pending) = match &mut app.route {
         crate::app::Route::Shell(ref mut shell) => {
-            let w = shell.writer.take();
+            let s = shell.stream.take();
             let p = std::mem::take(&mut shell.pending_output);
-            (w, p)
+            (s, p)
         }
         _ => return,
     };
-    let Some(ref mut writer) = writer else { return };
+    let Some(ref mut stream) = stream else { return };
+    let writer = &mut stream.writer;
 
     // Send resize with full terminal dimensions (no TUI borders during bridge).
     let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -392,8 +370,15 @@ async fn run_shell_bridge(
         let _ = stdout.flush().await;
     }
 
-    // Raw bridge loop.
-    let mut stdin = tokio::io::stdin();
+    // Non-blocking stdin via AsyncFd — no background thread, clean drop.
+    // tokio::io::stdin() spawns a blocking thread that outlives drop and
+    // races with crossterm's EventStream for fd 0 on resume.
+    let stdin_fd = std::io::stdin().as_raw_fd();
+    let old_flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
+    unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, old_flags | libc::O_NONBLOCK) };
+    let async_stdin = tokio::io::unix::AsyncFd::new(RawFd(stdin_fd))
+        .expect("AsyncFd registration");
+
     let mut buf = [0u8; 4096];
     let mut sigwinch = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::window_change(),
@@ -402,15 +387,22 @@ async fn run_shell_bridge(
     loop {
         tokio::select! {
             biased;
-            result = stdin.read(&mut buf) => {
-                match result {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
+            readable = async_stdin.readable() => {
+                let Ok(mut guard) = readable else { break };
+                match guard.try_io(|fd| {
+                    let n = unsafe {
+                        libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                    };
+                    if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
+                }) {
+                    Ok(Ok(0)) | Ok(Err(_)) => break,
+                    Ok(Ok(n)) => {
                         let frame = crate::kube::protocol::ExecFrame::Data(buf[..n].to_vec());
                         if crate::kube::protocol::write_bincode(writer, &frame).await.is_err() {
                             break;
                         }
                     }
+                    Err(_would_block) => continue,
                 }
             }
             event = event_rx.recv() => {
@@ -420,8 +412,6 @@ async fn run_shell_bridge(
                         let _ = stdout.flush().await;
                     }
                     Some(AppEvent::ExecEnded) | None => break,
-                    // Discard non-shell events. The daemon sends fresh
-                    // snapshots when the TUI resumes processing.
                     Some(_) => {}
                 }
             }
@@ -434,19 +424,26 @@ async fn run_shell_bridge(
         }
     }
 
-    // Reset terminal modes the container shell may have changed, without
-    // nuking the user's terminal state (no RIS). Covers: colors, scroll
-    // region, mouse tracking, bracketed paste, charset, then clear+home.
-    let _ = stdout.write_all(concat!(
-        "\x1b[m",        // SGR 0: reset colors/bold/underline
-        "\x1b[r",        // DECSTBM: reset scroll region
-        "\x1b[?1000l",   // disable mouse tracking (Basic Mouse Mode)
-        "\x1b[?1006l",   // disable SGR mouse extension
-        "\x1b[?2004l",   // disable bracketed paste
-        "\x1b(B",        // select US-ASCII charset for G0
-        "\x1b[2J\x1b[H", // clear screen + cursor home
-    ).as_bytes()).await;
-    let _ = stdout.flush().await;
+    // Clean up stdin: deregister from epoll, restore blocking mode.
+    drop(async_stdin);
+    unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, old_flags) };
+
+    // Reset terminal modes the container shell may have changed.
+    // Synchronous writes — no tokio Blocking threads in teardown.
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(concat!(
+            "\x1b[m",        // SGR 0: reset colors/bold/underline
+            "\x1b[r",        // DECSTBM: reset scroll region
+            "\x1b[?1000l",   // disable mouse tracking
+            "\x1b[?1006l",   // disable SGR mouse extension
+            "\x1b[?2004l",   // disable bracketed paste
+            "\x1b(B",        // select US-ASCII charset for G0
+            "\x1b[2J\x1b[H", // clear screen + cursor home
+        ).as_bytes());
+        let _ = out.flush();
+    }
 
     // Restore TUI state.
     let _ = crossterm::terminal::enable_raw_mode();
@@ -456,6 +453,7 @@ async fn run_shell_bridge(
         crossterm::cursor::Hide,
     );
     let _ = terminal.clear();
+    while input_rx.try_recv().is_ok() {}
     let _ = input_suspend.send(false);
 
     // Pop the shell route and flash a message.
@@ -512,6 +510,14 @@ fn resolve_placeholder(p: &crate::kube::protocol::ExecPlaceholder, target: &Exec
         (ExecPlaceholder::PodName, ExecTarget::Pod { pod, .. }) => Some(pod.clone()),
         (ExecPlaceholder::Container, ExecTarget::Pod { container, .. }) => Some(container.clone()),
         (ExecPlaceholder::NodeName, ExecTarget::Node { node }) => Some(format!("node/{}", node)),
+        (ExecPlaceholder::NodeDebugPodName, ExecTarget::Node { node }) => {
+            let sanitized: String = node.chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' })
+                .collect();
+            let name = format!("node-dbg-{}", sanitized);
+            let name = if name.len() > 63 { &name[..63] } else { &name };
+            Some(name.trim_end_matches('-').to_string())
+        }
         // Placeholder doesn't apply to this target variant.
         _ => None,
     }
@@ -805,40 +811,16 @@ pub async fn session_main(
         // call fired between this line and `mark_stable()` (in
         // `dispatch_app_event` on `ConnectionEstablished`) will be rejected
         // by the `is_stable()` check.
-        if let Some(new_ctx) = app.kube.context_switch.take_requested() {
-            let no_daemon = data_source.is_no_daemon();
-            // 1. Drop the old session — closes the socket, aborts bridge tasks.
-            drop(data_source);
-            // 2. Drop the old event_rx — any buffered stale events are discarded.
-            //    Old bridge tasks that haven't been aborted yet will fail on send.
-            drop(event_rx);
-            // 3. Clear all data AFTER dropping the session so no race exists
-            //    between clear and stale bridge sends.
-            app.clear_data();
-            // 4. New channel for the new session — total isolation.
-            let (new_tx, new_rx) = mpsc::channel::<AppEvent>(256);
-            event_tx = new_tx;
-            event_rx = new_rx;
-            // 5. Create a fresh session with the new channel.
-            let new_params = crate::kube::client_session::ConnectionParams {
-                context: Some(new_ctx),
-                namespace: app.kube.selected_ns.clone(),
-                readonly: app.read_only,
-                no_daemon,
-            };
-            data_source = ClientSession::new(new_params, event_tx.clone());
-            // ConnectionEstablished will fire when the new session is ready,
-            // which triggers open_core_subscriptions + re-subscribe.
-            needs_redraw = true;
-        }
-
-        // Auto-reconnect on connection loss. Same mechanism as context switch:
-        // drop old session, create new channel, create fresh ClientSession.
-        // The user stays in the TUI — no quit, no restart needed.
-        if app.reconnect_requested {
+        let rebuild_ctx = if let Some(new_ctx) = app.kube.context_switch.take_requested() {
+            Some(Some(new_ctx))
+        } else if app.reconnect_requested {
+            Some(if app.kube.context.is_empty() { None } else { Some(app.kube.context.clone()) })
+        } else {
+            None
+        };
+        if let Some(ctx) = rebuild_ctx {
             app.reconnect_requested = false;
             let no_daemon = data_source.is_no_daemon();
-            let ctx = if app.kube.context.is_empty() { None } else { Some(app.kube.context.clone()) };
             drop(data_source);
             drop(event_rx);
             app.clear_data();
@@ -854,8 +836,6 @@ pub async fn session_main(
                 },
                 event_tx.clone(),
             );
-            // ConnectionEstablished will fire when ready, triggering
-            // open_core_subscriptions and re-subscribing.
             needs_redraw = true;
         }
 
@@ -910,6 +890,7 @@ pub async fn session_main(
                 run_shell_bridge(
                     &mut app, &mut terminal, &mut event_rx,
                     &input.suspend_tx, &mut input.suspend_ack_rx,
+                    &mut input.input_rx,
                 ).await;
                 needs_redraw = true;
                 continue;

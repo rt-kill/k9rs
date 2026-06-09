@@ -425,6 +425,18 @@ fn apply_sgr(
     style
 }
 
+pub fn retry_jitter(seed: &[u8], attempt: u64) -> f64 {
+    let hash = seed.iter().fold(attempt, |acc, &b| {
+        acc.wrapping_mul(31).wrapping_add(b as u64)
+    });
+    0.75 + (hash % 50) as f64 / 100.0
+}
+
+pub fn content_max_scroll(total_lines: usize, visible: usize) -> usize {
+    let base = total_lines.saturating_sub(visible);
+    if base > 0 { base + visible / 4 } else { 0 }
+}
+
 /// Truncate a string to fit within `max_width` display columns.
 ///
 /// Uses `UnicodeWidthChar` so that multi-byte / wide characters (emoji, CJK)

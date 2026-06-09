@@ -457,8 +457,7 @@ pub enum ShellConnectState {
 /// daemon→stdout — with no parsing. The vt100 crate is not involved.
 pub struct ShellState {
     pub title: String,
-    pub writer: Option<tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>>,
-    pub _bridge: Option<tokio::task::AbortHandle>,
+    pub stream: Option<crate::kube::client_session::ExecStream>,
     pub connect_state: ShellConnectState,
     /// Bytes received before the bridge loop starts. Written to stdout
     /// on attach so the initial prompt isn't lost.
@@ -471,14 +470,6 @@ impl std::fmt::Debug for ShellState {
             .field("title", &self.title)
             .field("connect_state", &self.connect_state)
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for ShellState {
-    fn drop(&mut self) {
-        if let Some(handle) = self._bridge.take() {
-            handle.abort();
-        }
     }
 }
 
@@ -966,12 +957,17 @@ impl LogState {
             self.filtered_indices.push(new_idx);
         }
     }
-    pub fn clear(&mut self) {
+    pub fn clear_lines(&mut self) {
         self.lines.clear();
         self.scroll = 0;
         self.filtered_indices.clear();
+    }
+
+    pub fn clear(&mut self) {
+        self.clear_lines();
         self.filters.clear();
         self.draft_filter = None;
+        self.compiled_patterns.clear();
     }
 
     /// Recompile cached patterns from committed filters + draft.
@@ -1101,17 +1097,16 @@ impl ContentViewState {
         }
     }
 
-    /// Jump to the next search match, centering it in the viewport.
     pub fn next_match(&mut self, visible: usize) {
         if self.search_matches.is_empty() {
             return;
         }
         self.current_match = (self.current_match + 1) % self.search_matches.len();
         let target = self.search_matches[self.current_match];
-        self.scroll = target.saturating_sub(visible / 2);
+        let max = crate::util::content_max_scroll(self.line_count(), visible);
+        self.scroll = target.saturating_sub(visible / 2).min(max);
     }
 
-    /// Jump to the previous search match, centering it in the viewport.
     pub fn prev_match(&mut self, visible: usize) {
         if self.search_matches.is_empty() {
             return;
@@ -1122,7 +1117,8 @@ impl ContentViewState {
             self.current_match - 1
         };
         let target = self.search_matches[self.current_match];
-        self.scroll = target.saturating_sub(visible / 2);
+        let max = crate::util::content_max_scroll(self.line_count(), visible);
+        self.scroll = target.saturating_sub(visible / 2).min(max);
     }
 
     /// Clear search state.

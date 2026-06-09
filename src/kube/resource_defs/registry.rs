@@ -26,6 +26,7 @@ pub(crate) struct WatcherArgs {
     pub namespace: Namespace,
     pub snapshot_tx: watch::Sender<WatcherSnapshot>,
     pub filter: Option<SubscriptionFilter>,
+    pub streaming_lists: bool,
 }
 
 /// Type-erased watcher spawner. Created at registration time when concrete
@@ -235,6 +236,7 @@ where
             },
             &args.namespace,
             args.filter,
+            args.streaming_lists,
         )
         .await;
     })
