@@ -454,6 +454,9 @@ fn handle_contexts_view_keys(key: KeyEvent) -> Option<Action> {
         KeyCode::Home | KeyCode::Char('g') => Some(Action::Home),
         KeyCode::End | KeyCode::Char('G') => Some(Action::End),
 
+        // Clipboard.
+        KeyCode::Char('c') => Some(Action::Copy),
+
         // Switch to selected context.
         KeyCode::Enter => Some(Action::Enter),
         _ => None,

@@ -757,7 +757,16 @@ impl NavStack {
                     parts.push(label_str.join(","));
                 }
                 Some(NavFilter::Field(sel)) => {
-                    parts.push(sel.breadcrumb());
+                    let cross_resource = i > 0 && step.view != steps[i - 1].view;
+                    if cross_resource {
+                        if let K8sFieldSelector::MetadataName(name) = sel {
+                            parts.push(format!("{}/{}", step.view.short_label(), name));
+                        } else {
+                            parts.push(sel.breadcrumb());
+                        }
+                    } else {
+                        parts.push(sel.breadcrumb());
+                    }
                 }
                 Some(NavFilter::OwnerChain { display_name, kind, .. }) => {
                     let kind_str = crate::kube::resource_defs::REGISTRY.by_kind(*kind).gvr().kind;
@@ -885,6 +894,7 @@ mod tests {
 
     fn pod_rid() -> ResourceId { rid(BuiltInKind::Pod) }
     fn deploy_rid() -> ResourceId { rid(BuiltInKind::Deployment) }
+    fn node_rid() -> ResourceId { rid(BuiltInKind::Node) }
     fn svc_rid() -> ResourceId { rid(BuiltInKind::Service) }
 
     fn pod_view() -> ViewId { ViewId::Resource(pod_rid()) }
@@ -1081,6 +1091,17 @@ mod tests {
         stack.push(NavStep::new(pod_rid(), Some(field)));
         let bc = stack.breadcrumb();
         assert!(bc.contains("node=node-1"), "breadcrumb should contain field selector, got: {}", bc);
+    }
+
+    #[test]
+    fn breadcrumb_cross_resource_metadata_name() {
+        // ShowNode: pods → nodes filtered by metadata.name
+        let mut stack = NavStack::new(pod_rid());
+        let field = NavFilter::Field(K8sFieldSelector::MetadataName("worker-3".into()));
+        stack.push(NavStep::new(node_rid(), Some(field)));
+        let bc = stack.breadcrumb();
+        assert!(bc.contains("Nodes/worker-3"), "cross-resource MetadataName should show resource/name, got: {}", bc);
+        assert!(!bc.contains("name="), "should not show raw field selector for cross-resource, got: {}", bc);
     }
 
     // -----------------------------------------------------------------------

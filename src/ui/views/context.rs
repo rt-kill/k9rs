@@ -78,7 +78,7 @@ fn draw_context_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let selected = table.selected();
     let total = table.len();
 
-    let title = format!(" Contexts [{}/{}] ", selected.saturating_add(1).min(total), total);
+    let title = format!(" Contexts [{}] ", total);
 
     let block = Block::bordered()
         .title(title)
@@ -186,6 +186,7 @@ fn draw_context_breadcrumbs(f: &mut Frame, app: &App, area: Rect, theme: &Theme)
     let hints = vec![
         ("j/k", "navigate"),
         ("Enter", "switch context"),
+        ("c", "copy"),
         ("q/Esc", "back"),
     ];
 

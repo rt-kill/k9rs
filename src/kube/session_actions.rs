@@ -999,6 +999,25 @@ fn handle_io(
                         (joined, format!("Copied {} lines to clipboard", count))
                     }
                 }
+                Route::Contexts => {
+                    let ctxs = &app.data.contexts;
+                    if ctxs.items.is_empty() {
+                        (String::new(), String::new())
+                    } else {
+                        let mut lines = vec!["CURRENT\tNAME\tCLUSTER".to_string()];
+                        for ctx in &ctxs.items {
+                            let marker = if ctx.is_current { "*" } else { "" };
+                            let cluster = if ctx.identity.cluster.is_empty() {
+                                ctx.name.as_str()
+                            } else {
+                                &ctx.identity.cluster
+                            };
+                            lines.push(format!("{}\t{}\t{}", marker, ctx.name, cluster));
+                        }
+                        let count = ctxs.items.len();
+                        (lines.join("\n"), format!("Copied {} contexts to clipboard", count))
+                    }
+                }
                 _ => {
                     let dump = build_table_dump(app);
                     if dump.is_empty() {
