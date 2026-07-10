@@ -229,7 +229,7 @@ impl ResourceDef for PodDef {
         // absolute request/limit and lifecycle details are extra/wide.
         vec![
             C::new("NAMESPACE"), C::new("NAME"), C::new("READY"), C::new("STATUS"),
-            C::new("RESTARTS"), C::extra_age("LAST RESTART"),
+            C::new("RESTARTS"), C::extra("LAST RESTART"),
             C::new("CPU").with_metrics(Cpu),
             C::new("%CPU/R").with_metrics(CpuPercentRequest),
             C::new("%CPU/L").with_metrics(CpuPercentLimit),
@@ -240,7 +240,7 @@ impl ResourceDef for PodDef {
             C::new("IP"), C::new("NODE"), C::extra("NOMINATED NODE"),
             C::extra("QOS"),
             C::extra("SERVICE-ACCOUNT"), C::extra("READINESS GATES"),
-            C::extra("LABELS"), C::age("AGE"),
+            C::extra("LABELS"), C::new("AGE"),
         ]
     }
 
@@ -378,12 +378,13 @@ impl ConvertToRow<Pod> for PodDef {
         .flat_map(|cs| spec_ports.get(&cs.name).cloned().unwrap_or_default())
         .collect();
 
-    // QOS class
-    let qos = status.qos_class.as_deref().unwrap_or("BestEffort");
-    let qos_short = match qos {
-        "Guaranteed" => "GA",
-        "Burstable" => "BU",
-        _ => "BE",
+    // QOS class — a closed k8s set. An unexpected value shows "?" rather than
+    // silently masquerading as BestEffort (which `_ => "BE"` used to do).
+    let qos_short = match status.qos_class.as_deref() {
+        Some("Guaranteed") => "GA",
+        Some("Burstable") => "BU",
+        Some("BestEffort") | None => "BE",
+        Some(_) => "?",
     };
 
     // Service account
@@ -543,4 +544,25 @@ fn container_status_and_ready(cs: &k8s_openapi::api::core::v1::ContainerStatus) 
         "Unknown".to_string()
     };
     (status, ready)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kube::resource_def::{ConvertToRow, ResourceDef};
+
+    /// Pods are the highest-risk converter: 24 columns and a metrics overlay
+    /// that writes cells *by index* derived from `column_defs()`. Guard that
+    /// the `cells` vec aligns with the headers so a one-off drift can't silently
+    /// land a CPU value under the wrong column. (The headers↔column_defs half is
+    /// covered registry-wide in `resource_defs::registry::tests`.)
+    #[test]
+    fn pod_cells_align_with_headers() {
+        let row = PodDef::convert(k8s_openapi::api::core::v1::Pod::default());
+        assert_eq!(
+            row.cells.len(),
+            PodDef.default_headers().len(),
+            "pod cells vec must align with default_headers",
+        );
+    }
 }

@@ -219,6 +219,33 @@ pub fn load_overlays() -> HashMap<String, ResourceOverlay> {
                             );
                         }
                     }
+                    // Validate coloring rules at load. `build_column_rules`
+                    // checks them too, but only lazily when the resource is
+                    // first viewed — surfacing a malformed rule here means a
+                    // typo'd threshold is reported at startup, not on navigation.
+                    for color_rule in &overlay.coloring {
+                        for cr in &color_rule.rules {
+                            match (cr.match_text.as_deref(), cr.when.as_deref()) {
+                                (Some(_), Some(_)) => warn!(
+                                    "overlay: coloring rule for column '{}' on '{}' sets both 'match' and 'when' — 'match' wins, 'when' is ignored in {}",
+                                    color_rule.column, overlay.resource, path.display()
+                                ),
+                                (None, None) => warn!(
+                                    "overlay: coloring rule for column '{}' on '{}' has neither 'match' nor 'when' — it will never apply in {}",
+                                    color_rule.column, overlay.resource, path.display()
+                                ),
+                                (Some(""), None) => warn!(
+                                    "overlay: coloring rule for column '{}' on '{}' has an empty 'match' (would match everything) in {}",
+                                    color_rule.column, overlay.resource, path.display()
+                                ),
+                                (None, Some(when)) if RenderPredicate::parse_when(when).is_none() => warn!(
+                                    "overlay: coloring rule for column '{}' on '{}' has an invalid 'when' predicate '{}' (expected e.g. '>= 90') in {}",
+                                    color_rule.column, overlay.resource, when, path.display()
+                                ),
+                                _ => {}
+                            }
+                        }
+                    }
                     let key = overlay.resource.to_lowercase();
                     if overlays.contains_key(&key) {
                         warn!("overlay: duplicate definition for '{}', using {}", key, path.display());

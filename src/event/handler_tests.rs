@@ -161,6 +161,24 @@ fn test_confirm_dialog_keys() {
         handle_key_event(&app, make_key(KeyCode::Char('n'))),
         Some(Action::Cancel)
     ));
+
+    // Non-sticky: any unrecognized key cancels (cancel is always the safe
+    // direction), so a stray keystroke can't trap the user behind the modal.
+    // In particular a spurious 'r' (a stale terminal response misparsed as a
+    // key) opens the restart dialog, and the next key dismisses it instead of
+    // being swallowed. A bare ':' likewise dismisses rather than being eaten.
+    for stray in [KeyCode::Char('r'), KeyCode::Char(':'), KeyCode::Char('z'), KeyCode::Esc] {
+        assert!(
+            matches!(handle_key_event(&app, make_key(stray)), Some(Action::Cancel)),
+            "expected stray key {:?} to cancel the confirm dialog",
+            stray,
+        );
+    }
+    // Focus-movement keys are not a cancel — they toggle the selected button.
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Tab)),
+        Some(Action::ToggleDialogButton)
+    ));
 }
 
 #[test]

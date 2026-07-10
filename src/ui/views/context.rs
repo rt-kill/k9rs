@@ -97,14 +97,7 @@ fn draw_context_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let cluster_width = (inner.width as usize).saturating_sub(3).saturating_sub(name_width);
 
     // Header row
-    let header_text = format!(
-        " {} {:<nw$} {:<cw$}",
-        " ",
-        "NAME",
-        "CLUSTER",
-        nw = name_width,
-        cw = cluster_width,
-    );
+    let header_text = format_context_row(" ", "NAME", "CLUSTER", name_width, cluster_width);
     let header_style = theme.header;
     let header_display = truncate_to_width(&header_text, inner.width as usize);
     f.buffer_mut().set_string(inner.x, inner.y, header_display, header_style);
@@ -132,13 +125,8 @@ fn draw_context_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         } else {
             &ctx.identity.cluster
         };
-        let line_text = format!(
-            " {} {:<nw$} {:<cw$}",
-            current_marker,
-            ctx.name,
-            cluster_display,
-            nw = name_width,
-            cw = cluster_width,
+        let line_text = format_context_row(
+            current_marker, ctx.name.as_str(), cluster_display, name_width, cluster_width,
         );
 
         let style = if is_selected {
@@ -170,6 +158,20 @@ fn draw_context_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
 
         f.buffer_mut().set_string(inner.x, y, &display, style);
     }
+}
+
+/// Format one context row into the fixed three-column layout (current-marker,
+/// NAME, CLUSTER). Shared by the header and the data rows so their columns
+/// stay aligned by construction — the two used to carry duplicate format
+/// strings that could drift apart.
+fn format_context_row(
+    marker: &str,
+    name: &str,
+    cluster: &str,
+    name_width: usize,
+    cluster_width: usize,
+) -> String {
+    format!(" {} {:<nw$} {:<cw$}", marker, name, cluster, nw = name_width, cw = cluster_width)
 }
 
 // ---------------------------------------------------------------------------

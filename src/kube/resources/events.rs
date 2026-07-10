@@ -32,7 +32,7 @@ impl ResourceDef for EventDef {
         vec![
             C::new("NAMESPACE"), C::new("TYPE"), C::new("REASON"),
             C::new("OBJECT"), C::new("MESSAGE"), C::extra("SOURCE"),
-            C::new("COUNT"), C::age("AGE"),
+            C::new("COUNT"), C::new("AGE"),
         ]
     }
 }

@@ -7,6 +7,7 @@
 
 use crate::kube::protocol::{self, SessionEvent};
 use crate::kube::resource_def::BuiltInKind;
+use crate::kube::session_env::SessionEnv;
 
 use super::ServerSession;
 
@@ -21,7 +22,7 @@ impl ServerSession {
     /// (like every other mutating handler) doesn't re-check.
     pub(super) fn handle_delete_local(&mut self, obj: &protocol::ObjectRef) {
         let tx = self.event_tx.clone();
-        let Some(source) = self.shared.local_registry.get(&self.context.name, &obj.resource) else {
+        let Some(source) = self.locals.get(&obj.resource) else {
             self.track_task(async move {
                 let _ = tx.send(SessionEvent::CommandResult(Err(
                     "Unknown local resource".into(),
@@ -45,7 +46,7 @@ impl ServerSession {
     /// path so the client can use one wire flow for both.
     pub(super) fn handle_apply_local(&mut self, obj: &protocol::ObjectRef, yaml: &str) {
         let tx = self.event_tx.clone();
-        let Some(source) = self.shared.local_registry.get(&self.context.name, &obj.resource) else {
+        let Some(source) = self.locals.get(&obj.resource) else {
             self.track_task(async move {
                 let _ = tx.send(SessionEvent::CommandResult(Err(
                     "Unknown local resource".into(),
@@ -82,10 +83,11 @@ impl ServerSession {
                     crate::kube::describe::api_resource_for(&client, &target.resource).await?;
                 let api = crate::kube::describe::dynamic_api_for(&client, &ar, scope, &target.namespace);
 
-                // Parse the user's YAML and apply as a strategic merge patch.
-                // No SSA (no field manager) — avoids claiming field ownership
-                // that would conflict with GitOps tools.
-                let mut parsed: DynamicObject = serde_yaml::from_str(&yaml)
+                // Parse the user's YAML and apply as a JSON merge patch (RFC 7386
+                // — what `Patch::Merge` sends; arrays replace wholesale, matching a
+                // full-object editor's intent). No SSA (no field manager) — avoids
+                // claiming field ownership that would conflict with GitOps tools.
+                let parsed: DynamicObject = serde_yaml::from_str(&yaml)
                     .map_err(|e| anyhow::anyhow!("yaml parse error: {}", e))?;
 
                 // Validate that the parsed YAML targets the expected resource.
@@ -99,11 +101,14 @@ impl ServerSession {
                     }
                 }
 
-                // Strip resourceVersion — merge patches don't need it, and
-                // including a stale version causes 409 Conflict if anyone
-                // else touched the resource between our fetch and apply.
-                parsed.metadata.resource_version = None;
-
+                // Keep resourceVersion: carrying it in the merge patch makes the
+                // write conditional on the object not having changed since we
+                // fetched it for editing. If another writer touched it in the
+                // meantime, the apiserver enforces it as a precondition and returns
+                // 409 Conflict (surfaced as "Apply failed") rather than silently
+                // clobbering them. Stricter than `kubectl edit` (which sends a
+                // surgical diff with no RV precondition) — we round-trip the whole
+                // object, so the entire write is conditional.
                 api.patch(&target.name, &PatchParams::default(), &Patch::Merge(&parsed))
                     .await?;
                 Ok(())
@@ -125,15 +130,15 @@ impl ServerSession {
     pub(super) fn handle_describe_async(&mut self, target: &protocol::ObjectRef) {
         self.fetch_and_emit(
             target,
-            |c, t, ctx| Box::pin(crate::kube::describe::fetch_describe(c, t, ctx)),
-            |target, content| SessionEvent::DescribeResult { target, content },
+            |c, t, ctx, env| Box::pin(crate::kube::describe::fetch_describe(c, t, ctx, env)),
+            |target, lines| SessionEvent::DescribeResult { target, lines },
         );
     }
 
     pub(super) fn handle_yaml_async(&mut self, target: &protocol::ObjectRef) {
         self.fetch_and_emit(
             target,
-            |c, t, ctx| Box::pin(crate::kube::describe::fetch_yaml(c, t, ctx)),
+            |c, t, ctx, env| Box::pin(crate::kube::describe::fetch_yaml(c, t, ctx, env)),
             |target, content| SessionEvent::YamlResult { target, content },
         );
     }
@@ -141,28 +146,31 @@ impl ServerSession {
     /// Shared helper for describe/yaml: clones the session state, spawns a
     /// task that calls `fetch_fn`, wraps the result via `make_event`, and
     /// sends it back on the event channel.
-    fn fetch_and_emit<F, E>(
+    fn fetch_and_emit<T, F, E>(
         &mut self,
         target: &protocol::ObjectRef,
         fetch_fn: F,
         make_event: E,
     )
     where
+        T: Send + 'static,
         F: for<'a> FnOnce(
                 &'a kube::Client,
                 &'a protocol::ObjectRef,
                 &'a protocol::ContextName,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>
+                &'a SessionEnv,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>
             + Send
             + 'static,
-        E: FnOnce(protocol::ObjectRef, String) -> SessionEvent + Send + 'static,
+        E: FnOnce(protocol::ObjectRef, T) -> SessionEvent + Send + 'static,
     {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let context = self.context.name.clone();
+        let session_env = self.session_env.clone();
         let target = target.clone();
         self.track_task(async move {
-            let content = fetch_fn(&client, &target, &context).await;
+            let content = fetch_fn(&client, &target, &context, &session_env).await;
             let _ = tx.send(make_event(target, content)).await;
         });
     }
@@ -268,10 +276,11 @@ impl ServerSession {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let context = self.context.name.clone();
+        let session_env = self.session_env.clone();
         let target = target.clone();
         let display = target.kubectl_target();
         self.track_task(async move {
-            let result = crate::kube::ops::execute_delete(&client, &target, &context).await;
+            let result = crate::kube::ops::execute_delete(&client, &target, &context, &session_env).await;
             let event = match result {
                 Ok(()) => SessionEvent::CommandResult(Ok(format!("Deleted {}", display))),
                 Err(e) => SessionEvent::CommandResult(Err(format!("Delete failed: {}", e))),
@@ -418,7 +427,9 @@ impl ServerSession {
             self.track_task(async move {
                 let _ = tx.send(SessionEvent::DescribeResult {
                     target: target_owned,
-                    content: format!("Decode not supported on {}", plural),
+                    lines: crate::kube::describe::describe_lines_from_text(
+                        &format!("Decode not supported on {}", plural),
+                    ),
                 }).await;
             });
             return;
@@ -430,7 +441,9 @@ impl ServerSession {
             self.track_task(async move {
                 let _ = tx.send(SessionEvent::DescribeResult {
                     target: target_owned,
-                    content: format!("{} is not a secret-like resource", plural),
+                    lines: crate::kube::describe::describe_lines_from_text(
+                        &format!("{} is not a secret-like resource", plural),
+                    ),
                 }).await;
             });
             return;
@@ -449,7 +462,7 @@ impl ServerSession {
             };
             let _ = tx.send(SessionEvent::DescribeResult {
                 target: target_owned,
-                content,
+                lines: crate::kube::describe::describe_lines_from_text(&content),
             }).await;
         });
     }
@@ -552,10 +565,10 @@ impl ServerSession {
         if self.reject_if_namespace_unresolved(target, "Port-forward") { return; }
         let kubectl_target = target.kubectl_target();
 
-        // Get-or-create the per-context PortForwardSource. This may be the
-        // very first PF on this context (constructs a fresh source) or
-        // reuse one a sibling session is already keeping alive.
-        let source = self.shared.local_registry.port_forwards_for(&self.context.name);
+        // The per-context PortForwardSource, owned by this session's
+        // ContextLocals slice (shared with any sibling session on the same
+        // context).
+        let source = self.locals.port_forwards();
         // Pass the typed `Namespace` straight through — no
         // `display().to_string()` round-trip that would leak the literal
         // "all" string down into kubectl.
@@ -566,6 +579,7 @@ impl ServerSession {
                 namespace: target.namespace.clone(),
                 local_port,
                 remote_port: container_port,
+                env: self.session_env.clone(),
             },
         );
     }
@@ -609,22 +623,20 @@ fn dynamic_api_for_kind(
 fn decode_secret_to_text(secret: &k8s_openapi::api::core::v1::Secret) -> String {
     let ns = secret.metadata.namespace.as_deref().unwrap_or("");
     let name = secret.metadata.name.as_deref().unwrap_or("");
-    let mut output = format!("Secret: {}/{}\n\n", ns, name);
-    if let Some(data) = &secret.data {
-        for (key, value) in data {
-            let decoded = String::from_utf8_lossy(&value.0);
-            output.push_str(&format!("{}:\n  {}\n\n", key, decoded));
-        }
-    }
-    if let Some(string_data) = &secret.string_data {
-        for (key, value) in string_data {
-            output.push_str(&format!("{}:\n  {}\n\n", key, value));
-        }
-    }
-    if output.ends_with("\n\n") {
-        output.truncate(output.len() - 1);
-    }
-    output
+
+    // `data` is base64 (decode it); `string_data` is already plaintext. Both
+    // render as "key:\n  value\n\n". `.iter().flatten()` yields nothing when
+    // the map is absent, so the two sources concatenate without branching.
+    let data = secret.data.iter().flatten()
+        .map(|(key, value)| format!("{}:\n  {}\n\n", key, String::from_utf8_lossy(&value.0)));
+    let string_data = secret.string_data.iter().flatten()
+        .map(|(key, value)| format!("{}:\n  {}\n\n", key, value));
+
+    let body: String = data.chain(string_data).collect();
+    let output = format!("Secret: {}/{}\n\n{}", ns, name, body);
+    // Every section ends in a blank line; drop the final newline so the text
+    // ends with a single newline rather than a trailing blank line.
+    output.strip_suffix('\n').map(str::to_owned).unwrap_or(output)
 }
 
 /// Build a one-off `Job` from a CronJob's template, used by the manual

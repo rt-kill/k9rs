@@ -235,20 +235,14 @@ fn draw_container_select(
     let theme = &app.ui.theme;
     let area = f.area();
 
-    // Find the pod's containers (typed field on ResourceRow). Init
-    // containers get an `init:` display prefix so the user can tell
-    // them apart from regular containers — derived from the typed
-    // `kind` discriminant rather than carried as a string prefix in
-    // `name` like the older shape.
-    use crate::kube::resources::row::ContainerKind;
+    // Find the pod's containers (typed field on ResourceRow). Each renders
+    // via `ContainerInfo::display_name` — init containers get the `init:`
+    // prefix from the typed `kind` discriminant, not a string prefix in `name`.
     let containers: Vec<String> = app.table_for(&target.resource)
         .and_then(|t| t.items.iter().find(|p| {
             p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
         }))
-        .map(|p| p.containers.iter().map(|ci| match ci.kind {
-            ContainerKind::Init => format!("init:{}", ci.name),
-            ContainerKind::Regular => ci.name.clone(),
-        }).collect())
+        .map(|p| p.containers.iter().map(|ci| ci.display_name()).collect())
         .unwrap_or_default();
 
     if containers.is_empty() {

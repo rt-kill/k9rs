@@ -1,4 +1,7 @@
 use std::collections::HashSet;
+use std::sync::Arc;
+
+use unicode_width::UnicodeWidthStr;
 
 use crate::kube::protocol::ObjectKey;
 use crate::kube::resources::KubeResource;
@@ -161,6 +164,32 @@ pub struct StatefulTable<T: Clone> {
     /// marks survive data refreshes and sort changes. The render path checks
     /// this set directly via row_keys — no intermediate bitmap cache.
     pub marked: HashSet<ObjectKey>,
+    /// Monotonic data-version counter, bumped by every mutator that changes
+    /// `items` or `filtered_indices`. Since `items` is only ever *read*
+    /// externally (verified — no direct writes escape this module), these
+    /// mutators are the sole write paths, so the counter can't miss a change.
+    /// The render path uses it to detect "same data as last frame" in O(1)
+    /// and skip re-materializing the view.
+    generation: u64,
+    /// Memoized render-ready [`PreparedView`], reused while its
+    /// [`ViewCacheKey`] still matches (same data version + columns + width
+    /// clamp). Cursor moves, scroll, marks, and change-highlight ticks change
+    /// none of those, so those frames hit the cache. Only ever populated by
+    /// the `ResourceRow` `prepare_view`; stays `None` for other row types.
+    /// `Arc` so a hit clones a pointer, not the materialized `Vec`s.
+    view_cache: Option<(ViewCacheKey, Arc<PreparedView>)>,
+}
+
+/// Cache key for the memoized [`PreparedView`]. The view is pure over the
+/// table's data (captured by `generation`), the requested `visible_cols`, and
+/// the `max_col_width` clamp. `column_rules` and header names are fixed for a
+/// given descriptor, and a descriptor swap always arrives with a fresh data
+/// snapshot (→ `generation` bump), so they need no explicit key.
+#[derive(Clone, Debug, PartialEq)]
+struct ViewCacheKey {
+    generation: u64,
+    visible_cols: Vec<usize>,
+    max_col_width: u16,
 }
 
 impl<T: Clone> Default for StatefulTable<T> {
@@ -178,12 +207,22 @@ impl<T: Clone> Default for StatefulTable<T> {
             data_state: TableDataState::Initializing,
             num_cols: 0,
             marked: HashSet::new(),
+            generation: 0,
+            view_cache: None,
         }
     }
 }
 
 impl<T: Clone> StatefulTable<T> {
     pub fn new() -> Self { Self::default() }
+
+    /// Invalidate the memoized view by advancing the data version. Called by
+    /// every mutator that touches `items` or `filtered_indices`. Over-bumping
+    /// is harmless (it only forces an occasional redundant rebuild); a *missed*
+    /// bump would serve a stale view, so callers err toward bumping.
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
 
     pub fn len(&self) -> usize { self.filtered_indices.len() }
     pub fn is_empty(&self) -> bool { self.filtered_indices.is_empty() }
@@ -280,6 +319,7 @@ impl<T: Clone> StatefulTable<T> {
     }
 
     pub fn set_items(&mut self, items: Vec<T>) {
+        self.bump_generation();
         self.data_state = TableDataState::Ready;
         self.items = items;
         self.filtered_indices = (0..self.items.len()).collect();
@@ -288,6 +328,7 @@ impl<T: Clone> StatefulTable<T> {
     }
 
     pub fn apply_filter<F: Fn(&T) -> bool>(&mut self, pred: F) {
+        self.bump_generation();
         self.filtered_indices = self.items.iter().enumerate()
             .filter(|(_, item)| pred(item))
             .map(|(i, _)| i)
@@ -298,6 +339,7 @@ impl<T: Clone> StatefulTable<T> {
 
     /// Clear all data and reset to `Initializing` state.
     pub fn clear_data(&mut self) {
+        self.bump_generation();
         self.items.clear();
         self.filtered_indices.clear();
         self.selected = 0;
@@ -349,6 +391,7 @@ impl<T: Clone> StatefulTable<T> {
 
 impl<T: Clone + KubeResource> StatefulTable<T> {
     pub fn clear_filter(&mut self) {
+        self.bump_generation();
         self.filtered_indices = (0..self.items.len()).collect();
         self.clamp_selection();
         self.adjust_offset();
@@ -357,6 +400,7 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
     /// Toggle sort on a column. Reuses sort_items and rebuild_filter.
     /// Cursor stays at its screen index.
     pub fn sort_by_column(&mut self, target: crate::app::SortTarget) {
+        self.bump_generation();
         let actual_col = match target {
             crate::app::SortTarget::Column(c) => c,
             crate::app::SortTarget::Last => {
@@ -384,6 +428,7 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
     /// identity so they survive refreshes; any mark whose row no longer
     /// exists in the new snapshot is dropped.
     pub fn set_items_filtered(&mut self, items: Vec<T>) {
+        self.bump_generation();
         self.update_loading(items.len());
         self.items = items;
         // Prune marks whose rows no longer exist.
@@ -434,6 +479,7 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
     /// the nav-stack-derived predicates) — the table is just the storage,
     /// not the policy.
     pub fn rebuild_filter(&mut self) {
+        self.bump_generation();
         self.filtered_indices.clear();
         self.filtered_indices.extend(0..self.items.len());
     }
@@ -447,6 +493,7 @@ impl<T: Clone + KubeResource> StatefulTable<T> {
 /// visible-column cells, health tags, and identity keys, ready for the
 /// table widget. Encapsulates the `filtered_indices → items → visible
 /// cells` pipeline so the render code doesn't do manual index arithmetic.
+#[derive(Debug)]
 pub struct PreparedView {
     pub rows: Vec<Vec<String>>,
     pub health: Vec<crate::kube::resources::row::RowHealth>,
@@ -455,63 +502,120 @@ pub struct PreparedView {
     /// `CellValue::Status`), `None` to inherit the row's style.
     pub cell_style: Vec<Vec<Option<crate::kube::resources::row::RowHealth>>>,
     pub keys: Vec<crate::kube::protocol::ObjectKey>,
+    /// Natural per-column display widths (seeded from header widths, expanded
+    /// to the widest visible cell, padded and clamped to `max_col_width`).
+    /// Computed with the view so the widget consumes a ready number instead of
+    /// re-scanning every row every frame.
+    pub col_widths: Vec<u16>,
+}
+
+/// Natural per-column display widths: seed from header widths, expand to the
+/// widest cell in each column, then pad (`+3`: left border + two spaces) and
+/// clamp to `max_col_width`. Pure over `(headers, rows, max_col_width)`. Lives
+/// with the view materialization so a memoized frame reuses the result instead
+/// of the widget re-scanning all rows.
+fn column_widths(headers: &[&str], rows: &[Vec<String>], max_col_width: u16) -> Vec<u16> {
+    if headers.is_empty() {
+        return Vec::new();
+    }
+    let mut widths: Vec<u16> = headers.iter().map(|h| h.width() as u16 + 2).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < widths.len() {
+                widths[i] = widths[i].max(cell.width() as u16);
+            }
+        }
+    }
+    for w in &mut widths {
+        *w = (*w + 3).min(max_col_width);
+    }
+    widths
 }
 
 impl StatefulTable<crate::kube::resources::row::ResourceRow> {
-    /// Prepare the visible rows for rendering. Evaluates pre-resolved
-    /// column render rules against final cell values (including metrics).
-    ///
-    /// Follows the form system pattern: rules are resolved once from
-    /// shared overlay config (analogous to `FormSchema`), passed in as
-    /// `column_rules` (analogous to `FormFieldKind`), and evaluated
-    /// generically against each cell's display value.
+    /// Prepare the visible rows for rendering, memoized on the table's data
+    /// version + requested columns (see [`ViewCacheKey`]). A cache hit clones
+    /// an `Arc` and skips the O(rows×cols) materialization in
+    /// [`build_view`](Self::build_view) entirely — so a frame driven by a
+    /// cursor move, scroll, mark, or change-highlight tick (none of which
+    /// change a cache input) pays nothing to rebuild the view.
     pub fn prepare_view(
+        &mut self,
+        visible_col_indices: &[usize],
+        column_rules: &[crate::kube::overlay::ColumnRenderRules],
+        headers: &[&str],
+        max_col_width: u16,
+    ) -> Arc<PreparedView> {
+        let key = ViewCacheKey {
+            generation: self.generation,
+            visible_cols: visible_col_indices.to_vec(),
+            max_col_width,
+        };
+        if let Some((cached_key, view)) = &self.view_cache {
+            if *cached_key == key {
+                return Arc::clone(view);
+            }
+        }
+        let view = Arc::new(self.build_view(visible_col_indices, column_rules, headers, max_col_width));
+        self.view_cache = Some((key, Arc::clone(&view)));
+        view
+    }
+
+    /// Materialize the render-ready view from scratch — the expensive pass that
+    /// [`prepare_view`](Self::prepare_view) memoizes. Evaluates pre-resolved
+    /// column render rules against final cell values, following the form-system
+    /// pattern: rules are resolved once from shared overlay config (analogous
+    /// to `FormSchema`), passed in as `column_rules`, and evaluated generically
+    /// against each cell's display value.
+    fn build_view(
         &self,
         visible_col_indices: &[usize],
         column_rules: &[crate::kube::overlay::ColumnRenderRules],
+        headers: &[&str],
+        max_col_width: u16,
     ) -> PreparedView {
         use crate::kube::resources::row::{CellValue, RowHealth};
 
         let items: Vec<&crate::kube::resources::row::ResourceRow> = self.filtered_indices.iter()
             .filter_map(|&i| self.items.get(i))
             .collect();
-        PreparedView {
-            rows: items.iter().map(|r| {
-                visible_col_indices.iter()
-                    .map(|&ci| r.cells.get(ci).map(|c| c.to_string()).unwrap_or_default())
-                    .collect()
-            }).collect(),
-            // Per-cell rendering: zip each visible cell with its column's
-            // pre-resolved rules, evaluate, then check CellValue::Status.
-            cell_style: items.iter().map(|r| {
-                visible_col_indices.iter().map(|&ci| {
-                    // 1. Column render rules (from overlay config).
-                    if let Some(col_rules) = column_rules.get(ci) {
-                        if let Some(cell) = r.cells.get(ci) {
-                            let cell_str = cell.to_string();
-                            if let Some(style) = col_rules.evaluate(&cell_str) {
-                                return Some(style);
-                            }
+        let rows: Vec<Vec<String>> = items.iter().map(|r| {
+            visible_col_indices.iter()
+                .map(|&ci| r.cells.get(ci).map(|c| c.to_string()).unwrap_or_default())
+                .collect()
+        }).collect();
+        // Per-cell rendering: zip each visible cell with its column's
+        // pre-resolved rules, evaluate, then check CellValue::Status.
+        let cell_style = items.iter().map(|r| {
+            visible_col_indices.iter().map(|&ci| {
+                // 1. Column render rules (from overlay config).
+                if let Some(col_rules) = column_rules.get(ci) {
+                    if let Some(cell) = r.cells.get(ci) {
+                        let cell_str = cell.to_string();
+                        if let Some(style) = col_rules.evaluate(&cell_str) {
+                            return Some(style);
                         }
                     }
-                    // 2. CellValue::Status { health } from the converter.
-                    if let Some(CellValue::Status { health, .. }) = r.cells.get(ci) {
-                        if *health != RowHealth::Normal {
-                            return Some(*health);
-                        }
+                }
+                // 2. CellValue::Status { health } from the converter.
+                if let Some(CellValue::Status { health, .. }) = r.cells.get(ci) {
+                    if *health != RowHealth::Normal {
+                        return Some(*health);
                     }
-                    // 3. None = inherit row style.
-                    None
-                }).collect()
-            }).collect(),
-            health: items.iter().map(|r| r.health).collect(),
-            keys: items.iter().map(|r| {
-                crate::kube::protocol::ObjectKey::new(
-                    r.namespace.clone().unwrap_or_default(),
-                    r.name.clone(),
-                )
-            }).collect(),
-        }
+                }
+                // 3. None = inherit row style.
+                None
+            }).collect()
+        }).collect();
+        let health = items.iter().map(|r| r.health).collect();
+        let keys = items.iter().map(|r| {
+            crate::kube::protocol::ObjectKey::new(
+                r.namespace.clone().unwrap_or_default(),
+                r.name.clone(),
+            )
+        }).collect();
+        let col_widths = column_widths(headers, &rows, max_col_width);
+        PreparedView { rows, health, cell_style, keys, col_widths }
     }
 }
 
@@ -1013,5 +1117,73 @@ mod tests {
         let counts = t.nav_items_count();
         assert_eq!(counts.filtered, 1);
         assert_eq!(counts.total, 10);
+    }
+
+    // ---- prepared-view memoization -----------------------------------------
+
+    #[test]
+    fn prepare_view_reuses_cache_on_unchanged_data() {
+        let mut t = table_with_rows(5);
+        let a = t.prepare_view(&[0], &[], &["NAME"], 64);
+        let b = t.prepare_view(&[0], &[], &["NAME"], 64);
+        assert!(Arc::ptr_eq(&a, &b), "same data + columns must reuse the cached Arc");
+    }
+
+    #[test]
+    fn prepare_view_rebuilds_after_data_change() {
+        let mut t = table_with_rows(5);
+        let a = t.prepare_view(&[0], &[], &["NAME"], 64);
+        t.set_items_filtered((0..3).map(|i| row(&format!("row-{i}"), "default")).collect());
+        let b = t.prepare_view(&[0], &[], &["NAME"], 64);
+        assert!(!Arc::ptr_eq(&a, &b), "a data mutation must invalidate the cache");
+        assert_eq!(b.rows.len(), 3);
+    }
+
+    #[test]
+    fn prepare_view_rebuilds_on_column_change() {
+        let mut t = table_with_rows(5);
+        let a = t.prepare_view(&[0, 1], &[], &["NAME", "NS"], 64);
+        let b = t.prepare_view(&[0], &[], &["NAME"], 64);
+        assert!(!Arc::ptr_eq(&a, &b), "changing visible columns must invalidate the cache");
+    }
+
+    #[test]
+    fn prepare_view_rebuilds_on_width_clamp_change() {
+        let mut t = table_with_rows(5);
+        let a = t.prepare_view(&[0], &[], &["NAME"], 64);
+        let b = t.prepare_view(&[0], &[], &["NAME"], 20);
+        assert!(!Arc::ptr_eq(&a, &b), "changing max_col_width must invalidate the cache");
+    }
+
+    #[test]
+    fn prepare_view_survives_cursor_and_scroll() {
+        // The whole point of B-lite: frames driven by navigation, not data,
+        // must not pay to re-materialize the view.
+        let mut t = table_with_rows(5);
+        let a = t.prepare_view(&[0], &[], &["NAME"], 64);
+        t.next(); // cursor move
+        t.set_offset(2); // scroll
+        let b = t.prepare_view(&[0], &[], &["NAME"], 64);
+        assert!(Arc::ptr_eq(&a, &b), "cursor/scroll must not invalidate the materialized view");
+    }
+
+    // ---- column widths -----------------------------------------------------
+
+    #[test]
+    fn column_widths_expand_to_widest_cell() {
+        // header "N" seeds 1+2=3; widest cell "wide-value" (10) wins; +3 pad = 13.
+        let rows = vec![vec!["a".to_string()], vec!["wide-value".to_string()]];
+        assert_eq!(column_widths(&["N"], &rows, 64), vec![13]);
+    }
+
+    #[test]
+    fn column_widths_clamp_to_max() {
+        let rows = vec![vec!["x".repeat(100)]];
+        assert_eq!(column_widths(&["N"], &rows, 20), vec![20], "content beyond max is clamped");
+    }
+
+    #[test]
+    fn column_widths_empty_headers_is_empty() {
+        assert!(column_widths(&[], &[vec!["x".to_string()]], 64).is_empty());
     }
 }

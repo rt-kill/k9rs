@@ -1,12 +1,18 @@
 //! Exec-backed local resource source — periodically runs an external
 //! command, parses its JSON stdout into rows, and publishes snapshots.
 //!
-//! Follows the same per-context ownership model as [`super::port_forward::PortForwardSource`]:
-//! `Arc::new_cyclic` constructor, `Weak<Self>` in spawned tasks,
-//! `try_begin_grace` / `end_grace` with `AtomicBool`.
+//! The poll loop is a supervised [`LocalOperator`] on a
+//! [`RunDelay::Schedule`] — the second operator after port-forward, and the
+//! schedule-shaped one: re-running after the interval is the *normal* path,
+//! so no failure-flavored lifecycle events are emitted (a failed poll warns
+//! and keeps the last-known rows, exactly as before). Demand-driven
+//! lifetime: subscribers hold the strong refs (`try_begin_grace`/`end_grace`
+//! grace on the last drop), and the source's drop aborts the poll via its
+//! [`OperatorGuard`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -15,6 +21,9 @@ use crate::event::ResourceUpdate;
 use crate::kube::protocol::ResourceId;
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
+use super::supervise::{
+    supervise, AttemptHandle, LocalOperator, OperatorExit, OperatorGuard, RunDelay,
+};
 use super::LocalResourceSource;
 
 // ---------------------------------------------------------------------------
@@ -77,12 +86,17 @@ pub struct ExecSource {
     tx: watch::Sender<ResourceUpdate>,
     _keep_rx: watch::Receiver<ResourceUpdate>,
     grace_in_flight: AtomicBool,
+    /// RAII handle to the supervised poll loop, set once right after
+    /// construction (`OnceLock` because `Arc::new_cyclic` runs before the
+    /// task can exist). Source drop → guard drop → poll aborted — the old
+    /// "loop exits when the `Weak` stops upgrading" made immediate.
+    poll_guard: OnceLock<OperatorGuard>,
 }
 
 impl ExecSource {
-    /// Construct a new exec source and spawn the polling task. The task
-    /// holds only a `Weak<Self>` so the source can be dropped when the
-    /// last subscriber goes away.
+    /// Construct a new exec source and start its supervised polling
+    /// operator. The operator holds only a `Weak<Self>` so the source can
+    /// be dropped when the last subscriber goes away.
     pub fn for_context(config: ExecSourceConfig) -> Arc<Self> {
         let rid = super::types::LocalResourceKind::Custom(config.name.clone()).to_resource_id();
         let headers = config.headers.clone();
@@ -92,6 +106,7 @@ impl ExecSource {
             rows: Vec::new(),
         };
         let (tx, rx) = watch::channel(empty);
+        let interval = Duration::from_secs(config.poll_interval_secs);
         let arc = Arc::new_cyclic(|_weak: &Weak<Self>| Self {
             rid,
             config,
@@ -99,34 +114,31 @@ impl ExecSource {
             tx,
             _keep_rx: rx,
             grace_in_flight: AtomicBool::new(false),
+            poll_guard: OnceLock::new(),
         });
-        // Spawn the poll loop with a Weak ref.
-        let weak = Arc::downgrade(&arc);
-        tokio::spawn(Self::poll_loop(weak));
+        let (guard, gate) = supervise(
+            ExecPollOp { weak: Arc::downgrade(&arc) },
+            RunDelay::Schedule(interval),
+            // Exec has no lifecycle column — its rows ARE the output, and a
+            // failed poll keeps last-known rows. The sink is a required
+            // parameter, so "no state display" is this visible choice, not
+            // a silently-defaulted hook.
+            |_| {},
+        );
+        let _ = arc.poll_guard.set(guard);
+        // No insert-race here (the guard's slot IS the source itself), so
+        // arm immediately.
+        gate.arm();
         arc
     }
 
-    /// Background loop: run the command, parse stdout, update entries,
-    /// publish, sleep, repeat. Exits when the `Weak` can no longer upgrade.
-    async fn poll_loop(weak: Weak<Self>) {
-        loop {
-            let Some(this) = weak.upgrade() else { return };
-            let interval_secs = this.config.poll_interval_secs;
-            this.run_once().await;
-            drop(this); // release strong ref before sleeping
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-        }
-    }
-
-    /// Execute the command once and update internal state.
-    async fn run_once(&self) {
-        let output = match tokio::process::Command::new(&self.config.command)
-            .args(&self.config.args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await
-        {
+    /// Fold one poll's outcome into the source: parse stdout, replace the
+    /// entries, publish. Synchronous on purpose — the caller (the operator)
+    /// upgrades its `Weak` only for this call, never across an await. A
+    /// failed poll warns and returns without touching entries, so a
+    /// transient command failure never blanks the display.
+    fn ingest(&self, result: std::io::Result<std::process::Output>) {
+        let output = match result {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!(
@@ -227,6 +239,49 @@ impl ExecSource {
             headers: self.config.headers.clone(),
             rows,
         });
+    }
+}
+
+/// The supervised poll: run the configured command once, fold the output
+/// into the source. Holds `Weak<ExecSource>` and — per the operator
+/// contract — never a strong ref across the command await: the command
+/// line is copied out synchronously up front, and the source is
+/// re-upgraded only for the synchronous `ingest`.
+///
+/// NOTE: the command runs with the **daemon's** environment, not any TUI
+/// session's. An `ExecSource` is a daemon-owned, per-context resource
+/// (defined in `k9rs.daemon.execResources`, shared across every session on
+/// that context), so there is no single session identity to authenticate
+/// as — a command that shells out to `kubectl`/cloud CLIs uses the
+/// daemon's own credentials, by design. (Contrast the per-session
+/// `kubectl` spawns, which carry the viewing session's env via
+/// `SessionEnv`.)
+struct ExecPollOp {
+    weak: Weak<ExecSource>,
+}
+
+impl LocalOperator for ExecPollOp {
+    async fn run_once(&self, _attempt: AttemptHandle) -> OperatorExit {
+        let Some((command, args)) = self
+            .weak
+            .upgrade()
+            .map(|t| (t.config.command.clone(), t.config.args.clone()))
+        else {
+            return OperatorExit::Gone;
+        };
+        let result = tokio::process::Command::new(&command)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await;
+        let Some(this) = self.weak.upgrade() else {
+            return OperatorExit::Gone;
+        };
+        this.ingest(result);
+        // A poll "completing" — success or warned-and-kept-last-known — is
+        // the schedule's normal path; run again next interval.
+        OperatorExit::Continue(String::new())
     }
 }
 

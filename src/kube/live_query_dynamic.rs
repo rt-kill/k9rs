@@ -28,7 +28,25 @@ fn dyn_obj_key(obj: &DynamicObject) -> ObjectKey {
     )
 }
 
+/// Drop `metadata.managedFields` before an object enters the store. k9rs never
+/// reads managed-fields — no printer/overlay column resolves them, and describe
+/// & yaml re-fetch from the API — yet the dynamic store keeps the *whole*
+/// `DynamicObject` and `build_dynamic_snapshot` re-serializes it (managedFields
+/// and all) on every rebuild. Managed-fields are often the bulkiest part of
+/// `metadata`, so dropping them at the watch boundary shrinks both the retained
+/// store and every snapshot's `serde_json::to_value` walk. This is the same
+/// "keep only what the view needs" rule the typed path gets for free by
+/// converting to `ResourceRow` on ingest.
+fn strip_bulk_metadata(mut obj: DynamicObject) -> DynamicObject {
+    obj.metadata.managed_fields = None;
+    obj
+}
+
 /// Watcher loop for dynamic CRD instances (DynamicObject -> ResourceRow).
+// Args are runtime context (client/ns/snapshot_tx) plus the dynamic-resource
+// descriptor (gvk/plural/scope/printer columns) and streaming flag — all
+// intrinsic to the watch loop; bundling them buys nothing here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_dynamic_live_watcher(
     client: Client,
     ns: crate::kube::protocol::Namespace,
@@ -96,7 +114,7 @@ pub(crate) async fn run_dynamic_live_watcher(
                             }
                             WatcherEvent::InitApply(obj) => {
                                 let key = dyn_obj_key(&obj);
-                                store.insert(key, obj);
+                                store.insert(key, strip_bulk_metadata(obj));
                                 init_dirty = true;
                             }
                             WatcherEvent::InitDone => {
@@ -116,7 +134,7 @@ pub(crate) async fn run_dynamic_live_watcher(
                                 backoff_ms = initial_backoff_ms();
                                 backoff_start = std::time::Instant::now();
                                 let key = dyn_obj_key(&obj);
-                                store.insert(key, obj);
+                                store.insert(key, strip_bulk_metadata(obj));
                                 steady_dirty = true;
                             }
                             WatcherEvent::Delete(obj) => {
@@ -313,18 +331,22 @@ fn build_dynamic_snapshot(
 /// Supports the forms K8s CRDs actually put in `additionalPrinterColumns`:
 ///
 /// - Plain dot paths — `.spec.foo.bar`, `.status.phase`
+/// - Escaped dots in keys — `.metadata.labels.karpenter\.sh/nodepool` resolves
+///   the single key `karpenter.sh/nodepool` (label/annotation keys whose names
+///   contain dots). A backslash escapes the following char and is itself
+///   dropped, matching kubectl's `client-go/util/jsonpath` parser.
 /// - Array element filter — `.status.conditions[?(@.type=='Ready')].status`
 ///   (walks to the array at the path prefix, finds the first element whose
 ///   `type` field equals `'Ready'`, then continues the path on that element).
 ///   Both `==` and `!=` operators are accepted. String literals may be
 ///   wrapped in `'…'` or `"…"`.
 ///
-/// This covers the condition-filter pattern used by cert-manager, ArgoCD,
-/// Karpenter, Flux, and most operator CRDs. Anything more exotic —
-/// conjunctions (`&&`, `||`), numeric comparisons, wildcards, array
-/// slicing — still returns the empty string. Extend the filter parser
-/// below as real CRDs force it; don't reach for a full JSONPath crate
-/// unless the shape of the problem changes.
+/// This covers the condition-filter and label-key patterns used by cert-manager,
+/// ArgoCD, Karpenter, Flux, and most operator CRDs. NOT supported (these return
+/// the empty string): bracket key access (`.metadata.labels['karpenter.sh/x']` —
+/// the alternate form some CRDs emit), conjunctions (`&&`, `||`), numeric
+/// comparisons, wildcards, array slicing. Extend the parser below as real CRDs
+/// force it; don't reach for a full JSONPath crate unless the shape changes.
 ///
 /// `serde_json::Value` is used intentionally here: CRDs are discovered at
 /// runtime and have no compile-time schema, so the daemon holds a
@@ -373,10 +395,40 @@ fn walk_dot_path<'a>(val: &'a serde_json::Value, path: &str) -> Option<&'a serde
     let path = path.trim_matches('.');
     if path.is_empty() { return Some(val); }
     let mut current = val;
-    for part in path.split('.') {
-        current = current.get(part)?;
+    for part in split_escaped_dots(path) {
+        current = current.get(part.as_str())?;
     }
     Some(current)
+}
+
+/// Split a dot path into key segments, treating `\.` as a literal dot *inside* a
+/// key rather than a separator. CRD `additionalPrinterColumns` escape the dots
+/// in label keys this way — e.g. Karpenter's
+/// `.metadata.labels.karpenter\.sh/nodepool` must resolve the single key
+/// `karpenter.sh/nodepool`, not three broken segments. Without this, every
+/// label-based printer column (instance type, capacity type, zone, nodepool…)
+/// silently renders empty.
+fn split_escaped_dots(path: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut cur = String::new();
+    let mut chars = path.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // A backslash escapes the next char and is itself dropped — matching
+            // kubectl's `client-go/util/jsonpath` parser. So `\.` is a literal
+            // dot *inside* a key (not a separator), and any other `\x` keeps `x`.
+            // A trailing backslash is dropped.
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            '.' => segments.push(std::mem::take(&mut cur)),
+            other => cur.push(other),
+        }
+    }
+    segments.push(cur);
+    segments
 }
 
 /// Apply a single `[?(@.<key><op><literal>)]` filter to an array.
@@ -421,6 +473,24 @@ mod json_path_tests {
     fn plain_dot_path() {
         let obj = json!({ "spec": { "phase": "Running" } });
         assert_eq!(resolve_json_path(&obj, ".spec.phase"), "Running");
+    }
+
+    #[test]
+    fn escaped_dot_label_key() {
+        // CRD printer columns (e.g. Karpenter NodeClaim) reference label keys
+        // with escaped dots: `.metadata.labels.karpenter\.sh/capacity-type`.
+        let obj = json!({ "metadata": { "labels": {
+            "karpenter.sh/capacity-type": "spot",
+            "node.kubernetes.io/instance-type": "r8i-flex.8xlarge",
+        }}});
+        assert_eq!(
+            resolve_json_path(&obj, r".metadata.labels.karpenter\.sh/capacity-type"),
+            "spot",
+        );
+        assert_eq!(
+            resolve_json_path(&obj, r".metadata.labels.node\.kubernetes\.io/instance-type"),
+            "r8i-flex.8xlarge",
+        );
     }
 
     #[test]
@@ -512,5 +582,30 @@ mod json_path_tests {
             resolve_json_path(&obj, ".status.conditions[?(@.type=='Ready')].status"),
             ""
         );
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::strip_bulk_metadata;
+    use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+    use serde_json::json;
+
+    #[test]
+    fn drops_managed_fields_keeps_identity_and_data() {
+        let ar = ApiResource::from_gvk(&GroupVersionKind::gvk("example.com", "v1", "Widget"));
+        let mut obj = DynamicObject::new("w1", &ar);
+        obj.metadata.namespace = Some("default".into());
+        // Content is irrelevant — the strip clears the whole field.
+        obj.metadata.managed_fields = Some(vec![]);
+        obj.data = json!({ "spec": { "size": 3 } });
+
+        let stripped = strip_bulk_metadata(obj);
+
+        assert!(stripped.metadata.managed_fields.is_none(), "managedFields must be dropped");
+        // Identity + the spec/status that columns actually read are untouched.
+        assert_eq!(stripped.metadata.name.as_deref(), Some("w1"));
+        assert_eq!(stripped.metadata.namespace.as_deref(), Some("default"));
+        assert_eq!(stripped.data["spec"]["size"], json!(3));
     }
 }

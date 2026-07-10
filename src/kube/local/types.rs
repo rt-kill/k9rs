@@ -176,4 +176,16 @@ mod tests {
         assert_eq!(kind.scope(), ResourceScope::Cluster);
         assert!(kind.aliases().is_empty());
     }
+
+    /// Wire-tag stability for the local-resource identity enum (bincode encodes
+    /// the variant as its u32 declaration-index, LE). Reordering/inserting
+    /// remaps existing wire values; appending is safe.
+    #[test]
+    fn local_resource_kind_wire_tags_are_stable() {
+        assert_eq!(bincode::serialize(&LocalResourceKind::PortForward).unwrap(), 0u32.to_le_bytes());
+        assert_eq!(bincode::serialize(&LocalResourceKind::ExecResource).unwrap(), 1u32.to_le_bytes());
+        // Custom carries a payload; pin only its 4-byte tag.
+        let custom = bincode::serialize(&LocalResourceKind::Custom("x".into())).unwrap();
+        assert_eq!(&custom[..4], 2u32.to_le_bytes());
+    }
 }

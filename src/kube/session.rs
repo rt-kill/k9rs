@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use crate::app::{App, InputMode};
 use crate::event::AppEvent;
 use crate::kube::client_session::ClientSession;
+use crate::kube::repaint::Repaint;
 
 struct RawFd(std::os::unix::io::RawFd);
 impl AsRawFd for RawFd {
@@ -143,34 +144,82 @@ fn strip_leading_comments(s: &str) -> &str {
 pub(crate) struct SuspendGuard<'a, B: ratatui::backend::Backend + std::io::Write> {
     terminal: &'a mut ratatui::Terminal<B>,
     input_suspend: &'a tokio::sync::watch::Sender<bool>,
+    /// Drained on restore to discard stale terminal responses provoked by the
+    /// alt-screen / raw-mode transition (see [`drain_stale_input`]).
+    input_rx: &'a mut mpsc::Receiver<CtEvent>,
+    /// Set once [`SuspendGuard::restore`] has run; makes the `Drop` fallback a no-op.
+    restored: bool,
 }
 
 impl<'a, B: ratatui::backend::Backend + std::io::Write> SuspendGuard<'a, B> {
     /// Suspend the TUI: stop the input bridge, leave alternate screen.
-    /// Returns a guard that resumes on drop.
+    /// Returns a guard that resumes on `restore()` (or `Drop` as a fallback).
     pub(crate) async fn new(
         terminal: &'a mut ratatui::Terminal<B>,
         input_suspend: &'a tokio::sync::watch::Sender<bool>,
         input_suspend_ack: &mut mpsc::Receiver<()>,
+        input_rx: &'a mut mpsc::Receiver<CtEvent>,
     ) -> Result<Self> {
         let _ = input_suspend.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(1), input_suspend_ack.recv()).await;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        Ok(Self { terminal, input_suspend })
+        Ok(Self { terminal, input_suspend, input_rx, restored: false })
     }
 
     /// Access the terminal (e.g., to disable raw mode for subprocess shells).
     pub(crate) fn terminal_mut(&mut self) -> &mut ratatui::Terminal<B> {
         self.terminal
     }
-}
 
-impl<B: ratatui::backend::Backend + std::io::Write> Drop for SuspendGuard<'_, B> {
-    fn drop(&mut self) {
+    /// Re-enter the alternate screen and resume the input bridge. Shared by
+    /// the async `restore` (normal exit) and `Drop` (panic / early-return
+    /// fallback).
+    fn restore_screen(&mut self) {
         let _ = execute!(self.terminal.backend_mut(), crossterm::terminal::EnterAlternateScreen);
         let _ = self.terminal.clear();
         let _ = self.input_suspend.send(false);
     }
+
+    /// Normal exit path: restore the screen, then drain the stale terminal
+    /// responses the transition provokes over a short settling window. They
+    /// arrive a few ms after the bridge resumes and re-reads stdin, so a
+    /// single synchronous drain races them. Consuming `self` runs `Drop`
+    /// immediately afterwards, but the `restored` flag makes it a no-op.
+    pub(crate) async fn restore(mut self) {
+        self.restored = true;
+        self.restore_screen();
+        drain_stale_input(self.input_rx).await;
+    }
+}
+
+impl<B: ratatui::backend::Backend + std::io::Write> Drop for SuspendGuard<'_, B> {
+    fn drop(&mut self) {
+        if self.restored {
+            return; // `restore()` already restored the screen and drained.
+        }
+        // Reached only on an early return / error / panic before `restore()`.
+        // `Drop` can't await, so the settling drain is unavailable — do a
+        // best-effort one-shot drain. The deterministic protection against a
+        // surviving stray key is the non-sticky confirm dialog (handler.rs).
+        self.restore_screen();
+        while self.input_rx.try_recv().is_ok() {}
+    }
+}
+
+/// Drain stale terminal input provoked by an alt-screen / raw-mode transition.
+/// When the TUI suspends for a subprocess (editor) or the shell bridge, the
+/// terminal emits response sequences (cursor-position / device-status reports)
+/// in reply to the mode changes; crossterm parses the leftover bytes as key
+/// events, and a stray 'r' would pop the restart dialog. The responses can land
+/// a few milliseconds after the screen is restored — the input bridge has to
+/// wake and re-read stdin first — so one synchronous drain races them. Drain in
+/// a few short passes instead; the ~45ms total is imperceptible on return.
+async fn drain_stale_input(input_rx: &mut mpsc::Receiver<CtEvent>) {
+    for _ in 0..3 {
+        while input_rx.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    while input_rx.try_recv().is_ok() {}
 }
 
 
@@ -183,6 +232,7 @@ async fn run_editor_flow(
     data_source: &mut ClientSession,
     input_suspend: &tokio::sync::watch::Sender<bool>,
     input_suspend_ack: &mut mpsc::Receiver<()>,
+    input_rx: &mut mpsc::Receiver<CtEvent>,
 ) -> bool {
     let is_editor_ready = matches!(
         app.route,
@@ -217,9 +267,9 @@ async fn run_editor_flow(
     let path_arg = temp_file.path().to_string_lossy().to_string();
     let args = vec![path_arg];
     let exit_status = match run_interactive_local(
-        terminal, app, &editor, &args,
+        terminal, &editor, &args,
         crate::kube::session_commands::InteractiveKind::Editor,
-        input_suspend, input_suspend_ack,
+        input_suspend, input_suspend_ack, input_rx,
     ).await {
         Ok(s) => s,
         Err(e) => {
@@ -453,8 +503,11 @@ async fn run_shell_bridge(
         crossterm::cursor::Hide,
     );
     let _ = terminal.clear();
-    while input_rx.try_recv().is_ok() {}
+    // Resume the input bridge first, then drain the stale terminal responses
+    // the transition provokes — they arrive *after* resume, once the bridge
+    // re-reads stdin, so the old pre-resume one-shot drain caught nothing.
     let _ = input_suspend.send(false);
+    drain_stale_input(input_rx).await;
 
     // Pop the shell route and flash a message.
     app.pop_route();
@@ -584,9 +637,12 @@ fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: App
                 if app.nav.current().stream.is_none() {
                     let sub_filter = app.nav.current()
                         .filter.as_ref().and_then(|f| f.to_subscription_filter());
+                    let sub_ns = app.nav.current()
+                        .filter.as_ref().and_then(|f| f.subscription_namespace());
                     let change = crate::app::nav::NavChange {
                         subscribe: Some(rid),
                         subscription_filter: sub_filter,
+                        namespace: sub_ns,
                     };
                     apply_nav_change(app, data_source, change);
                 }
@@ -694,29 +750,44 @@ fn handle_content_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> 
 }
 
 pub(crate) fn apply_nav_change(app: &mut App, data_source: &mut ClientSession, change: crate::app::nav::NavChange) {
-    // Unsubscribe: dropping the old step's stream is all that's needed.
-    // The yamux substream RSTs → daemon bridge exits → watcher enters
-    // grace period. No control-stream command required.
-
     if let Some(ref new) = change.subscribe {
-        // For non-globally-stored resources, create the table on the
-        // current nav step so snapshot data lands there instead of the
-        // global store.
-        if !crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(new.clone())) {
+        // Drop ancestor subscriptions for the same resource. Without this,
+        // the ancestor's bridge keeps sending snapshots that
+        // find_table_for_resource_mut routes to the NEW step's table,
+        // overwriting it with stale/differently-filtered data.
+        // The current step has no stream yet, so clear_dead_subscription_for
+        // skips it and only kills ancestors.
+        app.nav.clear_dead_subscription_for(new);
+        let is_global = crate::app::nav::is_globally_stored(
+            &crate::app::view::ViewId::Resource(new.clone()),
+        );
+        let has_filter = change.subscription_filter.is_some();
+
+        if !is_global || has_filter {
             let step = app.nav.current_mut();
             if step.table.is_none() {
                 step.table = Some(crate::app::StatefulTable::new());
             }
-        } else if change.subscription_filter.is_some() {
-            // Globally-stored resources with a filter: clear the global
-            // table so stale rows from a DIFFERENT filter can't be shown.
-            app.clear_resource(new);
         }
-        let stream = data_source.subscribe_stream(
-            new.clone(),
-            app.kube.selected_ns.clone(),
-            change.subscription_filter.clone(),
-        );
+
+        // A drill can carry its own namespace scope (e.g. all-namespaces for a
+        // node's pods, which span every namespace); otherwise the subscription
+        // inherits the session's selected namespace.
+        let ns = change.namespace.clone().unwrap_or_else(|| app.kube.selected_ns.clone());
+
+        let stream = if is_global && has_filter {
+            data_source.subscribe_stream_nav(
+                new.clone(),
+                ns,
+                change.subscription_filter.clone(),
+            )
+        } else {
+            data_source.subscribe_stream(
+                new.clone(),
+                ns,
+                change.subscription_filter.clone(),
+            )
+        };
         app.nav.current_mut().stream = Some(stream);
     }
 }
@@ -808,8 +879,12 @@ pub async fn session_main(
         tokio::signal::unix::SignalKind::terminate(),
     ).expect("failed to install SIGTERM handler");
 
-    // Main event loop — only redraw when state changes
-    let mut needs_redraw = true; // draw the first frame immediately
+    // Main event loop. Input paints immediately; data-driven paints
+    // coalesce to the frame budget (`tick_rate`) so a busy cluster's stream
+    // of updates collapses into ≤1 frame per budget instead of
+    // one-paint-per-event — the difference between a trickle and a firehose
+    // of terminal bytes over SSH. See `Repaint`.
+    let mut repaint = Repaint::Now; // draw the first frame immediately
     loop {
         // Context switch: one socket = one context = one session.
         //
@@ -857,18 +932,23 @@ pub async fn session_main(
                 },
                 event_tx.clone(),
             );
-            needs_redraw = true;
+            repaint.on_input();
         }
 
-        // Tick check BEFORE select — guarantees animation runs even during event floods.
+        // Tick BEFORE select — guarantees animation advances (and any paint it
+        // triggers fires) even during an event flood that starves the in-select
+        // tick arm. A tick-driven change is data, so it coalesces.
         if last_tick.elapsed() >= tick_rate {
             if app.tick() {
-                needs_redraw = true;
+                repaint.on_data(std::time::Instant::now(), tick_rate);
             }
             last_tick = std::time::Instant::now();
         }
 
-        if needs_redraw {
+        // Top-of-loop paint gate: runs every turn, so a coalesced frame fires
+        // as soon as its deadline passes even while the biased arms below keep
+        // winning during a flood.
+        if repaint.due(std::time::Instant::now()) {
             terminal.draw(|f| {
                 crate::ui::draw(f, &mut app);
             })?;
@@ -891,15 +971,17 @@ pub async fn session_main(
                 execute!(terminal.backend_mut(), SetCursorStyle::SteadyBlock)?;
             }
 
-            needs_redraw = false;
+            repaint.painted();
         }
 
         // Unified edit flow: if route is EditorReady, run the editor.
         if run_editor_flow(
             &mut app, &mut terminal, &mut data_source,
-            &input.suspend_tx, &mut input.suspend_ack_rx,
+            &input.suspend_tx, &mut input.suspend_ack_rx, &mut input.input_rx,
         ).await {
-            needs_redraw = true;
+            // The stale-input drain now lives in the suspend guard's
+            // `restore()` (with a settling window), so no ad-hoc drain here.
+            repaint.on_input();
             continue;
         }
 
@@ -913,11 +995,16 @@ pub async fn session_main(
                     &input.suspend_tx, &mut input.suspend_ack_rx,
                     &mut input.input_rx,
                 ).await;
-                needs_redraw = true;
+                repaint.on_input();
                 continue;
             }
         }
 
+        // Snapshot the coalesced-paint deadline before the select so the timer
+        // arm below borrows nothing from `repaint`. `None` (idle, or `Now`
+        // which the top-of-loop gate already paints) → the arm parks forever
+        // and the loop blocks on real events.
+        let wake = repaint.wake_at();
         tokio::select! {
             // biased: always check key events first so user input (like disabling
             // autoscroll) takes effect before processing queued data events.
@@ -931,11 +1018,11 @@ pub async fn session_main(
                         if try_handle_input_mode(
                             &mut app, key, &mut data_source, &event_tx,
                         ) {
-                            needs_redraw = true;
+                            repaint.on_input();
                             continue;
                         }
 
-                        needs_redraw = true;
+                        repaint.on_input();
                         if let Some(action) = crate::event::handler::handle_key_event(&app, key) {
                             // Client-side UX shortcut: flash "Read-only mode"
                             // immediately without a wire round-trip. The server
@@ -963,7 +1050,7 @@ pub async fn session_main(
                     // Pure-keyboard TUI by design — mouse events are
                     // intentionally dropped (see ~/.config/claude memory).
                     CtEvent::Resize(_w, _h) => {
-                        needs_redraw = true;
+                        repaint.on_input();
                     }
                     _ => {}
                 }
@@ -990,11 +1077,21 @@ pub async fn session_main(
                         state.initial_load = false;
                     }
                 }
-                needs_redraw = true;
+                repaint.on_data(std::time::Instant::now(), tick_rate);
             }
+            // Fire a pending coalesced paint once events go quiet. Under a
+            // flood this arm is starved by the biased arms above, but the
+            // top-of-loop `repaint.due(..)` gate paints regardless — so
+            // coalescing holds both under load and precisely when idle.
+            () = async {
+                match wake {
+                    Some(t) => tokio::time::sleep_until(t.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
             _ = tick_interval.tick() => {
                 if app.tick() {
-                    needs_redraw = true;
+                    repaint.on_data(std::time::Instant::now(), tick_rate);
                 }
             }
             _ = sigterm.recv() => {

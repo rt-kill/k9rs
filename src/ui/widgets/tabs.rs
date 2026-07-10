@@ -4,6 +4,8 @@ use ratatui::{
     widgets::Widget,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::kube::protocol::ResourceId;
 use crate::ui::theme::Theme;
 
@@ -67,10 +69,12 @@ impl Widget for TabBar<'_> {
         } else {
             format!("<{}>", resource_label)
         };
-        let crumb_len = crumb_text.len().min((max_x - x) as usize);
-        if crumb_len > 0 {
-            buf.set_string(x, area.y, &crumb_text[..crumb_len], crumb_style);
-            x += crumb_len as u16;
+        // Width-bounded, char-boundary-safe truncation (a byte-index slice on
+        // a multi-byte label would panic), and advance by display width.
+        let crumb = crate::util::truncate_to_width(&crumb_text, max_x.saturating_sub(x) as usize);
+        if !crumb.is_empty() {
+            buf.set_string(x, area.y, crumb, crumb_style);
+            x += UnicodeWidthStr::width(crumb) as u16;
         }
 
         // Namespace breadcrumb (inactive: black on steelblue)
@@ -82,10 +86,10 @@ impl Widget for TabBar<'_> {
                 x += 1;
             }
             let ns_text = format!("<{}>", self.namespace);
-            let ns_len = ns_text.len().min((max_x - x) as usize);
-            if ns_len > 0 {
-                buf.set_string(x, area.y, &ns_text[..ns_len], ns_style);
-                x += ns_len as u16;
+            let ns = crate::util::truncate_to_width(&ns_text, max_x.saturating_sub(x) as usize);
+            if !ns.is_empty() {
+                buf.set_string(x, area.y, ns, ns_style);
+                x += UnicodeWidthStr::width(ns) as u16;
             }
         }
 

@@ -123,7 +123,12 @@ fn handle_confirm_dialog(app: &App, key: KeyEvent) -> Option<Action> {
             }
         }
         KeyCode::Left | KeyCode::Right | KeyCode::Tab => Some(Action::ToggleDialogButton),
-        _ => None,
+        // Any other key cancels. Cancel is always the safe direction, so a
+        // stray keystroke can never trap the user behind a modal — in
+        // particular a spurious 'r' (a stale terminal response misparsed as a
+        // key after an alt-screen transition) opens the restart dialog, and
+        // the user's next keypress dismisses it instead of being swallowed.
+        _ => Some(Action::Cancel),
     }
 }
 
@@ -287,6 +292,14 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
 
         // Sort by AGE (last column — resolved at apply time).
         KeyCode::Char('A') => Some(Action::Sort(crate::app::SortTarget::Last)),
+
+        // Sort by the currently selected (cursor) column — works in every table
+        // view. Repeats toggle direction (sort_by_column handles that). Uses the
+        // DATA index (sort indexes the full cells array), translating from the
+        // cursor's visible index so hidden columns don't shift the target.
+        KeyCode::Char('S') => {
+            Some(Action::Sort(crate::app::SortTarget::Column(app.active_table_selected_data_col())))
+        }
 
         // Copy.
         KeyCode::Char('c') => Some(Action::Copy),

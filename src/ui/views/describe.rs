@@ -34,8 +34,15 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
     };
 
     if !describe.content.is_empty() {
-        let all_lines: Vec<&str> = describe.content.lines().collect();
-        let total_lines = all_lines.len();
+        // Render from the producer's typed lines when present (a structured
+        // describe); fall back to text inference for genuinely-opaque content
+        // (YAML, aliases, kubectl-fallback text) where no structure is known.
+        let typed = !describe.describe_lines.is_empty();
+        let total_lines = if typed {
+            describe.describe_lines.len()
+        } else {
+            describe.content.lines().count()
+        };
 
         // Build title with optional search info
         let title = if let Some(ref search) = describe.search {
@@ -77,48 +84,53 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
             let start = describe.scroll.min(max_scroll);
             let end = (start + visible_height).min(total_lines);
 
-            let visible_lines: Vec<Line> = all_lines[start..end]
-                .iter()
-                .enumerate()
-                .map(|(vi, &line)| {
-                    let abs_line_idx = start + vi;
+            // A search match (current or other) overrides the per-line role
+            // styling below; returns the highlight style for an absolute index.
+            let highlight = |abs_idx: usize| -> Option<ratatui::style::Style> {
+                if !describe.search_matches.is_empty()
+                    && describe.current_match < describe.search_matches.len()
+                    && describe.search_matches[describe.current_match] == abs_idx
+                {
+                    Some(theme.search_match)
+                } else if describe.search_matches.binary_search(&abs_idx).is_ok() {
+                    Some(theme.filter)
+                } else {
+                    None
+                }
+            };
 
-                    // Check if this line is a search match
-                    let is_current_match = !describe.search_matches.is_empty()
-                        && describe.current_match < describe.search_matches.len()
-                        && describe.search_matches[describe.current_match] == abs_line_idx;
-                    let is_match = describe.search_matches.binary_search(&abs_line_idx).is_ok();
-
-                    if is_current_match {
-                        Line::from(Span::styled(line, theme.search_match))
-                    } else if is_match {
-                        Line::from(Span::styled(line, theme.filter))
-                    } else {
-                        // Color-code describe output at any indentation level.
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
-                            Line::from(Span::styled(line, theme.row_normal))
-                        } else if trimmed.ends_with(':') && trimmed.len() > 1 {
-                            // Section header at any level (e.g. "Containers:", "  Limits:")
-                            Line::from(Span::styled(line, theme.header))
-                        } else if let Some(colon_pos) = trimmed.find(':') {
-                            // Key: value pair at any indentation level.
-                            // Preserve the leading whitespace.
-                            let indent_len = line.len() - line.trim_start().len();
-                            let indent = &line[..indent_len];
-                            let key = &trimmed[..colon_pos];
-                            let value = &trimmed[colon_pos..];
-                            Line::from(vec![
-                                Span::styled(indent, theme.row_normal),
-                                Span::styled(key, theme.yaml_key),
-                                Span::styled(value, theme.row_normal),
-                            ])
-                        } else {
-                            Line::from(Span::styled(line, theme.row_normal))
-                        }
-                    }
-                })
-                .collect();
+            let visible_lines: Vec<Line> = if typed {
+                describe.describe_lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(vi, dl)| match highlight(start + vi) {
+                        Some(style) => Line::from(Span::styled(dl.text.as_str(), style)),
+                        None => match &dl.kind {
+                            crate::kube::protocol::DescribeLineKind::Section => {
+                                Line::from(Span::styled(dl.text.as_str(), theme.header))
+                            }
+                            crate::kube::protocol::DescribeLineKind::Field { key_end } => {
+                                field_spans(&dl.text, *key_end, theme)
+                            }
+                            crate::kube::protocol::DescribeLineKind::Plain => {
+                                Line::from(Span::styled(dl.text.as_str(), theme.row_normal))
+                            }
+                        },
+                    })
+                    .collect()
+            } else {
+                describe
+                    .content
+                    .lines()
+                    .skip(start)
+                    .take(end.saturating_sub(start))
+                    .enumerate()
+                    .map(|(vi, line)| match highlight(start + vi) {
+                        Some(style) => Line::from(Span::styled(line, style)),
+                        None => infer_line(line, theme),
+                    })
+                    .collect()
+            };
 
             // Render with scroll=(0,0) since we already windowed the content
             let paragraph = Paragraph::new(visible_lines);
@@ -170,5 +182,43 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
 
         let line = crate::ui::header::render_keybinding_bar(&hints, theme);
         f.render_widget(line, bar_area);
+    }
+}
+
+/// Style a tagged `Field` line: indent + key + value (colon onward), matching
+/// the long-standing visual but driven by the producer's `key_end` rather than
+/// the renderer re-finding the colon.
+fn field_spans<'a>(text: &'a str, key_end: usize, theme: &crate::ui::theme::Theme) -> Line<'a> {
+    let indent_len = text.len() - text.trim_start().len();
+    if indent_len <= key_end && key_end <= text.len() && text.is_char_boundary(key_end) {
+        Line::from(vec![
+            Span::styled(&text[..indent_len], theme.row_normal),
+            Span::styled(&text[indent_len..key_end], theme.yaml_key),
+            Span::styled(&text[key_end..], theme.row_normal),
+        ])
+    } else {
+        // Defensive: a malformed tag renders plain rather than panic-slicing.
+        Line::from(Span::styled(text, theme.row_normal))
+    }
+}
+
+/// Best-effort styling for genuinely-opaque text (YAML, aliases, kubectl
+/// fallback): the former render-time inference, retained only where there is no
+/// producer structure to trust.
+fn infer_line<'a>(line: &'a str, theme: &crate::ui::theme::Theme) -> Line<'a> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        Line::from(Span::styled(line, theme.row_normal))
+    } else if trimmed.ends_with(':') && trimmed.len() > 1 {
+        Line::from(Span::styled(line, theme.header))
+    } else if let Some(colon_pos) = trimmed.find(':') {
+        let indent_len = line.len() - line.trim_start().len();
+        Line::from(vec![
+            Span::styled(&line[..indent_len], theme.row_normal),
+            Span::styled(&trimmed[..colon_pos], theme.yaml_key),
+            Span::styled(&trimmed[colon_pos..], theme.row_normal),
+        ])
+    } else {
+        Line::from(Span::styled(line, theme.row_normal))
     }
 }

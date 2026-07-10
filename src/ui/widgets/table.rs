@@ -102,14 +102,20 @@ impl ColumnLayout {
     fn is_trailing_highlighted(&self) -> bool {
         self.widths.len().saturating_sub(1) == self.sel_col
     }
-}
 
-/// Default maximum column width in characters.
-const DEFAULT_MAX_COL_WIDTH: u16 = 64;
+    /// Index of the first visible column in the viewport.
+    fn first_visible(&self) -> Option<usize> {
+        (0..self.widths.len()).find(|&i| self.is_visible(i))
+    }
+}
 
 pub struct ResourceTable<'a> {
     headers: Vec<&'a str>,
     rows: &'a [Vec<String>],
+    /// Pre-computed per-column display widths (from `PreparedView`). Empty ⇒
+    /// nothing to render — same guard as the old content-scanning path when
+    /// there were no columns.
+    col_widths: &'a [u16],
     title: &'a str,
     namespace: &'a str,
     sort_col: Option<usize>,
@@ -122,7 +128,6 @@ pub struct ResourceTable<'a> {
     /// Per-cell rendering style. `cell_style[row][col]` = `Some(h)` means
     /// that cell has its own coloring; `None` = inherit row style.
     cell_style: &'a [Vec<Option<crate::kube::resources::row::RowHealth>>],
-    max_col_width: u16,
     /// Active search patterns for match highlighting. When non-empty,
     /// matched regions within cells are rendered with `theme.search_match`.
     search_patterns: &'a [crate::util::SearchPattern],
@@ -138,17 +143,18 @@ impl<'a> ResourceTable<'a> {
         static EMPTY_MAP: std::sync::LazyLock<std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>> = std::sync::LazyLock::new(std::collections::HashMap::new);
         static EMPTY_MARKED: std::sync::LazyLock<std::collections::HashSet<crate::kube::protocol::ObjectKey>> = std::sync::LazyLock::new(std::collections::HashSet::new);
         Self {
-            headers, rows, title, namespace: "",
+            headers, rows, col_widths: &[], title, namespace: "",
             sort_col: None, sort_asc: true, theme,
             marked: &EMPTY_MARKED,
             changed_rows: &EMPTY_MAP,
             row_keys: &[],
             row_health: &[],
             cell_style: &[],
-            max_col_width: DEFAULT_MAX_COL_WIDTH,
             search_patterns: &[],
         }
     }
+
+    pub fn col_widths(mut self, widths: &'a [u16]) -> Self { self.col_widths = widths; self }
 
     pub fn row_keys(mut self, keys: &'a [crate::kube::protocol::ObjectKey]) -> Self { self.row_keys = keys; self }
     pub fn row_health(mut self, health: &'a [crate::kube::resources::row::RowHealth]) -> Self { self.row_health = health; self }
@@ -157,29 +163,10 @@ impl<'a> ResourceTable<'a> {
     pub fn sort(mut self, col: Option<usize>, ascending: bool) -> Self { self.sort_col = col; self.sort_asc = ascending; self }
     pub fn namespace(mut self, ns: &'a str) -> Self { self.namespace = ns; self }
     pub fn changed_rows(mut self, changed: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>) -> Self { self.changed_rows = changed; self }
-    pub fn max_col_width(mut self, w: u16) -> Self { self.max_col_width = w; self }
     pub fn search_patterns(mut self, pats: &'a [crate::util::SearchPattern]) -> Self { self.search_patterns = pats; self }
 
     fn health_at(&self, idx: usize) -> crate::kube::resources::row::RowHealth {
         self.row_health.get(idx).copied().unwrap_or_default()
-    }
-
-    /// Compute natural column widths from content. No scaling.
-    fn compute_col_widths(&self, rows: &[Vec<String>]) -> Vec<u16> {
-        if self.headers.is_empty() { return Vec::new(); }
-        let mut widths: Vec<u16> = self.headers.iter()
-            .map(|h| h.width() as u16 + 2) // +2 for sort indicator
-            .collect();
-        for row in rows {
-            for (i, cell) in row.iter().enumerate() {
-                if i < widths.len() {
-                    widths[i] = widths[i].max(cell.width() as u16);
-                }
-            }
-        }
-        // +3 per column: │(1) + pad(1) + content + pad(1).
-        for w in &mut widths { *w = (*w + 3).min(self.max_col_width); }
-        widths
     }
 
     /// Render a single cell: `│ text  ` (left border + padded content).
@@ -192,13 +179,18 @@ impl<'a> ResourceTable<'a> {
         buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str,
         style: Style, border_style: Style,
         match_ranges: &[(usize, usize)], match_style: Style,
+        first_col: bool,
     ) {
         if width < 3 { return; }
         let inner = (width as usize) - 3;
         let text_width = text.width();
         let truncated = text_width > inner;
 
-        buf.set_string(x, y, "│", border_style);
+        if first_col {
+            buf.set_string(x, y, " ", style);
+        } else {
+            buf.set_string(x, y, "│", border_style);
+        }
 
         if match_ranges.is_empty() {
             // Fast path: no highlighting — single formatted string.
@@ -303,11 +295,12 @@ impl<'a> ResourceTable<'a> {
         layout: &ColumnLayout,
     ) {
         let hl = self.theme.search_match;
+        let first = layout.first_visible();
         for (i, cell) in cells.iter().enumerate() {
             if i >= layout.widths.len() || !layout.is_visible(i) { continue; }
             let (content_style, border_style) = self.cell_styles(base_style, i, is_row_selected, layout);
             let ranges = self.cell_match_ranges(cell.as_ref());
-            Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style, &ranges, hl);
+            Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style, &ranges, hl, first == Some(i));
         }
         // Trailing │ after last column.
         if let Some(tx) = layout.trailing_border_x() {
@@ -358,8 +351,9 @@ impl StatefulWidget for ResourceTable<'_> {
         block.render(area, buf);
         if inner.height == 0 || inner.width == 0 { return; }
 
-        // Column layout.
-        let col_widths = self.compute_col_widths(self.rows);
+        // Column layout — widths are pre-computed with the memoized view
+        // (see `PreparedView::col_widths`), not re-scanned per frame.
+        let col_widths = self.col_widths.to_vec();
         if col_widths.is_empty() { return; }
 
         // Clamp column selection.
@@ -458,6 +452,7 @@ impl StatefulWidget for ResourceTable<'_> {
             if has_cell_overrides {
                 let cell_styles = &self.cell_style[row_idx];
                 let hl = self.theme.search_match;
+                let first = layout.first_visible();
                 for (i, cell) in row.iter().enumerate() {
                     if i >= layout.widths.len() || !layout.is_visible(i) { continue; }
                     let style = if let Some(Some(h)) = cell_styles.get(i) {
@@ -472,7 +467,7 @@ impl StatefulWidget for ResourceTable<'_> {
                     };
                     let (content_style, border_style) = self.cell_styles(style, i, is_selected, &layout);
                     let ranges = self.cell_match_ranges(cell.as_ref());
-                    Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style, &ranges, hl);
+                    Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style, &ranges, hl, first == Some(i));
                 }
                 // Trailing border.
                 if let Some(tx) = layout.trailing_border_x() {

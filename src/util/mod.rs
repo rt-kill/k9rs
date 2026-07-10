@@ -20,21 +20,32 @@ pub struct SearchPattern {
     case_insensitive: bool,
 }
 
-/// Escape characters that are regex metacharacters in PCRE/Rust but
-/// literal in vim's default magic mode. Vim magic treats `. * ^ $ [ ] \`
-/// as special (same as PCRE), but `+ ? { } ( ) |` are literal in vim
-/// (they require `\+`, `\(`, etc. to be special). This function escapes
-/// the latter set so the regex engine treats them as literal, matching
-/// vim's behavior.
+/// Translate vim magic mode metacharacters to Rust regex equivalents.
+///
+/// Vim magic: `. * ^ $ [ ] \` are special (same as Rust regex), but
+/// `+ ? { } ( ) |` are LITERAL unless backslash-escaped (`\+`, `\|`, etc.).
+///
+/// Bare `|` → literal in vim → escape to `\|` for Rust regex.
+/// `\|`     → alternation in vim → emit bare `|` for Rust regex.
+/// Same for `+ ? { } ( )`.
 fn vim_magic_escape(pattern: &str) -> String {
+    const VIM_LITERAL: &[char] = &['+', '?', '{', '}', '(', ')', '|'];
     let mut result = String::with_capacity(pattern.len() + 8);
-    for ch in pattern.chars() {
-        match ch {
-            '+' | '?' | '{' | '}' | '(' | ')' | '|' => {
-                result.push('\\');
-                result.push(ch);
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.peek() {
+                Some(&next) if VIM_LITERAL.contains(&next) => {
+                    result.push(next);
+                    chars.next();
+                }
+                _ => result.push(ch),
             }
-            _ => result.push(ch),
+        } else if VIM_LITERAL.contains(&ch) {
+            result.push('\\');
+            result.push(ch);
+        } else {
+            result.push(ch);
         }
     }
     result
@@ -660,6 +671,31 @@ fn format_bytes(bytes: f64) -> String {
     }
 }
 
+/// RAII guard that aborts a tokio task when dropped. Same pattern family as
+/// `SuspendGuard`, `TempFile`, `ChildGuard`: holding the guard keeps the task
+/// running; dropping it (on any exit path, including unwind) aborts it.
+/// Holding the abort handle in an `Option` lets the guard be `Drop`'d
+/// explicitly without `Drop` running twice.
+///
+/// CONTRACT: abort-only, never join. Drops can run under locks (e.g. a
+/// DashMap shard lock while its slots drop); `abort()` is signal-and-return,
+/// so that's safe — a blocking join in `Drop` would deadlock.
+pub struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl AbortOnDrop {
+    pub fn new(handle: tokio::task::AbortHandle) -> Self {
+        Self(Some(handle))
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// Truncates a string to the given maximum number of characters.
 /// If truncated, appends an ellipsis character.
 pub fn truncate(s: &str, max: usize) -> String {
@@ -814,6 +850,49 @@ mod tests {
         assert!(pat.is_match("a?b"));
         assert!(!pat.is_match("ab")); // ? NOT optional
         assert!(!pat.is_match("b"));
+    }
+
+    #[test]
+    fn vim_magic_escaped_pipe_is_alternation() {
+        let pat = SearchPattern::new(r"foo\|bar");
+        assert!(pat.is_match("foo"));
+        assert!(pat.is_match("bar"));
+        assert!(!pat.is_match("baz"));
+    }
+
+    #[test]
+    fn vim_magic_escaped_plus_is_quantifier() {
+        let pat = SearchPattern::new(r"ab\+c");
+        assert!(pat.is_match("abc"));
+        assert!(pat.is_match("abbc"));
+        assert!(!pat.is_match("ac")); // + requires at least one b
+    }
+
+    #[test]
+    fn vim_magic_escaped_parens_are_group() {
+        let pat = SearchPattern::new(r"\(foo\)\|bar");
+        assert!(pat.is_match("foo"));
+        assert!(pat.is_match("bar"));
+        assert!(!pat.is_match("baz"));
+    }
+
+    #[test]
+    fn vim_magic_escaped_question_is_optional() {
+        let pat = SearchPattern::new(r"colou\?r");
+        assert!(pat.is_match("color"));
+        assert!(pat.is_match("colour"));
+    }
+
+    #[test]
+    fn vim_magic_backslash_non_special_passes_through() {
+        let pat = SearchPattern::new(r"foo\dbar");
+        assert!(pat.is_match("foo7bar")); // \d is regex digit
+    }
+
+    #[test]
+    fn vim_magic_trailing_backslash() {
+        let pat = SearchPattern::new(r"foo\");
+        assert!(pat.is_match(r"foo\"));
     }
 
     #[test]

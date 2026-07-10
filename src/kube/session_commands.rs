@@ -21,17 +21,17 @@ pub(crate) enum InteractiveKind {
 /// to launch.
 pub(crate) async fn run_interactive_local(
     terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
-    _app: &mut App,
     command: &str,
     args: &[String],
     _kind: InteractiveKind,
     input_suspend: &tokio::sync::watch::Sender<bool>,
     input_suspend_ack: &mut mpsc::Receiver<()>,
+    input_rx: &mut mpsc::Receiver<crossterm::event::Event>,
 ) -> Result<Option<std::process::ExitStatus>> {
     use crate::kube::session::SuspendGuard;
 
-    // The guard suspends the TUI and restores it on drop.
-    let mut guard = SuspendGuard::new(terminal, input_suspend, input_suspend_ack).await?;
+    // The guard suspends the TUI and restores it on `restore()` (or `Drop`).
+    let mut guard = SuspendGuard::new(terminal, input_suspend, input_suspend_ack, input_rx).await?;
 
     // Interactive subprocesses need a normal terminal.
     disable_raw_mode()?;
@@ -62,7 +62,25 @@ pub(crate) async fn run_interactive_local(
         crossterm::cursor::Hide,
     )?;
 
-    // Guard drops → enter alternate screen, clear, resume input.
+    // Reset terminal modes the subprocess may have changed. Matches the
+    // shell bridge cleanup (session.rs) — without this, stale terminal
+    // responses during the alt-screen transition can be parsed as key
+    // events (e.g. a spurious 'r' triggering the restart dialog).
+    {
+        let backend = guard.terminal_mut().backend_mut();
+        let _ = std::io::Write::write_all(backend, concat!(
+            "\x1b[?1000l",  // disable mouse tracking
+            "\x1b[?1006l",  // disable SGR mouse extension
+            "\x1b[?2004l",  // disable bracketed paste
+            "\x1b(B",       // select US-ASCII charset for G0
+        ).as_bytes());
+        let _ = std::io::Write::flush(backend);
+    }
+
+    // Restore the screen, resume input, and drain stale terminal responses
+    // (the settling drain catches the spurious-'r' that the mode-reset escapes
+    // above don't fully suppress — e.g. the alt-screen re-entry's own reply).
+    guard.restore().await;
     Ok(status.ok())
 }
 
@@ -242,13 +260,6 @@ fn parse_crd_in_namespace(cmd: &str, app: &App) -> Option<(crate::app::CrdInfo, 
     Some((crd, crate::kube::protocol::Namespace::from_user_command(ns)))
 }
 
-/// Legacy shim kept for a few callers (CLI dispatch, the startup
-/// `--command` flag) that want the single-alias form without going
-/// through the full parser. New call sites should use
-/// [`parse_command_input`] instead.
-pub(crate) fn parse_resource_command(cmd: &str) -> Option<ResourceId> {
-    ResourceId::from_alias(cmd)
-}
 
 // ---------------------------------------------------------------------------
 // Input mode handlers — extracted from the main event loop
@@ -522,16 +533,14 @@ pub(crate) fn handle_form_dialog_key(
         KeyCode::Left | KeyCode::Right => {
             if let Some(ref mut d) = app.ui.form_dialog {
                 if let Some(field) = d.current_field_mut() {
-                    if let FormFieldKind::Select { ref options } = field.kind {
+                    if let FormFieldKind::Select { ref options, ref mut selected } = field.kind {
                         if !options.is_empty() {
                             let n = options.len();
-                            let cur: usize = field.value.parse().unwrap_or(0);
-                            let new = if key.code == KeyCode::Left {
-                                (cur + n - 1) % n
+                            *selected = if key.code == KeyCode::Left {
+                                (*selected + n - 1) % n
                             } else {
-                                (cur + 1) % n
+                                (*selected + 1) % n
                             };
-                            field.value = new.to_string();
                         }
                     }
                 }

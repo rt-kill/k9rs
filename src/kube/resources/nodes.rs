@@ -4,7 +4,7 @@ use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
 use crate::kube::resources::k8s_const::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
+use crate::kube::resources::row::{CellValue, DrillTarget, QuantityUnit, ResourceRow, RowHealth};
 
 // ---------------------------------------------------------------------------
 // NodeDef
@@ -24,10 +24,11 @@ impl ResourceDef for NodeDef {
     fn aliases(&self) -> &[&str] { &["no", "node", "nodes"] }
     fn short_label(&self) -> &str { "Nodes" }
     fn default_headers(&self) -> Vec<String> {
-        ["NAME", "STATUS", "ROLES", "TAINTS", "VERSION",
-         "OS-IMAGE", "KERNEL",
-         "INTERNAL-IP", "EXTERNAL-IP", "PODS",
-         "CPU%", "MEM%", "ARCH", "LABELS", "AGE"]
+        ["NAME", "STATUS", "ROLES", "INSTANCE-TYPE", "TAINTS", "VERSION", "PODS/A",
+         "CPU", "CPU/A", "%CPU", "MEM", "MEM/A", "%MEM",
+         "GPU/A", "GPU/C", "SH-GPU/A", "SH-GPU/C",
+         "OS-IMAGE", "KERNEL", "INTERNAL-IP", "EXTERNAL-IP", "ARCH", "LABELS",
+         "AGE"]
             .into_iter().map(String::from).collect()
     }
     fn is_core(&self) -> bool { true }
@@ -41,13 +42,20 @@ impl ResourceDef for NodeDef {
         use MetricsColumn::*;
         vec![
             C::new("NAME"), C::new("STATUS"), C::new("ROLES"),
-            C::new("TAINTS"), C::new("VERSION"),
+            C::new("INSTANCE-TYPE"),
+            C::new("TAINTS"), C::new("VERSION"), C::new("PODS/A"),
+            C::new("CPU").with_metrics(Cpu),
+            C::new("CPU/A").with_metrics(CpuAlloc),
+            C::new("%CPU").with_metrics(CpuPercent),
+            C::new("MEM").with_metrics(Mem),
+            C::new("MEM/A").with_metrics(MemAlloc),
+            C::new("%MEM").with_metrics(MemPercent),
+            C::new("GPU/A"), C::new("GPU/C"),
+            C::new("SH-GPU/A"), C::new("SH-GPU/C"),
             C::extra("OS-IMAGE"), C::extra("KERNEL"),
-            C::new("INTERNAL-IP"), C::extra("EXTERNAL-IP"),
-            C::new("PODS"),
-            C::new("CPU%").with_metrics(CpuPercent),
-            C::new("MEM%").with_metrics(MemPercent),
-            C::extra("ARCH"), C::extra("LABELS"), C::age("AGE"),
+            C::extra("INTERNAL-IP"), C::extra("EXTERNAL-IP"),
+            C::extra("ARCH"), C::extra("LABELS"),
+            C::new("AGE"),
         ]
     }
 }
@@ -81,6 +89,12 @@ impl ConvertToRow<Node> for NodeDef {
                 role_list.join(",")
             }
         };
+
+        // Instance type from the well-known node label (modern, then legacy).
+        let instance_type = meta.labels.get("node.kubernetes.io/instance-type")
+            .or_else(|| meta.labels.get("beta.kubernetes.io/instance-type"))
+            .cloned()
+            .unwrap_or_else(|| "<none>".to_string());
 
         let spec = node.spec;
 
@@ -139,42 +153,59 @@ impl ConvertToRow<Node> for NodeDef {
             .map(|a| a.address.clone())
             .unwrap_or_else(|| "<none>".to_string());
 
-        // Capacity resources
+        // Allocatable (what k9s uses for the % columns) + capacity (for the GPU
+        // capacity columns). `allocatable` = capacity minus system-reserved.
+        let allocatable = status_val.allocatable.unwrap_or_default();
         let capacity = status_val.capacity.unwrap_or_default();
-        let _cpu_capacity = capacity
-            .get("cpu")
-            .map(|q| q.0.clone())
-            .unwrap_or_default();
-        let _mem_capacity = capacity
-            .get("memory")
-            .map(|q| q.0.clone())
-            .unwrap_or_default();
-        let pods_capacity = capacity
-            .get("pods")
-            .map(|q| q.0.clone())
-            .unwrap_or_default();
 
-        // CPU% and MEM% are initially n/a -- mutated by apply_node_metrics.
+        // CPU/MEM allocatable as numeric Quantity cells — the metrics overlay
+        // reads these to compute %CPU / %MEM (usage * 100 / allocatable).
+        let alloc_cpu_milli = allocatable.get("cpu")
+            .map(|q| crate::kube::metrics::parse_cpu_to_nano(&q.0) / 1_000_000)
+            .unwrap_or(0);
+        let alloc_mem_bytes = allocatable.get("memory")
+            .map(|q| crate::kube::metrics::parse_mem_to_bytes(&q.0))
+            .unwrap_or(0);
+        let pods_alloc = allocatable.get("pods").and_then(|q| q.0.parse::<i64>().ok());
+
+        // GPU counts (integers); absent → 0. The shared/time-sliced keys are
+        // best-effort — they vary by device-plugin setup.
+        let gpu_alloc = allocatable.get("nvidia.com/gpu").and_then(|q| q.0.parse::<i64>().ok()).unwrap_or(0);
+        let gpu_cap = capacity.get("nvidia.com/gpu").and_then(|q| q.0.parse::<i64>().ok()).unwrap_or(0);
+        let sh_gpu_alloc = allocatable.get("nvidia.com/gpu.shared").and_then(|q| q.0.parse::<i64>().ok()).unwrap_or(0);
+        let sh_gpu_cap = capacity.get("nvidia.com/gpu.shared").and_then(|q| q.0.parse::<i64>().ok()).unwrap_or(0);
+
         let drill_target = Some(DrillTarget::PodsByField(
             crate::app::nav::K8sFieldSelector::SpecNodeName(meta.name.clone()),
         ));
 
+        // CPU, %CPU, MEM, %MEM are Placeholder here — the metrics overlay
+        // (apply_node_metrics) fills them when metrics-server data arrives.
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.name.clone()),
             CellValue::Status { text: status, health },
             CellValue::Text(roles),
+            CellValue::Text(instance_type),
             CellValue::Count(taints as i64),
             CellValue::Text(version),
-            CellValue::Text(os_image),
-            CellValue::Text(kernel),
-            CellValue::Text(internal_ip),
-            CellValue::Text(external_ip),
-            CellValue::Text(pods_capacity),
-            CellValue::Placeholder, // CPU% — filled by metrics overlay
-            CellValue::Placeholder, // MEM% — filled by metrics overlay
-            CellValue::Text(arch),
-            CellValue::Text(meta.labels_str),
-            CellValue::Age(meta.age.map(|t| t.timestamp())),
+            pods_alloc.map(CellValue::Count).unwrap_or(CellValue::Placeholder),              // PODS/A (allocatable)
+            CellValue::Placeholder,                                                          // CPU
+            CellValue::Quantity { value: alloc_cpu_milli, unit: QuantityUnit::Millicores },  // CPU/A
+            CellValue::Percentage(None),                                                     // %CPU
+            CellValue::Placeholder,                                                          // MEM
+            CellValue::Quantity { value: alloc_mem_bytes, unit: QuantityUnit::Bytes },       // MEM/A
+            CellValue::Percentage(None),                                                     // %MEM
+            CellValue::Count(gpu_alloc),                                                     // GPU/A
+            CellValue::Count(gpu_cap),                                                       // GPU/C
+            CellValue::Count(sh_gpu_alloc),                                                  // SH-GPU/A
+            CellValue::Count(sh_gpu_cap),                                                    // SH-GPU/C
+            CellValue::Text(os_image),                                                       // OS-IMAGE
+            CellValue::Text(kernel),                                                         // KERNEL
+            CellValue::Text(internal_ip),                                                    // INTERNAL-IP
+            CellValue::Text(external_ip),                                                    // EXTERNAL-IP
+            CellValue::Text(arch),                                                           // ARCH
+            CellValue::Text(meta.labels_str),                                                // LABELS
+            CellValue::Age(meta.age.map(|t| t.timestamp())),                                 // AGE
         ];
         ResourceRow {
             name: meta.name,
@@ -184,5 +215,26 @@ impl ConvertToRow<Node> for NodeDef {
             cells,
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kube::resource_def::{ConvertToRow, ResourceDef};
+
+    /// The three parallel lists — `default_headers`, `column_defs`, and the
+    /// per-row `cells` vec — must stay positionally aligned. A drift silently
+    /// renders data under the wrong header. This guards all three.
+    #[test]
+    fn node_headers_columns_cells_aligned() {
+        let headers = NodeDef.default_headers();
+        let cols = NodeDef.column_defs();
+        assert_eq!(headers.len(), cols.len(), "default_headers vs column_defs length");
+        for (h, c) in headers.iter().zip(&cols) {
+            assert_eq!(h.as_str(), c.header, "header text mismatch with column_defs");
+        }
+        let row = NodeDef::convert(k8s_openapi::api::core::v1::Node::default());
+        assert_eq!(row.cells.len(), headers.len(), "cells vec must align with headers");
     }
 }

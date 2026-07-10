@@ -17,6 +17,7 @@ pub(crate) fn apply_event(
 ) {
     match event {
         AppEvent::ResourceUpdate(update) => apply_resource_update(app, update),
+        AppEvent::NavResourceUpdate(update) => apply_nav_resource_update(app, update),
         AppEvent::Flash(flash) => {
             // Purely local flashes: just show them. Do NOT pop the edit
             // route — that's driven by `CommandResult` below.
@@ -213,6 +214,39 @@ pub(crate) fn apply_event(
     }
 }
 
+fn apply_nav_resource_update(app: &mut App, update: ResourceUpdate) {
+    match update {
+        ResourceUpdate::Rows { resource, headers, rows } => {
+            let num_cols = headers.len();
+            let descriptor = crate::app::TableDescriptor::new(headers, resource.plural());
+            app.nav.set_descriptor_for_resource(&resource, descriptor);
+            if let Some(table) = app.nav.find_table_for_resource_mut(&resource) {
+                app.ui.deltas.update(&rows);
+                table.set_num_cols(num_cols);
+                table.set_items_filtered(rows);
+            }
+            match metrics_kind_for(&resource) {
+                Some(MetricsKind::Pod) => app.apply_pod_metrics(),
+                Some(MetricsKind::Node) => app.apply_node_metrics(),
+                None => {}
+            }
+        }
+        // Nav-scoped subscriptions only ever carry `Rows` (see the nav bridge in
+        // ClientSession). Anything else is a contract violation: route it to the
+        // global handler as a release-mode fail-safe, but trip in debug/tests so
+        // a future `StreamEvent` variant on the nav channel is caught at the
+        // source instead of silently shadowing the parent step's data.
+        other => {
+            debug_assert!(
+                false,
+                "nav-scoped subscription emitted a non-Rows update; the nav bridge \
+                 contract (Rows only) was violated",
+            );
+            apply_resource_update(app, other);
+        }
+    }
+}
+
 fn apply_resource_update(
     app: &mut App,
     update: ResourceUpdate,
@@ -298,7 +332,7 @@ fn apply_resource_update(
                 }
             }
         }
-        ResourceUpdate::Describe { target: response_target, content } => {
+        ResourceUpdate::Describe { target: response_target, lines } => {
             if let crate::app::Route::ContentView {
                 kind: crate::app::ContentViewKind::Describe,
                 target: Some(ref target),
@@ -307,10 +341,10 @@ fn apply_resource_update(
             } = app.route {
                 if *target != response_target { return; }
                 if *awaiting_response {
-                    app.kube.kubectl_cache.insert(target.clone(), crate::app::ContentKind::Describe, content.clone());
+                    app.kube.kubectl_cache.insert_describe(target.clone(), lines.clone());
                     *awaiting_response = false;
                 }
-                state.set_content(content);
+                state.set_describe_lines(lines);
             }
         }
         ResourceUpdate::LogLine { generation, line } => {

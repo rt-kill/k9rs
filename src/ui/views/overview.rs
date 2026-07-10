@@ -100,23 +100,23 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     }
     lines.push(Line::from(""));
 
-    // Stats — built dynamically from core resources
-    let mut has_unhealthy = false;
+    // Stats — built dynamically from core resources. `has_unhealthy` is a
+    // pure predicate over the same data, computed independently of the
+    // per-label formatting rather than flagged as a side effect inside it.
+    let has_unhealthy = core_stats.iter().any(|(_, total, healthy)| total - healthy > 0);
     let stats = if core_stats.is_empty() {
         "Loading...".to_string()
     } else {
-        let parts: Vec<String> = core_stats.iter().map(|(label, total, healthy)| {
+        core_stats.iter().map(|(label, total, healthy)| {
             let unhealthy = total - healthy;
             if unhealthy > 0 {
-                has_unhealthy = true;
                 format!("{}: {} ({} healthy, {} unhealthy)", label, total, healthy, unhealthy)
             } else if *total > 0 {
                 format!("{}: {} (all healthy)", label, total)
             } else {
                 format!("{}: loading...", label)
             }
-        }).collect();
-        parts.join("  |  ")
+        }).collect::<Vec<_>>().join("  |  ")
     };
     let stats_style = if has_unhealthy { theme.status_pending } else { theme.status_running };
     lines.push(Line::from(

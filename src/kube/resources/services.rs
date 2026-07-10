@@ -34,7 +34,7 @@ impl ResourceDef for ServiceDef {
             C::new("NAMESPACE"), C::new("NAME"), C::new("TYPE"),
             C::new("CLUSTER-IP"), C::new("EXTERNAL-IP"),
             C::extra("SELECTOR"), C::new("PORT(S)"),
-            C::extra("LABELS"), C::age("AGE"),
+            C::extra("LABELS"), C::new("AGE"),
         ]
     }
 

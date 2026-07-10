@@ -97,6 +97,14 @@ pub struct NavChange {
     /// Server-side filter for the new subscription (Labels, Field, OwnerUid).
     /// None = unfiltered. Only meaningful when `subscribe` is Some.
     pub subscription_filter: Option<SubscriptionFilter>,
+    /// Namespace scope for the fresh subscription, overriding the session's
+    /// selected namespace. `None` = inherit the selected namespace (the right
+    /// default for grep refinements and same-namespace drills). `Some` = an
+    /// intrinsic scope the source view's namespace must not narrow — e.g.
+    /// all-namespaces for a node's pods, which span every namespace. Only
+    /// meaningful when `subscribe` is `Some`. See
+    /// [`NavFilter::subscription_namespace`].
+    pub namespace: Option<crate::kube::protocol::Namespace>,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,9 +123,16 @@ pub enum NavFilter {
     /// compiled at construction (see [`CompiledGrep::new`]) so the
     /// hot-path `reapply_nav_filters` never re-parses the regex.
     Grep(CompiledGrep),
-    /// Label selector: show only items whose labels contain ALL of these k=v pairs.
-    /// Used for deployment→pods, statefulset→pods, etc.
-    Labels(BTreeMap<String, String>),
+    /// Label selector: show only items whose labels contain ALL of these k=v
+    /// pairs (deployment→pods, statefulset→pods, etc.). `namespace` scopes the
+    /// fresh subscription to the source object's namespace — a workload's pods
+    /// live in the workload's namespace, so the drill must stay namespaced even
+    /// from an all-namespaces parent (otherwise `app=nginx` would match pods in
+    /// every namespace).
+    Labels {
+        labels: BTreeMap<String, String>,
+        namespace: crate::kube::protocol::Namespace,
+    },
     /// Typed K8s field selector. Replaces the previous stringly-typed
     /// `Field { field: String, value: String }` — the variant carries the
     /// field path so callers can't fat-finger it.
@@ -133,6 +148,9 @@ pub enum NavFilter {
         kind: crate::kube::resource_def::BuiltInKind,
         /// Display name of the owner resource.
         display_name: String,
+        /// Scope the fresh subscription to the owner's namespace (its pods/jobs
+        /// live there) — same rationale as `Labels { namespace }`.
+        namespace: crate::kube::protocol::Namespace,
     },
     /// Column-restricted grep: matches only the cell at a specific column
     /// index. Opened with `~` (tilde) — filters the hovered column only.
@@ -150,11 +168,31 @@ impl NavFilter {
     pub fn to_subscription_filter(&self) -> Option<SubscriptionFilter> {
         match self {
             NavFilter::Grep(_) | NavFilter::ColumnGrep { .. } | NavFilter::Fault => None,
-            NavFilter::Labels(labels) => Some(SubscriptionFilter::Labels(labels.clone())),
+            NavFilter::Labels { labels, .. } => Some(SubscriptionFilter::Labels(labels.clone())),
             NavFilter::Field(sel) => Some(SubscriptionFilter::Field(sel.to_wire())),
             NavFilter::OwnerChain { uid, .. } => {
                 Some(SubscriptionFilter::OwnerUid(uid.clone()))
             }
+        }
+    }
+
+    /// The namespace a *fresh* subscription opened for this filter should use,
+    /// overriding the session's selected namespace. `None` means inherit the
+    /// selected namespace — correct for grep refinements (which don't open a new
+    /// subscription at all) and for filters with no inherent scope. Two filters
+    /// override it: a `spec.nodeName` selector is cluster-wide (a node hosts pods
+    /// from every namespace), and label/owner drills pin to the *source object's*
+    /// namespace so a same-namespace drill stays namespaced even from an
+    /// all-namespaces parent.
+    pub fn subscription_namespace(&self) -> Option<crate::kube::protocol::Namespace> {
+        match self {
+            NavFilter::Field(K8sFieldSelector::SpecNodeName(_)) => {
+                Some(crate::kube::protocol::Namespace::All)
+            }
+            NavFilter::Labels { namespace, .. } | NavFilter::OwnerChain { namespace, .. } => {
+                Some(namespace.clone())
+            }
+            _ => None,
         }
     }
 
@@ -271,6 +309,16 @@ impl NavStep {
             parent: None,
         }
     }
+
+    /// Whether this step owns a subscription whose bridge is still *running*.
+    /// A handle that's present but whose bridge has terminated does not count.
+    /// Used by the pop re-subscribe decision so a present-but-dead owner can't
+    /// suppress re-subscribe — distinct from `stream.is_some()`, which the
+    /// routing and reactive-cleanup sweeps use, where mere presence is the
+    /// right question (you route to / clear whatever handle is there).
+    fn has_live_stream(&self) -> bool {
+        self.stream.as_ref().is_some_and(|s| s.is_alive())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +410,7 @@ impl NavStack {
         );
         let old = self.top.view.clone();
         let sub_filter = step.filter.as_ref().and_then(|f| f.to_subscription_filter());
+        let sub_ns = step.filter.as_ref().and_then(|f| f.subscription_namespace());
         // Splice the old top in as the new step's parent, then install
         // the new step as the top. We need a placeholder ResourceId for
         // the temporary root — use a dummy that gets immediately replaced.
@@ -384,14 +433,14 @@ impl NavStack {
                 ViewId::Resource(rid) => Some(rid.clone()),
                 ViewId::Derived(_) => None,
             };
-            NavChange { subscribe: subscribe_rid, subscription_filter: sub_filter }
+            NavChange { subscribe: subscribe_rid, subscription_filter: sub_filter, namespace: sub_ns }
         } else {
             debug_assert!(
                 sub_filter.is_none(),
                 "NavStack::push: same-view push must not carry a server-side subscription filter \
                  (would leak a concurrent watcher and shadow the parent step's filtered data)"
             );
-            NavChange { subscribe: None, subscription_filter: None }
+            NavChange { subscribe: None, subscription_filter: None, namespace: None }
         }
     }
 
@@ -419,26 +468,29 @@ impl NavStack {
         // cached rows for instant pop-back; re-subscribing would open a
         // duplicate watcher AND wipe the ancestor's rows.
         let sub_filter = self.top.filter.as_ref().and_then(|f| f.to_subscription_filter());
+        let sub_ns = self.top.filter.as_ref().and_then(|f| f.subscription_namespace());
         let change = if new != old {
             // The new top (restored parent) may still hold its own live
             // subscription stream from before the drill-down. Check the
-            // top's own stream FIRST — `same_view_ancestor_has_stream` only
-            // walks ancestors, missing the top itself. Without this, every
+            // top's own stream FIRST — `same_view_ancestor_has_live_stream`
+            // only walks ancestors, missing the top itself. Without this, every
             // pop-back across a view change triggered a re-subscribe + data
             // clear, causing a visible "Loading..." flash even though the
-            // data was already cached and the stream alive.
-            if self.top.stream.is_some() || self.same_view_ancestor_has_stream() {
-                NavChange { subscribe: None, subscription_filter: None }
+            // data was already cached and the stream alive. Liveness-checked
+            // (not mere presence) so a terminated bridge's stale handle can't
+            // suppress the re-subscribe the dead view needs.
+            if self.top.has_live_stream() || self.same_view_ancestor_has_live_stream() {
+                NavChange { subscribe: None, subscription_filter: None, namespace: None }
             } else {
                 // Extract ResourceId if this is a resource view.
                 let subscribe_rid = match &new {
                     ViewId::Resource(rid) => Some(rid.clone()),
                     ViewId::Derived(_) => None,
                 };
-                NavChange { subscribe: subscribe_rid, subscription_filter: sub_filter }
+                NavChange { subscribe: subscribe_rid, subscription_filter: sub_filter, namespace: sub_ns }
             }
         } else {
-            NavChange { subscribe: None, subscription_filter: None }
+            NavChange { subscribe: None, subscription_filter: None, namespace: None }
         };
         Some((popped, change))
     }
@@ -463,10 +515,13 @@ impl NavStack {
         best
     }
 
-    /// True if any same-view ancestor (strictly ancestor — not the top)
-    /// owns a live subscription stream. Used by `pop` to decide whether
-    /// the new top can inherit a parent's stream instead of re-subscribing.
-    fn same_view_ancestor_has_stream(&self) -> bool {
+    /// True if any same-view ancestor (strictly ancestor — not the top) owns a
+    /// subscription whose bridge is still *running*. Used by `pop` to decide
+    /// whether the new top can inherit a parent's live stream instead of
+    /// re-subscribing. A present-but-dead handle is skipped (via
+    /// `has_live_stream`), so a terminated bridge can't trick pop into leaving
+    /// the restored view unsubscribed.
+    fn same_view_ancestor_has_live_stream(&self) -> bool {
         let current_view = &self.top.view;
         let mut node = match self.top.parent.as_deref() {
             Some(p) => p,
@@ -474,7 +529,7 @@ impl NavStack {
         };
         loop {
             if node.view != *current_view { return false; }
-            if node.stream.is_some() { return true; }
+            if node.has_live_stream() { return true; }
             match node.parent.as_deref() {
                 Some(p) => node = p,
                 None => return false,
@@ -503,15 +558,17 @@ impl NavStack {
         f(node)
     }
 
-    /// Clear any `stream: Some(_)` handle on steps whose view matches
-    /// `rid`. Called when a subscription for this rid has terminated
-    /// server-side (error, EOF) — the bridge task is already finished,
-    /// but the handle in `NavStep.stream` is still sitting there claiming
-    /// "subscription is live". Without this clear, a subsequent Esc
-    /// pop-back past the failing rid would consult
-    /// `same_view_ancestor_has_stream`, find this dead handle, treat it
-    /// as an alive owner, and skip re-subscribing — the view would stay
-    /// permanently stale until the user hit Ctrl-R.
+    /// Clear any `stream: Some(_)` handle on steps whose view matches `rid`.
+    /// Called when a subscription for this rid has terminated server-side
+    /// (error, EOF) — the bridge task is already finished, but its handle is
+    /// still sitting in `NavStep.stream`. Eagerly dropping it frees the handle
+    /// at the moment of failure rather than waiting for the next pop.
+    ///
+    /// Pop's re-subscribe decision independently guards against a stale handle
+    /// (it consults `has_live_stream`, not mere presence), so this is no longer
+    /// the *sole* defense against a dead owner suppressing re-subscribe — but
+    /// it's still worth doing eagerly, and the same event carries the
+    /// user-facing Failed state + error flash.
     pub fn clear_dead_subscription_for(&mut self, rid: &ResourceId) {
         let target = ViewId::Resource(rid.clone());
         let mut node: &mut NavStep = &mut self.top;
@@ -526,11 +583,12 @@ impl NavStack {
         }
     }
 
-    /// Drop every `SubscriptionStream` handle in the entire stack.
-    /// Called on session rebuild (context switch or reconnect) — the old
-    /// session is dead so every handle is a no-op `AbortHandle` to a
-    /// finished task, but leaving them in place tricks
-    /// `same_view_ancestor_has_stream()` into skipping re-subscribe.
+    /// Drop every `SubscriptionStream` handle in the entire stack. Called on
+    /// session rebuild (context switch or reconnect) — the old session is dead,
+    /// so every handle is a no-op `AbortHandle` to a finished task. Pop's
+    /// liveness check (`has_live_stream`) would skip these dead handles anyway,
+    /// but clearing them eagerly keeps the stack honest rather than holding
+    /// finished-task handles across the rebuild.
     pub fn clear_all_streams(&mut self) {
         let mut node: &mut NavStep = &mut self.top;
         loop {
@@ -561,6 +619,7 @@ impl NavStack {
         NavChange {
             subscribe: Some(rid),
             subscription_filter: None,
+            namespace: None,
         }
     }
 
@@ -750,7 +809,7 @@ impl NavStack {
                 Some(NavFilter::Grep(g)) => parts.push(format!("/{}", g.source())),
                 Some(NavFilter::ColumnGrep { pattern, col }) => parts.push(format!("~{}:{}", col, pattern.source())),
                 Some(NavFilter::Fault) => parts.push("⚠ fault".to_string()),
-                Some(NavFilter::Labels(labels)) => {
+                Some(NavFilter::Labels { labels, .. }) => {
                     let label_str: Vec<String> = labels.iter()
                         .map(|(k, v)| format!("{}={}", k, v))
                         .collect();
@@ -917,6 +976,35 @@ mod tests {
     }
 
     #[test]
+    fn node_drill_subscribes_all_namespaces() {
+        // node → pods (spec.nodeName) is a fresh, cluster-wide subscription —
+        // a node hosts pods from every namespace, so the source view's selected
+        // namespace must not narrow it.
+        let mut stack = NavStack::new(node_rid());
+        let change = stack.push(NavStep::new(
+            pod_rid(),
+            Some(NavFilter::Field(K8sFieldSelector::SpecNodeName("node-1".into()))),
+        ));
+        assert_eq!(
+            change.namespace,
+            Some(crate::kube::protocol::Namespace::All),
+            "node→pods drill must override the namespace to all-namespaces",
+        );
+    }
+
+    #[test]
+    fn non_node_drill_inherits_selected_namespace() {
+        // A MetadataName field drill (e.g. the `o`/owner jumps) carries no
+        // namespace override — it inherits the session's selected namespace.
+        let mut stack = NavStack::new(pod_rid());
+        let change = stack.push(NavStep::new(
+            node_rid(),
+            Some(NavFilter::Field(K8sFieldSelector::MetadataName("worker-3".into()))),
+        ));
+        assert_eq!(change.namespace, None, "non-node drills inherit the selected namespace");
+    }
+
+    #[test]
     fn pop_restores_previous_resource() {
         let mut stack = NavStack::new(pod_rid());
         stack.push(NavStep::new(deploy_rid(), None));
@@ -924,6 +1012,50 @@ mod tests {
         let result = stack.pop();
         assert!(result.is_some());
         assert_eq!(stack.view_id(), &pod_view());
+    }
+
+    /// A `SubscriptionStream` whose bridge task has already finished
+    /// (`is_alive()` is false) — stands in for a terminated subscription whose
+    /// handle is still sitting in the nav stack.
+    async fn dead_stream() -> crate::kube::client_session::SubscriptionStream {
+        let task = tokio::spawn(async {});
+        let abort = task.abort_handle();
+        let _ = task.await; // the task is now finished
+        crate::kube::client_session::SubscriptionStream::from_abort_handle(abort)
+    }
+
+    /// A `SubscriptionStream` whose bridge task is still running.
+    fn live_stream() -> crate::kube::client_session::SubscriptionStream {
+        let task = tokio::spawn(std::future::pending::<()>());
+        crate::kube::client_session::SubscriptionStream::from_abort_handle(task.abort_handle())
+    }
+
+    #[tokio::test]
+    async fn pop_resubscribes_when_restored_owner_stream_is_dead() {
+        // pods (DEAD stream) → drill to deployments → pop back to pods.
+        let mut stack = NavStack::new(pod_rid());
+        stack.top.stream = Some(dead_stream().await);
+        stack.push(NavStep::new(deploy_rid(), None));
+
+        let (_popped, change) = stack.pop().expect("not at root");
+        assert!(
+            change.subscribe.is_some(),
+            "a present-but-dead owner stream must trigger re-subscribe, not pass as live",
+        );
+    }
+
+    #[tokio::test]
+    async fn pop_inherits_when_restored_owner_stream_is_live() {
+        // pods (LIVE stream) → drill to deployments → pop back to pods.
+        let mut stack = NavStack::new(pod_rid());
+        stack.top.stream = Some(live_stream());
+        stack.push(NavStep::new(deploy_rid(), None));
+
+        let (_popped, change) = stack.pop().expect("not at root");
+        assert!(
+            change.subscribe.is_none(),
+            "a live owner stream must be inherited — re-subscribing would dup the watcher and wipe rows",
+        );
     }
 
     #[test]
@@ -1186,7 +1318,7 @@ mod tests {
     fn labels_filter_returns_subscription_labels() {
         let mut labels = std::collections::BTreeMap::new();
         labels.insert("app".into(), "web".into());
-        let f = NavFilter::Labels(labels.clone());
+        let f = NavFilter::Labels { labels: labels.clone(), namespace: crate::kube::protocol::Namespace::All };
         assert_eq!(
             f.to_subscription_filter(),
             Some(SubscriptionFilter::Labels(labels)),
@@ -1208,6 +1340,7 @@ mod tests {
             uid: "abc-123".into(),
             kind: BuiltInKind::Deployment,
             display_name: "my-deploy".into(),
+            namespace: crate::kube::protocol::Namespace::All,
         };
         assert_eq!(
             f.to_subscription_filter(),

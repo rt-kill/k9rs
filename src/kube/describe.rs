@@ -14,7 +14,10 @@
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
 use kube::discovery::{self, Scope};
 
-use crate::kube::protocol::{Namespace, ObjectRef, ResourceId, ResourceScope};
+use crate::kube::protocol::{
+    DescribeLine, DescribeLineKind, Namespace, ObjectRef, ResourceId, ResourceScope,
+};
+use crate::kube::session_env::SessionEnv;
 
 /// Build an `Api<DynamicObject>` for the given ApiResource + scope +
 /// namespace. Centralizes the four-way `match scope { Cluster, Namespaced
@@ -52,11 +55,54 @@ pub async fn fetch_describe(
     client: &kube::Client,
     target: &ObjectRef,
     context: &crate::kube::protocol::ContextName,
-) -> String {
+    session_env: &SessionEnv,
+) -> Vec<DescribeLine> {
     match fetch_describe_via_api(client, target).await {
-        Ok(content) => content,
-        Err(_) => fetch_describe_via_kubectl(target, context).await,
+        Ok(lines) => lines,
+        Err(_) => fetch_describe_via_kubectl(target, context, session_env).await,
     }
+}
+
+/// Classify one line of *opaque* text (kubectl describe output, a decoded
+/// secret, a local-resource describe) into a [`DescribeLineKind`]. This is the
+/// same best-effort heuristic the UI used to run at render time, lifted to the
+/// producer side — for text whose structure isn't otherwise known, inference is
+/// legitimate (nothing the producer knows is being discarded). Structured
+/// producers like [`format_describe`] tag precisely instead of calling this.
+pub fn classify_describe_line(text: &str) -> DescribeLineKind {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        DescribeLineKind::Plain
+    } else if trimmed.ends_with(':') && trimmed.len() > 1 {
+        DescribeLineKind::Section
+    } else if let Some(rel) = trimmed.find(':') {
+        // `key_end` is the colon's byte index in the full (indented) line.
+        let indent = text.len() - text.trim_start().len();
+        DescribeLineKind::Field { key_end: indent + rel }
+    } else {
+        DescribeLineKind::Plain
+    }
+}
+
+/// Split opaque multi-line text into classified [`DescribeLine`]s. Used by the
+/// kubectl-fallback, secret-decode, and local-resource describe paths.
+pub fn describe_lines_from_text(text: &str) -> Vec<DescribeLine> {
+    text.lines().map(classified).collect()
+}
+
+/// Build one describe line by classifying its text. `Into<String>` so callers
+/// can hand over either an owned `String` or a `&str` line.
+fn classified(text: impl Into<String>) -> DescribeLine {
+    let text = text.into();
+    let kind = classify_describe_line(&text);
+    DescribeLine { text, kind }
+}
+
+/// Build a `key: value` field line, locating the structural colon the producer
+/// just wrote (the label always precedes the value, so the first `:` is it).
+fn field_line(text: String) -> DescribeLine {
+    let key_end = text.find(':').unwrap_or(text.len());
+    DescribeLine::field(text, key_end)
 }
 
 /// Fetch YAML for a resource. Tries the kube API first (fast, no subprocess),
@@ -65,10 +111,11 @@ pub async fn fetch_yaml(
     client: &kube::Client,
     target: &ObjectRef,
     context: &crate::kube::protocol::ContextName,
+    session_env: &SessionEnv,
 ) -> String {
     match fetch_yaml_via_api(client, target).await {
         Ok(yaml) => yaml,
-        Err(_) => fetch_yaml_via_kubectl(target, context).await,
+        Err(_) => fetch_yaml_via_kubectl(target, context, session_env).await,
     }
 }
 
@@ -178,122 +225,133 @@ async fn fetch_yaml_via_api(
 async fn fetch_describe_via_api(
     client: &kube::Client,
     target: &ObjectRef,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Vec<DescribeLine>> {
     let (ar, scope) = api_resource_for(client, &target.resource).await?;
     let api = dynamic_api_for(client, &ar, scope, &target.namespace);
     let obj = api.get(&target.name).await?;
     Ok(format_describe(&obj))
 }
 
-/// Format a DynamicObject into a human-readable describe view.
-fn format_describe(obj: &kube::api::DynamicObject) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
+/// Format a DynamicObject into a human-readable describe view. Each line is
+/// emitted with its role tagged: the producer knows what it is writing (a
+/// header field, a section, a continuation, nested YAML), so it never has to be
+/// re-inferred downstream. Top-level fields are tagged precisely; nested YAML
+/// sub-content is classified (its inner structure isn't known here).
+fn format_describe(obj: &kube::api::DynamicObject) -> Vec<DescribeLine> {
+    let mut lines: Vec<DescribeLine> = Vec::new();
     let meta = &obj.metadata;
+    let blank = || DescribeLine::plain(String::new());
 
     // Header
     let kind = obj.types.as_ref().map(|t| t.kind.as_str()).unwrap_or("Resource");
-    let _ = writeln!(out, "Name:         {}", meta.name.as_deref().unwrap_or(""));
-    let _ = writeln!(out, "Namespace:    {}", meta.namespace.as_deref().unwrap_or("<none>"));
+    lines.push(field_line(format!("Name:         {}", meta.name.as_deref().unwrap_or(""))));
+    lines.push(field_line(format!("Namespace:    {}", meta.namespace.as_deref().unwrap_or("<none>"))));
     if let Some(uid) = &meta.uid {
-        let _ = writeln!(out, "UID:          {}", uid);
+        lines.push(field_line(format!("UID:          {}", uid)));
     }
     if let Some(ref ts) = meta.creation_timestamp {
-        let _ = writeln!(out, "Created:      {}", ts.0.to_rfc3339());
+        lines.push(field_line(format!("Created:      {}", ts.0.to_rfc3339())));
     }
 
     // Labels
-    let _ = writeln!(out);
+    lines.push(blank());
     if let Some(ref labels) = meta.labels {
         if labels.is_empty() {
-            let _ = writeln!(out, "Labels:       <none>");
+            lines.push(field_line("Labels:       <none>".to_string()));
         } else {
             for (i, (k, v)) in labels.iter().enumerate() {
                 if i == 0 {
-                    let _ = writeln!(out, "Labels:       {}={}", k, v);
+                    lines.push(field_line(format!("Labels:       {}={}", k, v)));
                 } else {
-                    let _ = writeln!(out, "              {}={}", k, v);
+                    // Continuation value — no structural key.
+                    lines.push(DescribeLine::plain(format!("              {}={}", k, v)));
                 }
             }
         }
     } else {
-        let _ = writeln!(out, "Labels:       <none>");
+        lines.push(field_line("Labels:       <none>".to_string()));
     }
 
     // Annotations
     if let Some(ref annotations) = meta.annotations {
         if annotations.is_empty() {
-            let _ = writeln!(out, "Annotations:  <none>");
+            lines.push(field_line("Annotations:  <none>".to_string()));
         } else {
             for (i, (k, v)) in annotations.iter().enumerate() {
-                let display_v = if v.len() > 80 { format!("{}...", &v[..77]) } else { v.clone() };
+                // Char-boundary-safe truncation: annotation values are arbitrary
+                // UTF-8, so a byte-index slice (`&v[..77]`) would panic mid-codepoint
+                // and crash this describe task daemon-side.
+                let display_v = crate::util::truncate(v, 80);
                 if i == 0 {
-                    let _ = writeln!(out, "Annotations:  {}={}", k, display_v);
+                    lines.push(field_line(format!("Annotations:  {}={}", k, display_v)));
                 } else {
-                    let _ = writeln!(out, "              {}={}", k, display_v);
+                    lines.push(DescribeLine::plain(format!("              {}={}", k, display_v)));
                 }
             }
         }
     } else {
-        let _ = writeln!(out, "Annotations:  <none>");
+        lines.push(field_line("Annotations:  <none>".to_string()));
     }
 
     // Owner references
     if let Some(ref owners) = meta.owner_references {
-        let _ = writeln!(out);
+        lines.push(blank());
         for owner in owners {
-            let _ = writeln!(out, "Controlled By:  {}/{}", owner.kind, owner.name);
+            lines.push(field_line(format!("Controlled By:  {}/{}", owner.kind, owner.name)));
         }
     }
 
     // Spec + Status as YAML subsections
     if let Some(spec) = obj.data.get("spec") {
-        let _ = writeln!(out);
-        let _ = writeln!(out, "Spec:");
+        lines.push(blank());
+        lines.push(DescribeLine::section("Spec:"));
         if let Ok(yaml) = serde_yaml::to_string(spec) {
             for line in yaml.lines() {
-                let _ = writeln!(out, "  {}", line);
+                lines.push(classified(format!("  {}", line)));
             }
         }
     }
     if let Some(status) = obj.data.get("status") {
-        let _ = writeln!(out);
-        let _ = writeln!(out, "Status:");
+        lines.push(blank());
+        lines.push(DescribeLine::section("Status:"));
         if let Ok(yaml) = serde_yaml::to_string(status) {
             for line in yaml.lines() {
-                let _ = writeln!(out, "  {}", line);
+                lines.push(classified(format!("  {}", line)));
             }
         }
     }
 
     // Type header for context
-    let _ = writeln!(out);
-    let _ = writeln!(out, "Kind:         {}", kind);
+    lines.push(blank());
+    lines.push(field_line(format!("Kind:         {}", kind)));
 
-    out
+    lines
 }
 
 // ---------------------------------------------------------------------------
 // kubectl fallbacks
 // ---------------------------------------------------------------------------
 
-async fn fetch_describe_via_kubectl(target: &ObjectRef, context: &crate::kube::protocol::ContextName) -> String {
-    let mut cmd = tokio::process::Command::new("kubectl");
+async fn fetch_describe_via_kubectl(target: &ObjectRef, context: &crate::kube::protocol::ContextName, session_env: &SessionEnv) -> Vec<DescribeLine> {
+    let mut cmd = session_env.kubectl();
     cmd.arg("describe").arg(target.kubectl_target());
     if !context.is_empty() { cmd.arg("--context").arg(context.as_str()); }
     if let Some(ns) = target.namespace.as_option() { cmd.arg("-n").arg(ns); }
     cmd.kill_on_drop(true);
-    match cmd.output().await {
+    // kubectl's output has no producer-side structure for us — classify each
+    // line (same as the UI used to, now done once here).
+    let text = match cmd.output().await {
         Ok(output) if output.status.success() => {
             crate::util::strip_ansi(&String::from_utf8_lossy(&output.stdout))
         }
         Ok(output) => format!("Error running kubectl describe:\n{}", String::from_utf8_lossy(&output.stderr)),
         Err(e) => format!("Failed to run kubectl: {}", e),
-    }
+    };
+    describe_lines_from_text(&text)
 }
 
-async fn fetch_yaml_via_kubectl(target: &ObjectRef, context: &crate::kube::protocol::ContextName) -> String {
-    let mut cmd = tokio::process::Command::new("kubectl");
+async fn fetch_yaml_via_kubectl(target: &ObjectRef, context: &crate::kube::protocol::ContextName, session_env: &SessionEnv) -> String {
+    let mut cmd = session_env.kubectl();
     cmd.arg("get").arg(target.kubectl_target()).arg("-o").arg("yaml");
     if !context.is_empty() { cmd.arg("--context").arg(context.as_str()); }
     if let Some(ns) = target.namespace.as_option() { cmd.arg("-n").arg(ns); }
@@ -302,5 +360,88 @@ async fn fetch_yaml_via_kubectl(target: &ObjectRef, context: &crate::kube::proto
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).to_string(),
         Ok(output) => format!("Error fetching YAML:\n{}", String::from_utf8_lossy(&output.stderr)),
         Err(e) => format!("Failed to run kubectl: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod describe_line_tests {
+    use super::*;
+    use crate::kube::protocol::{describe_lines_text, DescribeLineKind};
+
+    #[test]
+    fn classify_blank_and_no_colon_are_plain() {
+        assert_eq!(classify_describe_line(""), DescribeLineKind::Plain);
+        assert_eq!(classify_describe_line("    "), DescribeLineKind::Plain);
+        assert_eq!(classify_describe_line("- item"), DescribeLineKind::Plain);
+        assert_eq!(classify_describe_line("              app=foo"), DescribeLineKind::Plain);
+    }
+
+    #[test]
+    fn classify_section_ends_with_colon() {
+        assert_eq!(classify_describe_line("Spec:"), DescribeLineKind::Section);
+        assert_eq!(classify_describe_line("  Limits:"), DescribeLineKind::Section);
+    }
+
+    #[test]
+    fn classify_field_colon_is_absolute_index() {
+        // Top-level: colon at byte 4.
+        assert_eq!(classify_describe_line("Name:         foo"), DescribeLineKind::Field { key_end: 4 });
+        // Indented YAML sub-line: key_end is the absolute index (indent 2 + 8).
+        assert_eq!(classify_describe_line("  replicas: 3"), DescribeLineKind::Field { key_end: 10 });
+    }
+
+    #[test]
+    fn field_line_targets_label_colon_not_value_colon() {
+        // The fragility the typed wire fixes. `field_line` (used by the
+        // structured producer) tags at the LABEL's colon, ignoring colons in
+        // the value...
+        assert_eq!(
+            field_line("Annotations:  ref: a:b".to_string()).kind,
+            DescribeLineKind::Field { key_end: 11 }, // "Annotations".len()
+        );
+        // ...and keeps a value that ENDS in ':' a Field, where the opaque
+        // heuristic used to (and still, for genuinely-opaque text) reads it as
+        // a Section header. This divergence is exactly the bug being fixed.
+        assert_eq!(
+            field_line("Annotations:  trailing:".to_string()).kind,
+            DescribeLineKind::Field { key_end: 11 },
+        );
+        assert_eq!(
+            classify_describe_line("Annotations:  trailing:"),
+            DescribeLineKind::Section,
+        );
+    }
+
+    #[test]
+    fn flat_projection_roundtrips_line_count() {
+        // Flatten-then-split must preserve the line count exactly (no trailing
+        // newline drift, no embedded newlines) so search/scroll/line_count are
+        // unaffected by the typed representation.
+        let lines = describe_lines_from_text("a: 1\nSection:\n  b: 2\n\n- x");
+        assert_eq!(lines.len(), 5);
+        assert_eq!(describe_lines_text(&lines).lines().count(), lines.len());
+    }
+
+    #[test]
+    fn format_describe_tags_precisely() {
+        let obj: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "foo", "namespace": "default" },
+            "spec": { "replicas": 3 },
+        }))
+        .expect("valid DynamicObject");
+        let lines = format_describe(&obj);
+
+        // The Name field is tagged Field by the producer (not inferred).
+        assert!(matches!(lines[0].kind, DescribeLineKind::Field { .. }));
+        assert!(lines[0].text.starts_with("Name:"));
+        // The Spec subsection header is a Section; the Kind footer a Field.
+        assert!(lines.iter().any(|l| l.text == "Spec:" && l.kind == DescribeLineKind::Section));
+        assert!(lines
+            .iter()
+            .any(|l| l.text.starts_with("Kind:") && matches!(l.kind, DescribeLineKind::Field { .. })));
+        // Flat projection round-trips for search/scroll.
+        assert_eq!(describe_lines_text(&lines).lines().count(), lines.len());
     }
 }

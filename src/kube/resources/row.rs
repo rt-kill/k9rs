@@ -59,6 +59,16 @@ impl CellValue {
             CellValue::List(s.split(',').filter(|p| !p.is_empty()).map(String::from).collect())
         }
     }
+
+    /// The raw numeric value if this is a [`CellValue::Quantity`] (millicores or
+    /// bytes), else `None`. Used by the metrics overlay to read a node's
+    /// allocatable CPU/MEM and compute the percent columns.
+    pub fn quantity_value(&self) -> Option<u64> {
+        match self {
+            CellValue::Quantity { value, .. } => Some(*value),
+            _ => None,
+        }
+    }
 }
 
 // ---- Display ----------------------------------------------------------------
@@ -270,6 +280,21 @@ pub struct ContainerInfo {
     pub restart_count: i32,
 }
 
+impl ContainerInfo {
+    /// Display name for the container list: regular containers show their bare
+    /// name; init containers get an `init:` prefix so the user can tell them
+    /// apart. Derived from the typed `kind` discriminant — the prefix is never
+    /// carried in `name` (which stays exactly what `kubectl exec/logs` expects).
+    /// Single source of truth for the derived-view rows (`project_containers`)
+    /// and the container-select dialog.
+    pub fn display_name(&self) -> String {
+        match self.kind {
+            ContainerKind::Init => format!("init:{}", self.name),
+            ContainerKind::Regular => self.name.clone(),
+        }
+    }
+}
+
 /// Init vs regular container. Defaults to `Regular` for forward compat
 /// with snapshots that pre-date this field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,10 +320,11 @@ pub struct OwnerRefInfo {
 /// The client reads this blindly and constructs the appropriate nav action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DrillTarget {
-    /// Switch to a different namespace (used by namespace rows). Typed
-    /// as `Namespace` because this is a *selection* (the user picking a
-    /// scope), not a location string.
-    SwitchNamespace(crate::kube::protocol::Namespace),
+    /// Enter a namespace: make it the active scope and drill into the pods
+    /// running in it (what k9s does on Enter over a namespace row). Typed as
+    /// `Namespace` because this is a *selection* — the user picking a scope —
+    /// not a location string. Only namespace rows produce this variant.
+    PodsInNamespace(crate::kube::protocol::Namespace),
     /// Push a CRD-instance view onto the nav stack. Wraps a [`crate::kube::protocol::CrdRef`]
     /// so the drill handler can build a `ResourceId::Crd(...)` directly
     /// without re-marshaling fields.

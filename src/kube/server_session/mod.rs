@@ -7,6 +7,7 @@
 //!
 //! Wire format: length-prefixed bincode (see protocol.rs).
 
+mod client_build;
 mod ops;
 mod streaming;
 
@@ -14,12 +15,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::live_query::WatcherCache;
 use super::protocol::{self, SessionCommand, SessionEvent};
+use crate::kube::session_env::SessionEnv;
 
 
 // ---------------------------------------------------------------------------
@@ -41,18 +43,6 @@ struct InitParams {
 // SessionSharedState — opaque to the daemon, holds kube-aware shared state
 // ---------------------------------------------------------------------------
 
-/// A request submitted to the single-owner client-builder task. The builder
-/// loop drains these one at a time, mutates process-global env vars in
-/// isolation (no concurrent reader), constructs the `kube::Client`, and
-/// hands the result back via `reply`. Replaces the `client_creation_lock`
-/// `Mutex<()>` that used to fence env-var mutations.
-struct ClientBuilderRequest {
-    kubeconfig_yaml: String,
-    env_vars: HashMap<String, String>,
-    context: Option<protocol::ContextName>,
-    reply: tokio::sync::oneshot::Sender<anyhow::Result<(kube::Client, kube::Config)>>,
-}
-
 /// Shared state for all `ServerSession`s, created once at daemon startup.
 pub struct SessionSharedState {
     pub(super) watcher_cache: WatcherCache,
@@ -63,13 +53,17 @@ pub struct SessionSharedState {
     /// namespace fetch can't erase a prior cached CRD list and vice-versa —
     /// the cache can't be partially poisoned.
     pub discovery_cache: super::cache::DiscoveryCache,
-    /// Channel into the single-owner client-builder task. Sessions submit
-    /// `ClientBuilderRequest`s here and await the oneshot reply. The builder
-    /// task is the only place that touches process-global env vars, which
-    /// removes the need for any lock or `unsafe` synchronization on the
-    /// caller side. (`std::env::set_var` is process-global; with one owner,
-    /// it can't race.)
-    client_builder_tx: mpsc::Sender<ClientBuilderRequest>,
+    /// Shared per-`ContextId` metrics + discovery pollers, so N sessions on one
+    /// cluster poll it once instead of N times — the same sharing `watcher_cache`
+    /// gives resource watches. See [`crate::kube::shared_poller`].
+    metrics_pollers: crate::kube::shared_poller::PollerCache<crate::kube::metrics::MetricsSnapshot>,
+    discovery_pollers: crate::kube::shared_poller::PollerCache<streaming::DiscoverySnapshot>,
+    /// Bounds concurrent `kube::Client` builds. Each build can run a blocking
+    /// exec credential plugin (`aws eks get-token`); without a cap a reconnect
+    /// storm would fork that many auth subprocesses and occupy that many
+    /// blocking-pool threads at once. (The old single-owner builder task
+    /// effectively capped this at one in-flight build.)
+    client_build_semaphore: Semaphore,
     /// Monotonic session ID counter for structured logging.
     next_session_id: std::sync::atomic::AtomicU64,
 }
@@ -82,65 +76,31 @@ impl Default for SessionSharedState {
 
 impl SessionSharedState {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel::<ClientBuilderRequest>(16);
-        // The builder task is detached for the daemon's lifetime. It exits
-        // when the channel closes, which happens when the last
-        // `SessionSharedState` is dropped (i.e. daemon shutdown).
-        tokio::spawn(client_builder_loop(rx));
+        Self::with_local_grace(Some(std::time::Duration::from_secs(
+            crate::kube::GRACE_PERIOD_SECS,
+        )))
+    }
+
+    /// For `--no-daemon`: this state lives inside a single connection, so a
+    /// post-session grace window for local resources could never be
+    /// recovered — skip it and tear them down with the connection.
+    pub fn new_single_session() -> Self {
+        Self::with_local_grace(None)
+    }
+
+    fn with_local_grace(local_grace: Option<std::time::Duration>) -> Self {
         Self {
             watcher_cache: WatcherCache::new(),
             local_registry: Arc::new(crate::kube::local::LocalRegistry::new(
                 crate::kube::daemon_config::daemon_config().exec_resources.clone(),
+                local_grace,
             )),
             discovery_cache: super::cache::DiscoveryCache::new(),
-            client_builder_tx: tx,
+            metrics_pollers: crate::kube::shared_poller::PollerCache::new(),
+            discovery_pollers: crate::kube::shared_poller::PollerCache::new(),
+            client_build_semaphore: Semaphore::new(MAX_CONCURRENT_CLIENT_BUILDS),
             next_session_id: std::sync::atomic::AtomicU64::new(1),
         }
-    }
-}
-
-/// The single-owner client-builder loop. Owns process-global env vars; no
-/// other code in the daemon mutates them. Each request runs to completion
-/// before the next is dequeued, so even though we shadow process env vars,
-/// we never race with another reader.
-async fn client_builder_loop(mut rx: mpsc::Receiver<ClientBuilderRequest>) {
-    use kube::config::{Config, KubeConfigOptions, Kubeconfig};
-
-    while let Some(req) = rx.recv().await {
-        let result: anyhow::Result<(kube::Client, kube::Config)> = async {
-            for (key, value) in &req.env_vars {
-                // SAFETY: This task is the only writer of env vars in the
-                // daemon — `client_builder_loop` is spawned exactly once
-                // from `SessionSharedState::new`, and nothing else calls
-                // `std::env::set_var`. So there is no concurrent reader,
-                // and the process-global mutation is sequential.
-                #[allow(unused_unsafe)]
-                unsafe { std::env::set_var(key, value); }
-            }
-
-            let kubeconfig: Kubeconfig = serde_yaml::from_str(&req.kubeconfig_yaml)
-                .map_err(|e| anyhow::anyhow!("Failed to parse kubeconfig YAML: {}", e))?;
-
-            let context_name: Option<protocol::ContextName> = req.context.clone()
-                .or_else(|| kubeconfig.current_context.clone().map(protocol::ContextName::from));
-
-            let options = KubeConfigOptions {
-                context: context_name.as_ref().map(|c| c.as_str().to_owned()),
-                ..Default::default()
-            };
-
-            let mut config = Config::from_custom_kubeconfig(kubeconfig, &options).await
-                .map_err(|e| anyhow::anyhow!("Failed to create config from kubeconfig: {}", e))?;
-
-            config.read_timeout = Some(std::time::Duration::from_secs(300));
-            config.connect_timeout = Some(std::time::Duration::from_secs(30));
-
-            let client = kube::Client::try_from(config.clone())?;
-            Ok((client, config))
-        }.await;
-
-        // Receiver may be gone if the calling session bailed; ignore.
-        let _ = req.reply.send(result);
     }
 }
 
@@ -149,6 +109,11 @@ async fn client_builder_loop(mut rx: mpsc::Receiver<ClientBuilderRequest>) {
 // ---------------------------------------------------------------------------
 
 const EVENT_CHANNEL_CAPACITY: usize = 512;
+
+/// Max concurrent `kube::Client` builds (see [`SessionSharedState`]). Generous
+/// enough that opening several clusters at once stays parallel, bounded enough
+/// that a connection storm can't fork unbounded auth subprocesses.
+const MAX_CONCURRENT_CLIENT_BUILDS: usize = 8;
 
 // ---------------------------------------------------------------------------
 // SessionContext — shared between the control loop and substream tasks
@@ -164,11 +129,20 @@ const EVENT_CHANNEL_CAPACITY: usize = 512;
 pub(crate) struct SessionContext {
     pub shared: Arc<SessionSharedState>,
     pub client: kube::Client,
-    pub client_config: Option<kube::Config>,
+    /// The session's process env, applied to every `kubectl` subprocess the
+    /// substream tasks spawn (logs fallback, exec PTY) so they authenticate as
+    /// this session rather than the daemon's startup env.
+    pub session_env: SessionEnv,
     pub context: protocol::ContextId,
     /// Session ID for structured logging in substream tasks.
     pub session_id: u64,
     pub streaming_lists: bool,
+    /// This session's strong hold on the context's local resources
+    /// (port-forwards, exec sources). Held here AND on `ServerSession` so
+    /// every path that can serve a local op keeps the slice out of grace;
+    /// when the session's last holder drops, the context's grace window
+    /// begins.
+    pub locals: crate::kube::local::ContextKeepalive,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,10 +154,18 @@ pub struct ServerSession {
     shared: Arc<SessionSharedState>,
     client: kube::Client,
     client_config: Option<kube::Config>,
+    /// The session's process env, applied to every `kubectl` subprocess the
+    /// handlers spawn (describe/yaml/delete fallbacks, port-forward).
+    session_env: SessionEnv,
     context: protocol::ContextId,
     // `namespace` field removed — session doesn't need session-level
     // namespace state. Each subscription carries its own in `SubscriptionInit`.
     readonly: bool,
+    /// Strong hold on this context's local resources — the command loop
+    /// serves describe/yaml/delete/pf-create for them, so it must keep the
+    /// slice out of grace for the session's whole life (see
+    /// `SessionContext::locals` for the substream half).
+    locals: crate::kube::local::ContextKeepalive,
     metrics_task: Option<JoinHandle<()>>,
     /// Background loop that periodically re-runs discovery (namespaces +
     /// CRDs), so new namespaces / new CRDs land in the cache and reach the
@@ -206,6 +188,8 @@ impl ServerSession {
         client: kube::Client,
         context: protocol::ContextId,
         readonly: bool,
+        session_env: SessionEnv,
+        locals: crate::kube::local::ContextKeepalive,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         Self {
@@ -213,8 +197,10 @@ impl ServerSession {
             shared,
             client,
             client_config: None,
+            session_env,
             context,
             readonly,
+            locals,
             metrics_task: None,
             discovery_refresher_task: None,
             pending_tasks: tokio::task::JoinSet::new(),
@@ -475,8 +461,13 @@ impl ServerSession {
             }
         };
 
+        // The session's env, owned and applied to every subprocess spawned on
+        // its behalf (the in-process client's exec plugin + every `kubectl`).
+        // Never written to the daemon's process env.
+        let session_env = SessionEnv::new(init.env_vars.clone());
+
         // 3. Create kube::Client from kubeconfig + env vars.
-        let (client, client_config) = match Self::create_client_from_init(&init, &shared).await {
+        let (client, client_config) = match Self::create_client_from_init(&init, &session_env, &shared).await {
             Ok(c) => {
                 debug!("created kube::Client for context '{}'", context_name);
                 c
@@ -491,18 +482,20 @@ impl ServerSession {
             }
         };
 
-        // Build ContextId from context name + server URL + user identity.
+        // Build ContextId from context name + server URL + a fingerprint of the
+        // *resolved credentials* (NOT the user name) — two same-named users with
+        // different creds on one cluster must never share a watcher. See ContextId.
         let context_id = protocol::ContextId::new(
             context_name.clone(),
             client_config.cluster_url.to_string(),
-            init.identity.user.clone(),
+            client_build::fingerprint_auth(&client_config.auth_info),
         );
 
         // 4. Fetch K8s server version (best-effort, non-blocking for Ready).
         let mut identity = init.identity.clone();
         let streaming_lists = if let Ok(info) = client.apiserver_version().await {
             identity.k8s_version = info.git_version.clone();
-            parse_k8s_minor(&info.git_version).map_or(false, |minor| minor >= 32)
+            parse_k8s_minor(&info.git_version).is_some_and(|minor| minor >= 32)
         } else {
             false
         };
@@ -516,6 +509,14 @@ impl ServerSession {
             return;
         }
 
+        // Attach to the context's local-resource slice (port-forwards, exec
+        // sources). One attach per session, cloned to every holder that can
+        // serve a local op — the command loop (ServerSession) and the
+        // substream tasks (SessionContext). The slice stays alive while any
+        // holder lives; the session's end drops them all, starting the
+        // context's grace window.
+        let locals = shared.local_registry.attach(&context_id);
+
         // 5. Build ServerSession and enter command loop.
         let mut session = ServerSession::new(
             buf_writer,
@@ -523,6 +524,8 @@ impl ServerSession {
             client.clone(),
             context_id.clone(),
             init.readonly,
+            session_env.clone(),
+            locals.clone(),
         );
         session.client_config = Some(client_config.clone());
 
@@ -534,10 +537,11 @@ impl ServerSession {
             let ctx = Arc::new(SessionContext {
                 shared,
                 client,
-                client_config: Some(client_config),
+                session_env,
                 context: context_id,
                 session_id,
                 streaming_lists,
+                locals,
             });
             let _ = tx.send(Some(ctx));
         }
@@ -564,25 +568,26 @@ impl ServerSession {
         }
     }
 
-    /// Create a `kube::Client` from the kubeconfig YAML + env vars sent by
-    /// the TUI. Delegates to the daemon-wide `client_builder_loop` so env
-    /// var mutations are serialized through one task — no `Mutex<()>` and
-    /// no concurrent process-global writes.
+    /// Build this session's `kube::Client` from the kubeconfig + env the TUI
+    /// sent, bounded by the daemon-wide build semaphore. The credentials are
+    /// pinned into the config it builds from (see
+    /// [`client_build::build_session_client`]) — the daemon never mutates
+    /// process-global env, so concurrent tenants don't cross-contaminate.
     async fn create_client_from_init(
         init: &InitParams,
+        session_env: &SessionEnv,
         shared: &SessionSharedState,
     ) -> anyhow::Result<(kube::Client, kube::Config)> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let req = ClientBuilderRequest {
-            kubeconfig_yaml: init.kubeconfig_yaml.clone(),
-            env_vars: init.env_vars.clone(),
-            context: init.context.clone(),
-            reply: reply_tx,
-        };
-        shared.client_builder_tx.send(req).await
-            .map_err(|_| anyhow::anyhow!("Client builder task is gone"))?;
-        reply_rx.await
-            .map_err(|_| anyhow::anyhow!("Client builder dropped reply"))?
+        // Bound concurrent (and individually blocking) client builds so a
+        // connection storm can't fork unbounded auth subprocesses or stall
+        // every async worker at once. The permit is held across the build.
+        let _permit = shared.client_build_semaphore.acquire().await
+            .map_err(|_| anyhow::anyhow!("client-build semaphore closed"))?;
+        client_build::build_session_client(
+            &init.kubeconfig_yaml,
+            init.context.as_ref(),
+            session_env,
+        ).await
     }
 
     // -----------------------------------------------------------------------
@@ -605,7 +610,7 @@ impl ServerSession {
         let reader_handle = tokio::spawn(async move {
             binary_reader_loop(reader, cmd_tx).await;
         });
-        let _reader_guard = AbortOnDrop(Some(reader_handle.abort_handle()));
+        let _reader_guard = crate::util::AbortOnDrop::new(reader_handle.abort_handle());
 
         let mut event_rx = self
             .event_rx
@@ -735,7 +740,7 @@ impl ServerSession {
             let content = self.describe_local(&obj.resource, &obj.name);
             self.send_event(&SessionEvent::DescribeResult {
                 target: obj.clone(),
-                content,
+                lines: crate::kube::describe::describe_lines_from_text(&content),
             }).await?;
         } else {
             self.handle_describe_async(obj);
@@ -815,7 +820,7 @@ impl ServerSession {
         view_name: &str,
         accessor: fn(&dyn crate::kube::local::LocalResourceSource, &str) -> Option<Result<String, String>>,
     ) -> String {
-        let Some(source) = self.shared.local_registry.get(&self.context.name, rid) else {
+        let Some(source) = self.locals.get(rid) else {
             return format!("Unknown local resource type: {}", rid.plural());
         };
         match accessor(&*source, name) {
@@ -961,7 +966,7 @@ async fn handle_subscription_substream_inner(
 
     // Local resources branch out into the LocalResourceSource pipeline.
     if rid.is_local() {
-        let Some(source) = ctx.shared.local_registry.get(&ctx.context.name, &rid) else {
+        let Some(source) = ctx.locals.get(&rid) else {
             let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Error(
                 format!("Unknown local resource: {}", rid.plural())
             )).await;
@@ -1009,16 +1014,13 @@ async fn handle_subscription_substream_inner(
         filter: cache_filter,
     };
 
-    // Defer kube::Client creation to cache miss — try_from is expensive
-    // (~800ms with exec-based auth) and unnecessary when reusing an
-    // existing watcher.
-    let make_client = || -> kube::Client {
-        if let Some(ref cfg) = ctx.client_config {
-            kube::Client::try_from(cfg.clone()).unwrap_or_else(|_| ctx.client.clone())
-        } else {
-            ctx.client.clone()
-        }
-    };
+    // Share the session's already-authenticated client across all of its
+    // watchers. Building a *fresh* client per watcher would re-run the exec
+    // credential plugin (~800ms, a synchronous subprocess) on an async worker
+    // thread — and under the `WatcherCache` shard lock, at that (the SEV-4
+    // finding). The clone is just an `Arc` bump; a session's watches multiplex
+    // over its one client (HTTP/2), which is the right default.
+    let make_client = || ctx.client.clone();
 
     // CRD arms (resolved and unresolved) produce a (gvk, plural, scope)
     // tuple for the shared subscribe_dynamic path. Built-ins subscribe
@@ -1037,7 +1039,7 @@ async fn handle_subscription_substream_inner(
             CrdOrSub::BuiltIn(if init.force {
                 ctx.shared.watcher_cache.subscribe_force(key.clone(), *kind, &make_client(), ctx.streaming_lists)
             } else {
-                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, &make_client, ctx.streaming_lists)
+                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, make_client, ctx.streaming_lists)
             })
         }
         protocol::ResourceId::Crd(crd_ref) => {
@@ -1115,7 +1117,7 @@ async fn handle_subscription_substream_inner(
                 ctx.shared.watcher_cache.remove(&resolved_key);
             }
             let sub = ctx.shared.watcher_cache.subscribe_dynamic(
-                resolved_key.clone(), &make_client, gvk.clone(),
+                resolved_key.clone(), make_client, gvk.clone(),
                 plural.clone(), scope, printer_columns.clone(), ctx.streaming_lists,
             );
             (sub, ResubInfo::Dynamic { key: resolved_key, gvk, plural, scope, printer_columns })
@@ -1209,11 +1211,11 @@ async fn handle_subscription_substream_inner(
         // Re-subscribe — WatcherCache sees the dead watcher and creates a fresh one.
         sub = match &resub {
             ResubInfo::BuiltIn { key, kind } => {
-                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, &make_client, ctx.streaming_lists)
+                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, make_client, ctx.streaming_lists)
             }
             ResubInfo::Dynamic { key, gvk, plural, scope, printer_columns } => {
                 ctx.shared.watcher_cache.subscribe_dynamic(
-                    key.clone(), &make_client, gvk.clone(),
+                    key.clone(), make_client, gvk.clone(),
                     plural.clone(), *scope, printer_columns.clone(), ctx.streaming_lists,
                 )
             }
@@ -1256,19 +1258,8 @@ fn apply_owner_filter_inline(
     }
 }
 
-/// RAII guard that aborts a tokio task when dropped. Used by
-/// `ServerSession::run` to make sure the binary reader is reaped on every
-/// exit path, including unwind. Holding the abort handle in an `Option`
-/// lets the guard be `Drop`'d explicitly without `Drop` running twice.
-struct AbortOnDrop(Option<tokio::task::AbortHandle>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            handle.abort();
-        }
-    }
-}
+// (`AbortOnDrop` lived here originally; it's now `crate::util::AbortOnDrop`,
+// shared with the local-operator supervisor.)
 
 // ---------------------------------------------------------------------------
 // Log substream handler
@@ -1345,7 +1336,10 @@ async fn stream_logs_via_api(
     while let Some(line_result) = futures::StreamExt::next(&mut lines).await {
         match line_result {
             Ok(line) => {
-                if protocol::write_bincode(writer, &line).await.is_err() { return Ok(()); }
+                // API path only serves Named/Default (All falls back to
+                // kubectl), so every line is single-source → untagged.
+                let log_line = protocol::LogLine::untagged(line);
+                if protocol::write_bincode(writer, &log_line).await.is_err() { return Ok(()); }
                 if writer.flush().await.is_err() { return Ok(()); }
             }
             Err(_) => break,
@@ -1372,6 +1366,22 @@ fn parse_since_to_seconds(s: &str) -> Option<i64> {
     s.parse().ok()
 }
 
+/// Split a kubectl `--all-containers` line into `(container, body)`. kubectl
+/// auto-enables `--prefix` for `--all-containers`, prepending `[source] ` to
+/// EVERY streamed line — so the first `[...] ` group is always kubectl's prefix,
+/// and the container's own line (brackets and all) follows it. That property is
+/// what makes this safe: we strip exactly the first prefix, never log content.
+/// `source` is `pod/container` (or just `container`); the container is its final
+/// `/`-separated component. Returns `None` for a line that doesn't open with a
+/// recognizable prefix — it then rides the wire untagged rather than guessing.
+fn split_all_containers_prefix(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix('[')?;
+    let close = rest.find("] ")?;
+    let source = &rest[..close];
+    let container = source.rsplit('/').next().unwrap_or(source);
+    Some((container, &rest[close + 2..]))
+}
+
 /// Fallback: stream logs via `kubectl logs` subprocess.
 async fn stream_logs_via_kubectl(
     init: &protocol::LogInit,
@@ -1380,7 +1390,7 @@ async fn stream_logs_via_kubectl(
 ) {
     use tokio::io::AsyncBufReadExt;
 
-    let mut cmd = tokio::process::Command::new("kubectl");
+    let mut cmd = ctx.session_env.kubectl();
     cmd.arg("logs").arg(&init.pod);
     match &init.container {
         protocol::LogContainer::All => { cmd.arg("--all-containers"); }
@@ -1419,8 +1429,20 @@ async fn stream_logs_via_kubectl(
     };
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
+    // Only `--all-containers` carries kubectl's `[source] ` prefix; tag those
+    // lines with the source container and strip the prefix. Single-container
+    // streams have no prefix and ride the wire untagged.
+    let all_containers = matches!(init.container, protocol::LogContainer::All);
     while let Ok(Some(line)) = lines.next_line().await {
-        if protocol::write_bincode(writer, &line).await.is_err() { break; }
+        let parsed = if all_containers { split_all_containers_prefix(&line) } else { None };
+        let log_line = match parsed {
+            Some((container, body)) => protocol::LogLine {
+                container: Some(container.to_owned()),
+                content: body.to_owned(),
+            },
+            None => protocol::LogLine::untagged(line),
+        };
+        if protocol::write_bincode(writer, &log_line).await.is_err() { break; }
         if writer.flush().await.is_err() { break; }
     }
 }
@@ -1460,7 +1482,7 @@ async fn handle_exec_substream(
     };
 
     // Spawn kubectl with the slave PTY as its controlling terminal.
-    let child = match pty.spawn("kubectl", &args) {
+    let child = match pty.spawn("kubectl", &args, &ctx.session_env) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("kubectl spawn failed: {}", e);
@@ -1622,12 +1644,15 @@ impl Pty {
     }
 
     /// Spawn a process with the slave PTY as its controlling terminal.
-    fn spawn(&mut self, cmd: &str, args: &[String]) -> std::io::Result<std::process::Child> {
+    fn spawn(&mut self, cmd: &str, args: &[String], env: &SessionEnv) -> std::io::Result<std::process::Child> {
         use std::os::unix::process::CommandExt;
         let slave = self.slave;
         let master = self.master;
         let mut command = std::process::Command::new(cmd);
         command.args(args);
+        // Authenticate as this session, not the daemon's startup env. Applied
+        // before TERM below so our forced TERM always wins.
+        env.apply_to(&mut command);
         // kubectl forwards TERM to the remote container. Without this,
         // readline disables tab completion and programs disable syntax
         // highlighting because the remote shell thinks it's a dumb terminal.
@@ -1668,7 +1693,7 @@ fn parse_k8s_minor(git_version: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_k8s_minor;
+    use super::{parse_k8s_minor, split_all_containers_prefix};
 
     #[test]
     fn parse_standard_versions() {
@@ -1693,6 +1718,40 @@ mod tests {
         assert_eq!(parse_k8s_minor(""), None);
         assert_eq!(parse_k8s_minor("garbage"), None);
         assert_eq!(parse_k8s_minor("v1.abc.3"), None);
+    }
+
+    #[test]
+    fn all_containers_prefix_pod_slash_container() {
+        assert_eq!(split_all_containers_prefix("[mypod/web] hello"), Some(("web", "hello")));
+    }
+
+    #[test]
+    fn all_containers_prefix_bare_container() {
+        // Single-pod streams may emit just `[container]`; rsplit still works.
+        assert_eq!(split_all_containers_prefix("[web] hello"), Some(("web", "hello")));
+    }
+
+    #[test]
+    fn all_containers_prefix_multi_segment_source() {
+        // Any `/`-separated source resolves to its final (container) segment.
+        assert_eq!(split_all_containers_prefix("[ns/mypod/web] hi"), Some(("web", "hi")));
+    }
+
+    #[test]
+    fn all_containers_prefix_preserves_bracketed_body() {
+        // kubectl prepends its prefix once; the container's own `[INFO]` text
+        // follows untouched (we split on the FIRST `] `, which is the prefix).
+        assert_eq!(
+            split_all_containers_prefix("[mypod/web] [INFO] up] done"),
+            Some(("web", "[INFO] up] done")),
+        );
+    }
+
+    #[test]
+    fn all_containers_prefix_unprefixed_is_none() {
+        // A line without kubectl's prefix rides untagged rather than guessing.
+        assert_eq!(split_all_containers_prefix("plain log line"), None);
+        assert_eq!(split_all_containers_prefix("[no-close-bracket hi"), None);
     }
 }
 

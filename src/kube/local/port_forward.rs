@@ -1,39 +1,56 @@
-//! Port-forward source — the first implementation of [`LocalResourceSource`].
+//! Port-forward source — the first implementation of [`LocalResourceSource`],
+//! and the first [`LocalOperator`](super::supervise::LocalOperator).
 //!
-//! Owns a set of `kubectl port-forward` subprocesses, each with a proper state
-//! machine ([`PortForwardState`]), and publishes snapshot updates via a
-//! `watch::Sender` whenever any entry transitions states.
+//! Each forward is one supervised `kubectl port-forward` subprocess: when the
+//! tunnel dies unexpectedly (suspend/resume, network blip, pod restart), the
+//! supervisor re-establishes it with exponential backoff. The supervisor is
+//! the sole writer of [`PortForwardState`]; snapshots publish via a
+//! `watch::Sender` on every transition.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use serde::Serialize;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
-use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::event::ResourceUpdate;
 use crate::kube::protocol::{
     Namespace, ObjectRef, ResourceId,
 };
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
+use crate::kube::session_env::SessionEnv;
 
+use super::supervise::{
+    supervise, AttemptHandle, Backoff, LocalOperator, OperatorEvent, OperatorExit, OperatorGuard,
+    RunDelay,
+};
 use super::LocalResourceSource;
 
-/// The state of a single port-forward.
+/// Backoff between re-establish attempts after a forward dies. Reaching
+/// Active resets it, so a long-lived tunnel that drops reconnects fast.
+const PF_BACKOFF_MIN: Duration = Duration::from_millis(500);
+const PF_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// The state of a single port-forward, written exclusively by its
+/// supervisor's event sink (see `create`). There is no `Stopped` variant:
+/// an explicit stop *removes the entry* (row gone), and a subprocess that
+/// exits — cleanly or not — gets re-established, so no resting state ever
+/// meant "stopped".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum PortForwardState {
-    /// Subprocess has been spawned, waiting for tunnel readiness.
+    /// First attempt is underway, waiting for tunnel readiness.
     Starting,
     /// Tunnel is up and accepting connections.
     Active,
-    /// Subprocess exited with an error, or the port-bind probe failed, or
-    /// kubectl couldn't be spawned. See `last_message` for details.
+    /// The tunnel dropped; the supervisor is re-establishing it (backoff in
+    /// progress or a retry attempt probing). `last_message` has the detail.
+    Reconnecting,
+    /// Permanent failure — the supervisor parked (e.g. kubectl not
+    /// spawnable). No further attempts until the forward is recreated.
     Failed,
-    /// User explicitly stopped the forward.
-    Stopped,
 }
 
 impl PortForwardState {
@@ -41,8 +58,8 @@ impl PortForwardState {
         match self {
             PortForwardState::Starting => "Starting",
             PortForwardState::Active => "Active",
+            PortForwardState::Reconnecting => "Reconnecting",
             PortForwardState::Failed => "Failed",
-            PortForwardState::Stopped => "Stopped",
         }
     }
 }
@@ -83,20 +100,33 @@ pub struct PortForwardRequest {
     pub namespace: Namespace,
     pub local_port: u16,
     pub remote_port: u16,
+    /// The creating session's process env, applied to the `kubectl
+    /// port-forward` subprocess so it authenticates as that session rather
+    /// than the daemon's startup env. A `PortForwardSource` is shared per
+    /// context, but each forward is created by one session — its env rides on
+    /// the request.
+    pub env: SessionEnv,
 }
 
 struct EntrySlot {
     entry: PortForwardEntry,
-    /// Abort handle for the subprocess monitor task (owned by the source).
-    abort: Option<AbortHandle>,
+    /// RAII handle to this entry's supervised loop. Dropping the slot
+    /// (explicit `stop`, or the whole source tearing down) drops the guard,
+    /// which aborts the loop and reaps the in-flight kubectl child via
+    /// `kill_on_drop`. Drop IS the cleanup — there is no separate stop path.
+    _guard: OperatorGuard,
+    /// The env the forward was created with — reused when an edit
+    /// (`apply_yaml`) reconciles by stop + recreate, so the new subprocess
+    /// authenticates as the original creating session, not the daemon.
+    env: SessionEnv,
 }
 
-/// Per-context port-forward source. Each context the daemon serves gets
-/// its own instance via [`crate::kube::local::LocalRegistry::port_forwards_for`].
-/// All `kubectl port-forward` subprocesses spawned by this instance run
-/// against the bound context. The registry holds a strong `Arc` — port
-/// forwards survive context switches and nav pops, running until explicitly
-/// stopped or the daemon exits.
+/// Per-context port-forward source, owned strongly by its context's
+/// [`ContextLocals`](super::context_locals::ContextLocals). All `kubectl
+/// port-forward` subprocesses spawned by this instance run against the bound
+/// context. Forwards are side-effect resources: they run while the context is
+/// attached (or within its grace window), independent of whether anyone is
+/// viewing the `:pf` list, and die only on explicit stop or context teardown.
 pub struct PortForwardSource {
     id: ResourceId,
     /// Context name this source is bound to. Used as the `--context` arg on
@@ -114,18 +144,10 @@ pub struct PortForwardSource {
     self_weak: Weak<Self>,
 }
 
-impl Drop for PortForwardSource {
-    fn drop(&mut self) {
-        // Abort every monitor task. This drops their Arc<Self> references
-        // (breaking the circular ref) AND drops the `kill_on_drop` child
-        // process handle inside each task, which kills the kubectl subprocess.
-        for entry in self.entries.iter() {
-            if let Some(ref abort) = entry.abort {
-                abort.abort();
-            }
-        }
-    }
-}
+// No `Drop` impl: teardown is the field-drop cascade. Dropping the source
+// drops `entries`, which drops every `EntrySlot`, whose `OperatorGuard`
+// aborts its supervised loop, whose in-flight attempt drops its
+// `kill_on_drop` child. The old manual abort-every-task loop is subsumed.
 
 impl PortForwardSource {
     /// Construct a fresh source bound to a single context. Called by the
@@ -152,7 +174,14 @@ impl PortForwardSource {
     /// Recover the live `Arc<Self>` from the cyclic `Weak`. Always succeeds
     /// while at least one external strong ref is held — which is true any
     /// time a method is being called, since the caller had to upgrade the
-    /// registry's `Weak` to land here.
+    /// context's handle to land here.
+    ///
+    /// This deliberately hands back an *owned* strong `Arc` — its only
+    /// caller, the synchronous `apply_yaml`, needs it to call `create`,
+    /// which downgrades it for the supervised task. Keep callers
+    /// synchronous: holding this `Arc` across an `.await` would pin the
+    /// source open and defeat the `kill_on_drop` reaping the operator
+    /// contract exists to protect (see `supervise` module docs).
     fn arc_self(&self) -> Arc<Self> {
         self.self_weak
             .upgrade()
@@ -165,9 +194,9 @@ impl PortForwardSource {
     }
 
     /// Create a new port-forward. Returns the assigned id immediately; the
-    /// subprocess is spawned in the background and state transitions are
-    /// published via the watch channel. The kubectl `--context` arg comes
-    /// from `self.bound_context`, not the request.
+    /// supervised subprocess runs in the background and every state
+    /// transition is published via the watch channel. The kubectl
+    /// `--context` arg comes from `self.bound_context`, not the request.
     pub fn create(self: &Arc<Self>, req: PortForwardRequest) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         // Stored as a String (serialized into the YAML describe view).
@@ -185,171 +214,72 @@ impl PortForwardSource {
             started_at: Instant::now(),
             last_message: String::new(),
         };
+        // Remember the creating session's env so an edit (`apply_yaml`) can
+        // recreate this forward authenticating as that same session.
+        let entry_env = req.env.clone();
 
-        // CRITICAL: the monitor task holds a `Weak<Self>`, NOT a strong Arc.
-        // Otherwise the task's Arc would keep the source alive forever
-        // (kubectl port-forward never exits on its own), the source's `Drop`
-        // would never run, and kubectl subprocesses would leak across
-        // context switches. With `Weak`, when external refs drop, `Drop`
-        // fires, aborts every monitor task, and `kill_on_drop` reaps each
-        // child process.
-        //
-        // RACE-FREE HANDOFF: Spawn the task in a "waiting" state (blocked on
-        // `start_rx`), insert the slot with the abort handle already set,
-        // then signal via `start_tx.send(())`. This guarantees:
-        //   1. When run_forward calls `set_state(id, ...)`, the entry
-        //      exists in the DashMap (the previous race where Failed state
-        //      from a fast-failing port bind was silently dropped).
-        //   2. A concurrent `stop(id)` called between insert and start-send
-        //      still wins: it removes the slot + aborts the task, which
-        //      drops the oneshot future and run_forward never runs — no
-        //      kubectl subprocess to reap.
+        // CRITICAL: both the operator and the event sink hold `Weak<Self>`,
+        // never a strong Arc. A strong ref inside the supervised task would
+        // keep the source alive forever (the loop never exits on its own),
+        // so the source could never drop and kubectl children would leak.
+        // The sink is a synchronous closure — its upgrade-use-drop cannot
+        // straddle an `.await`, which is the old `with_live` guarantee held
+        // structurally.
+        let op = PortForwardOp {
+            weak: Arc::downgrade(self),
+            bound_context: self.bound_context.clone(),
+            req,
+        };
+        // Single state writer: the supervisor narrates the lifecycle through
+        // this sink; `run_once` itself never touches entry state.
         let weak = Arc::downgrade(self);
-        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
-        let handle: JoinHandle<()> = tokio::spawn(async move {
-            // Wait for the caller to finish inserting the slot. An `Err`
-            // here means the caller dropped the sender — treated as a
-            // cancellation, so we exit without running run_forward.
-            if start_rx.await.is_err() {
-                return;
+        let sink = move |ev: OperatorEvent| {
+            let Some(this) = weak.upgrade() else { return };
+            match ev {
+                OperatorEvent::Starting => {
+                    this.set_state(id, PortForwardState::Starting, String::new())
+                }
+                OperatorEvent::Active => {
+                    this.set_state(id, PortForwardState::Active, String::new())
+                }
+                OperatorEvent::Retrying { error, .. } => {
+                    this.set_state(id, PortForwardState::Reconnecting, error)
+                }
+                OperatorEvent::Fatal { error } => {
+                    this.set_state(id, PortForwardState::Failed, error)
+                }
             }
-            Self::run_forward(weak, id, req).await;
-        });
-        let abort = handle.abort_handle();
-        self.entries.insert(id, EntrySlot { entry, abort: Some(abort) });
+        };
+        let (guard, gate) = supervise(
+            op,
+            RunDelay::Backoff(Backoff::new(PF_BACKOFF_MIN, PF_BACKOFF_MAX)),
+            sink,
+        );
+
+        // RACE-FREE HANDOFF (preserved from the pre-supervision code): the
+        // loop is spawned parked on the gate; insert the slot with the guard
+        // already set, then arm. This guarantees:
+        //   1. When the sink calls `set_state(id, ...)`, the entry exists in
+        //      the DashMap (the previous race where a fast-failing bind's
+        //      state was silently dropped).
+        //   2. A concurrent `stop(id)` between insert and arm still wins: it
+        //      removes the slot, dropping the guard, which aborts the parked
+        //      task — the operator never runs, no kubectl child to reap.
+        self.entries.insert(id, EntrySlot { entry, _guard: guard, env: entry_env });
         self.publish();
-        let _ = start_tx.send(());
+        gate.arm();
         id
     }
 
-    /// Stop a port-forward by id. Aborts the monitor task (which kills the
-    /// subprocess via `kill_on_drop`) and removes the entry.
+    /// Stop a port-forward by id: remove the entry. Dropping the slot drops
+    /// its `OperatorGuard`, aborting the supervised loop and reaping the
+    /// kubectl child via `kill_on_drop` — removal IS the stop.
     pub fn stop(&self, id: u64) -> Result<(), String> {
-        let Some((_, slot)) = self.entries.remove(&id) else {
+        let Some((_, _slot)) = self.entries.remove(&id) else {
             return Err(format!("no port-forward with id {id}"));
         };
-        if let Some(abort) = slot.abort {
-            abort.abort();
-        }
         self.publish();
         Ok(())
-    }
-
-    /// The full lifecycle: port probe → spawn kubectl → probe with backoff → wait.
-    /// Holds only a `Weak<Self>` and upgrades on demand; drops the upgrade
-    /// before any `await` so the source can be dropped while kubectl runs.
-    async fn run_forward(weak: Weak<Self>, id: u64, req: PortForwardRequest) {
-        // 1. Local port bind probe.
-        match tokio::net::TcpListener::bind(("127.0.0.1", req.local_port)).await {
-            Ok(listener) => drop(listener),
-            Err(e) => {
-                if let Some(this) = weak.upgrade() {
-                    this.set_state(
-                        id,
-                        PortForwardState::Failed,
-                        format!("local port {} unavailable: {}", req.local_port, e),
-                    );
-                }
-                return;
-            }
-        }
-
-        // Read the bound context out of the source while we still have a
-        // strong ref — we drop the upgrade before spawning so the kubectl
-        // wait() below doesn't keep the source alive.
-        let bound_context = match weak.upgrade() {
-            Some(this) => this.bound_context.clone(),
-            None => return, // source dropped during port probe
-        };
-
-        // 2. Spawn kubectl.
-        let mut cmd = tokio::process::Command::new("kubectl");
-        cmd.arg("port-forward")
-            .arg(&req.kubectl_target)
-            .arg(format!("{}:{}", req.local_port, req.remote_port));
-        // Typed `Namespace` — `as_option()` returns `Some(name)` for
-        // Named and None for All. The `Namespace::All` case is silently
-        // dropped because port-forward against "all namespaces" makes no
-        // sense; the upstream caller should never construct one.
-        if let Some(ns) = req.namespace.as_option() {
-            cmd.arg("-n").arg(ns);
-        }
-        if !bound_context.is_empty() {
-            cmd.arg("--context").arg(bound_context.as_str());
-        }
-        cmd.stdout(std::process::Stdio::null());
-        // stderr → null, not piped: an unread piped stderr can fill the OS
-        // pipe buffer over a long-running forward (kubectl port-forward
-        // logs "Handling connection" per accept) and block the subprocess.
-        cmd.stderr(std::process::Stdio::null());
-        let mut child = match cmd.kill_on_drop(true).spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                if let Some(this) = weak.upgrade() {
-                    this.set_state(id, PortForwardState::Failed, format!("spawn failed: {e}"));
-                }
-                return;
-            }
-        };
-
-        // 3. Probe the local port with backoff until it binds, or give up.
-        // kubectl usually binds in <500ms, but slow auth / busy clusters can
-        // push it out several seconds. Probing a single time 500ms in (the
-        // prior behavior) left the state stuck in `Starting` whenever bind
-        // was slower than that — the child.wait() below wouldn't advance
-        // until kubectl itself exited, which it doesn't while still trying.
-        // Deltas between probes, cumulative ~7s:
-        const PROBE_DELAYS_MS: [u64; 6] = [200, 300, 500, 1000, 2000, 3000];
-        let mut probed = false;
-        for delay_ms in PROBE_DELAYS_MS {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            if TcpStream::connect(("127.0.0.1", req.local_port)).await.is_ok() {
-                probed = true;
-                break;
-            }
-        }
-        if probed {
-            if let Some(this) = weak.upgrade() {
-                this.set_state(id, PortForwardState::Active, String::new());
-            } else {
-                return; // source dropped — `child` drops next, kill_on_drop reaps
-            }
-        } else {
-            // kubectl is still running but never bound the port. Return
-            // early — dropping `child` triggers `kill_on_drop` to reap the
-            // subprocess, then set state to Failed with a clear reason.
-            if let Some(this) = weak.upgrade() {
-                this.set_state(
-                    id,
-                    PortForwardState::Failed,
-                    "port-forward did not bind within probe timeout".to_string(),
-                );
-            }
-            return;
-        }
-
-        // 4. Wait for subprocess exit.
-        match child.wait().await {
-            Ok(status) if status.success() => {
-                if let Some(this) = weak.upgrade() {
-                    this.set_state(id, PortForwardState::Stopped, String::new());
-                }
-            }
-            Ok(status) => {
-                if let Some(this) = weak.upgrade() {
-                    this.set_state(
-                        id,
-                        PortForwardState::Failed,
-                        format!("kubectl exited: {status}"),
-                    );
-                }
-            }
-            Err(e) => {
-                if let Some(this) = weak.upgrade() {
-                    this.set_state(id, PortForwardState::Failed, format!("wait error: {e}"));
-                }
-            }
-        }
     }
 
     fn set_state(&self, id: u64, state: PortForwardState, message: String) {
@@ -377,6 +307,104 @@ impl PortForwardSource {
     }
 }
 
+/// One supervised forward: a single attempt is port-probe → spawn kubectl →
+/// probe until bound → wait for exit. The supervisor around it owns retry,
+/// backoff, and all state narration; this only classifies how the attempt
+/// ended. Holds `Weak<PortForwardSource>` purely for the gone-check — per
+/// the operator contract it never touches source state (the sink does).
+struct PortForwardOp {
+    weak: Weak<PortForwardSource>,
+    bound_context: crate::kube::protocol::ContextName,
+    req: PortForwardRequest,
+}
+
+impl LocalOperator for PortForwardOp {
+    async fn run_once(&self, attempt: AttemptHandle) -> OperatorExit {
+        // 1. Local port bind probe.
+        match tokio::net::TcpListener::bind(("127.0.0.1", self.req.local_port)).await {
+            Ok(listener) => drop(listener),
+            Err(e) => {
+                // Continue (retry), not Fatal: the port may be held by a
+                // dying previous incarnation — `apply_yaml`'s stop→recreate
+                // races the old child's async SIGKILL, which used to strand
+                // an edited forward in terminal Failed. Backoff self-heals
+                // it. A port held permanently by another app keeps retrying
+                // cheaply (a bare bind attempt, no subprocess spawned).
+                return OperatorExit::Continue(format!(
+                    "local port {} unavailable: {}",
+                    self.req.local_port, e
+                ));
+            }
+        }
+
+        // Source gone during the probe? Nothing left to forward for.
+        if self.weak.strong_count() == 0 {
+            return OperatorExit::Gone;
+        }
+
+        // 2. Spawn kubectl.
+        let mut cmd = self.req.env.kubectl();
+        cmd.arg("port-forward")
+            .arg(&self.req.kubectl_target)
+            .arg(format!("{}:{}", self.req.local_port, self.req.remote_port));
+        // Typed `Namespace` — `as_option()` returns `Some(name)` for
+        // Named and None for All. The `Namespace::All` case is silently
+        // dropped because port-forward against "all namespaces" makes no
+        // sense; the upstream caller should never construct one.
+        if let Some(ns) = self.req.namespace.as_option() {
+            cmd.arg("-n").arg(ns);
+        }
+        if !self.bound_context.is_empty() {
+            cmd.arg("--context").arg(self.bound_context.as_str());
+        }
+        cmd.stdout(std::process::Stdio::null());
+        // stderr → null, not piped: an unread piped stderr can fill the OS
+        // pipe buffer over a long-running forward (kubectl port-forward
+        // logs "Handling connection" per accept) and block the subprocess.
+        cmd.stderr(std::process::Stdio::null());
+        let mut child = match cmd.kill_on_drop(true).spawn() {
+            Ok(c) => c,
+            // Fatal: kubectl missing / not executable is environmental —
+            // a restart loop would fork-fail forever to no end.
+            Err(e) => return OperatorExit::Fatal(format!("spawn failed: {e}")),
+        };
+
+        // 3. Probe the local port with backoff until it binds, or give up.
+        // kubectl usually binds in <500ms, but slow auth / busy clusters can
+        // push it out several seconds. Deltas between probes, cumulative ~7s:
+        const PROBE_DELAYS_MS: [u64; 6] = [200, 300, 500, 1000, 2000, 3000];
+        let mut probed = false;
+        for delay_ms in PROBE_DELAYS_MS {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            if TcpStream::connect(("127.0.0.1", self.req.local_port)).await.is_ok() {
+                probed = true;
+                break;
+            }
+        }
+        if !probed {
+            // kubectl is still running but never bound the port. Returning
+            // drops `child` → `kill_on_drop` reaps it; the supervisor backs
+            // off and tries again.
+            return OperatorExit::Continue(
+                "port-forward did not bind within probe timeout".to_string(),
+            );
+        }
+        // Healthy steady-state — the one signal an operator may send. Also
+        // resets the supervisor's backoff so a long-lived tunnel that later
+        // drops reconnects from the minimum delay.
+        attempt.active();
+
+        // 4. Wait for subprocess exit. ANY exit of a supervised forward —
+        // clean or not — is grounds to re-establish; that's the keep-alive
+        // contract. (The old terminal `Stopped` state died with this: an
+        // explicit stop removes the entry instead.)
+        match child.wait().await {
+            Ok(status) => OperatorExit::Continue(format!("kubectl exited: {status}")),
+            Err(e) => OperatorExit::Continue(format!("wait error: {e}")),
+        }
+    }
+}
+
 impl LocalResourceSource for PortForwardSource {
     fn resource_id(&self) -> &ResourceId {
         &self.id
@@ -387,9 +415,10 @@ impl LocalResourceSource for PortForwardSource {
     }
 
     fn try_begin_grace(&self) -> bool {
-        // Port forward sources are held strongly by the registry — no grace
-        // period needed. Returning false tells LocalSubscription::Drop to
-        // just drop its Arc without spawning a grace task.
+        // Port forward sources are held strongly by their ContextLocals —
+        // a forward's lifetime is the context's, so subscription-level
+        // grace doesn't apply. Returning false tells LocalSubscription::Drop
+        // to just drop its Arc without spawning a grace task.
         false
     }
 
@@ -451,10 +480,10 @@ impl LocalResourceSource for PortForwardSource {
 
         // Snapshot the current entry so we can decide what changed and
         // build a fresh request from it.
-        let current = self
+        let (current, current_env) = self
             .entries
             .get(&id)
-            .map(|slot| slot.entry.clone())
+            .map(|slot| (slot.entry.clone(), slot.env.clone()))
             .ok_or_else(|| format!("no port-forward with id {id}"))?;
 
         let unchanged = current.local_port == edit.local_port
@@ -485,6 +514,7 @@ impl LocalResourceSource for PortForwardSource {
             namespace: Namespace::Named(edit.namespace),
             local_port: edit.local_port,
             remote_port: edit.remote_port,
+            env: current_env,
         });
         Ok(format!("pf-{id} → pf-{new_id}"))
     }
@@ -556,11 +586,16 @@ pub fn headers() -> Vec<String> {
 pub fn pf_to_row(entry: &PortForwardEntry) -> ResourceRow {
     let age = crate::util::format_age_duration(entry.started_at.elapsed());
     let row_name = format!("pf-{}", entry.id);
+    // Exhaustive on purpose (no `_` arm): adding a `PortForwardState`
+    // variant must force a decision here, same closed-enum discipline as
+    // `LocalResourceKind`. `Reconnecting` maps to the EXISTING
+    // `RowHealth::Pending` — `RowHealth` crosses the wire, so a new variant
+    // there would be a protocol change; a new state string is not.
     let health = match entry.state {
         PortForwardState::Active => RowHealth::Normal,
         PortForwardState::Starting => RowHealth::Pending,
+        PortForwardState::Reconnecting => RowHealth::Pending,
         PortForwardState::Failed => RowHealth::Failed,
-        _ => RowHealth::Pending,
     };
     let cells: Vec<CellValue> = vec![
         CellValue::Text(row_name.clone()),

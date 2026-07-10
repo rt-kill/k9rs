@@ -39,6 +39,12 @@ pub enum MetricsKind {
 pub enum MetricsColumn {
     Cpu,
     Mem,
+    /// Allocatable CPU/MEM columns. NOT metrics-server data — filled at row
+    /// build from `node.status.allocatable` — but tagged so the metrics overlay
+    /// can locate them and read their `Quantity` value to compute the percent
+    /// columns (`usage * 100 / allocatable`).
+    CpuAlloc,
+    MemAlloc,
     CpuPercent,
     MemPercent,
     CpuPercentRequest,
@@ -72,13 +78,14 @@ impl ColumnLevel {
     }
 }
 
-/// Metadata for a single table column. Each def declares its columns as
-/// a `&'static [ColumnDef]` array (via the default impl on `ResourceDef`,
-/// which infers from the header strings using the same classification
-/// rules that used to live in the disconnected `EXTRA_COLUMNS` /
-/// `column_sort_kind_for_header` tables in `app/mod.rs`). Defs that
-/// need non-inferable metadata (e.g. Pod's CPU/MEM metrics overlay)
-/// override `column_defs()` and tag individual columns.
+/// Metadata for a single **explicitly-tagged** table column: its `&'static`
+/// header plus display level and optional metrics overlay. Defs that need
+/// non-default levels or a metrics overlay (pods, nodes, services, events)
+/// return these from `column_defs()`, tagging columns via the `const fn`
+/// constructors. Columns a def does NOT tag have their level inferred from the
+/// header by [`ColumnDef::infer`] — the same classification that used to live
+/// in the disconnected `EXTRA_COLUMNS` / `column_sort_kind_for_header` tables
+/// in `app/mod.rs`.
 #[derive(Debug, Clone, Copy)]
 pub struct ColumnDef {
     pub header: &'static str,
@@ -93,35 +100,36 @@ impl ColumnDef {
     pub const fn extra(header: &'static str) -> Self {
         Self { header, level: ColumnLevel::Extra, metrics: None }
     }
-    pub const fn age(header: &'static str) -> Self {
-        Self { header, level: ColumnLevel::Default, metrics: None }
-    }
-    pub const fn extra_age(header: &'static str) -> Self {
-        Self { header, level: ColumnLevel::Extra, metrics: None }
-    }
+    // (`age`/`extra_age` ctors removed — they were byte-identical to
+    // `new`/`extra`. Age columns are rendered from `CellValue::Age` in the
+    // row's cells, not from any `ColumnDef` flag, so the level is all that
+    // mattered; `ColumnSortKind` that once distinguished them is long gone.)
     pub const fn with_metrics(self, m: MetricsColumn) -> Self {
         Self { metrics: Some(m), ..self }
     }
 
-    /// Infer column metadata from a header string, using the same rules
+    /// Classify a column's display level from its header string — the DEFAULT
+    /// rule for any column a def doesn't explicitly tag, using the same rules
     /// that lived in the disconnected `EXTRA_COLUMNS` / `column_sort_kind`
-    /// tables. This is the DEFAULT classification — defs that need
-    /// non-inferable metadata (metrics overlay) override `column_defs()`
-    /// and call the `const fn` constructors above instead.
-    pub fn infer(header: &str) -> Self {
+    /// tables. Returns only the [`ColumnLevel`]: inference never produces a
+    /// metrics overlay, and the header belongs to the caller (it owns the
+    /// runtime `String`), so a bare level is the whole result — no
+    /// `&'static`-vs-runtime lifetime mismatch to paper over with an empty
+    /// header. Defs needing non-inferable metadata tag columns explicitly via
+    /// `column_defs()` and the `const fn` constructors above.
+    pub fn infer(header: &str) -> ColumnLevel {
         let upper = header.to_ascii_uppercase();
         let is_extra = matches!(
             upper.as_str(),
             "LABELS" | "CONTAINERS" | "IMAGES" | "SELECTOR" | "QOS"
             | "SERVICE-ACCOUNT" | "READINESS GATES" | "LAST RESTART"
             | "NODE SELECTOR" | "INTERNAL-IP" | "EXTERNAL-IP" | "ARCH"
-            | "TAINTS" | "CPU" | "MEM" | "CPU%" | "MEM%" | "MESSAGE"
+            | "TAINTS" | "CPU" | "MEM" | "CPU%" | "MEM%"
+            // NOTE: "MESSAGE" is intentionally absent — EventDef tags it Default
+            // explicitly, so leaving it out of inference keeps the two
+            // classifications from disagreeing for any other MESSAGE column.
         );
-        Self {
-            header: "",
-            level: if is_extra { ColumnLevel::Extra } else { ColumnLevel::Default },
-            metrics: None,
-        }
+        if is_extra { ColumnLevel::Extra } else { ColumnLevel::Default }
     }
 }
 
@@ -260,18 +268,16 @@ pub trait ResourceDef: Send + Sync + 'static {
     /// — this *is* the column layout.)
     fn default_headers(&self) -> Vec<String>;
 
-    /// Typed column metadata (level, sort kind, metrics overlay). The
-    /// default impl infers from the header strings using [`ColumnDef::infer`]
-    /// — correct for every built-in EXCEPT pods (CPU/MEM metrics) and
-    /// nodes (CPU%/MEM% metrics), which override to tag their metrics
-    /// columns explicitly.
-    ///
-    /// Consumers use this instead of the old `EXTRA_COLUMNS` / `column_sort_kind_for_header`
-    /// string tables. The metadata lives ON the def (or is inferred FROM
-    /// the def's headers), so renaming a column automatically updates its
-    /// classification — no parallel table to keep in sync.
+    /// Explicitly-tagged column metadata (header + level + metrics overlay),
+    /// positional with `default_headers()`. The default is EMPTY — a resource
+    /// that tags nothing has each column's level inferred from its header on
+    /// demand (see `app::column_level_for`), so there is no fake `&'static`
+    /// header to invent for the runtime header strings. Defs that need
+    /// non-default levels or a metrics overlay (pods, nodes, services, events)
+    /// override this and tag columns via the `const fn` constructors — same
+    /// optional-override shape as `is_core` / `metrics_kind` below.
     fn column_defs(&self) -> Vec<ColumnDef> {
-        self.default_headers().iter().map(|h| ColumnDef::infer(h)).collect()
+        Vec::new()
     }
 
     /// Whether this resource is auto-subscribed on connection (e.g. namespaces
@@ -339,6 +345,36 @@ mod tests {
                     def.gvr().kind, base,
                 );
             }
+        }
+    }
+
+    /// bincode encodes a fieldless enum as its u32 declaration-index (LE), so
+    /// these tags are the on-wire identity of every `ResourceId::BuiltIn`.
+    /// Appending a variant is safe; reordering or inserting one silently remaps
+    /// every existing row on the wire. `ordered` MUST be in declaration order —
+    /// the test asserts each variant serializes to its position, so a reorder
+    /// fails here and an append trips the count assert (extend the slice and
+    /// bump `PROTOCOL_VERSION`).
+    #[test]
+    fn builtin_kind_wire_tags_are_stable() {
+        use super::BuiltInKind::*;
+        let ordered = [
+            Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob,
+            Service, ConfigMap, Secret, ServiceAccount, Ingress, NetworkPolicy,
+            Hpa, Endpoints, EndpointSlice, LimitRange, ResourceQuota,
+            PodDisruptionBudget, Event, PersistentVolumeClaim, Lease,
+            Namespace, Node, PersistentVolume, StorageClass, PriorityClass,
+            Role, ClusterRole, RoleBinding, ClusterRoleBinding,
+            ValidatingWebhookConfiguration, MutatingWebhookConfiguration,
+            CustomResourceDefinition,
+        ];
+        assert_eq!(ordered.len(), 34, "BuiltInKind variant count changed");
+        for (i, kind) in ordered.iter().enumerate() {
+            assert_eq!(
+                bincode::serialize(kind).expect("serialize"),
+                (i as u32).to_le_bytes(),
+                "{:?}: wire tag drifted from {}", kind, i,
+            );
         }
     }
 }

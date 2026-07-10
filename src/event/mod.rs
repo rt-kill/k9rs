@@ -14,6 +14,11 @@ use crate::app::FlashMessage;
 pub enum AppEvent {
     /// An update to a Kubernetes resource list or content view.
     ResourceUpdate(ResourceUpdate),
+    /// Like ResourceUpdate but routed to the nav-step table instead of the
+    /// global store. Used for filtered views of globally-stored resources
+    /// (e.g., single-node view via ShowNode) so the always-on core
+    /// subscription doesn't overwrite filtered data in the same table.
+    NavResourceUpdate(ResourceUpdate),
     /// A server-sent `CommandResult` — the response to a mutating wire
     /// command (Apply, Delete, Scale, Restart, Decode, Trigger, Toggle).
     /// Previously these were collapsed into `Flash`, but that made the
@@ -87,14 +92,16 @@ pub enum ResourceUpdate {
     /// to B's temp file.
     Yaml { target: crate::kube::protocol::ObjectRef, content: String },
     /// Response to `SessionCommand::Describe(target)`. Same gating rules
-    /// as `Yaml` above.
-    Describe { target: crate::kube::protocol::ObjectRef, content: String },
-    /// A single log line tagged with the producing stream's generation id.
-    /// The TUI's log view stamps its own generation id on the route state
+    /// as `Yaml` above. Typed lines (not a flat `String`) so the UI renders by
+    /// the producer's role tags instead of re-inferring structure from text.
+    Describe { target: crate::kube::protocol::ObjectRef, lines: Vec<crate::kube::protocol::DescribeLine> },
+    /// A single typed log line tagged with the producing stream's generation
+    /// id. The TUI's log view stamps its own generation id on the route state
     /// when it opens a new stream and only applies lines whose id matches —
     /// otherwise lines already in flight from a *previous* stream (whose
     /// bridge has been aborted but whose queued events haven't been drained
-    /// yet) would bleed into the new view.
-    LogLine { generation: u64, line: String },
+    /// yet) would bleed into the new view. `line.container` is `Some` only for
+    /// `--all-containers` streams (daemon-tagged); the UI colors it as a prefix.
+    LogLine { generation: u64, line: crate::kube::protocol::LogLine },
 }
 

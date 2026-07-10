@@ -130,7 +130,20 @@ pub fn cached_crds_to_rows(cached: &[CachedCrd]) -> Vec<ResourceRow> {
 // ---------------------------------------------------------------------------
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use crate::util::AtomicOption;
+
+/// Monotonic epoch for the discovery cache's coarse last-access timestamps,
+/// initialized on first use. `now_secs` reads whole seconds elapsed since.
+static CACHE_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Seconds since [`CACHE_EPOCH`]. Coarse (whole seconds) — ample resolution for
+/// a TTL measured in minutes, and cheap to stash in an `AtomicU64`.
+fn now_secs() -> u64 {
+    CACHE_EPOCH.elapsed().as_secs()
+}
 
 /// All cached discovery data for a single [`ContextId`]. Each field is an
 /// independent [`AtomicOption`] so writers can update one without touching
@@ -150,10 +163,29 @@ use crate::util::AtomicOption;
 pub struct PerContext {
     pub namespaces: AtomicOption<Arc<Vec<String>>>,
     pub crds: AtomicOption<Arc<Vec<CachedCrd>>>,
+    /// Coarse last-access time (seconds since [`CACHE_EPOCH`]), bumped on every
+    /// read and write. A [`DiscoveryCache::sweep_stale`] pass evicts entries
+    /// idle past the TTL, so the map stays bounded by *active* contexts rather
+    /// than by every [`ContextId`] ever served.
+    last_access: AtomicU64,
+}
+
+impl PerContext {
+    /// A new entry stamped as accessed *now*, so a sweep that races creation
+    /// can't evict it in the window before its first read/write `touch`.
+    fn fresh() -> Self {
+        Self { last_access: AtomicU64::new(now_secs()), ..Default::default() }
+    }
+
+    /// Mark the entry used now — keeps it out of the next TTL sweep.
+    fn touch(&self) {
+        self.last_access.store(now_secs(), Ordering::Relaxed);
+    }
 }
 
 /// Daemon-wide cache of discovery data keyed by [`ContextId`] (server_url +
-/// user, so two contexts aliased to the same cluster share one entry).
+/// credential fingerprint, so two contexts aliased to the same cluster + creds
+/// share one entry).
 ///
 /// One entry per context, each field swappable independently. See
 /// [`PerContext`] for the per-field guarantees.
@@ -167,14 +199,23 @@ impl DiscoveryCache {
         Self::default()
     }
 
-    /// Return (or lazily create) the per-context entry. The returned Arc
-    /// lets the caller perform multiple field updates without re-taking the
-    /// shard lock.
+    /// Return (or lazily create) the per-context entry, stamping it accessed.
+    /// The returned Arc lets the caller perform multiple field updates without
+    /// re-taking the shard lock. Use it inline and drop it — don't hold it
+    /// across a TTL window: a concurrent [`sweep_stale`] could detach it from
+    /// the map (the Arc stays valid, but later writes through it become
+    /// invisible to fresh lookups, which re-create the entry).
     fn entry_for(&self, ctx: &ContextId) -> Arc<PerContext> {
-        if let Some(r) = self.entries.get(ctx) {
-            return r.clone();
-        }
-        self.entries.entry(ctx.clone()).or_default().clone()
+        let entry = if let Some(r) = self.entries.get(ctx) {
+            r.clone()
+        } else {
+            self.entries
+                .entry(ctx.clone())
+                .or_insert_with(|| Arc::new(PerContext::fresh()))
+                .clone()
+        };
+        entry.touch();
+        entry
     }
 
     /// Swap in a new namespace list. Only callers with a successful fetch
@@ -196,12 +237,14 @@ impl DiscoveryCache {
     /// Read the cached namespace list (cloned), if any.
     pub fn namespaces(&self, ctx: &ContextId) -> Option<Vec<String>> {
         let entry = self.entries.get(ctx)?;
+        entry.touch();
         entry.namespaces.load_cloned().map(|arc| (*arc).clone())
     }
 
     /// Read the cached CRD list (cloned), if any.
     pub fn crds(&self, ctx: &ContextId) -> Option<Vec<CachedCrd>> {
         let entry = self.entries.get(ctx)?;
+        entry.touch();
         entry.crds.load_cloned().map(|arc| (*arc).clone())
     }
 
@@ -215,6 +258,7 @@ impl DiscoveryCache {
         plural: &str,
     ) -> Option<Vec<PrinterColumn>> {
         let entry = self.entries.get(ctx)?;
+        entry.touch();
         let crds = entry.crds.load_cloned()?;
         crds.iter()
             .find(|c| c.gvr.group == group && c.gvr.plural == plural)
@@ -235,6 +279,26 @@ impl DiscoveryCache {
         let removed = self.entries.iter().filter(|e| e.key().name == *name).count();
         self.entries.retain(|cid, _| cid.name != *name);
         removed
+    }
+
+    /// Evict entries idle (no read or write) for at least `ttl`. Returns the
+    /// number removed. Active contexts — those a session is still reading or a
+    /// poller is refreshing — keep their `last_access` fresh and survive; only
+    /// abandoned ones are reclaimed. Eviction is always safe: a later access
+    /// simply re-fetches and re-inserts. This is what bounds the otherwise
+    /// daemon-lifetime map for a long-lived, many-cluster daemon.
+    pub fn sweep_stale(&self, ttl: Duration) -> usize {
+        self.sweep_older_than(now_secs().saturating_sub(ttl.as_secs()))
+    }
+
+    /// Eviction mechanism for [`sweep_stale`], split from the `now_secs` policy
+    /// so it can be exercised with a deterministic cutoff in tests. Removes
+    /// every entry whose `last_access` is at or before `cutoff_secs`.
+    fn sweep_older_than(&self, cutoff_secs: u64) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, entry| entry.last_access.load(Ordering::Relaxed) > cutoff_secs);
+        before - self.entries.len()
     }
 }
 
@@ -261,7 +325,7 @@ pub fn cached_namespaces_to_rows(names: &[String]) -> Vec<crate::kube::resources
                 // typed `Named` constructor directly: routing this through
                 // `from_user_command` would silently switch into all-namespaces
                 // mode if a cluster ever had a namespace literally named `all`.
-                drill_target: Some(DrillTarget::SwitchNamespace(
+                drill_target: Some(DrillTarget::PodsInNamespace(
                     crate::kube::protocol::Namespace::Named(name.clone()),
                 )),
                 cells,
@@ -269,4 +333,46 @@ pub fn cached_namespaces_to_rows(names: &[String]) -> Vec<crate::kube::resources
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod discovery_ttl_tests {
+    use super::*;
+    use crate::kube::protocol::{ContextId, ContextName};
+
+    fn cid(n: u64) -> ContextId {
+        ContextId::new(ContextName::new(format!("ctx{n}")), format!("https://{n}"), n)
+    }
+
+    fn set_access(cache: &DiscoveryCache, id: &ContextId, secs: u64) {
+        cache.entries.get(id).unwrap().last_access.store(secs, Ordering::Relaxed);
+    }
+
+    /// `sweep_older_than` removes entries idle past the cutoff and keeps the
+    /// rest. Driven by an explicit cutoff so it doesn't depend on wall clock.
+    #[test]
+    fn sweep_evicts_only_idle_entries() {
+        let cache = DiscoveryCache::new();
+        cache.set_namespaces(cid(1), vec!["default".into()]);
+        cache.set_namespaces(cid(2), vec!["default".into()]);
+        set_access(&cache, &cid(1), 100); // idle
+        set_access(&cache, &cid(2), 500); // recent
+
+        let removed = cache.sweep_older_than(300);
+        assert_eq!(removed, 1);
+        assert!(cache.namespaces(&cid(1)).is_none());
+        assert!(cache.namespaces(&cid(2)).is_some());
+    }
+
+    /// A read bumps `last_access`, rescuing an otherwise-idle entry from the
+    /// next sweep. Plants a far-future stamp the read must overwrite with now.
+    #[test]
+    fn reads_touch_last_access() {
+        let cache = DiscoveryCache::new();
+        cache.set_namespaces(cid(1), vec!["default".into()]);
+        set_access(&cache, &cid(1), 1_000_000);
+        let _ = cache.namespaces(&cid(1));
+        let after = cache.entries.get(&cid(1)).unwrap().last_access.load(Ordering::Relaxed);
+        assert!(after < 1_000_000, "a read should refresh last_access to ~now");
+    }
 }

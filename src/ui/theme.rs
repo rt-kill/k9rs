@@ -48,7 +48,9 @@ fn parse_color(s: &str) -> Option<Color> {
     if s == "default" || s.is_empty() {
         return Some(Color::Reset);
     }
-    if s.starts_with('#') && s.len() == 7 {
+    // `is_ascii` guards the byte-index slices below: a 7-*byte* string could hold
+    // a multi-byte char, and `&s[1..3]` would panic on a non-char-boundary cut.
+    if s.starts_with('#') && s.len() == 7 && s.is_ascii() {
         let r = u8::from_str_radix(&s[1..3], 16).ok()?;
         let g = u8::from_str_radix(&s[3..5], 16).ok()?;
         let b = u8::from_str_radix(&s[5..7], 16).ok()?;

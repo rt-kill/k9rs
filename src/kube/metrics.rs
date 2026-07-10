@@ -1,4 +1,18 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
+
+use crate::kube::protocol::{MetricsUsage, NodeName, ObjectKey};
+
+/// A single poll's pod + node usage, fanned out to every session watching a
+/// cluster via the shared metrics poller (see [`crate::kube::shared_poller`]).
+/// On a failed sub-fetch the prior map is kept intact (last-known), so a
+/// transient metrics-server blip never blanks the display.
+#[derive(Clone, Default)]
+pub struct MetricsSnapshot {
+    pub pods: HashMap<ObjectKey, MetricsUsage>,
+    pub nodes: HashMap<NodeName, MetricsUsage>,
+}
 
 // ---------------------------------------------------------------------------
 // Typed metrics structs (deserialized from DynamicObject.data)
@@ -38,13 +52,15 @@ struct ResourceUsage {
 
 impl From<&serde_json::Value> for PodMetricsData {
     fn from(data: &serde_json::Value) -> Self {
-        serde_json::from_value(data.clone()).unwrap_or(PodMetricsData { containers: vec![] })
+        // `&Value` is itself a `Deserializer`, so cast at the JSON boundary by
+        // borrow-deserializing — no `data.clone()` of the raw payload.
+        PodMetricsData::deserialize(data).unwrap_or(PodMetricsData { containers: vec![] })
     }
 }
 
 impl From<&serde_json::Value> for NodeMetricsData {
     fn from(data: &serde_json::Value) -> Self {
-        serde_json::from_value(data.clone()).unwrap_or(NodeMetricsData {
+        NodeMetricsData::deserialize(data).unwrap_or(NodeMetricsData {
             usage: ResourceUsage::default(),
         })
     }
@@ -135,6 +151,14 @@ pub fn parse_cpu_to_nano(s: &str) -> u64 {
     }
 }
 
+/// Scale the (possibly fractional) numeric part of a memory quantity by `mult`.
+/// `1.5Gi` → 1.5 × 1024³ (the old `u64`-only parse rendered such values as 0);
+/// a malformed value clamps to 0, and `as u64` saturates an out-of-range
+/// product to `u64::MAX` instead of wrapping.
+fn scale_quantity(val: &str, mult: u64) -> u64 {
+    (val.trim().parse::<f64>().unwrap_or(0.0).max(0.0) * mult as f64) as u64
+}
+
 pub fn parse_mem_to_bytes(s: &str) -> u64 {
     // K8s Quantity permits BOTH binary (Ki/Mi/Gi/Ti, base-1024) AND
     // decimal (K/M/G/T, base-1000) suffixes. Older code only handled the
@@ -146,33 +170,56 @@ pub fn parse_mem_to_bytes(s: &str) -> u64 {
     // Two-char binary suffixes first (otherwise "Ti" would match the
     // one-char "T" branch and consume only the leading 'T').
     if let Some(val) = s.strip_suffix("Ti") {
-        return val.parse::<u64>().unwrap_or(0).saturating_mul(1024u64.pow(4));
+        return scale_quantity(val, 1024u64.pow(4));
     }
     if let Some(val) = s.strip_suffix("Gi") {
-        return val.parse::<u64>().unwrap_or(0).saturating_mul(1024u64.pow(3));
+        return scale_quantity(val, 1024u64.pow(3));
     }
     if let Some(val) = s.strip_suffix("Mi") {
-        return val.parse::<u64>().unwrap_or(0).saturating_mul(1024u64.pow(2));
+        return scale_quantity(val, 1024u64.pow(2));
     }
     if let Some(val) = s.strip_suffix("Ki") {
-        return val.parse::<u64>().unwrap_or(0).saturating_mul(1024);
+        return scale_quantity(val, 1024);
     }
     // One-char decimal suffixes per the K8s Quantity spec
     // (E, P, T, G, M, k — note the *lowercase* k for kilo). Some real-world
     // configs use uppercase 'K' anyway; accept both to avoid silently
     // dropping a value to "0 bytes" on a typo.
     if let Some(val) = s.strip_suffix('T') {
-        return val.parse::<u64>().unwrap_or(0).saturating_mul(1_000_000_000_000);
+        return scale_quantity(val, 1_000_000_000_000);
     }
     if let Some(val) = s.strip_suffix('G') {
-        return val.parse::<u64>().unwrap_or(0).saturating_mul(1_000_000_000);
+        return scale_quantity(val, 1_000_000_000);
     }
     if let Some(val) = s.strip_suffix('M') {
-        return val.parse::<u64>().unwrap_or(0).saturating_mul(1_000_000);
+        return scale_quantity(val, 1_000_000);
     }
     if let Some(val) = s.strip_suffix('k').or_else(|| s.strip_suffix('K')) {
-        return val.parse::<u64>().unwrap_or(0).saturating_mul(1_000);
+        return scale_quantity(val, 1_000);
     }
     // No suffix → raw bytes.
     s.parse::<u64>().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mem_handles_integers_and_units() {
+        assert_eq!(parse_mem_to_bytes("0"), 0);
+        assert_eq!(parse_mem_to_bytes("512"), 512);
+        assert_eq!(parse_mem_to_bytes("1Ki"), 1024);
+        assert_eq!(parse_mem_to_bytes("2Mi"), 2 * 1024 * 1024);
+        assert_eq!(parse_mem_to_bytes("1Gi"), 1024u64.pow(3));
+        assert_eq!(parse_mem_to_bytes("1M"), 1_000_000); // decimal SI
+        assert_eq!(parse_mem_to_bytes("nonsense"), 0);
+    }
+
+    #[test]
+    fn parse_mem_handles_fractional_quantities() {
+        // The old u64-only parse rendered these as 0.
+        assert_eq!(parse_mem_to_bytes("1.5Gi"), 1024u64.pow(3) * 3 / 2);
+        assert_eq!(parse_mem_to_bytes("0.5Mi"), 1024 * 1024 / 2);
+    }
 }

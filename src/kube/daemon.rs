@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::{UnixListener, UnixStream};
@@ -38,6 +38,16 @@ pub fn socket_path() -> PathBuf {
 // ---------------------------------------------------------------------------
 // Daemon server
 // ---------------------------------------------------------------------------
+
+/// A discovery-cache context idle (no read or refresh) longer than this is
+/// evicted by the periodic sweep. Bounds the otherwise daemon-lifetime cache
+/// for long-lived, many-cluster daemons; eviction only costs a re-fetch on
+/// next use. Comfortably longer than any active session's discovery cadence so
+/// in-use contexts never churn.
+const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// How often the daemon sweeps idle discovery-cache entries.
+const DISCOVERY_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Run the cache daemon. Stays alive until killed (Ctrl-C / SIGTERM).
 pub async fn run_daemon() -> anyhow::Result<()> {
@@ -89,6 +99,16 @@ pub async fn run_daemon() -> anyhow::Result<()> {
         }
         Err(e) => return Err(e.into()),
     };
+    // Restrict the socket to the owner (0600). Connecting to a Unix socket
+    // requires write permission on the node, so this keeps other local users
+    // off the daemon's management plane (Shutdown/Clear) and its session API —
+    // important for the `/tmp/k9rs-<uid>.sock` fallback, whose parent dir is
+    // world-traversable (XDG_RUNTIME_DIR is already 0700).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
     info!("k9rs cache daemon listening on {:?}", path);
 
     let mut sigterm = tokio::signal::unix::signal(
@@ -111,6 +131,11 @@ pub async fn run_daemon() -> anyhow::Result<()> {
     // automatically when we await it.
     let mut connections: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
+    // Periodic sweep of idle discovery-cache entries. Lives in the accept loop
+    // (rather than a detached task) so it stops cleanly on shutdown. The first
+    // `tick()` fires immediately — a no-op against the empty startup cache.
+    let mut discovery_sweep = tokio::time::interval(DISCOVERY_SWEEP_INTERVAL);
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -126,6 +151,13 @@ pub async fn run_daemon() -> anyhow::Result<()> {
             // Periodically drain finished handlers so the JoinSet doesn't
             // grow with every accepted connection.
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            // Periodically evict idle discovery-cache entries.
+            _ = discovery_sweep.tick() => {
+                let removed = state.session_shared.discovery_cache.sweep_stale(DISCOVERY_CACHE_TTL);
+                if removed > 0 {
+                    info!("Discovery cache: swept {} idle context(s)", removed);
+                }
+            }
             _ = sigterm.recv() => {
                 info!("Daemon received SIGTERM — shutting down");
                 break;
@@ -239,7 +271,7 @@ async fn handle_management_command(
         SessionCommand::Clear { context } => {
             // Selectively clear discovery cache entries for the given
             // context name, or wipe everything if no context was specified.
-            // The cache is keyed by ContextId (server_url + user) but the
+            // The cache is keyed by ContextId (server_url + credential fingerprint) but the
             // CLI argument is the human-readable name; `DiscoveryCache` owns
             // the filter + atomic retain so the count stays stable under
             // concurrent inserts.

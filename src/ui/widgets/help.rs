@@ -51,10 +51,10 @@ impl<'a> HelpOverlay<'a> {
     }
 
     /// Maximum sensible value for `help_scroll` given the current terminal
-    /// height. Mirrors the render-time clamp at line 350 so action handlers
-    /// can store a stable max instead of `usize::MAX` (which makes PrevItem
-    /// decrements appear to do nothing for ~`visible_height` keystrokes
-    /// before they overcome the difference).
+    /// height. Mirrors the render-time clamp (see [`Widget::render`]) so action
+    /// handlers can store a stable max instead of a `usize::MAX` sentinel
+    /// (which made PrevItem decrements appear to do nothing for
+    /// ~`visible_height` keystrokes before they overcame the difference).
     ///
     /// Returns 0 if the content fits without scrolling.
     pub fn max_scroll(terminal_height: u16, caps: Option<&crate::kube::protocol::ResourceCapabilities>) -> usize {
@@ -174,7 +174,7 @@ impl<'a> HelpOverlay<'a> {
                     },
                     HelpEntry {
                         key: "Shift-S".into(),
-                        description: "Sort by status (pods)",
+                        description: "Sort by selected column",
                     },
                 ],
             },
@@ -386,9 +386,11 @@ impl Widget for HelpOverlay<'_> {
 
         let total = all_lines.len();
 
-        // Clamp scroll BEFORE formatting the title — Action::End sets
-        // help_scroll to usize::MAX as a sentinel, so `scroll + 1` would
-        // overflow if we used `self.scroll` directly.
+        // Re-clamp scroll to the content height before formatting the title.
+        // The End action stores a real max (via `help_max_scroll`), not a
+        // `usize::MAX` sentinel, but the terminal may have shrunk since — so
+        // clamp here too, which also keeps the `scroll + 1` title indicator
+        // from exceeding `total`.
         //
         // Block overhead is 2 border rows + 1 top-padding row + 0 bottom-
         // padding row = 3 (matches `Padding::new(1, 1, 1, 0)` below).

@@ -79,7 +79,7 @@ pub fn column_level_for(view: &crate::app::view::ViewId, name: &str) -> ColumnLe
             }
         }
     }
-    ColumnDef::infer(name).level
+    ColumnDef::infer(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -356,30 +356,46 @@ impl App {
     /// Apply stored node metrics to all current node items.
     pub fn apply_node_metrics(&mut self) {
         use crate::kube::resource_def::MetricsKind;
+        use crate::kube::resources::row::{CellValue, QuantityUnit};
         let Some(nodes_rid) = Self::rid_for_metrics(MetricsKind::Node) else { return };
         let cols = Self::all_metrics_cols(MetricsKind::Node);
-        let cpu_col = cols.get(&MetricsColumn::CpuPercent).copied();
-        let mem_col = cols.get(&MetricsColumn::MemPercent).copied();
-        if cpu_col.is_none() && mem_col.is_none() { return; }
+        let cpu = cols.get(&MetricsColumn::Cpu).copied();
+        let cpu_alloc = cols.get(&MetricsColumn::CpuAlloc).copied();
+        let cpu_pct = cols.get(&MetricsColumn::CpuPercent).copied();
+        let mem = cols.get(&MetricsColumn::Mem).copied();
+        let mem_alloc = cols.get(&MetricsColumn::MemAlloc).copied();
+        let mem_pct = cols.get(&MetricsColumn::MemPercent).copied();
+        if cpu.is_none() && mem.is_none() { return; }
         if let Some(table) = self.data.tables.get_mut(&nodes_rid) {
             for row in &mut table.items {
-                if let Some(usage) = self.kube.node_metrics.get(row.name.as_str()) {
-                    use crate::kube::resources::row::CellValue;
-                    if let Some(col) = cpu_col {
-                        if let Some(cap) = row.cells.get(col).map(|c| {
-                            let s = c.to_string();
-                            s.split('/').nth(1).unwrap_or("").to_string()
-                        }).filter(|s| !s.is_empty()) {
-                            row.set_cell(col, CellValue::Text(format!("{}/{}", usage.cpu, cap)));
+                match self.kube.node_metrics.get(row.name.as_str()) {
+                    Some(usage) => {
+                        // CPU usage, then percent of allocatable (read from the CPU/A cell).
+                        if let Some(c) = cpu {
+                            row.set_cell(c, CellValue::Quantity { value: usage.cpu_milli, unit: QuantityUnit::Millicores });
+                        }
+                        if let (Some(pc), Some(ac)) = (cpu_pct, cpu_alloc) {
+                            let alloc = row.cells.get(ac).and_then(|c| c.quantity_value()).unwrap_or(0);
+                            let pct = (alloc > 0).then(|| usage.cpu_milli.saturating_mul(100) / alloc);
+                            row.set_cell(pc, CellValue::Percentage(pct));
+                        }
+                        // MEM usage, then percent of allocatable.
+                        if let Some(c) = mem {
+                            row.set_cell(c, CellValue::Quantity { value: usage.mem_bytes, unit: QuantityUnit::Bytes });
+                        }
+                        if let (Some(pc), Some(ac)) = (mem_pct, mem_alloc) {
+                            let alloc = row.cells.get(ac).and_then(|c| c.quantity_value()).unwrap_or(0);
+                            let pct = (alloc > 0).then(|| usage.mem_bytes.saturating_mul(100) / alloc);
+                            row.set_cell(pc, CellValue::Percentage(pct));
                         }
                     }
-                    if let Some(col) = mem_col {
-                        if let Some(cap) = row.cells.get(col).map(|c| {
-                            let s = c.to_string();
-                            s.split('/').nth(1).unwrap_or("").to_string()
-                        }).filter(|s| !s.is_empty()) {
-                            row.set_cell(col, CellValue::Text(format!("{}/{}", usage.mem, cap)));
-                        }
+                    None => {
+                        // No metrics for this node this poll — clear usage/percent to
+                        // n/a rather than leaving a frozen stale value on display.
+                        if let Some(c) = cpu { row.set_cell(c, CellValue::Placeholder); }
+                        if let Some(c) = cpu_pct { row.set_cell(c, CellValue::Percentage(None)); }
+                        if let Some(c) = mem { row.set_cell(c, CellValue::Placeholder); }
+                        if let Some(c) = mem_pct { row.set_cell(c, CellValue::Percentage(None)); }
                     }
                 }
             }
@@ -406,10 +422,9 @@ impl App {
     /// Without this, the first snapshot for the CRD would land on a missing
     /// table in `apply_resource_update` and be dropped on the floor.
     pub fn clear_resource(&mut self, rid: &ResourceId) {
-        if nav::is_globally_stored(&ViewId::Resource(rid.clone())) {
-            let table = self.data.tables.entry(rid.clone()).or_default();
+        if let Some(table) = self.nav.find_table_for_resource_mut(rid) {
             table.clear_data();
-        } else if let Some(table) = self.nav.find_table_for_resource_mut(rid) {
+        } else if let Some(table) = self.data.tables.get_mut(rid) {
             table.clear_data();
         }
     }
@@ -473,6 +488,24 @@ impl App {
         self.active_view_table().map(|t| t.selected_col()).unwrap_or(0)
     }
 
+    /// The cursor column translated from its VISIBLE index to a DATA index (the
+    /// index into a row's `cells`). The cursor is clamped to the visible column
+    /// set, but sorting and column-filtering index the full `cells` array — so
+    /// anything acting on cell *data* by the cursor column MUST use this, not
+    /// [`active_table_selected_col`]. Mirrors the render's
+    /// `visible_columns(...)[selected_col].0`; falls back to the raw index when
+    /// no descriptor is available (no columns hidden, so the spaces coincide).
+    ///
+    /// [`active_table_selected_col`]: Self::active_table_selected_col
+    pub fn active_table_selected_data_col(&self) -> usize {
+        let visible_col = self.active_table_selected_col();
+        let skip_ns = !self.kube.selected_ns.is_all();
+        self.active_view_descriptor()
+            .map(|d| d.visible_columns(self.nav.view_id(), self.ui.column_level, skip_ns))
+            .and_then(|vis| vis.get(visible_col).map(|&(data_idx, _)| data_idx))
+            .unwrap_or(visible_col)
+    }
+
     /// Get the active view's table (immutable).
     pub fn active_view_table(&self) -> Option<&StatefulTable<crate::kube::resources::row::ResourceRow>> {
         // Derived views carry their table directly on the nav step.
@@ -502,33 +535,28 @@ impl App {
         }
     }
 
-    /// Route a table lookup by ResourceId (immutable). Checks the global
-    /// store for globally-stored resources, otherwise walks the nav stack.
+    /// Route a table lookup by ResourceId (immutable). Prefers nav-step
+    /// table (filtered views) over global store.
     pub fn table_for(&self, rid: &ResourceId) -> Option<&StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        if nav::is_globally_stored(&ViewId::Resource(rid.clone())) {
-            self.data.tables.get(rid)
-        } else {
-            self.nav.find_table_for_resource(rid)
-        }
+        self.nav.find_table_for_resource(rid)
+            .or_else(|| self.data.tables.get(rid))
     }
 
-    /// Route a table lookup by ResourceId (mutable). Checks the global
-    /// store for globally-stored resources, otherwise walks the nav stack.
+    /// Route a table lookup by ResourceId (mutable). Prefers nav-step
+    /// table (filtered views) over global store.
     pub fn table_for_mut(&mut self, rid: &ResourceId) -> Option<&mut StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        if nav::is_globally_stored(&ViewId::Resource(rid.clone())) {
-            self.data.tables.get_mut(rid)
-        } else {
+        if self.nav.find_table_for_resource(rid).is_some() {
             self.nav.find_table_for_resource_mut(rid)
+        } else {
+            self.data.tables.get_mut(rid)
         }
     }
 
-    /// Route a descriptor lookup by ResourceId.
+    /// Route a descriptor lookup by ResourceId. Prefers nav-step
+    /// descriptor over global store.
     pub fn descriptor_for(&self, rid: &ResourceId) -> Option<&TableDescriptor> {
-        if nav::is_globally_stored(&ViewId::Resource(rid.clone())) {
-            self.data.descriptors.get(rid)
-        } else {
-            self.nav.find_descriptor_for_resource(rid)
-        }
+        self.nav.find_descriptor_for_resource(rid)
+            .or_else(|| self.data.descriptors.get(rid))
     }
 
     pub fn col_left(&mut self) {

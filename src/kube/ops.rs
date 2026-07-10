@@ -20,6 +20,7 @@ pub async fn execute_delete(
     client: &::kube::Client,
     target: &ObjectRef,
     context: &crate::kube::protocol::ContextName,
+    session_env: &crate::kube::session_env::SessionEnv,
 ) -> anyhow::Result<()> {
     use ::kube::api::DeleteParams;
 
@@ -42,7 +43,7 @@ pub async fn execute_delete(
     }
 
     // Fallback: kubectl delete.
-    let mut cmd = tokio::process::Command::new("kubectl");
+    let mut cmd = session_env.kubectl();
     cmd.arg("delete").arg(target.kubectl_target());
     if let Some(ns) = target.namespace.as_option() { cmd.arg("-n").arg(ns); }
     if !context.is_empty() { cmd.arg("--context").arg(context.as_str()); }

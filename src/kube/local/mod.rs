@@ -11,10 +11,13 @@
 //! - Own their own typed state (the trait is object-safe via `Arc<dyn ...>`).
 //! - Publish `ResourceUpdate::Rows` snapshots via a `watch::Sender` whenever
 //!   their state changes.
-//! - Are registered on [`LocalRegistry`] (lives on `SessionSharedState`) so
-//!   they're shared across every TUI session connected to the daemon.
-//! - Are always alive for the daemon's lifetime once registered — subscribing
-//!   to a local resource just hands out a fresh `watch::Receiver`.
+//! - Live inside their context's [`ContextLocals`] slice, resolved through
+//!   [`LocalRegistry`] (on `SessionSharedState`) so they're shared across
+//!   every TUI session attached to that context.
+//! - Background work (a port-forward's kubectl child, an exec source's
+//!   poll) runs as a supervised [`supervise::LocalOperator`] — restart with
+//!   backoff for crash-shaped work, fixed interval for poll-shaped work —
+//!   torn down by dropping its [`supervise::OperatorGuard`].
 //!
 //! # Identity
 //!
@@ -26,18 +29,25 @@
 //!
 //! # Per-context lifetime
 //!
-//! Local sources are **per context**, not process-wide. Two lifetime
-//! models coexist:
+//! One ownership structure bounds everything: each context's local
+//! resources live in its [`ContextLocals`] slice, held `Weak` by the
+//! registry and kept alive by the sessions attached to that context (with
+//! a grace window after the last one leaves — see
+//! [`context_locals`]'s module docs). Context teardown drops the slice and
+//! everything in it.
 //!
-//! - **Port forwards** — the registry holds a strong `Arc`. Port forwards
-//!   are user-created side effects with running subprocesses; they persist
-//!   until explicitly stopped or the daemon exits. This means port forwards
-//!   survive context switches, nav pops, and any period without subscribers.
+//! Within that bound, two deliberate ownership policies coexist, expressed
+//! through strong-vs-`Weak` inside the slice:
 //!
-//! - **Exec resources** — the registry stores `Weak` refs with the same
-//!   grace-period model as the K8s watcher cache: subscribers hold `Arc`
-//!   keepalives, and when the last subscription drops a grace task extends
-//!   the lifetime briefly before the source is released.
+//! - **Port forwards (strong)** — user-created side effects. They run for
+//!   the slice's whole life, independent of whether anyone is viewing the
+//!   `:pf` list, and die only on explicit stop or context teardown.
+//!
+//! - **Exec resources (`Weak`)** — derived views (caches of a command's
+//!   output, no user-created state). Demand-driven within the context
+//!   bound: subscribers hold `Arc` keepalives, and when the last
+//!   subscription drops a grace task extends the lifetime briefly before
+//!   the source (and its poll) is released.
 //!
 //! # Adding a new local resource type
 //!
@@ -46,19 +56,24 @@
 //!    kind_str, plural, scope, aliases, short_label, and add the variant
 //!    to [`LocalResourceKind::all`].
 //! 2. Implement [`LocalResourceSource`] on a new struct with a
-//!    `for_context(name: ContextName)` constructor.
+//!    `for_context(...)` constructor. If it has background work, model
+//!    each unit as a [`supervise::LocalOperator`] and hold its
+//!    [`supervise::OperatorGuard`] where the unit's lifetime lives.
 //! 3. Write a converter `*_to_row` next to the source that turns entries
 //!    into [`crate::kube::resources::row::ResourceRow`].
-//! 4. Add a per-context cache field on [`registry::LocalRegistry`] and a
-//!    `*_for(context)` accessor (mirror `port_forwards_for`); add a match
-//!    arm in `LocalRegistry::get` for the new kind.
+//! 4. Add a field on [`context_locals::ContextLocals`] (strong for
+//!    side-effect resources, `Weak` for derived views) and a match arm in
+//!    `ContextLocals::get` for the new kind.
 
+pub mod context_locals;
 pub mod exec_source;
 pub mod port_forward;
 pub mod registry;
 pub mod subscription;
+pub mod supervise;
 pub mod types;
 
+pub use context_locals::{ContextKeepalive, ContextLocals};
 pub use registry::LocalRegistry;
 pub use subscription::LocalSubscription;
 pub use types::{find_by_alias, LocalResourceKind};
@@ -119,11 +134,18 @@ pub trait LocalResourceSource: Send + Sync + 'static {
     /// if a grace task is already running for this source and the caller
     /// should just drop its Arc immediately. Implementations typically
     /// CAS-flip an `AtomicBool`.
+    ///
+    /// Paired with [`Self::end_grace`]: together they are the `claim`/`reset`
+    /// closures driving [`crate::kube::spawn_grace`]. The pair MUST target the
+    /// exact same slot — the type system can't verify it, so an implementation
+    /// that claims one flag and resets another would silently wedge the grace
+    /// coalescing (a permanently-set flag means no future grace task spawns).
     fn try_begin_grace(&self) -> bool;
 
-    /// Reset the "grace task in flight" slot. Called by the grace task
-    /// just before it drops its Arc, so that a subsequent subscribe/drop
-    /// cycle can spawn a fresh grace task.
+    /// Reset the "grace task in flight" slot claimed by
+    /// [`Self::try_begin_grace`] — the *same* slot (see its note). Called by
+    /// the grace task just before it drops its Arc, so that a subsequent
+    /// subscribe/drop cycle can spawn a fresh grace task.
     fn end_grace(&self);
 }
 

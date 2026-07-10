@@ -14,8 +14,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
-use crate::kube::GRACE_PERIOD_SECS;
-
 use dashmap::DashMap;
 
 use futures::{StreamExt, TryStreamExt};
@@ -146,39 +144,21 @@ pub(crate) fn max_elapsed_ms() -> u64 {
 impl Drop for Subscription {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        // Only keep the watcher alive via grace period if it's still running.
-        // Dead watchers should be dropped immediately so the cache entry is
-        // cleaned up and a fresh watcher can be created on next subscribe.
-        if self._keepalive.task.is_finished() {
-            return;
-        }
-        // Coalesce: at most one grace task per LiveQuery. CAS-set the
-        // `grace_in_flight` flag; if we lose, another drop already spawned
-        // the task and we just drop our own Arc here. If we win, spawn.
-        if self._keepalive
-            .grace_in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        // Use `Handle::try_current` so dropping a Subscription outside a
-        // tokio runtime (e.g. during process shutdown after the runtime
-        // has been torn down) doesn't panic. If there's no runtime, reset
-        // the flag and let the Arc drop here.
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            self._keepalive.grace_in_flight.store(false, Ordering::Release);
-            return;
-        };
-        let arc = self._keepalive.clone();
-        handle.spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(GRACE_PERIOD_SECS)).await;
-            // Reset the flag BEFORE dropping the Arc so that a future
-            // subscribe-then-drop cycle (with the same LiveQuery, if it
-            // somehow survives this drop) can spawn a fresh grace task.
-            arc.grace_in_flight.store(false, Ordering::Release);
-            drop(arc);
-        });
+        // Shared grace dance (see `crate::kube::spawn_grace`). A *dead*
+        // watcher (self-terminated task) skips grace so its cache entry is
+        // reclaimed and the next subscribe builds a fresh watcher; a live one
+        // is kept warm for the window. Claim/reset ride the concrete
+        // `grace_in_flight` flag, coalescing to at most one grace task.
+        crate::kube::spawn_grace(
+            self._keepalive.clone(),
+            |lq| lq.task.is_finished(),
+            |lq| {
+                lq.grace_in_flight
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            },
+            |lq| lq.grace_in_flight.store(false, Ordering::Release),
+        );
     }
 }
 
@@ -400,6 +380,11 @@ impl WatcherCache {
     /// Subscribe to a dynamic CRD resource type. Reuses an existing watcher if
     /// the Weak upgrades, otherwise creates a new one via the dynamic-object
     /// watcher path.
+    // The args are the dynamic-resource descriptor (gvk/plural/scope/printer
+    // columns) plus the client factory and streaming flag — all intrinsic to
+    // opening a watcher. Kept flat rather than threaded through a struct in
+    // this hot path (matches the `#[allow]` on the table renderer).
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe_dynamic(
         &self,
         key: QueryKey,

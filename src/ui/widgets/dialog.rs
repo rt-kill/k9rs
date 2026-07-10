@@ -192,9 +192,8 @@ fn render_form_field(
             if focused { spans.push(Span::styled("\u{2588}", theme.filter)); }
             buf.set_line(vx, layout.y, &Line::from(spans), vw);
         }
-        FormFieldKind::Select { options } => {
-            let idx: usize = field.value.parse().unwrap_or(0);
-            let display = options.get(idx).map(|o| o.label.as_str()).unwrap_or("(none)");
+        FormFieldKind::Select { options, selected } => {
+            let display = options.get(*selected).map(|o| o.label.as_str()).unwrap_or("(none)");
             let style = if focused { theme.filter } else { theme.info_value };
             let arrows = if focused { (" \u{25c0} ", " \u{25b6}") } else { ("   ", "  ") };
             buf.set_line(vx, layout.y, &Line::from(vec![

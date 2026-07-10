@@ -5,6 +5,7 @@ use ratatui::{
 };
 
 use crate::app::{App, Route};
+use crate::kube::protocol::LogLine;
 use crate::ui::widgets::LogViewer;
 
 /// Draw the log streaming view.
@@ -27,15 +28,14 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     let indicator_area = chunks[1];
     let bar_area = chunks[2];
 
-    use crate::kube::protocol::LogContainer;
-    // Extract pod/container and state from route. The container is the
-    // typed `LogContainer`; the widget needs both a display label and a
-    // boolean for "should I parse per-line container prefixes".
-    let (pod_name, container_label, is_all_containers, logs) = match &app.route {
+    // Extract the pod/container label and state from the route. Per-line
+    // container tagging now rides the typed `LogLine` from the daemon, so the
+    // view no longer needs an "is this all-containers" flag — a line colors its
+    // own container iff `line.container` is `Some`.
+    let (pod_name, container_label, logs) = match &app.route {
         Route::Logs { ref target, ref state, .. } => (
             target.pod.as_str(),
             target.container_label(),
-            matches!(target.container, LogContainer::All),
             state.as_ref(),
         ),
         _ => return, // Not a log view — nothing to draw
@@ -58,17 +58,16 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
         if logs.wrap {
             // When wrap is enabled, pass all visible lines to the widget and let
             // ratatui's Paragraph handle wrapping and scrolling internally.
-            let all_lines: Vec<&str> = if is_filtered {
-                filtered.iter().map(|&i| logs.lines()[i].as_str()).collect()
+            let all_lines: Vec<&LogLine> = if is_filtered {
+                filtered.iter().map(|&i| &logs.lines()[i]).collect()
             } else {
-                logs.lines().iter().map(|s| s.as_str()).collect()
+                logs.lines().iter().collect()
             };
 
             let log_viewer = LogViewer::new(
                 &all_lines,
                 pod_name,
                 container_label,
-                is_all_containers,
                 since_label,
                 theme,
             );
@@ -108,17 +107,16 @@ pub fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
             let start = scroll;
             let end = (start + height).min(total);
 
-            let visible_lines: Vec<&str> = if is_filtered {
-                filtered[start..end].iter().map(|&i| logs.lines()[i].as_str()).collect()
+            let visible_lines: Vec<&LogLine> = if is_filtered {
+                filtered[start..end].iter().map(|&i| &logs.lines()[i]).collect()
             } else {
-                logs.lines().range(start..end).map(|s| s.as_str()).collect()
+                logs.lines().range(start..end).collect()
             };
 
             let log_viewer = LogViewer::new(
                 &visible_lines,
                 pod_name,
                 container_label,
-                is_all_containers,
                 since_label,
                 theme,
             );

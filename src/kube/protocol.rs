@@ -479,8 +479,8 @@ impl std::fmt::Display for Namespace {
 ///
 /// Distinct from [`ContextId`]: this carries the human-readable labels
 /// (kubeconfig `clusters:` entry name + `users:` entry name), while
-/// [`ContextId`] carries the canonical `(server_url, user)` identity used
-/// for cache sharing. Bundling the pair here DRYs up ~8 structs that used
+/// [`ContextId`] carries the canonical `(server_url, credential-fingerprint)`
+/// identity used for cache sharing. Bundling the pair here DRYs up ~8 structs that used
 /// to carry `cluster: String, user: String` as adjacent fields — and
 /// prevents accidental positional swaps when they ride together.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,21 +496,33 @@ impl ClusterIdentity {
     }
 }
 
-/// Identity (Hash/Eq) is `(server_url, user)` — the context name is
-/// display-only and does NOT affect cache sharing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Identity (Hash/Eq) is `(server_url, cred_fingerprint)` — the context name
+/// is display-only and does NOT affect cache sharing.
+///
+/// **Process-internal only.** `cred_fingerprint` is a `DefaultHasher` digest
+/// whose value is not portable across binaries / Rust versions, so a
+/// `ContextId` must never be persisted or sent on the wire — it is purely a
+/// daemon-side cache key. Hence, deliberately, no `Serialize`/`Deserialize`.
+#[derive(Debug, Clone)]
 pub struct ContextId {
     /// The kubeconfig context name (for display only, NOT part of identity).
     pub name: ContextName,
     /// The API server URL (cluster identity).
     pub server_url: String,
-    /// The kubeconfig user name (user identity for cache sharing).
-    pub user: String,
+    /// A stable hash of the *actual* credential material this connection
+    /// authenticates with (token / client cert / exec spec + its injected
+    /// env / impersonation / …), NOT the kubeconfig user *name*. Two configs
+    /// whose `users:` entries happen to share a name on one cluster but carry
+    /// different credentials hash differently and so never share a watcher —
+    /// the "different credentials MUST NOT share" rule above, made real.
+    /// Computed daemon-side from the resolved `AuthInfo`
+    /// (`server_session::client_build::fingerprint_auth`).
+    pub cred_fingerprint: u64,
 }
 
 impl PartialEq for ContextId {
     fn eq(&self, other: &Self) -> bool {
-        self.server_url == other.server_url && self.user == other.user
+        self.server_url == other.server_url && self.cred_fingerprint == other.cred_fingerprint
     }
 }
 
@@ -519,13 +531,13 @@ impl Eq for ContextId {}
 impl std::hash::Hash for ContextId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.server_url.hash(state);
-        self.user.hash(state);
+        self.cred_fingerprint.hash(state);
     }
 }
 
 impl ContextId {
-    pub fn new(name: ContextName, server_url: String, user: String) -> Self {
-        Self { name, server_url, user }
+    pub fn new(name: ContextName, server_url: String, cred_fingerprint: u64) -> Self {
+        Self { name, server_url, cred_fingerprint }
     }
 }
 
@@ -1119,7 +1131,7 @@ pub struct LogInit {
 /// changes in a bincode-incompatible way (new fields, reordering, etc.).
 /// The daemon rejects Init commands with a mismatched version so stale
 /// daemons fail fast instead of producing silent data corruption.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// All commands from any client (TUI session or management CLI).
 /// The first command on a connection determines the connection type:
@@ -1241,6 +1253,93 @@ impl SessionCommand {
 // Unified event type: Daemon -> Client (bincode)
 // ---------------------------------------------------------------------------
 
+/// One line of a describe view, with its structural role tagged by the
+/// *producer* so the UI renders by role instead of re-deriving structure from
+/// the text. The daemon already owns presentation here — `text` is the
+/// fully-formatted line (alignment included), exactly what used to travel as a
+/// flat `String`; the only thing added is `kind`. The flat projection used for
+/// search / scroll / clipboard / the TTL cache is just the `text`s joined with
+/// newlines (see [`describe_lines_text`]).
+///
+/// Why: `format_describe` knows each line's role as it writes it, but the old
+/// wire shipped a bare `String` and the UI guessed the role back via
+/// `ends_with(':')` / `find(':')` — fragile (a field *value* ending in `:`
+/// rendered as a section header) and a separation-of-concerns leak.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescribeLine {
+    pub text: String,
+    pub kind: DescribeLineKind,
+}
+
+/// The structural role of a [`DescribeLine`], chosen by the producer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DescribeLineKind {
+    /// A section header (e.g. `Spec:`, `Status:`). The whole line is emphasized.
+    Section,
+    /// A `key: value` field. `key_end` is the byte index in `text` of the
+    /// structural colon: the renderer styles `[indent..key_end]` as the key and
+    /// `[key_end..]` (colon onward) as the value, preserving leading indent.
+    Field { key_end: usize },
+    /// Plain text with no key/section structure (blank lines, list items,
+    /// free-form continuation values).
+    Plain,
+}
+
+impl DescribeLine {
+    /// A section-header line.
+    pub fn section(text: impl Into<String>) -> Self {
+        Self { text: text.into(), kind: DescribeLineKind::Section }
+    }
+    /// A plain line (no structure).
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self { text: text.into(), kind: DescribeLineKind::Plain }
+    }
+    /// A `key: value` field whose structural colon sits at byte `key_end`.
+    pub fn field(text: impl Into<String>, key_end: usize) -> Self {
+        Self { text: text.into(), kind: DescribeLineKind::Field { key_end } }
+    }
+}
+
+/// Flatten typed describe lines to the plain text used for search, scroll,
+/// clipboard, and the TTL cache. Inverse of splitting text into lines.
+pub fn describe_lines_text(lines: &[DescribeLine]) -> String {
+    lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
+}
+
+/// A single streamed log line, split at the daemon. `content` is the log text;
+/// `container` names the source container *only* when the line came from a
+/// multiplexed `--all-containers` stream — there the daemon strips kubectl's
+/// `[pod/container]` prefix and tags it here. Single-container streams leave
+/// `container` `None`: there's one source, already named in the view header.
+///
+/// Why typed: kubectl `--all-containers` auto-enables `--prefix`, emitting
+/// `[pod/container] body` on every line. The old wire shipped that raw `String`
+/// and the UI re-derived the container with a first-word heuristic that rejected
+/// the real `/`-bearing prefix outright — so the prefix leaked into the rendered
+/// body and never colored. The daemon knows the source, so it tags it once here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogLine {
+    pub container: Option<String>,
+    pub content: String,
+}
+
+impl LogLine {
+    /// A line from a single-source stream — no per-line container tag.
+    pub fn untagged(content: impl Into<String>) -> Self {
+        Self { container: None, content: content.into() }
+    }
+
+    /// Flat text form for clipboard / file export: a tagged line regains a
+    /// `[container] ` prefix so its source stays visible outside the colored
+    /// UI; an untagged line is just its content, borrowed (no allocation).
+    pub fn flat_text(&self) -> std::borrow::Cow<'_, str> {
+        match &self.container {
+            Some(c) => std::borrow::Cow::Owned(format!("[{}] {}", c, self.content)),
+            None => std::borrow::Cow::Borrowed(&self.content),
+        }
+    }
+}
+
 /// Events from daemon to TUI on the **control substream**. One-shot
 /// responses (CommandResult, DescribeResult, YamlResult) and global
 /// events (Discovery, PodMetrics, etc.). Subscription-specific events
@@ -1265,7 +1364,7 @@ pub enum SessionEvent {
     // YAML to B's temp file in the edit flow. Same shape as the LogLine
     // generation fix but uses the typed target for correlation.
 
-    DescribeResult { target: ObjectRef, content: String },
+    DescribeResult { target: ObjectRef, lines: Vec<DescribeLine> },
     YamlResult { target: ObjectRef, content: String },
     /// Result of a mutating operation. The message is carried in the Ok/Err
     /// variant directly so the receiver can't access the message without
@@ -1508,5 +1607,140 @@ mod tests {
         let bytes = bincode::serialize(&rid).unwrap();
         let decoded: ResourceId = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded, rid);
+    }
+}
+
+/// Golden byte-layout tests for the positionally-encoded wire types.
+///
+/// The roundtrip tests above serialize-then-deserialize with the SAME code, so
+/// they pass even if a `CellValue` variant is reordered or a `ResourceRow`
+/// field is inserted/removed — a daemon and a TUI built from different revisions
+/// would then silently misread each other's frames (bincode is positional;
+/// nothing self-describing is on the wire, only the `PROTOCOL_VERSION` gate).
+///
+/// These tests freeze the exact bytes. If one fails you changed an on-wire
+/// shape: that is a breaking change — bump [`PROTOCOL_VERSION`], update the
+/// golden here, and ship daemon + TUI together.
+#[cfg(test)]
+mod wire_layout_golden {
+    use super::{DescribeLine, DescribeLineKind, LogLine};
+    use crate::kube::resources::row::{CellValue, QuantityUnit, ResourceRow, RowHealth};
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn cell_tag(v: &CellValue) -> u32 {
+        let b = bincode::serialize(v).unwrap();
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    #[test]
+    fn cellvalue_variant_tags_are_positional() {
+        // bincode encodes the enum discriminant as a u32 LE tag = declaration
+        // index. This order IS the wire contract: reordering or inserting a
+        // variant silently remaps every cell. (The golden below pins the full
+        // byte layout; this documents the tag↔variant map explicitly.)
+        assert_eq!(cell_tag(&CellValue::Text(String::new())), 0);
+        assert_eq!(cell_tag(&CellValue::Ratio { num: 0, denom: 0 }), 1);
+        assert_eq!(cell_tag(&CellValue::Quantity { value: 0, unit: QuantityUnit::Millicores }), 2);
+        assert_eq!(cell_tag(&CellValue::Age(None)), 3);
+        assert_eq!(cell_tag(&CellValue::Count(0)), 4);
+        assert_eq!(cell_tag(&CellValue::Bool(false)), 5);
+        assert_eq!(cell_tag(&CellValue::List(Vec::new())), 6);
+        assert_eq!(cell_tag(&CellValue::Status { text: String::new(), health: RowHealth::Normal }), 7);
+        assert_eq!(cell_tag(&CellValue::Percentage(None)), 8);
+        assert_eq!(cell_tag(&CellValue::Placeholder), 9);
+    }
+
+    #[test]
+    fn cellvalue_wire_layout_golden() {
+        // One of every variant, with distinctive payloads — pins both the
+        // variant order AND each variant's field layout.
+        let sample = vec![
+            CellValue::Text("t".into()),
+            CellValue::Ratio { num: 1, denom: 2 },
+            CellValue::Quantity { value: 3, unit: QuantityUnit::Bytes },
+            CellValue::Age(Some(4)),
+            CellValue::Count(5),
+            CellValue::Bool(true),
+            CellValue::List(vec!["a".into()]),
+            CellValue::Status { text: "s".into(), health: RowHealth::Failed },
+            CellValue::Percentage(Some(6)),
+            CellValue::Placeholder,
+        ];
+        assert_eq!(
+            hex(&bincode::serialize(&sample).unwrap()),
+            "0a00000000000000000000000100000000000000740100000001000000020000000200000003000000000000000100000003000000010400000000000000040000000500000000000000050000000106000000010000000000000001000000000000006107000000010000000000000073020000000800000001060000000000000009000000",
+        );
+    }
+
+    #[test]
+    fn resourcerow_wire_layout_golden() {
+        // Pins ResourceRow field order/presence (incl. the metrics tail that
+        // has `#[serde(default)]` but is always positionally on the wire).
+        let row = ResourceRow {
+            cells: vec![CellValue::Text("c".into()), CellValue::Count(9)],
+            name: "row".into(),
+            namespace: Some("ns".into()),
+            drill_target: None,
+            containers: Vec::new(),
+            owner_refs: Vec::new(),
+            pf_ports: vec![80, 443],
+            crd_info: None,
+            node: None,
+            health: RowHealth::Pending,
+            cpu_request: Some(7),
+            cpu_limit: None,
+            mem_request: None,
+            mem_limit: None,
+        };
+        assert_eq!(
+            hex(&bincode::serialize(&row).unwrap()),
+            "0200000000000000000000000100000000000000630400000009000000000000000300000000000000726f770102000000000000006e73000000000000000000000000000000000002000000000000005000bb01000001000000010700000000000000000000",
+        );
+    }
+
+    #[test]
+    fn describeline_wire_layout_golden() {
+        // The describe wire type added in PROTOCOL_VERSION 6.
+        let lines = vec![
+            DescribeLine { text: "Name: x".into(), kind: DescribeLineKind::Field { key_end: 4 } },
+            DescribeLine { text: "Spec:".into(), kind: DescribeLineKind::Section },
+            DescribeLine { text: String::new(), kind: DescribeLineKind::Plain },
+        ];
+        assert_eq!(
+            hex(&bincode::serialize(&lines).unwrap()),
+            "030000000000000007000000000000004e616d653a20780100000004000000000000000500000000000000537065633a00000000000000000000000002000000",
+        );
+    }
+
+    #[test]
+    fn logline_wire_layout_golden() {
+        // The log-stream wire type added in PROTOCOL_VERSION 7. Field order is
+        // `container` (Option — 1-byte bincode tag, then the String if Some)
+        // then `content`. The All-containers path rides the tagged shape; every
+        // single-source line rides the untagged (None) shape.
+        let tagged = LogLine { container: Some("c".into()), content: "hi".into() };
+        assert_eq!(
+            hex(&bincode::serialize(&tagged).unwrap()),
+            "0101000000000000006302000000000000006869",
+        );
+        let untagged = LogLine::untagged("hi");
+        assert_eq!(
+            hex(&bincode::serialize(&untagged).unwrap()),
+            "0002000000000000006869",
+        );
+    }
+
+    #[test]
+    fn logline_flat_text() {
+        // Untagged: bare content (borrowed, no prefix). Tagged: the source
+        // container regains a `[container] ` prefix for clipboard / file export.
+        assert_eq!(LogLine::untagged("hi").flat_text().as_ref(), "hi");
+        assert_eq!(
+            LogLine { container: Some("web".into()), content: "msg".into() }.flat_text().as_ref(),
+            "[web] msg",
+        );
     }
 }

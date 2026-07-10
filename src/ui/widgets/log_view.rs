@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Paragraph, StatefulWidget, Widget, Wrap},
 };
 
+use crate::kube::protocol::LogLine;
 use crate::ui::theme::Theme;
 
 /// Parsed timestamp and content from a Kubernetes log line.
@@ -29,20 +30,6 @@ fn container_color(name: &str) -> Color {
     ];
     let hash: usize = name.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
     PALETTE[hash % PALETTE.len()]
-}
-
-/// Try to parse a container-name prefix from a multi-container log line.
-/// kubectl `--all-containers` prefixes each line with the container name
-/// followed by a space. Returns `(prefix, rest)` if found.
-fn parse_container_prefix(line: &str) -> Option<(&str, &str)> {
-    // Container prefix is the first word, must not contain '=' or ':' (those
-    // are timestamp or key=value patterns, not prefixes).
-    let space_pos = line.find(' ')?;
-    let prefix = &line[..space_pos];
-    if prefix.is_empty() || prefix.contains('=') || prefix.contains(':') || prefix.contains('/') {
-        return None;
-    }
-    Some((prefix, &line[space_pos + 1..]))
 }
 
 /// State for the log viewer widget.
@@ -84,25 +71,24 @@ pub struct LogViewState {
 /// Accepts `&[&str]` so it works with both `Vec<String>` and `VecDeque<String>`
 /// (the caller converts to a slice of borrowed strings).
 pub struct LogViewer<'a> {
-    lines: &'a [&'a str],
+    /// Visible window of typed log lines. Each carries `content` plus an
+    /// optional source `container` (daemon-tagged for `--all-containers`
+    /// streams); the renderer colors that container as a prefix directly,
+    /// with no per-line string parsing.
+    lines: &'a [&'a LogLine],
     pod_name: &'a str,
     /// User-facing label for the header bar — derived from the typed
     /// [`crate::kube::protocol::LogContainer`] via `ContainerRef::container_label`.
     container_label: &'a str,
-    /// Whether this view is streaming all containers (vs a single one).
-    /// Drives the per-line container-prefix parsing & coloring. Replaces
-    /// the previous `container_name == "all"` magic-string check.
-    is_all_containers: bool,
     since_label: &'a str,
     theme: &'a Theme,
 }
 
 impl<'a> LogViewer<'a> {
     pub fn new(
-        lines: &'a [&'a str],
+        lines: &'a [&'a LogLine],
         pod_name: &'a str,
         container_label: &'a str,
-        is_all_containers: bool,
         since_label: &'a str,
         theme: &'a Theme,
     ) -> Self {
@@ -110,7 +96,6 @@ impl<'a> LogViewer<'a> {
             lines,
             pod_name,
             container_label,
-            is_all_containers,
             since_label,
             theme,
         }
@@ -200,36 +185,39 @@ impl StatefulWidget for LogViewer<'_> {
             .map(|s| crate::util::SearchPattern::new(s))
             .collect();
 
-        let prepare_line = |line: &str, theme: &Theme, is_all: bool, show_ts: bool,
+        let prepare_line = |line: &LogLine, theme: &Theme, show_ts: bool,
                             compiled: &[crate::util::SearchPattern]| -> Line<'static> {
             let mut spans: Vec<Span<'static>> = Vec::new();
 
-            // 1. Timestamp (optional prefix).
-            let content = if show_ts {
-                if let Some(LogTimestamp { timestamp: ts, content }) = Self::parse_timestamp(line) {
+            // 1. Container prefix — the daemon-tagged source container. Present
+            //    only for --all-containers streams (where `container` is `Some`);
+            //    single-container streams skip it. Normally drawn in the
+            //    container's stable color, but when an active filter matches the
+            //    container name it's drawn highlighted — otherwise a line shown
+            //    *because* its container matched the grep would have no visible
+            //    reason for being there.
+            if let Some(container) = &line.container {
+                let style = if compiled.iter().any(|p| p.is_match(container)) {
+                    theme.search_match
+                } else {
+                    Style::default().fg(container_color(container))
+                };
+                spans.push(Span::styled(format!("{} ", container), style));
+            }
+
+            // 2. Timestamp (optional), parsed from the line content.
+            let body = if show_ts {
+                if let Some(LogTimestamp { timestamp: ts, content }) = Self::parse_timestamp(&line.content) {
                     spans.push(Span::styled(ts.to_string(), theme.log_timestamp));
                     spans.push(Span::styled(" ".to_string(), theme.log_text));
                     content
                 } else {
-                    line
+                    &line.content
                 }
-            } else if let Some(LogTimestamp { content, .. }) = Self::parse_timestamp(line) {
+            } else if let Some(LogTimestamp { content, .. }) = Self::parse_timestamp(&line.content) {
                 content
             } else {
-                line
-            };
-
-            // 2. Container prefix (multi-container logs).
-            let body = if is_all {
-                if let Some((prefix, rest)) = parse_container_prefix(content) {
-                    let color = container_color(prefix);
-                    spans.push(Span::styled(format!("{} ", prefix), Style::default().fg(color)));
-                    rest
-                } else {
-                    content
-                }
-            } else {
-                content
+                &line.content
             };
 
             // 3. Body: ANSI colors preserved, filter highlights overlaid.
@@ -244,31 +232,47 @@ impl StatefulWidget for LogViewer<'_> {
                         ranges.extend(pat.find_all(&stripped));
                     }
                     ranges.sort_unstable();
-                    ranges
+                    // Merge overlapping ranges from multiple patterns.
+                    let mut merged: Vec<(usize, usize)> = Vec::new();
+                    for (ms, me) in ranges {
+                        if let Some(last) = merged.last_mut() {
+                            if ms <= last.1 {
+                                last.1 = last.1.max(me);
+                                continue;
+                            }
+                        }
+                        merged.push((ms, me));
+                    }
+                    merged
                 };
                 if match_ranges.is_empty() {
-                    // No matches — render with ANSI colors.
                     spans.extend(ansi_spans.into_iter().map(|s| {
                         Span::styled(s.content.to_string(), s.style)
                     }));
                 } else {
-                    // Has matches — override matched portions with highlight style,
-                    // keep ANSI colors on non-matched portions.
-                    let mut char_pos: usize = 0;
+                    let mut pos: usize = 0;
                     for s in &ansi_spans {
-                        // parse_ansi_line returns spans with ONLY visible text
-                        // (ANSI codes already removed) — no double-strip needed.
-                        let span_start = char_pos;
-                        let span_end = char_pos + s.content.len();
-                        let overlaps_match = match_ranges.iter().any(|&(ms, me)| {
-                            ms < span_end && me > span_start
-                        });
-                        if overlaps_match {
-                            spans.push(Span::styled(s.content.to_string(), theme.search_match));
-                        } else {
-                            spans.push(Span::styled(s.content.to_string(), s.style));
+                        let text = s.content.as_ref();
+                        let span_start = pos;
+                        let span_end = pos + text.len();
+
+                        let mut cursor = 0usize;
+                        for &(ms, me) in &match_ranges {
+                            if ms >= span_end || me <= span_start { continue; }
+                            let local_start = ms.saturating_sub(span_start);
+                            let local_end = (me - span_start).min(text.len());
+                            if local_start > cursor {
+                                spans.push(Span::styled(text[cursor..local_start].to_string(), s.style));
+                            }
+                            spans.push(Span::styled(text[local_start..local_end].to_string(), theme.search_match));
+                            cursor = local_end;
                         }
-                        char_pos = span_end;
+                        if cursor < text.len() {
+                            spans.push(Span::styled(text[cursor..].to_string(), s.style));
+                        } else if cursor == 0 {
+                            spans.push(Span::styled(text.to_string(), s.style));
+                        }
+                        pos = span_end;
                     }
                 }
             } else {
@@ -288,7 +292,7 @@ impl StatefulWidget for LogViewer<'_> {
             let start = state.scroll.min(self.lines.len().saturating_sub(1));
             let text_lines: Vec<Line<'static>> = self.lines[start..]
                 .iter()
-                .map(|line| prepare_line(line, self.theme, self.is_all_containers, state.show_timestamps, &compiled_patterns))
+                .map(|&line| prepare_line(line, self.theme, state.show_timestamps, &compiled_patterns))
                 .collect();
             let paragraph = Paragraph::new(text_lines)
                 .wrap(Wrap { trim: false })
@@ -298,7 +302,7 @@ impl StatefulWidget for LogViewer<'_> {
             let end = (state.scroll + visible_height).min(self.lines.len());
             for (vi, line_idx) in (state.scroll..end).enumerate() {
                 let y = inner.y + vi as u16;
-                let styled = prepare_line(self.lines[line_idx], self.theme, self.is_all_containers, state.show_timestamps, &compiled_patterns);
+                let styled = prepare_line(self.lines[line_idx], self.theme, state.show_timestamps, &compiled_patterns);
                 buf.set_line(inner.x, y, &styled, inner.width);
             }
         }

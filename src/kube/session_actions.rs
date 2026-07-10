@@ -211,11 +211,8 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
                     let container_count = {
                         // Manual dual-path lookup: can't call app.table_for()
                         // because app.route is mutably borrowed by this match.
-                        let table = if crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(target.resource.clone())) {
-                            app.data.tables.get(&target.resource)
-                        } else {
-                            app.nav.find_table_for_resource(&target.resource)
-                        };
+                        let table = app.nav.find_table_for_resource(&target.resource)
+                            .or_else(|| app.data.tables.get(&target.resource));
                         table
                             .and_then(|t| t.items.iter().find(|p| {
                                 p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
@@ -364,13 +361,16 @@ fn handle_resource_op(
                 if app.nav.view_id().is_derived() {
                     if let (Some(source), Some(table)) = (app.nav.current().source.clone(), app.active_view_table()) {
                         if let Some(item) = table.selected_item() {
-                            let ns = source.namespace.display().to_string();
-                            if !ns.is_empty() && ns != "all" {
+                            // Only a Named namespace can be shelled into; `All` is
+                            // structurally excluded (and a namespace literally named
+                            // "all" is `Named("all")`, so it works correctly — the
+                            // old `ns != "all"` magic-string guard wrongly rejected it).
+                            if let crate::kube::protocol::Namespace::Named(ns) = &source.namespace {
                                 return ActionResult::Exec {
                                     op: crate::kube::protocol::OperationKind::Shell,
                                     target: crate::kube::session::ExecTarget::Pod {
                                         pod: source.name.clone(),
-                                        namespace: ns,
+                                        namespace: ns.clone(),
                                         container: item.name.clone(),
                                     },
                                 };
@@ -607,7 +607,9 @@ fn handle_filter_search(
         }
         Action::ColumnFilter => {
             if matches!(app.route, Route::Resources) {
-                let col = app.active_table_selected_col();
+                // Data index — the filter indexes the full `cells` array, not
+                // the visible subset (which differs whenever a column is hidden).
+                let col = app.active_table_selected_data_col();
                 app.nav.filter_input_mut().start_column(col);
             }
         }
@@ -801,7 +803,7 @@ fn handle_log_action(
                     chrono::Utc::now().format("%Y%m%d-%H%M%S"),
                 );
                 let content: String = state.lines().iter()
-                    .map(|l| crate::util::strip_ansi(l))
+                    .map(|l| crate::util::strip_ansi(&l.flat_text()))
                     .collect::<Vec<_>>()
                     .join("\n");
                 match crate::util::safe_write_temp(&filename, content.as_bytes()) {
@@ -992,7 +994,7 @@ fn handle_io(
                         let lines = state.lines();
                         let joined: String = indices.iter()
                             .filter_map(|&i| lines.get(i))
-                            .map(|l| crate::util::strip_ansi(l))
+                            .map(|l| crate::util::strip_ansi(&l.flat_text()))
                             .collect::<Vec<_>>()
                             .join("\n");
                         let count = indices.len();
@@ -1215,11 +1217,8 @@ pub(crate) fn handle_enter(
         let target = target.clone();
         let pod_ns_str = target.namespace.display().to_string();
         let container_name = {
-            let table = if crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(target.resource.clone())) {
-                app.data.tables.get(&target.resource)
-            } else {
-                app.nav.find_table_for_resource(&target.resource)
-            };
+            let table = app.nav.find_table_for_resource(&target.resource)
+                .or_else(|| app.data.tables.get(&target.resource));
             table
                 .and_then(|t| t.items.iter().find(|p| {
                     p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
@@ -1288,8 +1287,8 @@ pub(crate) fn handle_enter(
     };
 
     match row.drill_target.clone() {
-        Some(DrillTarget::SwitchNamespace(ns)) => {
-            do_switch_namespace(app, data_source, ns);
+        Some(DrillTarget::PodsInNamespace(ns)) => {
+            drill_to_pods_in_namespace(app, data_source, ns);
         }
         Some(DrillTarget::BrowseCrd(crd_ref)) => {
             let kind_label = crd_ref.kind.clone();
@@ -1303,10 +1302,15 @@ pub(crate) fn handle_enter(
             app.ui.flash = Some(crate::app::FlashMessage::info(format!("Browsing CRD: {}", kind_label)));
         }
         Some(DrillTarget::PodsByLabels { labels, breadcrumb }) => {
-            drill_to_pods_by_labels(app, data_source, labels, &breadcrumb);
+            // Scope to the *source* object's namespace, not the parent view's —
+            // from an all-namespaces parent these labels would otherwise match
+            // pods cluster-wide.
+            let source_ns = crate::kube::protocol::Namespace::from_row(row.namespace.as_deref().unwrap_or(""));
+            drill_to_pods_by_labels(app, data_source, labels, source_ns, &breadcrumb);
         }
         Some(DrillTarget::PodsByOwner { uid, kind, name }) => {
-            drill_to_pods_by_owner(app, data_source, &uid, kind, &name);
+            let source_ns = crate::kube::protocol::Namespace::from_row(row.namespace.as_deref().unwrap_or(""));
+            drill_to_pods_by_owner(app, data_source, &uid, kind, &name, source_ns);
         }
         Some(DrillTarget::PodsByField(selector)) => {
             let breadcrumb = selector.breadcrumb();
@@ -1334,6 +1338,7 @@ pub(crate) fn handle_enter(
                     uid,
                     kind,
                     display_name: name.clone(),
+                    namespace: crate::kube::protocol::Namespace::from_row(row.namespace.as_deref().unwrap_or("")),
                 }),
             ));
             apply_nav_change(app, data_source, change);
@@ -1380,9 +1385,9 @@ pub(crate) fn handle_describe(
 ) {
     use crate::app::Route;
     if let Some(info) = get_selected_resource_info(app) {
-        if let Some(cached) = app.kube.kubectl_cache.get(&info, crate::app::ContentKind::Describe) {
+        if let Some(lines) = app.kube.kubectl_cache.get_describe_lines(&info) {
             let mut state = crate::app::ContentViewState::default();
-            state.set_content(cached.to_string());
+            state.set_describe_lines(lines);
             app.navigate_to(Route::ContentView {
                 kind: crate::app::ContentViewKind::Describe,
                 target: Some(info),
@@ -1669,8 +1674,8 @@ pub(crate) fn build_form_from_schema(
                     FormFieldState {
                         name: field_schema.name.into(),
                         label: field_schema.label.into(),
-                        kind: FormFieldKind::Select { options },
-                        value: "0".into(),
+                        kind: FormFieldKind::Select { options, selected: 0 },
+                        value: String::new(),
                     }
                 }
             }
@@ -1732,6 +1737,7 @@ pub(crate) fn drill_to_pods_by_labels(
     app: &mut App,
     data_source: &mut ClientSession,
     labels: std::collections::BTreeMap<String, String>,
+    namespace: crate::kube::protocol::Namespace,
     description: &str,
 ) {
     use crate::app::nav::{NavFilter, NavStep};
@@ -1739,7 +1745,7 @@ pub(crate) fn drill_to_pods_by_labels(
     app.nav.save_selected(app.active_table_selected());
     let change = app.nav.push(NavStep::new(
         rid(BuiltInKind::Pod),
-        Some(NavFilter::Labels(labels)),
+        Some(NavFilter::Labels { labels, namespace }),
     ));
     apply_nav_change(app, data_source, change);
     app.reapply_nav_filters();
@@ -1771,6 +1777,7 @@ pub(crate) fn drill_to_pods_by_owner(
     uid: &str,
     kind: BuiltInKind,
     name: &str,
+    namespace: crate::kube::protocol::Namespace,
 ) {
     use crate::app::nav::{NavFilter, NavStep};
 
@@ -1781,6 +1788,7 @@ pub(crate) fn drill_to_pods_by_owner(
             uid: uid.to_string(),
             kind,
             display_name: name.to_string(),
+            namespace,
         }),
     ));
     apply_nav_change(app, data_source, change);
@@ -1789,6 +1797,37 @@ pub(crate) fn drill_to_pods_by_owner(
     app.ui.flash = Some(crate::app::FlashMessage::info(format!(
         "Pods for {}/{}",
         kind_lower, name
+    )));
+}
+
+/// Drill from a namespace row into the pods running in that namespace.
+/// Entering a namespace also makes it the session's active scope (matching
+/// k9s), so sibling tabs inherit it. The pushed Pod step carries no filter,
+/// so `apply_nav_change` falls back to `selected_ns` for the fresh
+/// subscription — scoping the pods to the namespace we just selected. Esc
+/// pops back to the (cluster-scoped) namespace list, whose cached rows
+/// survive the namespaced-cache clear below.
+pub(crate) fn drill_to_pods_in_namespace(
+    app: &mut App,
+    data_source: &mut ClientSession,
+    ns: crate::kube::protocol::Namespace,
+) {
+    use crate::app::nav::NavStep;
+
+    // Make the selected namespace the active scope (same hygiene as
+    // `do_switch_namespace`: drop other namespaces' cached rows so they
+    // can't bleed into sibling tabs after the switch).
+    app.kube.selected_ns = ns.clone();
+    app.clear_namespaced_caches();
+    app.kube.kubectl_cache.clear();
+    app.ui.deltas.clear();
+
+    app.nav.save_selected(app.active_table_selected());
+    let change = app.nav.push(NavStep::new(rid(BuiltInKind::Pod), None));
+    apply_nav_change(app, data_source, change);
+    app.ui.flash = Some(crate::app::FlashMessage::info(format!(
+        "Pods in namespace: {}",
+        ns.display()
     )));
 }
 

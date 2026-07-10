@@ -88,7 +88,9 @@ struct TableSnapshot<'a> {
     row_keys: &'a [crate::kube::protocol::ObjectKey],
     row_health: &'a [crate::kube::resources::row::RowHealth],
     cell_style: &'a [Vec<Option<crate::kube::resources::row::RowHealth>>],
-    max_col_width: u16,
+    /// Pre-computed per-column display widths, carried from the memoized
+    /// [`PreparedView`] so the widget doesn't re-scan rows each frame.
+    col_widths: &'a [u16],
     search_patterns: &'a [crate::util::SearchPattern],
 }
 
@@ -111,7 +113,7 @@ fn draw_resource_table(
         .row_keys(snap.row_keys)
         .row_health(snap.row_health)
         .cell_style(snap.cell_style)
-        .max_col_width(snap.max_col_width)
+        .col_widths(snap.col_widths)
         .search_patterns(snap.search_patterns);
 
     let mut state = ResourceTableState {
@@ -212,7 +214,7 @@ fn draw_unified_table(
     let column_rules = ctx.descriptor
         .map(|d| d.column_rules())
         .unwrap_or(EMPTY_RULES);
-    let view = table.prepare_view(&visible_indices, column_rules);
+    let view = table.prepare_view(&visible_indices, column_rules, &headers, ctx.max_col_width);
 
     let selected = table.selected();
     let initial_offset = table.offset();
@@ -238,7 +240,7 @@ fn draw_unified_table(
         row_keys: &view.keys,
         row_health: &view.health,
         cell_style: &view.cell_style,
-        max_col_width: ctx.max_col_width,
+        col_widths: &view.col_widths,
         search_patterns: ctx.search_patterns,
     };
     let (new_offset, new_page_size, new_col_offset) = draw_resource_table(
@@ -333,15 +335,13 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let view_id = app.nav.view_id().clone();
     let title = view_id.short_label().to_lowercase();
     let current_rid = view_id.resource_id().cloned();
-    let is_global = crate::app::nav::is_globally_stored(&view_id);
     // For derived views (no ResourceId), table + descriptor live directly
     // on the NavStep. For resource views, route through global/nav lookup.
+    // Nav-step is preferred over global (handles filtered views of globally-
+    // stored resources like Node).
     let desc = if let Some(ref rid) = current_rid {
-        if is_global {
-            app.data.descriptors.get(rid).cloned()
-        } else {
-            app.nav.find_descriptor_for_resource(rid).cloned()
-        }
+        app.nav.find_descriptor_for_resource(rid).cloned()
+            .or_else(|| app.data.descriptors.get(rid).cloned())
     } else {
         // Derived view — descriptor on the nav step itself.
         app.nav.current().descriptor.clone()
@@ -361,11 +361,12 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     };
     // Manual routing (not `active_view_table_mut()`) to avoid borrow
     // conflict with `theme` — `&mut self` would conflict with `&app.ui.theme`.
+    // Nav-step preferred over global (same as table_for_mut).
     let table_ref = if let Some(ref rid) = current_rid {
-        if is_global {
-            app.data.tables.get_mut(rid)
-        } else {
+        if app.nav.find_table_for_resource(rid).is_some() {
             app.nav.find_table_for_resource_mut(rid)
+        } else {
+            app.data.tables.get_mut(rid)
         }
     } else {
         // Derived view — table on the nav step itself.

@@ -25,6 +25,7 @@ use crate::event::AppEvent;
 
 #[derive(Parser, Debug)]
 #[command(name = "k9rs", version, about = "A fast Kubernetes TUI")]
+#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     /// Kubernetes context to use
     #[arg(long)]
@@ -42,7 +43,7 @@ struct Cli {
     #[arg(long)]
     log_file: Option<String>,
 
-    /// Start on a specific resource view
+    /// Start on a specific resource view (legacy; prefer positional nav path)
     #[arg(short, long)]
     command: Option<String>,
 
@@ -53,6 +54,16 @@ struct Cli {
     /// Read-only mode: disables all destructive actions (delete, edit, scale, restart, shell)
     #[arg(long)]
     readonly: bool,
+
+    /// Navigation path: resource [filter] [resource [filter]] ...
+    ///
+    /// Each arg that matches a known resource (pods, deploy, svc, ...) starts
+    /// a new nav level. Unrecognized args become grep filters for the current
+    /// level. Examples:
+    ///   k9rs pods                  # view pods
+    ///   k9rs pods nginx            # pods grepped to "nginx"
+    ///   k9rs deploy my-app pods    # deploy > /my-app > pods
+    nav_path: Vec<String>,
 
     #[command(subcommand)]
     subcmd: Option<crate::cli::Command>,
@@ -116,13 +127,8 @@ async fn main() -> Result<()> {
         app.read_only = true;
     }
 
-    // Parse initial command/resource
-    if let Some(ref cmd) = cli.command {
-        if let Some(tab) = crate::kube::session_commands::parse_resource_command(cmd) {
-            app.nav.reset(tab);
-            app.route = crate::app::Route::Resources;
-        }
-    }
+    // Parse startup navigation from positional args or legacy -c flag.
+    let startup_segments = parse_startup_segments(&cli);
 
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>(500);
 
@@ -173,27 +179,12 @@ async fn main() -> Result<()> {
         event_tx.clone(),
     );
 
-    // If `--command` put us straight into a resource view, open a
-    // subscription substream immediately. The bridge task inside
-    // subscribe_stream awaits the MuxHandle (which becomes available
-    // after the connection handshake), so the subscribe fires as soon
-    // as the connection is up. Core resources (namespaces, nodes) are
-    // auto-subscribed by the client via `open_core_subscriptions` on
-    // `ConnectionEstablished`, so we skip them here to avoid opening
-    // a duplicate substream for the same table.
-    if matches!(app.route, crate::app::Route::Resources) {
-        if let Some(initial_rid) = app.nav.resource_id().cloned() {
-            let is_core = initial_rid.built_in_kind()
-                .map(|k| crate::kube::resource_defs::REGISTRY.by_kind(k).is_core())
-                .unwrap_or(false);
-            if !is_core {
-                let filter = app.nav.current().filter.as_ref()
-                    .and_then(|f| f.to_subscription_filter());
-                let stream = data_source.subscribe_stream(initial_rid, app.kube.selected_ns.clone(), filter);
-                app.nav.current_mut().stream = Some(stream);
-            }
-        }
-    }
+    // Apply startup navigation (positional args or -c) and open
+    // subscription substreams. Bridge tasks inside subscribe_stream
+    // await the MuxHandle, so subscribes fire as soon as the connection
+    // is up. Core resources are auto-subscribed via
+    // `open_core_subscriptions` on ConnectionEstablished.
+    apply_startup_nav(&mut app, &data_source, &startup_segments);
 
     // Spawn the input bridge so keypresses flow into `session_main` from
     // frame zero — the user can type `:`, navigate, scroll, etc. immediately,
@@ -279,5 +270,117 @@ async fn main() -> Result<()> {
             // Normal exit — no message needed.
             Ok(())
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup navigation — positional args → nav stack
+// ---------------------------------------------------------------------------
+
+use crate::kube::protocol::ResourceId;
+
+enum StartupSegment {
+    Resource(ResourceId),
+    Filter(String),
+}
+
+fn parse_startup_segments(cli: &Cli) -> Vec<StartupSegment> {
+    if !cli.nav_path.is_empty() {
+        cli.nav_path.iter().map(|arg| {
+            match ResourceId::from_alias(arg) {
+                Some(rid) => StartupSegment::Resource(rid),
+                None => StartupSegment::Filter(arg.clone()),
+            }
+        }).collect()
+    } else if let Some(ref cmd) = cli.command {
+        match ResourceId::from_alias(cmd) {
+            Some(rid) => vec![StartupSegment::Resource(rid)],
+            None => vec![],
+        }
+    } else {
+        vec![]
+    }
+}
+
+fn apply_startup_nav(
+    app: &mut App,
+    data_source: &crate::kube::client_session::ClientSession,
+    segments: &[StartupSegment],
+) {
+    if segments.is_empty() {
+        return;
+    }
+
+    // First segment must be a resource.
+    let first_rid = match &segments[0] {
+        StartupSegment::Resource(rid) => rid.clone(),
+        StartupSegment::Filter(text) => {
+            app.ui.flash = Some(crate::app::FlashMessage::warn(
+                format!("Unknown resource: {}", text),
+            ));
+            return;
+        }
+    };
+
+    app.nav.reset(first_rid);
+    app.route = crate::app::Route::Resources;
+
+    for seg in &segments[1..] {
+        match seg {
+            StartupSegment::Filter(pattern) => {
+                if let Some(rid) = app.nav.resource_id().cloned() {
+                    let grep = crate::app::nav::NavFilter::Grep(
+                        crate::app::nav::CompiledGrep::new(pattern),
+                    );
+                    app.nav.push(crate::app::nav::NavStep::new(rid, Some(grep)));
+                }
+            }
+            StartupSegment::Resource(rid) => {
+                // Subscribe the current top before it becomes a parent.
+                subscribe_top_if_needed(app, data_source);
+
+                let mut step = crate::app::nav::NavStep::new(rid.clone(), None);
+                if !crate::app::nav::is_globally_stored(
+                    &crate::app::view::ViewId::Resource(rid.clone()),
+                ) {
+                    step.table = Some(crate::app::table::StatefulTable::new());
+                }
+                app.nav.push(step);
+            }
+        }
+    }
+
+    // Subscribe the final top of the stack.
+    subscribe_top_if_needed(app, data_source);
+}
+
+fn subscribe_top_if_needed(
+    app: &mut App,
+    data_source: &crate::kube::client_session::ClientSession,
+) {
+    let Some(rid) = app.nav.resource_id().cloned() else { return };
+    let is_core = rid.built_in_kind()
+        .map(|k| crate::kube::resource_defs::REGISTRY.by_kind(k).is_core())
+        .unwrap_or(false);
+    if is_core {
+        return;
+    }
+    // Only subscribe if the subscription owner doesn't already have a stream.
+    let needs_stream = {
+        let mut has = false;
+        app.nav.with_subscription_owner(|step| {
+            has = step.stream.is_some();
+        });
+        !has
+    };
+    if needs_stream {
+        let filter = app.nav.current().filter.as_ref()
+            .and_then(|f| f.to_subscription_filter());
+        let stream = data_source.subscribe_stream(
+            rid, app.kube.selected_ns.clone(), filter,
+        );
+        app.nav.with_subscription_owner(|step| {
+            step.stream = Some(stream);
+        });
     }
 }

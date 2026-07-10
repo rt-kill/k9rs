@@ -38,7 +38,7 @@ impl ConvertToRow<Namespace> for NamespaceDef {
         // identifier, never the user-typed sentinel "all". Use `Named`
         // directly so a namespace literally named `all` would still drill
         // into itself instead of switching to all-namespaces mode.
-        let drill_target = Some(DrillTarget::SwitchNamespace(
+        let drill_target = Some(DrillTarget::PodsInNamespace(
             crate::kube::protocol::Namespace::Named(meta.name.clone()),
         ));
         let health = match status.as_str() {

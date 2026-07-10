@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 
-use crate::kube::protocol::{LogContainer, ObjectRef};
+use crate::kube::protocol::{LogContainer, LogLine, ObjectRef};
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -664,10 +664,10 @@ pub struct FormFieldState {
     /// Discriminator that decides which input control the widget renders
     /// and what keystrokes the input handler accepts.
     pub kind: FormFieldKind,
-    /// Current input. For Text/Number/Port this is whatever the user has
-    /// typed; for Select this is the *selected option index* serialised as
-    /// a digit string ("0", "1", …) so the same field can be cycled by the
-    /// shared input handler.
+    /// Current text input — the characters the user has typed. Used by the
+    /// text-like kinds (Text/Number/Port). For `Select` the chosen option is
+    /// the typed `selected` index carried on the kind itself, and this field
+    /// stays empty.
     pub value: String,
 }
 
@@ -682,8 +682,10 @@ pub enum FormFieldKind {
     Number { min: i64, max: i64 },
     /// Network port (1..=65535). Input is digits-only.
     Port,
-    /// One of a fixed set of choices, cycled with Left/Right.
-    Select { options: Vec<SelectOption> },
+    /// One of a fixed set of choices, cycled with Left/Right. `selected`
+    /// indexes `options` — typed, so the chosen option can't desync from a
+    /// parallel digit-string the way the old `value`-encoded index could.
+    Select { options: Vec<SelectOption>, selected: usize },
 }
 
 /// A single entry in a [`FormFieldKind::Select`]. `value` is what the
@@ -778,10 +780,8 @@ fn parse_port_field(fields: &[FormFieldState], name: &str) -> Result<u16, String
         .find(|f| f.name == name)
         .ok_or_else(|| format!("Missing field: {}", name))?;
     match &field.kind {
-        FormFieldKind::Select { options } => {
-            let idx: usize = field.value.parse()
-                .map_err(|_| "Invalid port selection".to_string())?;
-            options.get(idx)
+        FormFieldKind::Select { options, selected } => {
+            options.get(*selected)
                 .and_then(|opt| opt.value.parse::<u16>().ok())
                 .ok_or_else(|| "Invalid port selection".to_string())
         }
@@ -850,8 +850,10 @@ pub struct LogState {
     /// Log line buffer. Private — external code reads via [`lines()`] and
     /// mutates via [`push()`], which maintains the `filtered_indices`
     /// invariant (adjusting indices on eviction). Direct mutation would
-    /// corrupt `filtered_indices`.
-    lines: VecDeque<String>,
+    /// corrupt `filtered_indices`. Typed [`LogLine`]s: `content` plus an
+    /// optional source `container` (set only for `--all-containers` streams),
+    /// so the renderer colors the container without re-parsing a string prefix.
+    lines: VecDeque<LogLine>,
     pub max_lines: usize,
     pub scroll: usize,
     pub follow: bool,
@@ -917,7 +919,7 @@ impl LogState {
 
     /// The log line buffer. Use [`push()`] to append lines — it maintains
     /// the `filtered_indices` invariant on eviction.
-    pub fn lines(&self) -> &VecDeque<String> { &self.lines }
+    pub fn lines(&self) -> &VecDeque<LogLine> { &self.lines }
 
     /// Committed filter patterns (source text). Use [`commit_filter()`] /
     /// [`pop_filter()`] to mutate — they rebuild compiled patterns.
@@ -936,7 +938,20 @@ impl LogState {
             ..Default::default()
         }
     }
-    pub fn push(&mut self, line: String) {
+    /// Whether a line passes the active filter stack: every pattern must match
+    /// its `content` or its (optional) source `container`. Single source of
+    /// truth for both the incremental [`push()`] check and the full
+    /// [`rebuild_filter()`] sweep, so they can't diverge — and matching the
+    /// container keeps grep narrowing an `--all-containers` view now that the
+    /// container is a typed field, not an inline `[pod/container]` text prefix.
+    fn line_matches(line: &LogLine, patterns: &[crate::util::SearchPattern]) -> bool {
+        patterns.iter().all(|p| {
+            p.is_match(&line.content)
+                || line.container.as_deref().is_some_and(|c| p.is_match(c))
+        })
+    }
+
+    pub fn push(&mut self, line: LogLine) {
         let evicted = self.lines.len() >= self.max_lines;
         if evicted {
             self.lines.pop_front();
@@ -953,7 +968,7 @@ impl LogState {
         self.lines.push_back(line);
         // Incrementally check the new line against cached compiled patterns.
         let new_idx = self.lines.len() - 1;
-        if self.compiled_patterns.is_empty() || self.compiled_patterns.iter().all(|p| p.is_match(&self.lines[new_idx])) {
+        if self.compiled_patterns.is_empty() || Self::line_matches(&self.lines[new_idx], &self.compiled_patterns) {
             self.filtered_indices.push(new_idx);
         }
     }
@@ -988,10 +1003,7 @@ impl LogState {
             self.filtered_indices = (0..self.lines.len()).collect();
         } else {
             self.filtered_indices = (0..self.lines.len())
-                .filter(|&i| {
-                    let line = &self.lines[i];
-                    self.compiled_patterns.iter().all(|p| p.is_match(line))
-                })
+                .filter(|&i| Self::line_matches(&self.lines[i], &self.compiled_patterns))
                 .collect();
         }
     }
@@ -1058,6 +1070,11 @@ impl LogState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContentViewState {
     pub content: String,
+    /// Typed describe lines when this view is a structured *describe* (empty
+    /// for YAML, aliases, and kubectl-fallback text). When non-empty the
+    /// renderer styles by the producer's role tags instead of re-inferring
+    /// structure from `content`.
+    pub describe_lines: Vec<crate::kube::protocol::DescribeLine>,
     pub scroll: usize,
     pub search: Option<String>,
     pub search_matches: Vec<usize>,
@@ -1069,10 +1086,22 @@ pub struct ContentViewState {
 }
 
 impl ContentViewState {
-    /// Set content and update cached line count.
+    /// Set plain-text content (YAML, aliases, error text) and update the cached
+    /// line count. Clears any typed describe lines so the renderer falls back
+    /// to text inference for these genuinely-opaque views.
     pub fn set_content(&mut self, content: String) {
         self.line_count = content.lines().count();
         self.content = content;
+        self.describe_lines.clear();
+    }
+
+    /// Set typed describe lines (a structured describe). Derives the flat
+    /// `content` (line texts joined) so search / scroll / clipboard keep
+    /// operating on a `String` unchanged.
+    pub fn set_describe_lines(&mut self, lines: Vec<crate::kube::protocol::DescribeLine>) {
+        self.content = crate::kube::protocol::describe_lines_text(&lines);
+        self.line_count = lines.len();
+        self.describe_lines = lines;
     }
 
     /// Get the cached line count (O(1) instead of O(n)).
@@ -1164,6 +1193,10 @@ impl CacheKey {
 /// A cached content entry with its timestamp.
 pub(crate) struct CacheEntry {
     pub(crate) content: String,
+    /// Typed describe lines for `ContentKind::Describe` entries; empty for
+    /// YAML. Lets a cached describe re-open render by role tags exactly like a
+    /// fresh one, with no inference-on-cache-hit inconsistency.
+    pub(crate) describe_lines: Vec<crate::kube::protocol::DescribeLine>,
     pub(crate) cached_at: Instant,
 }
 
@@ -1198,13 +1231,35 @@ impl KubectlCache {
     }
 
     pub fn insert(&mut self, target: ObjectRef, kind: ContentKind, content: String) {
-        let key = CacheKey::new(target, kind);
-        // If the key already exists, just update the value (no change to insertion order).
+        self.insert_entry(
+            CacheKey::new(target, kind),
+            CacheEntry { content, describe_lines: Vec::new(), cached_at: Instant::now() },
+        );
+    }
+
+    /// Cache a structured describe by its typed lines. The flat `content` is
+    /// derived so the text-keyed `get` keeps working for this entry too.
+    pub fn insert_describe(
+        &mut self,
+        target: ObjectRef,
+        lines: Vec<crate::kube::protocol::DescribeLine>,
+    ) {
+        let content = crate::kube::protocol::describe_lines_text(&lines);
+        self.insert_entry(
+            CacheKey::new(target, ContentKind::Describe),
+            CacheEntry { content, describe_lines: lines, cached_at: Instant::now() },
+        );
+    }
+
+    /// Shared insert: update in place if the key exists (preserving insertion
+    /// order), else append and, once at capacity, evict the oldest entry —
+    /// FIFO by insertion order, not LRU (an in-place update does not refresh
+    /// recency, so a frequently-read entry is still evicted on schedule).
+    fn insert_entry(&mut self, key: CacheKey, entry: CacheEntry) {
         if let std::collections::hash_map::Entry::Occupied(mut e) = self.entries.entry(key.clone()) {
-            e.insert(CacheEntry { content, cached_at: std::time::Instant::now() });
+            e.insert(entry);
             return;
         }
-        // Evict the oldest entry if at capacity.
         if self.entries.len() >= self.max_capacity {
             if let Some(oldest_key) = self.insertion_order.first().cloned() {
                 self.entries.remove(&oldest_key);
@@ -1212,7 +1267,25 @@ impl KubectlCache {
             }
         }
         self.insertion_order.push(key.clone());
-        self.entries.insert(key, CacheEntry { content, cached_at: Instant::now() });
+        self.entries.insert(key, entry);
+    }
+
+    /// Fresh typed describe lines for `target`, if cached and unexpired. Used by
+    /// the describe cache-hit path so a re-open renders identically to a fresh
+    /// describe instead of falling back to text inference.
+    pub fn get_describe_lines(
+        &self,
+        target: &ObjectRef,
+    ) -> Option<Vec<crate::kube::protocol::DescribeLine>> {
+        let key = CacheKey::new(target.clone(), ContentKind::Describe);
+        self.entries.get(&key).and_then(|entry| {
+            // Empty lines count as a miss, not a hit: a describe view fed empty
+            // lines would derive empty `content` and wedge on "Loading…". A real
+            // describe always has lines, so this only rejects a degenerate
+            // entry and re-fetches.
+            let usable = entry.cached_at.elapsed() < self.ttl && !entry.describe_lines.is_empty();
+            usable.then(|| entry.describe_lines.clone())
+        })
     }
 
     pub fn clear(&mut self) {
@@ -1360,5 +1433,97 @@ mod form_submit_tests {
             }
             _ => panic!("expected PortForward command"),
         }
+    }
+
+    #[test]
+    fn port_forward_build_command_select_uses_typed_index() {
+        let target = pod_target();
+        // The pf_ports path builds a Select container_port. The chosen option is
+        // the typed `selected` index — no digit-string round-trip — so selected=1
+        // resolves to the second option ("8443").
+        let fields = vec![
+            FormFieldState {
+                name: "container_port".into(),
+                label: "".into(),
+                kind: FormFieldKind::Select {
+                    options: vec![
+                        SelectOption::new("8080", "8080"),
+                        SelectOption::new("8443", "8443"),
+                    ],
+                    selected: 1,
+                },
+                value: String::new(),
+            },
+            FormFieldState {
+                name: "local_port".into(),
+                label: "".into(),
+                kind: FormFieldKind::Port,
+                value: "9090".into(),
+            },
+        ];
+        let cmd = FormSubmit::PortForward.build_command(&target, &fields).unwrap();
+        match cmd {
+            crate::kube::protocol::SessionCommand::PortForward { container_port, local_port, .. } => {
+                assert_eq!(container_port, 8443);
+                assert_eq!(local_port, 9090);
+            }
+            _ => panic!("expected PortForward command"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod log_state_tests {
+    use super::*;
+    use crate::kube::protocol::LogLine;
+
+    /// Eviction must keep `filtered_indices` valid under an active filter: as
+    /// the ring buffer drops its oldest line, surviving indices shift down and
+    /// out-of-window ones are dropped. Also exercises the container-OR branch of
+    /// `line_matches` — a line kept solely because its source container matched.
+    #[test]
+    fn eviction_under_filter_keeps_indices_valid() {
+        let mut s = LogState::new();
+        s.max_lines = 3;
+        s.update_draft("m".to_string());
+        s.commit_filter();
+
+        s.push(LogLine::untagged("match-a"));     // content "m" ✓ — later evicted
+        s.push(LogLine::untagged("nope"));        // no "m"        — later evicted
+        s.push(LogLine { container: Some("mongo".into()), content: "x".into() }); // container "m" ✓
+        s.push(LogLine::untagged("xyz"));         // no "m"
+        s.push(LogLine::untagged("more"));        // content "m" ✓
+
+        // Buffer holds the last 3: [mongo/x, xyz, more] at indices 0,1,2.
+        assert_eq!(s.lines().len(), 3);
+        // Survivors matching "m": index 0 (container "mongo") and index 2 ("more").
+        assert_eq!(s.filtered_indices().to_vec(), vec![0usize, 2]);
+        assert!(s.filtered_indices().iter().all(|&i| i < s.lines().len()));
+        assert!(s.filtered_indices().windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// The incremental `push` predicate and the full `rebuild_filter` sweep must
+    /// agree regardless of whether the filter was set before or after the lines.
+    #[test]
+    fn push_and_rebuild_agree() {
+        let build = |rebuild_after: bool| {
+            let mut s = LogState::new();
+            s.max_lines = 10;
+            if !rebuild_after {
+                s.update_draft("e".to_string());
+                s.commit_filter();
+            }
+            s.push(LogLine::untagged("one"));     // "e" ✓
+            s.push(LogLine { container: Some("svc-e".into()), content: "z".into() }); // container "e" ✓
+            s.push(LogLine::untagged("two"));     // no "e"
+            s.push(LogLine::untagged("three"));   // "e" ✓
+            if rebuild_after {
+                s.update_draft("e".to_string());
+                s.commit_filter();
+            }
+            s.filtered_indices().to_vec()
+        };
+        assert_eq!(build(false), build(true));
+        assert_eq!(build(false), vec![0usize, 1, 3]);
     }
 }

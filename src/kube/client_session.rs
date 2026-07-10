@@ -129,6 +129,27 @@ impl Drop for SubscriptionStream {
     }
 }
 
+impl SubscriptionStream {
+    /// Whether the bridge task is still running. Goes `false` once the bridge
+    /// has terminated by any path — retry give-up, EOF, or panic.
+    ///
+    /// Every such terminal path also emits `SubscriptionFailed`, which clears
+    /// the nav stack's handle reactively; this method lets the nav layer's
+    /// re-subscribe decision observe liveness *directly* instead of trusting
+    /// that convention, so a present-but-dead handle can never masquerade as a
+    /// live subscription owner.
+    pub fn is_alive(&self) -> bool {
+        !self._bridge.is_finished()
+    }
+
+    /// Build a handle from a raw abort handle. Test-only — production code gets
+    /// a `SubscriptionStream` from `subscribe_stream`, never by hand.
+    #[cfg(test)]
+    pub(crate) fn from_abort_handle(bridge: tokio::task::AbortHandle) -> Self {
+        Self { _bridge: bridge }
+    }
+}
+
 /// An active exec session backed by a yamux substream. The daemon
 /// spawns kubectl in a PTY; raw terminal bytes flow over yamux.
 /// Drop aborts the reader bridge and closes the substream
@@ -468,7 +489,10 @@ async fn open_transport(
 ) -> anyhow::Result<crate::kube::mux::MuxedConnection> {
     use crate::kube::mux::MuxedConnection;
     if no_daemon {
-        let server_state = Arc::new(SessionSharedState::new());
+        // Single-session state: no local-resource grace window — this
+        // registry dies with the connection, so recovery is impossible and
+        // grace would only keep kubectl children alive pointlessly.
+        let server_state = Arc::new(SessionSharedState::new_single_session());
         let (client_stream, server_stream) = tokio::io::duplex(protocol::DUPLEX_BUFFER_SIZE);
 
         // Server side of the duplex — wrapped in a yamux session and
@@ -716,10 +740,12 @@ impl ClientSession {
                 return;
             }
 
-            // Each frame is a single log line (String, bincode-framed).
+            // Each frame is a single typed `LogLine` (bincode-framed): content
+            // plus an optional source container (set only for `--all-containers`
+            // streams, where the daemon already stripped kubectl's prefix).
             // EOF = log stream ended.
             loop {
-                match protocol::read_bincode::<_, String>(&mut reader).await {
+                match protocol::read_bincode::<_, protocol::LogLine>(&mut reader).await {
                     Ok(line) => {
                         // Pass ANSI codes through — the log renderer parses
                         // SGR sequences into ratatui Styles so application-
@@ -814,6 +840,33 @@ impl ClientSession {
 // High-level operations
 // ---------------------------------------------------------------------------
 
+/// How a subscription is opened. Collapses the former `(force, nav_scoped)`
+/// bool pair passed to `subscribe_stream_inner` — the fourth combination
+/// (force *and* nav-scoped) was never used, so the enum makes it
+/// unrepresentable and the call sites read as a named mode instead of two
+/// position-sensitive `false`s.
+#[derive(Clone, Copy)]
+enum SubscribeMode {
+    /// Cache-shared watcher; snapshots route to the global store.
+    Normal,
+    /// Filtered view of a globally-stored resource (e.g. ShowNode): snapshots
+    /// route to the nav-step table instead of the global store.
+    NavScoped,
+    /// Force a fresh server-side watcher, bypassing the cache (Ctrl-R refresh).
+    Force,
+}
+
+impl SubscribeMode {
+    /// Whether the server should bypass its watcher cache.
+    fn force(self) -> bool {
+        matches!(self, SubscribeMode::Force)
+    }
+    /// Whether snapshots route to the nav-step table rather than the global store.
+    fn nav_scoped(self) -> bool {
+        matches!(self, SubscribeMode::NavScoped)
+    }
+}
+
 impl ClientSession {
     /// Open a per-subscription substream. Spawns a background task that:
     ///
@@ -833,7 +886,20 @@ impl ClientSession {
         namespace: protocol::Namespace,
         filter: Option<protocol::SubscriptionFilter>,
     ) -> SubscriptionStream {
-        self.subscribe_stream_inner(resource, namespace, filter, false)
+        self.subscribe_stream_inner(resource, namespace, filter, SubscribeMode::Normal)
+    }
+
+    /// Like `subscribe_stream` but routes updates to the nav-step table
+    /// instead of the global store. Used for filtered views of globally-
+    /// stored resources (ShowNode) where a core subscription already
+    /// populates the global table.
+    pub fn subscribe_stream_nav(
+        &self,
+        resource: protocol::ResourceId,
+        namespace: protocol::Namespace,
+        filter: Option<protocol::SubscriptionFilter>,
+    ) -> SubscriptionStream {
+        self.subscribe_stream_inner(resource, namespace, filter, SubscribeMode::NavScoped)
     }
 
     /// Like `subscribe_stream` but forces the server to create a fresh watcher,
@@ -844,7 +910,7 @@ impl ClientSession {
         namespace: protocol::Namespace,
         filter: Option<protocol::SubscriptionFilter>,
     ) -> SubscriptionStream {
-        self.subscribe_stream_inner(resource, namespace, filter, true)
+        self.subscribe_stream_inner(resource, namespace, filter, SubscribeMode::Force)
     }
 
     fn subscribe_stream_inner(
@@ -852,8 +918,12 @@ impl ClientSession {
         resource: protocol::ResourceId,
         namespace: protocol::Namespace,
         filter: Option<protocol::SubscriptionFilter>,
-        force: bool,
+        mode: SubscribeMode,
     ) -> SubscriptionStream {
+        // Derive the two orthogonal behaviours once; the spawned bridge below
+        // captures these by value, exactly as it did the former bool params.
+        let force = mode.force();
+        let nav_scoped = mode.nav_scoped();
         let mut mux_rx = self.mux_handle_rx.clone();
         let event_tx = self.event_tx.clone();
         let rid = resource.clone();
@@ -865,9 +935,22 @@ impl ClientSession {
             // failure, retry with backoff. Same pattern as the daemon
             // bridge's watcher retry. Natural exit: session death
             // (open fails) or event channel dropped (reconnection).
+            // Give up re-probing a permanently-failing subscription after this
+            // many consecutive server-side errors with no healthy snapshot in
+            // between. Each retry backs off, so this bounds the self-heal window
+            // (~30s) instead of churning forever on a forbidden / missing-CRD
+            // view. A Snapshot resets the count.
+            const SUBSCRIPTION_ERROR_CEILING: u32 = 5;
+
             let mut ever_received_data = false;
             let mut retry_backoff = std::time::Duration::from_secs(2);
             let bridge_start = std::time::Instant::now();
+            // Consecutive `StreamEvent::Error`s since the last healthy snapshot,
+            // plus the last error we actually flashed — together they drive the
+            // give-up ceiling and de-dup the flash so a stable error surfaces
+            // once, not once per retry.
+            let mut consecutive_errors: u32 = 0;
+            let mut last_flashed_error: Option<String> = None;
 
             loop {
                 // Re-check the watch channel each iteration so we pick up
@@ -926,37 +1009,76 @@ impl ClientSession {
                 // Reset on each retry — the daemon re-resolves CRDs.
                 let mut current_rid = rid.clone();
                 loop {
-                    match protocol::read_bincode::<_, protocol::StreamEvent>(&mut reader).await {
-                        Ok(event) => {
-                            if !ever_received_data {
-                                tracing::info!("subscription bridge: {} first data in {:?}",
-                                    rid.plural(), bridge_start.elapsed());
-                            }
-                            ever_received_data = true;
-                            retry_backoff = std::time::Duration::from_secs(2);
-                            let app_event = match event {
-                                protocol::StreamEvent::Snapshot(update) => {
-                                    AppEvent::ResourceUpdate(update)
-                                }
-                                protocol::StreamEvent::Error(msg) => {
-                                    AppEvent::SubscriptionFailed {
-                                        resource: current_rid.clone(),
-                                        message: msg,
-                                    }
-                                }
-                                protocol::StreamEvent::Resolved { original, resolved } => {
-                                    current_rid = resolved.clone();
-                                    AppEvent::ResourceResolved { original, resolved }
-                                }
-                            };
-                            if event_tx.send(app_event).await.is_err() {
-                                return;
-                            }
-                        }
+                    let event = match protocol::read_bincode::<_, protocol::StreamEvent>(&mut reader).await {
+                        Ok(event) => event,
                         Err(e) => {
                             tracing::warn!("subscription bridge read failed for {}: {}", current_rid.plural(), e);
                             break;
                         }
+                    };
+                    if !ever_received_data {
+                        tracing::info!("subscription bridge: {} first data in {:?}",
+                            rid.plural(), bridge_start.elapsed());
+                    }
+                    ever_received_data = true;
+
+                    let app_event = match event {
+                        protocol::StreamEvent::Snapshot(update) => {
+                            // Healthy data: the subscription works. Clear the
+                            // failure ceiling + flash de-dup and reset the backoff
+                            // so a *later* failure surfaces fresh.
+                            consecutive_errors = 0;
+                            last_flashed_error = None;
+                            retry_backoff = std::time::Duration::from_secs(2);
+                            if nav_scoped {
+                                AppEvent::NavResourceUpdate(update)
+                            } else {
+                                AppEvent::ResourceUpdate(update)
+                            }
+                        }
+                        protocol::StreamEvent::Resolved { original, resolved } => {
+                            // The substream is alive and the server resolved the
+                            // rid — progress for backoff purposes, but not a
+                            // healthy snapshot, so it does NOT clear the ceiling.
+                            current_rid = resolved.clone();
+                            retry_backoff = std::time::Duration::from_secs(2);
+                            AppEvent::ResourceResolved { original, resolved }
+                        }
+                        protocol::StreamEvent::Error(msg) => {
+                            // Server-side subscription error (RBAC denied, CRD
+                            // missing, ...). The bridge re-probes on retry, so it
+                            // self-heals once the cause is fixed — but a PERMANENT
+                            // failure must not retry-and-reflash forever. Note we
+                            // do NOT reset the backoff here (errors back off), and
+                            // we count consecutive failures.
+                            consecutive_errors += 1;
+                            if consecutive_errors >= SUBSCRIPTION_ERROR_CEILING {
+                                // Terminal: stop retrying this subscription, with
+                                // one final flash. A fresh subscribe (Ctrl-R /
+                                // nav) starts a new bridge with the count reset.
+                                let _ = event_tx.send(AppEvent::SubscriptionFailed {
+                                    resource: current_rid.clone(),
+                                    message: format!(
+                                        "{msg} (stopped retrying after {consecutive_errors} failures — press Ctrl-R to retry)"
+                                    ),
+                                }).await;
+                                return;
+                            }
+                            if last_flashed_error.as_deref() == Some(msg.as_str()) {
+                                // Same error as the last flash — suppress the
+                                // duplicate, keep quietly retrying within the
+                                // ceiling.
+                                continue;
+                            }
+                            last_flashed_error = Some(msg.clone());
+                            AppEvent::SubscriptionFailed {
+                                resource: current_rid.clone(),
+                                message: msg,
+                            }
+                        }
+                    };
+                    if event_tx.send(app_event).await.is_err() {
+                        return;
                     }
                 }
 
@@ -1079,8 +1201,8 @@ async fn reader_loop(
 /// `subscribe_stream`.
 fn convert_session_event(event: SessionEvent, current_context: &crate::kube::protocol::ContextName) -> Vec<AppEvent> {
     match event {
-        SessionEvent::DescribeResult { target, content } => {
-            vec![AppEvent::ResourceUpdate(ResourceUpdate::Describe { target, content })]
+        SessionEvent::DescribeResult { target, lines } => {
+            vec![AppEvent::ResourceUpdate(ResourceUpdate::Describe { target, lines })]
         }
 
         SessionEvent::YamlResult { target, content } => {
@@ -1146,6 +1268,26 @@ fn convert_session_event(event: SessionEvent, current_context: &crate::kube::pro
             warn!("ClientSession: unexpected event after handshake");
             vec![]
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_liveness_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn is_alive_tracks_the_bridge_task() {
+        // A running bridge → alive.
+        let running = tokio::spawn(std::future::pending::<()>());
+        let live = SubscriptionStream::from_abort_handle(running.abort_handle());
+        assert!(live.is_alive());
+
+        // A finished bridge → not alive.
+        let done = tokio::spawn(async {});
+        let abort = done.abort_handle();
+        let _ = done.await; // ensure the task has actually completed
+        let dead = SubscriptionStream::from_abort_handle(abort);
+        assert!(!dead.is_alive());
     }
 }
 
