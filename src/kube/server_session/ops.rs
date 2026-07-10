@@ -571,7 +571,7 @@ impl ServerSession {
         let source = self.locals.port_forwards();
         // Pass the typed `Namespace` straight through — no
         // `display().to_string()` round-trip that would leak the literal
-        // "all" string down into kubectl.
+        // "all" string into resolution.
         let _pf_id = source.create(
             crate::kube::local::port_forward::PortForwardRequest {
                 target: target.clone(),
@@ -579,7 +579,10 @@ impl ServerSession {
                 namespace: target.namespace.clone(),
                 local_port,
                 remote_port: container_port,
-                env: self.session_env.clone(),
+                // The session's client: the native tunnel resolves and
+                // authenticates as this session, and keeps working after
+                // the session ends (refreshable creds ride in the client).
+                client: self.client.clone(),
             },
         );
     }

@@ -1,19 +1,27 @@
 //! Port-forward source — the first implementation of [`LocalResourceSource`],
 //! and the first [`LocalOperator`](super::supervise::LocalOperator).
 //!
-//! Each forward is one supervised `kubectl port-forward` subprocess: when the
-//! tunnel dies unexpectedly (suspend/resume, network blip, pod restart), the
-//! supervisor re-establishes it with exponential backoff. The supervisor is
-//! the sole writer of [`PortForwardState`]; snapshots publish via a
-//! `watch::Sender` on every transition.
+//! Each forward is one supervised **native websocket tunnel**
+//! (`Api::portforward` — no kubectl subprocess): an attempt resolves the
+//! target to a ready pod (see [`super::pf_resolve`]), binds the local
+//! listener, opens a canary stream to the pod as the liveness signal, and
+//! serves each accepted connection over its own tunnel. When the canary
+//! drops (suspend/resume, network blip, pod death), the supervisor
+//! re-establishes with exponential backoff — and because resolution reruns
+//! per attempt, the reconnect lands on a healthy replacement pod, which a
+//! pinned `kubectl port-forward` never could. The supervisor is the sole
+//! writer of [`PortForwardState`]; snapshots publish via a `watch::Sender`
+//! on every transition.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::Api;
 use serde::Serialize;
-use tokio::net::TcpStream;
+use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
 use crate::event::ResourceUpdate;
@@ -21,8 +29,8 @@ use crate::kube::protocol::{
     Namespace, ObjectRef, ResourceId,
 };
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
-use crate::kube::session_env::SessionEnv;
 
+use super::pf_resolve::{self, ResolveError};
 use super::supervise::{
     supervise, AttemptHandle, Backoff, LocalOperator, OperatorEvent, OperatorExit, OperatorGuard,
     RunDelay,
@@ -36,8 +44,8 @@ const PF_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// The state of a single port-forward, written exclusively by its
 /// supervisor's event sink (see `create`). There is no `Stopped` variant:
-/// an explicit stop *removes the entry* (row gone), and a subprocess that
-/// exits — cleanly or not — gets re-established, so no resting state ever
+/// an explicit stop *removes the entry* (row gone), and a tunnel that
+/// drops — cleanly or not — gets re-established, so no resting state ever
 /// meant "stopped".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum PortForwardState {
@@ -48,8 +56,9 @@ pub enum PortForwardState {
     /// The tunnel dropped; the supervisor is re-establishing it (backoff in
     /// progress or a retry attempt probing). `last_message` has the detail.
     Reconnecting,
-    /// Permanent failure — the supervisor parked (e.g. kubectl not
-    /// spawnable). No further attempts until the forward is recreated.
+    /// Permanent failure — the supervisor parked (e.g. unsupported
+    /// target kind, port not on the service). No further attempts until
+    /// the forward is recreated.
     Failed,
 }
 
@@ -69,13 +78,15 @@ impl PortForwardState {
 pub struct PortForwardEntry {
     pub id: u64,
     /// The original K8s `ObjectRef` this forward was created for. Purely
-    /// informational — the kubectl command uses `kubectl_target` below.
+    /// informational — resolution parses `kubectl_target` below.
     pub target: ObjectRef,
-    /// The kubectl short-form target string (e.g. `"svc/nginx"`, `"pod/foo"`).
+    /// The kubectl-style short-form target (e.g. `"services/nginx"`,
+    /// `"pods/foo"`) — parsed by `pf_resolve` into a concrete pod.
     pub kubectl_target: String,
-    /// Namespace the target lives in (for `kubectl -n`).
+    /// Namespace the target lives in (resolution + tunnels scope to it).
     pub namespace: String,
-    /// Context the forward was created under (for `kubectl --context`).
+    /// Context the forward was created under (display metadata; the
+    /// request's client carries the actual identity).
     pub context: crate::kube::protocol::ContextName,
     pub local_port: u16,
     pub remote_port: u16,
@@ -94,43 +105,47 @@ pub struct PortForwardEntry {
 pub struct PortForwardRequest {
     pub target: ObjectRef,
     pub kubectl_target: String,
-    /// The namespace to pass to `kubectl -n`. Typed [`Namespace`] —
+    /// The namespace the target lives in. Typed [`Namespace`] —
     /// `Namespace::All` is rejected at create time because port-forward
     /// has no meaning across all namespaces.
     pub namespace: Namespace,
     pub local_port: u16,
     pub remote_port: u16,
-    /// The creating session's process env, applied to the `kubectl
-    /// port-forward` subprocess so it authenticates as that session rather
-    /// than the daemon's startup env. A `PortForwardSource` is shared per
-    /// context, but each forward is created by one session — its env rides on
-    /// the request.
-    pub env: SessionEnv,
+    /// The creating session's `kube::Client`, used for target resolution
+    /// and the websocket tunnels so the forward authenticates as that
+    /// session (with its refreshable credentials) rather than anything
+    /// daemon-global. A `PortForwardSource` is shared per context, but each
+    /// forward is created by one session — its client rides on the request
+    /// and outlives the session (a `kube::Client` is a self-contained
+    /// handle; its auth layer refreshes in-process).
+    pub client: kube::Client,
 }
 
 struct EntrySlot {
     entry: PortForwardEntry,
     /// RAII handle to this entry's supervised loop. Dropping the slot
     /// (explicit `stop`, or the whole source tearing down) drops the guard,
-    /// which aborts the loop and reaps the in-flight kubectl child via
-    /// `kill_on_drop`. Drop IS the cleanup — there is no separate stop path.
+    /// which aborts the loop, tearing down the in-flight attempt
+    /// (listener, canary, connection pumps). Drop IS the cleanup — there
+    /// is no separate stop path.
     _guard: OperatorGuard,
-    /// The env the forward was created with — reused when an edit
-    /// (`apply_yaml`) reconciles by stop + recreate, so the new subprocess
-    /// authenticates as the original creating session, not the daemon.
-    env: SessionEnv,
+    /// The client the forward was created with — reused when an edit
+    /// (`apply_yaml`) reconciles by stop + recreate, so the new tunnel
+    /// authenticates as the original creating session.
+    client: kube::Client,
 }
 
 /// Per-context port-forward source, owned strongly by its context's
-/// [`ContextLocals`](super::context_locals::ContextLocals). All `kubectl
-/// port-forward` subprocesses spawned by this instance run against the bound
-/// context. Forwards are side-effect resources: they run while the context is
+/// [`ContextLocals`](super::context_locals::ContextLocals). All tunnels
+/// this instance opens authenticate via their creating request's client
+/// (the bound context). Forwards are side-effect resources: they run while the context is
 /// attached (or within its grace window), independent of whether anyone is
 /// viewing the `:pf` list, and die only on explicit stop or context teardown.
 pub struct PortForwardSource {
     id: ResourceId,
-    /// Context name this source is bound to. Used as the `--context` arg on
-    /// every `kubectl port-forward` subprocess this source spawns.
+    /// Context name this source is bound to — display metadata on every
+    /// entry (describe/yaml). Authentication rides on each request's
+    /// `kube::Client`, which IS that context; this is the human label.
     bound_context: crate::kube::protocol::ContextName,
     entries: DashMap<u64, EntrySlot>,
     next_id: AtomicU64,
@@ -146,8 +161,8 @@ pub struct PortForwardSource {
 
 // No `Drop` impl: teardown is the field-drop cascade. Dropping the source
 // drops `entries`, which drops every `EntrySlot`, whose `OperatorGuard`
-// aborts its supervised loop, whose in-flight attempt drops its
-// `kill_on_drop` child. The old manual abort-every-task loop is subsumed.
+// aborts its supervised loop, whose in-flight attempt drops its listener,
+// canary, and pumps. The old manual abort-every-task loop is subsumed.
 
 impl PortForwardSource {
     /// Construct a fresh source bound to a single context. Called by the
@@ -194,9 +209,9 @@ impl PortForwardSource {
     }
 
     /// Create a new port-forward. Returns the assigned id immediately; the
-    /// supervised subprocess runs in the background and every state
-    /// transition is published via the watch channel. The kubectl
-    /// `--context` arg comes from `self.bound_context`, not the request.
+    /// supervised tunnel runs in the background and every state transition
+    /// is published via the watch channel. The request's `client` carries
+    /// the context identity — `self.bound_context` is display metadata.
     pub fn create(self: &Arc<Self>, req: PortForwardRequest) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         // Stored as a String (serialized into the YAML describe view).
@@ -214,20 +229,19 @@ impl PortForwardSource {
             started_at: Instant::now(),
             last_message: String::new(),
         };
-        // Remember the creating session's env so an edit (`apply_yaml`) can
-        // recreate this forward authenticating as that same session.
-        let entry_env = req.env.clone();
+        // Remember the creating session's client so an edit (`apply_yaml`)
+        // can recreate this forward authenticating as that same session.
+        let entry_client = req.client.clone();
 
         // CRITICAL: both the operator and the event sink hold `Weak<Self>`,
         // never a strong Arc. A strong ref inside the supervised task would
         // keep the source alive forever (the loop never exits on its own),
-        // so the source could never drop and kubectl children would leak.
+        // so the source could never drop and its tunnels would leak.
         // The sink is a synchronous closure — its upgrade-use-drop cannot
         // straddle an `.await`, which is the old `with_live` guarantee held
         // structurally.
         let op = PortForwardOp {
             weak: Arc::downgrade(self),
-            bound_context: self.bound_context.clone(),
             req,
         };
         // Single state writer: the supervisor narrates the lifecycle through
@@ -264,16 +278,16 @@ impl PortForwardSource {
         //      state was silently dropped).
         //   2. A concurrent `stop(id)` between insert and arm still wins: it
         //      removes the slot, dropping the guard, which aborts the parked
-        //      task — the operator never runs, no kubectl child to reap.
-        self.entries.insert(id, EntrySlot { entry, _guard: guard, env: entry_env });
+        //      task — the operator never runs, no tunnel to tear down.
+        self.entries.insert(id, EntrySlot { entry, _guard: guard, client: entry_client });
         self.publish();
         gate.arm();
         id
     }
 
     /// Stop a port-forward by id: remove the entry. Dropping the slot drops
-    /// its `OperatorGuard`, aborting the supervised loop and reaping the
-    /// kubectl child via `kill_on_drop` — removal IS the stop.
+    /// its `OperatorGuard`, aborting the supervised loop and closing the
+    /// tunnel — removal IS the stop.
     pub fn stop(&self, id: u64) -> Result<(), String> {
         let Some((_, _slot)) = self.entries.remove(&id) else {
             return Err(format!("no port-forward with id {id}"));
@@ -307,102 +321,147 @@ impl PortForwardSource {
     }
 }
 
-/// One supervised forward: a single attempt is port-probe → spawn kubectl →
-/// probe until bound → wait for exit. The supervisor around it owns retry,
-/// backoff, and all state narration; this only classifies how the attempt
-/// ended. Holds `Weak<PortForwardSource>` purely for the gone-check — per
-/// the operator contract it never touches source state (the sink does).
+/// One supervised forward: a single attempt is resolve-target → bind the
+/// local listener → open a canary tunnel to the pod (the liveness signal) →
+/// serve accepted connections, each over its own tunnel. The supervisor
+/// around it owns retry, backoff, and all state narration; this only
+/// classifies how the attempt ended. Holds `Weak<PortForwardSource>` purely
+/// for the gone-check — per the operator contract it never touches source
+/// state (the sink does). Everything an attempt owns (listener, canary,
+/// pump tasks in the `JoinSet`) lives inside `run_once`'s future, so an
+/// abort tears the whole attempt down.
 struct PortForwardOp {
     weak: Weak<PortForwardSource>,
-    bound_context: crate::kube::protocol::ContextName,
     req: PortForwardRequest,
 }
 
 impl LocalOperator for PortForwardOp {
     async fn run_once(&self, attempt: AttemptHandle) -> OperatorExit {
-        // 1. Local port bind probe.
-        match tokio::net::TcpListener::bind(("127.0.0.1", self.req.local_port)).await {
-            Ok(listener) => drop(listener),
+        // Typed `Namespace` — `Namespace::All` is rejected upstream because
+        // port-forward against "all namespaces" is meaningless; a request
+        // that somehow carries it is a construction bug, not a transient.
+        let Some(ns) = self.req.namespace.as_option() else {
+            return OperatorExit::Fatal("port-forward requires a namespace".into());
+        };
+
+        // 1. Resolve the target to a concrete (pod, port). Re-runs every
+        // attempt, so a reconnect after pod death lands on a healthy
+        // replacement.
+        let target = match pf_resolve::resolve(
+            &self.req.client,
+            ns,
+            &self.req.kubectl_target,
+            self.req.remote_port,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(ResolveError::Retry(m)) => return OperatorExit::Continue(m),
+            Err(ResolveError::Fatal(m)) => return OperatorExit::Fatal(m),
+        };
+
+        // Source gone during resolution? Nothing left to forward for.
+        if self.weak.strong_count() == 0 {
+            return OperatorExit::Gone;
+        }
+
+        // 2. Bind the local listener. Continue (retry), not Fatal: the port
+        // may be held by a dying previous incarnation — `apply_yaml`'s
+        // stop→recreate races the old attempt's teardown, which used to
+        // strand an edited forward in terminal Failed. Backoff self-heals
+        // it; a port held permanently by another app keeps retrying cheaply.
+        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", self.req.local_port)).await
+        {
+            Ok(l) => l,
             Err(e) => {
-                // Continue (retry), not Fatal: the port may be held by a
-                // dying previous incarnation — `apply_yaml`'s stop→recreate
-                // races the old child's async SIGKILL, which used to strand
-                // an edited forward in terminal Failed. Backoff self-heals
-                // it. A port held permanently by another app keeps retrying
-                // cheaply (a bare bind attempt, no subprocess spawned).
                 return OperatorExit::Continue(format!(
                     "local port {} unavailable: {}",
                     self.req.local_port, e
                 ));
             }
-        }
-
-        // Source gone during the probe? Nothing left to forward for.
-        if self.weak.strong_count() == 0 {
-            return OperatorExit::Gone;
-        }
-
-        // 2. Spawn kubectl.
-        let mut cmd = self.req.env.kubectl();
-        cmd.arg("port-forward")
-            .arg(&self.req.kubectl_target)
-            .arg(format!("{}:{}", self.req.local_port, self.req.remote_port));
-        // Typed `Namespace` — `as_option()` returns `Some(name)` for
-        // Named and None for All. The `Namespace::All` case is silently
-        // dropped because port-forward against "all namespaces" makes no
-        // sense; the upstream caller should never construct one.
-        if let Some(ns) = self.req.namespace.as_option() {
-            cmd.arg("-n").arg(ns);
-        }
-        if !self.bound_context.is_empty() {
-            cmd.arg("--context").arg(self.bound_context.as_str());
-        }
-        cmd.stdout(std::process::Stdio::null());
-        // stderr → null, not piped: an unread piped stderr can fill the OS
-        // pipe buffer over a long-running forward (kubectl port-forward
-        // logs "Handling connection" per accept) and block the subprocess.
-        cmd.stderr(std::process::Stdio::null());
-        let mut child = match cmd.kill_on_drop(true).spawn() {
-            Ok(c) => c,
-            // Fatal: kubectl missing / not executable is environmental —
-            // a restart loop would fork-fail forever to no end.
-            Err(e) => return OperatorExit::Fatal(format!("spawn failed: {e}")),
         };
 
-        // 3. Probe the local port with backoff until it binds, or give up.
-        // kubectl usually binds in <500ms, but slow auth / busy clusters can
-        // push it out several seconds. Deltas between probes, cumulative ~7s:
-        const PROBE_DELAYS_MS: [u64; 6] = [200, 300, 500, 1000, 2000, 3000];
-        let mut probed = false;
-        for delay_ms in PROBE_DELAYS_MS {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            if TcpStream::connect(("127.0.0.1", self.req.local_port)).await.is_ok() {
-                probed = true;
-                break;
+        // 3. Canary tunnel — one idle stream to the pod whose closure is
+        // the liveness signal (the native analogue of kubectl's child
+        // exiting): pod death, kubelet restart, or a suspended laptop's
+        // dead connection all surface as EOF/error on this read.
+        let api: Api<Pod> = Api::namespaced(self.req.client.clone(), ns);
+        let mut canary_pf = match api.portforward(&target.pod, &[target.port]).await {
+            Ok(p) => p,
+            Err(e) => {
+                return OperatorExit::Continue(format!("tunnel to {}: {}", target.pod, e));
             }
-        }
-        if !probed {
-            // kubectl is still running but never bound the port. Returning
-            // drops `child` → `kill_on_drop` reaps it; the supervisor backs
-            // off and tries again.
-            return OperatorExit::Continue(
-                "port-forward did not bind within probe timeout".to_string(),
-            );
-        }
+        };
+        let Some(mut canary) = canary_pf.take_stream(target.port) else {
+            return OperatorExit::Continue("tunnel stream unavailable".into());
+        };
         // Healthy steady-state — the one signal an operator may send. Also
         // resets the supervisor's backoff so a long-lived tunnel that later
         // drops reconnects from the minimum delay.
         attempt.active();
 
-        // 4. Wait for subprocess exit. ANY exit of a supervised forward —
-        // clean or not — is grounds to re-establish; that's the keep-alive
-        // contract. (The old terminal `Stopped` state died with this: an
-        // explicit stop removes the entry instead.)
-        match child.wait().await {
-            Ok(status) => OperatorExit::Continue(format!("kubectl exited: {status}")),
-            Err(e) => OperatorExit::Continue(format!("wait error: {e}")),
+        // 4. Serve. Each accepted connection gets its own tunnel to the
+        // resolved pod, pumped by a task in this JoinSet — dropping the
+        // set (attempt ends or is aborted) aborts every in-flight pump.
+        let mut pumps: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        let mut sink = [0u8; 64];
+        loop {
+            tokio::select! {
+                read = canary.read(&mut sink) => match read {
+                    Ok(0) => {
+                        return OperatorExit::Continue(format!(
+                            "tunnel to {} closed", target.pod,
+                        ));
+                    }
+                    Ok(_) => {} // stray bytes on the idle canary — ignore
+                    Err(e) => {
+                        return OperatorExit::Continue(format!(
+                            "tunnel to {} lost: {}", target.pod, e,
+                        ));
+                    }
+                },
+                accepted = listener.accept() => match accepted {
+                    Ok((tcp, _addr)) => {
+                        pumps.spawn(pump(
+                            self.req.client.clone(),
+                            ns.to_string(),
+                            target.pod.clone(),
+                            target.port,
+                            tcp,
+                        ));
+                    }
+                    Err(e) => {
+                        return OperatorExit::Continue(format!("accept failed: {e}"));
+                    }
+                },
+                // Reap finished pumps so the set doesn't grow unboundedly.
+                Some(_) = pumps.join_next(), if !pumps.is_empty() => {}
+            }
         }
     }
+}
+
+/// Pump one local TCP connection over its own websocket tunnel to the pod.
+/// The `Portforwarder` stays in scope for the pump's lifetime — dropping it
+/// (connection done, or the pump aborted with its attempt) closes the
+/// websocket.
+async fn pump(
+    client: kube::Client,
+    ns: String,
+    pod: String,
+    port: u16,
+    mut tcp: tokio::net::TcpStream,
+) {
+    let api: Api<Pod> = Api::namespaced(client, &ns);
+    let mut pf = match api.portforward(&pod, &[port]).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("port-forward pump to {pod}:{port}: {e}");
+            return;
+        }
+    };
+    let Some(mut stream) = pf.take_stream(port) else { return };
+    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
 }
 
 impl LocalResourceSource for PortForwardSource {
@@ -480,10 +539,10 @@ impl LocalResourceSource for PortForwardSource {
 
         // Snapshot the current entry so we can decide what changed and
         // build a fresh request from it.
-        let (current, current_env) = self
+        let (current, current_client) = self
             .entries
             .get(&id)
-            .map(|slot| (slot.entry.clone(), slot.env.clone()))
+            .map(|slot| (slot.entry.clone(), slot.client.clone()))
             .ok_or_else(|| format!("no port-forward with id {id}"))?;
 
         let unchanged = current.local_port == edit.local_port
@@ -514,7 +573,7 @@ impl LocalResourceSource for PortForwardSource {
             namespace: Namespace::Named(edit.namespace),
             local_port: edit.local_port,
             remote_port: edit.remote_port,
-            env: current_env,
+            client: current_client,
         });
         Ok(format!("pf-{id} → pf-{new_id}"))
     }

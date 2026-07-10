@@ -586,13 +586,17 @@ impl StatefulTable<crate::kube::resources::row::ResourceRow> {
         }).collect();
         // Per-cell rendering: zip each visible cell with its column's
         // pre-resolved rules, evaluate, then check CellValue::Status.
-        let cell_style = items.iter().map(|r| {
-            visible_col_indices.iter().map(|&ci| {
-                // 1. Column render rules (from overlay config).
+        // Reuses the display strings already materialized into `rows`
+        // (same items × same visible_col_indices ⇒ same shape) instead of
+        // stringifying every cell a second time.
+        let cell_style = items.iter().zip(rows.iter()).map(|(r, row_strs)| {
+            visible_col_indices.iter().zip(row_strs.iter()).map(|(&ci, cell_str)| {
+                // 1. Column render rules (from overlay config). Only for
+                //    cells that exist — a missing cell's empty placeholder
+                //    string must not match a rule.
                 if let Some(col_rules) = column_rules.get(ci) {
-                    if let Some(cell) = r.cells.get(ci) {
-                        let cell_str = cell.to_string();
-                        if let Some(style) = col_rules.evaluate(&cell_str) {
+                    if r.cells.get(ci).is_some() {
+                        if let Some(style) = col_rules.evaluate(cell_str) {
                             return Some(style);
                         }
                     }

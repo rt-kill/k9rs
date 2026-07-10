@@ -67,6 +67,7 @@
 
 pub mod context_locals;
 pub mod exec_source;
+pub mod pf_resolve;
 pub mod port_forward;
 pub mod registry;
 pub mod subscription;

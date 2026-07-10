@@ -10,7 +10,9 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream", "serde"] }
 
 # Kubernetes
-kube = { version = "0.98", features = ["client", "runtime", "derive"] }
+# `ws` for the native websocket port-forward (Api::portforward) — no kubectl
+# subprocess in the forward path.
+kube = { version = "0.98", features = ["client", "runtime", "derive", "ws"] }
 k8s-openapi = { version = "0.24", features = ["latest"] }
 http = "1"
 

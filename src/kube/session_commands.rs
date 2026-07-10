@@ -626,7 +626,8 @@ pub(crate) fn handle_filter_key(
                 let filter = if let Some(c) = committed.column {
                     crate::app::nav::NavFilter::ColumnGrep {
                         pattern: crate::app::nav::CompiledGrep::new(committed.text),
-                        col: c,
+                        col: c.index,
+                        header: c.header,
                     }
                 } else {
                     crate::app::nav::NavFilter::Grep(

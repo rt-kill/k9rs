@@ -298,7 +298,8 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // DATA index (sort indexes the full cells array), translating from the
         // cursor's visible index so hidden columns don't shift the target.
         KeyCode::Char('S') => {
-            Some(Action::Sort(crate::app::SortTarget::Column(app.active_table_selected_data_col())))
+            let (col, _header) = app.active_table_selected_data_col();
+            Some(Action::Sort(crate::app::SortTarget::Column(col)))
         }
 
         // Copy.

@@ -497,13 +497,18 @@ impl App {
     /// no descriptor is available (no columns hidden, so the spaces coincide).
     ///
     /// [`active_table_selected_col`]: Self::active_table_selected_col
-    pub fn active_table_selected_data_col(&self) -> usize {
+    pub fn active_table_selected_data_col(&self) -> (usize, String) {
         let visible_col = self.active_table_selected_col();
         let skip_ns = !self.kube.selected_ns.is_all();
         self.active_view_descriptor()
             .map(|d| d.visible_columns(self.nav.view_id(), self.ui.column_level, skip_ns))
-            .and_then(|vis| vis.get(visible_col).map(|&(data_idx, _)| data_idx))
-            .unwrap_or(visible_col)
+            .and_then(|vis| {
+                vis.get(visible_col)
+                    .map(|&(data_idx, name)| (data_idx, name.to_string()))
+            })
+            // No descriptor → fall back to the raw index for both (the
+            // breadcrumb then shows what it always used to: the number).
+            .unwrap_or_else(|| (visible_col, visible_col.to_string()))
     }
 
     /// Get the active view's table (immutable).
@@ -659,7 +664,7 @@ impl App {
         for f in self.nav.active_filters() {
             match f {
                 NavFilter::Grep(g) => committed.push(g.pattern().clone()),
-                NavFilter::ColumnGrep { pattern, col } => col_greps.push((pattern.pattern().clone(), *col)),
+                NavFilter::ColumnGrep { pattern, col, .. } => col_greps.push((pattern.pattern().clone(), *col)),
                 NavFilter::Fault => has_fault = true,
                 _ => {}
             }

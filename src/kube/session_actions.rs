@@ -608,9 +608,10 @@ fn handle_filter_search(
         Action::ColumnFilter => {
             if matches!(app.route, Route::Resources) {
                 // Data index — the filter indexes the full `cells` array, not
-                // the visible subset (which differs whenever a column is hidden).
-                let col = app.active_table_selected_data_col();
-                app.nav.filter_input_mut().start_column(col);
+                // the visible subset (which differs whenever a column is
+                // hidden). The header rides along for the breadcrumb.
+                let (col, header) = app.active_table_selected_data_col();
+                app.nav.filter_input_mut().start_column(col, header);
             }
         }
         Action::ClearFilter => {

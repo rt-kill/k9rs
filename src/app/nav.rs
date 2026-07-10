@@ -154,7 +154,14 @@ pub enum NavFilter {
     },
     /// Column-restricted grep: matches only the cell at a specific column
     /// index. Opened with `~` (tilde) — filters the hovered column only.
-    ColumnGrep { pattern: CompiledGrep, col: usize },
+    ColumnGrep {
+        pattern: CompiledGrep,
+        col: usize,
+        /// Header name of `col`, captured when the filter was created (the
+        /// only moment the descriptor is reliably in hand) so the
+        /// breadcrumb reads `~STATUS:x` instead of a raw data-col index.
+        header: String,
+    },
     /// The "fault" filter — show only rows whose typed [`crate::kube::resources::row::RowHealth`]
     /// is `Failed` or `Pending`. The classification happens on the server
     /// (in the row converter), so the filter runs as `row.health != Normal`
@@ -807,7 +814,7 @@ impl NavStack {
             }
             match &step.filter {
                 Some(NavFilter::Grep(g)) => parts.push(format!("/{}", g.source())),
-                Some(NavFilter::ColumnGrep { pattern, col }) => parts.push(format!("~{}:{}", col, pattern.source())),
+                Some(NavFilter::ColumnGrep { pattern, header, .. }) => parts.push(format!("~{}:{}", header, pattern.source())),
                 Some(NavFilter::Fault) => parts.push("⚠ fault".to_string()),
                 Some(NavFilter::Labels { labels, .. }) => {
                     let label_str: Vec<String> = labels.iter()
@@ -855,7 +862,17 @@ impl NavStack {
 pub struct FilterInputState {
     active: bool,
     text: String,
-    column: Option<usize>,
+    column: Option<ColumnTarget>,
+}
+
+/// Column restriction for `~` mode: the DATA index the filter matches
+/// against plus the header name captured at activation — one value, so the
+/// pair can't drift (the filter uses the index, the breadcrumb shows the
+/// header).
+#[derive(Debug, Clone)]
+pub(crate) struct ColumnTarget {
+    pub index: usize,
+    pub header: String,
 }
 
 /// Committed filter text + optional column restriction, returned by
@@ -863,7 +880,7 @@ pub struct FilterInputState {
 #[derive(Debug)]
 pub(crate) struct CommittedFilter {
     pub text: String,
-    pub column: Option<usize>,
+    pub column: Option<ColumnTarget>,
 }
 
 impl FilterInputState {
@@ -874,7 +891,7 @@ impl FilterInputState {
     /// The text being typed (not yet committed to NavStack).
     pub fn text(&self) -> &str { &self.text }
     /// Column restriction index, if any (`~` mode).
-    pub fn column(&self) -> Option<usize> { self.column }
+    pub fn column(&self) -> Option<usize> { self.column.as_ref().map(|c| c.index) }
 
     // -- State transitions ----------------------------------------------------
 
@@ -885,11 +902,13 @@ impl FilterInputState {
         self.column = None;
     }
 
-    /// Enter column-restricted filter mode (`~`).
-    pub fn start_column(&mut self, col: usize) {
+    /// Enter column-restricted filter mode (`~`). Takes the header name
+    /// alongside the data index — captured here because the caller has the
+    /// descriptor in hand at activation, unlike breadcrumb-render time.
+    pub fn start_column(&mut self, col: usize, header: String) {
         self.active = true;
         self.text.clear();
-        self.column = Some(col);
+        self.column = Some(ColumnTarget { index: col, header });
     }
 
     /// Cancel without committing — discards text, resets column, exits
@@ -1310,7 +1329,7 @@ mod tests {
 
     #[test]
     fn column_grep_filter_returns_none() {
-        let f = NavFilter::ColumnGrep { pattern: CompiledGrep::new("x"), col: 2 };
+        let f = NavFilter::ColumnGrep { pattern: CompiledGrep::new("x"), col: 2, header: "STATUS".into() };
         assert!(f.to_subscription_filter().is_none());
     }
 
@@ -1362,7 +1381,7 @@ mod tests {
     #[test]
     fn filter_start_column_sets_column() {
         let mut fi = FilterInputState::default();
-        fi.start_column(3);
+        fi.start_column(3, "STATUS".into());
         assert!(fi.active());
         assert_eq!(fi.column(), Some(3));
     }
@@ -1370,7 +1389,7 @@ mod tests {
     #[test]
     fn filter_cancel_resets_all_fields() {
         let mut fi = FilterInputState::default();
-        fi.start_column(5);
+        fi.start_column(5, "AGE".into());
         fi.push_char('x');
         fi.cancel();
         assert!(!fi.active());
@@ -1381,12 +1400,14 @@ mod tests {
     #[test]
     fn filter_commit_returns_text_and_column() {
         let mut fi = FilterInputState::default();
-        fi.start_column(2);
+        fi.start_column(2, "READY".into());
         fi.push_char('a');
         fi.push_char('b');
         let c = fi.commit().expect("non-empty text should commit");
         assert_eq!(c.text, "ab");
-        assert_eq!(c.column, Some(2));
+        let col = c.column.expect("column restriction must survive commit");
+        assert_eq!(col.index, 2);
+        assert_eq!(col.header, "READY");
         assert!(!fi.active());
     }
 
