@@ -319,7 +319,7 @@ users:
         let bound = bind_session_env(parse(), Some("does-not-exist"), &session_env());
         // Original AWS_PROFILE preserved, no session env injected anywhere.
         assert_eq!(exec_env_of(&bound, "user-exec").unwrap().get("AWS_PROFILE").map(String::as_str), Some("original"));
-        assert!(exec_env_of(&bound, "user-exec").unwrap().get("PATH").is_none());
+        assert!(!exec_env_of(&bound, "user-exec").unwrap().contains_key("PATH"));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //!
 //! Each local resource type implements [`LocalResourceSource`]. Sources:
 //! - Own their own typed state (the trait is object-safe via `Arc<dyn ...>`).
-//! - Publish `ResourceUpdate::Rows` snapshots via a `watch::Sender` whenever
+//! - Publish `TableBaseline` snapshots (Baseline-only streams by contract — a local Delta is unrepresentable: the watch channel is a latest-full-value source) via a `watch::Sender` whenever
 //!   their state changes.
 //! - Live inside their context's [`ContextLocals`] slice, resolved through
 //!   [`LocalRegistry`] (on `SessionSharedState`) so they're shared across
@@ -82,7 +82,7 @@ pub use types::{find_by_alias, LocalResourceKind};
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use crate::event::ResourceUpdate;
+use crate::kube::protocol::TableBaseline;
 use crate::kube::protocol::ResourceId;
 
 /// A daemon-owned source of [`ResourceRow`](crate::kube::resources::row::ResourceRow)
@@ -104,7 +104,7 @@ pub trait LocalResourceSource: Send + Sync + 'static {
     /// infallible by construction — the receiver always carries the
     /// current snapshot, and "the source went away" is modeled by the
     /// subscription being dropped, not by publishing a sentinel.
-    fn subscribe(&self) -> watch::Receiver<ResourceUpdate>;
+    fn subscribe(&self) -> watch::Receiver<TableBaseline>;
 
     /// Delete a logical entry by its row name. The row name is chosen by the
     /// converter and carries whatever encoded id the source needs (e.g.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
 fn make_key(code: KeyCode) -> KeyEvent {
@@ -10,15 +11,60 @@ fn make_key(code: KeyCode) -> KeyEvent {
     }
 }
 
+/// Reset the nav stack to a test-only root list element for `kind`
+/// (parked stream — no session, no daemon).
+fn reset_to_kind(app: &mut App, kind: crate::kube::resource_def::BuiltInKind) {
+    reset_to_rid(app, rid(kind));
+}
+
+fn reset_to_rid(app: &mut App, resource: crate::kube::protocol::ResourceId) {
+    let label = resource.short_label().to_lowercase();
+    let root = crate::app::element::Element::ResourceList(
+        crate::app::element::ResourceList::open_for_test(
+            crate::app::element::QuerySpec {
+                rid: resource,
+                namespace: crate::kube::protocol::Namespace::All,
+                filter: None,
+            },
+            &app.kube.metrics,
+            label,
+        ),
+    );
+    app.nav.reset(root);
+}
+
+/// Push a content element (yaml/describe) as the top view.
+fn push_content_element(app: &mut App, yaml: bool) {
+    let target = ObjectRef::new(
+        crate::kube::protocol::ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
+        String::new(),
+        crate::kube::protocol::Namespace::from_user_command(""),
+    );
+    let spec = if yaml {
+        crate::app::element::ContentSpec::Yaml(target)
+    } else {
+        crate::app::element::ContentSpec::Describe(target)
+    };
+    app.nav.push(crate::app::element::Element::ContentView(
+        crate::app::element::ContentView::new(spec, crate::app::ContentViewState::default(), false),
+    ));
+}
+
+/// Push a log-session element (parked stream) as the top view.
+fn push_log_element(app: &mut App) {
+    app.nav.push(crate::app::element::Element::LogSession(Box::new(
+        crate::app::element::LogSession::for_test(ContainerRef::new(
+            "test-pod",
+            "default",
+            crate::kube::protocol::LogContainer::Default,
+        )),
+    )));
+}
+
 fn make_resource_app() -> App {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::Resources;
-    // `populate_capabilities` used to seed `app.capabilities` for every
-    // built-in kind so `app.current_capabilities()` returned a real manifest
-    // during tests. Gone now — `current_capabilities()` computes straight
-    // from the typed rid via `ResourceId::capabilities()`, so there's
-    // nothing to preload.
-    app
+    // The test root is already a pods list element — nothing to preload:
+    // `current_capabilities()` computes straight from the typed rid.
+    App::new_for_test()
 }
 
 fn make_ctrl_key(code: KeyCode) -> KeyEvent {
@@ -95,7 +141,7 @@ fn test_resource_view_describe_yaml() {
 fn test_pods_logs_key() {
     // Logs are Shift+L (uppercase), plain 'l' is column-right.
     let mut app = make_resource_app();
-    app.nav.reset(rid(crate::kube::resource_def::BuiltInKind::Pod));
+    reset_to_kind(&mut app, crate::kube::resource_def::BuiltInKind::Pod);
     assert!(matches!(
         handle_key_event(&app, make_key(KeyCode::Char('L'))),
         Some(Action::Logs)
@@ -112,7 +158,7 @@ fn test_workload_types_have_logs() {
     use crate::kube::resource_def::BuiltInKind::*;
     for kind in [Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob] {
         let mut app = make_resource_app();
-        app.nav.reset(rid(kind));
+        reset_to_kind(&mut app, kind);
         assert!(
             matches!(handle_key_event(&app, make_key(KeyCode::Char('L'))), Some(Action::Logs)),
             "Expected Logs action for {:?}",
@@ -126,7 +172,7 @@ fn test_non_workload_no_logs() {
     use crate::kube::resource_def::BuiltInKind::*;
     for kind in [Service, Node, Namespace, ConfigMap, Secret] {
         let mut app = make_resource_app();
-        app.nav.reset(rid(kind));
+        reset_to_kind(&mut app, kind);
         assert!(
             !matches!(handle_key_event(&app, make_key(KeyCode::Char('L'))), Some(Action::Logs)),
             "Expected no Logs action for {:?}",
@@ -137,8 +183,7 @@ fn test_non_workload_no_logs() {
 
 #[test]
 fn test_confirm_dialog_keys() {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
+    let mut app = App::new_for_test();
     app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
         message: "Are you sure?".to_string(),
         pending: crate::app::PendingAction::Single {
@@ -207,74 +252,57 @@ fn test_resource_view_port_forward() {
 #[test]
 fn test_restart_on_deployments() {
     let mut app = make_resource_app();
-    app.nav.reset(rid(crate::kube::resource_def::BuiltInKind::Deployment));
+    reset_to_kind(&mut app, crate::kube::resource_def::BuiltInKind::Deployment);
     let action = handle_key_event(&app, make_key(KeyCode::Char('r')));
     assert!(matches!(action, Some(Action::Restart)));
 }
 
 #[test]
 fn test_q_goes_back_in_detail_view() {
-    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::ContentView {
-        kind: crate::app::ContentViewKind::Yaml,
-        target: Some(ObjectRef::new(
-            ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
-            String::new(),
-            Namespace::from_user_command(""),
-        )),
-        awaiting_response: false,
-        state: crate::app::ContentViewState::default(),
-    };
+    let mut app = App::new_for_test();
+    push_content_element(&mut app, true);
     let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
     assert!(matches!(action, Some(Action::Back)));
 }
 
 #[test]
 fn test_log_view_s_toggles_follow() {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::Logs {
-        target: ContainerRef::new(String::new(), String::new(), crate::kube::protocol::LogContainer::Default),
-        state: Box::new(crate::app::LogState::new()), stream: None,
-    };
+    let mut app = App::new_for_test();
+    push_log_element(&mut app);
     let action = handle_key_event(&app, make_key(KeyCode::Char('s')));
     assert!(matches!(action, Some(Action::ToggleLogFollow)));
 }
 
 #[test]
 fn test_log_view_t_toggles_timestamps() {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::Logs {
-        target: ContainerRef::new(String::new(), String::new(), crate::kube::protocol::LogContainer::Default),
-        state: Box::new(crate::app::LogState::new()), stream: None,
-    };
+    let mut app = App::new_for_test();
+    push_log_element(&mut app);
     let action = handle_key_event(&app, make_key(KeyCode::Char('t')));
     assert!(matches!(action, Some(Action::ToggleLogTimestamps)));
 }
 
 #[test]
 fn test_log_view_shift_c_clears_logs() {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::Logs {
-        target: ContainerRef::new(String::new(), String::new(), crate::kube::protocol::LogContainer::Default),
-        state: Box::new(crate::app::LogState::new()), stream: None,
-    };
+    let mut app = App::new_for_test();
+    push_log_element(&mut app);
     let action = handle_key_event(&app, make_shift_key(KeyCode::Char('C')));
     assert!(matches!(action, Some(Action::ClearLogs)));
 }
 
 #[test]
 fn test_q_goes_back_in_help_view() {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::Help;
+    let mut app = App::new_for_test();
+    app.ui.overlay = Some(crate::app::Overlay::Help { scroll: 0 });
     let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
     assert!(matches!(action, Some(Action::Back)));
 }
 
 #[test]
 fn test_q_goes_back_in_contexts_view() {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::Contexts;
+    let mut app = App::new_for_test();
+    app.nav.push(crate::app::element::Element::ContextList(
+        crate::app::element::ContextList::new(Vec::new()),
+    ));
     let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
     assert!(matches!(action, Some(Action::Back)));
 }
@@ -289,72 +317,59 @@ fn test_esc_noop_in_resource_view_no_filter() {
 
 #[test]
 fn test_esc_goes_back_in_detail_view() {
-    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::ContentView {
-        kind: crate::app::ContentViewKind::Describe,
-        target: Some(ObjectRef::new(
-            ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
-            String::new(),
-            Namespace::from_user_command(""),
-        )),
-        awaiting_response: false,
-        state: crate::app::ContentViewState::default(),
-    };
+    let mut app = App::new_for_test();
+    push_content_element(&mut app, false);
     let action = handle_key_event(&app, make_key(KeyCode::Esc));
     assert!(matches!(action, Some(Action::Back)));
 }
 
 #[test]
 fn test_esc_goes_back_in_log_view() {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::Logs {
-        target: ContainerRef::new(String::new(), String::new(), crate::kube::protocol::LogContainer::Default),
-        state: Box::new(crate::app::LogState::new()), stream: None,
-    };
+    let mut app = App::new_for_test();
+    push_log_element(&mut app);
     let action = handle_key_event(&app, make_key(KeyCode::Esc));
     assert!(matches!(action, Some(Action::Back)));
 }
 
 #[test]
 fn test_esc_goes_back_in_help_view() {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::Help;
+    let mut app = App::new_for_test();
+    app.ui.overlay = Some(crate::app::Overlay::Help { scroll: 0 });
     let action = handle_key_event(&app, make_key(KeyCode::Esc));
     assert!(matches!(action, Some(Action::Back)));
 }
 
 #[test]
 fn test_esc_goes_back_in_contexts_view() {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::Contexts;
+    let mut app = App::new_for_test();
+    app.nav.push(crate::app::element::Element::ContextList(
+        crate::app::element::ContextList::new(Vec::new()),
+    ));
     let action = handle_key_event(&app, make_key(KeyCode::Esc));
     assert!(matches!(action, Some(Action::Back)));
 }
 
 #[test]
 fn test_q_goes_back_in_container_select() {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::ContainerSelect {
+    let mut app = App::new_for_test();
+    app.ui.overlay = Some(crate::app::Overlay::ContainerSelect {
         target: crate::kube::protocol::ObjectRef::new(
             rid(crate::kube::resource_def::BuiltInKind::Pod),
             String::new(),
             crate::kube::protocol::Namespace::All,
         ),
+        containers: Vec::new(),
         selected: 0,
         action: crate::app::ContainerAction::Logs,
-    };
+    });
     let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
     assert!(matches!(action, Some(Action::Back)));
 }
 
 #[test]
 fn test_log_view_home_end() {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::Logs {
-        target: ContainerRef::new(String::new(), String::new(), crate::kube::protocol::LogContainer::Default),
-        state: Box::new(crate::app::LogState::new()), stream: None,
-    };
+    let mut app = App::new_for_test();
+    push_log_element(&mut app);
     assert!(matches!(
         handle_key_event(&app, make_key(KeyCode::Char('g'))),
         Some(Action::Home)
@@ -367,18 +382,8 @@ fn test_log_view_home_end() {
 
 #[test]
 fn test_detail_view_home_end() {
-    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::ContentView {
-        kind: crate::app::ContentViewKind::Yaml,
-        target: Some(ObjectRef::new(
-            ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
-            String::new(),
-            Namespace::from_user_command(""),
-        )),
-        awaiting_response: false,
-        state: crate::app::ContentViewState::default(),
-    };
+    let mut app = App::new_for_test();
+    push_content_element(&mut app, true);
     assert!(matches!(
         handle_key_event(&app, make_key(KeyCode::Char('g'))),
         Some(Action::Home)
@@ -526,7 +531,7 @@ fn test_resource_view_toggle_sort_direction() {
 fn test_resource_view_sort_by_name() {
     let mut app = make_resource_app();
     // Pods are namespaced, so NAME is column 1.
-    app.nav.reset(rid(crate::kube::resource_def::BuiltInKind::Pod));
+    reset_to_kind(&mut app, crate::kube::resource_def::BuiltInKind::Pod);
     let action = handle_key_event(&app, make_key(KeyCode::Char('N')));
     assert!(matches!(action, Some(Action::Sort(crate::app::SortTarget::Column(1)))));
 }
@@ -535,7 +540,7 @@ fn test_resource_view_sort_by_name() {
 fn test_resource_view_sort_by_name_cluster_scoped() {
     let mut app = make_resource_app();
     // Nodes are cluster-scoped, so NAME is column 0.
-    app.nav.reset(rid(crate::kube::resource_def::BuiltInKind::Node));
+    reset_to_kind(&mut app, crate::kube::resource_def::BuiltInKind::Node);
     let action = handle_key_event(&app, make_key(KeyCode::Char('N')));
     assert!(matches!(action, Some(Action::Sort(crate::app::SortTarget::Column(0)))));
 }
@@ -552,18 +557,8 @@ fn test_resource_view_sort_by_age() {
 // ---------------------------------------------------------------------------
 
 fn make_yaml_app() -> App {
-    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::ContentView {
-        kind: crate::app::ContentViewKind::Yaml,
-        target: Some(ObjectRef::new(
-            ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
-            String::new(),
-            Namespace::from_user_command(""),
-        )),
-        awaiting_response: false,
-        state: crate::app::ContentViewState::default(),
-    };
+    let mut app = App::new_for_test();
+    push_content_element(&mut app, true);
     app
 }
 
@@ -613,12 +608,8 @@ fn test_detail_view_slash_starts_search() {
 // ---------------------------------------------------------------------------
 
 fn make_log_app() -> App {
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All);
-    app.route = Route::Logs {
-        target: ContainerRef::new(String::new(), String::new(), crate::kube::protocol::LogContainer::Default),
-        state: Box::new(crate::app::LogState::new()),
-        stream: None,
-    };
+    let mut app = App::new_for_test();
+    push_log_element(&mut app);
     app
 }
 

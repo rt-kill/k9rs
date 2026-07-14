@@ -314,10 +314,67 @@ pub struct OwnerRefInfo {
     pub uid: String,
 }
 
+/// Typed K8s field selector. Each variant corresponds to a specific K8s
+/// field selector path; the variant data is the value to match against.
+/// New field paths get new variants — the wire-format string and
+/// breadcrumb are derived from the variant.
+///
+/// WIRE-FROZEN: rides inside [`DrillTarget::PodsByField`] on `ResourceRow`
+/// (proto 8). Variant order and fields are part of the bincode layout —
+/// append-only, never reorder. Pinned by `drill_wire_tags_are_stable`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum K8sFieldSelector {
+    /// `metadata.name=<name>` — exact match on the resource name.
+    /// Universally supported by the K8s API for all resource types.
+    MetadataName(String),
+    /// `spec.nodeName=<name>` — pods scheduled on a specific node.
+    SpecNodeName(String),
+    /// `status.phase=<phase>` — pods in a specific lifecycle phase.
+    StatusPhase(String),
+}
+
+impl K8sFieldSelector {
+    /// Render the selector in the format K8s expects on the wire
+    /// (`field.path=value`), suitable for `SubscriptionFilter::Field`.
+    pub fn to_wire(&self) -> String {
+        match self {
+            Self::MetadataName(v) => format!("metadata.name={}", v),
+            Self::SpecNodeName(v) => format!("spec.nodeName={}", v),
+            Self::StatusPhase(v) => format!("status.phase={}", v),
+        }
+    }
+
+    /// Short user-facing label for the breadcrumb.
+    pub fn breadcrumb(&self) -> String {
+        match self {
+            Self::MetadataName(v) => format!("name={}", v),
+            Self::SpecNodeName(v) => format!("node={}", v),
+            Self::StatusPhase(v) => format!("phase={}", v),
+        }
+    }
+}
+
+/// A client-side derived view type (containers of a pod, ...). The DATA
+/// enum lives here because it rides the wire inside
+/// [`DrillTarget::Derived`]; the BEHAVIOR (labels, projection, operations)
+/// lives in [`crate::app::view`], next to the projection registry it
+/// dispatches into.
+///
+/// WIRE-FROZEN: variant order is part of the bincode layout — append-only,
+/// never reorder. Pinned by `drill_wire_tags_are_stable`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DerivedViewKind {
+    /// Containers of a pod — projected from `ResourceRow.containers`.
+    Containers,
+}
+
 /// What happens when the user presses Enter on a row. Set by the converter
 /// (server-side) so the client doesn't need K8s knowledge to drill down.
 ///
 /// The client reads this blindly and constructs the appropriate nav action.
+///
+/// WIRE-FROZEN: variant order and fields are part of the bincode layout —
+/// append-only, never reorder. Pinned by `drill_wire_tags_are_stable`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DrillTarget {
     /// Enter a namespace: make it the active scope and drill into the pods
@@ -349,7 +406,7 @@ pub enum DrillTarget {
     /// Replaces the older `PodsByField { field: String, value: String }`
     /// shape — the typed enum carries the field path so producers can't
     /// fat-finger `"spec.nodeName"`.
-    PodsByField(crate::app::nav::K8sFieldSelector),
+    PodsByField(K8sFieldSelector),
     /// Drill down to pods by name prefix (fallback when no selector exists).
     PodsByNameGrep(String),
     /// Drill down to jobs owned by a parent resource (via ownerReference
@@ -365,8 +422,8 @@ pub enum DrillTarget {
     /// data. The `DerivedViewKind` determines what to project (containers,
     /// volumes, etc.); the row carries the data to project from.
     /// Adding a new derived view type never touches DrillTarget — the
-    /// taxonomy lives on [`crate::app::view::DerivedViewKind`].
-    Derived(crate::app::view::DerivedViewKind),
+    /// taxonomy lives on [`DerivedViewKind`].
+    Derived(DerivedViewKind),
 }
 
 impl super::KubeResource for ResourceRow {
@@ -401,6 +458,58 @@ impl ResourceRow {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    // ---- Wire-tag goldens -----------------------------------------------------
+    //
+    // DrillTarget (and the two enums embedded in it) ride the wire inside
+    // ResourceRow. Bincode encodes enum tags positionally (u32 LE), so a
+    // reorder or mid-enum insert silently corrupts proto-8 framing. These
+    // pins turn that mistake into a red test. Every variant of all three
+    // enums is pinned — extend (append-only) when adding variants.
+
+    #[test]
+    fn drill_wire_tags_are_stable() {
+        use crate::kube::protocol::{CrdRef, Namespace, ResourceScope};
+        use crate::kube::resource_def::BuiltInKind;
+
+        let tag = |t: &DrillTarget| bincode::serialize(t).unwrap()[..4].to_vec();
+
+        assert_eq!(tag(&DrillTarget::PodsInNamespace(Namespace::All)), 0u32.to_le_bytes());
+        let crd = CrdRef {
+            group: "g".into(), version: "v1".into(), kind: "K".into(),
+            plural: "ks".into(), scope: ResourceScope::Namespaced,
+        };
+        assert_eq!(tag(&DrillTarget::BrowseCrd(crd)), 1u32.to_le_bytes());
+        assert_eq!(
+            tag(&DrillTarget::PodsByLabels { labels: BTreeMap::new(), breadcrumb: String::new() }),
+            2u32.to_le_bytes()
+        );
+        assert_eq!(
+            tag(&DrillTarget::PodsByOwner { uid: String::new(), kind: BuiltInKind::Deployment, name: String::new() }),
+            3u32.to_le_bytes()
+        );
+        assert_eq!(
+            tag(&DrillTarget::PodsByField(K8sFieldSelector::MetadataName("x".into()))),
+            4u32.to_le_bytes()
+        );
+        assert_eq!(tag(&DrillTarget::PodsByNameGrep(String::new())), 5u32.to_le_bytes());
+        assert_eq!(
+            tag(&DrillTarget::JobsByOwner { uid: String::new(), kind: BuiltInKind::CronJob, name: String::new() }),
+            6u32.to_le_bytes()
+        );
+        assert_eq!(tag(&DrillTarget::Derived(DerivedViewKind::Containers)), 7u32.to_le_bytes());
+
+        // Embedded enums, same treatment.
+        let sel_tag = |s: &K8sFieldSelector| bincode::serialize(s).unwrap()[..4].to_vec();
+        assert_eq!(sel_tag(&K8sFieldSelector::MetadataName("x".into())), 0u32.to_le_bytes());
+        assert_eq!(sel_tag(&K8sFieldSelector::SpecNodeName("x".into())), 1u32.to_le_bytes());
+        assert_eq!(sel_tag(&K8sFieldSelector::StatusPhase("x".into())), 2u32.to_le_bytes());
+
+        assert_eq!(
+            bincode::serialize(&DerivedViewKind::Containers).unwrap()[..4],
+            0u32.to_le_bytes()
+        );
+    }
 
     // ---- Display ------------------------------------------------------------
 

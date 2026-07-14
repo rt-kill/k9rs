@@ -1,14 +1,6 @@
 use crate::app::App;
 
-use crate::kube::resource_def::MetricsKind;
 use crate::event::{AppEvent, ResourceUpdate};
-
-/// Look up the metrics overlay kind for a resource, if any, via the registry.
-/// CRDs and locals never carry metrics overlays, so this returns `None` for them.
-fn metrics_kind_for(rid: &crate::kube::protocol::ResourceId) -> Option<MetricsKind> {
-    let kind = rid.built_in_kind()?;
-    crate::kube::resource_defs::REGISTRY.by_kind(kind).metrics_kind()
-}
 
 /// Handle a single AppEvent (resource update, error, or flash).
 pub(crate) fn apply_event(
@@ -16,31 +8,34 @@ pub(crate) fn apply_event(
     event: AppEvent,
 ) {
     match event {
+        // The destination rides the event: apply and done. Routing bugs
+        // (an event landing in the wrong table) are unrepresentable —
+        // there is no lookup. A popped element's queued events land in an
+        // unreferenced store and free it when the queue drains.
+        AppEvent::Store(ev) => ev.store.apply(ev.epoch, ev.payload),
         AppEvent::ResourceUpdate(update) => apply_resource_update(app, update),
-        AppEvent::NavResourceUpdate(update) => apply_nav_resource_update(app, update),
         AppEvent::Flash(flash) => {
             // Purely local flashes: just show them. Do NOT pop the edit
             // route — that's driven by `CommandResult` below.
             app.ui.flash = Some(flash);
         }
         AppEvent::CommandResult(result) => {
-            // Terminal state of the unified edit flow. Only take the route
-            // out if we're actually in EditingResource::Applying — don't
-            // touch app.route if the user navigated elsewhere (avoids a
-            // flicker from the replace/restore cycle).
+            // Terminal state of the unified edit flow. Only take the
+            // overlay out if we're actually in Edit::Applying — an
+            // unrelated CommandResult must not disturb whatever dialog
+            // is up.
             let is_applying = matches!(
-                app.route,
-                crate::app::Route::EditingResource {
+                app.ui.overlay,
+                Some(crate::app::Overlay::Edit {
                     state: crate::app::EditState::Applying { .. }, ..
-                }
+                })
             );
             if is_applying {
-                // Move the route out so we own TempFile (not clone).
-                let old_route = std::mem::replace(&mut app.route, crate::app::Route::Resources);
-                if let crate::app::Route::EditingResource {
+                // Move the overlay out so we own TempFile (not clone).
+                if let Some(crate::app::Overlay::Edit {
                     target,
                     state: crate::app::EditState::Applying { temp_file, original },
-                } = old_route {
+                }) = app.ui.overlay.take() {
                     match &result {
                         Ok(_) => {
                             drop(temp_file);
@@ -53,10 +48,10 @@ pub(crate) fn apply_event(
                                 msg, current,
                             );
                             let _ = std::fs::write(temp_file.path(), &with_error);
-                            app.route = crate::app::Route::EditingResource {
+                            app.ui.overlay = Some(crate::app::Overlay::Edit {
                                 target,
                                 state: crate::app::EditState::EditorReady { temp_file, original },
-                            };
+                            });
                         }
                     }
                 }
@@ -67,93 +62,65 @@ pub(crate) fn apply_event(
             });
         }
         AppEvent::ResourceResolved { original, resolved } => {
-            // The server discovered the true identity of a resource we subscribed to
-            // with incomplete info (e.g., `:nodeclaims` → karpenter.sh/v1/NodeClaim/Cluster).
-            // Update the nav step's ResourceId and move the table entry so future
-            // snapshots (keyed by resolved rid) find the right table.
-            if app.nav.resource_id() == Some(&original) {
-                app.nav.current_mut().view = crate::app::view::ViewId::Resource(resolved.clone());
-                // If the resolved resource is cluster-scoped but we're in a
-                // specific namespace, auto-switch to All. The watcher already
-                // uses Api::all_with (server resolved the scope), so this is
-                // a display-only correction — same as the auto-switch that
-                // fires when discovery is loaded (session_commands.rs:366).
-                if resolved.is_cluster_scoped() && !app.kube.selected_ns.is_all() {
-                    app.kube.selected_ns = crate::kube::protocol::Namespace::All;
-                }
-            }
-            // Move the table entry and descriptor from old key to new key.
-            // For globally-stored resources, this moves entries in the global
-            // maps. For NavStep-owned resources, the step's `resource` field
-            // was already updated above and the table/descriptor live on the
-            // same step — no rekey needed (the find methods walk by identity).
-            if crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(original.clone())) || crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(resolved.clone())) {
-                if let Some(table) = app.data.tables.remove(&original) {
-                    app.data.tables.insert(resolved.clone(), table);
-                }
-                if let Some(desc) = app.data.descriptors.remove(&original) {
-                    // Rebuild descriptor with the resolved plural so
-                    // column_rules resolve overlay lookups against the
-                    // canonical resource name, not the user-typed alias.
-                    let rebuilt = crate::app::TableDescriptor::new(
-                        desc.headers().to_vec(),
-                        resolved.plural(),
-                    );
-                    app.data.descriptors.insert(resolved, rebuilt);
-                }
+            // The server discovered the true identity of a resource we
+            // subscribed to with incomplete info (e.g., `:nodeclaims` →
+            // karpenter.sh/v1/NodeClaim/Cluster). The owning elements
+            // update themselves in place — the element IS the identity,
+            // so there are no global maps to rekey.
+            app.nav.apply_resolved(&original, &resolved);
+            // If the resolved resource is cluster-scoped but we're in a
+            // specific namespace, auto-switch the SELECTOR to All (a
+            // display-only correction for future root constructions; the
+            // element's own query already used the server-resolved scope).
+            if app.nav.resource_id() == Some(&resolved)
+                && resolved.is_cluster_scoped()
+                && !app.kube.selected_ns.is_all()
+            {
+                app.kube.selected_ns = crate::kube::protocol::Namespace::All;
             }
         }
         AppEvent::SubscriptionFailed { resource, message } => {
-            // Mark the table as errored so the UI shows the error instead of spinner.
-            // Clear items first (rendering only shows the error when items is empty),
-            // then transition to Failed. clear_data() resets to Initializing, so the
-            // Failed transition must come after.
-            if crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(resource.clone())) {
-                let table = app.data.tables.entry(resource.clone()).or_default();
-                table.clear_data();
-                table.data_state = crate::app::table::TableDataState::Failed(message.clone());
-            } else if let Some(table) = app.nav.find_table_for_resource_mut(&resource) {
-                table.clear_data();
-                table.data_state = crate::app::table::TableDataState::Failed(message.clone());
-            }
-            // The bridge task behind the failing subscription has already
-            // exited. Drop the stale `SubscriptionStream` handle sitting
-            // in the nav stack so a later Esc pop-back past this rid
-            // re-subscribes instead of thinking the dead handle is a
-            // live owner.
-            app.nav.clear_dead_subscription_for(&resource);
-            // Flash the error so the user sees it regardless of which
-            // view is active — the Failed state is only visible when
-            // viewing that specific resource's table.
+            // FLASH-ONLY: the failing bridge separately delivered
+            // `StorePayload::Failed` to its own store (epoch-gated), which
+            // is what flips the owning element's state. This surfaces the
+            // message regardless of which view is active.
             app.ui.flash = Some(crate::app::FlashMessage::error(
                 format!("{}: {}", resource.short_label(), message)
             ));
         }
         AppEvent::PodMetrics(metrics) => {
-            app.kube.pod_metrics = metrics;
-            app.apply_pod_metrics();
-            // Metrics overlay changes cell values — if the user has a grep
-            // filter active on CPU/MEM columns, re-filter so it reflects the
-            // updated values. Only needed when viewing a metrics-overlay
-            // resource (pods or nodes).
-            if app.nav.resource_id().and_then(metrics_kind_for).is_some() {
-                app.reapply_nav_filters();
-            }
+            // Elements bound to the hub overlay these at derive time —
+            // the version bump invalidates their view memos; nothing to
+            // route, nothing to re-apply.
+            app.kube.metrics.set_pods(metrics);
         }
         AppEvent::NodeMetrics(metrics) => {
-            app.kube.node_metrics = metrics;
-            app.apply_node_metrics();
-            if app.nav.resource_id().and_then(metrics_kind_for).is_some() {
-                app.reapply_nav_filters();
+            app.kube.metrics.set_nodes(metrics);
+        }
+        AppEvent::Discovery { namespaces, crds } => {
+            // Cached discovery data seeds the app-level core stores
+            // (completion / picker sources) at the SEED epoch — always
+            // weaker than live data, so a stale cache can never clobber a
+            // live core stream.
+            use crate::kube::resource_def::BuiltInKind;
+            if !namespaces.is_empty() {
+                let rows = crate::kube::cache::cached_namespaces_to_rows(&namespaces);
+                app.core.seed(BuiltInKind::Namespace, rows);
+            }
+            if !crds.is_empty() {
+                let rows = crate::kube::cache::cached_crds_to_rows(&crds);
+                app.core.seed(BuiltInKind::CustomResourceDefinition, rows);
             }
         }
-        AppEvent::LogStreamEnded => {
-            if let crate::app::Route::Logs { ref mut state, .. } = app.route {
-                state.streaming = false;
+        AppEvent::Log(ev) => {
+            // Destination rides the event — apply into the line store.
+            match ev.payload {
+                crate::event::LogPayload::Line(line) => ev.store.push(ev.epoch, line),
+                crate::event::LogPayload::Ended => ev.store.mark_ended(ev.epoch),
             }
         }
         AppEvent::ExecData(bytes) => {
-            if let crate::app::Route::Shell(ref mut shell) = app.route {
+            if let Some(crate::app::Overlay::Shell(ref mut shell)) = app.ui.overlay {
                 shell.connect_state = crate::app::ShellConnectState::Connected;
                 // Buffer output until the main loop enters bridge mode.
                 // These bytes (typically the initial shell prompt) will be
@@ -163,14 +130,14 @@ pub(crate) fn apply_event(
         }
         AppEvent::ExecEnded => {
             // During the Connecting phase, ExecEnded means the connection
-            // failed before we entered bridge mode. Pop the route and flash.
-            // During bridge mode this event is consumed directly by the
-            // bridge loop (it never reaches this handler).
-            if matches!(app.route, crate::app::Route::Shell(_)) {
+            // failed before we entered bridge mode. Clear the overlay and
+            // flash. During bridge mode this event is consumed directly by
+            // the bridge loop (it never reaches this handler).
+            if matches!(app.ui.overlay, Some(crate::app::Overlay::Shell(_))) {
                 app.ui.flash = Some(crate::app::FlashMessage::error(
                     "Shell connection failed".to_string()
                 ));
-                app.pop_route();
+                app.ui.overlay = None;
             }
         }
         AppEvent::DaemonDisconnected => {
@@ -189,9 +156,7 @@ pub(crate) fn apply_event(
             app.kube.identity = identity;
             if !namespaces.is_empty() {
                 let ns_rows = crate::kube::cache::cached_namespaces_to_rows(&namespaces);
-                let table = app.data.tables.entry(crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Namespace))
-                    .or_default();
-                table.set_items(ns_rows);
+                app.core.seed(crate::kube::resource_def::BuiltInKind::Namespace, ns_rows);
             }
         }
         AppEvent::ConnectionFailed(message) => {
@@ -209,40 +174,11 @@ pub(crate) fn apply_event(
                 app.kube.context = current_context;
                 app.kube.identity = current_identity;
             }
-            app.data.contexts.set_items(contexts);
-        }
-    }
-}
-
-fn apply_nav_resource_update(app: &mut App, update: ResourceUpdate) {
-    match update {
-        ResourceUpdate::Rows { resource, headers, rows } => {
-            let num_cols = headers.len();
-            let descriptor = crate::app::TableDescriptor::new(headers, resource.plural());
-            app.nav.set_descriptor_for_resource(&resource, descriptor);
-            if let Some(table) = app.nav.find_table_for_resource_mut(&resource) {
-                app.ui.deltas.update(&rows);
-                table.set_num_cols(num_cols);
-                table.set_items_filtered(rows);
+            app.data.contexts.set_items(contexts.clone());
+            // A showing context picker refreshes in place (top-only touch).
+            if let crate::app::element::Element::ContextList(c) = app.nav.top_mut() {
+                c.table.set_items(contexts);
             }
-            match metrics_kind_for(&resource) {
-                Some(MetricsKind::Pod) => app.apply_pod_metrics(),
-                Some(MetricsKind::Node) => app.apply_node_metrics(),
-                None => {}
-            }
-        }
-        // Nav-scoped subscriptions only ever carry `Rows` (see the nav bridge in
-        // ClientSession). Anything else is a contract violation: route it to the
-        // global handler as a release-mode fail-safe, but trip in debug/tests so
-        // a future `StreamEvent` variant on the nav channel is caught at the
-        // source instead of silently shadowing the parent step's data.
-        other => {
-            debug_assert!(
-                false,
-                "nav-scoped subscription emitted a non-Rows update; the nav bridge \
-                 contract (Rows only) was violated",
-            );
-            apply_resource_update(app, other);
         }
     }
 }
@@ -252,65 +188,31 @@ fn apply_resource_update(
     update: ResourceUpdate,
 ) {
     match update {
-        ResourceUpdate::Rows { resource, headers, rows } => {
-            let num_cols = headers.len();
-            let descriptor = crate::app::TableDescriptor::new(headers, resource.plural());
-            if crate::app::nav::is_globally_stored(&crate::app::view::ViewId::Resource(resource.clone())) {
-                // Set descriptor BEFORE populating table data so column-
-                // restricted greps see the correct column count.
-                app.data.descriptors.insert(resource.clone(), descriptor);
-                let table = app.data.tables.entry(resource.clone()).or_default();
-                app.ui.deltas.update(&rows);
-                table.set_num_cols(num_cols);
-                table.set_items_filtered(rows);
-            } else {
-                app.nav.set_descriptor_for_resource(&resource, descriptor);
-                if let Some(table) = app.nav.find_table_for_resource_mut(&resource) {
-                    app.ui.deltas.update(&rows);
-                    table.set_num_cols(num_cols);
-                    table.set_items_filtered(rows);
-                } else {
-                    return;
-                }
-            }
-            // Apply metrics overlay whenever fresh data arrives. Dispatch
-            // through the typed `MetricsKind` enum — no string match on
-            // `resource.plural`. Pod and node metrics come from different
-            // APIs and update different columns, hence the per-kind branch.
-            match metrics_kind_for(&resource) {
-                Some(MetricsKind::Pod) => app.apply_pod_metrics(),
-                Some(MetricsKind::Node) => app.apply_node_metrics(),
-                None => {}
-            }
-        }
         ResourceUpdate::Yaml { target: response_target, content } => {
-            // Two routes consume `YamlResult`:
-            //   1. `Route::ContentView { kind: Yaml }` — the read-only YAML viewer.
-            //   2. `Route::EditingResource { state: AwaitingYaml }` — the
-            //      first stage of the unified edit flow. We write the
-            //      content to a temp file and transition to `EditorReady`,
-            //      and the session main loop will pick it up on its next
-            //      iteration to suspend + exec `$EDITOR`.
-            //
-            // Gate on `target == response_target`: if the user navigated
-            // A→B while A's fetch was in flight, dropping the A response
-            // prevents it from writing A's content under B's identity.
-            if let crate::app::Route::ContentView {
-                kind: crate::app::ContentViewKind::Yaml,
-                target: Some(ref target),
-                ref mut awaiting_response,
-                ref mut state,
-            } = app.route {
-                if *target != response_target { return; }
-                if *awaiting_response {
-                    app.kube.kubectl_cache.insert(target.clone(), crate::app::ContentKind::Yaml, content.clone());
-                    *awaiting_response = false;
+            // Two consumers:
+            //   1. A `ContentView` element showing this target's YAML —
+            //      delivery is peek-top-and-match (a response for a view
+            //      the user already left is dropped; re-entering re-fetches).
+            //   2. The Edit overlay in `AwaitingYaml` — write the temp
+            //      file and hand off to the main loop's editor poll.
+            use crate::app::element::{ContentSpec, Element};
+            if let Element::ContentView(cv) = app.nav.top_mut() {
+                if let ContentSpec::Yaml(ref target) = cv.kind {
+                    if *target == response_target {
+                        if cv.awaiting_response {
+                            app.kube.kubectl_cache.insert(
+                                target.clone(),
+                                crate::app::ContentKind::Yaml,
+                                content.clone(),
+                            );
+                            cv.awaiting_response = false;
+                        }
+                        cv.state.set_content(content);
+                        return;
+                    }
                 }
-                state.set_content(content);
-            } else if let crate::app::Route::EditingResource {
-                ref target,
-                ref mut state,
-            } = app.route {
+            }
+            if let Some(crate::app::Overlay::Edit { ref target, ref mut state }) = app.ui.overlay {
                 if *target != response_target { return; }
                 if matches!(state, crate::app::EditState::AwaitingYaml) {
                     match write_edit_temp_file(target, &content) {
@@ -321,51 +223,31 @@ fn apply_resource_update(
                             };
                         }
                         Err(e) => {
-                            // Couldn't write the temp file — abort the edit
-                            // and pop back to the previous route.
+                            // Couldn't write the temp file — abort the edit.
                             app.ui.flash = Some(crate::app::FlashMessage::error(
                                 format!("Edit failed: {}", e)
                             ));
-                            app.pop_route();
+                            app.ui.overlay = None;
                         }
                     }
                 }
             }
         }
         ResourceUpdate::Describe { target: response_target, lines } => {
-            if let crate::app::Route::ContentView {
-                kind: crate::app::ContentViewKind::Describe,
-                target: Some(ref target),
-                ref mut awaiting_response,
-                ref mut state,
-            } = app.route {
-                if *target != response_target { return; }
-                if *awaiting_response {
-                    app.kube.kubectl_cache.insert_describe(target.clone(), lines.clone());
-                    *awaiting_response = false;
-                }
-                state.set_describe_lines(lines);
-            }
-        }
-        ResourceUpdate::LogLine { generation, line } => {
-            // Gate apply on a matching generation id. The previous log
-            // stream's bridge may have been aborted, but events already in
-            // the channel queue still arrive after the route changed —
-            // those carry the OLD generation and must be dropped.
-            if let crate::app::Route::Logs { ref mut state, .. } = app.route {
-                if state.generation == generation {
-                    state.push(line);
+            use crate::app::element::{ContentSpec, Element};
+            if let Element::ContentView(cv) = app.nav.top_mut() {
+                if let ContentSpec::Describe(ref target) = cv.kind {
+                    if *target == response_target {
+                        if cv.awaiting_response {
+                            app.kube.kubectl_cache.insert_describe(target.clone(), lines.clone());
+                            cv.awaiting_response = false;
+                        }
+                        cv.state.set_describe_lines(lines);
+                    }
                 }
             }
-            return; // Log lines don't need nav filter reapply
         }
     }
-    // Reapply nav stack filters after every table data update so that drill-down
-    // and grep filters stay active as fresh snapshots arrive.
-    app.reapply_nav_filters();
-
-    // Expire old change highlights.
-    app.ui.deltas.expire(std::time::Duration::from_secs(app.config.ui.change_highlight_secs));
 }
 
 

@@ -1,7 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::actions::Action;
-use crate::app::{App, Route};
+use crate::app::{App, Overlay};
+use crate::app::element::Element;
 #[cfg(test)]
 use crate::app::nav::rid;
 #[cfg(test)]
@@ -14,10 +15,10 @@ use crate::kube::protocol::OperationKind;
 /// Data-driven: reads `descriptor().default_key` from each operation.
 /// First match wins — resources control priority via `operations()` order.
 fn lookup_view_op_key(app: &App, key: char) -> Option<Action> {
-    // Use view capabilities (not registry) — works for both resource
-    // and derived views. Derived views declare their own operations
-    // on DerivedViewKind; resource views delegate to ResourceId.
-    let caps = app.nav.view_id().capabilities();
+    // Use the top element's capabilities (not the registry) — works for
+    // both resource and derived views. Derived views declare their own
+    // operations on DerivedViewKind; resource views delegate to ResourceId.
+    let caps = app.nav.top().capabilities();
     for op in &caps.operations {
         if op.descriptor().default_key == Some(key) {
             return Some(op.to_action());
@@ -29,7 +30,8 @@ fn lookup_view_op_key(app: &App, key: char) -> Option<Action> {
 /// Look up a key binding from user-defined overlays for the current resource.
 /// Maps key → capability name. No implementation details leak into the action.
 fn lookup_overlay_key(app: &App, key: char) -> Option<Action> {
-    let overlay = crate::kube::overlay::overlay_for(app.nav.view_id().plural())?;
+    let rid = app.nav.top().rid()?;
+    let overlay = crate::kube::overlay::overlay_for(rid.plural())?;
     let cap_name = overlay.bindings.get(&key)?;
     Some(Action::OverlayCapability(cap_name.clone()))
 }
@@ -49,37 +51,33 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     }
 
     // -----------------------------------------------------------------------
-    // Detail views and log view override `/` to start search instead of filter.
+    // Overlays first. Checked BEFORE global keys so `:q`, Ctrl-C, etc.
+    // can't leak through during the edit flow or a shell connect.
     // -----------------------------------------------------------------------
-    if matches!(app.route, Route::ContentView { .. } | Route::Logs { .. })
-        && key.code == KeyCode::Char('/')
-    {
-        return Some(Action::SearchStart);
+    match &app.ui.overlay {
+        Some(Overlay::Edit { .. }) | Some(Overlay::Shell(_)) => {
+            // Modal operations block ALL keys except Esc. (Shell during
+            // Connecting: Esc cancels; during bridge mode the TUI is
+            // suspended and this path is never reached.)
+            return match key.code {
+                KeyCode::Esc => Some(Action::Back),
+                _ => None,
+            };
+        }
+        Some(Overlay::ContainerSelect { .. }) => return handle_container_select_keys(key),
+        Some(Overlay::Help { .. }) => return handle_help_view_keys(key),
+        None => {}
     }
 
     // -----------------------------------------------------------------------
-    // Modal routes that block ALL keys except Esc. Checked BEFORE global
-    // keys so `:q`, Ctrl-C, etc. can't leak through during edit flow.
+    // Detail views and log view override `/` to start search instead of filter.
     // -----------------------------------------------------------------------
-    match &app.route {
-        Route::EditingResource { .. } => {
-            return match key.code {
-                KeyCode::Esc => Some(Action::Back),
-                _ => None,
-            };
-        }
-        Route::ContainerSelect { .. } => return handle_container_select_keys(key),
-        Route::Shell(_) => {
-            // During Connecting: Escape cancels, other keys fall through
-            // to global handlers (user has full TUI control).
-            // During bridge mode: the TUI is suspended and this code
-            // path is never reached.
-            return match key.code {
-                KeyCode::Esc => Some(Action::Back),
-                _ => None,
-            };
-        }
-        _ => {}
+    if matches!(
+        app.nav.top(),
+        Element::ContentView(_) | Element::LogSession(_) | Element::LogFilter(_)
+    ) && key.code == KeyCode::Char('/')
+    {
+        return Some(Action::SearchStart);
     }
 
     // -----------------------------------------------------------------------
@@ -90,19 +88,17 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     }
 
     // -----------------------------------------------------------------------
-    // Route-specific keys.
+    // Per-kind keys: EXHAUSTIVE over the top element — adding a kind
+    // forces a decision here.
     // -----------------------------------------------------------------------
-    match &app.route {
-        Route::Overview => handle_overview_keys(key),
-        Route::Resources => handle_resource_view_keys(app, key),
-        Route::ContentView { .. } => handle_detail_view_keys(key),
-        Route::Logs { .. } => handle_log_view_keys(app, key),
-        Route::Help => handle_help_view_keys(key),
-        Route::Contexts => handle_contexts_view_keys(key),
-        Route::ContainerSelect { .. } => handle_container_select_keys(key),
-        // EditingResource and Shell are handled in the modal early-return
-        // above — they never reach this match. Listed for exhaustiveness.
-        Route::EditingResource { .. } | Route::Shell(_) => None,
+    match app.nav.top() {
+        Element::Overview(_) => handle_overview_keys(key),
+        Element::ResourceList(_) | Element::RowFilter(_) | Element::DerivedRows(_) => {
+            handle_resource_view_keys(app, key)
+        }
+        Element::ContentView(_) => handle_detail_view_keys(key),
+        Element::LogSession(_) | Element::LogFilter(_) => handle_log_view_keys(app, key),
+        Element::ContextList(_) => handle_contexts_view_keys(key),
     }
 }
 
@@ -156,9 +152,9 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(Action::ToggleHeader);
     }
 
-    // Ctrl-S: save logs (in log view) or save table (everywhere else).
+    // Ctrl-S: save logs (in log views) or save table (everywhere else).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-        return if matches!(app.route, Route::Logs { .. }) {
+        return if matches!(app.nav.top(), Element::LogSession(_) | Element::LogFilter(_)) {
             Some(Action::SaveLogs)
         } else {
             Some(Action::SaveTable)
@@ -297,10 +293,11 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // view. Repeats toggle direction (sort_by_column handles that). Uses the
         // DATA index (sort indexes the full cells array), translating from the
         // cursor's visible index so hidden columns don't shift the target.
-        KeyCode::Char('S') => {
-            let (col, _header) = app.active_table_selected_data_col();
-            Some(Action::Sort(crate::app::SortTarget::Column(col)))
-        }
+        KeyCode::Char('S') => app
+            .nav
+            .top()
+            .selected_data_col()
+            .map(|(col, _header)| Action::Sort(crate::app::SortTarget::Column(col))),
 
         // Copy.
         KeyCode::Char('c') => Some(Action::Copy),
@@ -367,7 +364,7 @@ fn handle_detail_view_keys(key: KeyEvent) -> Option<Action> {
 // Log view
 // ---------------------------------------------------------------------------
 
-fn handle_log_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
+fn handle_log_view_keys(_app: &App, key: KeyEvent) -> Option<Action> {
     // Shift-C: clear logs.
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Char('C') {
         return Some(Action::ClearLogs);
@@ -376,20 +373,10 @@ fn handle_log_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
     match key.code {
         // `q` in log view goes back.
         KeyCode::Char('q') => Some(Action::Back),
-        // Esc: if filtering, cancel draft or pop filter; otherwise go back.
-        KeyCode::Esc => {
-            let has_log_filters = match &app.route {
-                Route::Logs { ref state, .. } => {
-                    state.is_filtering() || !state.filters().is_empty()
-                }
-                _ => false,
-            };
-            if has_log_filters {
-                Some(Action::ClearFilter)
-            } else {
-                Some(Action::Back)
-            }
-        }
+        // Esc: pop — a committed log filter IS an element, so the first
+        // press pops one filter, the next leaves the log view; a live
+        // draft is cancelled by the input path before this fires.
+        KeyCode::Esc => Some(Action::Back),
 
         // Scrolling.
         KeyCode::Down | KeyCode::Char('j') => Some(Action::ScrollDown(1)),

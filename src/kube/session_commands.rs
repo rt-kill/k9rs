@@ -269,7 +269,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::app::InputMode;
 use crate::kube::client_session::ClientSession;
-use crate::kube::session::{ds_try, apply_nav_change};
+use crate::kube::session::ds_try;
 use crate::kube::session_actions::do_switch_namespace;
 
 // (COMMAND_HISTORY_LIMIT moved to app.config.ui.command_history_size)
@@ -374,7 +374,7 @@ fn handle_command_submit(
             app.should_quit = true;
         }
         ParsedCommand::Help => {
-            app.navigate_to(crate::app::Route::Help);
+            app.ui.overlay = Some(crate::app::Overlay::Help { scroll: 0 });
         }
         ParsedCommand::Aliases => {
             handle_action(
@@ -383,10 +383,14 @@ fn handle_command_submit(
             );
         }
         ParsedCommand::Overview => {
-            app.route = crate::app::Route::Overview;
+            app.nav.reset(crate::app::element::Element::Overview(
+                crate::app::element::Overview,
+            ));
         }
         ParsedCommand::ContextList => {
-            app.navigate_to(crate::app::Route::Contexts);
+            app.nav.push(crate::app::element::Element::ContextList(
+                crate::app::element::ContextList::new(app.data.contexts.items().to_vec()),
+            ));
         }
         ParsedCommand::ContextSwitch(ctx_name) => {
             begin_context_switch(app, data_source, &ctx_name);
@@ -395,61 +399,50 @@ fn handle_command_submit(
             do_switch_namespace(app, data_source, ns);
         }
         ParsedCommand::Resource(rid) => {
-            app.route = crate::app::Route::Resources;
             if rid.is_cluster_scoped() && !app.kube.selected_ns.is_all() {
-                // Just update the namespace — don't call do_switch_namespace
-                // which would nav.reset + subscribe (creating a subscription
-                // that nav.reset below immediately replaces = broken pipe).
+                // Display-only selector correction (the element's own
+                // query already carries the resolved scope).
                 app.kube.selected_ns = crate::kube::protocol::Namespace::All;
             }
-            let change = app.nav.reset(rid);
-            *app.nav.filter_input_mut() = Default::default();
-            apply_nav_change(app, data_source, change);
+            let root = App::root_list_element(
+                data_source, &app.kube.metrics, rid, app.kube.selected_ns.clone(),
+            );
+            app.nav.reset(root);
         }
         ParsedCommand::ResourceFilter { rid, filter } => {
-            app.route = crate::app::Route::Resources;
-            let change = app.nav.reset(rid.clone());
-            apply_nav_change(app, data_source, change);
-            let change = app.nav.push(crate::app::nav::NavStep::new(
-                rid,
-                Some(crate::app::nav::NavFilter::Grep(
-                    crate::app::nav::CompiledGrep::new(filter),
-                )),
-            ));
-            apply_nav_change(app, data_source, change);
-            *app.nav.filter_input_mut() = Default::default();
-            app.reapply_nav_filters();
+            let root = App::root_list_element(
+                data_source, &app.kube.metrics, rid, app.kube.selected_ns.clone(),
+            );
+            app.nav.reset(root);
+            let predicate = crate::app::store::RowPredicate::Grep(
+                crate::app::nav::CompiledGrep::new(filter),
+            );
+            if let Ok(el) = crate::app::element::Element::derive_filter(app.nav.top(), predicate) {
+                app.nav.push(el);
+            }
         }
         ParsedCommand::ResourceInNamespace { rid, namespace } => {
-            app.route = crate::app::Route::Resources;
-            let change = app.nav.reset(rid.clone());
-            *app.nav.filter_input_mut() = Default::default();
-            if namespace != app.kube.selected_ns {
-                // `do_switch_namespace` calls `nav.reset(root_rid)` and
-                // opens a fresh substream for the new namespace itself,
-                // so the earlier `change` from our own `reset(rid)` is
-                // stale (its stream was already dropped and replaced).
-                // Applying it would just churn through clear+resubscribe
-                // a second time on the same rid; skip it.
-                do_switch_namespace(app, data_source, namespace.clone());
-            } else {
-                apply_nav_change(app, data_source, change);
-            }
+            // The element carries the requested namespace as its OWN
+            // scope; the selector follows it (explicit selector write).
+            app.kube.selected_ns = namespace.clone();
+            let root = App::root_list_element(
+                data_source, &app.kube.metrics, rid.clone(), namespace.clone(),
+            );
+            app.nav.reset(root);
             app.ui.flash = Some(crate::app::FlashMessage::info(format!(
                 "{}({})", rid.short_label(), namespace.display()
             )));
         }
         ParsedCommand::CrdInNamespace { crd, namespace } => {
-            app.route = crate::app::Route::Resources;
-            if namespace != app.kube.selected_ns {
-                do_switch_namespace(app, data_source, namespace.clone());
-            }
+            app.kube.selected_ns = namespace.clone();
             let crd_rid = ResourceId::crd(
                 crd.group.clone(), crd.version.clone(),
                 crd.kind.clone(), crd.plural.clone(), crd.scope,
             );
-            let change = app.nav.reset(crd_rid);
-            apply_nav_change(app, data_source, change);
+            let root = App::root_list_element(
+                data_source, &app.kube.metrics, crd_rid, namespace.clone(),
+            );
+            app.nav.reset(root);
             app.ui.flash = Some(crate::app::FlashMessage::info(
                 format!("Browsing CRD: {}({})", crd.kind, namespace.display())
             ));
@@ -473,12 +466,13 @@ fn handle_command_submit(
                     crate::kube::protocol::ResourceScope::Namespaced,
                 )
             };
-            app.route = crate::app::Route::Resources;
             if scope == crate::kube::protocol::ResourceScope::Cluster && !app.kube.selected_ns.is_all() {
-                do_switch_namespace(app, data_source, crate::kube::protocol::Namespace::All);
+                app.kube.selected_ns = crate::kube::protocol::Namespace::All;
             }
-            let change = app.nav.reset(crd_rid);
-            apply_nav_change(app, data_source, change);
+            let root = App::root_list_element(
+                data_source, &app.kube.metrics, crd_rid, app.kube.selected_ns.clone(),
+            );
+            app.nav.reset(root);
             app.ui.flash = Some(crate::app::FlashMessage::info(format!("Browsing: {}", kind_label)));
         }
     }
@@ -607,51 +601,42 @@ fn dispatch_form_submit(
 pub(crate) fn handle_filter_key(
     app: &mut App,
     key: KeyEvent,
-    data_source: &mut ClientSession,
+    _data_source: &mut ClientSession,
 ) -> bool {
-    if !app.nav.filter_input().active() {
+    if !app.nav.top().filter_input().active() {
         return false;
     }
     match key.code {
+        // Draft mutations need no explicit re-filter: the draft is a
+        // derive input, so the next frame's view re-derives naturally.
         KeyCode::Esc => {
-            app.nav.filter_input_mut().cancel();
-            app.reapply_nav_filters();
+            if let Some(fi) = app.nav.top_mut().filter_input_mut() {
+                fi.cancel();
+            }
         }
         KeyCode::Enter => {
-            if let Some(committed) = app.nav.filter_input_mut().commit() {
-                let Some(current_rid) = app.nav.resource_id().cloned() else {
-                    app.reapply_nav_filters();
-                    return true;
-                };
-                let filter = if let Some(c) = committed.column {
-                    crate::app::nav::NavFilter::ColumnGrep {
-                        pattern: crate::app::nav::CompiledGrep::new(committed.text),
-                        col: c.index,
-                        header: c.header,
-                    }
-                } else {
-                    crate::app::nav::NavFilter::Grep(
-                        crate::app::nav::CompiledGrep::new(committed.text),
-                    )
-                };
-                let change = app.nav.push(crate::app::nav::NavStep::new(
-                    current_rid,
-                    Some(filter),
-                ));
-                apply_nav_change(app, data_source, change);
+            if let Some(committed) = app.nav.top_mut().filter_input_mut().and_then(|fi| fi.commit()) {
+                let predicate = crate::app::element::predicate_for_commit(
+                    committed.text,
+                    committed.column.map(|c| (c.index, c.header)),
+                );
+                // Commit = one RowFilter element over the top's output.
+                // Tops without a row output (projections) can't commit —
+                // the draft simply clears, matching the old behavior.
+                if let Ok(el) = crate::app::element::Element::derive_filter(app.nav.top(), predicate) {
+                    app.nav.push(el);
+                }
             }
-            app.reapply_nav_filters();
         }
         KeyCode::Backspace => {
-            app.nav.filter_input_mut().pop_char();
-            app.reapply_nav_filters();
+            if let Some(fi) = app.nav.top_mut().filter_input_mut() {
+                fi.pop_char();
+            }
         }
         KeyCode::Char(c) => {
-            app.nav.filter_input_mut().push_char(c);
-            // The nav layer is the only source of truth for filter text;
-            // re-derive the visible row set from the updated input. This
-            // also refreshes the marked-visible cache.
-            app.reapply_nav_filters();
+            if let Some(fi) = app.nav.top_mut().filter_input_mut() {
+                fi.push_char(c);
+            }
         }
         // Don't consume keys we don't handle — let them fall through
         // to the global handler (e.g., Ctrl-C to quit).
@@ -667,7 +652,7 @@ mod parser_tests {
     use crate::kube::resource_def::BuiltInKind;
 
     fn make_app() -> App {
-        App::new(crate::kube::protocol::ContextName::default(), crate::kube::protocol::Namespace::All)
+        App::new_for_test()
     }
 
     fn parse(input: &str) -> ParsedCommand {

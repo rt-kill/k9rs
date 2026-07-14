@@ -317,18 +317,20 @@ impl ServerSession {
     ) {
         let mut buf_writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
 
+        // Version handshake BEFORE any framed message — a mismatched peer
+        // can never mis-parse an enum (see protocol::PROTOCOL_MAGIC).
+        if protocol::read_handshake(&mut reader).await.is_err() {
+            return;
+        }
+        if protocol::write_handshake(&mut buf_writer).await.is_err() {
+            return;
+        }
+
         let init = match protocol::read_bincode::<_, SessionCommand>(&mut reader).await {
             Ok(SessionCommand::Init {
-                protocol_version, context, namespace, readonly,
+                context, namespace, readonly,
                 kubeconfig_yaml, env_vars, identity,
             }) => {
-                if protocol_version != protocol::PROTOCOL_VERSION {
-                    let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
-                        format!("Protocol mismatch: TUI v{} != daemon v{}. Restart the daemon.",
-                            protocol_version, protocol::PROTOCOL_VERSION),
-                    )).await;
-                    return;
-                }
                 InitParams { context, namespace, readonly, kubeconfig_yaml, env_vars, identity }
             }
             Ok(_) => {
@@ -358,19 +360,13 @@ impl ServerSession {
     ) {
         let mut buf_writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
 
-        // See NOTE on `init_and_run` re: duplicated protocol version check.
+        // Versioning lives in the connection handshake (performed by the
+        // caller before any framed read).
         let init = match first_cmd {
             SessionCommand::Init {
-                protocol_version, context, namespace, readonly,
+                context, namespace, readonly,
                 kubeconfig_yaml, env_vars, identity,
             } => {
-                if protocol_version != protocol::PROTOCOL_VERSION {
-                    let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
-                        format!("Protocol mismatch: TUI v{} != daemon v{}. Restart the daemon.",
-                            protocol_version, protocol::PROTOCOL_VERSION),
-                    )).await;
-                    return;
-                }
                 InitParams { context, namespace, readonly, kubeconfig_yaml, env_vars, identity }
             }
             _ => {
@@ -394,19 +390,19 @@ impl ServerSession {
         session_id: u64,
     ) {
         let mut buf_writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
-        // See NOTE on `init_and_run` re: duplicated protocol version check.
+        // Version handshake BEFORE any framed message — a mismatched peer
+        // can never mis-parse an enum (see protocol::PROTOCOL_MAGIC).
+        if protocol::read_handshake(&mut reader).await.is_err() {
+            return;
+        }
+        if protocol::write_handshake(&mut buf_writer).await.is_err() {
+            return;
+        }
         let init = match protocol::read_bincode::<_, SessionCommand>(&mut reader).await {
             Ok(SessionCommand::Init {
-                protocol_version, context, namespace, readonly,
+                context, namespace, readonly,
                 kubeconfig_yaml, env_vars, identity,
             }) => {
-                if protocol_version != protocol::PROTOCOL_VERSION {
-                    let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
-                        format!("Protocol mismatch: TUI v{} != daemon v{}. Restart the daemon.",
-                            protocol_version, protocol::PROTOCOL_VERSION),
-                    )).await;
-                    return;
-                }
                 InitParams { context, namespace, readonly, kubeconfig_yaml, env_vars, identity }
             }
             Ok(_) => {
@@ -979,13 +975,17 @@ async fn handle_subscription_substream_inner(
             source.subscribe(),
             source,
         );
+        // Local sources are Baseline-only streams by contract (their watch
+        // channel is a latest-full-value source; a local Delta is
+        // unrepresentable). The client applies them through the same
+        // Baseline path as everything else.
         let _ = protocol::write_bincode(&mut writer,
-            &protocol::StreamEvent::Snapshot(sub.current())).await;
+            &protocol::StreamEvent::Baseline(sub.current())).await;
         let _ = writer.flush().await;
         loop {
             if sub.changed().await.is_err() { break; }
             if protocol::write_bincode(&mut writer,
-                &protocol::StreamEvent::Snapshot(sub.current())).await.is_err() { break; }
+                &protocol::StreamEvent::Baseline(sub.current())).await.is_err() { break; }
             if writer.flush().await.is_err() { break; }
         }
         return;
@@ -1079,21 +1079,8 @@ async fn handle_subscription_substream_inner(
         }
     };
 
-    // Capture re-subscription recipe so the bridge can retry after watcher
-    // death. Built-ins need (key, kind); CRDs need the resolved identity.
-    enum ResubInfo {
-        BuiltIn {
-            key: QueryKey,
-            kind: crate::kube::resource_def::BuiltInKind,
-        },
-        Dynamic {
-            key: QueryKey,
-            gvk: kube::api::GroupVersionKind,
-            plural: String,
-            scope: protocol::ResourceScope,
-            printer_columns: Vec<crate::kube::cache::PrinterColumn>,
-        },
-    }
+    // (ResubInfo hoisted to module scope for the bridge helpers.)
+
 
     let (mut sub, resub) = match crd_or_sub {
         CrdOrSub::BuiltIn(sub) => {
@@ -1124,138 +1111,226 @@ async fn handle_subscription_substream_inner(
         }
     };
 
-    // Bridge: watcher -> StreamEvent frames on the substream.
+    // Bridge: watcher → StreamEvent frames on the substream.
     //
-    // If the watcher dies after having delivered data (transient failure —
-    // laptop suspend, VPN drop, token refresh race), re-subscribe with
-    // exponential backoff. WatcherCache detects the dead watcher and spawns
-    // a fresh one. The TUI keeps the last good snapshot while we retry.
+    // Stream contract: Baseline first, then Deltas; a fresh Baseline (same
+    // stream) repairs fanout lag; watcher death → resubscribe with backoff
+    // while the TUI keeps its last data — the new attach forwards deltas
+    // immediately (refreshing the stale table in place) and sends the
+    // authoritative post-list Baseline at InitDone, which clears any rows
+    // that died during the outage.
     //
-    // If the watcher dies *before* ever delivering data (RBAC, unknown
-    // resource), the error is almost certainly permanent — send it
-    // immediately and exit.
-    let mut ever_received_data = false;
+    // The bridge is the serialization point: baselines (oneshot ask) and
+    // deltas (broadcast ring) are two daemon-internal channels, but this
+    // task imposes baseline-before-deltas on the single ordered substream,
+    // and idempotent application makes baseline/delta overlap harmless.
     let mut retry_backoff = std::time::Duration::from_secs(5);
+    // Join semantics on first attach (baseline as soon as there's data);
+    // relist semantics on every re-attach (defer to InitDone).
+    let mut after_initial_list = false;
+    let mut sent_any_data = false;
 
-    // Send current snapshot immediately if available.
-    if let Some(update) = sub.current() {
-        ever_received_data = true;
-        let update = apply_owner_filter_inline(update, &filter);
-        if let Err(e) = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await {
-            tracing::warn!(session = session_id, sub = sub_id, "initial snapshot write failed for {}: {}", rid.plural(), e);
-            return;
-        }
-        if let Err(e) = writer.flush().await {
-            tracing::warn!(session = session_id, sub = sub_id, "initial snapshot flush failed for {}: {}", rid.plural(), e);
-            return;
-        }
-        tracing::info!(session = session_id, sub = sub_id,
-            "subscribe: {}({}) snapshot ready in {:?}",
-            rid.plural(), init.namespace.display(), sub_start.elapsed());
-    } else {
-        tracing::info!(session = session_id, sub = sub_id,
-            "subscribe: {}({}) snapshot pending, waiting for watcher",
-            rid.plural(), init.namespace.display());
-    }
-
-    loop {
-        // Forward snapshots until the watcher dies or the substream breaks.
-        let watcher_died = loop {
-            if sub.changed().await.is_err() {
-                break true;
-            }
-            let Some(update) = sub.current() else {
-                break true;
-            };
-            ever_received_data = true;
-            retry_backoff = std::time::Duration::from_secs(5);
-            let update = apply_owner_filter_inline(update, &filter);
-            if let Err(e) = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await {
-                tracing::warn!(session = session_id, sub = sub_id, "bridge write failed for {}: {}", rid.plural(), e);
-                break false;
-            }
-            if let Err(e) = writer.flush().await {
-                tracing::warn!(session = session_id, sub = sub_id, "bridge flush failed for {}: {}", rid.plural(), e);
-                break false;
+    'attach: loop {
+        // Cursor is already pinned (sub holds its broadcast receiver), so
+        // the baseline can only overlap buffered deltas, never gap.
+        let mut baseline_rx = sub.request_baseline(after_initial_list);
+        let baseline = loop {
+            tokio::select! {
+                b = &mut baseline_rx => match b {
+                    Ok(b) => break Some(b),
+                    Err(_) => break None, // watcher task gone (ask dropped)
+                },
+                msg = sub.recv() => match msg {
+                    Ok(msg) => match &*msg {
+                        // Forward deltas while the baseline is deferred —
+                        // keeps the client fresh during a long re-LIST and
+                        // keeps the ring drained.
+                        crate::kube::live_query::WatcherMsg::Delta(delta) => {
+                            if sent_any_data {
+                                let delta = filter_delta(delta.clone(), &filter);
+                                if protocol::write_bincode(&mut writer, &protocol::StreamEvent::Delta(delta)).await.is_err() { return; }
+                                if writer.flush().await.is_err() { return; }
+                            }
+                        }
+                        crate::kube::live_query::WatcherMsg::Dead(_) => break None,
+                    },
+                    Err(_) => break None, // Lagged pre-baseline: the ask repairs it anyway
+                },
             }
         };
 
-        if !watcher_died {
-            return; // Substream error — TUI disconnected, nothing to retry.
-        }
-
-        if !ever_received_data {
-            // First watcher never produced data — likely permanent (RBAC, unknown resource).
-            let detail = sub.last_error().unwrap_or_default();
-            let msg = if detail.is_empty() {
-                format!("Watcher failed for {}", rid.plural())
-            } else {
-                format!("Watcher failed for {}: {}", rid.plural(), detail)
-            };
-            let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Error(msg)).await;
-            return;
-        }
-
-        // Transient failure after prior success — retry with jittered backoff.
-        // ±25% jitter prevents thundering herd when many watchers die
-        // simultaneously (e.g., after laptop suspend/resume).
-        let detail = sub.last_error().unwrap_or_default();
-        let jitter_factor = crate::util::retry_jitter(rid.plural().as_bytes(), retry_backoff.as_millis() as u64);
-        let jittered = retry_backoff.mul_f64(jitter_factor);
-        tracing::info!(session = session_id, sub = sub_id,
-            "watcher died for {}, retrying in {:?}: {}",
-            rid.plural(), jittered, detail);
-        tokio::time::sleep(jittered).await;
-        retry_backoff = (retry_backoff * 2).min(std::time::Duration::from_secs(60));
-
-        // Re-subscribe — WatcherCache sees the dead watcher and creates a fresh one.
-        sub = match &resub {
-            ResubInfo::BuiltIn { key, kind } => {
-                ctx.shared.watcher_cache.subscribe(key.clone(), *kind, make_client, ctx.streaming_lists)
+        let Some(baseline) = baseline else {
+            // Watcher died before answering. Permanent iff it never
+            // produced data for us (first LIST fail-fast: RBAC, unknown
+            // resource); transient otherwise.
+            let detail = drain_death_reason(&mut sub).await.unwrap_or_default();
+            if !sent_any_data {
+                let msg = if detail.is_empty() {
+                    format!("Watcher failed for {}", rid.plural())
+                } else {
+                    format!("Watcher failed for {}: {}", rid.plural(), detail)
+                };
+                let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Error(msg)).await;
+                return;
             }
-            ResubInfo::Dynamic { key, gvk, plural, scope, printer_columns } => {
-                ctx.shared.watcher_cache.subscribe_dynamic(
-                    key.clone(), make_client, gvk.clone(),
-                    plural.clone(), *scope, printer_columns.clone(), ctx.streaming_lists,
-                )
-            }
+            sub = resubscribe(&ctx, &resub, make_client, &mut retry_backoff, &detail, session_id).await;
+            after_initial_list = true;
+            continue 'attach;
         };
 
-        // Deliver the first snapshot from the new watcher if immediately available.
-        if let Some(update) = sub.current() {
-            ever_received_data = true;
-            let update = apply_owner_filter_inline(update, &filter);
-            if protocol::write_bincode(&mut writer, &protocol::StreamEvent::Snapshot(update)).await.is_err() {
-                return;
-            }
-            if writer.flush().await.is_err() {
-                return;
+        let baseline = filter_baseline(baseline, &filter);
+        if protocol::write_bincode(&mut writer, &protocol::StreamEvent::Baseline(baseline)).await.is_err() { return; }
+        if writer.flush().await.is_err() { return; }
+        if !sent_any_data {
+            tracing::info!(session = session_id, sub = sub_id,
+                "subscribe: {}({}) baseline ready in {:?}",
+                rid.plural(), init.namespace.display(), sub_start.elapsed());
+        }
+        sent_any_data = true;
+        retry_backoff = std::time::Duration::from_secs(5);
+
+        loop {
+            match sub.recv().await {
+                Ok(msg) => match &*msg {
+                    crate::kube::live_query::WatcherMsg::Delta(delta) => {
+                        let delta = filter_delta(delta.clone(), &filter);
+                        if protocol::write_bincode(&mut writer, &protocol::StreamEvent::Delta(delta)).await.is_err() { return; }
+                        if writer.flush().await.is_err() { return; }
+                    }
+                    crate::kube::live_query::WatcherMsg::Dead(reason) => {
+                        let detail = reason.clone();
+                        sub = resubscribe(&ctx, &resub, make_client, &mut retry_backoff, &detail, session_id).await;
+                        after_initial_list = true;
+                        continue 'attach;
+                    }
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Fell behind the ring: repair with a fresh in-band
+                    // Baseline (replaces everything client-side), then
+                    // continue from the advanced cursor — overlap is
+                    // idempotent.
+                    tracing::debug!(session = session_id, sub = sub_id,
+                        "subscription lagged {} batches for {}, re-baselining", n, rid.plural());
+                    after_initial_list = false;
+                    continue 'attach;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let detail = String::new();
+                    sub = resubscribe(&ctx, &resub, make_client, &mut retry_backoff, &detail, session_id).await;
+                    after_initial_list = true;
+                    continue 'attach;
+                }
             }
         }
     }
 }
 
-/// Owner-uid post-filter for subscription substreams. OwnerUid is the one
-/// `SubscriptionFilter` variant that K8s can't apply server-side (the
-/// field doesn't exist on the resource schema), so we drop rows whose
-/// owner chain doesn't include the requested UID after the watcher hands
-/// us each snapshot.
-fn apply_owner_filter_inline(
-    update: crate::event::ResourceUpdate,
-    filter: &Option<protocol::SubscriptionFilter>,
-) -> crate::event::ResourceUpdate {
-    let Some(protocol::SubscriptionFilter::OwnerUid(ref uid)) = filter else {
-        return update;
-    };
-    match update {
-        crate::event::ResourceUpdate::Rows { resource, headers, rows } => {
-            let filtered: Vec<_> = rows.into_iter().filter(|row| {
-                row.owner_refs.iter().any(|r| r.uid == *uid)
-            }).collect();
-            crate::event::ResourceUpdate::Rows { resource, headers, rows: filtered }
+// Capture re-subscription recipe so the bridge can retry after watcher
+// death. Built-ins need (key, kind); CRDs need the resolved identity.
+enum ResubInfo {
+    BuiltIn {
+        key: crate::kube::live_query::QueryKey,
+        kind: crate::kube::resource_def::BuiltInKind,
+    },
+    Dynamic {
+        key: crate::kube::live_query::QueryKey,
+        gvk: kube::api::GroupVersionKind,
+        plural: String,
+        scope: protocol::ResourceScope,
+        printer_columns: Vec<crate::kube::cache::PrinterColumn>,
+    },
+}
+
+/// After a watcher death, pull the terminal `Dead(reason)` off the ring if
+/// it's still there (it is sent as the task's final act).
+async fn drain_death_reason(sub: &mut crate::kube::live_query::Subscription) -> Option<String> {
+    loop {
+        match sub.recv().await {
+            Ok(msg) => {
+                if let crate::kube::live_query::WatcherMsg::Dead(reason) = &*msg {
+                    return Some(reason.clone());
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
         }
-        other => other,
     }
+}
+
+/// Backoff, then re-subscribe (the WatcherCache sees the dead watcher and
+/// spawns a fresh one). ±25% jitter prevents thundering herd when many
+/// watchers die simultaneously (e.g., after laptop suspend/resume).
+async fn resubscribe(
+    ctx: &Arc<SessionContext>,
+    resub: &ResubInfo,
+    make_client: impl Fn() -> kube::Client + Clone,
+    retry_backoff: &mut std::time::Duration,
+    detail: &str,
+    session_id: u64,
+) -> crate::kube::live_query::Subscription {
+    let rid_label = match resub {
+        ResubInfo::BuiltIn { key, .. } | ResubInfo::Dynamic { key, .. } => key.resource.plural(),
+    };
+    let jitter_factor = crate::util::retry_jitter(rid_label.as_bytes(), retry_backoff.as_millis() as u64);
+    let jittered = retry_backoff.mul_f64(jitter_factor);
+    tracing::info!(session = session_id,
+        "watcher died for {}, retrying in {:?}: {}", rid_label, jittered, detail);
+    tokio::time::sleep(jittered).await;
+    *retry_backoff = (*retry_backoff * 2).min(std::time::Duration::from_secs(60));
+
+    match resub {
+        ResubInfo::BuiltIn { key, kind } => {
+            ctx.shared.watcher_cache.subscribe(key.clone(), *kind, make_client, ctx.streaming_lists)
+        }
+        ResubInfo::Dynamic { key, gvk, plural, scope, printer_columns } => {
+            ctx.shared.watcher_cache.subscribe_dynamic(
+                key.clone(), make_client, gvk.clone(),
+                plural.clone(), *scope, printer_columns.clone(), ctx.streaming_lists,
+            )
+        }
+    }
+}
+
+/// Owner-uid post-filter, baseline flavor. OwnerUid is the one
+/// `SubscriptionFilter` variant K8s can't apply server-side, so the bridge
+/// filters each frame. Exhaustive over frame kinds by construction — one
+/// function per frame type, no wildcard arm a future variant can slip past.
+fn filter_baseline(
+    mut baseline: protocol::TableBaseline,
+    filter: &Option<protocol::SubscriptionFilter>,
+) -> protocol::TableBaseline {
+    let Some(protocol::SubscriptionFilter::OwnerUid(ref uid)) = filter else {
+        return baseline;
+    };
+    baseline.rows.retain(|row| row.owner_refs.iter().any(|r| r.uid == *uid));
+    baseline
+}
+
+/// Owner-uid post-filter, delta flavor. Stateless: an upsert that fails
+/// the filter becomes a Remove — the row may never have been shown, but
+/// client removes are idempotent (remove-of-absent is a no-op), so a pod
+/// whose ownerRef mutates away from the drill correctly disappears.
+fn filter_delta(
+    delta: protocol::TableDelta,
+    filter: &Option<protocol::SubscriptionFilter>,
+) -> protocol::TableDelta {
+    let Some(protocol::SubscriptionFilter::OwnerUid(ref uid)) = filter else {
+        return delta;
+    };
+    let changes = delta.changes.into_iter().map(|change| match change {
+        protocol::RowChange::Upsert(row) => {
+            if row.owner_refs.iter().any(|r| r.uid == *uid) {
+                protocol::RowChange::Upsert(row)
+            } else {
+                protocol::RowChange::Remove(protocol::ObjectKey::new(
+                    row.namespace.clone().unwrap_or_default(),
+                    row.name.clone(),
+                ))
+            }
+        }
+        protocol::RowChange::Remove(key) => protocol::RowChange::Remove(key),
+    }).collect();
+    protocol::TableDelta { changes }
 }
 
 // (`AbortOnDrop` lived here originally; it's now `crate::util::AbortOnDrop`,

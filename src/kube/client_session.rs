@@ -93,10 +93,6 @@ pub struct ClientSession {
     mux_handle_rx: watch::Receiver<Option<crate::kube::mux::MuxHandle>>,
     event_tx: mpsc::Sender<AppEvent>,
     no_daemon: bool,
-    /// Monotonic counter used by `stream_log_substream` to stamp every
-    /// emitted `LogLine`. The receiver gates apply on a matching id so
-    /// stale lines from a previous stream don't bleed into a new view.
-    log_generation: std::sync::atomic::AtomicU64,
     /// Tracks fire-and-forget background tasks launched by TUI action
     /// handlers (copy-to-clipboard, save-table). Mirrors
     /// `ServerSession::pending_tasks` on the server side. On
@@ -167,21 +163,29 @@ impl Drop for ExecStream {
 
 /// An active log stream backed by its own yamux substream. Same shape as
 /// `SubscriptionStream` — drop aborts the bridge, closes the substream,
-/// the daemon's kubectl subprocess dies via `kill_on_drop`.
-///
-/// Carries a monotonic `generation` id stamped on every emitted `LogLine`.
-/// The TUI's log view writes the same id into its `LogState.generation`
-/// when it opens the stream; the apply path then drops any line whose id
-/// doesn't match. This protects against the race where switching from
-/// log-A to log-B leaves stale lines from A queued in the channel.
+/// the daemon's kubectl subprocess dies via `kill_on_drop`. Lines land in
+/// the `LineStore` the stream was handed at open (destination rides the
+/// event) — no ids, no routing tags.
 pub struct LogStream {
     _bridge: tokio::task::AbortHandle,
-    pub generation: u64,
 }
 
 impl std::fmt::Debug for LogStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LogStream").field("generation", &self.generation).finish_non_exhaustive()
+        f.debug_struct("LogStream").finish_non_exhaustive()
+    }
+}
+
+impl LogStream {
+    /// Whether the bridge task behind this stream is still running.
+    pub fn is_alive(&self) -> bool {
+        !self._bridge.is_finished()
+    }
+
+    /// Build a handle from a raw abort handle. Test-only.
+    #[cfg(test)]
+    pub(crate) fn from_abort_handle(bridge: tokio::task::AbortHandle) -> Self {
+        Self { _bridge: bridge }
     }
 }
 
@@ -228,7 +232,6 @@ impl ClientSession {
             mux_handle_rx,
             event_tx,
             no_daemon,
-            log_generation: std::sync::atomic::AtomicU64::new(0),
             pending_tasks: tokio::task::JoinSet::new(),
         }
     }
@@ -298,7 +301,6 @@ impl ClientSession {
         prepared: &PreparedKubeconfig,
     ) -> SessionCommand {
         SessionCommand::Init {
-            protocol_version: protocol::PROTOCOL_VERSION,
             context: Some(prepared.context_name.clone()),
             namespace: params.namespace.clone(),
             readonly: params.readonly,
@@ -309,6 +311,13 @@ impl ClientSession {
     }
 
 }
+
+
+/// Monotonic epoch source for table streams: each subscription bridge
+/// instance takes one, stamping its Baseline/Delta events so a successor
+/// subscription's table can reject this stream's late-queued events
+/// (accepted iff `event.epoch >= table.epoch`; a Baseline sets it).
+static NEXT_STREAM_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Connection manager
@@ -537,6 +546,12 @@ async fn do_handshake(
     params: &ConnectionParams,
     prepared: &PreparedKubeconfig,
 ) -> anyhow::Result<HandshakeOutcome> {
+    // Version preamble BEFORE any framed message (see PROTOCOL_MAGIC):
+    // a pre-8 daemon can never mis-parse us, and we detect it deterministically.
+    protocol::write_handshake(&mut writer).await
+        .map_err(|e| anyhow::anyhow!("Failed to send protocol handshake: {}", e))?;
+    protocol::read_handshake(&mut reader).await?;
+
     let init_cmd = ClientSession::build_init_command(params, prepared);
     protocol::write_bincode(&mut writer, &init_cmd).await
         .map_err(|e| anyhow::anyhow!("Failed to send Init: {}", e))?;
@@ -697,17 +712,23 @@ impl ClientSession {
     /// Takes a fully-built `LogInit` so callers can't mistakenly pass an
     /// untyped namespace string and round-trip it through `Namespace::from_row`
     /// (the parameter list used to be 7 strings/options long).
-    pub fn stream_log_substream(&self, log_init: protocol::LogInit) -> LogStream {
-        use std::sync::atomic::Ordering;
-        // Allocate a fresh generation id for this stream. Every LogLine
-        // event the bridge emits is tagged with it; the receiver checks
-        // against `LogState.generation` and drops mismatches.
-        let generation = self.log_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    pub fn stream_log_substream(
+        &self,
+        log_init: protocol::LogInit,
+        store: std::sync::Arc<crate::app::store::LineStore>,
+    ) -> LogStream {
+        // Same succession rule as table subscriptions: the store's epoch
+        // floor is raised BEFORE this returns, so a replaced stream's
+        // queued lines are stale on arrival (range restarts reuse the
+        // store so LogFilter children keep their handles).
+        let epoch = NEXT_STREAM_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        store.expect_epoch(epoch);
         let mut mux_rx = self.mux_handle_rx.clone();
         let event_tx = self.event_tx.clone();
         let init = protocol::SubstreamInit::Log(log_init);
         let handle = tokio::spawn(async move {
             let panic_tx = event_tx.clone();
+            let panic_store = store.clone();
             let result = std::panic::AssertUnwindSafe(async {
             // Yield the MuxHandle out of the wait loop so the "is Some"
             // check and the binding are one step — no post-loop `.unwrap()`.
@@ -719,7 +740,11 @@ impl ClientSession {
             let stream = match mux_handle.open().await {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = event_tx.send(AppEvent::LogStreamEnded).await;
+                    let _ = event_tx.send(AppEvent::Log(crate::event::LogEvent {
+                        store: store.clone(),
+                        epoch,
+                        payload: crate::event::LogPayload::Ended,
+                    })).await;
                     let _ = event_tx.send(AppEvent::Flash(FlashMessage::error(
                         format!("log substream open failed: {}", e),
                     ))).await;
@@ -733,7 +758,11 @@ impl ClientSession {
             );
 
             if protocol::write_bincode(&mut write_half, &init).await.is_err() {
-                let _ = event_tx.send(AppEvent::LogStreamEnded).await;
+                let _ = event_tx.send(AppEvent::Log(crate::event::LogEvent {
+                    store: store.clone(),
+                    epoch,
+                    payload: crate::event::LogPayload::Ended,
+                })).await;
                 let _ = event_tx.send(AppEvent::Flash(FlashMessage::error(
                     "Log init handshake failed".to_string(),
                 ))).await;
@@ -750,14 +779,20 @@ impl ClientSession {
                         // Pass ANSI codes through — the log renderer parses
                         // SGR sequences into ratatui Styles so application-
                         // embedded colors are preserved faithfully.
-                        let event = AppEvent::ResourceUpdate(
-                            crate::event::ResourceUpdate::LogLine { generation, line },
-                        );
+                        let event = AppEvent::Log(crate::event::LogEvent {
+                            store: store.clone(),
+                            epoch,
+                            payload: crate::event::LogPayload::Line(line),
+                        });
                         if event_tx.send(event).await.is_err() { break; }
                     }
                     Err(_) => {
                         // EOF — log stream ended.
-                        let _ = event_tx.send(AppEvent::LogStreamEnded).await;
+                        let _ = event_tx.send(AppEvent::Log(crate::event::LogEvent {
+                            store: store.clone(),
+                            epoch,
+                            payload: crate::event::LogPayload::Ended,
+                        })).await;
                         let _ = event_tx.send(AppEvent::Flash(
                             FlashMessage::info("Log stream ended"),
                         )).await;
@@ -774,7 +809,11 @@ impl ClientSession {
                 } else {
                     "unknown panic".to_string()
                 };
-                let _ = panic_tx.send(AppEvent::LogStreamEnded).await;
+                let _ = panic_tx.send(AppEvent::Log(crate::event::LogEvent {
+                    store: panic_store,
+                    epoch,
+                    payload: crate::event::LogPayload::Ended,
+                })).await;
                 let _ = panic_tx.send(AppEvent::Flash(FlashMessage::error(
                     format!("log bridge panicked: {}", msg),
                 ))).await;
@@ -782,7 +821,6 @@ impl ClientSession {
         });
         LogStream {
             _bridge: handle.abort_handle(),
-            generation,
         }
     }
 
@@ -840,42 +878,26 @@ impl ClientSession {
 // High-level operations
 // ---------------------------------------------------------------------------
 
-/// How a subscription is opened. Collapses the former `(force, nav_scoped)`
-/// bool pair passed to `subscribe_stream_inner` — the fourth combination
-/// (force *and* nav-scoped) was never used, so the enum makes it
-/// unrepresentable and the call sites read as a named mode instead of two
-/// position-sensitive `false`s.
-#[derive(Clone, Copy)]
-enum SubscribeMode {
-    /// Cache-shared watcher; snapshots route to the global store.
-    Normal,
-    /// Filtered view of a globally-stored resource (e.g. ShowNode): snapshots
-    /// route to the nav-step table instead of the global store.
-    NavScoped,
-    /// Force a fresh server-side watcher, bypassing the cache (Ctrl-R refresh).
-    Force,
-}
-
-impl SubscribeMode {
-    /// Whether the server should bypass its watcher cache.
-    fn force(self) -> bool {
-        matches!(self, SubscribeMode::Force)
-    }
-    /// Whether snapshots route to the nav-step table rather than the global store.
-    fn nav_scoped(self) -> bool {
-        matches!(self, SubscribeMode::NavScoped)
-    }
-}
-
 impl ClientSession {
-    /// Open a per-subscription substream. Spawns a background task that:
+    /// Open a per-subscription substream feeding `store`. Spawns a
+    /// self-healing bridge task that:
     ///
     /// 1. Awaits the `MuxHandle` (blocks until the handshake completes —
     ///    same timing as the old `cmd_tx` queue-until-handshake pattern).
-    /// 2. Opens a fresh yamux substream.
-    /// 3. Writes a `SubscriptionInit { resource, filter }` handshake.
-    /// 4. Reads `StreamEvent`s from the substream and forwards them into
-    ///    the main event channel as `AppEvent`s.
+    /// 2. Opens a fresh yamux substream and writes `SubscriptionInit`.
+    /// 3. Reads `StreamEvent`s and forwards them as [`AppEvent::Store`]
+    ///    events CARRYING the destination store — no routing exists, and
+    ///    the bridge itself never touches the store's lock (the event
+    ///    loop is the sole applier).
+    ///
+    /// The store's epoch floor is raised with this stream's first epoch
+    /// BEFORE this returns: from that instant, every event of a
+    /// superseded stream targeting the same store is stale on arrival
+    /// (Ctrl-R / reconnect succession can't flicker old data back).
+    /// Bridge-internal retries allocate fresh (higher) epochs; their
+    /// baselines set the floor on acceptance.
+    ///
+    /// `force` asks the server to bypass its watcher cache (Ctrl-R).
     ///
     /// Returns a `SubscriptionStream` handle. Drop it to unsubscribe —
     /// the bridge task is aborted, the substream is closed (RST sent to
@@ -885,45 +907,11 @@ impl ClientSession {
         resource: protocol::ResourceId,
         namespace: protocol::Namespace,
         filter: Option<protocol::SubscriptionFilter>,
+        store: std::sync::Arc<crate::app::store::RowStore>,
+        force: bool,
     ) -> SubscriptionStream {
-        self.subscribe_stream_inner(resource, namespace, filter, SubscribeMode::Normal)
-    }
-
-    /// Like `subscribe_stream` but routes updates to the nav-step table
-    /// instead of the global store. Used for filtered views of globally-
-    /// stored resources (ShowNode) where a core subscription already
-    /// populates the global table.
-    pub fn subscribe_stream_nav(
-        &self,
-        resource: protocol::ResourceId,
-        namespace: protocol::Namespace,
-        filter: Option<protocol::SubscriptionFilter>,
-    ) -> SubscriptionStream {
-        self.subscribe_stream_inner(resource, namespace, filter, SubscribeMode::NavScoped)
-    }
-
-    /// Like `subscribe_stream` but forces the server to create a fresh watcher,
-    /// bypassing the cache. Used by Ctrl-R refresh.
-    pub fn subscribe_stream_force(
-        &self,
-        resource: protocol::ResourceId,
-        namespace: protocol::Namespace,
-        filter: Option<protocol::SubscriptionFilter>,
-    ) -> SubscriptionStream {
-        self.subscribe_stream_inner(resource, namespace, filter, SubscribeMode::Force)
-    }
-
-    fn subscribe_stream_inner(
-        &self,
-        resource: protocol::ResourceId,
-        namespace: protocol::Namespace,
-        filter: Option<protocol::SubscriptionFilter>,
-        mode: SubscribeMode,
-    ) -> SubscriptionStream {
-        // Derive the two orthogonal behaviours once; the spawned bridge below
-        // captures these by value, exactly as it did the former bool params.
-        let force = mode.force();
-        let nav_scoped = mode.nav_scoped();
+        let first_epoch = NEXT_STREAM_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        store.expect_epoch(first_epoch);
         let mut mux_rx = self.mux_handle_rx.clone();
         let event_tx = self.event_tx.clone();
         let rid = resource.clone();
@@ -951,8 +939,18 @@ impl ClientSession {
             // once, not once per retry.
             let mut consecutive_errors: u32 = 0;
             let mut last_flashed_error: Option<String> = None;
+            // First attempt rides the epoch floored synchronously by
+            // `subscribe_stream`; every retry attempt mints a fresh one.
+            let mut first_epoch = Some(first_epoch);
 
             loop {
+                // Epoch for THIS attempt — allocated up front so failure
+                // paths can stamp their `Failed` payload with it (the
+                // store's floor gates a superseded stream's failure away
+                // from its successor's state).
+                let epoch = first_epoch.take().unwrap_or_else(|| {
+                    NEXT_STREAM_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                });
                 // Re-check the watch channel each iteration so we pick up
                 // a fresh MuxHandle after session reconnection.
                 let mux_handle = loop {
@@ -964,9 +962,15 @@ impl ClientSession {
                     Ok(s) => s,
                     Err(e) => {
                         if !ever_received_data {
+                            let message = format!("substream open failed: {}", e);
+                            let _ = event_tx.send(AppEvent::Store(crate::event::StoreEvent {
+                                store: store.clone(),
+                                epoch,
+                                payload: crate::app::store::StorePayload::Failed(message.clone()),
+                            })).await;
                             let _ = event_tx.send(AppEvent::SubscriptionFailed {
                                 resource: rid,
-                                message: format!("substream open failed: {}", e),
+                                message,
                             }).await;
                             return;
                         }
@@ -992,9 +996,15 @@ impl ClientSession {
                 });
                 if let Err(e) = protocol::write_bincode(&mut write_half, &init).await {
                     if !ever_received_data {
+                        let message = format!("subscription init failed: {}", e);
+                        let _ = event_tx.send(AppEvent::Store(crate::event::StoreEvent {
+                            store: store.clone(),
+                            epoch,
+                            payload: crate::app::store::StorePayload::Failed(message.clone()),
+                        })).await;
                         let _ = event_tx.send(AppEvent::SubscriptionFailed {
                             resource: rid,
-                            message: format!("subscription init failed: {}", e),
+                            message,
                         }).await;
                         return;
                     }
@@ -1023,18 +1033,28 @@ impl ClientSession {
                     ever_received_data = true;
 
                     let app_event = match event {
-                        protocol::StreamEvent::Snapshot(update) => {
+                        protocol::StreamEvent::Baseline(baseline) => {
                             // Healthy data: the subscription works. Clear the
                             // failure ceiling + flash de-dup and reset the backoff
                             // so a *later* failure surfaces fresh.
                             consecutive_errors = 0;
                             last_flashed_error = None;
                             retry_backoff = std::time::Duration::from_secs(2);
-                            if nav_scoped {
-                                AppEvent::NavResourceUpdate(update)
-                            } else {
-                                AppEvent::ResourceUpdate(update)
-                            }
+                            AppEvent::Store(crate::event::StoreEvent {
+                                store: store.clone(),
+                                epoch,
+                                payload: crate::app::store::StorePayload::Baseline(baseline),
+                            })
+                        }
+                        protocol::StreamEvent::Delta(delta) => {
+                            consecutive_errors = 0;
+                            last_flashed_error = None;
+                            retry_backoff = std::time::Duration::from_secs(2);
+                            AppEvent::Store(crate::event::StoreEvent {
+                                store: store.clone(),
+                                epoch,
+                                payload: crate::app::store::StorePayload::Delta(delta),
+                            })
                         }
                         protocol::StreamEvent::Resolved { original, resolved } => {
                             // The substream is alive and the server resolved the
@@ -1056,11 +1076,17 @@ impl ClientSession {
                                 // Terminal: stop retrying this subscription, with
                                 // one final flash. A fresh subscribe (Ctrl-R /
                                 // nav) starts a new bridge with the count reset.
+                                let message = format!(
+                                    "{msg} (stopped retrying after {consecutive_errors} failures — press Ctrl-R to retry)"
+                                );
+                                let _ = event_tx.send(AppEvent::Store(crate::event::StoreEvent {
+                                    store: store.clone(),
+                                    epoch,
+                                    payload: crate::app::store::StorePayload::Failed(message.clone()),
+                                })).await;
                                 let _ = event_tx.send(AppEvent::SubscriptionFailed {
                                     resource: current_rid.clone(),
-                                    message: format!(
-                                        "{msg} (stopped retrying after {consecutive_errors} failures — press Ctrl-R to retry)"
-                                    ),
+                                    message,
                                 }).await;
                                 return;
                             }
@@ -1071,6 +1097,13 @@ impl ClientSession {
                                 continue;
                             }
                             last_flashed_error = Some(msg.clone());
+                            // The element's state flips through its OWN store
+                            // (epoch-gated); the flash below is display-only.
+                            let _ = event_tx.send(AppEvent::Store(crate::event::StoreEvent {
+                                store: store.clone(),
+                                epoch,
+                                payload: crate::app::store::StorePayload::Failed(msg.clone()),
+                            })).await;
                             AppEvent::SubscriptionFailed {
                                 resource: current_rid.clone(),
                                 message: msg,
@@ -1083,9 +1116,15 @@ impl ClientSession {
                 }
 
                 if !ever_received_data {
+                    let message = String::from("substream closed before any data");
+                    let _ = event_tx.send(AppEvent::Store(crate::event::StoreEvent {
+                        store: store.clone(),
+                        epoch,
+                        payload: crate::app::store::StorePayload::Failed(message.clone()),
+                    })).await;
                     let _ = event_tx.send(AppEvent::SubscriptionFailed {
                         resource: rid,
-                        message: "substream closed before any data".into(),
+                        message,
                     }).await;
                     return;
                 }
@@ -1225,30 +1264,10 @@ fn convert_session_event(event: SessionEvent, current_context: &crate::kube::pro
                 debug!("ClientSession: discarding stale Discovery for context '{}' (current: '{}')", ctx, current_context);
                 return vec![];
             }
-            let mut events = Vec::new();
-            use crate::kube::resource_def::BuiltInKind;
-            use crate::kube::protocol::ResourceId;
-            // Headers are derived from the REGISTRY rather than hardcoded
-            // strings — single source of truth with the live-watcher path,
-            // which also pulls them from `def.default_headers()`.
-            let registry = &crate::kube::resource_defs::REGISTRY;
-            if !namespaces.is_empty() {
-                let rows = crate::kube::cache::cached_namespaces_to_rows(&namespaces);
-                events.push(AppEvent::ResourceUpdate(ResourceUpdate::Rows {
-                    resource: ResourceId::BuiltIn(BuiltInKind::Namespace),
-                    headers: registry.by_kind(BuiltInKind::Namespace).default_headers(),
-                    rows,
-                }));
-            }
-            if !crds.is_empty() {
-                let rows = crate::kube::cache::cached_crds_to_rows(&crds);
-                events.push(AppEvent::ResourceUpdate(ResourceUpdate::Rows {
-                    resource: ResourceId::BuiltIn(BuiltInKind::CustomResourceDefinition),
-                    headers: registry.by_kind(BuiltInKind::CustomResourceDefinition).default_headers(),
-                    rows,
-                }));
-            }
-            events
+            // Typed pass-through: the EVENT LOOP converts to rows and
+            // seeds the app-level core stores — the reader task holds no
+            // store Arcs (single-writer rule) and does no row work.
+            vec![AppEvent::Discovery { namespaces, crds }]
         }
 
         SessionEvent::PodMetrics(metrics) => {

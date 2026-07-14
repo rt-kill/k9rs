@@ -1,56 +1,30 @@
-//! Dynamic CRD instance watcher.
+//! Dynamic CRD watcher — same delta machinery as the typed path.
 //!
-//! Watches arbitrary CRD instances using `DynamicObject` and builds
-//! `ResourceRow` snapshots via JSONPath extraction from printer columns.
+//! Objects convert to [`ResourceRow`] AT INGEST (the column plan — printer
+//! columns + overlay columns + NAMESPACE/NAME/AGE — is computed once at
+//! spawn), so the store holds rows, not retained `DynamicObject`s. The old
+//! per-flush `build_dynamic_snapshot` (which re-serialized EVERY object
+//! every 200ms) and the `managedFields` strip (nothing is retained to
+//! strip) died with the delta rework. The loop itself is
+//! [`run_typed_watcher`](super::live_query::run_typed_watcher), generic
+//! over the dynamic type — one skeleton, two ingests.
 
-use std::collections::HashMap;
-
-use futures::{StreamExt, TryStreamExt};
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
-use kube::runtime::watcher::{self, Event as WatcherEvent};
-use kube::{Api, Client};
-use tokio::sync::watch;
-use tracing::{debug, warn};
+use kube::Client;
+use tracing::warn;
 
-use crate::event::ResourceUpdate;
 use crate::kube::cache::PrinterColumn;
-use crate::kube::protocol::{ObjectKey, ResourceScope};
-use crate::kube::resources::row::{CellValue, RowHealth};
+use crate::kube::protocol::ResourceScope;
+use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
-use super::live_query::{INIT_FLUSH_INTERVAL_MS, initial_backoff_ms, max_backoff_ms, max_elapsed_ms, watcher_page_size, WatcherSnapshot};
-
-/// Extracts the ObjectKey from a DynamicObject.
-fn dyn_obj_key(obj: &DynamicObject) -> ObjectKey {
-    let meta = &obj.metadata;
-    ObjectKey::new(
-        meta.namespace.clone().unwrap_or_default(),
-        meta.name.clone().unwrap_or_default(),
-    )
-}
-
-/// Drop `metadata.managedFields` before an object enters the store. k9rs never
-/// reads managed-fields — no printer/overlay column resolves them, and describe
-/// & yaml re-fetch from the API — yet the dynamic store keeps the *whole*
-/// `DynamicObject` and `build_dynamic_snapshot` re-serializes it (managedFields
-/// and all) on every rebuild. Managed-fields are often the bulkiest part of
-/// `metadata`, so dropping them at the watch boundary shrinks both the retained
-/// store and every snapshot's `serde_json::to_value` walk. This is the same
-/// "keep only what the view needs" rule the typed path gets for free by
-/// converting to `ResourceRow` on ingest.
-fn strip_bulk_metadata(mut obj: DynamicObject) -> DynamicObject {
-    obj.metadata.managed_fields = None;
-    obj
-}
-
-/// Watcher loop for dynamic CRD instances (DynamicObject -> ResourceRow).
-// Args are runtime context (client/ns/snapshot_tx) plus the dynamic-resource
-// descriptor (gvk/plural/scope/printer columns) and streaming flag — all
-// intrinsic to the watch loop; bundling them buys nothing here.
+/// Watcher for dynamic CRD instances. Thin wrapper: build the Api + column
+/// plan, then run the shared typed loop with a JSONPath-driven converter.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_dynamic_live_watcher(
     client: Client,
     ns: crate::kube::protocol::Namespace,
-    snapshot_tx: watch::Sender<WatcherSnapshot>,
+    delta_tx: tokio::sync::broadcast::Sender<std::sync::Arc<super::live_query::WatcherMsg>>,
+    ask_rx: tokio::sync::mpsc::Receiver<super::live_query::BaselineAsk>,
     gvk: GroupVersionKind,
     plural: String,
     scope: ResourceScope,
@@ -62,168 +36,43 @@ pub(crate) async fn run_dynamic_live_watcher(
     } else {
         ApiResource::from_gvk_with_plural(&gvk, &plural)
     };
-    // Delegate the scope routing to the centralized helper. Previously
-    // this function re-inlined the `Api::all_with`/`Api::namespaced_with`
-    // branches, one of the four copies task #102 was supposed to collapse.
-    let api: Api<DynamicObject> = crate::kube::describe::dynamic_api_for(&client, &ar, scope, &ns);
+    let api: kube::Api<DynamicObject> =
+        crate::kube::describe::dynamic_api_for(&client, &ar, scope, &ns);
 
-    // Build a ResourceId for the dynamic type so Rows updates carry identity.
-    // Dynamic watchers always serve runtime-discovered CRDs, never built-ins.
     let resource_id = crate::kube::protocol::ResourceId::crd(
         gvk.group.clone(), gvk.version.clone(), gvk.kind.clone(), plural.clone(), scope,
     );
 
-    let mut watcher_config = watcher::Config::default()
-        .page_size(watcher_page_size())
-        .any_semantic();
-    if streaming_lists {
-        watcher_config = watcher_config.streaming_lists();
-    }
-    let mut stream = watcher::watcher(api, watcher_config).boxed();
+    let columns = column_plan(&printer_columns, scope, &plural);
+    let headers: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
-    let mut store: HashMap<ObjectKey, DynamicObject> = HashMap::new();
-    let mut backoff_ms: u64 = initial_backoff_ms();
-    let mut backoff_start = std::time::Instant::now();
-    let mut init_dirty = false;
-    let mut steady_dirty = false;
-    let mut had_success = false;
+    let convert = move |obj: DynamicObject| convert_dynamic(obj, &columns);
 
-    let mut flush_timer = tokio::time::interval(std::time::Duration::from_millis(INIT_FLUSH_INTERVAL_MS));
-    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    // Reason we exit the loop — same pattern as run_typed_watcher.
-    let mut exit_reason: Option<String> = None;
-
-    loop {
-        tokio::select! {
-            timeout_result = tokio::time::timeout(super::live_query::STALE_TIMEOUT, stream.try_next()) => {
-                let event_result = match timeout_result {
-                    Ok(r) => r,
-                    Err(_) => {
-                        tracing::warn!("live_query dynamic: watcher stale, no events in {:?}", super::live_query::STALE_TIMEOUT);
-                        exit_reason = Some(format!("watch stale: no events in {:?}", super::live_query::STALE_TIMEOUT));
-                        break;
-                    }
-                };
-                match event_result {
-                    Ok(Some(event)) => {
-                        match event {
-                            WatcherEvent::Init => {
-                                store.clear();
-                                backoff_start = std::time::Instant::now();
-                            }
-                            WatcherEvent::InitApply(obj) => {
-                                let key = dyn_obj_key(&obj);
-                                store.insert(key, strip_bulk_metadata(obj));
-                                init_dirty = true;
-                            }
-                            WatcherEvent::InitDone => {
-                                had_success = true;
-                                backoff_ms = initial_backoff_ms();
-                                backoff_start = std::time::Instant::now();
-                                debug!("live_query dynamic: initial list complete, {} items", store.len());
-                                let snap = build_dynamic_snapshot(&store, &printer_columns, scope, &plural);
-                                let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
-                                    resource: resource_id.clone(),
-                                    headers: snap.headers,
-                                    rows: snap.rows,
-                                }));
-                            }
-                            WatcherEvent::Apply(obj) => {
-                                had_success = true;
-                                backoff_ms = initial_backoff_ms();
-                                backoff_start = std::time::Instant::now();
-                                let key = dyn_obj_key(&obj);
-                                store.insert(key, strip_bulk_metadata(obj));
-                                steady_dirty = true;
-                            }
-                            WatcherEvent::Delete(obj) => {
-                                had_success = true;
-                                backoff_ms = initial_backoff_ms();
-                                backoff_start = std::time::Instant::now();
-                                let key = dyn_obj_key(&obj);
-                                store.remove(&key);
-                                steady_dirty = true;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        debug!("live_query dynamic: stream ended");
-                        if steady_dirty {
-                            let snap = build_dynamic_snapshot(&store, &printer_columns, scope, &plural);
-                            let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
-                                resource: resource_id.clone(),
-                                headers: snap.headers,
-                                rows: snap.rows,
-                            }));
-                        }
-                        break;
-                    }
-                    Err(e) => {
-                        if !had_success {
-                            warn!("live_query dynamic: initial load failed: {}", e);
-                            exit_reason = Some(format!("{}", e));
-                            break;
-                        }
-                        if backoff_start.elapsed().as_millis() as u64 > max_elapsed_ms() {
-                            warn!("live_query dynamic: watcher failed for over 2 minutes, giving up: {}", e);
-                            exit_reason = Some(format!("{}", e));
-                            break;
-                        }
-                        warn!("live_query dynamic: watcher error: {}, retrying in {}ms", e, backoff_ms);
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = (backoff_ms * 2).min(max_backoff_ms());
-                    }
-                }
-            }
-            _ = flush_timer.tick() => {
-                if init_dirty && !store.is_empty() && store.len() <= super::live_query::INIT_FLUSH_ROW_LIMIT {
-                    init_dirty = false;
-                    let snap = build_dynamic_snapshot(&store, &printer_columns, scope, &plural);
-                    let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
-                        resource: resource_id.clone(),
-                        headers: snap.headers,
-                        rows: snap.rows,
-                    }));
-                }
-                if steady_dirty {
-                    steady_dirty = false;
-                    let snap = build_dynamic_snapshot(&store, &printer_columns, scope, &plural);
-                    let _ = snapshot_tx.send(WatcherSnapshot::Live(ResourceUpdate::Rows {
-                        resource: resource_id.clone(),
-                        headers: snap.headers,
-                        rows: snap.rows,
-                    }));
-                }
-            }
-        }
-    }
-
-    // Terminal state — same pattern as run_typed_watcher.
-    let reason = exit_reason.unwrap_or_else(|| "watcher stream ended".to_string());
-    let _ = snapshot_tx.send(WatcherSnapshot::Dead(reason));
+    // CRD watchers carry no server-side filter today (parity).
+    let stream = super::live_query::watch_stream(api, &None, streaming_lists);
+    super::live_query::run_typed_watcher(
+        stream,
+        delta_tx,
+        ask_rx,
+        convert,
+        resource_id,
+        headers,
+        &ns,
+    )
+    .await;
 }
 
-/// Table data built from a dynamic-watcher store: ordered column headers
-/// and the sorted rows below them. The watcher feeds both into the
-/// `ResourceUpdate::Rows` frame on every publish — they're always produced
-/// together and always consumed together, so they ride through the codebase
-/// as one value rather than an anonymous `(Vec<String>, Vec<ResourceRow>)`.
-pub(crate) struct DynamicSnapshot {
-    pub headers: Vec<String>,
-    pub rows: Vec<crate::kube::resources::row::ResourceRow>,
-}
-
-/// Build a sorted snapshot of [`DynamicSnapshot`] from the dynamic store.
-fn build_dynamic_snapshot(
-    store: &HashMap<ObjectKey, DynamicObject>,
+/// The full ordered column plan for a dynamic resource: NAMESPACE (if
+/// namespaced), NAME, the CRD printer columns, user overlay columns, AGE.
+/// Computed once at watcher spawn — headers are immutable per watcher
+/// instance (a printer-column change arrives via a new watcher, which
+/// re-plans and re-baselines).
+fn column_plan(
     printer_columns: &[PrinterColumn],
     scope: ResourceScope,
     plural: &str,
-) -> DynamicSnapshot {
-    // Use the authoritative scope from API discovery, not guessed from data.
+) -> Vec<PrinterColumn> {
     let is_namespaced = scope == ResourceScope::Namespaced;
-
     let mut all_columns: Vec<PrinterColumn> = Vec::new();
     if is_namespaced {
         all_columns.push(PrinterColumn {
@@ -264,35 +113,25 @@ fn build_dynamic_snapshot(
         json_path: ".metadata.creationTimestamp".into(),
         column_type: crate::kube::cache::PrinterColumnType::Date,
     });
+    all_columns
+}
 
-    let headers: Vec<String> = all_columns.iter().map(|c| c.name.clone()).collect();
+/// Convert one `DynamicObject` to a row via the column plan. Every column
+/// goes through JSONPath against the object's JSON tree — this IS the
+/// external API boundary where `serde_json::Value` is acceptable. A value
+/// that fails to serialize (shouldn't happen for a well-formed
+/// `DynamicObject`) yields a named row with empty cells + a warning,
+/// rather than silently vanishing.
+fn convert_dynamic(obj: DynamicObject, columns: &[PrinterColumn]) -> ResourceRow {
+    let namespace = obj.metadata.namespace.clone().unwrap_or_default();
+    let name = obj.metadata.name.clone().unwrap_or_default();
 
-    let mut items: Vec<crate::kube::resources::row::ResourceRow> = store
-        .values()
-        .filter_map(|obj| {
-            let meta = &obj.metadata;
-            let namespace = meta.namespace.clone().unwrap_or_default();
-            let name = meta.name.clone().unwrap_or_default();
-
-            // Every column goes through JSONPath — no special cases. If the
-            // object can't even serialize to a `Value` tree (shouldn't happen
-            // for a well-formed `DynamicObject`, but would silently produce a
-            // row full of empty cells under the old `unwrap_or(Null)` shape),
-            // warn and drop the row instead of shipping an all-null ghost.
-            let json_val = match serde_json::to_value(obj) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        "live_query dynamic: failed to serialize {}/{} for JSONPath, dropping: {}",
-                        namespace, name, e,
-                    );
-                    return None;
-                }
-            };
-            let mut cells = Vec::with_capacity(all_columns.len());
-            for col in &all_columns {
+    let cells: Vec<CellValue> = match serde_json::to_value(&obj) {
+        Ok(json_val) => columns
+            .iter()
+            .map(|col| {
                 let raw = resolve_json_path(&json_val, &col.json_path);
-                let cell = if col.column_type.is_date() {
+                if col.column_type.is_date() {
                     // Date columns become Age cells with epoch seconds.
                     if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&raw) {
                         CellValue::Age(Some(ts.with_timezone(&chrono::Utc).timestamp()))
@@ -301,30 +140,27 @@ fn build_dynamic_snapshot(
                     }
                 } else {
                     CellValue::Text(raw)
-                };
-                cells.push(cell);
-            }            Some(crate::kube::resources::row::ResourceRow {
-                name,
-                namespace: Some(namespace),
-                containers: Vec::new(),
-                owner_refs: Vec::new(),
-                pf_ports: Vec::new(),
-                node: None,
-                health: RowHealth::Normal,
-                crd_info: None,
-                drill_target: None,
-                cells,
-                ..Default::default()
+                }
             })
-        })
-        .collect();
-    items.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+            .collect(),
+        Err(e) => {
+            warn!(
+                "live_query dynamic: failed to serialize {}/{} for JSONPath: {}",
+                namespace, name, e,
+            );
+            Vec::new()
+        }
+    };
 
-    // Overlay coloring evaluation moved to client-side (prepare_view)
-    // so it runs against final cell values including metrics overlays.
-
-    DynamicSnapshot { headers, rows: items }
+    ResourceRow {
+        name,
+        namespace: Some(namespace),
+        health: RowHealth::Normal,
+        cells,
+        ..Default::default()
+    }
 }
+
 
 /// Walk a JSONPath into a `serde_json::Value` tree.
 ///
@@ -582,30 +418,5 @@ mod json_path_tests {
             resolve_json_path(&obj, ".status.conditions[?(@.type=='Ready')].status"),
             ""
         );
-    }
-}
-
-#[cfg(test)]
-mod strip_tests {
-    use super::strip_bulk_metadata;
-    use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
-    use serde_json::json;
-
-    #[test]
-    fn drops_managed_fields_keeps_identity_and_data() {
-        let ar = ApiResource::from_gvk(&GroupVersionKind::gvk("example.com", "v1", "Widget"));
-        let mut obj = DynamicObject::new("w1", &ar);
-        obj.metadata.namespace = Some("default".into());
-        // Content is irrelevant — the strip clears the whole field.
-        obj.metadata.managed_fields = Some(vec![]);
-        obj.data = json!({ "spec": { "size": 3 } });
-
-        let stripped = strip_bulk_metadata(obj);
-
-        assert!(stripped.metadata.managed_fields.is_none(), "managedFields must be dropped");
-        // Identity + the spec/status that columns actually read are untouched.
-        assert_eq!(stripped.metadata.name.as_deref(), Some("w1"));
-        assert_eq!(stripped.metadata.namespace.as_deref(), Some("default"));
-        assert_eq!(stripped.data["spec"]["size"], json!(3));
     }
 }

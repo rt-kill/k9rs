@@ -24,7 +24,6 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
-use crate::event::ResourceUpdate;
 use crate::kube::protocol::{
     Namespace, ObjectRef, ResourceId,
 };
@@ -149,9 +148,9 @@ pub struct PortForwardSource {
     bound_context: crate::kube::protocol::ContextName,
     entries: DashMap<u64, EntrySlot>,
     next_id: AtomicU64,
-    tx: watch::Sender<ResourceUpdate>,
+    tx: watch::Sender<crate::kube::protocol::TableBaseline>,
     /// Keeps the `watch::Sender` alive regardless of subscriber count.
-    _keep_rx: watch::Receiver<ResourceUpdate>,
+    _keep_rx: watch::Receiver<crate::kube::protocol::TableBaseline>,
     /// Self-reference set by `Arc::new_cyclic` during construction. Lets
     /// `&self` methods (e.g. `apply_yaml` from the trait) reach the `Arc`
     /// they live inside without interior mutability — `create()` needs the
@@ -169,7 +168,7 @@ impl PortForwardSource {
     /// registry the first time any session subscribes for that context.
     pub fn for_context(bound_context: crate::kube::protocol::ContextName) -> Arc<Self> {
         let id = super::types::LocalResourceKind::PortForward.to_resource_id();
-        let empty = ResourceUpdate::Rows {
+        let empty = crate::kube::protocol::TableBaseline {
             resource: id.clone(),
             headers: headers(),
             rows: Vec::new(),
@@ -313,7 +312,7 @@ impl PortForwardSource {
             .map(|e| pf_to_row(&e.entry))
             .collect();
         rows.sort_by(|a, b| a.name.cmp(&b.name));
-        let _ = self.tx.send(ResourceUpdate::Rows {
+        let _ = self.tx.send(crate::kube::protocol::TableBaseline {
             resource: self.id.clone(),
             headers: headers(),
             rows,
@@ -485,7 +484,7 @@ impl LocalResourceSource for PortForwardSource {
         // No-op: grace is never started for port forwards.
     }
 
-    fn subscribe(&self) -> watch::Receiver<ResourceUpdate> {
+    fn subscribe(&self) -> watch::Receiver<crate::kube::protocol::TableBaseline> {
         self.tx.subscribe()
     }
 

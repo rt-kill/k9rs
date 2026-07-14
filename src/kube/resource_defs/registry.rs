@@ -7,11 +7,12 @@
 
 use std::collections::HashMap;
 
-use tokio::sync::watch;
+use std::sync::Arc;
+
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::event::ResourceUpdate;
-use crate::kube::live_query::WatcherSnapshot;
+use crate::kube::live_query::{BaselineAsk, WatcherMsg};
 use crate::kube::protocol::{Namespace, ResourceId, SubscriptionFilter};
 use crate::kube::resource_def::{BuiltInKind, ConvertToRow, ResourceDef};
 use crate::kube::resources::row::ResourceRow;
@@ -24,7 +25,8 @@ use crate::kube::resources::row::ResourceRow;
 pub(crate) struct WatcherArgs {
     pub client: kube::Client,
     pub namespace: Namespace,
-    pub snapshot_tx: watch::Sender<WatcherSnapshot>,
+    pub delta_tx: broadcast::Sender<Arc<WatcherMsg>>,
+    pub ask_rx: mpsc::Receiver<BaselineAsk>,
     pub filter: Option<SubscriptionFilter>,
     pub streaming_lists: bool,
 }
@@ -245,22 +247,15 @@ where
         + 'static,
 {
     tokio::spawn(async move {
+        let stream = crate::kube::live_query::watch_stream(api, &args.filter, args.streaming_lists);
         crate::kube::live_query::run_typed_watcher(
-            api,
-            args.snapshot_tx,
+            stream,
+            args.delta_tx,
+            args.ask_rx,
             convert,
-            move |rows| {
-                // Overlay coloring evaluation moved to client side
-                // (prepare_view) where metrics are already populated.
-                ResourceUpdate::Rows {
-                    resource: resource_id.clone(),
-                    headers: headers.clone(),
-                    rows,
-                }
-            },
+            resource_id,
+            headers,
             &args.namespace,
-            args.filter,
-            args.streaming_lists,
         )
         .await;
     })

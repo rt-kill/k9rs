@@ -68,79 +68,73 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Widget};
 use ratatui::Frame;
 
-use crate::app::{App, Route};
+use crate::app::element::Element;
+use crate::app::{App, Overlay};
 use crate::ui::widgets::{ConfirmDialogWidget, FormDialogWidget, FilterBar, FlashWidget, HelpOverlay};
 
 /// Main UI draw function.
 ///
-/// Routes to the correct view based on `app.route`, then overlays flash messages,
-/// help screen, and confirmation dialogs as needed.
+/// Blindly renders the TOP nav element (exhaustive over element kinds),
+/// then layers the overlay slot and the input/flash/dialog chrome.
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    match &app.route {
-        Route::Overview => {
+    match app.nav.top() {
+        Element::Overview(_) => {
             views::overview::draw_overview(f, app, area);
         }
-        Route::Resources => {
+        Element::ResourceList(_) | Element::RowFilter(_) | Element::DerivedRows(_) => {
             views::resource::draw_resources(f, app, area);
         }
-        Route::ContentView { kind: crate::app::ContentViewKind::Yaml, .. } => {
-            views::yaml::draw_yaml(f, app, area);
-        }
-        Route::ContentView { .. } => {
-            // Describe and Aliases both use the describe view
-            views::describe::draw_describe(f, app, area);
-        }
-        Route::Logs { .. } => {
+        Element::ContentView(cv) => match cv.kind {
+            crate::app::element::ContentSpec::Yaml(_) => views::yaml::draw_yaml(f, app, area),
+            _ => views::describe::draw_describe(f, app, area),
+        },
+        Element::LogSession(_) | Element::LogFilter(_) => {
             views::log::draw_logs(f, app, area);
         }
-        Route::Shell(ref shell) => {
-            views::shell::draw_shell(f, shell, area, &app.ui.theme);
-        }
-        Route::Help => {
-            // Draw resource view underneath the help overlay
-            views::resource::draw_resources(f, app, area);
-            draw_help_overlay(f, app);
-        }
-        Route::Contexts => {
+        Element::ContextList(_) => {
             views::context::draw_contexts(f, app, area);
-        }
-        Route::ContainerSelect { ref target, selected, .. } => {
-            let target = target.clone();
-            let sel = *selected;
-            views::resource::draw_resources(f, app, area);
-            draw_container_select(f, app, &target, sel);
-        }
-        Route::EditingResource { .. } => {
-            // Snapshot the label first (immutable borrow on `app.route`),
-            // then run the resource view (mutable borrow on `app`), then
-            // draw the overlay (immutable borrow on `app.ui.theme`). The
-            // borrows are disjoint in time so the borrow checker accepts
-            // them in this order.
-            let label = if let Route::EditingResource { ref target, ref state } = app.route {
-                let kind = target.resource.display_label().to_string();
-                let name = target.name.clone();
-                match state {
-                    crate::app::EditState::AwaitingYaml => format!("Fetching YAML for {}/{}…", kind, name),
-                    crate::app::EditState::EditorReady { .. } => format!("Launching editor for {}/{}…", kind, name),
-                    crate::app::EditState::Applying { .. } => format!("Applying {}/{}…", kind, name),
-                }
-            } else { String::new() };
-            views::resource::draw_resources(f, app, area);
-            draw_centered_overlay(f, &label, &app.ui.theme);
         }
     }
 
-    // Draw command prompt overlay on top of any view when command mode is active.
-    // In resource/context views this is handled inline, but for sub-views
-    // (logs, describe, yaml) we need to draw it as an overlay so the user can
-    // see what they're typing.
-    if !matches!(app.route, Route::Resources | Route::Contexts | Route::Overview) {
+    // The single modal slot, over whatever view is showing.
+    match &app.ui.overlay {
+        Some(Overlay::Help { scroll }) => {
+            draw_help_overlay(f, app, *scroll);
+        }
+        Some(Overlay::ContainerSelect { target, containers, selected, .. }) => {
+            let names: Vec<String> = containers.iter().map(|ci| ci.display_name()).collect();
+            let target = target.clone();
+            let sel = *selected;
+            draw_container_select(f, app, &target, &names, sel);
+        }
+        Some(Overlay::Edit { target, state }) => {
+            let kind = target.resource.display_label().to_string();
+            let name = target.name.clone();
+            let label = match state {
+                crate::app::EditState::AwaitingYaml => format!("Fetching YAML for {}/{}…", kind, name),
+                crate::app::EditState::EditorReady { .. } => format!("Launching editor for {}/{}…", kind, name),
+                crate::app::EditState::Applying { .. } => format!("Applying {}/{}…", kind, name),
+            };
+            draw_centered_overlay(f, &label, &app.ui.theme);
+        }
+        Some(Overlay::Shell(shell)) => {
+            views::shell::draw_shell(f, shell, area, &app.ui.theme);
+        }
+        None => {}
+    }
+
+    // Draw command prompt overlay on top of any view when command mode is
+    // active. In table/context views this is handled inline, but sub-views
+    // (logs, describe, yaml) need it as an overlay so the user can see
+    // what they're typing.
+    let top_is_inline = app.nav.top().is_table() || matches!(app.nav.top(), Element::ContextList(_));
+    if !top_is_inline {
         if app.ui.input_mode.is_active() {
             draw_command_overlay(f, app);
         }
-        if app.nav.filter_input().active() {
+        if app.nav.top().filter_input().active() {
             draw_filter_overlay(f, app);
         }
     }
@@ -159,9 +153,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 /// Draw the help overlay on top of the current view.
-fn draw_help_overlay(f: &mut Frame, app: &App) {
+fn draw_help_overlay(f: &mut Frame, app: &App, scroll: usize) {
     let theme = &app.ui.theme;
-    let help = HelpOverlay::new(theme, app.ui.help_scroll, Some(app.current_capabilities()));
+    let help = HelpOverlay::new(theme, scroll, Some(app.current_capabilities()));
     f.render_widget(help, f.area());
 }
 
@@ -221,11 +215,14 @@ fn draw_flash(f: &mut Frame, app: &App) {
     }
 }
 
-/// Draw the container selection overlay for multi-container pods.
+/// Draw the container selection overlay for multi-container pods. The
+/// container list was captured on the route at construction — the dialog
+/// is self-contained.
 fn draw_container_select(
     f: &mut Frame,
     app: &App,
     target: &crate::kube::protocol::ObjectRef,
+    containers: &[String],
     selected_idx: usize,
 ) {
     use ratatui::layout::{Constraint, Layout, Rect};
@@ -234,16 +231,6 @@ fn draw_container_select(
 
     let theme = &app.ui.theme;
     let area = f.area();
-
-    // Find the pod's containers (typed field on ResourceRow). Each renders
-    // via `ContainerInfo::display_name` — init containers get the `init:`
-    // prefix from the typed `kind` discriminant, not a string prefix in `name`.
-    let containers: Vec<String> = app.table_for(&target.resource)
-        .and_then(|t| t.items.iter().find(|p| {
-            p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
-        }))
-        .map(|p| p.containers.iter().map(|ci| ci.display_name()).collect())
-        .unwrap_or_default();
 
     if containers.is_empty() {
         return;
@@ -399,10 +386,10 @@ fn draw_filter_overlay(f: &mut Frame, app: &App) {
     Clear.render(overlay_area, f.buffer_mut());
 
     let counts = app.active_table_items_count();
-    let match_count = if app.nav.filter_input().text().is_empty() { counts.total } else { counts.filtered };
+    let match_count = if app.nav.top().filter_input().text().is_empty() { counts.total } else { counts.filtered };
     let filter_bar = FilterBar::new(
-        app.nav.filter_input().active(),
-        app.nav.filter_input().text(),
+        app.nav.top().filter_input().active(),
+        app.nav.top().filter_input().text(),
         match_count,
         counts.total,
         theme,

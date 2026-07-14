@@ -1,6 +1,8 @@
 pub mod actions;
 pub mod derived;
+pub mod element;
 pub mod nav;
+pub mod store;
 pub mod table;
 pub mod types;
 pub mod view;
@@ -10,11 +12,9 @@ pub use table::*;
 pub use types::*;
 pub use view::*;
 
-use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::kube::protocol::{ObjectKey, ResourceId};
-use crate::kube::resources::KubeResource;
+use crate::kube::protocol::ResourceId;
 
 pub use crate::kube::resource_def::{ColumnDef, ColumnLevel, MetricsColumn};
 
@@ -53,120 +53,120 @@ pub struct KubeContext {
 // `ColumnSortKind` was deleted: `CellValue::cmp()` handles type-aware ordering
 // directly, so no per-column sort-kind dispatch is needed.
 
-/// Look up the display level for a column by header name. Uses the typed
-/// column metadata from the def (via `column_defs()`) when the current
-/// resource is a built-in; falls back to `ColumnDef::infer` for CRDs
-/// and locals (which have no registered def or no override).
-pub fn column_level_for(view: &crate::app::view::ViewId, name: &str) -> ColumnLevel {
-    // Derived views have no column-level overrides — all columns default-visible.
-    let Some(rid) = view.resource_id() else {
-        return ColumnLevel::Default;
-    };
-    // Overlay level overrides take priority (e.g., promote QOS from Extra to Default).
-    if let Some(overlay) = crate::kube::overlay::overlay_for(rid.plural()) {
-        for oc in &overlay.columns {
-            if oc.header.eq_ignore_ascii_case(name) && oc.jsonpath.is_none() {
-                return oc.level.into();
-            }
-        }
-    }
-    // Fall back to built-in def column metadata.
-    if let Some(k) = rid.built_in_kind() {
-        let def = crate::kube::resource_defs::REGISTRY.by_kind(k);
-        for col in def.column_defs() {
-            if col.header.eq_ignore_ascii_case(name) {
-                return col.level;
-            }
-        }
-    }
-    ColumnDef::infer(name)
-}
-
 // ---------------------------------------------------------------------------
-// TableDescriptor — runtime column headers for a resource type
+// CoreData — app-level shared stores (chrome services, NOT navigation)
 // ---------------------------------------------------------------------------
 
-/// Runtime column headers and pre-resolved render rules for a resource
-/// type. Built once when the server sends a descriptor (snapshot with
-/// headers). The `column_rules` cache is rebuilt whenever `set_headers`
-/// is called — same pattern as `FormFieldState { value, kind }` where
-/// `kind` is set once at construction.
-#[derive(Debug, Clone, Default)]
-pub struct TableDescriptor {
-    headers: Vec<String>,
-    /// Pre-resolved overlay coloring rules, indexed by data column
-    /// position (parallel to `headers`). Built once from overlay config
-    /// when the descriptor arrives — not per frame.
-    column_rules: Vec<crate::kube::overlay::ColumnRenderRules>,
+/// The always-on core stores that app chrome reads — command completion,
+/// the namespace picker, overview stats, node-address lookups —
+/// independent of what the nav stack is showing. A nav element viewing
+/// one of these resources opens its OWN store + subscription like any
+/// other resource (the daemon's watcher cache dedupes the upstream
+/// watch); these exist for the chrome, not for views.
+pub struct CoreData {
+    pub namespaces: std::sync::Arc<store::RowStore>,
+    pub nodes: std::sync::Arc<store::RowStore>,
+    pub crds: std::sync::Arc<store::RowStore>,
+    /// The always-on subscriptions feeding the stores above. Replaced
+    /// wholesale on (re)connect — the old streams drop, RSTing their
+    /// substreams.
+    streams: Vec<crate::kube::client_session::SubscriptionStream>,
 }
 
-impl TableDescriptor {
-    /// Create a descriptor with headers and pre-resolved column render
-    /// rules. Rules are built once from overlay config — not per frame.
-    pub fn new(headers: Vec<String>, resource_plural: &str) -> Self {
-        let column_rules = crate::kube::overlay::build_column_rules(&headers, resource_plural);
-        Self { headers, column_rules }
+impl Default for CoreData {
+    fn default() -> Self {
+        Self {
+            namespaces: store::RowStore::new("namespaces"),
+            nodes: store::RowStore::new("nodes"),
+            crds: store::RowStore::new("customresourcedefinitions"),
+            streams: Vec::new(),
+        }
+    }
+}
+
+impl CoreData {
+    /// Seed epoch for cached/handshake/discovery data: 0, always weaker
+    /// than any live stream (the epoch allocator starts at 1) — a stale
+    /// snapshot can never outrank live data, while an idle store accepts
+    /// the seed.
+    const SEED_EPOCH: u64 = 0;
+
+    pub fn store_for(
+        &self,
+        kind: crate::kube::resource_def::BuiltInKind,
+    ) -> Option<&std::sync::Arc<store::RowStore>> {
+        use crate::kube::resource_def::BuiltInKind as K;
+        match kind {
+            K::Namespace => Some(&self.namespaces),
+            K::Node => Some(&self.nodes),
+            K::CustomResourceDefinition => Some(&self.crds),
+            _ => None,
+        }
     }
 
-    /// Column headers (from the server's resource snapshot).
-    pub fn headers(&self) -> &[String] {
-        &self.headers
+    /// Seed a core store from cached data (connection handshake,
+    /// discovery). Headers come from the registry def — single source of
+    /// truth with the live-watcher path.
+    pub fn seed(
+        &self,
+        kind: crate::kube::resource_def::BuiltInKind,
+        rows: Vec<crate::kube::resources::row::ResourceRow>,
+    ) {
+        let Some(target) = self.store_for(kind) else { return };
+        let def = crate::kube::resource_defs::REGISTRY.by_kind(kind);
+        target.apply(
+            Self::SEED_EPOCH,
+            store::StorePayload::Baseline(crate::kube::protocol::TableBaseline {
+                resource: ResourceId::BuiltIn(kind),
+                headers: def.default_headers(),
+                rows,
+            }),
+        );
     }
 
-    /// Pre-resolved column render rules (from overlay config).
-    pub fn column_rules(&self) -> &[crate::kube::overlay::ColumnRenderRules] {
-        &self.column_rules
+    /// Open the always-on subscriptions (namespaces + nodes) into the
+    /// core stores. Called on (re)connect; previous streams drop.
+    pub fn open_streams(&mut self, session: &crate::kube::client_session::ClientSession) {
+        self.streams.clear();
+        for def in crate::kube::resource_defs::REGISTRY.all() {
+            if !def.is_core() {
+                continue;
+            }
+            let rid = def.resource_id();
+            let Some(target) = rid.built_in_kind().and_then(|k| self.store_for(k)) else {
+                continue;
+            };
+            self.streams.push(session.subscribe_stream(
+                rid,
+                crate::kube::protocol::Namespace::All,
+                None,
+                std::sync::Arc::clone(target),
+                false,
+            ));
+        }
     }
 
-    /// Find the column index for a header name (case-insensitive).
-    /// Returns an index into the *full* cell array (not the visible subset).
-    pub fn col(&self, name: &str) -> Option<usize> {
-        self.headers.iter().position(|h| h.eq_ignore_ascii_case(name))
+    /// Context switch: all core data belongs to the old cluster.
+    pub fn clear(&mut self) {
+        self.streams.clear();
+        self.namespaces.clear();
+        self.nodes.clear();
+        self.crds.clear();
     }
 
-    /// Return (data_index, header_name) pairs for columns visible at the
-    /// given display level. Optionally skips the NAMESPACE column when
-    /// viewing a single namespace. Uses the typed column metadata from
-    /// the def (when `rid` is a built-in) to determine each column's
-    /// level; falls back to `ColumnDef::infer` for CRDs / locals.
-    pub fn visible_columns(&self, view: &crate::app::view::ViewId, level: ColumnLevel, skip_namespace: bool) -> Vec<(usize, &str)> {
-        self.headers.iter().enumerate()
-            .filter(|(_, name)| {
-                if skip_namespace && name.eq_ignore_ascii_case("NAMESPACE") {
-                    return false;
-                }
-                column_level_for(view, name) <= level
-            })
-            .map(|(i, name)| (i, name.as_str()))
-            .collect()
+    /// Namespace names, for completion and the picker.
+    pub fn namespace_names(&self) -> Vec<String> {
+        self.namespaces.with_read(|i| i.rows.iter().map(|r| r.name.clone()).collect())
     }
 }
 
 pub struct AppData {
-    /// Global tables for core resources (keyed by ResourceId).
-    pub tables: std::collections::HashMap<ResourceId, StatefulTable<crate::kube::resources::row::ResourceRow>>,
-    /// Runtime column headers for unified tables.
-    pub descriptors: std::collections::HashMap<ResourceId, TableDescriptor>,
-
     pub contexts: StatefulTable<KubeContext>,
 }
 
 impl Default for AppData {
     fn default() -> Self {
-        let mut tables = std::collections::HashMap::new();
-        // Only pre-populate entries for globally-stored resources (Namespace,
-        // Node, CRD). All other resources have their tables on NavStep.
-        for def in crate::kube::resource_defs::REGISTRY.all() {
-            let rid = def.resource_id();
-            if nav::is_globally_stored(&ViewId::Resource(rid.clone())) {
-                tables.insert(rid, StatefulTable::new());
-            }
-        }
-        Self {
-            tables,
-            descriptors: std::collections::HashMap::new(),
-            contexts: StatefulTable::new(),
-        }
+        Self { contexts: StatefulTable::new() }
     }
 }
 
@@ -188,12 +188,12 @@ pub enum ExitReason {
 pub struct App {
     pub should_quit: bool,
     pub exit_reason: Option<ExitReason>,
-    pub route: Route,
-    pub route_stack: Vec<Route>,
 
     pub data: AppData,
+    /// App-level shared stores (completion / picker / overview chrome).
+    pub core: CoreData,
 
-    /// Stackable navigation state for drill-downs and grep filters.
+    /// The navigation stack: self-contained scope elements, strict LIFO.
     pub nav: nav::NavStack,
     /// Ordered list of pinned resources for Tab/BackTab cycling.
     pub pinned_resources: Vec<ResourceId>,
@@ -220,17 +220,53 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(context: crate::kube::protocol::ContextName, namespace: crate::kube::protocol::Namespace) -> Self {
+    pub fn new(
+        context: crate::kube::protocol::ContextName,
+        namespace: crate::kube::protocol::Namespace,
+        session: &crate::kube::client_session::ClientSession,
+    ) -> Self {
+        let _ = session; // the Overview root opens no subscription
+        let metrics = store::MetricsHub::new();
+        // The startup root is the Overview landing page — no resource
+        // watch opens until the user navigates to one (startup args or
+        // `:cmd` reset to a resource root).
+        let root = element::Element::Overview(element::Overview);
+        Self::new_with_root(context, namespace, metrics, root)
+    }
+
+    /// Test-only: an App whose root element rides a parked stream — no
+    /// session, no daemon, no network.
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        let namespace = crate::kube::protocol::Namespace::All;
+        let metrics = store::MetricsHub::new();
+        let root = element::Element::ResourceList(element::ResourceList::open_for_test(
+            element::QuerySpec {
+                rid: nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                namespace: namespace.clone(),
+                filter: None,
+            },
+            &metrics,
+            "pods".to_string(),
+        ));
+        Self::new_with_root(crate::kube::protocol::ContextName::default(), namespace, metrics, root)
+    }
+
+    fn new_with_root(
+        context: crate::kube::protocol::ContextName,
+        namespace: crate::kube::protocol::Namespace,
+        metrics: std::sync::Arc<store::MetricsHub>,
+        root: element::Element,
+    ) -> Self {
         let config = Self::load_config();
         let cache_capacity = config.ui.cache_capacity;
         let skin_name = config.ui.skin.clone();
         Self {
             should_quit: false,
             exit_reason: None,
-            route: Route::Overview,
-            route_stack: Vec::new(),
             data: AppData::default(),
-            nav: nav::NavStack::new(nav::rid(crate::kube::resource_def::BuiltInKind::Pod)),
+            core: CoreData::default(),
+            nav: nav::NavStack::new(root),
             pinned_resources: default_pinned_resources(),
             command_history: Vec::new(),
             no_exit_on_ctrl_c: config.no_exit_on_ctrl_c,
@@ -243,23 +279,58 @@ impl App {
                 form_dialog: None,
                 theme: crate::ui::theme::Theme::load(skin_name.as_deref()),
                 input_mode: InputMode::Normal,
-                help_scroll: 0,
+                overlay: None,
                 show_header: true,
                 tick_count: 0,
                 column_level: ColumnLevel::Default,
-                deltas: DeltaTracker::new(),
             },
             kube: KubeState {
                 context,
                 identity: crate::kube::protocol::ClusterIdentity::default(),
                 selected_ns: namespace,
                 context_switch: ContextSwitchState::Stable,
-                pod_metrics: HashMap::new(),
-                node_metrics: HashMap::new(),
-                core_streams: Vec::new(),
+                metrics,
                 kubectl_cache: KubectlCache::new(Duration::from_secs(30), cache_capacity),
             },
         }
+    }
+
+    /// Construct a ROOT list element for `rid` scoped by `namespace` —
+    /// the one construction site where the ambient selector is a
+    /// legitimate input (roots are built FROM the selector; drills carry
+    /// their own intrinsic scope).
+    pub fn root_list_element(
+        session: &crate::kube::client_session::ClientSession,
+        metrics: &std::sync::Arc<store::MetricsHub>,
+        rid: ResourceId,
+        namespace: crate::kube::protocol::Namespace,
+    ) -> element::Element {
+        let label = rid.short_label().to_lowercase();
+        element::Element::ResourceList(element::ResourceList::open(
+            session,
+            element::QuerySpec { rid, namespace, filter: None },
+            metrics,
+            label,
+        ))
+    }
+
+    /// Same, seeding cursor/sort continuity from the element being
+    /// replaced or covered.
+    pub fn list_element_from_top(
+        &self,
+        session: &crate::kube::client_session::ClientSession,
+        rid: ResourceId,
+        namespace: crate::kube::protocol::Namespace,
+        filter: Option<crate::kube::protocol::SubscriptionFilter>,
+        label: String,
+    ) -> element::Element {
+        element::Element::ResourceList(element::ResourceList::open_from(
+            session,
+            element::QuerySpec { rid, namespace, filter },
+            &self.kube.metrics,
+            label,
+            self.nav.top(),
+        ))
     }
 
     /// Load settings from `~/.config/k9rs/config.yaml`. Uses the shared
@@ -272,175 +343,10 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Navigate to a new route: swaps the current route into the stack and
-    /// sets `new_route` as current. No Clone needed — the old route is moved.
-    /// When the old route drops off the stack (or is replaced), any resources
-    /// it owns (like LogStream in Route::Logs) drop automatically.
-    pub fn navigate_to(&mut self, new_route: Route) {
-        self.ui.confirm_dialog = None;
-        self.ui.form_dialog = None;
-        let old = std::mem::replace(&mut self.route, new_route);
-        if self.route_stack.len() >= 50 {
-            self.route_stack.remove(0);
-        }
-        self.route_stack.push(old);
-    }
-
-    /// Pop the route stack — returns to the previous route. No-op if the
-    /// stack is empty (the current route is preserved).
-    pub fn pop_route(&mut self) {
-        if let Some(prev) = self.route_stack.pop() {
-            self.route = prev;
-        }
-    }
-
-    /// Look up the ResourceId for a given MetricsKind via the registry.
-    /// Returns `None` if no registered def declares this metrics kind.
-    fn rid_for_metrics(kind: crate::kube::resource_def::MetricsKind) -> Option<crate::kube::protocol::ResourceId> {
-        crate::kube::resource_defs::REGISTRY.all()
-            .find(|d| d.metrics_kind() == Some(kind))
-            .map(|d| d.resource_id())
-    }
-
-    /// Bulk-fetch all metrics column indices for a given MetricsKind in one
-    /// registry walk. Avoids the O(n) × 6 pattern of calling the single-
-    /// column lookup six times.
-    fn all_metrics_cols(mk: crate::kube::resource_def::MetricsKind) -> std::collections::HashMap<MetricsColumn, usize> {
-        let mut result = std::collections::HashMap::new();
-        if let Some(def) = crate::kube::resource_defs::REGISTRY.all().find(|d| d.metrics_kind() == Some(mk)) {
-            for (i, col) in def.column_defs().iter().enumerate() {
-                if let Some(tag) = col.metrics {
-                    result.insert(tag, i);
-                }
-            }
-        }
-        result
-    }
-
-    /// Apply stored pod metrics to all current pod items.
-    /// Writes the CPU/MEM usage cells and computes percentage columns
-    /// (%CPU/R, %CPU/L, %MEM/R, %MEM/L) from the row's typed
-    /// request/limit fields and the metrics values.
-    pub fn apply_pod_metrics(&mut self) {
-        use crate::kube::resource_def::MetricsKind;
-        let Some(pods_rid) = Self::rid_for_metrics(MetricsKind::Pod) else { return };
-        let cols = Self::all_metrics_cols(MetricsKind::Pod);
-        let cpu_col = cols.get(&MetricsColumn::Cpu).copied();
-        let mem_col = cols.get(&MetricsColumn::Mem).copied();
-        let pct_cpu_r = cols.get(&MetricsColumn::CpuPercentRequest).copied();
-        let pct_cpu_l = cols.get(&MetricsColumn::CpuPercentLimit).copied();
-        let pct_mem_r = cols.get(&MetricsColumn::MemPercentRequest).copied();
-        let pct_mem_l = cols.get(&MetricsColumn::MemPercentLimit).copied();
-        // Pod is not globally stored, so search the nav stack.
-        if let Some(table) = self.nav.find_table_for_resource_mut(&pods_rid) {
-            for row in &mut table.items {
-                if let Some(usage) = self.kube.pod_metrics.get(&ObjectKey::new(row.namespace.clone().unwrap_or_default(), row.name.clone())) {
-                    use crate::kube::resources::row::{CellValue, QuantityUnit};
-                    if let Some(col) = cpu_col { row.set_cell(col, CellValue::Quantity { value: usage.cpu_milli, unit: QuantityUnit::Millicores }); }
-                    if let Some(col) = mem_col { row.set_cell(col, CellValue::Quantity { value: usage.mem_bytes, unit: QuantityUnit::Bytes }); }
-
-                    fn pct_val(current: u64, limit: Option<u64>) -> CellValue {
-                        limit.filter(|&l| l > 0)
-                            .map(|l| CellValue::Percentage(Some(current.saturating_mul(100) / l)))
-                            .unwrap_or(CellValue::Percentage(None))
-                    }
-                    if let Some(col) = pct_cpu_r { row.set_cell(col, pct_val(usage.cpu_milli, row.cpu_request)); }
-                    if let Some(col) = pct_cpu_l { row.set_cell(col, pct_val(usage.cpu_milli, row.cpu_limit)); }
-                    if let Some(col) = pct_mem_r { row.set_cell(col, pct_val(usage.mem_bytes, row.mem_request)); }
-                    if let Some(col) = pct_mem_l { row.set_cell(col, pct_val(usage.mem_bytes, row.mem_limit)); }
-                }
-            }
-        }
-    }
-
-    /// Apply stored node metrics to all current node items.
-    pub fn apply_node_metrics(&mut self) {
-        use crate::kube::resource_def::MetricsKind;
-        use crate::kube::resources::row::{CellValue, QuantityUnit};
-        let Some(nodes_rid) = Self::rid_for_metrics(MetricsKind::Node) else { return };
-        let cols = Self::all_metrics_cols(MetricsKind::Node);
-        let cpu = cols.get(&MetricsColumn::Cpu).copied();
-        let cpu_alloc = cols.get(&MetricsColumn::CpuAlloc).copied();
-        let cpu_pct = cols.get(&MetricsColumn::CpuPercent).copied();
-        let mem = cols.get(&MetricsColumn::Mem).copied();
-        let mem_alloc = cols.get(&MetricsColumn::MemAlloc).copied();
-        let mem_pct = cols.get(&MetricsColumn::MemPercent).copied();
-        if cpu.is_none() && mem.is_none() { return; }
-        if let Some(table) = self.data.tables.get_mut(&nodes_rid) {
-            for row in &mut table.items {
-                match self.kube.node_metrics.get(row.name.as_str()) {
-                    Some(usage) => {
-                        // CPU usage, then percent of allocatable (read from the CPU/A cell).
-                        if let Some(c) = cpu {
-                            row.set_cell(c, CellValue::Quantity { value: usage.cpu_milli, unit: QuantityUnit::Millicores });
-                        }
-                        if let (Some(pc), Some(ac)) = (cpu_pct, cpu_alloc) {
-                            let alloc = row.cells.get(ac).and_then(|c| c.quantity_value()).unwrap_or(0);
-                            let pct = (alloc > 0).then(|| usage.cpu_milli.saturating_mul(100) / alloc);
-                            row.set_cell(pc, CellValue::Percentage(pct));
-                        }
-                        // MEM usage, then percent of allocatable.
-                        if let Some(c) = mem {
-                            row.set_cell(c, CellValue::Quantity { value: usage.mem_bytes, unit: QuantityUnit::Bytes });
-                        }
-                        if let (Some(pc), Some(ac)) = (mem_pct, mem_alloc) {
-                            let alloc = row.cells.get(ac).and_then(|c| c.quantity_value()).unwrap_or(0);
-                            let pct = (alloc > 0).then(|| usage.mem_bytes.saturating_mul(100) / alloc);
-                            row.set_cell(pc, CellValue::Percentage(pct));
-                        }
-                    }
-                    None => {
-                        // No metrics for this node this poll — clear usage/percent to
-                        // n/a rather than leaving a frozen stale value on display.
-                        if let Some(c) = cpu { row.set_cell(c, CellValue::Placeholder); }
-                        if let Some(c) = cpu_pct { row.set_cell(c, CellValue::Percentage(None)); }
-                        if let Some(c) = mem { row.set_cell(c, CellValue::Placeholder); }
-                        if let Some(c) = mem_pct { row.set_cell(c, CellValue::Percentage(None)); }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Clear ALL resource table data. Used for context switches where
-    /// everything is stale. Namespace switches should NOT call this — the
-    /// server only re-subscribes namespaced resources, and cluster-scoped
-    /// data (nodes, PVs, etc.) is preserved automatically.
-    pub fn clear_data(&mut self) {
-        // Clear all table data but keep entries so auto-subscribed resources
-        // (namespaces, nodes) can receive data from the new context.
-        for table in self.data.tables.values_mut() {
-            table.clear_data();
-        }
-        self.data.descriptors.clear();
-    }
-
-    /// Clear data for a specific resource so it shows "Loading..." until
-    /// fresh data arrives from the server. Creates the entry if it doesn't
-    /// exist yet — required for dynamically-discovered CRDs whose
-    /// `ResourceId` isn't in the pre-populated `RESOURCE_TYPES` table.
-    /// Without this, the first snapshot for the CRD would land on a missing
-    /// table in `apply_resource_update` and be dropped on the floor.
-    pub fn clear_resource(&mut self, rid: &ResourceId) {
-        if let Some(table) = self.nav.find_table_for_resource_mut(rid) {
-            table.clear_data();
-        } else if let Some(table) = self.data.tables.get_mut(rid) {
-            table.clear_data();
-        }
-    }
-
-    /// Clear every namespace-scoped resource table. Called from
-    /// `do_switch_namespace` so cached rows from the old namespace can't
-    /// bleed into the new namespace's view. Cluster-scoped tables (nodes,
-    /// PVs, namespaces themselves, etc.) are left alone — their data is
-    /// the same across namespaces.
-    pub fn clear_namespaced_caches(&mut self) {
-        for (rid, table) in self.data.tables.iter_mut() {
-            if !rid.is_cluster_scoped() {
-                table.clear_data();
-            }
-        }
-    }
+    // -- Element dispatch -------------------------------------------------------
+    //
+    // The TUI drives exactly one element: the TOP of the nav stack. The
+    // contexts panel (chrome until the route fold-in) keeps its own arm.
 
     pub fn next_tab(&mut self) -> ResourceId {
         let pinned = &self.pinned_resources;
@@ -462,278 +368,69 @@ impl App {
         pinned[if idx == 0 { pinned.len() - 1 } else { idx - 1 }].clone()
     }
 
-    // Delegate navigation to the currently active table
-    fn with_active_table<F: FnOnce(&mut dyn table::TableNav)>(&mut self, f: F) {
-        if let Some(table) = self.active_view_table_mut() {
-            f(table);
-        }
-    }
-
-    // Delegate read-only operations to the currently active table
-    fn with_active_table_ref<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&dyn table::TableNav) -> R,
-    {
-        if let Some(table) = self.active_view_table() {
-            f(table)
-        } else {
-            // Fallback for unknown CRDs — return default counts
-            static EMPTY: std::sync::LazyLock<StatefulTable<crate::kube::resources::row::ResourceRow>> =
-                std::sync::LazyLock::new(StatefulTable::new);
-            f(&*EMPTY)
-        }
-    }
-
-    pub fn active_table_selected_col(&self) -> usize {
-        self.active_view_table().map(|t| t.selected_col()).unwrap_or(0)
-    }
-
-    /// The cursor column translated from its VISIBLE index to a DATA index (the
-    /// index into a row's `cells`). The cursor is clamped to the visible column
-    /// set, but sorting and column-filtering index the full `cells` array — so
-    /// anything acting on cell *data* by the cursor column MUST use this, not
-    /// [`active_table_selected_col`]. Mirrors the render's
-    /// `visible_columns(...)[selected_col].0`; falls back to the raw index when
-    /// no descriptor is available (no columns hidden, so the spaces coincide).
-    ///
-    /// [`active_table_selected_col`]: Self::active_table_selected_col
-    pub fn active_table_selected_data_col(&self) -> (usize, String) {
-        let visible_col = self.active_table_selected_col();
-        let skip_ns = !self.kube.selected_ns.is_all();
-        self.active_view_descriptor()
-            .map(|d| d.visible_columns(self.nav.view_id(), self.ui.column_level, skip_ns))
-            .and_then(|vis| {
-                vis.get(visible_col)
-                    .map(|&(data_idx, name)| (data_idx, name.to_string()))
-            })
-            // No descriptor → fall back to the raw index for both (the
-            // breadcrumb then shows what it always used to: the number).
-            .unwrap_or_else(|| (visible_col, visible_col.to_string()))
-    }
-
-    /// Get the active view's table (immutable).
-    pub fn active_view_table(&self) -> Option<&StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        // Derived views carry their table directly on the nav step.
-        // Resource views route through table_for (global or nav-step lookup).
-        if let Some(rid) = self.nav.resource_id() {
-            self.table_for(rid)
-        } else {
-            self.nav.current().table.as_ref()
-        }
-    }
-
-    /// Get the active view's table (mutable).
-    pub fn active_view_table_mut(&mut self) -> Option<&mut StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        if let Some(rid) = self.nav.resource_id().cloned() {
-            self.table_for_mut(&rid)
-        } else {
-            self.nav.current_mut().table.as_mut()
-        }
-    }
-
-    /// Get the active view's descriptor.
-    pub fn active_view_descriptor(&self) -> Option<&TableDescriptor> {
-        if let Some(rid) = self.nav.resource_id() {
-            self.descriptor_for(rid)
-        } else {
-            self.nav.current().descriptor.as_ref()
-        }
-    }
-
-    /// Route a table lookup by ResourceId (immutable). Prefers nav-step
-    /// table (filtered views) over global store.
-    pub fn table_for(&self, rid: &ResourceId) -> Option<&StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        self.nav.find_table_for_resource(rid)
-            .or_else(|| self.data.tables.get(rid))
-    }
-
-    /// Route a table lookup by ResourceId (mutable). Prefers nav-step
-    /// table (filtered views) over global store.
-    pub fn table_for_mut(&mut self, rid: &ResourceId) -> Option<&mut StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        if self.nav.find_table_for_resource(rid).is_some() {
-            self.nav.find_table_for_resource_mut(rid)
-        } else {
-            self.data.tables.get_mut(rid)
-        }
-    }
-
-    /// Route a descriptor lookup by ResourceId. Prefers nav-step
-    /// descriptor over global store.
-    pub fn descriptor_for(&self, rid: &ResourceId) -> Option<&TableDescriptor> {
-        self.nav.find_descriptor_for_resource(rid)
-            .or_else(|| self.data.descriptors.get(rid))
-    }
-
     pub fn col_left(&mut self) {
-        self.with_active_table(|t| t.nav_col_left());
+        self.nav.top_mut().col_left();
     }
 
     pub fn col_right(&mut self) {
-        self.with_active_table(|t| t.nav_col_right());
+        self.nav.top_mut().col_right();
     }
 
     pub fn select_next(&mut self) {
-        if matches!(self.route, Route::Contexts) {
-            self.data.contexts.next();
-        } else {
-            self.with_active_table(|t| t.nav_next());
-        }
+        self.nav.top_mut().select_next();
     }
     pub fn select_prev(&mut self) {
-        if matches!(self.route, Route::Contexts) {
-            self.data.contexts.previous();
-        } else {
-            self.with_active_table(|t| t.nav_prev());
-        }
+        self.nav.top_mut().select_prev();
     }
     pub fn page_up(&mut self) {
-        if matches!(self.route, Route::Contexts) {
-            self.data.contexts.page_up();
-        } else {
-            self.with_active_table(|t| t.nav_page_up());
-        }
+        self.nav.top_mut().page_up();
     }
     pub fn page_down(&mut self) {
-        if matches!(self.route, Route::Contexts) {
-            self.data.contexts.page_down();
-        } else {
-            self.with_active_table(|t| t.nav_page_down());
-        }
+        self.nav.top_mut().page_down();
     }
     pub fn go_home(&mut self) {
-        if matches!(self.route, Route::Contexts) {
-            self.data.contexts.home();
-        } else {
-            self.with_active_table(|t| t.nav_home());
-        }
+        self.nav.top_mut().go_home();
     }
     pub fn go_end(&mut self) {
-        if matches!(self.route, Route::Contexts) {
-            self.data.contexts.end();
-        } else {
-            self.with_active_table(|t| t.nav_end());
-        }
+        self.nav.top_mut().go_end();
     }
 
-    /// Get the current selection index in the active table.
+    /// The cursor index on the top element.
     pub fn active_table_selected(&self) -> usize {
-        self.with_active_table_ref(|t| t.nav_selected())
+        self.nav.top().table_interaction().map(|i| i.selected).unwrap_or(0)
     }
 
-    /// Set the selection index on the active table (clamped to bounds).
+    /// Move the top element's cursor (clamped to its view).
     pub fn select_in_active_table(&mut self, idx: usize) {
-        self.with_active_table(|t| t.nav_select(idx));
+        self.nav.top_mut().select(idx);
     }
 
-    /// Toggle mark on the currently selected row, then advance to the next row.
+    /// Toggle mark on the row under the cursor.
     pub fn toggle_mark(&mut self) {
-        self.with_active_table(|t| t.nav_toggle_mark());
+        self.nav.top_mut().toggle_mark();
     }
 
-    /// Span-mark: mark all rows from the last marked row to the current selection.
+    /// Mark the span from the nearest mark to the cursor.
     pub fn span_mark(&mut self) {
-        self.with_active_table(|t| t.nav_span_mark());
+        self.nav.top_mut().span_mark();
     }
 
-    /// Clear all marks on the current table.
+    /// Clear all marks on the top element's data.
     pub fn clear_marks(&mut self) {
-        self.with_active_table(|t| t.nav_clear_marks());
+        self.nav.top_mut().clear_marks();
     }
 
-    /// Reapply client-side grep filters (plus any uncommitted filter_input text)
-    /// to the current table. Labels, Field, and OwnerChain filters are handled
-    /// server-side via SubscriptionFilter — the server only sends matching rows.
-    /// Only Grep filtering remains client-side (it operates on display text).
-    ///
-    /// Committed grep patterns live inside `NavFilter::Grep(CompiledGrep)`
-    /// — compiled exactly once at filter push, reused on every snapshot.
-    /// The only per-call regex compile is the uncommitted filter-input
-    /// draft, which is cheap because there's at most one and the user is
-    /// actively typing it.
-    pub fn reapply_nav_filters(&mut self) {
-        use crate::app::nav::NavFilter;
-        use crate::util::SearchPattern;
-
-        // Collect OWNED copies of compiled grep patterns + a flag for the
-        // active fault filter. Cloning releases the immutable borrow on
-        // `self.nav` before we take the mutable reference to the table
-        // (which may also live on the nav stack).
-        let mut committed: Vec<SearchPattern> = Vec::new();
-        let mut col_greps: Vec<(SearchPattern, usize)> = Vec::new();
-        let mut has_fault = false;
-        for f in self.nav.active_filters() {
-            match f {
-                NavFilter::Grep(g) => committed.push(g.pattern().clone()),
-                NavFilter::ColumnGrep { pattern, col, .. } => col_greps.push((pattern.pattern().clone(), *col)),
-                NavFilter::Fault => has_fault = true,
-                _ => {}
-            }
-        }
-        // Uncommitted draft text from the filter input is compiled fresh
-        // here — it changes per keystroke, so caching would just churn.
-        let draft: Option<SearchPattern> = {
-            let text = self.nav.filter_input().text().to_string();
-            (!text.is_empty()).then(|| SearchPattern::new(&text))
-        };
-
-        if committed.is_empty() && col_greps.is_empty() && draft.is_none() && !has_fault {
-            self.clear_filter();
-            return;
-        }
-
-        if let Some(table) = self.active_view_table_mut() {
-            table.apply_filter(|item| {
-                // Fault check: typed health predicate, not regex.
-                if has_fault {
-                    use crate::kube::resources::row::RowHealth;
-                    if matches!(item.health, RowHealth::Normal) {
-                        return false;
-                    }
-                }
-                // Grep check: every committed pattern must match, AND the
-                // transient draft pattern (if any) must match.
-                let committed_ok = committed.iter().all(|pat| {
-                    item.cells().iter().any(|cell| pat.is_match(&cell.to_string()))
-                });
-                if !committed_ok { return false; }
-                // Column-restricted greps: each must match its specific cell.
-                let col_ok = col_greps.iter().all(|(pat, col)| {
-                    item.cells().get(*col).is_some_and(|cell| pat.is_match(&cell.to_string()))
-                });
-                if !col_ok { return false; }
-                if let Some(ref d) = draft {
-                    if !item.cells().iter().any(|cell| d.is_match(&cell.to_string())) {
-                        return false;
-                    }
-                }
-                true
-            });
-        }
-    }
-
-    pub fn clear_filter(&mut self) {
-        self.with_active_table(|t| t.nav_clear_filter());
-    }
-
-    /// Sort the active resource table by the given target column.
-    /// If already sorted by this column, toggles ascending/descending.
-    /// CellValue::cmp() handles type-aware ordering directly, so no
-    /// ColumnSortKind dispatch is needed.
+    /// Sort the top element by the given target column (same column
+    /// toggles direction). The next derive applies it — filters and
+    /// draft text ride along by construction, so there is nothing to
+    /// re-apply.
     pub fn sort_by(&mut self, target: crate::app::SortTarget) {
-        self.with_active_table(|t| t.nav_sort_by(target));
-        // `sort_by_column` -> `rebuild_filter` resets `filtered_indices`
-        // to `0..items.len()` (the table is just storage; nav filters are
-        // owned by `App`). Without re-applying them here, sorting with an
-        // active Grep/Fault filter would silently drop the filter until
-        // the next snapshot triggered `apply_resource_update`'s reapply.
-        self.reapply_nav_filters();
+        self.nav.top_mut().sort_by(target);
     }
 
-    /// Toggle the sort direction on the active table's current sort column.
-    /// Re-sorts with the same column index, which toggles asc/desc.
+    /// Toggle the sort direction on the top element's current column.
     pub fn toggle_sort_direction(&mut self) {
-        self.with_active_table(|t| t.nav_toggle_sort());
-        self.reapply_nav_filters();
+        self.nav.top_mut().toggle_sort();
     }
 
     /// Advance tick counter, expire flash messages, etc.
@@ -748,29 +445,33 @@ impl App {
                 changed = true;
             }
         }
-        // Expire row-level change highlights.
-        if self.ui.deltas.expire(Duration::from_secs(self.config.ui.change_highlight_secs)) {
-            changed = true;
+        // Expire row-change flash on the TOP element's store. Covered
+        // stores expire lazily when they become top again.
+        if let Some(store) = self.nav.top().data_store() {
+            if store.expire_flash(Duration::from_secs(self.config.ui.change_highlight_secs)) {
+                changed = true;
+            }
         }
         // Keep redrawing while a loading state is active (spinner animation).
         if !changed {
             // Resource table loading
-            let table_loading = self.active_view_table()
-                .is_none_or(|t| t.items.is_empty() && matches!(t.data_state, crate::app::table::TableDataState::Initializing));
-            if table_loading {
+            let top = self.nav.top();
+            if top.counts().total == 0
+                && matches!(top.data_state(), crate::app::table::TableDataState::Initializing)
+            {
                 changed = true;
             }
-            // Log view: animate while streaming with no lines yet
+            // Log view: animate while streaming with no lines yet.
             if !changed {
-                if let Route::Logs { ref state, .. } = self.route {
-                    if state.streaming && state.lines().is_empty() {
+                if let Some(store) = self.nav.top().log_store() {
+                    if store.with_read(|i| i.live && i.lines.is_empty()) {
                         changed = true;
                     }
                 }
             }
-            // Shell view: animate while connecting (waiting for first byte).
+            // Shell overlay: animate while connecting (waiting for first byte).
             if !changed {
-                if let Route::Shell(ref shell) = self.route {
+                if let Some(Overlay::Shell(ref shell)) = self.ui.overlay {
                     if shell.connect_state == crate::app::ShellConnectState::Connecting {
                         changed = true;
                     }
@@ -780,14 +481,13 @@ impl App {
         changed
     }
 
-
     /// Build completion candidates dynamically based on command input.
     pub fn command_completions(&self) -> Vec<String> {
         let cmd_input = match &self.ui.input_mode {
             InputMode::Command { input, .. } => input.as_str(),
             _ => return Vec::new(),
         };
-        complete_command(cmd_input, &self.data)
+        complete_command(cmd_input, &self.core, &self.data.contexts)
     }
 
     /// Returns the best (first) completion match, if any.
@@ -809,75 +509,70 @@ impl App {
         }
     }
 
-    /// Returns filtered and total counts for the currently active resource table.
+    /// Returns filtered and total counts for the top element.
     pub fn active_table_items_count(&self) -> ItemCounts {
-        self.with_active_table_ref(|t| t.nav_items_count())
+        self.nav.top().counts()
     }
 
-    /// Build the capability manifest for the current nav resource. Computed
-    /// from the typed `ResourceId` via [`ResourceId::capabilities`] — the
-    /// client no longer caches a server-sent `ResourceCapabilities` because
-    /// the classification is pure data over the closed [`BuiltInKind`] /
-    /// [`LocalResourceKind`] enums (CRDs fall back to the always-on trio).
-    /// Computing on demand eliminates:
-    /// - the three-map rekey dance on `ResourceResolved`
-    /// - the `AppEvent::ResourceCapabilities` wire round-trip
-    /// - every "caps cache missed after resolve" failure mode
+    /// Capability manifest for the top element — pure data over the
+    /// element's identity, computed on demand.
     pub fn current_capabilities(&self) -> crate::kube::protocol::ResourceCapabilities {
-        self.nav.view_id().capabilities()
+        self.nav.top().capabilities()
     }
 
     /// Compute health statistics for all core resources. Returns
     /// `(label, total, healthy)` tuples. Used by the overview page —
-    /// moved here so the view doesn't contain business logic.
+    /// reads the app-level core stores, not navigation state.
     pub fn core_resource_stats(&self) -> Vec<(&'static str, usize, usize)> {
         use crate::kube::resources::row::RowHealth;
         let mut stats = Vec::new();
         for def in crate::kube::resource_defs::REGISTRY.all() {
-            if !def.is_core() { continue; }
-            let rid = def.resource_id();
-            let label = def.short_label();
-            if let Some(table) = self.data.tables.get(&rid) {
-                let total = table.items.len();
-                let healthy = table.items.iter()
-                    .filter(|r| matches!(r.health, RowHealth::Normal))
-                    .count();
-                stats.push((label, total, healthy));
+            if !def.is_core() {
+                continue;
             }
+            let Some(kind) = def.resource_id().built_in_kind() else { continue };
+            let Some(store) = self.core.store_for(kind) else { continue };
+            let (total, healthy) = store.with_read(|i| {
+                (
+                    i.rows.len(),
+                    i.rows.iter().filter(|r| matches!(r.health, RowHealth::Normal)).count(),
+                )
+            });
+            stats.push((def.short_label(), total, healthy));
         }
         stats
     }
 
-    /// Whether the current nav resource is cluster-scoped (no namespace).
+    /// Whether the top element's view is cluster-scoped (no namespace).
     pub fn current_tab_is_cluster_scoped(&self) -> bool {
-        self.nav.view_id().is_cluster_scoped()
+        self.nav.top().is_cluster_scoped()
     }
 
-    /// Find a discovered CRD by its kind name (case-insensitive).
-    /// Returns a lightweight CrdInfo extracted from the row's typed `crd_info` field.
+    /// Find a discovered CRD by its kind name (case-insensitive), from
+    /// the app-level CRD store (Discovery-fed).
     pub fn find_crd_by_name(&self, cmd: &str) -> Option<CrdInfo> {
         let lower = cmd.to_lowercase();
-        let crds_rid = nav::rid(crate::kube::resource_def::BuiltInKind::CustomResourceDefinition);
-        let table = self.data.tables.get(&crds_rid)?;
-        table.items.iter().find_map(|row| {
-            let info = row.crd_info.as_ref()?;
-            let kind_lower = info.kind.to_lowercase();
-            let name_lower = row.name.to_lowercase();
-            let plural_lower = info.plural.to_lowercase();
-            // Match by: kind, plural, full CRD name, kind+"s", or the
-            // short plural from the CRD name (before the first dot).
-            if kind_lower == lower
-                || plural_lower == lower
-                || name_lower == lower
-                || format!("{}s", kind_lower) == lower
-                || name_lower.split('.').next().is_some_and(|short| short == lower)
-            {
-                // CrdInfo is a type alias for CrdRef — clone the row's
-                // stored ref directly, no field-by-field copy.
-                Some(info.clone())
-            } else {
-                None
-            }
+        self.core.crds.with_read(|i| {
+            i.rows.iter().find_map(|row| {
+                let info = row.crd_info.as_ref()?;
+                let kind_lower = info.kind.to_lowercase();
+                let name_lower = row.name.to_lowercase();
+                let plural_lower = info.plural.to_lowercase();
+                // Match by: kind, plural, full CRD name, kind+"s", or the
+                // short plural from the CRD name (before the first dot).
+                if kind_lower == lower
+                    || plural_lower == lower
+                    || name_lower == lower
+                    || format!("{}s", kind_lower) == lower
+                    || name_lower.split('.').next().is_some_and(|short| short == lower)
+                {
+                    // CrdInfo is a type alias for CrdRef — clone the row's
+                    // stored ref directly, no field-by-field copy.
+                    Some(info.clone())
+                } else {
+                    None
+                }
+            })
         })
     }
 }
@@ -901,20 +596,37 @@ fn resource_commands() -> Vec<&'static str> {
     v
 }
 
-/// Build completion candidates for the given command input. Reads from
-/// `AppData` for namespace/context/CRD names. Pure function — no App needed.
-fn complete_command(cmd_input: &str, data: &AppData) -> Vec<String> {
-    use crate::kube::resources::KubeResource;
-
+/// Build completion candidates for the given command input. Reads the
+/// app-level core stores for namespace/CRD names and the contexts panel
+/// for context names. Pure function — no App needed.
+fn complete_command(
+    cmd_input: &str,
+    core: &CoreData,
+    contexts: &StatefulTable<KubeContext>,
+) -> Vec<String> {
     let input_lower = cmd_input.trim_start().to_lowercase();
+
+    // CRD name candidates as (kind, plural, short-plural), lowercased —
+    // gathered once from the core store for the checks below.
+    let crd_candidates: Vec<(String, String, String)> = core.crds.with_read(|i| {
+        i.rows
+            .iter()
+            .filter_map(|row| {
+                let info = row.crd_info.as_ref()?;
+                Some((
+                    info.kind.to_lowercase(),
+                    info.plural.to_lowercase(),
+                    row.name.split('.').next().unwrap_or("").to_lowercase(),
+                ))
+            })
+            .collect()
+    });
 
     // Namespace completion: "ns <tab>" or "namespace <tab>"
     if input_lower.starts_with("ns ") || input_lower.starts_with("namespace ") {
         let cmd_prefix = if input_lower.starts_with("ns ") { "ns " } else { "namespace " };
-        let ns_items = data.tables.get(&nav::rid(crate::kube::resource_def::BuiltInKind::Namespace))
-            .map(|t| &t.items[..]).unwrap_or(&[]);
-        let mut completions: Vec<String> = ns_items.iter()
-            .map(|ns| format!("{}{}", cmd_prefix, ns.name()))
+        let mut completions: Vec<String> = core.namespace_names().into_iter()
+            .map(|ns| format!("{}{}", cmd_prefix, ns))
             .filter(|s| s.to_lowercase().starts_with(&input_lower))
             .collect();
         completions.sort();
@@ -925,7 +637,7 @@ fn complete_command(cmd_input: &str, data: &AppData) -> Vec<String> {
     // Context completion: "ctx <tab>" or "context <tab>"
     if input_lower.starts_with("ctx ") || input_lower.starts_with("context ") {
         let cmd_prefix = if input_lower.starts_with("ctx ") { "ctx " } else { "context " };
-        let mut completions: Vec<String> = data.contexts.items.iter()
+        let mut completions: Vec<String> = contexts.items().iter()
             .map(|c| format!("{}{}", cmd_prefix, c.name))
             .filter(|s| s.to_lowercase().starts_with(&input_lower))
             .collect();
@@ -939,20 +651,13 @@ fn complete_command(cmd_input: &str, data: &AppData) -> Vec<String> {
         let resource_part = &input_lower[..space_pos];
         let rc = resource_commands();
         let is_builtin = rc.contains(&resource_part);
-        let crd_items = data.tables.get(&nav::rid(crate::kube::resource_def::BuiltInKind::CustomResourceDefinition))
-            .map(|t| &t.items[..]).unwrap_or(&[]);
-        let is_crd = !is_builtin && crd_items.iter().any(|row| {
-            let info = match row.crd_info.as_ref() { Some(i) => i, None => return false };
-            let kind = info.kind.to_lowercase();
-            let plural = info.plural.to_lowercase();
-            let short = row.name.split('.').next().unwrap_or("").to_lowercase();
-            resource_part == kind || resource_part == plural || resource_part == short
-        });
+        let is_crd = !is_builtin
+            && crd_candidates.iter().any(|(kind, plural, short)| {
+                resource_part == kind || resource_part == plural || resource_part == short
+            });
         if is_builtin || is_crd {
-            let ns_items = data.tables.get(&nav::rid(crate::kube::resource_def::BuiltInKind::Namespace))
-                .map(|t| &t.items[..]).unwrap_or(&[]);
-            let mut completions: Vec<String> = ns_items.iter()
-                .map(|ns| format!("{} {}", resource_part, ns.name()))
+            let mut completions: Vec<String> = core.namespace_names().into_iter()
+                .map(|ns| format!("{} {}", resource_part, ns))
                 .filter(|s| s.to_lowercase().starts_with(&input_lower))
                 .collect();
             completions.sort();
@@ -977,14 +682,8 @@ fn complete_command(cmd_input: &str, data: &AppData) -> Vec<String> {
         .collect();
 
     // CRD name completions
-    let crd_items = data.tables.get(&nav::rid(crate::kube::resource_def::BuiltInKind::CustomResourceDefinition))
-        .map(|t| &t.items[..]).unwrap_or(&[]);
-    for row in crd_items {
-        let Some(info) = row.crd_info.as_ref() else { continue };
-        let kind_lower = info.kind.to_lowercase();
-        let plural_lower = info.plural.to_lowercase();
-        let short_plural = row.name.split('.').next().unwrap_or("").to_lowercase();
-        for candidate in [&kind_lower, &plural_lower, &short_plural] {
+    for (kind_lower, plural_lower, short_plural) in &crd_candidates {
+        for candidate in [kind_lower, plural_lower, short_plural] {
             if !candidate.is_empty() && candidate.starts_with(&input_lower) {
                 completions.push(candidate.clone());
             }
@@ -994,4 +693,36 @@ fn complete_command(cmd_input: &str, data: &AppData) -> Vec<String> {
     completions.sort();
     completions.dedup();
     completions
+}
+
+// ---------------------------------------------------------------------------
+// Test support
+// ---------------------------------------------------------------------------
+
+/// Shared runtime plumbing for tests that need real (but inert) task
+/// handles — a parked bridge task that never connects to anything.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::LazyLock;
+
+    static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    });
+
+    /// A subscription handle backed by a parked task: alive until
+    /// dropped, touches no socket, no daemon, no cluster.
+    pub(crate) fn parked_stream() -> crate::kube::client_session::SubscriptionStream {
+        let handle = RT.handle().spawn(std::future::pending::<()>());
+        crate::kube::client_session::SubscriptionStream::from_abort_handle(handle.abort_handle())
+    }
+
+    /// Same, for log streams.
+    pub(crate) fn parked_log_stream() -> crate::kube::client_session::LogStream {
+        let handle = RT.handle().spawn(std::future::pending::<()>());
+        crate::kube::client_session::LogStream::from_abort_handle(handle.abort_handle())
+    }
 }

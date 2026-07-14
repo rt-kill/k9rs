@@ -122,10 +122,6 @@ async fn main() -> Result<()> {
         cli.namespace.as_deref().unwrap_or("all"),
     );
     let cli_context: Option<crate::kube::protocol::ContextName> = cli.context.clone().map(Into::into);
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), namespace);
-    if cli.readonly {
-        app.read_only = true;
-    }
 
     // Parse startup navigation from positional args or legacy -c flag.
     let startup_segments = parse_startup_segments(&cli);
@@ -133,6 +129,27 @@ async fn main() -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>(500);
 
     use crate::kube::client_session::ClientSession;
+
+    // Construct the data source FIRST — `ClientSession::new` is
+    // non-blocking (it spawns a background manager that does the
+    // kubeconfig read, socket connect, and handshake), and the App's
+    // root nav element opens its subscription against it. Bridge tasks
+    // inside `subscribe_stream` await the MuxHandle, so subscribes fire
+    // as soon as the connection is up.
+    let data_source = ClientSession::new(
+        crate::kube::client_session::ConnectionParams {
+            context: cli_context.clone(),
+            namespace: namespace.clone(),
+            readonly: cli.readonly,
+            no_daemon: cli.no_daemon,
+        },
+        event_tx.clone(),
+    );
+
+    let mut app = App::new(crate::kube::protocol::ContextName::default(), namespace, &data_source);
+    if cli.readonly {
+        app.read_only = true;
+    }
 
     // -----------------------------------------------------------------------
     // Enter the TUI immediately. NO blocking I/O happens before this point.
@@ -160,30 +177,9 @@ async fn main() -> Result<()> {
     // Draw first frame immediately so the TUI appears instantly.
     terminal.draw(|f| crate::ui::draw(f, &mut app))?;
 
-    // Construct the data source. This is non-blocking — `ClientSession::new`
-    // returns immediately and spawns its own background manager that does the
-    // (single) kubeconfig read, daemon socket connect, Init/Ready handshake,
-    // and then brings up the reader/writer loops. Commands sent on
-    // `data_source` queue locally on an unbounded channel and are flushed as
-    // soon as the writer task spawns. Lifecycle events arrive on `event_tx`:
-    //   - `AppEvent::KubeconfigLoaded`     (fast: contexts panel populated)
-    //   - `AppEvent::ConnectionEstablished` (handshake complete: do initial subscribe)
-    //   - `AppEvent::ConnectionFailed`     (fatal: TUI exits with error)
-    let data_source = ClientSession::new(
-        crate::kube::client_session::ConnectionParams {
-            context: cli_context.clone(),
-            namespace: app.kube.selected_ns.clone(),
-            readonly: cli.readonly,
-            no_daemon: cli.no_daemon,
-        },
-        event_tx.clone(),
-    );
-
-    // Apply startup navigation (positional args or -c) and open
-    // subscription substreams. Bridge tasks inside subscribe_stream
-    // await the MuxHandle, so subscribes fire as soon as the connection
-    // is up. Core resources are auto-subscribed via
-    // `open_core_subscriptions` on ConnectionEstablished.
+    // Apply startup navigation (positional args or -c). Each element
+    // opens its own subscription at construction; core stores are wired
+    // on ConnectionEstablished.
     apply_startup_nav(&mut app, &data_source, &startup_segments);
 
     // Spawn the input bridge so keypresses flow into `session_main` from
@@ -322,65 +318,37 @@ fn apply_startup_nav(
         }
     };
 
-    app.nav.reset(first_rid);
-    app.route = crate::app::Route::Resources;
+    let root = App::root_list_element(
+        data_source,
+        &app.kube.metrics,
+        first_rid,
+        app.kube.selected_ns.clone(),
+    );
+    app.nav.reset(root);
 
     for seg in &segments[1..] {
         match seg {
             StartupSegment::Filter(pattern) => {
-                if let Some(rid) = app.nav.resource_id().cloned() {
-                    let grep = crate::app::nav::NavFilter::Grep(
-                        crate::app::nav::CompiledGrep::new(pattern),
-                    );
-                    app.nav.push(crate::app::nav::NavStep::new(rid, Some(grep)));
+                let predicate = crate::app::store::RowPredicate::Grep(
+                    crate::app::nav::CompiledGrep::new(pattern),
+                );
+                if let Ok(el) =
+                    crate::app::element::Element::derive_filter(app.nav.top(), predicate)
+                {
+                    app.nav.push(el);
                 }
             }
             StartupSegment::Resource(rid) => {
-                // Subscribe the current top before it becomes a parent.
-                subscribe_top_if_needed(app, data_source);
-
-                let mut step = crate::app::nav::NavStep::new(rid.clone(), None);
-                if !crate::app::nav::is_globally_stored(
-                    &crate::app::view::ViewId::Resource(rid.clone()),
-                ) {
-                    step.table = Some(crate::app::table::StatefulTable::new());
-                }
-                app.nav.push(step);
+                let label = rid.short_label().to_lowercase();
+                let el = app.list_element_from_top(
+                    data_source,
+                    rid.clone(),
+                    app.kube.selected_ns.clone(),
+                    None,
+                    label,
+                );
+                app.nav.push(el);
             }
         }
-    }
-
-    // Subscribe the final top of the stack.
-    subscribe_top_if_needed(app, data_source);
-}
-
-fn subscribe_top_if_needed(
-    app: &mut App,
-    data_source: &crate::kube::client_session::ClientSession,
-) {
-    let Some(rid) = app.nav.resource_id().cloned() else { return };
-    let is_core = rid.built_in_kind()
-        .map(|k| crate::kube::resource_defs::REGISTRY.by_kind(k).is_core())
-        .unwrap_or(false);
-    if is_core {
-        return;
-    }
-    // Only subscribe if the subscription owner doesn't already have a stream.
-    let needs_stream = {
-        let mut has = false;
-        app.nav.with_subscription_owner(|step| {
-            has = step.stream.is_some();
-        });
-        !has
-    };
-    if needs_stream {
-        let filter = app.nav.current().filter.as_ref()
-            .and_then(|f| f.to_subscription_filter());
-        let stream = data_source.subscribe_stream(
-            rid, app.kube.selected_ns.clone(), filter,
-        );
-        app.nav.with_subscription_owner(|step| {
-            step.stream = Some(stream);
-        });
     }
 }

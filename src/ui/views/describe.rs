@@ -7,7 +7,7 @@ use ratatui::{
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Route};
+use crate::app::App;
 
 /// Draw the describe view showing kubectl describe output.
 ///
@@ -26,11 +26,15 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
     let content_area = chunks[0];
     let bar_area = chunks[1];
 
-    // Extract state and resource type/name from route
-    let (describe, resource_type, resource_name) = match &app.route {
-        Route::ContentView { kind: crate::app::ContentViewKind::Aliases, ref state, .. } => (state, "aliases", ""),
-        Route::ContentView { target: Some(ref target), ref state, .. } => (state, target.resource.display_label(), target.name.as_str()),
-        _ => return, // Not a describe view — nothing to draw
+    // The top element IS the view: its spec carries the target identity,
+    // its state carries scroll/search.
+    use crate::app::element::{ContentSpec, Element};
+    let Element::ContentView(cv) = app.nav.top() else { return };
+    let (describe, resource_type, resource_name) = match &cv.kind {
+        ContentSpec::Aliases => (&cv.state, "aliases", ""),
+        ContentSpec::Describe(target) | ContentSpec::Yaml(target) => {
+            (&cv.state, target.resource.display_label(), target.name.as_str())
+        }
     };
 
     if !describe.content.is_empty() {

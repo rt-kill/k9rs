@@ -74,7 +74,9 @@ fn draw_context_key_hints(f: &mut Frame, area: Rect, theme: &Theme) {
 // ---------------------------------------------------------------------------
 
 fn draw_context_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
-    let table = &app.data.contexts;
+    // The top element IS the picker: its own table copy, seeded at push.
+    let crate::app::element::Element::ContextList(picker) = app.nav.top() else { return };
+    let table = &picker.table;
     let selected = table.selected();
     let total = table.len();
 

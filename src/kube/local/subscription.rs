@@ -18,22 +18,22 @@
 
 use tokio::sync::watch;
 
-use crate::event::ResourceUpdate;
+use crate::kube::protocol::TableBaseline;
 use crate::kube::protocol::ResourceId;
 
 use super::SharedLocalSource;
 
 /// A subscription to a local resource source. Unlike the K8s
-/// `live_query::Subscription` which carries `Option<ResourceUpdate>` to
+/// `live_query::Subscription` which carries typed messages to
 /// signal "watcher died", local sources are infallible by construction —
 /// they always have a current value, and "the source went away" is modeled
 /// by dropping the subscription, not by publishing `None`. So the receiver
-/// type is `watch::Receiver<ResourceUpdate>`, no Option.
+/// type is `watch::Receiver<TableBaseline>`, no Option.
 pub struct LocalSubscription {
     /// The resource id the subscription is for (logging / debugging).
     pub resource: ResourceId,
     /// Receiver for snapshot updates. The source owns the `watch::Sender`.
-    pub snapshot_rx: watch::Receiver<ResourceUpdate>,
+    pub snapshot_rx: watch::Receiver<TableBaseline>,
     /// Strong handle to the underlying source. Keeps the source alive for
     /// as long as the subscription exists; on `Drop` the grace period
     /// extends that lifetime by [`GRACE_PERIOD_SECS`](crate::kube::GRACE_PERIOD_SECS) more seconds.
@@ -45,7 +45,7 @@ impl LocalSubscription {
     /// the caller's `Arc` is preserved (clone it before calling).
     pub fn new(
         resource: ResourceId,
-        snapshot_rx: watch::Receiver<ResourceUpdate>,
+        snapshot_rx: watch::Receiver<TableBaseline>,
         source: SharedLocalSource,
     ) -> Self {
         Self {
@@ -57,7 +57,7 @@ impl LocalSubscription {
 
     /// Read the current snapshot without waiting. Always returns a value —
     /// local sources are constructed with an initial snapshot.
-    pub fn current(&mut self) -> ResourceUpdate {
+    pub fn current(&mut self) -> TableBaseline {
         self.snapshot_rx.borrow_and_update().clone()
     }
 

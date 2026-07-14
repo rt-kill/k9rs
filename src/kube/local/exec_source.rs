@@ -17,7 +17,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::event::ResourceUpdate;
 use crate::kube::protocol::ResourceId;
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
@@ -83,8 +82,8 @@ pub struct ExecSource {
     rid: ResourceId,
     config: ExecSourceConfig,
     entries: Mutex<Vec<ExecEntry>>,
-    tx: watch::Sender<ResourceUpdate>,
-    _keep_rx: watch::Receiver<ResourceUpdate>,
+    tx: watch::Sender<crate::kube::protocol::TableBaseline>,
+    _keep_rx: watch::Receiver<crate::kube::protocol::TableBaseline>,
     grace_in_flight: AtomicBool,
     /// RAII handle to the supervised poll loop, set once right after
     /// construction (`OnceLock` because `Arc::new_cyclic` runs before the
@@ -100,7 +99,7 @@ impl ExecSource {
     pub fn for_context(config: ExecSourceConfig) -> Arc<Self> {
         let rid = super::types::LocalResourceKind::Custom(config.name.clone()).to_resource_id();
         let headers = config.headers.clone();
-        let empty = ResourceUpdate::Rows {
+        let empty = crate::kube::protocol::TableBaseline {
             resource: rid.clone(),
             headers,
             rows: Vec::new(),
@@ -234,7 +233,7 @@ impl ExecSource {
             .map(entry_to_row)
             .collect();
         rows.sort_by(|a, b| a.name.cmp(&b.name));
-        let _ = self.tx.send(ResourceUpdate::Rows {
+        let _ = self.tx.send(crate::kube::protocol::TableBaseline {
             resource: self.rid.clone(),
             headers: self.config.headers.clone(),
             rows,
@@ -304,7 +303,7 @@ impl LocalResourceSource for ExecSource {
         self.grace_in_flight.store(false, Ordering::Release);
     }
 
-    fn subscribe(&self) -> watch::Receiver<ResourceUpdate> {
+    fn subscribe(&self) -> watch::Receiver<crate::kube::protocol::TableBaseline> {
         self.tx.subscribe()
     }
 

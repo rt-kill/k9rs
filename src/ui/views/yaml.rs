@@ -6,7 +6,7 @@ use ratatui::{
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Route};
+use crate::app::App;
 use crate::ui::widgets::{YamlViewer, YamlViewState};
 
 /// Draw the YAML view with syntax highlighting.
@@ -26,17 +26,17 @@ pub fn draw_yaml(f: &mut Frame, app: &App, area: Rect) {
     let content_area = chunks[0];
     let bar_area = chunks[1];
 
-    // Extract resource type and name from route
-    let (resource_type, resource_name) = match &app.route {
-        Route::ContentView { target: Some(ref target), .. } => (target.resource.display_label(), target.name.as_str()),
-        _ => ("unknown", "unknown"),
+    // The top element IS the view.
+    use crate::app::element::{ContentSpec, Element};
+    let Element::ContentView(cv) = app.nav.top() else { return };
+    let (resource_type, resource_name) = match &cv.kind {
+        ContentSpec::Yaml(target) | ContentSpec::Describe(target) => {
+            (target.resource.display_label(), target.name.as_str())
+        }
+        ContentSpec::Aliases => ("unknown", "unknown"),
     };
     let yaml_title = format!("YAML: {}/{}", resource_type, resource_name);
-
-    let yaml = match &app.route {
-        Route::ContentView { ref state, .. } => state,
-        _ => return, // Not a yaml view — nothing to draw
-    };
+    let yaml = &cv.state;
 
     if !yaml.content.is_empty() {
         let viewer = YamlViewer::new(

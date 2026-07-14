@@ -1,20 +1,47 @@
-use std::collections::BTreeMap;
+//! The navigation stack: a strict-LIFO vector of self-contained
+//! [`Element`]s (see [`crate::app::element`]).
+//!
+//! The stack owns exactly two things: HISTORY (which scopes the user
+//! walked through) and UNDO (pop = drop, RAII releases the popped
+//! element's handles). Elements are fully self-defining — the stack never
+//! interprets them, and display blindly renders the top.
+//!
+//! Invariants, held structurally:
+//! - **Never empty**: [`NavStack::pop`] refuses to remove the root, so
+//!   [`NavStack::top`] needs no `expect`.
+//! - **Peek-only derivation**: there is no index accessor; push-sites
+//!   receive `&Element` (the top) from [`NavStack::top`], and the
+//!   derivation constructors on [`Element`] take an element, never the
+//!   stack.
+//! - **Top-to-bottom teardown**: children hold backward `Arc`s into
+//!   parents' stores, so parents must outlive children. A bare `Vec`
+//!   drops front-to-back (= bottom-first = WRONG); [`Drop`] and
+//!   [`NavStack::reset`] drain via `pop()` back-to-front.
+//! - Ancestor access happens only through named semantic methods that
+//!   walk internally (`ensure_top_live`, `apply_resolved`) — data-plane
+//!   maintenance, not scope interpretation.
 
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-use crate::app::view::ViewId;
-use crate::kube::protocol::{ResourceId, SubscriptionFilter};
+use crate::app::element::Element;
+use crate::kube::client_session::ClientSession;
+use crate::kube::protocol::ResourceId;
 use crate::util::SearchPattern;
 
-/// A grep pattern that has been compiled exactly once, at filter
-/// construction. Carries both the source text (for breadcrumbs and
-/// completion round-trips) and the compiled [`SearchPattern`] so that
-/// `reapply_nav_filters` — which runs on every snapshot — doesn't have
-/// to recompile.
-///
-/// Not serializable: `NavFilter` is client-only state and never rides
-/// the wire. If it needs to be persisted, persist [`CompiledGrep::source`]
-/// and recompile on load.
+/// Typed K8s field selector. Defined in [`crate::kube::resources::row`]
+/// because it rides the wire inside `DrillTarget` (WIRE-FROZEN there);
+/// re-exported here because drill construction is its main client-side
+/// consumer.
+pub use crate::kube::resources::row::K8sFieldSelector;
+
+// ---------------------------------------------------------------------------
+// CompiledGrep — a pattern compiled exactly once
+// ---------------------------------------------------------------------------
+
+/// A grep pattern compiled exactly once, at predicate construction.
+/// Carries both the source text (for crumbs and completion round-trips)
+/// and the compiled [`SearchPattern`] so per-frame derives never
+/// recompile.
 #[derive(Debug, Clone)]
 pub struct CompiledGrep {
     source: String,
@@ -22,842 +49,239 @@ pub struct CompiledGrep {
 }
 
 impl CompiledGrep {
-    /// Compile a grep pattern from raw user text. Smartcase rules live
-    /// inside [`SearchPattern::new`] — same behavior as before, just
-    /// moved to the construction site instead of reapply time.
+    /// Compile from raw user text. Smartcase rules live inside
+    /// [`SearchPattern::new`].
     pub fn new(source: impl Into<String>) -> Self {
         let source = source.into();
         let pattern = SearchPattern::new(&source);
         Self { source, pattern }
     }
 
-    /// The original pattern text, kept for breadcrumb rendering and
-    /// debug output.
+    /// The original pattern text (crumb rendering, debug output).
     pub fn source(&self) -> &str {
         &self.source
     }
 
-    /// The compiled pattern. Use this for match checks in hot paths —
-    /// no allocation, no recompile.
+    /// The compiled pattern — no allocation, no recompile in hot paths.
     pub fn pattern(&self) -> &SearchPattern {
         &self.pattern
     }
 }
 
-/// Typed K8s field selector — replaces the previous stringly-typed
-/// `NavFilter::Field { field: String, value: String }`. Each variant
-/// corresponds to a specific K8s field selector path; the variant data
-/// is the value to match against. New field paths get new variants —
-/// the wire-format string and breadcrumb are derived from the variant.
-///
-/// `Serialize`/`Deserialize` so it can ride the wire inside `DrillTarget`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum K8sFieldSelector {
-    /// `metadata.name=<name>` — exact match on the resource name.
-    /// Universally supported by the K8s API for all resource types.
-    MetadataName(String),
-    /// `spec.nodeName=<name>` — pods scheduled on a specific node.
-    SpecNodeName(String),
-    /// `status.phase=<phase>` — pods in a specific lifecycle phase.
-    StatusPhase(String),
-}
+// ---------------------------------------------------------------------------
+// RootSpec — the recipe for reconstructing a root (NOT a live element)
+// ---------------------------------------------------------------------------
 
-impl K8sFieldSelector {
-    /// Render the selector in the format K8s expects on the wire
-    /// (`field.path=value`), suitable for `SubscriptionFilter::Field`.
-    pub fn to_wire(&self) -> String {
-        match self {
-            Self::MetadataName(v) => format!("metadata.name={}", v),
-            Self::SpecNodeName(v) => format!("spec.nodeName={}", v),
-            Self::StatusPhase(v) => format!("status.phase={}", v),
-        }
-    }
-
-    /// Short user-facing label for the breadcrumb.
-    pub fn breadcrumb(&self) -> String {
-        match self {
-            Self::MetadataName(v) => format!("name={}", v),
-            Self::SpecNodeName(v) => format!("node={}", v),
-            Self::StatusPhase(v) => format!("phase={}", v),
-        }
-    }
-}
-
-/// What subscription changes a nav operation requires. Returned by
-/// push/pop/reset so the session layer can open a fresh substream when
-/// needed.
-///
-/// Note: there's no `unsubscribe` field. Unsubscribing is handled by
-/// `NavStep::stream`'s `Drop` impl — when a nav step is popped or
-/// replaced, its `SubscriptionStream` drops, which aborts the bridge
-/// task and closes the yamux substream. There's nothing for the session
-/// layer to do explicitly.
-pub struct NavChange {
-    pub subscribe: Option<ResourceId>,
-    /// Server-side filter for the new subscription (Labels, Field, OwnerUid).
-    /// None = unfiltered. Only meaningful when `subscribe` is Some.
-    pub subscription_filter: Option<SubscriptionFilter>,
-    /// Namespace scope for the fresh subscription, overriding the session's
-    /// selected namespace. `None` = inherit the selected namespace (the right
-    /// default for grep refinements and same-namespace drills). `Some` = an
-    /// intrinsic scope the source view's namespace must not narrow — e.g.
-    /// all-namespaces for a node's pods, which span every namespace. Only
-    /// meaningful when `subscribe` is `Some`. See
-    /// [`NavFilter::subscription_namespace`].
-    pub namespace: Option<crate::kube::protocol::Namespace>,
+/// What kind of root the stack had before the last reset — a construction
+/// recipe for the `-` (toggle last view) key, deliberately NOT a live
+/// element (a stashed element would keep dead subscriptions alive).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootSpec {
+    Resource(ResourceId),
 }
 
 // ---------------------------------------------------------------------------
-// NavFilter — the kinds of filters that can narrow a resource view
+// NavStack
 // ---------------------------------------------------------------------------
 
-// The fault filter previously carried a regex pattern that matched against
-// raw status strings. With `RowHealth` typed by the converter (server-side),
-// it now filters directly on `row.health != Normal` — no regex, no string
-// match. The constant is gone; the variant is its own implementation.
-
-/// A filter applied at one level of the navigation stack.
-#[derive(Debug, Clone)]
-pub enum NavFilter {
-    /// Text grep across all columns (what `/` does). The pattern is
-    /// compiled at construction (see [`CompiledGrep::new`]) so the
-    /// hot-path `reapply_nav_filters` never re-parses the regex.
-    Grep(CompiledGrep),
-    /// Label selector: show only items whose labels contain ALL of these k=v
-    /// pairs (deployment→pods, statefulset→pods, etc.). `namespace` scopes the
-    /// fresh subscription to the source object's namespace — a workload's pods
-    /// live in the workload's namespace, so the drill must stay namespaced even
-    /// from an all-namespaces parent (otherwise `app=nginx` would match pods in
-    /// every namespace).
-    Labels {
-        labels: BTreeMap<String, String>,
-        namespace: crate::kube::protocol::Namespace,
-    },
-    /// Typed K8s field selector. Replaces the previous stringly-typed
-    /// `Field { field: String, value: String }` — the variant carries the
-    /// field path so callers can't fat-finger it.
-    Field(K8sFieldSelector),
-    /// Owner reference chain: show pods owned (directly or transitively) by
-    /// the resource with this UID. Follows ownerReferences metadata for 100%
-    /// accurate drill-down (Pod → ReplicaSet → Deployment).
-    OwnerChain {
-        /// UID of the owner resource to match.
-        uid: String,
-        /// Kind of the owner (typed — breadcrumb display fetches the human
-        /// string via [`crate::kube::resource_defs::REGISTRY`]).
-        kind: crate::kube::resource_def::BuiltInKind,
-        /// Display name of the owner resource.
-        display_name: String,
-        /// Scope the fresh subscription to the owner's namespace (its pods/jobs
-        /// live there) — same rationale as `Labels { namespace }`.
-        namespace: crate::kube::protocol::Namespace,
-    },
-    /// Column-restricted grep: matches only the cell at a specific column
-    /// index. Opened with `~` (tilde) — filters the hovered column only.
-    ColumnGrep {
-        pattern: CompiledGrep,
-        col: usize,
-        /// Header name of `col`, captured when the filter was created (the
-        /// only moment the descriptor is reliably in hand) so the
-        /// breadcrumb reads `~STATUS:x` instead of a raw data-col index.
-        header: String,
-    },
-    /// The "fault" filter — show only rows whose typed [`crate::kube::resources::row::RowHealth`]
-    /// is `Failed` or `Pending`. The classification happens on the server
-    /// (in the row converter), so the filter runs as `row.health != Normal`
-    /// instead of regexing status cells.
-    Fault,
-}
-
-impl NavFilter {
-    /// Convert this filter to a server-side subscription filter, if applicable.
-    /// Grep and Fault are client-side only and return None.
-    pub fn to_subscription_filter(&self) -> Option<SubscriptionFilter> {
-        match self {
-            NavFilter::Grep(_) | NavFilter::ColumnGrep { .. } | NavFilter::Fault => None,
-            NavFilter::Labels { labels, .. } => Some(SubscriptionFilter::Labels(labels.clone())),
-            NavFilter::Field(sel) => Some(SubscriptionFilter::Field(sel.to_wire())),
-            NavFilter::OwnerChain { uid, .. } => {
-                Some(SubscriptionFilter::OwnerUid(uid.clone()))
-            }
-        }
-    }
-
-    /// The namespace a *fresh* subscription opened for this filter should use,
-    /// overriding the session's selected namespace. `None` means inherit the
-    /// selected namespace — correct for grep refinements (which don't open a new
-    /// subscription at all) and for filters with no inherent scope. Two filters
-    /// override it: a `spec.nodeName` selector is cluster-wide (a node hosts pods
-    /// from every namespace), and label/owner drills pin to the *source object's*
-    /// namespace so a same-namespace drill stays namespaced even from an
-    /// all-namespaces parent.
-    pub fn subscription_namespace(&self) -> Option<crate::kube::protocol::Namespace> {
-        match self {
-            NavFilter::Field(K8sFieldSelector::SpecNodeName(_)) => {
-                Some(crate::kube::protocol::Namespace::All)
-            }
-            NavFilter::Labels { namespace, .. } | NavFilter::OwnerChain { namespace, .. } => {
-                Some(namespace.clone())
-            }
-            _ => None,
-        }
-    }
-
-    /// The compiled grep pattern this filter contributes, if any. Only
-    /// [`NavFilter::Grep`] produces a pattern — Fault is now a typed
-    /// `row.health` predicate (see [`NavFilter::keep_by_health`]) and
-    /// labels/field/owner-chain dispatch through `to_subscription_filter`.
-    /// Returns `&CompiledGrep` so callers use the cached pattern without
-    /// recompiling — the reason this method replaced the older
-    /// `as_grep_pattern() -> Option<&str>` that forced reapply-time
-    /// recompiles on every snapshot.
-    pub fn as_grep(&self) -> Option<&CompiledGrep> {
-        match self {
-            NavFilter::Grep(g) => Some(g),
-            _ => None,
-        }
-    }
-
-}
-
-// ---------------------------------------------------------------------------
-// NavStep — one level in the navigation stack
-// ---------------------------------------------------------------------------
-
-/// A single level in the navigation stack.
-///
-/// Steps form a singly-linked chain — each `NavStep` either is the root
-/// (`parent == None`) or carries a boxed `parent` pointing one level
-/// deeper. The chain is **owned end-to-end**, so there is no `NavStack`
-/// collection to reach into by index: outside code only ever sees the
-/// current top, handed out by [`NavStack::current`] /
-/// [`NavStack::current_mut`]. Operations that genuinely need ancestor
-/// state (subscription-owner lookup, clear-dead-stream sweeps, breadcrumb
-/// rendering) go through named methods on [`NavStack`] that walk the
-/// chain internally — never through a public `step(i)` accessor.
-#[derive(Debug)]
-pub struct NavStep {
-    /// What view this step is looking at (resource type or derived view type).
-    pub view: ViewId,
-    /// Instance context for derived views — the parent row this view was
-    /// derived from (e.g., the pod whose containers are being viewed).
-    /// `None` for resource views. Used for breadcrumbs ("pod-name > Containers")
-    /// and to scope actions back to the parent.
-    pub source: Option<crate::kube::protocol::ObjectRef>,
-    /// The filter applied at this level (if any).
-    pub filter: Option<NavFilter>,
-    /// Saved table selection index so "back" restores cursor position.
-    pub saved_selected: usize,
-    /// Uncommitted filter input for this frame.
-    pub filter_input: FilterInputState,
-    /// The active subscription substream for this step's view. Dropping it
-    /// closes the yamux substream (RST to the daemon), which cleanly
-    /// terminates the daemon's bridge for this subscription. `None` before
-    /// the first subscribe or for steps that don't own a subscription
-    /// (grep filters on the same rid reuse the parent's stream).
-    pub stream: Option<crate::kube::client_session::SubscriptionStream>,
-    /// NavStep-owned table for non-globally-stored resources. When this
-    /// step is popped, the table dies (RAII). Globally stored resources
-    /// (Namespace, Node, CRD) keep their tables in `AppData::unified`.
-    pub table: Option<crate::app::table::StatefulTable<crate::kube::resources::row::ResourceRow>>,
-    /// NavStep-owned descriptor for non-globally-stored resources.
-    pub descriptor: Option<crate::app::TableDescriptor>,
-    /// Link to the step one level down (`None` at the root). Private —
-    /// callers can't reach into the chain; they navigate through
-    /// [`NavStack::pop`] or ancestor-aware methods on `NavStack`.
-    parent: Option<Box<NavStep>>,
-}
-
-impl NavStep {
-    fn root(rid: ResourceId) -> Self {
-        Self {
-            view: ViewId::Resource(rid),
-            source: None,
-            filter: None,
-            saved_selected: 0,
-            filter_input: FilterInputState::default(),
-            stream: None,
-            table: None,
-            descriptor: None,
-            parent: None,
-        }
-    }
-
-    /// Build a derived view step. `source` is the parent row (e.g., the
-    /// pod whose containers are being viewed). Table and descriptor are
-    /// populated by the caller after construction.
-    pub fn derived(kind: crate::app::view::DerivedViewKind, source: crate::kube::protocol::ObjectRef) -> Self {
-        Self {
-            view: ViewId::Derived(kind),
-            source: Some(source),
-            filter: None,
-            saved_selected: 0,
-            filter_input: FilterInputState::default(),
-            stream: None,
-            table: None,
-            descriptor: None,
-            parent: None,
-        }
-    }
-
-    /// Build a fresh step destined for [`NavStack::push`]. `parent` stays
-    /// `None`; the stack links it in during push so callers never touch
-    /// the chain directly.
-    pub fn new(resource: ResourceId, filter: Option<NavFilter>) -> Self {
-        Self {
-            view: ViewId::Resource(resource),
-            source: None,
-            filter,
-            saved_selected: 0,
-            filter_input: FilterInputState::default(),
-            stream: None,
-            table: None,
-            descriptor: None,
-            parent: None,
-        }
-    }
-
-    /// Whether this step owns a subscription whose bridge is still *running*.
-    /// A handle that's present but whose bridge has terminated does not count.
-    /// Used by the pop re-subscribe decision so a present-but-dead owner can't
-    /// suppress re-subscribe — distinct from `stream.is_some()`, which the
-    /// routing and reactive-cleanup sweeps use, where mere presence is the
-    /// right question (you route to / clear whatever handle is there).
-    fn has_live_stream(&self) -> bool {
-        self.stream.as_ref().is_some_and(|s| s.is_alive())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// NavStack — the full navigation state
-// ---------------------------------------------------------------------------
-
-/// Navigation state. Exposes **only the top step** — all ancestor access
-/// goes through named semantic methods that walk the private parent chain
-/// internally. There is no public `step(i)` / index-based accessor, so the
-/// compiler enforces "user can only touch the current view" by
-/// construction.
-///
-/// Popping the root is a no-op: [`NavStack::pop`] returns `None` so the
-/// caller can flash a "at root" message rather than crashing.
+/// The navigation stack. `items[0]` is the root, `items.last()` the top.
 #[derive(Debug)]
 pub struct NavStack {
-    /// The current top of the stack. Always present — the chain is
-    /// never empty because `pop()` refuses to remove the root.
-    top: NavStep,
-    /// The root view before the last `reset()`, used for
-    /// "toggle last view" (Ctrl-^).
-    prev_root: Option<ViewId>,
+    items: Vec<Element>,
+    prev_root: Option<RootSpec>,
 }
 
 impl NavStack {
-    /// Create a new NavStack with a root step for the given resource.
-    pub fn new(rid: ResourceId) -> Self {
-        Self {
-            top: NavStep::root(rid),
-            prev_root: None,
+    pub fn new(root: Element) -> Self {
+        Self { items: vec![root], prev_root: None }
+    }
+
+    /// The top element — the only element the TUI interprets.
+    pub fn top(&self) -> &Element {
+        self.items.last().expect("NavStack is never empty (pop refuses the root)")
+    }
+
+    pub fn top_mut(&mut self) -> &mut Element {
+        self.items.last_mut().expect("NavStack is never empty (pop refuses the root)")
+    }
+
+    /// Push a derived element. The outgoing top is covered: its memoized
+    /// view is dropped (ephemeral by rule — rebuilt on first read after
+    /// pop), its persistent interaction state stays untouched.
+    pub fn push(&mut self, element: Element) {
+        if let Some(covered) = self.items.last_mut() {
+            covered.drop_view_cache();
         }
+        self.items.push(element);
     }
 
-    /// The current (topmost) step.
-    pub fn current(&self) -> &NavStep {
-        &self.top
-    }
-
-    /// Mutable access to the current step.
-    pub fn current_mut(&mut self) -> &mut NavStep {
-        &mut self.top
-    }
-
-    /// The current view id.
-    pub fn view_id(&self) -> &ViewId {
-        &self.top.view
-    }
-
-    /// Convenience: the underlying `ResourceId` if the current view is
-    /// a resource view. Returns `None` for derived views.
-    pub fn resource_id(&self) -> Option<&ResourceId> {
-        self.view_id().resource_id()
-    }
-
-    /// The root view id (bottom of the stack). Walks the parent
-    /// chain to the last link.
-    pub fn root_view_id(&self) -> &ViewId {
-        let mut node = &self.top;
-        while let Some(ref p) = node.parent {
-            node = p;
-        }
-        &node.view
-    }
-
-    /// Convenience: the root `ResourceId`, if the root view is a
-    /// resource view. Returns `None` for derived views.
-    pub fn root_resource_id(&self) -> Option<&ResourceId> {
-        self.root_view_id().resource_id()
-    }
-
-    /// Push a new step (grep or drill-down). Returns subscription changes.
-    ///
-    /// **Invariant:** same-rid pushes only ever carry **client-side**
-    /// filters (`Grep`, `Fault`) whose `to_subscription_filter()` is
-    /// `None`. They inherit the parent step's substream — the data is
-    /// already flowing through the table (global or NavStep), and the new
-    /// step just narrows what the table widget renders.
-    ///
-    /// A same-rid push that introduced a *server-side* filter would be
-    /// a bug: it would leak two concurrent watchers for the same rid,
-    /// and the unfiltered one's snapshots would shadow the filtered
-    /// one's. The debug-assert below catches any future call site that
-    /// forgets this.
-    pub fn push(&mut self, mut step: NavStep) -> NavChange {
-        debug_assert!(
-            step.parent.is_none(),
-            "NavStack::push: caller constructed a NavStep with a parent chain \
-             — callers own only the top, the stack owns the history",
-        );
-        let old = self.top.view.clone();
-        let sub_filter = step.filter.as_ref().and_then(|f| f.to_subscription_filter());
-        let sub_ns = step.filter.as_ref().and_then(|f| f.subscription_namespace());
-        // Splice the old top in as the new step's parent, then install
-        // the new step as the top. We need a placeholder ResourceId for
-        // the temporary root — use a dummy that gets immediately replaced.
-        // Extract a ResourceId from old to keep the placeholder valid.
-        let placeholder_rid = match &old {
-            ViewId::Resource(rid) => rid.clone(),
-            ViewId::Derived(_) => {
-                // For derived views, walk to find the root ResourceId.
-                // This placeholder is immediately replaced, so any rid works.
-                crate::kube::resource_def::BuiltInKind::Pod.into()
-            }
-        };
-        let old_top = std::mem::replace(&mut self.top, NavStep::root(placeholder_rid));
-        step.parent = Some(Box::new(old_top));
-        self.top = step;
-        let new = self.top.view.clone();
-        if new != old {
-            // Extract the ResourceId to subscribe to, if the new view is a resource.
-            let subscribe_rid = match &new {
-                ViewId::Resource(rid) => Some(rid.clone()),
-                ViewId::Derived(_) => None,
-            };
-            NavChange { subscribe: subscribe_rid, subscription_filter: sub_filter, namespace: sub_ns }
+    /// Pop the top element (undo one scope transition). `None` at the
+    /// root — callers flash "at root" rather than crash. The returned
+    /// element drops at the caller's discretion; its backward Arcs
+    /// release then.
+    pub fn pop(&mut self) -> Option<Element> {
+        if self.items.len() > 1 {
+            self.items.pop()
         } else {
-            debug_assert!(
-                sub_filter.is_none(),
-                "NavStack::push: same-view push must not carry a server-side subscription filter \
-                 (would leak a concurrent watcher and shadow the parent step's filtered data)"
-            );
-            NavChange { subscribe: None, subscription_filter: None, namespace: None }
+            None
         }
     }
 
-    /// Pop one step. Returns `(popped_step, subscription_changes)`, or
-    /// `None` when already at the root — callers treat `None` as "can't
-    /// go back" and typically flash a message. Because the root has no
-    /// `parent`, popping the root is structurally impossible; that's the
-    /// invariant that makes `current()` safe without an `.expect()`.
-    pub fn pop(&mut self) -> Option<(NavStep, NavChange)> {
-        // `parent.take()` replaces the link with `None` and hands us the
-        // boxed parent node. `None` means we're at the root and refuse
-        // to pop.
-        let parent = self.top.parent.take()?;
-
-        let old = self.top.view.clone();
-        // Install the parent as the new top; the old top is what we return.
-        let popped = std::mem::replace(&mut self.top, *parent);
-        let new = self.top.view.clone();
-
-        // When popping back across a view change, prefer to inherit the
-        // **owner step's** existing substream if it's still alive. The
-        // new top might be a client-side filter over a same-view ancestor;
-        // in that case `current().stream` is `None` but a deeper ancestor
-        // still owns the live stream. Skipping re-subscribe here preserves
-        // cached rows for instant pop-back; re-subscribing would open a
-        // duplicate watcher AND wipe the ancestor's rows.
-        let sub_filter = self.top.filter.as_ref().and_then(|f| f.to_subscription_filter());
-        let sub_ns = self.top.filter.as_ref().and_then(|f| f.subscription_namespace());
-        let change = if new != old {
-            // The new top (restored parent) may still hold its own live
-            // subscription stream from before the drill-down. Check the
-            // top's own stream FIRST — `same_view_ancestor_has_live_stream`
-            // only walks ancestors, missing the top itself. Without this, every
-            // pop-back across a view change triggered a re-subscribe + data
-            // clear, causing a visible "Loading..." flash even though the
-            // data was already cached and the stream alive. Liveness-checked
-            // (not mere presence) so a terminated bridge's stale handle can't
-            // suppress the re-subscribe the dead view needs.
-            if self.top.has_live_stream() || self.same_view_ancestor_has_live_stream() {
-                NavChange { subscribe: None, subscription_filter: None, namespace: None }
-            } else {
-                // Extract ResourceId if this is a resource view.
-                let subscribe_rid = match &new {
-                    ViewId::Resource(rid) => Some(rid.clone()),
-                    ViewId::Derived(_) => None,
-                };
-                NavChange { subscribe: subscribe_rid, subscription_filter: sub_filter, namespace: sub_ns }
-            }
-        } else {
-            NavChange { subscribe: None, subscription_filter: None, namespace: None }
-        };
-        Some((popped, change))
+    /// Replace the whole stack with a fresh root (`:cmd`, tab cycling,
+    /// namespace/context switch). Records the outgoing ROOT's recipe for
+    /// `-`, then drains the old stack **top to bottom** — children release
+    /// their backward Arcs before the parents they point into drop.
+    pub fn reset(&mut self, new_root: Element) {
+        self.prev_root = self.items.first().and_then(root_spec_of);
+        while self.items.pop().is_some() {}
+        self.items.push(new_root);
     }
 
-    /// Depth of the subscription-owner ancestor from the top (0 = top,
-    /// 1 = top's parent, ...). The owner is the deepest same-rid
-    /// ancestor that holds `stream: Some(_)`. Falls back to 0 if no
-    /// same-rid ancestor owns a stream — the top is its own owner.
-    fn subscription_owner_depth(&self) -> usize {
-        let current_view = &self.top.view;
-        let mut depth = 0usize;
-        let mut best = 0usize;
-        let mut node = &self.top;
-        loop {
-            if node.view != *current_view { break; }
-            if node.stream.is_some() { best = depth; }
-            match node.parent.as_deref() {
-                Some(p) => { depth += 1; node = p; }
-                None => break,
-            }
-        }
-        best
-    }
-
-    /// True if any same-view ancestor (strictly ancestor — not the top) owns a
-    /// subscription whose bridge is still *running*. Used by `pop` to decide
-    /// whether the new top can inherit a parent's live stream instead of
-    /// re-subscribing. A present-but-dead handle is skipped (via
-    /// `has_live_stream`), so a terminated bridge can't trick pop into leaving
-    /// the restored view unsubscribed.
-    fn same_view_ancestor_has_live_stream(&self) -> bool {
-        let current_view = &self.top.view;
-        let mut node = match self.top.parent.as_deref() {
-            Some(p) => p,
-            None => return false,
-        };
-        loop {
-            if node.view != *current_view { return false; }
-            if node.has_live_stream() { return true; }
-            match node.parent.as_deref() {
-                Some(p) => node = p,
-                None => return false,
-            }
-        }
-    }
-
-    /// Run a closure with mutable access to the subscription-owner step.
-    /// The owner is the deepest same-rid ancestor with a live stream; if
-    /// none exists, the closure runs against the current top. Callers
-    /// use this to touch `stream` on the owner (clear during refresh,
-    /// replace after a new subscribe) without ever seeing a raw index.
-    pub fn with_subscription_owner<R>(
-        &mut self,
-        f: impl FnOnce(&mut NavStep) -> R,
-    ) -> R {
-        let depth = self.subscription_owner_depth();
-        let mut node: &mut NavStep = &mut self.top;
-        for _ in 0..depth {
-            // Depth was just computed from a walk along this same chain,
-            // so the parent links exist. If they don't, that's a bug in
-            // `subscription_owner_depth`, not at a call site.
-            node = node.parent.as_deref_mut()
-                .expect("subscription_owner_depth out of range — chain changed underneath");
-        }
-        f(node)
-    }
-
-    /// Clear any `stream: Some(_)` handle on steps whose view matches `rid`.
-    /// Called when a subscription for this rid has terminated server-side
-    /// (error, EOF) — the bridge task is already finished, but its handle is
-    /// still sitting in `NavStep.stream`. Eagerly dropping it frees the handle
-    /// at the moment of failure rather than waiting for the next pop.
-    ///
-    /// Pop's re-subscribe decision independently guards against a stale handle
-    /// (it consults `has_live_stream`, not mere presence), so this is no longer
-    /// the *sole* defense against a dead owner suppressing re-subscribe — but
-    /// it's still worth doing eagerly, and the same event carries the
-    /// user-facing Failed state + error flash.
-    pub fn clear_dead_subscription_for(&mut self, rid: &ResourceId) {
-        let target = ViewId::Resource(rid.clone());
-        let mut node: &mut NavStep = &mut self.top;
-        loop {
-            if node.view == target && node.stream.is_some() {
-                node.stream = None;
-            }
-            match node.parent.as_deref_mut() {
-                Some(p) => node = p,
-                None => break,
-            }
-        }
-    }
-
-    /// Drop every `SubscriptionStream` handle in the entire stack. Called on
-    /// session rebuild (context switch or reconnect) — the old session is dead,
-    /// so every handle is a no-op `AbortHandle` to a finished task. Pop's
-    /// liveness check (`has_live_stream`) would skip these dead handles anyway,
-    /// but clearing them eagerly keeps the stack honest rather than holding
-    /// finished-task handles across the rebuild.
-    pub fn clear_all_streams(&mut self) {
-        let mut node: &mut NavStep = &mut self.top;
-        loop {
-            node.stream = None;
-            match node.parent.as_deref_mut() {
-                Some(p) => node = p,
-                None => break,
-            }
-        }
-    }
-
-    /// Replace the entire stack with a new root. Returns subscription changes.
-    ///
-    /// Always returns `subscribe: Some(rid)` because resetting drops every
-    /// step's subscription stream. Even when the rid is unchanged
-    /// (e.g., `:pods` while already on pods), the streams were destroyed
-    /// and the caller must open a new one via `apply_nav_change`.
-    pub fn reset(&mut self, rid: ResourceId) -> NavChange {
-        self.prev_root = Some(self.root_view_id().clone());
-        let view = ViewId::Resource(rid.clone());
-        let mut step = NavStep::root(rid.clone());
-        // For non-globally-stored resources, create the table on the root
-        // step so snapshot data lands on the NavStep (RAII ownership).
-        if !is_globally_stored(&view) {
-            step.table = Some(crate::app::table::StatefulTable::new());
-        }
-        self.top = step;
-        NavChange {
-            subscribe: Some(rid),
-            subscription_filter: None,
-            namespace: None,
-        }
-    }
-
-    /// Collect all filters that apply to the current view, root-first
-    /// (outermost) through leaf (innermost). Walks from top backward
-    /// along same-rid ancestors and then reverses.
-    pub fn active_filters(&self) -> Vec<&NavFilter> {
-        let current_view = &self.top.view;
-        let mut filters = Vec::new();
-        let mut node = &self.top;
-        loop {
-            if node.view != *current_view { break; }
-            if let Some(ref f) = node.filter { filters.push(f); }
-            match node.parent.as_deref() {
-                Some(p) => node = p,
-                None => break,
-            }
-        }
-        filters.reverse();
-        filters
+    /// Bottom→top walk for the crumb bar and indicator scans. Read-only:
+    /// nothing below the top can be interpreted, only labeled.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Element> {
+        self.items.iter()
     }
 
     pub fn depth(&self) -> usize {
-        let mut n = 1usize;
-        let mut node = &self.top;
-        while let Some(ref p) = node.parent {
-            n += 1;
-            node = p;
-        }
-        n
+        self.items.len()
     }
 
-    pub fn is_drilled(&self) -> bool { self.top.parent.is_some() }
-
-    /// Remove the topmost [`NavFilter::Fault`] step from the stack, if
-    /// any. Returns true if a step was removed. The root step (which
-    /// never carries a filter from the reset path) is left alone even
-    /// if a caller somehow set one.
-    pub fn pop_fault_filter(&mut self) -> bool {
-        // Check the top first: if it's fault-filtered, pop it (uses the
-        // normal pop path so a same-rid ancestor's stream is inherited).
-        if matches!(self.top.filter, Some(NavFilter::Fault)) && self.top.parent.is_some() {
-            self.pop();
-            return true;
-        }
-        // Otherwise walk: find the first ancestor whose parent is
-        // fault-filtered, and splice the parent out.
-        let mut node: &mut NavStep = &mut self.top;
-        loop {
-            let parent_is_fault = node.parent.as_deref()
-                .map(|p| matches!(p.filter, Some(NavFilter::Fault)) && p.parent.is_some())
-                .unwrap_or(false);
-            if parent_is_fault {
-                // Splice: node.parent = node.parent.parent
-                let mut parent_box = node.parent.take().expect("checked by parent_is_fault");
-                node.parent = parent_box.parent.take();
-                return true;
-            }
-            match node.parent.as_deref_mut() {
-                Some(p) => node = p,
-                None => return false,
-            }
-        }
+    pub fn is_drilled(&self) -> bool {
+        self.items.len() > 1
     }
 
-    pub fn has_fault_filter(&self) -> bool {
-        let mut node = &self.top;
-        loop {
-            if matches!(&node.filter, Some(NavFilter::Fault)) {
-                return true;
-            }
-            match node.parent.as_deref() {
-                Some(p) => node = p,
-                None => return false,
-            }
-        }
+    /// The crumb bar: a fold over the elements' self-owned labels.
+    pub fn breadcrumb(&self) -> String {
+        self.items.iter().map(Element::label).collect::<Vec<_>>().join(" > ")
     }
 
-    pub fn save_selected(&mut self, selected: usize) {
-        self.top.saved_selected = selected;
-    }
-
-    pub fn prev_root(&self) -> Option<&ViewId> {
+    /// The recipe of the root before the last reset (`-` toggle).
+    pub fn prev_root(&self) -> Option<&RootSpec> {
         self.prev_root.as_ref()
     }
 
-    /// Walk from the top through the parent chain and return the first step
-    /// where `step.view` matches `rid` and `step.table.is_some()`.
-    pub fn find_table_for_resource(&self, rid: &ResourceId) -> Option<&crate::app::table::StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        let target = ViewId::Resource(rid.clone());
-        let mut node = &self.top;
-        loop {
-            if node.view == target {
-                if let Some(ref t) = node.table {
-                    return Some(t);
-                }
-            }
-            match node.parent.as_deref() {
-                Some(p) => node = p,
-                None => return None,
-            }
-        }
+    /// The current root's recipe (recorded by the ns/context-switch paths
+    /// to rebuild the same root under a new scope).
+    pub fn root_spec(&self) -> Option<RootSpec> {
+        self.items.first().and_then(root_spec_of)
     }
 
-    /// Mutable version of [`find_table_for_resource`].
-    pub fn find_table_for_resource_mut(&mut self, rid: &ResourceId) -> Option<&mut crate::app::table::StatefulTable<crate::kube::resources::row::ResourceRow>> {
-        let target = ViewId::Resource(rid.clone());
-        let mut node: &mut NavStep = &mut self.top;
-        loop {
-            if node.view == target && node.table.is_some() {
-                return node.table.as_mut();
-            }
-            match node.parent.as_deref_mut() {
-                Some(p) => node = p,
-                None => return None,
-            }
-        }
+    /// Convenience: the top's resource id, if resource-backed.
+    pub fn resource_id(&self) -> Option<&ResourceId> {
+        self.top().rid()
     }
 
-    /// Walk from the top through the parent chain and return the first
-    /// descriptor where `step.view` matches `rid` and `step.descriptor.is_some()`.
-    pub fn find_descriptor_for_resource(&self, rid: &ResourceId) -> Option<&crate::app::TableDescriptor> {
-        let target = ViewId::Resource(rid.clone());
-        let mut node = &self.top;
-        loop {
-            if node.view == target {
-                if let Some(ref d) = node.descriptor {
-                    return Some(d);
-                }
-            }
-            match node.parent.as_deref() {
-                Some(p) => node = p,
-                None => return None,
-            }
-        }
-    }
+    // -- Named data-plane maintenance (the sanctioned below-top walks) ------
 
-    /// Set the descriptor on the first step that owns a table for `rid`.
-    /// Used by `apply_resource_update` to co-locate the descriptor with
-    /// the table data on the same NavStep.
-    pub fn set_descriptor_for_resource(&mut self, rid: &ResourceId, descriptor: crate::app::TableDescriptor) {
-        let target = ViewId::Resource(rid.clone());
-        let mut node: &mut NavStep = &mut self.top;
-        loop {
-            if node.view == target && node.table.is_some() {
-                node.descriptor = Some(descriptor);
-                return;
-            }
-            match node.parent.as_deref_mut() {
-                Some(p) => node = p,
-                None => return,
-            }
-        }
-    }
-
-    /// The current step's filter input state.
-    pub fn filter_input(&self) -> &FilterInputState {
-        &self.top.filter_input
-    }
-
-    /// Mutable access to the current step's filter input state.
-    pub fn filter_input_mut(&mut self) -> &mut FilterInputState {
-        &mut self.top.filter_input
-    }
-
-    pub fn breadcrumb(&self) -> String {
-        // Walk from top to root collecting steps in reverse order, then
-        // iterate forward to build the root → ... → current breadcrumb.
-        let mut steps: Vec<&NavStep> = Vec::new();
-        let mut node = &self.top;
-        loop {
-            steps.push(node);
-            match node.parent.as_deref() {
-                Some(p) => node = p,
-                None => break,
-            }
-        }
-        steps.reverse();
-
-        let mut parts = Vec::new();
-        for (i, step) in steps.iter().enumerate() {
-            if i == 0 && step.filter.is_none() {
-                parts.push(step.view.short_label().to_string());
-                continue;
-            }
-            match &step.filter {
-                Some(NavFilter::Grep(g)) => parts.push(format!("/{}", g.source())),
-                Some(NavFilter::ColumnGrep { pattern, header, .. }) => parts.push(format!("~{}:{}", header, pattern.source())),
-                Some(NavFilter::Fault) => parts.push("⚠ fault".to_string()),
-                Some(NavFilter::Labels { labels, .. }) => {
-                    let label_str: Vec<String> = labels.iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
-                        .collect();
-                    parts.push(label_str.join(","));
-                }
-                Some(NavFilter::Field(sel)) => {
-                    let cross_resource = i > 0 && step.view != steps[i - 1].view;
-                    if cross_resource {
-                        if let K8sFieldSelector::MetadataName(name) = sel {
-                            parts.push(format!("{}/{}", step.view.short_label(), name));
-                        } else {
-                            parts.push(sel.breadcrumb());
-                        }
-                    } else {
-                        parts.push(sel.breadcrumb());
+    /// Revive the subscription feeding the TOP's data, if its bridge died
+    /// (reconnect, failure while covered). The owner is found by STORE
+    /// POINTER IDENTITY — never by rid, so two same-rid elements with
+    /// different filters can never cross-revive.
+    pub fn ensure_top_live(&mut self, session: &ClientSession) {
+        let Some(store) = self.top().data_store().cloned() else { return };
+        for element in self.items.iter_mut().rev() {
+            if let Element::ResourceList(list) = element {
+                if Arc::ptr_eq(list.query().store(), &store) {
+                    if !list.query().is_live() {
+                        list.query_mut().resubscribe(session);
                     }
-                }
-                Some(NavFilter::OwnerChain { display_name, kind, .. }) => {
-                    let kind_str = crate::kube::resource_defs::REGISTRY.by_kind(*kind).gvr().kind;
-                    parts.push(format!("{}/{}", kind_str, display_name));
-                }
-                None => {
-                    // Derived views with a source show "parent-name > ViewLabel"
-                    if let Some(ref src) = step.source {
-                        parts.push(src.name.clone());
-                    }
-                    parts.push(step.view.short_label().to_string());
+                    return;
                 }
             }
         }
-        parts.join(" > ")
+    }
+
+    /// Ctrl-R: force-refresh the subscription feeding the TOP's data —
+    /// found by store pointer identity, re-run with the element's OWN
+    /// stored query spec (never the ambient selector).
+    pub fn refresh_top_query(&mut self, session: &ClientSession) {
+        let Some(store) = self.top().data_store().cloned() else { return };
+        for element in self.items.iter_mut().rev() {
+            if let Element::ResourceList(list) = element {
+                if Arc::ptr_eq(list.query().store(), &store) {
+                    list.query_mut().refresh(session);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Route a log-stream control (range restart) to the SESSION that
+    /// owns the top's line store — found by pointer identity, the same
+    /// named-walk discipline as `ensure_top_live`.
+    pub fn with_log_session_of(
+        &mut self,
+        store: &Arc<crate::app::store::LineStore>,
+        f: impl FnOnce(&mut crate::app::element::LogSession),
+    ) {
+        for element in self.items.iter_mut().rev() {
+            if let Element::LogSession(session) = element {
+                if Arc::ptr_eq(session.store(), store) {
+                    f(session);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The server resolved a rid to its true identity: elements update
+    /// themselves in place (the element IS the identity — no global maps
+    /// to rekey).
+    pub fn apply_resolved(&mut self, original: &ResourceId, resolved: &ResourceId) {
+        for element in self.items.iter_mut() {
+            if let Element::ResourceList(list) = element {
+                if list.rid() == original {
+                    list.apply_resolved(resolved.clone());
+                }
+            }
+        }
+    }
+
+    // -- Fault-filter helpers (Ctrl-Z) ---------------------------------------
+
+    /// Whether the TOP element is a fault filter (poppable by Ctrl-Z).
+    pub fn top_is_fault(&self) -> bool {
+        self.top().is_fault_filter()
+    }
+
+    /// Whether ANY element on the stack is a fault filter. Under strict
+    /// LIFO a buried fault step can't be spliced out (the old mid-chain
+    /// splice is gone — children's value-copied predicate chains would
+    /// not have updated anyway); Ctrl-Z on a buried fault flashes instead.
+    pub fn any_fault(&self) -> bool {
+        self.items.iter().any(Element::is_fault_filter)
     }
 }
 
+impl Drop for NavStack {
+    /// Whole-stack teardown (context switch, app exit) must ALSO run
+    /// top-to-bottom — a bare Vec drop is bottom-first, which would tear
+    /// parents down under children still holding backward Arcs into them.
+    fn drop(&mut self) {
+        while self.items.pop().is_some() {}
+    }
+}
+
+fn root_spec_of(root: &Element) -> Option<RootSpec> {
+    root.rid().cloned().map(RootSpec::Resource)
+}
+
+/// Convenience helper: build a built-in `ResourceId` from a typed
+/// [`BuiltInKind`](crate::kube::resource_def::BuiltInKind). Compile-time
+/// checked: typos become E0599, not runtime panics.
+pub fn rid(kind: crate::kube::resource_def::BuiltInKind) -> ResourceId {
+    ResourceId::BuiltIn(kind)
+}
+
 // ---------------------------------------------------------------------------
-// FilterInputState — the input widget state (while user is typing `/`)
+// FilterInputState — the input widget state (while the user types `/`/`~`)
 // ---------------------------------------------------------------------------
 
-/// Tracks the filter input widget state, separate from committed nav filters.
-/// Fields are private — mutation goes through typed methods that enforce
-/// valid transitions (same pattern as LogState's encapsulated fields).
+/// The filter input widget state — element-owned draft interaction state
+/// (each element keeps its own; covering an element never leaks its draft
+/// into another). Fields are private — mutation goes through typed
+/// methods that enforce valid transitions.
 #[derive(Debug, Default, Clone)]
 pub struct FilterInputState {
     active: bool,
@@ -866,9 +290,9 @@ pub struct FilterInputState {
 }
 
 /// Column restriction for `~` mode: the DATA index the filter matches
-/// against plus the header name captured at activation — one value, so the
-/// pair can't drift (the filter uses the index, the breadcrumb shows the
-/// header).
+/// against plus the header name captured at activation — one value, so
+/// the pair can't drift (the predicate uses the index, the crumb shows
+/// the header).
 #[derive(Debug, Clone)]
 pub(crate) struct ColumnTarget {
     pub index: usize,
@@ -887,11 +311,17 @@ impl FilterInputState {
     // -- Read-only accessors --------------------------------------------------
 
     /// Whether the filter bar is in edit mode (listening for keystrokes).
-    pub fn active(&self) -> bool { self.active }
-    /// The text being typed (not yet committed to NavStack).
-    pub fn text(&self) -> &str { &self.text }
+    pub fn active(&self) -> bool {
+        self.active
+    }
+    /// The text being typed (not yet committed as a RowFilter element).
+    pub fn text(&self) -> &str {
+        &self.text
+    }
     /// Column restriction index, if any (`~` mode).
-    pub fn column(&self) -> Option<usize> { self.column.as_ref().map(|c| c.index) }
+    pub fn column(&self) -> Option<usize> {
+        self.column.as_ref().map(|c| c.index)
+    }
 
     // -- State transitions ----------------------------------------------------
 
@@ -903,8 +333,8 @@ impl FilterInputState {
     }
 
     /// Enter column-restricted filter mode (`~`). Takes the header name
-    /// alongside the data index — captured here because the caller has the
-    /// descriptor in hand at activation, unlike breadcrumb-render time.
+    /// alongside the data index — captured here because the caller has
+    /// the visible-column mapping in hand at activation.
     pub fn start_column(&mut self, col: usize, header: String) {
         self.active = true;
         self.text.clear();
@@ -912,16 +342,15 @@ impl FilterInputState {
     }
 
     /// Cancel without committing — discards text, resets column, exits
-    /// edit mode. Full reset so no state lingers from a cancelled `~`
-    /// column filter into the next `/` invocation.
+    /// edit mode.
     pub fn cancel(&mut self) {
         self.text.clear();
         self.column = None;
         self.active = false;
     }
 
-    /// Commit the typed text. Takes the text and column, exits edit mode.
-    /// Returns `None` if text is empty (nothing to commit).
+    /// Commit the typed text. Exits edit mode; returns `None` if the text
+    /// is empty (nothing to commit).
     pub(crate) fn commit(&mut self) -> Option<CommittedFilter> {
         self.active = false;
         let text = std::mem::take(&mut self.text);
@@ -935,498 +364,128 @@ impl FilterInputState {
 
     // -- Keystroke handling ---------------------------------------------------
 
-    pub fn push_char(&mut self, c: char) { self.text.push(c); }
-    pub fn pop_char(&mut self) { self.text.pop(); }
-}
-
-/// Convenience helper: build a built-in `ResourceId` from a typed
-/// [`BuiltInKind`]. A one-line wrapper for `ResourceId::BuiltIn` that
-/// keeps callsites that frequently reference well-known built-ins
-/// (pods, nodes, namespaces, crds) brief. Compile-time checked:
-/// typos become E0599, not runtime panics.
-pub fn rid(kind: crate::kube::resource_def::BuiltInKind) -> ResourceId {
-    ResourceId::BuiltIn(kind)
-}
-
-/// Returns `true` for views whose tables live in the global
-/// `AppData::unified` store rather than on a `NavStep`. These are
-/// long-lived resources the TUI always needs (namespace list for the
-/// picker, node list for ShowNode drill, CRD list for command
-/// completion and `:crd` browsing). Derived views are never globally
-/// stored.
-pub fn is_globally_stored(view: &ViewId) -> bool {
-    use crate::kube::resource_def::BuiltInKind;
-    match view {
-        ViewId::Resource(rid) => matches!(
-            rid.built_in_kind(),
-            Some(BuiltInKind::Namespace | BuiltInKind::Node | BuiltInKind::CustomResourceDefinition)
-        ),
-        ViewId::Derived(_) => false,
+    pub fn push_char(&mut self, c: char) {
+        self.text.push(c);
+    }
+    pub fn pop_char(&mut self) {
+        self.text.pop();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::element::{ContentSpec, ContentView, Element, QuerySpec, ResourceList};
+    use crate::app::store::{MetricsHub, RowPredicate};
+    use crate::kube::protocol::Namespace;
     use crate::kube::resource_def::BuiltInKind;
 
-    fn pod_rid() -> ResourceId { rid(BuiltInKind::Pod) }
-    fn deploy_rid() -> ResourceId { rid(BuiltInKind::Deployment) }
-    fn node_rid() -> ResourceId { rid(BuiltInKind::Node) }
-    fn svc_rid() -> ResourceId { rid(BuiltInKind::Service) }
-
-    fn pod_view() -> ViewId { ViewId::Resource(pod_rid()) }
-    fn deploy_view() -> ViewId { ViewId::Resource(deploy_rid()) }
-    fn svc_view() -> ViewId { ViewId::Resource(svc_rid()) }
-
-    // -----------------------------------------------------------------------
-    // push / pop basics
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn push_changes_resource_id() {
-        let mut stack = NavStack::new(pod_rid());
-        assert_eq!(stack.view_id(), &pod_view());
-
-        let step = NavStep::new(deploy_rid(), None);
-        let change = stack.push(step);
-        assert_eq!(stack.view_id(), &deploy_view());
-        assert!(change.subscribe.is_some(), "cross-rid push should subscribe");
+    fn list(kind: BuiltInKind) -> Element {
+        Element::ResourceList(ResourceList::open_for_test(
+            QuerySpec {
+                rid: ResourceId::BuiltIn(kind),
+                namespace: Namespace::All,
+                filter: None,
+            },
+            &MetricsHub::new(),
+            ResourceId::BuiltIn(kind).short_label().to_lowercase(),
+        ))
     }
 
     #[test]
-    fn node_drill_subscribes_all_namespaces() {
-        // node → pods (spec.nodeName) is a fresh, cluster-wide subscription —
-        // a node hosts pods from every namespace, so the source view's selected
-        // namespace must not narrow it.
-        let mut stack = NavStack::new(node_rid());
-        let change = stack.push(NavStep::new(
-            pod_rid(),
-            Some(NavFilter::Field(K8sFieldSelector::SpecNodeName("node-1".into()))),
-        ));
-        assert_eq!(
-            change.namespace,
-            Some(crate::kube::protocol::Namespace::All),
-            "node→pods drill must override the namespace to all-namespaces",
-        );
-    }
-
-    #[test]
-    fn non_node_drill_inherits_selected_namespace() {
-        // A MetadataName field drill (e.g. the `o`/owner jumps) carries no
-        // namespace override — it inherits the session's selected namespace.
-        let mut stack = NavStack::new(pod_rid());
-        let change = stack.push(NavStep::new(
-            node_rid(),
-            Some(NavFilter::Field(K8sFieldSelector::MetadataName("worker-3".into()))),
-        ));
-        assert_eq!(change.namespace, None, "non-node drills inherit the selected namespace");
-    }
-
-    #[test]
-    fn pop_restores_previous_resource() {
-        let mut stack = NavStack::new(pod_rid());
-        stack.push(NavStep::new(deploy_rid(), None));
-
-        let result = stack.pop();
-        assert!(result.is_some());
-        assert_eq!(stack.view_id(), &pod_view());
-    }
-
-    /// A `SubscriptionStream` whose bridge task has already finished
-    /// (`is_alive()` is false) — stands in for a terminated subscription whose
-    /// handle is still sitting in the nav stack.
-    async fn dead_stream() -> crate::kube::client_session::SubscriptionStream {
-        let task = tokio::spawn(async {});
-        let abort = task.abort_handle();
-        let _ = task.await; // the task is now finished
-        crate::kube::client_session::SubscriptionStream::from_abort_handle(abort)
-    }
-
-    /// A `SubscriptionStream` whose bridge task is still running.
-    fn live_stream() -> crate::kube::client_session::SubscriptionStream {
-        let task = tokio::spawn(std::future::pending::<()>());
-        crate::kube::client_session::SubscriptionStream::from_abort_handle(task.abort_handle())
-    }
-
-    #[tokio::test]
-    async fn pop_resubscribes_when_restored_owner_stream_is_dead() {
-        // pods (DEAD stream) → drill to deployments → pop back to pods.
-        let mut stack = NavStack::new(pod_rid());
-        stack.top.stream = Some(dead_stream().await);
-        stack.push(NavStep::new(deploy_rid(), None));
-
-        let (_popped, change) = stack.pop().expect("not at root");
-        assert!(
-            change.subscribe.is_some(),
-            "a present-but-dead owner stream must trigger re-subscribe, not pass as live",
-        );
-    }
-
-    #[tokio::test]
-    async fn pop_inherits_when_restored_owner_stream_is_live() {
-        // pods (LIVE stream) → drill to deployments → pop back to pods.
-        let mut stack = NavStack::new(pod_rid());
-        stack.top.stream = Some(live_stream());
-        stack.push(NavStep::new(deploy_rid(), None));
-
-        let (_popped, change) = stack.pop().expect("not at root");
-        assert!(
-            change.subscribe.is_none(),
-            "a live owner stream must be inherited — re-subscribing would dup the watcher and wipe rows",
-        );
-    }
-
-    #[test]
-    fn pop_at_root_returns_none() {
-        let mut stack = NavStack::new(pod_rid());
-        assert!(stack.pop().is_none());
-    }
-
-    #[test]
-    fn push_same_rid_no_subscribe() {
-        let mut stack = NavStack::new(pod_rid());
-        let grep = NavFilter::Grep(CompiledGrep::new("nginx"));
-        let step = NavStep::new(pod_rid(), Some(grep));
-        let change = stack.push(step);
-        assert!(change.subscribe.is_none(), "same-rid push should not subscribe");
-    }
-
-    #[test]
-    fn multi_push_pop_sequence() {
-        let mut stack = NavStack::new(pod_rid());
-        stack.push(NavStep::new(deploy_rid(), None));
-        stack.push(NavStep::new(svc_rid(), None));
-        assert_eq!(stack.view_id(), &svc_view());
-        assert_eq!(stack.depth(), 3);
-
-        stack.pop();
-        assert_eq!(stack.view_id(), &deploy_view());
-        stack.pop();
-        assert_eq!(stack.view_id(), &pod_view());
-        assert!(stack.pop().is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // reset
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn reset_clears_stack_and_changes_resource() {
-        let mut stack = NavStack::new(pod_rid());
-        stack.push(NavStep::new(deploy_rid(), None));
+    fn pop_refuses_the_root_and_lifo_holds() {
+        let mut stack = NavStack::new(list(BuiltInKind::Pod));
+        assert!(stack.pop().is_none(), "root never pops");
+        stack.push(list(BuiltInKind::Deployment));
         assert_eq!(stack.depth(), 2);
-
-        let change = stack.reset(svc_rid());
-        assert_eq!(stack.view_id(), &svc_view());
+        assert!(stack.is_drilled());
+        assert!(stack.pop().is_some());
         assert_eq!(stack.depth(), 1);
         assert!(!stack.is_drilled());
-        assert!(change.subscribe.is_some());
+        assert!(stack.pop().is_none());
     }
 
     #[test]
-    fn reset_tracks_prev_root() {
-        let mut stack = NavStack::new(pod_rid());
-        assert!(stack.prev_root().is_none());
-
-        stack.reset(deploy_rid());
-        assert_eq!(stack.prev_root(), Some(&pod_view()));
-
-        stack.reset(svc_rid());
-        assert_eq!(stack.prev_root(), Some(&deploy_view()));
-    }
-
-    // -----------------------------------------------------------------------
-    // filter inheritance / is_drilled
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn grep_push_marks_drilled() {
-        let mut stack = NavStack::new(pod_rid());
-        assert!(!stack.is_drilled());
-
-        let grep = NavFilter::Grep(CompiledGrep::new("nginx"));
-        stack.push(NavStep::new(pod_rid(), Some(grep)));
-        assert!(stack.is_drilled());
-    }
-
-    #[test]
-    fn pop_removes_grep_filter() {
-        let mut stack = NavStack::new(pod_rid());
-        let grep = NavFilter::Grep(CompiledGrep::new("nginx"));
-        stack.push(NavStep::new(pod_rid(), Some(grep)));
-
-        assert_eq!(stack.active_filters().len(), 1);
-        stack.pop();
-        assert!(stack.active_filters().is_empty());
-        assert!(!stack.is_drilled());
-    }
-
-    #[test]
-    fn active_filters_stacks_same_rid() {
-        let mut stack = NavStack::new(pod_rid());
-        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Grep(CompiledGrep::new("a")))));
-        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Grep(CompiledGrep::new("b")))));
-
-        let filters = stack.active_filters();
-        assert_eq!(filters.len(), 2);
-        // Root-first order: "a" was pushed first, so it appears first.
-        assert_eq!(filters[0].as_grep().unwrap().source(), "a");
-        assert_eq!(filters[1].as_grep().unwrap().source(), "b");
-    }
-
-    #[test]
-    fn active_filters_stops_at_rid_boundary() {
-        let mut stack = NavStack::new(pod_rid());
-        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Grep(CompiledGrep::new("x")))));
-        // Push a different resource -- the pod grep should not appear in active_filters.
-        stack.push(NavStep::new(deploy_rid(), Some(NavFilter::Grep(CompiledGrep::new("y")))));
-
-        let filters = stack.active_filters();
-        assert_eq!(filters.len(), 1);
-        assert_eq!(filters[0].as_grep().unwrap().source(), "y");
-    }
-
-    #[test]
-    fn fault_filter_push_and_pop() {
-        let mut stack = NavStack::new(pod_rid());
-        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Fault)));
-        assert!(stack.has_fault_filter());
-
-        assert!(stack.pop_fault_filter());
-        assert!(!stack.has_fault_filter());
-    }
-
-    // -----------------------------------------------------------------------
-    // breadcrumb
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn breadcrumb_root_only() {
-        let stack = NavStack::new(pod_rid());
-        let bc = stack.breadcrumb();
-        // Root with no filter shows the short_label (e.g. "po" for pods).
-        assert!(!bc.is_empty());
-    }
-
-    #[test]
-    fn breadcrumb_with_grep() {
-        let mut stack = NavStack::new(pod_rid());
-        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Grep(CompiledGrep::new("nginx")))));
-        let bc = stack.breadcrumb();
-        assert!(bc.contains("/nginx"), "breadcrumb should contain grep pattern, got: {}", bc);
-    }
-
-    #[test]
-    fn breadcrumb_with_drill() {
-        let mut stack = NavStack::new(pod_rid());
-        stack.push(NavStep::new(deploy_rid(), None));
-        let bc = stack.breadcrumb();
-        // Should contain " > " separator between two resource labels.
-        assert!(bc.contains(" > "), "breadcrumb should contain separator, got: {}", bc);
-    }
-
-    #[test]
-    fn breadcrumb_fault_filter() {
-        let mut stack = NavStack::new(pod_rid());
-        stack.push(NavStep::new(pod_rid(), Some(NavFilter::Fault)));
-        let bc = stack.breadcrumb();
-        assert!(bc.contains("fault"), "breadcrumb should contain fault, got: {}", bc);
-    }
-
-    #[test]
-    fn breadcrumb_field_selector() {
-        let mut stack = NavStack::new(deploy_rid());
-        let field = NavFilter::Field(K8sFieldSelector::SpecNodeName("node-1".into()));
-        // Field selector is a server-side filter, so it must be a cross-rid push.
-        stack.push(NavStep::new(pod_rid(), Some(field)));
-        let bc = stack.breadcrumb();
-        assert!(bc.contains("node=node-1"), "breadcrumb should contain field selector, got: {}", bc);
-    }
-
-    #[test]
-    fn breadcrumb_cross_resource_metadata_name() {
-        // ShowNode: pods → nodes filtered by metadata.name
-        let mut stack = NavStack::new(pod_rid());
-        let field = NavFilter::Field(K8sFieldSelector::MetadataName("worker-3".into()));
-        stack.push(NavStep::new(node_rid(), Some(field)));
-        let bc = stack.breadcrumb();
-        assert!(bc.contains("Nodes/worker-3"), "cross-resource MetadataName should show resource/name, got: {}", bc);
-        assert!(!bc.contains("name="), "should not show raw field selector for cross-resource, got: {}", bc);
-    }
-
-    // -----------------------------------------------------------------------
-    // find_table_for_resource
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn find_table_on_step_with_table() {
-        let mut stack = NavStack::new(pod_rid());
-        let mut step = NavStep::new(deploy_rid(), None);
-        step.table = Some(crate::app::table::StatefulTable::new());
-        stack.push(step);
-
-        assert!(stack.find_table_for_resource(&deploy_rid()).is_some());
-        assert!(stack.find_table_for_resource(&pod_rid()).is_none());
-    }
-
-    #[test]
-    fn find_table_walks_parent_chain() {
-        let mut stack = NavStack::new(pod_rid());
-        let mut step = NavStep::new(deploy_rid(), None);
-        step.table = Some(crate::app::table::StatefulTable::new());
-        stack.push(step);
-        // Push another step on top (same rid, no table).
-        stack.push(NavStep::new(deploy_rid(), Some(NavFilter::Grep(CompiledGrep::new("x")))));
-
-        // Should walk past the grep step and find the table on the parent.
-        assert!(stack.find_table_for_resource(&deploy_rid()).is_some());
-    }
-
-    #[test]
-    fn find_table_returns_none_when_absent() {
-        let stack = NavStack::new(pod_rid());
-        assert!(stack.find_table_for_resource(&svc_rid()).is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // root_resource_id / depth / save_selected
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn root_resource_id_after_pushes() {
-        let mut stack = NavStack::new(pod_rid());
-        stack.push(NavStep::new(deploy_rid(), None));
-        stack.push(NavStep::new(svc_rid(), None));
-        assert_eq!(stack.root_view_id(), &pod_view());
-    }
-
-    #[test]
-    fn save_and_restore_selected() {
-        let mut stack = NavStack::new(pod_rid());
-        stack.save_selected(42);
-        stack.push(NavStep::new(deploy_rid(), None));
-
-        let (_, _) = stack.pop().unwrap();
-        assert_eq!(stack.current().saved_selected, 42);
-    }
-
-    // -----------------------------------------------------------------------
-    // NavFilter::to_subscription_filter
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn grep_filter_returns_none() {
-        let f = NavFilter::Grep(CompiledGrep::new("nginx"));
-        assert!(f.to_subscription_filter().is_none());
-    }
-
-    #[test]
-    fn fault_filter_returns_none() {
-        let f = NavFilter::Fault;
-        assert!(f.to_subscription_filter().is_none());
-    }
-
-    #[test]
-    fn column_grep_filter_returns_none() {
-        let f = NavFilter::ColumnGrep { pattern: CompiledGrep::new("x"), col: 2, header: "STATUS".into() };
-        assert!(f.to_subscription_filter().is_none());
-    }
-
-    #[test]
-    fn labels_filter_returns_subscription_labels() {
-        let mut labels = std::collections::BTreeMap::new();
-        labels.insert("app".into(), "web".into());
-        let f = NavFilter::Labels { labels: labels.clone(), namespace: crate::kube::protocol::Namespace::All };
+    fn reset_drains_everything_and_records_prev_root() {
+        let mut stack = NavStack::new(list(BuiltInKind::Pod));
+        let root_store = std::sync::Arc::clone(stack.top().data_store().unwrap());
+        stack.push(
+            Element::derive_filter(
+                stack.top(),
+                RowPredicate::Grep(CompiledGrep::new("x")),
+            )
+            .unwrap(),
+        );
+        assert_eq!(stack.depth(), 2);
+        stack.reset(list(BuiltInKind::Node));
+        assert_eq!(stack.depth(), 1);
+        // Every old element dropped — no leaked backward Arcs (only our
+        // local handle survives).
+        assert_eq!(std::sync::Arc::strong_count(&root_store), 1);
+        // The recipe of the OLD root was recorded for `-`.
         assert_eq!(
-            f.to_subscription_filter(),
-            Some(SubscriptionFilter::Labels(labels)),
+            stack.prev_root(),
+            Some(&RootSpec::Resource(ResourceId::BuiltIn(BuiltInKind::Pod)))
+        );
+        assert_eq!(
+            stack.root_spec(),
+            Some(RootSpec::Resource(ResourceId::BuiltIn(BuiltInKind::Node)))
         );
     }
 
     #[test]
-    fn field_filter_returns_subscription_field() {
-        let f = NavFilter::Field(K8sFieldSelector::SpecNodeName("node1".into()));
-        assert_eq!(
-            f.to_subscription_filter(),
-            Some(SubscriptionFilter::Field("spec.nodeName=node1".into())),
+    fn breadcrumb_is_a_label_fold() {
+        let mut stack = NavStack::new(list(BuiltInKind::Pod));
+        stack.push(
+            Element::derive_filter(
+                stack.top(),
+                RowPredicate::Grep(CompiledGrep::new("api")),
+            )
+            .unwrap(),
         );
+        stack.push(Element::ContentView(ContentView::new(
+            ContentSpec::Aliases,
+            crate::app::ContentViewState::default(),
+            false,
+        )));
+        assert_eq!(stack.breadcrumb(), "pods > /api > aliases");
     }
 
     #[test]
-    fn owner_chain_filter_returns_subscription_owner_uid() {
-        let f = NavFilter::OwnerChain {
-            uid: "abc-123".into(),
-            kind: BuiltInKind::Deployment,
-            display_name: "my-deploy".into(),
-            namespace: crate::kube::protocol::Namespace::All,
-        };
-        assert_eq!(
-            f.to_subscription_filter(),
-            Some(SubscriptionFilter::OwnerUid("abc-123".into())),
+    fn fault_helpers_see_only_elements() {
+        let mut stack = NavStack::new(list(BuiltInKind::Pod));
+        assert!(!stack.top_is_fault());
+        assert!(!stack.any_fault());
+        stack.push(Element::derive_filter(stack.top(), RowPredicate::Fault).unwrap());
+        assert!(stack.top_is_fault());
+        assert!(stack.any_fault());
+        // Bury it: a grep on top — Ctrl-Z must NOT splice; the helpers
+        // report "buried" (top no, any yes).
+        stack.push(
+            Element::derive_filter(
+                stack.top(),
+                RowPredicate::Grep(CompiledGrep::new("x")),
+            )
+            .unwrap(),
         );
-    }
-
-    // -- FilterInputState tests -----------------------------------------------
-
-    #[test]
-    fn filter_start_resets_state() {
-        let mut fi = FilterInputState::default();
-        fi.start();
-        assert!(fi.active());
-        assert!(fi.text().is_empty());
-        assert!(fi.column().is_none());
+        assert!(!stack.top_is_fault());
+        assert!(stack.any_fault());
     }
 
     #[test]
-    fn filter_start_column_sets_column() {
-        let mut fi = FilterInputState::default();
-        fi.start_column(3, "STATUS".into());
-        assert!(fi.active());
-        assert_eq!(fi.column(), Some(3));
-    }
-
-    #[test]
-    fn filter_cancel_resets_all_fields() {
-        let mut fi = FilterInputState::default();
-        fi.start_column(5, "AGE".into());
-        fi.push_char('x');
-        fi.cancel();
-        assert!(!fi.active());
-        assert!(fi.text().is_empty());
-        assert!(fi.column().is_none(), "cancel must reset column");
-    }
-
-    #[test]
-    fn filter_commit_returns_text_and_column() {
-        let mut fi = FilterInputState::default();
-        fi.start_column(2, "READY".into());
-        fi.push_char('a');
-        fi.push_char('b');
-        let c = fi.commit().expect("non-empty text should commit");
-        assert_eq!(c.text, "ab");
-        let col = c.column.expect("column restriction must survive commit");
-        assert_eq!(col.index, 2);
-        assert_eq!(col.header, "READY");
-        assert!(!fi.active());
-    }
-
-    #[test]
-    fn filter_commit_returns_none_on_empty_text() {
-        let mut fi = FilterInputState::default();
-        fi.start();
-        assert!(fi.commit().is_none());
-        assert!(!fi.active());
-    }
-
-    #[test]
-    fn filter_push_pop_char() {
-        let mut fi = FilterInputState::default();
-        fi.start();
-        fi.push_char('h');
-        fi.push_char('i');
-        assert_eq!(fi.text(), "hi");
-        fi.pop_char();
-        assert_eq!(fi.text(), "h");
+    fn apply_resolved_updates_matching_lists_in_place() {
+        let unresolved = ResourceId::CrdUnresolved("widgets".to_string());
+        let mut stack = NavStack::new(Element::ResourceList(ResourceList::open_for_test(
+            QuerySpec { rid: unresolved.clone(), namespace: Namespace::All, filter: None },
+            &MetricsHub::new(),
+            "widgets".to_string(),
+        )));
+        let resolved = ResourceId::BuiltIn(BuiltInKind::Pod);
+        stack.apply_resolved(&unresolved, &resolved);
+        assert_eq!(stack.resource_id(), Some(&resolved));
     }
 }

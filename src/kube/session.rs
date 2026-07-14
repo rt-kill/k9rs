@@ -83,13 +83,13 @@ pub(crate) enum ExecTarget {
     },
 }
 
-/// Open an exec session and navigate to Route::Shell. The daemon spawns
-/// kubectl in a PTY and proxies bytes over yamux. During the Connecting
-/// phase the TUI shows a loading bar and the user has full navigation
-/// control. Once the first ExecData arrives (Connected), the session
+/// Open an exec session as the Shell OVERLAY. The daemon spawns kubectl
+/// in a PTY and proxies bytes over yamux. During the Connecting phase the
+/// TUI shows a loading bar over the current view (which is never
+/// displaced); once the first ExecData arrives (Connected), the session
 /// loop suspends the TUI and enters a raw byte bridge — stdin→daemon,
 /// daemon→stdout — with 100% terminal fidelity and no vt100 parsing.
-pub(crate) async fn open_exec_route(
+pub(crate) async fn open_exec_overlay(
     app: &mut App,
     data_source: &ClientSession,
     exec_init: crate::kube::protocol::ExecInit,
@@ -98,7 +98,9 @@ pub(crate) async fn open_exec_route(
 ) -> Result<()> {
     let stream = data_source.open_exec_stream(exec_init.clone(), event_tx.clone()).await?;
 
-    app.navigate_to(crate::app::Route::Shell(Box::new(crate::app::ShellState {
+    app.ui.confirm_dialog = None;
+    app.ui.form_dialog = None;
+    app.ui.overlay = Some(crate::app::Overlay::Shell(Box::new(crate::app::ShellState {
         title,
         stream: Some(stream),
         connect_state: crate::app::ShellConnectState::Connecting,
@@ -235,23 +237,22 @@ async fn run_editor_flow(
     input_rx: &mut mpsc::Receiver<CtEvent>,
 ) -> bool {
     let is_editor_ready = matches!(
-        app.route,
-        crate::app::Route::EditingResource {
+        app.ui.overlay,
+        Some(crate::app::Overlay::Edit {
             state: crate::app::EditState::EditorReady { .. }, ..
-        }
+        })
     );
     if !is_editor_ready {
         return false;
     }
 
-    // Take the route out so we own TempFile (move, not borrow).
-    let old_route = std::mem::replace(&mut app.route, crate::app::Route::Resources);
-    let (target, temp_file, original) = match old_route {
-        crate::app::Route::EditingResource {
+    // Take the overlay out so we own TempFile (move, not borrow).
+    let (target, temp_file, original) = match app.ui.overlay.take() {
+        Some(crate::app::Overlay::Edit {
             target,
             state: crate::app::EditState::EditorReady { temp_file, original },
-        } => (target, temp_file, original),
-        _ => unreachable!(),
+        }) => (target, temp_file, original),
+        _ => unreachable!("gated by is_editor_ready"),
     };
 
     // Record file mtime BEFORE launching the editor. If the user
@@ -331,20 +332,20 @@ async fn run_editor_flow(
         return true;
     }
 
-    // Send Apply. Move TempFile to Applying state.
+    // Send Apply. Move TempFile to the Applying state.
     let target_clone = target.clone();
-    app.route = crate::app::Route::EditingResource {
+    app.ui.overlay = Some(crate::app::Overlay::Edit {
         target,
         state: crate::app::EditState::Applying {
             temp_file,
             original,
         },
-    };
+    });
     if let Err(e) = data_source.apply(&target_clone, stripped.to_string()) {
         app.ui.flash = Some(crate::app::FlashMessage::error(
             format!("Apply failed: {}", e)
         ));
-        app.pop_route();
+        app.ui.overlay = None;
     }
     true
 }
@@ -372,9 +373,9 @@ async fn run_shell_bridge(
 ) {
     use tokio::io::AsyncWriteExt;
 
-    // Extract the exec stream and pending output from ShellState.
-    let (mut stream, pending) = match &mut app.route {
-        crate::app::Route::Shell(ref mut shell) => {
+    // Extract the exec stream and pending output from the Shell overlay.
+    let (mut stream, pending) = match &mut app.ui.overlay {
+        Some(crate::app::Overlay::Shell(ref mut shell)) => {
             let s = shell.stream.take();
             let p = std::mem::take(&mut shell.pending_output);
             (s, p)
@@ -509,8 +510,8 @@ async fn run_shell_bridge(
     let _ = input_suspend.send(false);
     drain_stale_input(input_rx).await;
 
-    // Pop the shell route and flash a message.
-    app.pop_route();
+    // Clear the shell overlay (the view underneath was never displaced).
+    app.ui.overlay = None;
     app.ui.flash = Some(crate::app::FlashMessage::info("Shell session ended".to_string()));
 }
 
@@ -592,27 +593,13 @@ async fn handle_action_result(
             };
             let (exec_init, title) = build_exec_init(template, &target);
             let label = op.descriptor().label;
-            if let Err(e) = open_exec_route(app, data_source, exec_init, title, event_tx).await {
+            if let Err(e) = open_exec_overlay(app, data_source, exec_init, title, event_tx).await {
                 app.ui.flash = Some(crate::app::FlashMessage::error(
                     format!("{} failed: {}", label, e)
                 ));
             }
         }
         ActionResult::None => {}
-    }
-}
-
-pub(crate) fn open_core_subscriptions(app: &mut App, data_source: &ClientSession) {
-    for def in crate::kube::resource_defs::REGISTRY.all() {
-        if def.is_core() {
-            let rid = def.resource_id();
-            let stream = data_source.subscribe_stream(
-                rid,
-                crate::kube::protocol::Namespace::All,
-                None,
-            );
-            app.kube.core_streams.push(stream);
-        }
     }
 }
 
@@ -624,29 +611,17 @@ fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: App
             // Transition: InFlight → Stable. The new session is live; a
             // subsequent `begin_context_switch` is now allowed.
             app.kube.context_switch.mark_stable();
-            // Open core resource substreams now that the connection is ready.
-            // The user lands on Overview (the default route) with only the
-            // mandatory subscriptions (namespaces, nodes). They navigate to
-            // a resource view explicitly — no automatic pods(all) subscribe.
-            open_core_subscriptions(app, data_source);
-            // Re-subscribe the current nav view if it lost its stream
-            // during the rebuild. Without this, reconnect leaves the user
-            // staring at "Loading..." until they manually navigate away
-            // and back.
-            if let Some(rid) = app.nav.resource_id().cloned() {
-                if app.nav.current().stream.is_none() {
-                    let sub_filter = app.nav.current()
-                        .filter.as_ref().and_then(|f| f.to_subscription_filter());
-                    let sub_ns = app.nav.current()
-                        .filter.as_ref().and_then(|f| f.subscription_namespace());
-                    let change = crate::app::nav::NavChange {
-                        subscribe: Some(rid),
-                        subscription_filter: sub_filter,
-                        namespace: sub_ns,
-                    };
-                    apply_nav_change(app, data_source, change);
-                }
-            }
+            // Open the always-on core subscriptions (namespaces, nodes)
+            // into the app-level core stores now that the connection is
+            // ready.
+            app.core.open_streams(data_source);
+            // Revive the subscription feeding the TOP element's data if
+            // its bridge died during the rebuild — the owner is found by
+            // store pointer identity, re-subscribed with its OWN stored
+            // query spec, and its next Baseline replaces rows in place
+            // (no "Loading..." limbo, no blank flash). Covered elements
+            // revive lazily on pop.
+            app.nav.ensure_top_live(data_source);
         }
         other => apply_event(app, other),
     }
@@ -691,24 +666,42 @@ fn try_handle_input_mode(
 /// `handle_filter_key` — each input modality has its own free function so
 /// the main loop just calls them in priority order.
 fn handle_log_filter_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
-    let crate::app::Route::Logs { ref mut state, .. } = app.route else {
-        return false;
-    };
-    if !state.is_filtering() {
+    if !app.nav.top().log_view().is_some_and(|v| v.is_filtering()) {
         return false;
     }
     match key.code {
-        KeyCode::Esc => state.cancel_filter(),
-        KeyCode::Enter => state.commit_filter(),
+        KeyCode::Esc => {
+            if let Some(view) = app.nav.top_mut().log_view_mut() {
+                view.draft = None;
+            }
+        }
+        KeyCode::Enter => {
+            // Commit = one LogFilter element narrowing the top's line
+            // output; Esc later pops filters one at a time.
+            let draft = app
+                .nav
+                .top_mut()
+                .log_view_mut()
+                .and_then(|v| v.draft.take())
+                .filter(|t| !t.is_empty());
+            if let Some(text) = draft {
+                if let Ok(el) = crate::app::element::Element::derive_log_filter(
+                    app.nav.top(),
+                    crate::app::nav::CompiledGrep::new(text),
+                ) {
+                    app.nav.push(el);
+                }
+            }
+        }
         KeyCode::Backspace => {
-            let mut text = state.draft_filter.clone().unwrap_or_default();
-            text.pop();
-            state.update_draft(text);
+            if let Some(Some(d)) = app.nav.top_mut().log_view_mut().map(|v| v.draft.as_mut()) {
+                d.pop();
+            }
         }
         KeyCode::Char(c) => {
-            let mut text = state.draft_filter.clone().unwrap_or_default();
-            text.push(c);
-            state.update_draft(text);
+            if let Some(Some(d)) = app.nav.top_mut().log_view_mut().map(|v| v.draft.as_mut()) {
+                d.push(c);
+            }
         }
         _ => {}
     }
@@ -721,8 +714,11 @@ fn handle_log_filter_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool
 /// extracted so the main loop doesn't carry the same 20 lines twice.
 fn handle_content_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     use crate::app::SearchInputResult;
-    let state = match app.route {
-        crate::app::Route::ContentView { ref mut state, .. } if state.search_input_active => state,
+    let search_context_lines = app.config.ui.search_context_lines;
+    let state = match app.nav.top_mut() {
+        crate::app::element::Element::ContentView(cv) if cv.state.search_input_active => {
+            &mut cv.state
+        }
         _ => return false,
     };
     match crate::app::handle_search_key(&mut state.search_input, key.code) {
@@ -740,55 +736,12 @@ fn handle_content_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> 
                 state.update_search();
                 if let Some(&t) = state.search_matches.first() {
                     state.current_match = 0;
-                    state.scroll = t.saturating_sub(app.config.ui.search_context_lines);
+                    state.scroll = t.saturating_sub(search_context_lines);
                 }
             }
             true
         }
         SearchInputResult::Updated => true,
-    }
-}
-
-pub(crate) fn apply_nav_change(app: &mut App, data_source: &mut ClientSession, change: crate::app::nav::NavChange) {
-    if let Some(ref new) = change.subscribe {
-        // Drop ancestor subscriptions for the same resource. Without this,
-        // the ancestor's bridge keeps sending snapshots that
-        // find_table_for_resource_mut routes to the NEW step's table,
-        // overwriting it with stale/differently-filtered data.
-        // The current step has no stream yet, so clear_dead_subscription_for
-        // skips it and only kills ancestors.
-        app.nav.clear_dead_subscription_for(new);
-        let is_global = crate::app::nav::is_globally_stored(
-            &crate::app::view::ViewId::Resource(new.clone()),
-        );
-        let has_filter = change.subscription_filter.is_some();
-
-        if !is_global || has_filter {
-            let step = app.nav.current_mut();
-            if step.table.is_none() {
-                step.table = Some(crate::app::StatefulTable::new());
-            }
-        }
-
-        // A drill can carry its own namespace scope (e.g. all-namespaces for a
-        // node's pods, which span every namespace); otherwise the subscription
-        // inherits the session's selected namespace.
-        let ns = change.namespace.clone().unwrap_or_else(|| app.kube.selected_ns.clone());
-
-        let stream = if is_global && has_filter {
-            data_source.subscribe_stream_nav(
-                new.clone(),
-                ns,
-                change.subscription_filter.clone(),
-            )
-        } else {
-            data_source.subscribe_stream(
-                new.clone(),
-                ns,
-                change.subscription_filter.clone(),
-            )
-        };
-        app.nav.current_mut().stream = Some(stream);
     }
 }
 
@@ -802,58 +755,6 @@ pub struct InputChannels {
     pub suspend_ack_rx: mpsc::Receiver<()>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::kube::protocol::ExecPlaceholder;
-
-    fn pod_target() -> ExecTarget {
-        ExecTarget::Pod {
-            pod: "my-pod".into(),
-            namespace: "default".into(),
-            container: "nginx".into(),
-        }
-    }
-
-    fn node_target() -> ExecTarget {
-        ExecTarget::Node { node: "worker-1".into() }
-    }
-
-    #[test]
-    fn resolve_namespace_on_pod() {
-        let result = resolve_placeholder(&ExecPlaceholder::Namespace, &pod_target());
-        assert_eq!(result, Some("default".into()));
-    }
-
-    #[test]
-    fn resolve_namespace_on_node_returns_none() {
-        let result = resolve_placeholder(&ExecPlaceholder::Namespace, &node_target());
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn resolve_node_name_on_node() {
-        let result = resolve_placeholder(&ExecPlaceholder::NodeName, &node_target());
-        assert_eq!(result, Some("node/worker-1".into()));
-    }
-
-    #[test]
-    fn resolve_pod_name_on_node_returns_none() {
-        let result = resolve_placeholder(&ExecPlaceholder::PodName, &node_target());
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn resolve_container_on_pod_with_empty_container() {
-        let target = ExecTarget::Pod {
-            pod: "p".into(),
-            namespace: "ns".into(),
-            container: String::new(),
-        };
-        let result = resolve_placeholder(&ExecPlaceholder::Container, &target);
-        assert_eq!(result, Some(String::new()), "empty container is valid — ConditionalPair skips it");
-    }
-}
 
 pub async fn session_main(
     mut app: App,
@@ -913,13 +814,14 @@ pub async fn session_main(
             let no_daemon = data_source.is_no_daemon();
             drop(data_source);
             drop(event_rx);
-            app.clear_data();
-            app.kube.core_streams.clear();
-            app.nav.clear_all_streams();
-            app.kube.pod_metrics.clear();
-            app.kube.node_metrics.clear();
+            // Stores are KEPT: rows stay visible through the reconnect,
+            // and per-store flash-hash continuity means rows that changed
+            // during the gap flash after the recovery baseline. Dead
+            // stream handles are inert (`is_alive` = false); revival
+            // happens on ConnectionEstablished (top) and on pop (covered).
+            // Metrics are stale for the new session either way.
+            app.kube.metrics.clear();
             app.kube.kubectl_cache.clear();
-            app.ui.deltas.clear();
             let (new_tx, new_rx) = mpsc::channel::<AppEvent>(256);
             event_tx = new_tx;
             event_rx = new_rx;
@@ -954,17 +856,16 @@ pub async fn session_main(
             })?;
 
             // Set cursor style based on input mode: bar for text input, block otherwise
-            let route_has_text_input = match &app.route {
-                crate::app::Route::ContentView { ref state, .. } => state.search_input_active,
-                crate::app::Route::Logs { ref state, .. } => state.is_filtering(),
-                _ => false,
+            let view_has_text_input = match app.nav.top() {
+                crate::app::element::Element::ContentView(c) => c.state.search_input_active,
+                el => el.log_view().is_some_and(|v| v.is_filtering()),
             };
             let in_input_mode = matches!(app.ui.input_mode, InputMode::Command { .. })
                 || app.ui.form_dialog.as_ref().is_some_and(|d| {
                     d.fields.get(d.focused).is_some_and(|field| field.is_text_input())
                 })
-                || app.nav.filter_input().active()
-                || route_has_text_input;
+                || app.nav.top().filter_input().active()
+                || view_has_text_input;
             if in_input_mode {
                 execute!(terminal.backend_mut(), SetCursorStyle::SteadyBar)?;
             } else {
@@ -988,7 +889,7 @@ pub async fn session_main(
         // Shell bridge: when the daemon confirms the shell is connected,
         // suspend the TUI and enter a raw byte bridge. stdin→daemon,
         // daemon→stdout, no parsing. Restores TUI on exit.
-        if let crate::app::Route::Shell(ref shell) = app.route {
+        if let Some(crate::app::Overlay::Shell(ref shell)) = app.ui.overlay {
             if shell.connect_state == crate::app::ShellConnectState::Connected {
                 run_shell_bridge(
                     &mut app, &mut terminal, &mut event_rx,
@@ -1072,9 +973,18 @@ pub async fn session_main(
                 // Gap detection for log initial load: if we drained all
                 // pending events and the log view is still in initial_load,
                 // the initial tail batch is complete — snap to bottom.
-                if let crate::app::Route::Logs { ref mut state, .. } = app.route {
-                    if state.initial_load && !state.lines().is_empty() {
-                        state.initial_load = false;
+                // Initial tail-fetch completion: a gap in line delivery
+                // means the batch is done — release follow auto-scroll.
+                let has_lines = app
+                    .nav
+                    .top()
+                    .log_store()
+                    .is_some_and(|st| st.with_read(|i| !i.lines.is_empty()));
+                if has_lines {
+                    if let Some(view) = app.nav.top_mut().log_view_mut() {
+                        if view.initial_load {
+                            view.initial_load = false;
+                        }
                     }
                 }
                 repaint.on_data(std::time::Instant::now(), tick_rate);
@@ -1115,4 +1025,57 @@ pub async fn session_main(
 
     // Return the exit reason so main.rs can print a message after terminal restore.
     Ok(app.exit_reason)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kube::protocol::ExecPlaceholder;
+
+    fn pod_target() -> ExecTarget {
+        ExecTarget::Pod {
+            pod: "my-pod".into(),
+            namespace: "default".into(),
+            container: "nginx".into(),
+        }
+    }
+
+    fn node_target() -> ExecTarget {
+        ExecTarget::Node { node: "worker-1".into() }
+    }
+
+    #[test]
+    fn resolve_namespace_on_pod() {
+        let result = resolve_placeholder(&ExecPlaceholder::Namespace, &pod_target());
+        assert_eq!(result, Some("default".into()));
+    }
+
+    #[test]
+    fn resolve_namespace_on_node_returns_none() {
+        let result = resolve_placeholder(&ExecPlaceholder::Namespace, &node_target());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_node_name_on_node() {
+        let result = resolve_placeholder(&ExecPlaceholder::NodeName, &node_target());
+        assert_eq!(result, Some("node/worker-1".into()));
+    }
+
+    #[test]
+    fn resolve_pod_name_on_node_returns_none() {
+        let result = resolve_placeholder(&ExecPlaceholder::PodName, &node_target());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_container_on_pod_with_empty_container() {
+        let target = ExecTarget::Pod {
+            pod: "p".into(),
+            namespace: "ns".into(),
+            container: String::new(),
+        };
+        let result = resolve_placeholder(&ExecPlaceholder::Container, &target);
+        assert_eq!(result, Some(String::new()), "empty container is valid — ConditionalPair skips it");
+    }
 }

@@ -6,7 +6,9 @@ use crate::event::AppEvent;
 use crate::kube::client_session::ClientSession;
 use crate::kube::protocol::{self, ObjectRef};
 use crate::kube::resource_def::BuiltInKind;
-use crate::kube::session::{ds_try, ActionResult, apply_nav_change};
+use crate::app::element::Element;
+use crate::app::store::RowPredicate;
+use crate::kube::session::{ds_try, ActionResult};
 
 const HELP_PAGE_SCROLL_LINES: usize = 10;
 const DEFAULT_TERMINAL_HEIGHT: usize = 24;
@@ -39,7 +41,6 @@ pub(crate) fn handle_action(
     data_source: &mut ClientSession,
 ) -> ActionResult {
     use crate::app::actions::Action;
-    use crate::app::Route;
 
     match action {
         // --- Lifecycle ---
@@ -48,36 +49,37 @@ pub(crate) fn handle_action(
             app.should_quit = true;
         }
         Action::Back => {
-            if let Some(route) = app.route_stack.pop() {
-                app.route = route;
+            // ONE undo path: close the overlay if any, else pop the top
+            // element (reviving its data if the subscription died while
+            // covered). At the root: no-op.
+            if app.ui.overlay.is_some() {
+                app.ui.overlay = None;
+            } else if app.nav.pop().is_some() {
+                app.nav.ensure_top_live(data_source);
             }
         }
         Action::Help => {
-            if matches!(app.route, Route::Help) {
-                if let Some(route) = app.route_stack.pop() {
-                    app.route = route;
-                } else {
-                    app.route = Route::Resources;
-                }
+            if matches!(app.ui.overlay, Some(crate::app::Overlay::Help { .. })) {
+                app.ui.overlay = None;
             } else {
-                app.navigate_to(Route::Help);
+                app.ui.overlay = Some(crate::app::Overlay::Help { scroll: 0 });
             }
         }
 
         // --- Tab switching ---
         Action::NextTab => {
-            if matches!(app.route, Route::Overview) { app.route = Route::Resources; }
             let new_rid = app.next_tab();
-            let change = app.nav.reset(new_rid);
-            *app.nav.filter_input_mut() = Default::default();
-            apply_nav_change(app, data_source, change);
+            let root = App::root_list_element(
+                data_source, &app.kube.metrics, new_rid, app.kube.selected_ns.clone(),
+            );
+            app.nav.reset(root);
         }
         Action::PrevTab => {
-            if matches!(app.route, Route::Overview) { app.route = Route::Resources; }
             let new_rid = app.prev_tab();
-            let change = app.nav.reset(new_rid);
-            *app.nav.filter_input_mut() = Default::default();
-            apply_nav_change(app, data_source, change);
+            let root = App::root_list_element(
+                data_source, &app.kube.metrics, new_rid, app.kube.selected_ns.clone(),
+            );
+            app.nav.reset(root);
         }
 
         // --- Scroll / in-view navigation ---
@@ -153,10 +155,11 @@ pub(crate) fn handle_action(
         Action::SpanMark => app.span_mark(),
         Action::ClearMarks => app.clear_marks(),
         Action::ToggleLastView => {
-            if let Some(last_rid) = app.nav.prev_root().and_then(|v| v.resource_id()).cloned() {
-                let change = app.nav.reset(last_rid);
-                *app.nav.filter_input_mut() = Default::default();
-                apply_nav_change(app, data_source, change);
+            if let Some(crate::app::nav::RootSpec::Resource(last_rid)) = app.nav.prev_root().cloned() {
+                let root = App::root_list_element(
+                    data_source, &app.kube.metrics, last_rid, app.kube.selected_ns.clone(),
+                );
+                app.nav.reset(root);
             }
         }
         Action::ShowPortForwards => handle_show_port_forwards(app, data_source),
@@ -166,10 +169,10 @@ pub(crate) fn handle_action(
             }
             let schema = crate::kube::protocol::OperationKind::PortForward.form_schema()
                 .expect("PortForward always has a form schema");
-            let row = app.active_view_table().and_then(|t| t.selected_item());
-            let desc = app.active_view_descriptor();
+            let row = app.nav.top().selected_row();
+            let headers = app.nav.top().headers_snapshot();
             if let Some(info) = get_selected_resource_info(app) {
-                if let Some(dialog) = build_form_from_schema(schema, crate::kube::protocol::OperationKind::PortForward, info, row, desc) {
+                if let Some(dialog) = build_form_from_schema(schema, crate::kube::protocol::OperationKind::PortForward, info, row.as_ref(), &headers) {
                     app.ui.form_dialog = Some(dialog);
                 } else {
                     app.ui.flash = Some(crate::app::FlashMessage::error(
@@ -197,140 +200,112 @@ pub(crate) fn handle_action(
 
 fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
     use crate::app::actions::Action;
-    use crate::app::Route;
+    use crate::app::element::Element;
+    use crate::app::Overlay;
 
-    match action {
-        Action::NextItem => {
-            let caps = app.current_capabilities();
-            match &mut app.route {
-                Route::ContentView { ref mut state, .. } => {
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
-                    state.scroll = (state.scroll + 1).min(content_max_scroll(state.line_count(), visible));
-                }
-                Route::ContainerSelect { ref target, ref mut selected, .. } => {
-                    let container_count = {
-                        // Manual dual-path lookup: can't call app.table_for()
-                        // because app.route is mutably borrowed by this match.
-                        let table = app.nav.find_table_for_resource(&target.resource)
-                            .or_else(|| app.data.tables.get(&target.resource));
-                        table
-                            .and_then(|t| t.items.iter().find(|p| {
-                                p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
-                            }))
-                            .map(|p| p.containers.len())
-                            .unwrap_or(0)
-                    };
-                    if container_count > 0 && *selected + 1 < container_count {
+    // Overlays capture scroll keys first (help sheet, container picker).
+    match (&mut app.ui.overlay, &action) {
+        (Some(Overlay::Help { scroll }), a) => {
+            let caps = app.nav.top().capabilities();
+            let max = help_max_scroll(&caps);
+            match a {
+                Action::NextItem => *scroll = (*scroll + 1).min(max),
+                Action::PrevItem => *scroll = scroll.saturating_sub(1),
+                Action::PageUp => *scroll = scroll.saturating_sub(HELP_PAGE_SCROLL_LINES),
+                Action::PageDown => *scroll = (*scroll + HELP_PAGE_SCROLL_LINES).min(max),
+                Action::Home => *scroll = 0,
+                Action::End => *scroll = max,
+                _ => {}
+            }
+            return;
+        }
+        (Some(Overlay::ContainerSelect { containers, selected, .. }), a) => {
+            match a {
+                Action::NextItem => {
+                    if !containers.is_empty() && *selected + 1 < containers.len() {
                         *selected += 1;
                     }
                 }
-                Route::Help => {
-                    let max = help_max_scroll(&caps);
-                    app.ui.help_scroll = (app.ui.help_scroll + 1).min(max);
-                }
-                _ => app.select_next(),
+                Action::PrevItem => *selected = selected.saturating_sub(1),
+                _ => {}
             }
+            return;
         }
-        Action::PrevItem => {
-            match &mut app.route {
-                Route::ContentView { ref mut state, .. } => state.scroll = state.scroll.saturating_sub(1),
-                Route::ContainerSelect { ref mut selected, .. } => {
-                    *selected = selected.saturating_sub(1);
-                }
-                Route::Help => {
-                    app.ui.help_scroll = app.ui.help_scroll.saturating_sub(1);
-                }
-                _ => app.select_prev(),
-            }
-        }
-        Action::PageUp => {
-            match &mut app.route {
-                Route::Logs { ref mut state, .. } => {
-                    state.follow = false;
-                    state.scroll = state.scroll.saturating_sub(app.config.ui.page_scroll_lines);
-                }
-                Route::ContentView { ref mut state, .. } => state.scroll = state.scroll.saturating_sub(app.config.ui.page_scroll_lines),
-                Route::Help => {
-                    app.ui.help_scroll = app.ui.help_scroll.saturating_sub(HELP_PAGE_SCROLL_LINES);
-                }
-                _ => app.page_up(),
-            }
-        }
-        Action::PageDown => {
-            let caps = app.current_capabilities();
-            match &mut app.route {
-                Route::Logs { ref mut state, .. } => {
-                    state.follow = false;
-                    let total = state.visible_count();
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(LOG_CHROME_LINES);
-                    let max = total.saturating_sub(visible);
-                    state.scroll = (state.scroll + app.config.ui.page_scroll_lines).min(max);
-                }
-                Route::ContentView { ref mut state, .. } => {
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
-                    state.scroll = (state.scroll + app.config.ui.page_scroll_lines).min(content_max_scroll(state.line_count(), visible));
-                }
-                Route::Help => {
-                    let max = help_max_scroll(&caps);
-                    app.ui.help_scroll = (app.ui.help_scroll + HELP_PAGE_SCROLL_LINES).min(max);
-                }
-                _ => app.page_down(),
-            }
-        }
-        Action::Home => {
-            match &mut app.route {
-                Route::Logs { ref mut state, .. } => {
-                    state.follow = false;
-                    state.scroll = 0;
-                }
-                Route::ContentView { ref mut state, .. } => state.scroll = 0,
-                Route::Help => app.ui.help_scroll = 0,
-                _ => app.go_home(),
-            }
-        }
-        Action::End => {
-            let caps = app.current_capabilities();
-            match &mut app.route {
-                Route::Logs { ref mut state, .. } => {
-                    let total = state.visible_count();
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(LOG_CHROME_LINES);
-                    state.scroll = total.saturating_sub(visible);
-                    state.follow = true;
-                }
-                Route::ContentView { ref mut state, .. } => {
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
-                    state.scroll = content_max_scroll(state.line_count(), visible);
-                }
-                Route::Help => {
-                    app.ui.help_scroll = help_max_scroll(&caps);
-                }
-                _ => app.go_end(),
-            }
-        }
-        Action::ScrollUp(n) => {
-            if let Route::Logs { ref mut state, .. } = app.route {
-                if state.follow {
-                    let total = state.visible_count();
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(LOG_CHROME_LINES);
-                    state.scroll = total.saturating_sub(visible);
-                    state.follow = false;
-                }
-                state.scroll = state.scroll.saturating_sub(n);
-            }
-        }
-        Action::ScrollDown(n) => {
-            if let Route::Logs { ref mut state, .. } = app.route {
-                if !state.follow {
-                    let total = state.visible_count();
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(LOG_CHROME_LINES);
-                    let max = total.saturating_sub(visible);
-                    state.scroll = (state.scroll + n).min(max);
-                }
-            }
-        }
-        Action::ColLeft => app.col_left(),
-        Action::ColRight => app.col_right(),
         _ => {}
+    }
+
+    let page_lines = app.config.ui.page_scroll_lines;
+    match app.nav.top_mut() {
+        // Log views: scroll over the derived visible-line set.
+        el @ (Element::LogSession(_) | Element::LogFilter(_)) => {
+            let total = el.log_visible().map(|v| v.len()).unwrap_or(0);
+            let visible = crossterm::terminal::size()
+                .map(|(_, h)| h as usize)
+                .unwrap_or(DEFAULT_TERMINAL_HEIGHT)
+                .saturating_sub(LOG_CHROME_LINES);
+            let max = total.saturating_sub(visible);
+            let Some(view) = el.log_view_mut() else { return };
+            match action {
+                Action::PageUp => {
+                    view.follow = false;
+                    view.scroll = view.scroll.saturating_sub(page_lines);
+                }
+                Action::PageDown => {
+                    view.follow = false;
+                    view.scroll = (view.scroll + page_lines).min(max);
+                }
+                Action::Home => {
+                    view.follow = false;
+                    view.scroll = 0;
+                }
+                Action::End => {
+                    view.scroll = max;
+                    view.follow = true;
+                }
+                Action::ScrollUp(n) => {
+                    if view.follow {
+                        view.scroll = max;
+                        view.follow = false;
+                    }
+                    view.scroll = view.scroll.saturating_sub(n);
+                }
+                Action::ScrollDown(n) => {
+                    if !view.follow {
+                        view.scroll = (view.scroll + n).min(max);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Content views: scroll over the cached line count.
+        Element::ContentView(cv) => {
+            let visible = crossterm::terminal::size()
+                .map(|(_, h)| h as usize)
+                .unwrap_or(DEFAULT_TERMINAL_HEIGHT)
+                .saturating_sub(CONTENT_CHROME_LINES);
+            let max = content_max_scroll(cv.state.line_count(), visible);
+            match action {
+                Action::NextItem => cv.state.scroll = (cv.state.scroll + 1).min(max),
+                Action::PrevItem => cv.state.scroll = cv.state.scroll.saturating_sub(1),
+                Action::PageUp => cv.state.scroll = cv.state.scroll.saturating_sub(page_lines),
+                Action::PageDown => cv.state.scroll = (cv.state.scroll + page_lines).min(max),
+                Action::Home => cv.state.scroll = 0,
+                Action::End => cv.state.scroll = max,
+                _ => {}
+            }
+        }
+        // Table views (incl. the context picker via its element arms).
+        _ => match action {
+            Action::NextItem => app.select_next(),
+            Action::PrevItem => app.select_prev(),
+            Action::PageUp => app.page_up(),
+            Action::PageDown => app.page_down(),
+            Action::Home => app.go_home(),
+            Action::End => app.go_end(),
+            Action::ColLeft => app.col_left(),
+            Action::ColRight => app.col_right(),
+            _ => {}
+        },
     }
 }
 
@@ -344,12 +319,11 @@ fn handle_resource_op(
     data_source: &mut ClientSession,
 ) -> ActionResult {
     use crate::app::actions::Action;
-    use crate::app::Route;
 
     // Derived views (container table, etc.) only support Shell — all other
     // mutating operations (delete, edit, scale, restart) don't apply to
     // derived rows. Shell is handled specially below (uses nav.source).
-    if app.nav.view_id().is_derived() && !matches!(action, Action::Shell) {
+    if app.nav.top().derived_kind().is_some() && !matches!(action, Action::Shell) {
         return ActionResult::None;
     }
 
@@ -357,30 +331,31 @@ fn handle_resource_op(
         Action::Shell => {
             if app.current_capabilities().supports(crate::kube::protocol::OperationKind::Shell) {
                 // Derived view (container table): shell directly into
-                // the selected container using the parent pod as context.
-                if app.nav.view_id().is_derived() {
-                    if let (Some(source), Some(table)) = (app.nav.current().source.clone(), app.active_view_table()) {
-                        if let Some(item) = table.selected_item() {
-                            // Only a Named namespace can be shelled into; `All` is
-                            // structurally excluded (and a namespace literally named
-                            // "all" is `Named("all")`, so it works correctly — the
-                            // old `ns != "all"` magic-string guard wrongly rejected it).
-                            if let crate::kube::protocol::Namespace::Named(ns) = &source.namespace {
-                                return ActionResult::Exec {
-                                    op: crate::kube::protocol::OperationKind::Shell,
-                                    target: crate::kube::session::ExecTarget::Pod {
-                                        pod: source.name.clone(),
-                                        namespace: ns.clone(),
-                                        container: item.name.clone(),
-                                    },
-                                };
-                            }
+                // the selected container; the element's origin IS the
+                // parent pod.
+                if app.nav.top().derived_kind().is_some() {
+                    let origin = app.nav.top().origin().cloned();
+                    let item = app.nav.top().selected_row();
+                    if let (Some(origin), Some(item)) = (origin, item) {
+                        // Only a Named namespace can be shelled into; `All` is
+                        // structurally excluded (and a namespace literally named
+                        // "all" is `Named("all")`, so it works correctly — the
+                        // old `ns != "all"` magic-string guard wrongly rejected it).
+                        if let crate::kube::protocol::Namespace::Named(ns) = &origin.namespace {
+                            return ActionResult::Exec {
+                                op: crate::kube::protocol::OperationKind::Shell,
+                                target: crate::kube::session::ExecTarget::Pod {
+                                    pod: origin.name.clone(),
+                                    namespace: ns.clone(),
+                                    container: item.name.clone(),
+                                },
+                            };
                         }
                     }
                     return ActionResult::None;
                 }
                 let Some(current_rid) = app.nav.resource_id().cloned() else { return ActionResult::None; };
-                if let Some(row) = app.active_view_table().and_then(|t| t.selected_item()) {
+                if let Some(row) = app.nav.top().selected_row() {
                     let Some(pod_ns) = row.namespace.clone() else {
                         app.ui.flash = Some(crate::app::FlashMessage::error(
                             format!("Shell refused: pod/{} has no resolved namespace", row.name)
@@ -401,8 +376,11 @@ fn handle_resource_op(
                         crate::kube::protocol::Namespace::from_row(&pod_ns),
                     );
                     if containers.len() > 1 {
-                        app.navigate_to(Route::ContainerSelect {
+                        app.ui.confirm_dialog = None;
+                        app.ui.form_dialog = None;
+                        app.ui.overlay = Some(crate::app::Overlay::ContainerSelect {
                             target,
+                            containers: containers.clone(),
                             selected: 0,
                             action: crate::app::ContainerAction::Shell,
                         });
@@ -438,13 +416,15 @@ fn handle_resource_op(
             }
         }
         Action::Edit => {
-            if matches!(app.route, Route::EditingResource { .. }) {
+            if matches!(app.ui.overlay, Some(crate::app::Overlay::Edit { .. })) {
                 app.ui.flash = Some(crate::app::FlashMessage::warn("Edit already in progress".to_string()));
                 return ActionResult::None;
             }
             if let Some(info) = get_selected_resource_info(app) {
                 ds_try!(app, data_source.yaml(&info));
-                app.navigate_to(Route::EditingResource {
+                app.ui.confirm_dialog = None;
+                app.ui.form_dialog = None;
+                app.ui.overlay = Some(crate::app::Overlay::Edit {
                     target: info,
                     state: crate::app::EditState::AwaitingYaml,
                 });
@@ -454,9 +434,9 @@ fn handle_resource_op(
             if let Some(info) = get_selected_resource_info(app) {
                 let schema = crate::kube::protocol::OperationKind::Scale.form_schema()
                     .expect("Scale always has a form schema");
-                let row = app.active_view_table().and_then(|t| t.selected_item());
-                let desc = app.active_view_descriptor();
-                if let Some(dialog) = build_form_from_schema(schema, crate::kube::protocol::OperationKind::Scale, info, row, desc) {
+                let row = app.nav.top().selected_row();
+                let headers = app.nav.top().headers_snapshot();
+                if let Some(dialog) = build_form_from_schema(schema, crate::kube::protocol::OperationKind::Scale, info, row.as_ref(), &headers) {
                     app.ui.form_dialog = Some(dialog);
                 }
             }
@@ -505,12 +485,14 @@ fn handle_resource_op(
                 let mut state = crate::app::ContentViewState::default();
                 state.set_content(format!("Decoding secret {}/{}...", info.namespace, info.name));
                 ds_try!(app, data_source.decode_secret(&info));
-                app.navigate_to(Route::ContentView {
-                    kind: crate::app::ContentViewKind::Describe,
-                    target: Some(info),
-                    awaiting_response: false,
-                    state,
-                });
+                let el = crate::app::element::Element::ContentView(
+                    crate::app::element::ContentView::new(
+                        crate::app::element::ContentSpec::Describe(info),
+                        state,
+                        false,
+                    ),
+                );
+                app.nav.push(el);
             }
         }
         Action::TriggerCronJob => {
@@ -595,132 +577,126 @@ fn handle_filter_search(
     data_source: &mut ClientSession,
 ) {
     use crate::app::actions::Action;
-    use crate::app::Route;
 
     match action {
         Action::Filter(_) => {
-            if matches!(app.route, Route::Resources) {
-                app.nav.filter_input_mut().start();
-            } else if let Route::Logs { ref mut state, .. } = app.route {
-                state.start_filter();
+            if let Some(view) = app.nav.top_mut().log_view_mut() {
+                view.draft = Some(String::new());
+            } else if let Some(fi) = app.nav.top_mut().filter_input_mut() {
+                fi.start();
             }
         }
         Action::ColumnFilter => {
-            if matches!(app.route, Route::Resources) {
-                // Data index — the filter indexes the full `cells` array, not
-                // the visible subset (which differs whenever a column is
-                // hidden). The header rides along for the breadcrumb.
-                let (col, header) = app.active_table_selected_data_col();
-                app.nav.filter_input_mut().start_column(col, header);
+            {
+                // Data index — the predicate indexes the full `cells` array,
+                // not the visible subset. Read from the element's own last
+                // view (the same visible set the renderer used), so the
+                // mapping cannot drift. The header rides along for the crumb.
+                if let Some((col, header)) = app.nav.top().selected_data_col() {
+                    if let Some(fi) = app.nav.top_mut().filter_input_mut() {
+                        fi.start_column(col, header);
+                    }
+                }
             }
         }
         Action::ClearFilter => {
-            if let Route::Logs { ref mut state, .. } = app.route {
-                if state.is_filtering() {
-                    state.cancel_filter();
-                } else if !state.filters().is_empty() {
-                    state.pop_filter();
+            // Esc, unified: cancel a draft → close the overlay → pop the
+            // top element. First press pops; marks are never touched.
+            if let Some(view) = app.nav.top_mut().log_view_mut() {
+                if view.is_filtering() {
+                    view.draft = None;
+                    return;
                 }
-            } else if let Some((popped, change)) = app.nav.pop() {
-                apply_nav_change(app, data_source, change);
-                if popped.view != *app.nav.view_id() {
-                    let saved = app.nav.current().saved_selected;
-                    app.select_in_active_table(saved);
-                }
-                app.reapply_nav_filters();
-            } else {
-                app.clear_filter();
             }
+            if app.ui.overlay.is_some() {
+                app.ui.overlay = None;
+            } else if app.nav.pop().is_some() {
+                // Pop = drop: the popped element's stream RSTs, its
+                // backward Arcs release. The revealed element still owns
+                // its cursor, sort, and draft — nothing to restore. Only
+                // its subscription may have died while covered; revive it.
+                app.nav.ensure_top_live(data_source);
+            }
+            // At the root there is nothing to pop — Esc is a no-op.
         }
         Action::ToggleFaultFilter => {
-            if !app.nav.has_fault_filter() {
-                if let Some(current_rid) = app.nav.resource_id().cloned() {
-                    let sel = app.active_table_selected();
-                    app.nav.save_selected(sel);
-                    let change = app.nav.push(crate::app::nav::NavStep::new(
-                        current_rid,
-                        Some(crate::app::nav::NavFilter::Fault),
-                    ));
-                    apply_nav_change(app, data_source, change);
-                    app.reapply_nav_filters();
-                    app.ui.flash = Some(crate::app::FlashMessage::info("Fault filter ON"));
-                }
-            } else {
-                app.nav.pop_fault_filter();
-                app.reapply_nav_filters();
+            // Strict LIFO: Ctrl-Z pops the fault filter when it is the
+            // TOP; a fault filter buried under later refinements can't be
+            // spliced out from the middle (children's predicate chains
+            // are value-copies — a splice would not update them anyway).
+            if app.nav.top_is_fault() {
+                app.nav.pop();
+                app.nav.ensure_top_live(data_source);
                 app.ui.flash = Some(crate::app::FlashMessage::info("Fault filter OFF"));
+            } else if app.nav.any_fault() {
+                app.ui.flash = Some(crate::app::FlashMessage::warn(
+                    "Fault filter active below — Esc back to it",
+                ));
+            } else if let Ok(el) = Element::derive_filter(app.nav.top(), RowPredicate::Fault) {
+                app.nav.push(el);
+                app.ui.flash = Some(crate::app::FlashMessage::info("Fault filter ON"));
             }
         }
         Action::SearchStart => {
-            match &mut app.route {
-                Route::ContentView { ref mut state, .. } => {
-                    state.search_input_active = true;
-                    state.search_input.clear();
+            match app.nav.top_mut() {
+                crate::app::element::Element::ContentView(cv) => {
+                    cv.state.search_input_active = true;
+                    cv.state.search_input.clear();
                 }
-                Route::Logs { ref mut state, .. } => {
-                    state.start_filter();
+                el => {
+                    if let Some(view) = el.log_view_mut() {
+                        view.draft = Some(String::new());
+                    }
                 }
-                _ => {}
             }
         }
         Action::SearchExec(term) => {
-            if let Route::ContentView { ref mut state, .. } = app.route {
-                state.search = Some(term.clone());
-                state.update_search();
+            if let crate::app::element::Element::ContentView(cv) = app.nav.top_mut() {
+                cv.state.search = Some(term.clone());
+                cv.state.update_search();
             }
         }
         Action::SearchNext => {
-            match &mut app.route {
-                Route::ContentView { ref mut state, .. } => {
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
-                    state.next_match(visible);
-                }
-                Route::Logs { ref mut state, .. } => {
-                    let current_scroll = state.scroll;
-                    if let Some(&next_idx) = state.filtered_indices().iter()
-                        .find(|&&idx| idx > current_scroll)
-                    {
-                        state.scroll = next_idx;
-                        state.follow = false;
-                    } else if let Some(&first) = state.filtered_indices().first() {
-                        state.scroll = first;
-                        state.follow = false;
+            let el = app.nav.top_mut();
+            if let crate::app::element::Element::ContentView(cv) = el {
+                let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
+                cv.state.next_match(visible);
+            } else if let Some(indices) = el.log_visible() {
+                if let Some(view) = el.log_view_mut() {
+                    let current_scroll = view.scroll;
+                    if let Some(&next_idx) = indices.iter().find(|&&idx| idx > current_scroll) {
+                        view.scroll = next_idx;
+                        view.follow = false;
+                    } else if let Some(&first) = indices.first() {
+                        view.scroll = first;
+                        view.follow = false;
                     }
                 }
-                _ => {}
             }
         }
         Action::SearchPrev => {
-            match &mut app.route {
-                Route::ContentView { ref mut state, .. } => {
-                    let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
-                    state.prev_match(visible);
-                }
-                Route::Logs { ref mut state, .. } => {
-                    let current_scroll = state.scroll;
-                    if let Some(&prev_idx) = state.filtered_indices().iter().rev()
-                        .find(|&&idx| idx < current_scroll)
-                    {
-                        state.scroll = prev_idx;
-                        state.follow = false;
-                    } else if let Some(&last) = state.filtered_indices().last() {
-                        state.scroll = last;
-                        state.follow = false;
+            let el = app.nav.top_mut();
+            if let crate::app::element::Element::ContentView(cv) = el {
+                let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
+                cv.state.prev_match(visible);
+            } else if let Some(indices) = el.log_visible() {
+                if let Some(view) = el.log_view_mut() {
+                    let current_scroll = view.scroll;
+                    if let Some(&prev_idx) = indices.iter().rev().find(|&&idx| idx < current_scroll) {
+                        view.scroll = prev_idx;
+                        view.follow = false;
+                    } else if let Some(&last) = indices.last() {
+                        view.scroll = last;
+                        view.follow = false;
                     }
                 }
-                _ => {}
             }
         }
         Action::SearchClear => {
-            match &mut app.route {
-                Route::ContentView { ref mut state, .. } => {
-                    state.clear_search();
-                }
-                Route::Logs { .. } => {
-                    // Log view uses stackable filters — cleared via Esc/pop_filter
-                }
-                _ => {}
+            if let crate::app::element::Element::ContentView(cv) = app.nav.top_mut() {
+                cv.state.clear_search();
             }
+            // Log views: committed filters are elements — cleared via Esc.
         }
         _ => {}
     }
@@ -736,93 +712,109 @@ fn handle_log_action(
     data_source: &mut ClientSession,
 ) {
     use crate::app::actions::Action;
-    use crate::app::Route;
+    use crate::app::element::Element;
 
     match action {
         Action::ToggleLogFollow => {
-            if let Route::Logs { ref mut state, .. } = app.route {
-                state.follow = !state.follow;
-                if state.follow {
-                    state.scroll = state.visible_count().saturating_sub(1);
+            let total = app.nav.top_mut().log_visible().map(|v| v.len()).unwrap_or(0);
+            if let Some(view) = app.nav.top_mut().log_view_mut() {
+                view.follow = !view.follow;
+                if view.follow {
+                    view.scroll = total.saturating_sub(1);
                 } else {
                     let (_, rows) = crossterm::terminal::size().unwrap_or((80, DEFAULT_TERMINAL_HEIGHT as u16));
                     let visible = (rows as usize).saturating_sub(LOG_CHROME_LINES);
-                    let total = state.visible_count();
-                    state.scroll = total.saturating_sub(visible);
+                    view.scroll = total.saturating_sub(visible);
                 }
             }
         }
         Action::ToggleLogWrap => {
-            if let Route::Logs { ref mut state, .. } = app.route {
-                state.wrap = !state.wrap;
+            if let Some(view) = app.nav.top_mut().log_view_mut() {
+                view.wrap = !view.wrap;
             }
         }
         Action::ToggleLogTimestamps => {
-            if let Route::Logs { ref mut state, .. } = app.route {
-                state.show_timestamps = !state.show_timestamps;
+            if let Some(view) = app.nav.top_mut().log_view_mut() {
+                view.show_timestamps = !view.show_timestamps;
+                let on = view.show_timestamps;
                 app.ui.flash = Some(crate::app::FlashMessage::info(
-                    if state.show_timestamps { "Timestamps: on" } else { "Timestamps: off" }
+                    if on { "Timestamps: on" } else { "Timestamps: off" }
                 ));
             }
         }
         Action::ClearLogs => {
-            if let Route::Logs { ref mut state, .. } = app.route {
-                state.clear();
+            // Clears the DATA (the session's line store) — every filter
+            // element over it empties with it, honestly.
+            if let Some(store) = app.nav.top().log_store() {
+                store.clear();
+                app.ui.flash = Some(crate::app::FlashMessage::info("Logs cleared"));
             }
-            app.ui.flash = Some(crate::app::FlashMessage::info("Logs cleared"));
         }
         Action::LogSince(ref since) => {
+            // Range keys re-run the OWNING session's spec. Under a filter,
+            // the owner is found by store pointer identity — the same
+            // named-walk discipline as subscription revival.
+            let Some(store) = app.nav.top().log_store().cloned() else { return };
             let since_label = since.as_deref().unwrap_or("tail");
             app.ui.flash = Some(crate::app::FlashMessage::info(format!("Log range: {}", since_label)));
-            if let Route::Logs { ref target, ref mut state, ref mut stream } = app.route {
-                let tail_lines = state.tail_lines;
-                state.clear_lines();
-                state.follow = true;
-                state.streaming = true;
-                state.initial_load = true;
-                state.since = since.clone();
-                let tail = if since.is_none() { Some(tail_lines) } else { None };
-                let new_stream = data_source.stream_log_substream(crate::kube::protocol::LogInit {
-                    pod: target.pod.clone(),
-                    namespace: crate::kube::protocol::Namespace::from_row(&target.namespace),
-                    container: target.container.clone(),
-                    follow: true,
-                    tail,
-                    since: since.clone(),
-                    previous: false,
-                });
-                state.generation = new_stream.generation;
-                *stream = Some(new_stream);
-            }
+            app.nav.with_log_session_of(&store, |session_el| {
+                session_el.restart_range(data_source, since.clone());
+            });
         }
         Action::SaveLogs => {
-            if let Route::Logs { ref target, ref state, .. } = app.route {
-                let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
-                let filename = format!(
-                    "logs-{}-{}-{}.log",
-                    safe(&target.pod), safe(target.container_label()),
-                    chrono::Utc::now().format("%Y%m%d-%H%M%S"),
-                );
-                let content: String = state.lines().iter()
+            let Element::LogSession(ref s) = app.nav.top() else {
+                // Saving from a filter view saves what you see — the
+                // filtered lines of the top element.
+                save_visible_logs(app);
+                return;
+            };
+            let target = &s.target;
+            let safe = |x: &str| x.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
+            let filename = format!(
+                "logs-{}-{}-{}.log",
+                safe(&target.pod), safe(target.container_label()),
+                chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+            );
+            let content: String = s.store().with_read(|i| {
+                i.lines.iter()
                     .map(|l| crate::util::strip_ansi(&l.flat_text()))
                     .collect::<Vec<_>>()
-                    .join("\n");
-                match crate::util::safe_write_temp(&filename, content.as_bytes()) {
-                    Ok(path) => {
-                        let count = content.lines().count();
-                        app.ui.flash = Some(crate::app::FlashMessage::info(
-                            format!("Saved {} lines to {}", count, path.display())
-                        ));
-                    }
-                    Err(e) => {
-                        app.ui.flash = Some(crate::app::FlashMessage::error(
-                            format!("Save failed: {}", e)
-                        ));
-                    }
-                }
-            }
+                    .join("\n")
+            });
+            write_log_file(app, &filename, &content);
         }
         _ => {}
+    }
+}
+
+/// Save the top log element's VISIBLE (filtered) lines.
+fn save_visible_logs(app: &mut App) {
+    let Some(indices) = app.nav.top_mut().log_visible() else { return };
+    let Some(store) = app.nav.top().log_store() else { return };
+    let content: String = store.with_read(|i| {
+        indices.iter()
+            .filter_map(|&idx| i.lines.get(idx))
+            .map(|l| crate::util::strip_ansi(&l.flat_text()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    let filename = format!("logs-filtered-{}.log", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    write_log_file(app, &filename, &content);
+}
+
+fn write_log_file(app: &mut App, filename: &str, content: &str) {
+    match crate::util::safe_write_temp(filename, content.as_bytes()) {
+        Ok(path) => {
+            let count = content.lines().count();
+            app.ui.flash = Some(crate::app::FlashMessage::info(
+                format!("Saved {} lines to {}", count, path.display())
+            ));
+        }
+        Err(e) => {
+            app.ui.flash = Some(crate::app::FlashMessage::error(
+                format!("Save failed: {}", e)
+            ));
+        }
     }
 }
 
@@ -840,19 +832,21 @@ fn handle_drill(
     match action {
         Action::ShowNode => {
             if app.current_capabilities().supports(crate::kube::protocol::OperationKind::ShowNode) {
-                if let Some(row) = app.active_view_table().and_then(|t| t.selected_item()) {
+                if let Some(row) = app.nav.top().selected_row() {
                     let node = row.node.clone().unwrap_or_default();
                     if !node.is_empty() {
-                        let sel = app.active_table_selected();
-                        app.nav.save_selected(sel);
-                        let change = app.nav.push(crate::app::nav::NavStep::new(
+                        // "The node with the ip of this pod": the row's node
+                        // IS the whole definition — nodes are cluster-scoped,
+                        // so nothing namespace-ish enters construction.
+                        let selector = crate::app::nav::K8sFieldSelector::MetadataName(node.clone());
+                        let el = app.list_element_from_top(
+                            data_source,
                             rid(BuiltInKind::Node),
-                            Some(crate::app::nav::NavFilter::Field(
-                                crate::app::nav::K8sFieldSelector::MetadataName(node),
-                            )),
-                        ));
-                        apply_nav_change(app, data_source, change);
-                        app.reapply_nav_filters();
+                            protocol::Namespace::All,
+                            Some(protocol::SubscriptionFilter::Field(selector.to_wire())),
+                            format!("Nodes/{}", node),
+                        );
+                        app.nav.push(el);
                     }
                 }
             }
@@ -861,23 +855,29 @@ fn handle_drill(
             if let Some(info) = get_selected_resource_info(app) {
                 let name = info.name.clone();
                 let kind = info.resource.display_label().to_string();
-                let sel = app.active_table_selected();
-                app.nav.save_selected(sel);
-                let change = app.nav.push(crate::app::nav::NavStep::new(
+                // A pods list (scoped by the selector at construction) plus
+                // a grep refinement over it — two honest elements.
+                let el = app.list_element_from_top(
+                    data_source,
                     rid(BuiltInKind::Pod),
-                    Some(crate::app::nav::NavFilter::Grep(
-                        crate::app::nav::CompiledGrep::new(regex::escape(&name)),
-                    )),
+                    app.kube.selected_ns.clone(),
+                    None,
+                    "pods".to_string(),
+                );
+                app.nav.push(el);
+                let predicate = RowPredicate::Grep(crate::app::nav::CompiledGrep::new(
+                    regex::escape(&name),
                 ));
-                apply_nav_change(app, data_source, change);
-                app.reapply_nav_filters();
+                if let Ok(el) = Element::derive_filter(app.nav.top(), predicate) {
+                    app.nav.push(el);
+                }
                 app.ui.flash = Some(crate::app::FlashMessage::info(
                     format!("Pods referencing {}/{}", kind.to_lowercase(), name)
                 ));
             }
         }
         Action::JumpToOwner => {
-            if let Some(row) = app.active_view_table().and_then(|t| t.selected_item()) {
+            if let Some(row) = app.nav.top().selected_row() {
                 if let Some(owner) = row.owner_refs.first() {
                     let owner_kind = owner.kind.clone();
                     let owner_name = owner.name.clone();
@@ -885,16 +885,15 @@ fn handle_drill(
                         .unwrap_or_else(|| {
                             crate::kube::protocol::ResourceId::CrdUnresolved(owner_kind.to_lowercase())
                         });
-                    let sel = app.active_table_selected();
-                    app.nav.save_selected(sel);
-                    let change = app.nav.push(crate::app::nav::NavStep::new(
-                        owner_rid,
-                        Some(crate::app::nav::NavFilter::Field(
-                            crate::app::nav::K8sFieldSelector::MetadataName(owner_name.clone()),
-                        )),
-                    ));
-                    apply_nav_change(app, data_source, change);
-                    app.reapply_nav_filters();
+                    let selector = crate::app::nav::K8sFieldSelector::MetadataName(owner_name.clone());
+                    let el = app.list_element_from_top(
+                        data_source,
+                        owner_rid.clone(),
+                        app.kube.selected_ns.clone(),
+                        Some(protocol::SubscriptionFilter::Field(selector.to_wire())),
+                        format!("{}/{}", owner_rid.short_label(), owner_name),
+                    );
+                    app.nav.push(el);
                     app.ui.flash = Some(crate::app::FlashMessage::info(
                         format!("Owner: {}/{}", owner_kind.to_lowercase(), owner_name)
                     ));
@@ -904,10 +903,7 @@ fn handle_drill(
             }
         }
         Action::NodeShell => {
-            if let Some(row) = app.data.tables
-                .get(&rid(BuiltInKind::Node))
-                .and_then(|t| t.selected_item())
-            {
+            if let Some(row) = app.nav.top().selected_row() {
                 let node = row.name.clone();
                 return ActionResult::Exec {
                     op: crate::kube::protocol::OperationKind::NodeShell,
@@ -916,32 +912,30 @@ fn handle_drill(
             }
         }
         Action::OverlayCapability(ref cap_name) => {
-            let plural = app.nav.view_id().plural().to_owned();
+            let Some(plural) = app.nav.top().rid().map(|r| r.plural().to_owned()) else {
+                return ActionResult::None;
+            };
             let overlay = crate::kube::overlay::overlay_for(&plural);
             let cap = overlay.and_then(|o| o.capabilities.get(cap_name));
             match cap {
                 Some(crate::kube::overlay::OverlayCapability::Drill { target, column }) => {
                     let target_rid = crate::kube::protocol::ResourceId::from_alias(target)
                         .unwrap_or_else(|| crate::kube::protocol::ResourceId::CrdUnresolved(target.clone()));
-                    let filter_value = app.active_view_table()
-                        .and_then(|t| t.selected_item())
-                        .and_then(|row| {
-                            let desc = app.active_view_descriptor()?;
-                            let col_idx = desc.headers().iter()
-                                .position(|h| h.eq_ignore_ascii_case(column))?;
-                            row.cells.get(col_idx).map(|c| c.to_string())
-                        });
+                    let headers = app.nav.top().headers_snapshot();
+                    let filter_value = app.nav.top().selected_row().and_then(|row| {
+                        let col_idx = headers.iter().position(|h| h.eq_ignore_ascii_case(column))?;
+                        row.cells.get(col_idx).map(|c| c.to_string())
+                    });
                     if let Some(value) = filter_value.filter(|v| !v.is_empty()) {
-                        let sel = app.active_table_selected();
-                        app.nav.save_selected(sel);
-                        let change = app.nav.push(crate::app::nav::NavStep::new(
+                        let selector = crate::app::nav::K8sFieldSelector::MetadataName(value.clone());
+                        let el = app.list_element_from_top(
+                            data_source,
                             target_rid,
-                            Some(crate::app::nav::NavFilter::Field(
-                                crate::app::nav::K8sFieldSelector::MetadataName(value.clone()),
-                            )),
-                        ));
-                        apply_nav_change(app, data_source, change);
-                        app.reapply_nav_filters();
+                            app.kube.selected_ns.clone(),
+                            Some(protocol::SubscriptionFilter::Field(selector.to_wire())),
+                            format!("{}/{}", target, value),
+                        );
+                        app.nav.push(el);
                         app.ui.flash = Some(crate::app::FlashMessage::info(
                             format!("{} matching: {}", target, value)
                         ));
@@ -974,41 +968,42 @@ fn handle_io(
     data_source: &mut ClientSession,
 ) {
     use crate::app::actions::Action;
-    use crate::app::Route;
 
     match action {
         Action::Copy => {
-            let (text, label) = match &app.route {
-                Route::ContentView { ref state, .. } => {
-                    if state.content.is_empty() {
+            use crate::app::element::Element;
+            let (text, label) = match app.nav.top_mut() {
+                Element::ContentView(cv) => {
+                    if cv.state.content.is_empty() {
                         (String::new(), String::new())
                     } else {
-                        let lines = state.line_count();
-                        (state.content.clone(), format!("Copied {} lines to clipboard", lines))
+                        let lines = cv.state.line_count();
+                        (cv.state.content.clone(), format!("Copied {} lines to clipboard", lines))
                     }
                 }
-                Route::Logs { ref state, .. } => {
-                    let indices = state.filtered_indices();
+                el @ (Element::LogSession(_) | Element::LogFilter(_)) => {
+                    let indices = el.log_visible().unwrap_or_default();
+                    let store = el.log_store().expect("log kinds have a store");
                     if indices.is_empty() {
                         (String::new(), String::new())
                     } else {
-                        let lines = state.lines();
-                        let joined: String = indices.iter()
-                            .filter_map(|&i| lines.get(i))
-                            .map(|l| crate::util::strip_ansi(&l.flat_text()))
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        let joined: String = store.with_read(|i| {
+                            indices.iter()
+                                .filter_map(|&idx| i.lines.get(idx))
+                                .map(|l| crate::util::strip_ansi(&l.flat_text()))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        });
                         let count = indices.len();
                         (joined, format!("Copied {} lines to clipboard", count))
                     }
                 }
-                Route::Contexts => {
-                    let ctxs = &app.data.contexts;
-                    if ctxs.items.is_empty() {
+                Element::ContextList(c) => {
+                    if c.table.items().is_empty() {
                         (String::new(), String::new())
                     } else {
                         let mut lines = vec!["CURRENT\tNAME\tCLUSTER".to_string()];
-                        for ctx in &ctxs.items {
+                        for ctx in c.table.items() {
                             let marker = if ctx.is_current { "*" } else { "" };
                             let cluster = if ctx.identity.cluster.is_empty() {
                                 ctx.name.as_str()
@@ -1017,7 +1012,7 @@ fn handle_io(
                             };
                             lines.push(format!("{}\t{}\t{}", marker, ctx.name, cluster));
                         }
-                        let count = ctxs.items.len();
+                        let count = c.table.items().len();
                         (lines.join("\n"), format!("Copied {} contexts to clipboard", count))
                     }
                 }
@@ -1051,7 +1046,7 @@ fn handle_io(
             let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
             let filename = format!(
                 "{}-{}.txt",
-                safe(app.nav.view_id().short_label()),
+                safe(app.nav.top().title()),
                 chrono::Utc::now().format("%Y%m%d-%H%M%S")
             );
             let content = build_table_dump(app);
@@ -1082,71 +1077,58 @@ fn handle_io(
 // ---------------------------------------------------------------------------
 
 fn handle_show_port_forwards(app: &mut App, data_source: &mut ClientSession) {
-    use crate::app::Route;
     let pf_rid = crate::kube::protocol::ResourceId::Local(
         crate::kube::local::LocalResourceKind::PortForward,
     );
-    let sel = app.active_table_selected();
-    app.nav.save_selected(sel);
-    app.route = Route::Resources;
-    let change = app.nav.push(crate::app::nav::NavStep::new(pf_rid, None));
-    apply_nav_change(app, data_source, change);
+    let label = pf_rid.short_label().to_lowercase();
+    let el = app.list_element_from_top(
+        data_source, pf_rid, app.kube.selected_ns.clone(), None, label,
+    );
+    app.nav.push(el);
 }
 
 fn handle_refresh(app: &mut App, data_source: &mut ClientSession) {
-    use crate::app::{ContentViewKind, Route};
+    use crate::app::element::{ContentSpec, Element};
 
-    // If we're inside a describe/yaml view, re-fetch the content directly.
-    let content_refresh = match app.route {
-        Route::ContentView { kind: kind @ (ContentViewKind::Describe | ContentViewKind::Yaml), target: Some(ref target), .. } => {
-            Some((kind, target.clone()))
-        }
-        _ => None,
-    };
-    if let Some((kind, target)) = content_refresh {
-        app.kube.kubectl_cache.clear();
-        let result = if kind == ContentViewKind::Describe {
-            data_source.describe(&target)
-        } else {
-            data_source.yaml(&target)
+    // Inside a describe/yaml element: re-fetch ITS OWN target directly.
+    if let Element::ContentView(cv) = app.nav.top_mut() {
+        let result = match &cv.kind {
+            ContentSpec::Describe(target) => Some(data_source.describe(target)),
+            ContentSpec::Yaml(target) => Some(data_source.yaml(target)),
+            ContentSpec::Aliases => None,
         };
-        match result {
-            Ok(()) => {
-                app.route = Route::ContentView {
-                    kind,
-                    target: Some(target),
-                    awaiting_response: true,
-                    state: crate::app::ContentViewState::default(),
-                };
-                app.ui.flash = Some(crate::app::FlashMessage::info("Refreshing..."));
-            }
-            Err(_) => {
-                app.ui.flash = Some(crate::app::FlashMessage::error("Failed to refresh"));
+        if let Some(result) = result {
+            app.kube.kubectl_cache.clear();
+            match result {
+                Ok(()) => {
+                    if let Element::ContentView(cv) = app.nav.top_mut() {
+                        cv.state = crate::app::ContentViewState::default();
+                        cv.awaiting_response = true;
+                    }
+                    app.ui.flash = Some(crate::app::FlashMessage::info("Refreshing..."));
+                }
+                Err(_) => {
+                    app.ui.flash = Some(crate::app::FlashMessage::error("Failed to refresh"));
+                }
             }
         }
         return;
     }
 
     // Derived views are client-side projections — no subscription to refresh.
-    if app.nav.view_id().is_derived() {
+    if app.nav.top().derived_kind().is_some() {
         app.ui.flash = Some(crate::app::FlashMessage::info("Pop back to refresh the parent view"));
         return;
     }
-    let Some(rid) = app.nav.resource_id().cloned() else { return; };
     app.kube.kubectl_cache.clear();
-    let filter = app.nav.with_subscription_owner(|owner| {
-        let f = owner.filter.as_ref().and_then(|f| f.to_subscription_filter());
-        owner.stream = None;
-        f
-    });
-    app.clear_resource(&rid);
-    let stream = data_source.subscribe_stream_force(rid, app.kube.selected_ns.clone(), filter);
-    app.nav.with_subscription_owner(|owner| owner.stream = Some(stream));
+    // Re-run the owning element's OWN query spec with a forced watcher.
+    // The old refresh re-subscribed with the AMBIENT namespace, silently
+    // narrowing all-namespace drills — unrepresentable now.
+    app.nav.refresh_top_query(data_source);
     app.ui.flash = Some(crate::app::FlashMessage::info("Refreshed"));
 }
 
 fn handle_show_aliases(app: &mut App) {
-    use crate::app::Route;
     let mut content = String::from("Resource Aliases\n================\n\n");
     content.push_str(&format!("  {:<45} {}\n", "ALIAS", "RESOURCE"));
     content.push_str(&format!("  {:<45} {}\n", "-----", "--------"));
@@ -1169,12 +1151,9 @@ fn handle_show_aliases(app: &mut App) {
     content.push_str("  Ctrl-s                     Save table to file\n");
     let mut state = crate::app::ContentViewState::default();
     state.set_content(content);
-    app.navigate_to(Route::ContentView {
-        kind: crate::app::ContentViewKind::Aliases,
-        target: None,
-        awaiting_response: false,
-        state,
-    });
+    app.nav.push(crate::app::element::Element::ContentView(
+        crate::app::element::ContentView::new(crate::app::element::ContentSpec::Aliases, state, false),
+    ));
 }
 
 // ===========================================================================
@@ -1195,51 +1174,41 @@ pub(crate) fn handle_enter(
     app: &mut App,
     data_source: &mut ClientSession,
 ) -> ActionResult {
-    use crate::app::Route;
     use crate::kube::protocol::ResourceId;
 
     // Derived view Enter: open logs for the selected container.
-    if app.nav.view_id().is_derived() {
+    if app.nav.top().derived_kind().is_some() {
         open_logs_from_derived(app, data_source, false);
         return ActionResult::None;
     }
 
-    // Handle context view Enter
-    if matches!(app.route, Route::Contexts) {
-        if let Some(ctx) = app.data.contexts.selected_item() {
+    // Handle context-picker Enter: switch to the selected context.
+    if let crate::app::element::Element::ContextList(c) = app.nav.top() {
+        if let Some(ctx) = c.table.selected_item() {
             let ctx_name = ctx.name.clone();
             begin_context_switch(app, data_source, &ctx_name);
         }
         return ActionResult::None;
     }
 
-    // Handle ContainerSelect: open logs or shell for the selected container.
-    if let Route::ContainerSelect { ref target, selected, action } = app.route {
+    // Handle ContainerSelect overlay: open logs or shell for the pick.
+    if let Some(crate::app::Overlay::ContainerSelect { ref target, ref containers, selected, action }) = app.ui.overlay {
         let target = target.clone();
         let pod_ns_str = target.namespace.display().to_string();
-        let container_name = {
-            let table = app.nav.find_table_for_resource(&target.resource)
-                .or_else(|| app.data.tables.get(&target.resource));
-            table
-                .and_then(|t| t.items.iter().find(|p| {
-                    p.name == target.name && p.namespace.as_deref() == target.namespace.as_option()
-                }))
-                .and_then(|p| p.containers.get(selected).map(|ci| ci.name.clone()))
-        };
-
-        let container_name = match container_name {
+        // The dialog captured its container list at construction.
+        let container_name = match containers.get(selected).map(|ci| ci.name.clone()) {
             Some(n) => n,
             None => {
                 app.ui.flash = Some(crate::app::FlashMessage::error(
                     format!("Pod {}/{} no longer has a container at index {}", pod_ns_str, target.name, selected)
                 ));
-                app.route = app.route_stack.pop().unwrap_or(Route::Resources);
+                app.ui.overlay = None;
                 return ActionResult::None;
             }
         };
+        app.ui.overlay = None;
 
         if matches!(action, crate::app::ContainerAction::Shell) {
-            app.route = app.route_stack.pop().unwrap_or(Route::Resources);
             return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget::Pod {
                 pod: target.name,
                 namespace: pod_ns_str,
@@ -1248,39 +1217,30 @@ pub(crate) fn handle_enter(
         }
 
         let previous = matches!(action, crate::app::ContainerAction::PreviousLogs);
-
-        let mut log_state = crate::app::LogState::from_config(&app.config.ui.logs);
-        log_state.follow = !previous;
-        log_state.streaming = true;
-        log_state.initial_load = true;
-        let tail = Some(log_state.tail_lines);
-
-        let new_stream = data_source.stream_log_substream(crate::kube::protocol::LogInit {
-            pod: target.name.clone(),
-            namespace: target.namespace.clone(),
-            container: log_container_from_str(&container_name),
-            follow: !previous,
-            tail,
-            since: None,
-            previous,
-        });
-        log_state.generation = new_stream.generation;
-
-        app.navigate_to(Route::Logs {
-            target: ContainerRef::new(
+        push_log_session(
+            app,
+            data_source,
+            ContainerRef::new(
                 target.name.clone(),
                 pod_ns_str,
                 log_container_from_str(&container_name),
             ),
-            state: Box::new(log_state),
-            stream: Some(new_stream),
-        });
+            crate::kube::protocol::LogInit {
+                pod: target.name.clone(),
+                namespace: target.namespace.clone(),
+                container: log_container_from_str(&container_name),
+                follow: !previous,
+                tail: Some(app.config.ui.logs.tail_lines),
+                since: None,
+                previous,
+            },
+        );
         return ActionResult::None;
     }
 
     // Handle Enter: read the row's drill_target and act on it.
     use crate::kube::resources::row::DrillTarget;
-    let row_data = app.active_view_table().and_then(|t| t.selected_item()).cloned();
+    let row_data = app.nav.top().selected_row();
 
     let Some(row) = row_data else {
         handle_describe(app, data_source);
@@ -1293,13 +1253,12 @@ pub(crate) fn handle_enter(
         }
         Some(DrillTarget::BrowseCrd(crd_ref)) => {
             let kind_label = crd_ref.kind.clone();
-            let sel = app.active_view_table().map(|t| t.selected()).unwrap_or(0);
-            app.nav.save_selected(sel);
-            let change = app.nav.push(crate::app::nav::NavStep::new(
-                ResourceId::Crd(crd_ref),
-                None,
-            ));
-            apply_nav_change(app, data_source, change);
+            let crd_rid = ResourceId::Crd(crd_ref);
+            let label = crd_rid.short_label().to_lowercase();
+            let el = app.list_element_from_top(
+                data_source, crd_rid, app.kube.selected_ns.clone(), None, label,
+            );
+            app.nav.push(el);
             app.ui.flash = Some(crate::app::FlashMessage::info(format!("Browsing CRD: {}", kind_label)));
         }
         Some(DrillTarget::PodsByLabels { labels, breadcrumb }) => {
@@ -1315,63 +1274,52 @@ pub(crate) fn handle_enter(
         }
         Some(DrillTarget::PodsByField(selector)) => {
             let breadcrumb = selector.breadcrumb();
-            let sel = app.active_view_table().map(|t| t.selected()).unwrap_or(0);
-            app.nav.save_selected(sel);
-            let change = app.nav.push(crate::app::nav::NavStep::new(
+            // The element's OWN scope is intrinsic to the drill: a node
+            // hosts pods from EVERY namespace, so a spec.nodeName drill is
+            // cluster-wide; name/phase drills keep the session scope as a
+            // construction input. Because the element owns its columns,
+            // the cluster-wide view shows NAMESPACE regardless of the
+            // ambient selector.
+            let ns = match &selector {
+                crate::app::nav::K8sFieldSelector::SpecNodeName(_) => protocol::Namespace::All,
+                _ => app.kube.selected_ns.clone(),
+            };
+            let el = app.list_element_from_top(
+                data_source,
                 rid(BuiltInKind::Pod),
-                Some(crate::app::nav::NavFilter::Field(selector)),
-            ));
-            apply_nav_change(app, data_source, change);
-            app.reapply_nav_filters();
+                ns,
+                Some(protocol::SubscriptionFilter::Field(selector.to_wire())),
+                breadcrumb.clone(),
+            );
+            app.nav.push(el);
             app.ui.flash = Some(crate::app::FlashMessage::info(format!("Pods filtered by {}", breadcrumb)));
         }
         Some(DrillTarget::PodsByNameGrep(name)) => {
             drill_to_pods_by_grep(app, data_source, &name);
         }
         Some(DrillTarget::JobsByOwner { uid, kind, name }) => {
-            use crate::app::nav::{NavFilter, NavStep};
-            let sel = app.active_view_table().map(|t| t.selected()).unwrap_or(0);
-            app.nav.save_selected(sel);
-            let kind_lower = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().kind.to_lowercase();
-            let change = app.nav.push(NavStep::new(
+            let kind_str = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().kind;
+            let kind_lower = kind_str.to_lowercase();
+            // Scope to the SOURCE object's namespace — its jobs live there.
+            let source_ns = protocol::Namespace::from_row(row.namespace.as_deref().unwrap_or(""));
+            let el = app.list_element_from_top(
+                data_source,
                 rid(BuiltInKind::Job),
-                Some(NavFilter::OwnerChain {
-                    uid,
-                    kind,
-                    display_name: name.clone(),
-                    namespace: crate::kube::protocol::Namespace::from_row(row.namespace.as_deref().unwrap_or("")),
-                }),
-            ));
-            apply_nav_change(app, data_source, change);
-            app.reapply_nav_filters();
+                source_ns,
+                Some(protocol::SubscriptionFilter::OwnerUid(uid)),
+                format!("{}/{}", kind_str, name),
+            );
+            app.nav.push(el);
             app.ui.flash = Some(crate::app::FlashMessage::info(format!("Jobs for {}/{}", kind_lower, name)));
         }
         Some(DrillTarget::Derived(kind)) => {
-            // Generic derived view: project parent row into child rows,
-            // push a client-side view step (no daemon subscription).
-            let Some(current_rid) = app.nav.resource_id().cloned() else {
-                return ActionResult::None;
-            };
-            let row_ns = row.namespace.as_deref().unwrap_or("");
-            let source = ObjectRef::new(
-                current_rid,
-                row.name.clone(),
-                protocol::Namespace::from_row(row_ns),
-            );
-            let child_rows = kind.project(&row);
-            let headers = kind.default_headers();
-
-            let sel = app.active_view_table().map(|t| t.selected()).unwrap_or(0);
-            app.nav.save_selected(sel);
-
-            let mut step = crate::app::nav::NavStep::derived(kind.clone(), source);
-            let mut table = crate::app::StatefulTable::new();
-            table.set_items(child_rows);
-            step.table = Some(table);
-            step.descriptor = Some(crate::app::TableDescriptor::new(headers, kind.plural()));
-
-            let change = app.nav.push(step);
-            apply_nav_change(app, data_source, change);
+            // "Containers on this pod": the row's identity + the top's
+            // live source ARE the definition. The projection is LIVE — it
+            // re-derives as the parent row changes and empties honestly
+            // if the pod disappears.
+            if let Ok(el) = Element::derive_projection(app.nav.top(), &row, kind) {
+                app.nav.push(el);
+            }
         }
         None => {
             handle_describe(app, data_source);
@@ -1384,27 +1332,25 @@ pub(crate) fn handle_describe(
     app: &mut App,
     data_source: &mut ClientSession,
 ) {
-    use crate::app::Route;
+    use crate::app::element::{ContentSpec, ContentView, Element};
     if let Some(info) = get_selected_resource_info(app) {
         if let Some(lines) = app.kube.kubectl_cache.get_describe_lines(&info) {
             let mut state = crate::app::ContentViewState::default();
             state.set_describe_lines(lines);
-            app.navigate_to(Route::ContentView {
-                kind: crate::app::ContentViewKind::Describe,
-                target: Some(info),
-                awaiting_response: false,
+            app.nav.push(Element::ContentView(ContentView::new(
+                ContentSpec::Describe(info),
                 state,
-            });
+                false,
+            )));
             return;
         }
 
         ds_try!(app, data_source.describe(&info));
-        app.navigate_to(Route::ContentView {
-            kind: crate::app::ContentViewKind::Describe,
-            target: Some(info),
-            awaiting_response: true,
-            state: crate::app::ContentViewState::default(),
-        });
+        app.nav.push(Element::ContentView(ContentView::new(
+            ContentSpec::Describe(info),
+            crate::app::ContentViewState::default(),
+            true,
+        )));
     }
 }
 
@@ -1412,27 +1358,25 @@ pub(crate) fn handle_yaml(
     app: &mut App,
     data_source: &mut ClientSession,
 ) {
-    use crate::app::Route;
+    use crate::app::element::{ContentSpec, ContentView, Element};
     if let Some(info) = get_selected_resource_info(app) {
         if let Some(cached) = app.kube.kubectl_cache.get(&info, crate::app::ContentKind::Yaml) {
             let mut state = crate::app::ContentViewState::default();
             state.set_content(cached.to_string());
-            app.navigate_to(Route::ContentView {
-                kind: crate::app::ContentViewKind::Yaml,
-                target: Some(info),
-                awaiting_response: false,
+            app.nav.push(Element::ContentView(ContentView::new(
+                ContentSpec::Yaml(info),
                 state,
-            });
+                false,
+            )));
             return;
         }
 
         ds_try!(app, data_source.yaml(&info));
-        app.navigate_to(Route::ContentView {
-            kind: crate::app::ContentViewKind::Yaml,
-            target: Some(info),
-            awaiting_response: true,
-            state: crate::app::ContentViewState::default(),
-        });
+        app.nav.push(Element::ContentView(ContentView::new(
+            ContentSpec::Yaml(info),
+            crate::app::ContentViewState::default(),
+            true,
+        )));
     }
 }
 
@@ -1450,17 +1394,29 @@ pub(crate) fn handle_previous_logs(
     open_logs(app, data_source, true);
 }
 
+/// Push a `LogSession` element for `spec` — "logs of this container" is
+/// the element's whole self-definition.
+fn push_log_session(
+    app: &mut App,
+    data_source: &mut ClientSession,
+    target: ContainerRef,
+    spec: protocol::LogInit,
+) {
+    let el = crate::app::element::Element::LogSession(Box::new(
+        crate::app::element::LogSession::open(data_source, target, spec, &app.config.ui.logs),
+    ));
+    app.nav.push(el);
+}
+
 /// Core log-open flow shared by live and previous-logs actions.
 fn open_logs(
     app: &mut App,
     data_source: &mut ClientSession,
     previous: bool,
 ) {
-    use crate::app::Route;
-
     // Derived view (e.g., container table): the selected row IS the
-    // container, and nav.source IS the parent pod.
-    if app.nav.view_id().is_derived() {
+    // container, and the element's origin IS the parent pod.
+    if app.nav.top().derived_kind().is_some() {
         open_logs_from_derived(app, data_source, previous);
         return;
     }
@@ -1470,14 +1426,16 @@ fn open_logs(
     let namespace_typed = info.namespace.clone();
     let namespace_display = namespace_typed.display().to_string();
 
-    let containers = app.active_view_table()
-        .and_then(|t| t.selected_item())
+    let containers = app.nav.top().selected_row()
         .map(|row| row.containers.clone())
         .unwrap_or_default();
 
     if containers.len() > 1 {
-        app.navigate_to(Route::ContainerSelect {
+        app.ui.confirm_dialog = None;
+        app.ui.form_dialog = None;
+        app.ui.overlay = Some(crate::app::Overlay::ContainerSelect {
             target: info.clone(),
+            containers: containers.clone(),
             selected: 0,
             action: if previous {
                 crate::app::ContainerAction::PreviousLogs
@@ -1496,98 +1454,69 @@ fn open_logs(
         (target.clone(), target, protocol::LogContainer::All)
     };
 
-    let mut log_state = crate::app::LogState::from_config(&app.config.ui.logs);
-    log_state.follow = !previous;
-    log_state.streaming = true;
-    log_state.initial_load = true;
-    let tail = Some(log_state.tail_lines);
-
-    let new_stream = data_source.stream_log_substream(protocol::LogInit {
-        pod: log_target.clone(),
-        namespace: namespace_typed,
-        container: route_container.clone(),
-        follow: !previous,
-        tail,
-        since: None,
-        previous,
-    });
-    log_state.generation = new_stream.generation;
-
-    app.navigate_to(Route::Logs {
-        target: ContainerRef::new(route_pod, namespace_display, route_container),
-        state: Box::new(log_state),
-        stream: Some(new_stream),
-    });
+    push_log_session(
+        app,
+        data_source,
+        ContainerRef::new(route_pod, namespace_display, route_container.clone()),
+        protocol::LogInit {
+            pod: log_target,
+            namespace: namespace_typed,
+            container: route_container,
+            follow: !previous,
+            tail: Some(app.config.ui.logs.tail_lines),
+            since: None,
+            previous,
+        },
+    );
 }
 
 /// Open logs from a derived view (e.g., container table). The selected
-/// row's name is the container, and `nav.source` is the parent pod.
+/// row's name is the container; the element's origin is the parent pod.
 fn open_logs_from_derived(
     app: &mut App,
     data_source: &mut ClientSession,
     previous: bool,
 ) {
-    use crate::kube::resources::KubeResource;
+    let Some(origin) = app.nav.top().origin().cloned() else { return; };
+    let Some(item) = app.nav.top().selected_row() else { return; };
 
-    let Some(source) = app.nav.current().source.clone() else { return; };
-    let Some(table) = app.active_view_table() else { return; };
-    let Some(item) = table.selected_item() else { return; };
-
-    let container_name = item.name().to_string();
-    let pod_name = source.name.clone();
-    let namespace = source.namespace.clone();
+    let container_name = item.name.clone();
+    let pod_name = origin.name.clone();
+    let namespace = origin.namespace.clone();
     let ns_display = namespace.display().to_string();
-
     let container = protocol::LogContainer::Named(container_name.clone());
 
-    let mut log_state = crate::app::LogState::from_config(&app.config.ui.logs);
-    log_state.follow = !previous;
-    log_state.streaming = true;
-    log_state.initial_load = true;
-    let tail = Some(log_state.tail_lines);
-
-    let new_stream = data_source.stream_log_substream(protocol::LogInit {
-        pod: pod_name.clone(),
-        namespace,
-        container: container.clone(),
-        follow: !previous,
-        tail,
-        since: None,
-        previous,
-    });
-    log_state.generation = new_stream.generation;
-
-    app.navigate_to(crate::app::Route::Logs {
-        target: ContainerRef::new(pod_name, ns_display, container),
-        state: Box::new(log_state),
-        stream: Some(new_stream),
-    });
+    push_log_session(
+        app,
+        data_source,
+        ContainerRef::new(pod_name.clone(), ns_display, container.clone()),
+        protocol::LogInit {
+            pod: pod_name,
+            namespace,
+            container,
+            follow: !previous,
+            tail: Some(app.config.ui.logs.tail_lines),
+            since: None,
+            previous,
+        },
+    );
 }
 
 /// Build a tab-separated text dump of the currently visible resource table.
+/// Reads the element's own last-materialized view: same columns (the
+/// element's OWN NAMESPACE decision — not the ambient selector), same
+/// filter and sort, same effective (metrics-overlaid) cell strings the
+/// user is looking at. What you copy is exactly what you see.
 pub(crate) fn build_table_dump(app: &App) -> String {
-    let current_view = app.nav.view_id();
-    if let Some(table) = app.active_view_table() {
-        let skip_ns = !app.kube.selected_ns.is_all();
-        let visible = app.active_view_descriptor()
-            .map(|d| d.visible_columns(current_view, app.ui.column_level, skip_ns))
-            .unwrap_or_default();
-        let visible_indices: Vec<usize> = visible.iter().map(|&(i, _)| i).collect();
-        let headers: String = visible.iter().map(|&(_, name)| name).collect::<Vec<_>>().join("\t");
-        let mut lines = vec![headers];
-        for &i in table.filtered_indices() {
-            if let Some(item) = table.items.get(i) {
-                let row: String = visible_indices.iter()
-                    .map(|&ci| item.cells.get(ci).map(|c| c.to_string()).unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join("\t");
-                lines.push(row);
-            }
-        }
-        lines.join("\n")
-    } else {
-        String::new()
+    let Some(view) = app.nav.top().last_view() else { return String::new() };
+    if view.rows.is_empty() && view.total_rows == 0 {
+        return String::new();
     }
+    let mut lines = vec![view.headers.join("\t")];
+    for row in &view.rows {
+        lines.push(row.join("\t"));
+    }
+    lines.join("\n")
 }
 
 /// Build a `FormDialog` from a declarative `FormSchema`.
@@ -1606,7 +1535,7 @@ pub(crate) fn build_form_from_schema(
     op: crate::kube::protocol::OperationKind,
     target: ObjectRef,
     row: Option<&crate::kube::resources::row::ResourceRow>,
-    desc: Option<&crate::app::TableDescriptor>,
+    headers: &[String],
 ) -> Option<crate::app::FormDialog> {
     use crate::app::{FormDialog, FormFieldKind, FormFieldState, FormSubmit};
     use crate::kube::protocol::{FormFieldSchemaKind, DynamicSelectFallback};
@@ -1629,7 +1558,7 @@ pub(crate) fn build_form_from_schema(
             FormFieldSchemaKind::Number { min, max, default_column } => {
                 let default_value = default_column
                     .and_then(|col_name| {
-                        let col_idx = desc.and_then(|d| d.col(col_name))?;
+                        let col_idx = headers.iter().position(|h| h.eq_ignore_ascii_case(col_name))?;
                         let r = row?;
                         let cell = r.cells.get(col_idx)?;
                         let s = cell.to_string();
@@ -1694,46 +1623,47 @@ pub(crate) fn build_form_from_schema(
 }
 
 pub(crate) fn get_selected_resource_info(app: &App) -> Option<ObjectRef> {
-    use crate::kube::resources::KubeResource;
     use crate::kube::protocol::Namespace;
 
-    let current_rid = app.nav.resource_id()?.clone();
-    let table = app.active_view_table()?;
-    let item = table.selected_item()?;
+    let current_rid = app.nav.top().rid()?.clone();
+    let row = app.nav.top().selected_row()?;
     Some(ObjectRef::new(
         current_rid,
-        item.name().to_string(),
-        Namespace::from_row(item.namespace()),
+        row.name.clone(),
+        Namespace::from_row(row.namespace.as_deref().unwrap_or("")),
     ))
 }
 
-/// Get resource info for all marked items in the active table.
+/// Resource refs for all marked rows on the top element's data. Marks are
+/// IDENTITY-keyed on the shared store, so this is the marked set as data
+/// — independent of the current refinement (matching the fused-table
+/// behavior; the marked∩visible question belongs to the batch-ops
+/// feature, not here).
 pub(crate) fn get_marked_resource_infos(app: &App) -> Vec<ObjectRef> {
-    use crate::kube::resources::KubeResource;
     use crate::kube::protocol::Namespace;
 
-    let Some(current_rid) = app.nav.resource_id().cloned() else { return Vec::new(); };
-    let mut result = Vec::new();
-    if let Some(table) = app.active_view_table() {
-        for item in &table.items {
-            let key = crate::kube::protocol::ObjectKey::new(item.namespace(), item.name());
-            if table.marked.contains(&key) {
-                result.push(ObjectRef::new(
-                    current_rid.clone(),
-                    item.name().to_string(),
-                    Namespace::from_row(item.namespace()),
-                ));
-            }
-        }
-    }
-    result
+    let Some(current_rid) = app.nav.top().rid().cloned() else { return Vec::new(); };
+    app.nav
+        .top()
+        .marked_keys()
+        .into_iter()
+        .map(|key| {
+            ObjectRef::new(
+                current_rid.clone(),
+                key.name,
+                Namespace::from_row(&key.namespace),
+            )
+        })
+        .collect()
 }
 
 // ===========================================================================
 // Navigation helpers (merged from session_nav.rs)
 // ===========================================================================
 
-/// Drill down to pods filtered by label selector.
+/// Drill down to pods filtered by label selector. `namespace` is the
+/// SOURCE object's namespace — intrinsic to the drill, carried on the
+/// element's own query spec.
 pub(crate) fn drill_to_pods_by_labels(
     app: &mut App,
     data_source: &mut ClientSession,
@@ -1741,37 +1671,42 @@ pub(crate) fn drill_to_pods_by_labels(
     namespace: crate::kube::protocol::Namespace,
     description: &str,
 ) {
-    use crate::app::nav::{NavFilter, NavStep};
-
-    app.nav.save_selected(app.active_table_selected());
-    let change = app.nav.push(NavStep::new(
+    let el = app.list_element_from_top(
+        data_source,
         rid(BuiltInKind::Pod),
-        Some(NavFilter::Labels { labels, namespace }),
-    ));
-    apply_nav_change(app, data_source, change);
-    app.reapply_nav_filters();
+        namespace,
+        Some(protocol::SubscriptionFilter::Labels(labels)),
+        description.to_string(),
+    );
+    app.nav.push(el);
     app.ui.flash = Some(crate::app::FlashMessage::info(format!("Pods for {}", description)));
 }
 
-/// Drill down to pods filtered by name prefix (fallback when no selector_labels).
+/// Drill down to pods filtered by name prefix (fallback when no
+/// selector_labels): a pods list element plus a grep refinement over it.
 pub(crate) fn drill_to_pods_by_grep(
     app: &mut App,
     data_source: &mut ClientSession,
     name: &str,
 ) {
-    use crate::app::nav::{CompiledGrep, NavFilter, NavStep};
-    let filter = format!("{}-", regex::escape(name));
-    app.nav.save_selected(app.active_table_selected());
-    let change = app.nav.push(NavStep::new(
+    use crate::app::nav::CompiledGrep;
+    let el = app.list_element_from_top(
+        data_source,
         rid(BuiltInKind::Pod),
-        Some(NavFilter::Grep(CompiledGrep::new(filter))),
-    ));
-    apply_nav_change(app, data_source, change);
-    app.reapply_nav_filters();
+        app.kube.selected_ns.clone(),
+        None,
+        "pods".to_string(),
+    );
+    app.nav.push(el);
+    let predicate = RowPredicate::Grep(CompiledGrep::new(format!("{}-", regex::escape(name))));
+    if let Ok(el) = Element::derive_filter(app.nav.top(), predicate) {
+        app.nav.push(el);
+    }
     app.ui.flash = Some(crate::app::FlashMessage::info(format!("Pods matching: {}", name)));
 }
 
 /// Drill down to pods owned by a resource (via ownerReferences chain).
+/// `namespace` is the source object's namespace — intrinsic scope.
 pub(crate) fn drill_to_pods_by_owner(
     app: &mut App,
     data_source: &mut ClientSession,
@@ -1780,21 +1715,16 @@ pub(crate) fn drill_to_pods_by_owner(
     name: &str,
     namespace: crate::kube::protocol::Namespace,
 ) {
-    use crate::app::nav::{NavFilter, NavStep};
-
-    app.nav.save_selected(app.active_table_selected());
-    let change = app.nav.push(NavStep::new(
+    let kind_str = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().kind;
+    let el = app.list_element_from_top(
+        data_source,
         rid(BuiltInKind::Pod),
-        Some(NavFilter::OwnerChain {
-            uid: uid.to_string(),
-            kind,
-            display_name: name.to_string(),
-            namespace,
-        }),
-    ));
-    apply_nav_change(app, data_source, change);
-    app.reapply_nav_filters();
-    let kind_lower = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().kind.to_lowercase();
+        namespace,
+        Some(protocol::SubscriptionFilter::OwnerUid(uid.to_string())),
+        format!("{}/{}", kind_str, name),
+    );
+    app.nav.push(el);
+    let kind_lower = kind_str.to_lowercase();
     app.ui.flash = Some(crate::app::FlashMessage::info(format!(
         "Pods for {}/{}",
         kind_lower, name
@@ -1813,19 +1743,21 @@ pub(crate) fn drill_to_pods_in_namespace(
     data_source: &mut ClientSession,
     ns: crate::kube::protocol::Namespace,
 ) {
-    use crate::app::nav::NavStep;
-
-    // Make the selected namespace the active scope (same hygiene as
-    // `do_switch_namespace`: drop other namespaces' cached rows so they
-    // can't bleed into sibling tabs after the switch).
+    // Entering a namespace also makes it the session's active SELECTOR
+    // (k9s parity) — an explicit selector write, not something the
+    // element reads back. The pushed element carries the namespace as
+    // its OWN scope.
     app.kube.selected_ns = ns.clone();
-    app.clear_namespaced_caches();
     app.kube.kubectl_cache.clear();
-    app.ui.deltas.clear();
 
-    app.nav.save_selected(app.active_table_selected());
-    let change = app.nav.push(NavStep::new(rid(BuiltInKind::Pod), None));
-    apply_nav_change(app, data_source, change);
+    let el = app.list_element_from_top(
+        data_source,
+        rid(BuiltInKind::Pod),
+        ns.clone(),
+        None,
+        "pods".to_string(),
+    );
+    app.nav.push(el);
     app.ui.flash = Some(crate::app::FlashMessage::info(format!(
         "Pods in namespace: {}",
         ns.display()
@@ -1845,27 +1777,26 @@ pub(crate) fn begin_context_switch(
         return;
     }
 
-    app.kube.core_streams.clear();
-    app.nav.current_mut().stream = None;
+    // All core data belongs to the old cluster; elements drop with the
+    // stack reset (their streams RST; the new root's stream binds to the
+    // NEW session after the rebuild via the revive path).
+    app.core.clear();
     app.kube.context = ctx_name.clone();
     app.kube.selected_ns = crate::kube::protocol::Namespace::All;
-    app.kube.identity = app.data.contexts.items.iter()
+    app.kube.identity = app.data.contexts.items().iter()
         .find(|c| c.name == *ctx_name)
         .map(|ctx| ctx.identity.clone())
         .unwrap_or_default();
-    let root = app.nav.root_resource_id().cloned()
-        .unwrap_or_else(|| crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod));
-    let _change = app.nav.reset(root);
-    *app.nav.filter_input_mut() = Default::default();
+    // Land on the Overview root for the new context (matching the old
+    // Route::Overview landing) — no resource watch opens until the user
+    // navigates to one.
+    app.nav.reset(crate::app::element::Element::Overview(crate::app::element::Overview));
     app.kube.kubectl_cache.clear();
-    app.route_stack.clear();
-    app.route = crate::app::Route::Overview;
     app.ui.confirm_dialog = None;
     app.ui.form_dialog = None;
+    app.ui.overlay = None;
     app.ui.input_mode = InputMode::Normal;
-    app.ui.deltas.clear();
-    app.kube.pod_metrics.clear();
-    app.kube.node_metrics.clear();
+    app.kube.metrics.clear();
 
     app.kube.context_switch = crate::app::ContextSwitchState::Requested(ctx_name.clone());
     app.ui.flash = Some(crate::app::FlashMessage::info(format!(
@@ -1886,23 +1817,21 @@ pub(crate) fn do_switch_namespace(
         return;
     }
 
-    app.route_stack.clear();
-    app.route = crate::app::Route::Resources;
     app.ui.confirm_dialog = None;
     app.ui.form_dialog = None;
+    app.ui.overlay = None;
     app.ui.input_mode = InputMode::Normal;
-    app.clear_namespaced_caches();
     app.kube.kubectl_cache.clear();
-    app.ui.deltas.clear();
 
-    let root_rid = app.nav.root_resource_id().cloned()
-        .unwrap_or_else(|| crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod));
-    let _change = app.nav.reset(root_rid.clone());
-    *app.nav.filter_input_mut() = Default::default();
-
-    app.clear_resource(&root_rid);
-    let stream = data_source.subscribe_stream(root_rid, ns.clone(), None);
-    app.nav.current_mut().stream = Some(stream);
+    // Same root recipe, re-scoped: a fresh element with a fresh store —
+    // the old namespace's rows drop with the old stack (no cache to
+    // scrub, no tracker to reset).
+    let root_rid = match app.nav.root_spec() {
+        Some(crate::app::nav::RootSpec::Resource(r)) => r,
+        None => rid(BuiltInKind::Pod),
+    };
+    let root = App::root_list_element(data_source, &app.kube.metrics, root_rid, ns.clone());
+    app.nav.reset(root);
 
     app.ui.flash = Some(crate::app::FlashMessage::info(format!(
         "Switched to namespace: {}",

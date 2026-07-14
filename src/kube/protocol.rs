@@ -630,7 +630,7 @@ impl std::fmt::Display for NodeName {
 }
 
 /// CPU and memory usage from the metrics-server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetricsUsage {
     pub cpu: String,
     pub mem: String,
@@ -915,7 +915,7 @@ impl ResourceCapabilities {
 }
 
 /// Maximum bincode message size on the daemon socket. The largest
-/// legitimate message is a `ResourceUpdate::Rows` snapshot for a busy
+/// legitimate message is a `TableBaseline` for a busy
 /// cluster. 64 MiB gives headroom for very large clusters while still
 /// rejecting outrageous allocations from a corrupted frame.
 const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
@@ -1058,10 +1058,19 @@ pub struct SubscriptionInit {
 /// from the typed kind, and the wire round-trip + client-side cache was
 /// pure duplication that introduced a three-map rekey bug every time a
 /// CRD resolved.
+/// Stream contract: a subscription stream is one `Baseline`, then zero or
+/// more `Delta`s; `Baseline` may recur (join, watcher recovery, fanout
+/// lag, force-refresh) and REPLACES all prior state. No sequence numbers:
+/// the substream is ordered and reliable with a single writer, so the only
+/// possible loss is daemon-internal fanout lag — repaired by an in-band
+/// `Baseline` on the same stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamEvent {
-    /// Fresh rows for the subscribed resource.
-    Snapshot(crate::event::ResourceUpdate),
+    /// Full replacing state (headers ride only here).
+    Baseline(TableBaseline),
+    /// Incremental changes since the previous frame. The resource id is
+    /// implied by the substream (one subscription per substream).
+    Delta(TableDelta),
     /// The subscription failed — no further events will arrive on this
     /// substream. The daemon closes the stream after sending this.
     Error(String),
@@ -1129,9 +1138,103 @@ pub struct LogInit {
 /// Protocol version for the TUI↔daemon wire format. Bump this whenever
 /// `ResourceRow`, `SessionCommand`, `SessionEvent`, or any serialized type
 /// changes in a bincode-incompatible way (new fields, reordering, etc.).
-/// The daemon rejects Init commands with a mismatched version so stale
-/// daemons fail fast instead of producing silent data corruption.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// Exchanged in the raw [`write_handshake`]/[`read_handshake`] preamble
+/// BEFORE any framed message, so a version mismatch can never mis-parse an
+/// enum — stale peers fail fast with a readable error.
+pub const PROTOCOL_VERSION: u32 = 8;
+
+/// Handshake magic — "K9RS" as a big-endian u32. Doubles as a poison
+/// length: a pre-8 daemon reads these 4 bytes as a frame-length prefix of
+/// ~1.26 GB, trips `MAX_MESSAGE_SIZE`, and bails cleanly instead of
+/// mis-parsing; a v8 peer reading a pre-8 peer's first frame sees a small
+/// length where the magic should be and reports the mismatch.
+pub const PROTOCOL_MAGIC: u32 = 0x4B39_5253;
+
+/// Write the 8-byte connection preamble: MAGIC then PROTOCOL_VERSION, both
+/// big-endian (matching the hand-rolled frame-length convention). The
+/// client writes first; the server replies with its own preamble.
+pub async fn write_handshake<W: AsyncWriteExt + Unpin>(writer: &mut W) -> anyhow::Result<()> {
+    writer.write_all(&PROTOCOL_MAGIC.to_be_bytes()).await?;
+    writer.write_all(&PROTOCOL_VERSION.to_be_bytes()).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Read and validate the peer's 8-byte preamble. Errors distinguish a
+/// pre-handshake peer (no magic) from a version mismatch, so the caller
+/// can surface an actionable message ("restart the daemon: pkill k9rs").
+pub async fn read_handshake<R: AsyncReadExt + Unpin>(reader: &mut R) -> anyhow::Result<()> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf).await?;
+    let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let version = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if magic != PROTOCOL_MAGIC {
+        anyhow::bail!(
+            "incompatible peer (no protocol handshake — pre-v8 binary?). \
+             Restart the daemon: pkill k9rs"
+        );
+    }
+    if version != PROTOCOL_VERSION {
+        anyhow::bail!(
+            "protocol version mismatch: peer speaks v{version}, this binary speaks v{}. \
+             Restart the daemon: pkill k9rs",
+            PROTOCOL_VERSION
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Subscription stream payloads (protocol 8)
+// ---------------------------------------------------------------------------
+
+/// Full authoritative state of one subscribed resource. Reset semantics:
+/// the receiver REPLACES everything it holds for this stream. Row order is
+/// unspecified — the client owns sorting. Headers ride only here (a
+/// header-changing event on the daemon always produces a fresh baseline).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableBaseline {
+    pub resource: ResourceId,
+    pub headers: Vec<String>,
+    pub rows: Vec<crate::kube::resources::row::ResourceRow>,
+}
+
+/// One flush window's changes. Daemon-enforced invariant: at most one
+/// change per `ObjectKey` per batch (last-writer-wins coalescing at
+/// origination), so application is order-independent within a batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableDelta {
+    pub changes: Vec<RowChange>,
+}
+
+/// A single row mutation. Application MUST be idempotent: `Upsert` is
+/// insert-or-replace, `Remove` of an absent key is a no-op (the OwnerUid
+/// post-filter statelessly translates filtered-out upserts into removes).
+// Variant size asymmetry (full row vs key) is inherent to the wire shape;
+// boxing the row would add a per-change allocation on the hot flush path
+// for a transient batch value. Deliberate.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RowChange {
+    /// Insert-or-replace. Identity derives from the row itself
+    /// (`ObjectKey::new(row.namespace, row.name)`) — no second key field.
+    Upsert(crate::kube::resources::row::ResourceRow),
+    /// Remove by identity.
+    Remove(ObjectKey),
+}
+
+impl RowChange {
+    /// The identity this change targets.
+    pub fn key(&self) -> ObjectKey {
+        match self {
+            RowChange::Upsert(row) => ObjectKey::new(
+                row.namespace.clone().unwrap_or_default(),
+                row.name.clone(),
+            ),
+            RowChange::Remove(key) => key.clone(),
+        }
+    }
+}
 
 /// All commands from any client (TUI session or management CLI).
 /// The first command on a connection determines the connection type:
@@ -1142,11 +1245,9 @@ pub enum SessionCommand {
     // --- Session lifecycle ---
 
     /// Start a TUI session with raw kubeconfig + environment variables.
+    /// (Versioning lives in the connection handshake — see
+    /// [`write_handshake`] — not in this message.)
     Init {
-        /// Protocol version — daemon rejects mismatches to prevent silent
-        /// data corruption from stale binaries.
-        #[serde(default)]
-        protocol_version: u32,
         context: Option<ContextName>,
         namespace: Namespace,
         readonly: bool,
@@ -1391,7 +1492,6 @@ pub enum SessionEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::ResourceUpdate;
     use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
     #[test]
@@ -1469,58 +1569,130 @@ mod tests {
             drill_target: None,
             ..Default::default()
         };
-        let update = ResourceUpdate::Rows {
+        let baseline = TableBaseline {
             resource: rid.clone(),
             headers: vec!["NAMESPACE".into(), "NAME".into()],
             rows: vec![row],
         };
-        let bytes = bincode::serialize(&update).unwrap();
-        let decoded: ResourceUpdate = bincode::deserialize(&bytes).unwrap();
-        match decoded {
-            ResourceUpdate::Rows { resource, headers, rows } => {
-                assert_eq!(resource, ResourceId::BuiltIn(BuiltInKind::Pod));
-                assert_eq!(resource.plural(), "pods");
-                assert_eq!(headers.len(), 2);
-                assert_eq!(rows.len(), 1);
-            }
-            _ => panic!("Wrong variant"),
-        }
+        let bytes = bincode::serialize(&baseline).unwrap();
+        let decoded: TableBaseline = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.resource, ResourceId::BuiltIn(BuiltInKind::Pod));
+        assert_eq!(decoded.resource.plural(), "pods");
+        assert_eq!(decoded.headers.len(), 2);
+        assert_eq!(decoded.rows.len(), 1);
     }
 
     #[test]
-    fn test_session_event_snapshot_bincode_roundtrip() {
+    fn test_stream_event_baseline_delta_roundtrip() {
         let rid = ResourceId::BuiltIn(BuiltInKind::Deployment);
-        let update = ResourceUpdate::Rows {
+        let row = ResourceRow {
+            cells: vec![
+                CellValue::Text("prod".into()),
+                CellValue::Text("web".into()),
+                CellValue::Text("3/3".into()),
+            ],
+            name: "web".into(),
+            namespace: Some("prod".into()),
+            ..Default::default()
+        };
+        let baseline = StreamEvent::Baseline(TableBaseline {
             resource: rid,
             headers: vec!["NAMESPACE".into(), "NAME".into(), "READY".into()],
-            rows: vec![ResourceRow {
-                cells: vec![
-                    CellValue::Text("prod".into()),
-                    CellValue::Text("web".into()),
-                    CellValue::Text("3/3".into()),
-                ],
-                name: "web".into(),
-                namespace: Some("prod".into()),
-                containers: Vec::new(),
-                owner_refs: Vec::new(),
-                pf_ports: Vec::new(),
-                node: None,
-                health: RowHealth::Normal,
-                crd_info: None,
-                drill_target: None,
-                ..Default::default()
-            }],
-        };
-        // StreamEvent (substream wire type) bincode roundtrip.
-        let stream_event = StreamEvent::Snapshot(update);
-        let bytes = bincode::serialize(&stream_event).unwrap();
-        let decoded: StreamEvent = bincode::deserialize(&bytes).unwrap();
-        match decoded {
-            StreamEvent::Snapshot(ResourceUpdate::Rows { rows, .. }) => {
-                assert_eq!(rows[0].name, "web");
+            rows: vec![row.clone()],
+        });
+        let bytes = bincode::serialize(&baseline).unwrap();
+        match bincode::deserialize::<StreamEvent>(&bytes).unwrap() {
+            StreamEvent::Baseline(b) => assert_eq!(b.rows[0].name, "web"),
+            _ => panic!("Wrong event type"),
+        }
+        let delta = StreamEvent::Delta(TableDelta {
+            changes: vec![
+                RowChange::Upsert(row),
+                RowChange::Remove(ObjectKey::new("prod".to_string(), "old".to_string())),
+            ],
+        });
+        let bytes = bincode::serialize(&delta).unwrap();
+        match bincode::deserialize::<StreamEvent>(&bytes).unwrap() {
+            StreamEvent::Delta(d) => {
+                assert_eq!(d.changes.len(), 2);
+                assert_eq!(d.changes[1].key(), ObjectKey::new("prod".to_string(), "old".to_string()));
             }
             _ => panic!("Wrong event type"),
         }
+    }
+
+    /// Envelope wire-tag stability (bincode u32 LE declaration-index) for
+    /// the enums the wire depends on. RULE: any change to these goldens is
+    /// a protocol break — bump PROTOCOL_VERSION in the same change.
+    /// Appending variants is safe; reordering or mid-enum inserts are not.
+    #[test]
+    fn envelope_wire_tags_are_stable() {
+        // SessionCommand: pin the head (Init MUST stay tag 0 — the daemon
+        // dispatches on the first frame) and the ops that follow.
+        let init = SessionCommand::Init {
+            context: None,
+            namespace: Namespace::All,
+            readonly: false,
+            kubeconfig_yaml: String::new(),
+            env_vars: std::collections::HashMap::new(),
+            identity: ClusterIdentity::default(),
+        };
+        assert_eq!(&bincode::serialize(&init).unwrap()[..4], 0u32.to_le_bytes());
+        let obj = ObjectRef {
+            resource: ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
+            namespace: Namespace::All,
+            name: String::new(),
+        };
+        assert_eq!(&bincode::serialize(&SessionCommand::Describe(obj.clone())).unwrap()[..4], 1u32.to_le_bytes());
+        assert_eq!(&bincode::serialize(&SessionCommand::Yaml(obj.clone())).unwrap()[..4], 2u32.to_le_bytes());
+        assert_eq!(&bincode::serialize(&SessionCommand::Delete(obj)).unwrap()[..4], 3u32.to_le_bytes());
+
+        // SessionEvent: head pins.
+        let ready = SessionEvent::Ready {
+            context: ContextName::new(String::new()),
+            identity: ClusterIdentity::default(),
+            namespaces: vec![],
+        };
+        assert_eq!(&bincode::serialize(&ready).unwrap()[..4], 0u32.to_le_bytes());
+        assert_eq!(&bincode::serialize(&SessionEvent::SessionError(String::new())).unwrap()[..4], 1u32.to_le_bytes());
+
+        // SubstreamInit: complete (3 variants).
+        let sub = SubstreamInit::Subscribe(SubscriptionInit {
+            resource: ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
+            namespace: Namespace::All,
+            filter: None,
+            force: false,
+        });
+        assert_eq!(&bincode::serialize(&sub).unwrap()[..4], 0u32.to_le_bytes());
+
+        // OperationKind: complete, in declaration order — capabilities
+        // ride the typed enum on both sides.
+        use OperationKind::*;
+        for (i, op) in [Describe, Yaml, Delete, Restart, Scale, StreamLogs,
+                        PreviousLogs, PortForward, Shell, ShowNode, ForceKill,
+                        NodeShell, DecodeSecret, TriggerCronJob,
+                        ToggleSuspendCronJob]
+            .iter().enumerate()
+        {
+            assert_eq!(
+                &bincode::serialize(op).unwrap()[..4],
+                (i as u32).to_le_bytes(),
+                "OperationKind tag drift at {op:?}",
+            );
+        }
+    }
+
+    /// Wire-tag stability for the proto-8 stream enums (bincode u32 LE
+    /// declaration-index). Appending is safe; reorder/insert is a break.
+    #[test]
+    fn stream_wire_tags_are_stable() {
+        assert_eq!(PROTOCOL_VERSION, 8);
+        let b = bincode::serialize(&StreamEvent::Error("x".into())).unwrap();
+        assert_eq!(&b[..4], 2u32.to_le_bytes()); // Baseline=0, Delta=1, Error=2
+        let r = bincode::serialize(&RowChange::Remove(ObjectKey::new(String::new(), String::new()))).unwrap();
+        assert_eq!(&r[..4], 1u32.to_le_bytes()); // Upsert=0, Remove=1
+        // Handshake preamble bytes are pinned: magic then version, BE.
+        assert_eq!(PROTOCOL_MAGIC.to_be_bytes(), [0x4B, 0x39, 0x52, 0x53]);
     }
 
     #[test]

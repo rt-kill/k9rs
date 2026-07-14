@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use std::collections::VecDeque;
 
-use crate::kube::protocol::{LogContainer, LogLine, ObjectRef};
+use crate::kube::protocol::{LogContainer, ObjectRef};
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -20,14 +19,14 @@ pub struct UiState {
     pub confirm_dialog: Option<ConfirmDialog>,
     pub form_dialog: Option<FormDialog>,
     pub input_mode: InputMode,
-    pub help_scroll: usize,
+    /// The single modal slot: dialogues and operations ABOUT the current
+    /// view (help, container picker, edit flow, live shell). Mutually
+    /// exclusive by construction; Esc closes; closing is not navigation.
+    pub overlay: Option<Overlay>,
     pub show_header: bool,
     pub theme: crate::ui::theme::Theme,
     pub tick_count: usize,
     pub column_level: crate::kube::resource_def::ColumnLevel,
-    /// Row-change flash highlights. Lives in UiState because it's a purely
-    /// visual concern (which rows to highlight), not cluster data.
-    pub deltas: DeltaTracker,
 }
 
 // ---------------------------------------------------------------------------
@@ -42,14 +41,13 @@ pub struct KubeState {
     pub identity: crate::kube::protocol::ClusterIdentity,
     pub selected_ns: crate::kube::protocol::Namespace,
     pub context_switch: ContextSwitchState,
-    pub pod_metrics: HashMap<crate::kube::protocol::ObjectKey, crate::kube::protocol::MetricsUsage>,
-    pub node_metrics: HashMap<crate::kube::protocol::NodeName, crate::kube::protocol::MetricsUsage>,
-    pub core_streams: Vec<crate::kube::client_session::SubscriptionStream>,
+    /// Latest metrics-server usage. Elements bind to it at construction
+    /// ([`crate::app::store::MetricsBinding`]); values overlay at derive
+    /// time — rows are never mutated.
+    pub metrics: std::sync::Arc<crate::app::store::MetricsHub>,
     pub kubectl_cache: KubectlCache,
 }
 
-// Default for LogState when no config is available (tests, etc.).
-const MAX_LOG_LINES: usize = 50_000;
 
 
 // ---------------------------------------------------------------------------
@@ -64,6 +62,7 @@ const MAX_LOG_LINES: usize = 50_000;
 ///
 /// Replaces the prior pair of loose `prev_rows: HashMap<ObjectKey, u64>` +
 /// `changed_rows: HashMap<ObjectKey, Instant>` fields on `App`.
+#[derive(Debug)]
 pub struct DeltaTracker {
     prev_hashes: HashMap<crate::kube::protocol::ObjectKey, u64>,
     changed: HashMap<crate::kube::protocol::ObjectKey, Instant>,
@@ -83,11 +82,14 @@ impl DeltaTracker {
         }
     }
 
-    /// Compare incoming rows against the previous snapshot's hashes.
+    /// Baseline apply: compare incoming rows against the previous hashes.
     /// Rows whose content hash changed get a fresh timestamp in `changed`.
-    /// The old hash map is replaced wholesale — rows that disappeared from
-    /// the new snapshot are implicitly forgotten.
-    pub fn update(&mut self, rows: &[crate::kube::resources::row::ResourceRow]) {
+    /// The old hash map is replaced wholesale — rows that disappeared are
+    /// implicitly forgotten. `prev_hashes` surviving across baselines is
+    /// what gives cross-recovery highlight continuity (rows that changed
+    /// while a watcher was down still flash after the recovery baseline)
+    /// without mass-highlighting unchanged rows.
+    pub fn rebaseline(&mut self, rows: &[crate::kube::resources::row::ResourceRow]) {
         use crate::kube::protocol::ObjectKey;
         let now = Instant::now();
         let mut new_prev = HashMap::with_capacity(rows.len());
@@ -96,11 +98,7 @@ impl DeltaTracker {
                 row.namespace.clone().unwrap_or_default(),
                 row.name.clone(),
             );
-            let mut hasher = DefaultHasher::new();
-            for cell in &row.cells {
-                cell.hash(&mut hasher);
-            }
-            let new_hash = hasher.finish();
+            let new_hash = Self::hash_cells(row);
             if let Some(prev_hash) = self.prev_hashes.get(&key) {
                 if *prev_hash != new_hash {
                     self.changed.insert(key.clone(), now);
@@ -112,6 +110,44 @@ impl DeltaTracker {
         // Prune change highlights for rows that no longer exist so stale
         // entries don't accumulate between expire() ticks.
         self.changed.retain(|k, _| self.prev_hashes.contains_key(k));
+    }
+
+    /// Delta apply: O(batch), replacing the per-snapshot full-store hash
+    /// pass. The hash comparison stays — kube watches deliver metadata-only
+    /// churn (heartbeats, resourceVersion bumps) as upserts with identical
+    /// cells, and those must NOT flash. New keys don't flash (matches the
+    /// baseline path's insert semantics); removes clear their state in
+    /// O(1) (replacing the old O(n) retain).
+    pub fn apply_changes(&mut self, changes: &[crate::kube::protocol::RowChange]) {
+        use crate::kube::protocol::RowChange;
+        let now = Instant::now();
+        for change in changes {
+            match change {
+                RowChange::Upsert(row) => {
+                    let key = change.key();
+                    let new_hash = Self::hash_cells(row);
+                    match self.prev_hashes.insert(key.clone(), new_hash) {
+                        Some(prev) if prev != new_hash => {
+                            self.changed.insert(key, now);
+                        }
+                        Some(_) => {} // metadata-only churn: no flash
+                        None => {}    // insert: no flash (matches baseline)
+                    }
+                }
+                RowChange::Remove(key) => {
+                    self.prev_hashes.remove(key);
+                    self.changed.remove(key);
+                }
+            }
+        }
+    }
+
+    fn hash_cells(row: &crate::kube::resources::row::ResourceRow) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for cell in &row.cells {
+            cell.hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     /// Remove change highlights older than `max_age`. Returns `true` if
@@ -136,6 +172,60 @@ impl DeltaTracker {
     /// visible row to decide whether to apply the highlight style.
     pub fn changed_rows(&self) -> &HashMap<crate::kube::protocol::ObjectKey, Instant> {
         &self.changed
+    }
+}
+
+#[cfg(test)]
+mod delta_tracker_tests {
+    use super::*;
+    use crate::kube::protocol::{ObjectKey, RowChange};
+    use crate::kube::resources::row::{CellValue, ResourceRow};
+
+    fn row(name: &str, val: &str) -> ResourceRow {
+        ResourceRow {
+            name: name.into(),
+            namespace: Some("ns".into()),
+            cells: vec![CellValue::Text(val.into())],
+            ..Default::default()
+        }
+    }
+    fn key(name: &str) -> ObjectKey {
+        ObjectKey::new("ns".to_string(), name.to_string())
+    }
+
+    /// E4: a metadata-only upsert (identical cells) must NOT flash — kube
+    /// heartbeat churn would otherwise light the table permanently. A real
+    /// change flashes; an insert doesn't (matches the baseline path);
+    /// removes clear their state.
+    #[test]
+    fn apply_changes_flashes_only_genuine_changes() {
+        let mut d = DeltaTracker::new();
+        d.rebaseline(&[row("a", "1")]);
+        assert!(d.changed_rows().is_empty(), "baseline seeds hashes, no flash");
+
+        d.apply_changes(&[RowChange::Upsert(row("a", "1"))]); // heartbeat
+        assert!(d.changed_rows().is_empty(), "identical cells: no flash");
+
+        d.apply_changes(&[RowChange::Upsert(row("a", "2"))]); // real change
+        assert!(d.changed_rows().contains_key(&key("a")));
+
+        d.apply_changes(&[RowChange::Upsert(row("new", "1"))]); // insert
+        assert!(!d.changed_rows().contains_key(&key("new")), "inserts don't flash");
+
+        d.apply_changes(&[RowChange::Remove(key("a"))]);
+        assert!(!d.changed_rows().contains_key(&key("a")), "remove clears state");
+    }
+
+    /// Cross-recovery continuity: hashes survive a re-baseline, so a row
+    /// that changed while a watcher was down flashes after the recovery
+    /// baseline — and unchanged rows do NOT mass-flash.
+    #[test]
+    fn rebaseline_keeps_continuity_without_mass_flash() {
+        let mut d = DeltaTracker::new();
+        d.rebaseline(&[row("a", "1"), row("b", "1")]);
+        d.rebaseline(&[row("a", "1"), row("b", "2")]); // recovery baseline
+        assert!(!d.changed_rows().contains_key(&key("a")), "unchanged: quiet");
+        assert!(d.changed_rows().contains_key(&key("b")), "changed-during-gap: flash");
     }
 }
 
@@ -365,77 +455,60 @@ impl ContainerRef {
 }
 
 // ---------------------------------------------------------------------------
-// Route
+// Overlay — the single modal slot
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-pub enum Route {
-    Overview,
-    Resources,
-    /// Unified content view for YAML, Describe, and Aliases. All three share
-    /// `ContentViewState` for scrolling/search — collapsing them eliminates
-    /// 11+ multi-arm match patterns throughout the codebase.
-    ContentView {
-        kind: ContentViewKind,
-        /// The resource being viewed. `None` for Aliases.
-        target: Option<ObjectRef>,
-        awaiting_response: bool,
-        state: ContentViewState,
-    },
-    Logs {
-        target: ContainerRef,
-        state: Box<LogState>,
-        /// The log stream permit. When this route is dropped (navigation
-        /// away, pop, tab switch), the stream drops → bridge aborts →
-        /// daemon's log handler exits. Impossible to leak: the stream's
-        /// lifetime IS the route's lifetime.
-        stream: Option<crate::kube::client_session::LogStream>,
-    },
-    /// Live shell session. During Connecting the TUI shows a loading bar
-    /// and the user has full navigation control. Once connected, the
-    /// session loop suspends the TUI and raw-bridges stdin↔daemon bytes.
-    /// Drop aborts the bridge (same RAII as LogStream).
-    Shell(Box<ShellState>),
-    /// In-progress edit on `target`. The unified edit flow:
-    ///
-    ///   1. `Action::Edit` enters this route in `EditState::AwaitingYaml`
-    ///      and sends `SessionCommand::Yaml(target)`.
-    ///   2. The server returns the resource's YAML via `YamlResult`.
-    ///      `apply_resource_update` writes it to a temp file and
-    ///      transitions to `EditState::EditorReady { temp_path }`.
-    ///   3. The session loop sees `EditorReady` on its next iteration,
-    ///      suspends raw mode, runs `$EDITOR <temp_path>`, reads the
-    ///      result back, sends `SessionCommand::Apply { target, yaml }`,
-    ///      and transitions to `EditState::Applying`.
-    ///   4. The server's `Apply` handler dispatches by `is_local()` and
-    ///      sends back a `CommandResult`. `apply_event` flashes the result
-    ///      and pops the route.
-    ///
-    /// One state machine, one wire flow, no per-resource branching.
-    EditingResource {
-        target: ObjectRef,
-        state: EditState,
-    },
-    Help,
-    Contexts,
+/// A dialogue or operation layered over the current view. NOT navigation:
+/// views live on the nav stack ([`crate::app::element::Element`]); an
+/// overlay has no history, no data handle, no self-definition — Esc
+/// closes it (dropping its RAII: [`crate::kube::client_session::ExecStream`],
+/// [`TempFile`]) and the view underneath was never displaced.
+pub enum Overlay {
+    /// The `?` help sheet.
+    Help { scroll: usize },
+    /// "Which container?" picker for multi-container pods. Captures its
+    /// container list at construction — self-contained (no table lookups
+    /// under a dialog that may outlive the row).
     ContainerSelect {
-        /// The pod whose containers are being chosen from. Stored as a
-        /// typed `ObjectRef` so the dispatch handler in `handle_enter_key`
-        /// can look the pod up by structural identity (no flat `(name,
-        /// ns)` tuple round-trip, and no `Namespace::from_row` re-parse
-        /// of an empty-string sentinel).
         target: crate::kube::protocol::ObjectRef,
+        containers: Vec<crate::kube::resources::row::ContainerInfo>,
         selected: usize,
         action: ContainerAction,
     },
+    /// The unified edit flow (a transient state machine that suspends the
+    /// TUI for `$EDITOR`):
+    ///
+    ///   1. `Action::Edit` opens this overlay in `EditState::AwaitingYaml`
+    ///      and sends `SessionCommand::Yaml(target)`.
+    ///   2. The server returns YAML; `apply_event` writes the temp file
+    ///      and transitions to `EditState::EditorReady`.
+    ///   3. The session loop sees `EditorReady`, suspends raw mode, runs
+    ///      `$EDITOR`, sends `Apply`, transitions to `Applying`.
+    ///   4. `CommandResult` clears the overlay (or re-opens the editor
+    ///      with the server error prepended).
+    Edit {
+        target: crate::kube::protocol::ObjectRef,
+        state: EditState,
+    },
+    /// Live shell session. During Connecting the TUI shows a loading bar
+    /// with full navigation; once Connected the session loop suspends the
+    /// TUI and raw-bridges stdin↔daemon bytes. Drop aborts the bridge.
+    Shell(Box<ShellState>),
 }
 
-/// Which kind of content is being displayed in a `Route::ContentView`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContentViewKind {
-    Yaml,
-    Describe,
-    Aliases,
+impl std::fmt::Debug for Overlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Overlay::Help { scroll } => f.debug_struct("Help").field("scroll", scroll).finish(),
+            Overlay::ContainerSelect { target, .. } => {
+                f.debug_struct("ContainerSelect").field("target", target).finish_non_exhaustive()
+            }
+            Overlay::Edit { target, .. } => {
+                f.debug_struct("Edit").field("target", target).finish_non_exhaustive()
+            }
+            Overlay::Shell(state) => f.debug_tuple("Shell").field(state).finish(),
+        }
+    }
 }
 
 /// Shell connection lifecycle.
@@ -842,226 +915,6 @@ impl FormFieldState {
     /// inside an edit box, not on a Select picker or button).
     pub fn is_text_input(&self) -> bool {
         matches!(self.kind, FormFieldKind::Text { .. } | FormFieldKind::Number { .. } | FormFieldKind::Port)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LogState {
-    /// Log line buffer. Private — external code reads via [`lines()`] and
-    /// mutates via [`push()`], which maintains the `filtered_indices`
-    /// invariant (adjusting indices on eviction). Direct mutation would
-    /// corrupt `filtered_indices`. Typed [`LogLine`]s: `content` plus an
-    /// optional source `container` (set only for `--all-containers` streams),
-    /// so the renderer colors the container without re-parsing a string prefix.
-    lines: VecDeque<LogLine>,
-    pub max_lines: usize,
-    pub scroll: usize,
-    pub follow: bool,
-    pub wrap: bool,
-    pub show_timestamps: bool,
-    pub streaming: bool,
-    pub since: Option<String>,
-    pub tail_lines: u64,
-    /// Stack of committed grep filters. Private — external code reads via
-    /// [`filters()`] and mutates via [`commit_filter()`] / [`pop_filter()`],
-    /// which rebuild compiled patterns and filtered indices.
-    filters: Vec<String>,
-    /// Draft filter being typed (live preview). None = not in filter input mode.
-    pub draft_filter: Option<String>,
-    /// Compiled patterns for committed + draft filters. Rebuilt only when
-    /// filters change, not on every log line push.
-    compiled_patterns: Vec<crate::util::SearchPattern>,
-    /// Indices into `lines` that pass all filters (committed + draft).
-    /// Private — external code reads via [`filtered_indices()`].
-    filtered_indices: Vec<usize>,
-    /// Generation id stamped by the client_session when this log stream
-    /// was opened. The bridge tags every emitted `LogLine` with the same
-    /// id; the apply path drops lines whose id doesn't match. Without
-    /// this, lines already in flight from a *previous* log stream (whose
-    /// bridge has been aborted but whose queued events haven't drained)
-    /// would bleed into a freshly-opened log view.
-    pub generation: u64,
-    /// True during the initial tail fetch. While true, the render path
-    /// skips follow-mode auto-scroll so the view doesn't jump as lines
-    /// stream in. Set false when the initial batch is complete (detected
-    /// by a gap in line delivery).
-    pub initial_load: bool,
-}
-
-impl Default for LogState {
-    fn default() -> Self {
-        Self {
-            lines: VecDeque::new(),
-            max_lines: MAX_LOG_LINES,
-            scroll: 0,
-            follow: false,
-            wrap: false,
-            show_timestamps: true,
-            streaming: false,
-            since: None,
-            tail_lines: 100,
-            filters: Vec::new(),
-            draft_filter: None,
-            compiled_patterns: Vec::new(),
-            filtered_indices: Vec::new(),
-            generation: 0,
-            initial_load: false,
-        }
-    }
-}
-
-impl LogState {
-    pub fn new() -> Self {
-        Self { follow: true, show_timestamps: true, streaming: false, ..Default::default() }
-    }
-
-    // -- Read-only accessors for private fields ------------------------------
-
-    /// The log line buffer. Use [`push()`] to append lines — it maintains
-    /// the `filtered_indices` invariant on eviction.
-    pub fn lines(&self) -> &VecDeque<LogLine> { &self.lines }
-
-    /// Committed filter patterns (source text). Use [`commit_filter()`] /
-    /// [`pop_filter()`] to mutate — they rebuild compiled patterns.
-    pub fn filters(&self) -> &[String] { &self.filters }
-
-    /// Indices into `lines` that pass all active filters.
-    pub fn filtered_indices(&self) -> &[usize] { &self.filtered_indices }
-    /// Create a LogState with user-configured defaults.
-    pub fn from_config(log_config: &LogConfig) -> Self {
-        Self {
-            max_lines: log_config.max_lines,
-            tail_lines: log_config.tail_lines,
-            follow: log_config.default_follow,
-            show_timestamps: log_config.default_timestamps,
-            wrap: log_config.default_wrap,
-            ..Default::default()
-        }
-    }
-    /// Whether a line passes the active filter stack: every pattern must match
-    /// its `content` or its (optional) source `container`. Single source of
-    /// truth for both the incremental [`push()`] check and the full
-    /// [`rebuild_filter()`] sweep, so they can't diverge — and matching the
-    /// container keeps grep narrowing an `--all-containers` view now that the
-    /// container is a typed field, not an inline `[pod/container]` text prefix.
-    fn line_matches(line: &LogLine, patterns: &[crate::util::SearchPattern]) -> bool {
-        patterns.iter().all(|p| {
-            p.is_match(&line.content)
-                || line.container.as_deref().is_some_and(|c| p.is_match(c))
-        })
-    }
-
-    pub fn push(&mut self, line: LogLine) {
-        let evicted = self.lines.len() >= self.max_lines;
-        if evicted {
-            self.lines.pop_front();
-            if !self.follow {
-                self.scroll = self.scroll.saturating_sub(1);
-            }
-            // Adjust all filtered_indices: decrement by 1, drop index 0.
-            self.filtered_indices.retain_mut(|idx| {
-                if *idx == 0 { return false; }
-                *idx -= 1;
-                true
-            });
-        }
-        self.lines.push_back(line);
-        // Incrementally check the new line against cached compiled patterns.
-        let new_idx = self.lines.len() - 1;
-        if self.compiled_patterns.is_empty() || Self::line_matches(&self.lines[new_idx], &self.compiled_patterns) {
-            self.filtered_indices.push(new_idx);
-        }
-    }
-    pub fn clear_lines(&mut self) {
-        self.lines.clear();
-        self.scroll = 0;
-        self.filtered_indices.clear();
-    }
-
-    pub fn clear(&mut self) {
-        self.clear_lines();
-        self.filters.clear();
-        self.draft_filter = None;
-        self.compiled_patterns.clear();
-    }
-
-    /// Recompile cached patterns from committed filters + draft.
-    /// Called only when filters change, not on every log line.
-    fn recompile_patterns(&mut self) {
-        self.compiled_patterns = self.filters.iter()
-            .chain(self.draft_filter.iter())
-            .filter(|s| !s.is_empty())
-            .map(|s| crate::util::SearchPattern::new(s))
-            .collect();
-    }
-
-    /// Rebuild filtered_indices from cached compiled patterns.
-    pub fn rebuild_filter(&mut self) {
-        self.recompile_patterns();
-
-        if self.compiled_patterns.is_empty() {
-            self.filtered_indices = (0..self.lines.len()).collect();
-        } else {
-            self.filtered_indices = (0..self.lines.len())
-                .filter(|&i| Self::line_matches(&self.lines[i], &self.compiled_patterns))
-                .collect();
-        }
-    }
-
-    /// Whether we're in filter input mode.
-    pub fn is_filtering(&self) -> bool {
-        self.draft_filter.is_some()
-    }
-
-    /// Start a new draft filter (user pressed `/`).
-    pub fn start_filter(&mut self) {
-        self.draft_filter = Some(String::new());
-    }
-
-    /// Update the draft filter text (user typed a character).
-    pub fn update_draft(&mut self, text: String) {
-        self.draft_filter = Some(text);
-        self.rebuild_filter();
-    }
-
-    /// Commit the draft filter (user pressed Enter).
-    pub fn commit_filter(&mut self) {
-        if let Some(draft) = self.draft_filter.take() {
-            if !draft.is_empty() {
-                self.filters.push(draft);
-            }
-            self.rebuild_filter();
-        }
-    }
-
-    /// Cancel the draft filter (user pressed Esc).
-    pub fn cancel_filter(&mut self) {
-        self.draft_filter = None;
-        self.rebuild_filter();
-    }
-
-    /// Pop the last committed filter (user pressed Esc with no draft).
-    pub fn pop_filter(&mut self) -> bool {
-        if self.filters.pop().is_some() {
-            self.rebuild_filter();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// The active filter patterns for highlighting (committed + draft).
-    pub fn active_patterns(&self) -> Vec<String> {
-        let mut all: Vec<String> = self.filters.clone();
-        if let Some(ref d) = self.draft_filter {
-            if !d.is_empty() { all.push(d.clone()); }
-        }
-        all
-    }
-
-    /// Total visible line count (after filtering).
-    pub fn visible_count(&self) -> usize {
-        self.filtered_indices.len()
     }
 }
 
@@ -1472,58 +1325,4 @@ mod form_submit_tests {
     }
 }
 
-#[cfg(test)]
-mod log_state_tests {
-    use super::*;
-    use crate::kube::protocol::LogLine;
 
-    /// Eviction must keep `filtered_indices` valid under an active filter: as
-    /// the ring buffer drops its oldest line, surviving indices shift down and
-    /// out-of-window ones are dropped. Also exercises the container-OR branch of
-    /// `line_matches` — a line kept solely because its source container matched.
-    #[test]
-    fn eviction_under_filter_keeps_indices_valid() {
-        let mut s = LogState::new();
-        s.max_lines = 3;
-        s.update_draft("m".to_string());
-        s.commit_filter();
-
-        s.push(LogLine::untagged("match-a"));     // content "m" ✓ — later evicted
-        s.push(LogLine::untagged("nope"));        // no "m"        — later evicted
-        s.push(LogLine { container: Some("mongo".into()), content: "x".into() }); // container "m" ✓
-        s.push(LogLine::untagged("xyz"));         // no "m"
-        s.push(LogLine::untagged("more"));        // content "m" ✓
-
-        // Buffer holds the last 3: [mongo/x, xyz, more] at indices 0,1,2.
-        assert_eq!(s.lines().len(), 3);
-        // Survivors matching "m": index 0 (container "mongo") and index 2 ("more").
-        assert_eq!(s.filtered_indices().to_vec(), vec![0usize, 2]);
-        assert!(s.filtered_indices().iter().all(|&i| i < s.lines().len()));
-        assert!(s.filtered_indices().windows(2).all(|w| w[0] < w[1]));
-    }
-
-    /// The incremental `push` predicate and the full `rebuild_filter` sweep must
-    /// agree regardless of whether the filter was set before or after the lines.
-    #[test]
-    fn push_and_rebuild_agree() {
-        let build = |rebuild_after: bool| {
-            let mut s = LogState::new();
-            s.max_lines = 10;
-            if !rebuild_after {
-                s.update_draft("e".to_string());
-                s.commit_filter();
-            }
-            s.push(LogLine::untagged("one"));     // "e" ✓
-            s.push(LogLine { container: Some("svc-e".into()), content: "z".into() }); // container "e" ✓
-            s.push(LogLine::untagged("two"));     // no "e"
-            s.push(LogLine::untagged("three"));   // "e" ✓
-            if rebuild_after {
-                s.update_draft("e".to_string());
-                s.commit_filter();
-            }
-            s.filtered_indices().to_vec()
-        };
-        assert_eq!(build(false), build(true));
-        assert_eq!(build(false), vec![0usize, 1, 3]);
-    }
-}

@@ -15,15 +15,13 @@ use crate::kube::resources::row::ResourceRow;
 // DerivedViewKind — closed enum of client-side derived views
 // ---------------------------------------------------------------------------
 
-/// A client-side derived view type. Metadata lives on the enum via
+/// A client-side derived view type. The DATA enum is defined in
+/// [`crate::kube::resources::row`] (it rides the wire inside
+/// `DrillTarget::Derived`, WIRE-FROZEN there); the BEHAVIOR lives here via
 /// exhaustive-match accessors — same pattern as [`crate::kube::resource_def::BuiltInKind`]
 /// and [`crate::kube::local::LocalResourceKind`]. Adding a variant
 /// forces filling in all metadata arms.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum DerivedViewKind {
-    /// Containers of a pod — projected from `ResourceRow.containers`.
-    Containers,
-}
+pub use crate::kube::resources::row::DerivedViewKind;
 
 impl DerivedViewKind {
     /// Short label for breadcrumbs and tab bar.

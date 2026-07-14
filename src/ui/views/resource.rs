@@ -9,7 +9,7 @@ use ratatui::{
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, StatefulTable};
+use crate::app::App;
 use crate::kube::protocol::{OperationKind, ResourceCapabilities};
 
 use crate::ui::header;
@@ -130,128 +130,6 @@ fn draw_resource_table(
 }
 
 
-/// Rendering context for [`draw_unified_table`]. Bundles the read-only
-/// parameters that come from `App` state — separating them from the mutable
-/// `table` and the `Frame` avoids a 11-parameter function signature.
-struct TableRenderCtx<'a> {
-    title: &'a str,
-    namespace: &'a crate::kube::protocol::Namespace,
-    theme: &'a Theme,
-    descriptor: Option<&'a crate::app::TableDescriptor>,
-    column_level: crate::app::ColumnLevel,
-    changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
-    view: &'a crate::app::view::ViewId,
-    max_col_width: u16,
-    search_patterns: &'a [crate::util::SearchPattern],
-}
-
-/// Draw function for unified ResourceRow tables. Uses runtime column headers
-/// from the TableDescriptor instead of a static `T::headers()`.
-///
-/// Column visibility is controlled by `column_level`: only columns whose
-/// `ColumnLevel` is <= `column_level` are displayed. The NAMESPACE column
-/// is also hidden when viewing a single namespace. Rows always contain all
-/// cells; this function extracts only the visible subset for display.
-fn draw_unified_table(
-    f: &mut Frame,
-    area: Rect,
-    table: &mut StatefulTable<crate::kube::resources::row::ResourceRow>,
-    ctx: &TableRenderCtx<'_>,
-) {
-    let title = ctx.title;
-
-    // Hide the NAMESPACE column when viewing a single namespace —
-    // `visible_columns` walks columns by name, so the first-column gate the
-    // old code added was redundant (and would have masked any future
-    // descriptor that put NAMESPACE at a non-zero index).
-    let skip_ns = !ctx.namespace.is_all();
-
-    // Compute which columns (by data index) are visible at the current level.
-    let visible: Vec<(usize, &str)> = if let Some(desc) = ctx.descriptor {
-        desc.visible_columns(ctx.view, ctx.column_level, skip_ns)
-    } else {
-        vec![(0, "NAME")]
-    };
-    let visible_indices: Vec<usize> = visible.iter().map(|&(i, _)| i).collect();
-    let headers: Vec<&str> = visible.iter().map(|&(_, name)| name).collect();
-
-    // Update num_cols to reflect VISIBLE column count (not total).
-    // This ensures col_left/col_right navigation stays within bounds.
-    table.set_num_cols(visible.len());
-
-    if table.items.is_empty() {
-        let loading_text = match &table.data_state {
-            crate::app::table::TableDataState::Failed(err) => format!("Error: {}", err),
-            crate::app::table::TableDataState::Ready => format!("No {} found.", title.to_lowercase()),
-            crate::app::table::TableDataState::Initializing => crate::util::loading_bar("Loading..."),
-        };
-        let loading_line = Line::from(Span::styled(loading_text, ctx.theme.info_value));
-        let title_ns = if ctx.namespace.is_all() {
-            format!(" {}[0]", title.to_lowercase())
-        } else {
-            format!(" {}({})[0]", title.to_lowercase(), ctx.namespace.display())
-        };
-        let block = Block::bordered()
-            .title(Span::styled(title_ns, ctx.theme.title))
-            .border_style(ctx.theme.border);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        if inner.height > 0 && inner.width > 0 {
-            let center_y = inner.y + inner.height / 2;
-            let center_x = inner.x
-                + inner.width.saturating_sub(loading_line.width() as u16) / 2;
-            f.render_widget(
-                loading_line,
-                Rect::new(center_x, center_y, inner.width, 1),
-            );
-        }
-        return;
-    }
-
-    // Column render rules are cached on the descriptor (built once when
-    // the descriptor arrives, not per frame). Empty slice if no descriptor.
-    static EMPTY_RULES: &[crate::kube::overlay::ColumnRenderRules] = &[];
-    let column_rules = ctx.descriptor
-        .map(|d| d.column_rules())
-        .unwrap_or(EMPTY_RULES);
-    let view = table.prepare_view(&visible_indices, column_rules, &headers, ctx.max_col_width);
-
-    let selected = table.selected();
-    let initial_offset = table.offset();
-    let selected_col = table.selected_col();
-    let col_offset = table.col_offset();
-    let sort_ascending = table.sort_ascending();
-    let display_sort_col = visible_indices.iter().position(|&i| i == table.sort_column());
-    let marked: &std::collections::HashSet<crate::kube::protocol::ObjectKey> = &table.marked;
-
-    let ns_label = if ctx.namespace.is_all() { "" } else { ctx.namespace.display() };
-    let snap = TableSnapshot {
-        headers,
-        rows: &view.rows,
-        selected,
-        offset: initial_offset,
-        selected_col,
-        col_offset,
-        sort_ascending,
-        display_sort_col,
-        namespace: ns_label,
-        marked,
-        changed_rows: ctx.changed_rows,
-        row_keys: &view.keys,
-        row_health: &view.health,
-        cell_style: &view.cell_style,
-        col_widths: &view.col_widths,
-        search_patterns: ctx.search_patterns,
-    };
-    let (new_offset, new_page_size, new_col_offset) = draw_resource_table(
-        f, area, title, &snap, ctx.theme,
-    );
-
-    table.set_offset(new_offset);
-    table.set_page_size(new_page_size);
-    table.set_col_offset(new_col_offset);
-}
-
 // ---------------------------------------------------------------------------
 // Main entry point: draw_resources
 // ---------------------------------------------------------------------------
@@ -279,7 +157,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let command_height: u16 = if app.ui.input_mode.is_active() { 3 } else { 0 };
     // Only show the filter bar box while actively typing; when committed
     // (inactive but text non-empty), the table title shows `</:filter_text>`.
-    let filter_visible = app.nav.filter_input().active();
+    let filter_visible = app.nav.top().filter_input().active();
     let filter_height: u16 = if filter_visible { 3 } else { 0 };
 
     let chunks = Layout::vertical([
@@ -314,11 +192,15 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
 
     // 3. Filter prompt
     if filter_visible {
-        let counts = app.active_table_items_count();
-        let match_count = if app.nav.filter_input().text().is_empty() && !app.nav.is_drilled() { counts.total } else { counts.filtered };
+        let counts = app.nav.top().counts();
+        let match_count = if app.nav.top().filter_input().text().is_empty() && !app.nav.is_drilled() {
+            counts.total
+        } else {
+            counts.filtered
+        };
         let filter_bar = FilterBar::new(
-            app.nav.filter_input().active(),
-            app.nav.filter_input().text(),
+            app.nav.top().filter_input().active(),
+            app.nav.top().filter_input().text(),
             match_count,
             counts.total,
             theme,
@@ -326,83 +208,74 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(filter_bar, filter_area);
     }
 
-    // 4. Resource table. Collect the borrows we need into locals *before*
-    // taking the mutable reference to the table so the borrow checker stays
-    // happy.
-    let ns_display = app.kube.selected_ns.display();
-    let ns = app.kube.selected_ns.clone();
-    let cl = app.ui.column_level;
-    let view_id = app.nav.view_id().clone();
-    let title = view_id.short_label().to_lowercase();
-    let current_rid = view_id.resource_id().cloned();
-    // For derived views (no ResourceId), table + descriptor live directly
-    // on the NavStep. For resource views, route through global/nav lookup.
-    // Nav-step is preferred over global (handles filtered views of globally-
-    // stored resources like Node).
-    let desc = if let Some(ref rid) = current_rid {
-        app.nav.find_descriptor_for_resource(rid).cloned()
-            .or_else(|| app.data.descriptors.get(rid).cloned())
-    } else {
-        // Derived view — descriptor on the nav step itself.
-        app.nav.current().descriptor.clone()
-    };
-    let changed_rows = app.ui.deltas.changed_rows();
-    // Collect active grep patterns (committed + draft) for match
-    // highlighting. Cloned into owned Vec before the mutable table borrow.
-    let search_patterns: Vec<crate::util::SearchPattern> = {
-        let mut pats: Vec<crate::util::SearchPattern> = app.nav.active_filters().iter()
-            .filter_map(|f| f.as_grep().map(|g| g.pattern().clone()))
-            .collect();
-        let draft = app.nav.filter_input().text();
-        if !draft.is_empty() {
-            pats.push(crate::util::SearchPattern::new(draft));
-        }
-        pats
-    };
-    // Manual routing (not `active_view_table_mut()`) to avoid borrow
-    // conflict with `theme` — `&mut self` would conflict with `&app.ui.theme`.
-    // Nav-step preferred over global (same as table_for_mut).
-    let table_ref = if let Some(ref rid) = current_rid {
-        if app.nav.find_table_for_resource(rid).is_some() {
-            app.nav.find_table_for_resource_mut(rid)
-        } else {
-            app.data.tables.get_mut(rid)
-        }
-    } else {
-        // Derived view — table on the nav step itself.
-        app.nav.current_mut().table.as_mut()
-    };
-    if let Some(table) = table_ref {
-        let ctx = TableRenderCtx {
-            title: &title,
-            namespace: &ns,
-            theme,
-            descriptor: desc.as_ref(),
-            column_level: cl,
-            changed_rows,
-            view: &view_id,
-            max_col_width: app.config.ui.max_column_width,
-            search_patterns: &search_patterns,
+    // 4. Resource table — the TOP element materializes its own view (the
+    // ephemeral "view" of the nav model). Everything rendered here is
+    // element-owned: query + predicates, columns (NAMESPACE membership was
+    // fixed at the element's construction — never the ambient selector),
+    // title, scope label, cursor. Nothing reads ambient state; nothing
+    // reaches below the top.
+    let level = app.ui.column_level;
+    let max_col_width = app.config.ui.max_column_width;
+    let element = app.nav.top_mut();
+    let view = element.view(level, max_col_width);
+
+    if view.total_rows == 0 {
+        // No data at all (loading / failed / genuinely empty): bordered
+        // block with a centered status line.
+        let text = match element.data_state() {
+            crate::app::table::TableDataState::Failed(err) => format!("Error: {}", err),
+            crate::app::table::TableDataState::Ready => format!("No {} found.", element.title()),
+            crate::app::table::TableDataState::Initializing => crate::util::loading_bar("Loading..."),
         };
-        draw_unified_table(f, table_area, table, &ctx);
-    } else {
-        // Table doesn't exist yet (e.g., CRD not yet discovered). Show loading bar.
-        let loading_text = crate::util::loading_bar("Loading...");
-        let loading_line = Line::from(Span::styled(loading_text, theme.info_value));
-        let title_ns = if !ns_display.is_empty() {
-            format!(" {}({})[0]", title.to_lowercase(), ns_display)
+        let status_line = Line::from(Span::styled(text, theme.info_value));
+        let scope = element.scope_label();
+        let title_str = if scope.is_empty() {
+            format!(" {}[0]", element.title())
         } else {
-            format!(" {}[0]", title.to_lowercase())
+            format!(" {}({})[0]", element.title(), scope)
         };
-        let block = ratatui::widgets::Block::bordered()
-            .title(Span::styled(title_ns, theme.title))
+        let block = Block::bordered()
+            .title(Span::styled(title_str, theme.title))
             .border_style(theme.border);
         let inner = block.inner(table_area);
         f.render_widget(block, table_area);
         if inner.height > 0 && inner.width > 0 {
             let center_y = inner.y + inner.height / 2;
-            let center_x = inner.x + inner.width.saturating_sub(loading_line.width() as u16) / 2;
-            f.render_widget(loading_line, ratatui::layout::Rect::new(center_x, center_y, inner.width, 1));
+            let center_x = inner.x + inner.width.saturating_sub(status_line.width() as u16) / 2;
+            f.render_widget(status_line, Rect::new(center_x, center_y, inner.width, 1));
+        }
+    } else {
+        let marked = element.marked_snapshot();
+        let changed = element.changed_snapshot();
+        let patterns = element.grep_patterns();
+        let title = element.title().to_string();
+        let Some(it) = element.table_interaction() else { return };
+        let headers: Vec<&str> = view.headers.iter().map(String::as_str).collect();
+        let display_sort_col = view.visible_cols.iter().position(|&i| i == it.sort.col);
+        let snap = TableSnapshot {
+            headers,
+            rows: &view.rows,
+            selected: it.selected.min(view.keys.len().saturating_sub(1)),
+            offset: it.offset,
+            selected_col: it.selected_col.min(view.visible_cols.len().saturating_sub(1)),
+            col_offset: it.col_offset,
+            sort_ascending: it.sort.ascending,
+            display_sort_col,
+            namespace: element.scope_label(),
+            marked: &marked,
+            changed_rows: &changed,
+            row_keys: &view.keys,
+            row_health: &view.health,
+            cell_style: &view.cell_style,
+            col_widths: &view.col_widths,
+            search_patterns: &patterns,
+        };
+        let (new_offset, new_page_size, new_col_offset) =
+            draw_resource_table(f, table_area, &title, &snap, theme);
+        if let Some(it) = element.table_interaction_mut() {
+            it.offset = new_offset;
+            it.page_size = new_page_size;
+            it.col_offset = new_col_offset;
         }
     }
 

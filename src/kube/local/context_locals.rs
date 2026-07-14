@@ -289,7 +289,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         drop(k2);
         tokio::time::sleep(Duration::from_millis(60)).await; // t≈120
-        assert!(weak.upgrade().is_none() == false, "second dropper extended the window");
+        assert!(weak.upgrade().is_some(), "second dropper extended the window");
         tokio::time::sleep(Duration::from_millis(120)).await; // t≈240
         assert!(weak.upgrade().is_none(), "extended window expired");
     }
