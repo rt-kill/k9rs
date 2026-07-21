@@ -101,7 +101,15 @@ async fn main() -> Result<()> {
     // Setup logging
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     if let Some(ref log_file) = cli.log_file {
-        let file = std::fs::File::create(log_file)?;
+        // 0600: the log can contain resource data (and, at debug level,
+        // command bodies) — it must not be world-readable via a lax umask.
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(log_file)?;
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(file)
@@ -126,9 +134,23 @@ async fn main() -> Result<()> {
     // Parse startup navigation from positional args or legacy -c flag.
     let startup_segments = parse_startup_segments(&cli);
 
-    let (event_tx, event_rx) = mpsc::channel::<AppEvent>(500);
+    let (event_tx, event_rx) =
+        mpsc::channel::<AppEvent>(crate::kube::session::EVENT_CHANNEL_CAP);
 
     use crate::kube::client_session::ClientSession;
+
+    // Load + validate the user config BEFORE any TUI setup: a config
+    // error prints to a normal, visible stderr and exits. The strict
+    // validation (unknown fields, malformed/reserved key chords) is
+    // only worth anything if its rejection reaches the user — a silent
+    // fallback to defaults would quietly drop settings like readOnly.
+    let config = match App::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("k9rs: config error: {e}");
+            std::process::exit(2);
+        }
+    };
 
     // Construct the data source FIRST — `ClientSession::new` is
     // non-blocking (it spawns a background manager that does the
@@ -146,7 +168,9 @@ async fn main() -> Result<()> {
         event_tx.clone(),
     );
 
-    let mut app = App::new(crate::kube::protocol::ContextName::default(), namespace, &data_source);
+    let mut app = App::new(
+        crate::kube::protocol::ContextName::default(), namespace, &data_source, config,
+    );
     if cli.readonly {
         app.read_only = true;
     }

@@ -179,14 +179,31 @@ impl NavStack {
     /// POINTER IDENTITY — never by rid, so two same-rid elements with
     /// different filters can never cross-revive.
     pub fn ensure_top_live(&mut self, session: &ClientSession) {
-        let Some(store) = self.top().data_store().cloned() else { return };
-        for element in self.items.iter_mut().rev() {
-            if let Element::ResourceList(list) = element {
-                if Arc::ptr_eq(list.query().store(), &store) {
-                    if !list.query().is_live() {
-                        list.query_mut().resubscribe(session);
+        // Table kinds: revive the owning ResourceList's subscription.
+        if let Some(store) = self.top().data_store().cloned() {
+            for element in self.items.iter_mut().rev() {
+                if let Element::ResourceList(list) = element {
+                    if Arc::ptr_eq(list.query().store(), &store) {
+                        if !list.query().is_live() {
+                            list.query_mut().resubscribe(session);
+                        }
+                        return;
                     }
-                    return;
+                }
+            }
+            return;
+        }
+        // Log kinds: revive the owning LogSession's stream. A dead log
+        // stream otherwise renders as an eternally-following live view
+        // (its `Ended` died in the closed channel), so this is what makes
+        // a log view honest across a reconnect or a pop that reveals it.
+        if let Some(store) = self.top().log_store().cloned() {
+            for element in self.items.iter_mut().rev() {
+                if let Element::LogSession(s) = element {
+                    if Arc::ptr_eq(s.store(), &store) {
+                        s.revive_if_dead(session);
+                        return;
+                    }
                 }
             }
         }
@@ -227,13 +244,19 @@ impl NavStack {
 
     /// The server resolved a rid to its true identity: elements update
     /// themselves in place (the element IS the identity — no global maps
-    /// to rekey).
+    /// to rekey). Refinements carry a VALUE COPY of the rid, so they
+    /// update alongside their lists — an `ObjectRef` built from a
+    /// filter-on-top must never carry the stale pre-resolution identity.
     pub fn apply_resolved(&mut self, original: &ResourceId, resolved: &ResourceId) {
         for element in self.items.iter_mut() {
-            if let Element::ResourceList(list) = element {
-                if list.rid() == original {
-                    list.apply_resolved(resolved.clone());
+            match element {
+                Element::ResourceList(list) => {
+                    if list.rid() == original {
+                        list.apply_resolved(resolved.clone());
+                    }
                 }
+                Element::RowFilter(filter) => filter.apply_resolved(original, resolved),
+                _ => {}
             }
         }
     }

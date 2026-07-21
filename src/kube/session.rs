@@ -45,6 +45,12 @@ pub(crate) use ds_try;
 
 /// Maximum events to drain per iteration to prevent UI freezes during bursts.
 const EVENT_DRAIN_CAP: usize = 200;
+
+/// Capacity of the App event channel. Used for both the initial channel
+/// (in `main`) and every reconnect/context-switch rebuild, so
+/// buffer-dependent behavior (backpressure onset, drain batching) is
+/// identical before and after the first reconnect.
+pub const EVENT_CHANNEL_CAP: usize = 500;
 // (SEARCH_SCROLL_CONTEXT moved to app.config.ui.search_context_lines)
 
 /// Result returned from `handle_action` to signal the main loop about actions
@@ -463,7 +469,17 @@ async fn run_shell_bridge(
                         let _ = stdout.flush().await;
                     }
                     Some(AppEvent::ExecEnded) | None => break,
-                    Some(_) => {}
+                    // Everything else (Store deltas, log lines, OpResults,
+                    // and critically DaemonDisconnected) must still be
+                    // APPLIED, not dropped — this bridge owns event_rx for
+                    // the whole shell session, so swallowing here would
+                    // leave stores diverged (missed deltas are never
+                    // re-sent) and could eat a disconnect, stranding the
+                    // TUI in a no-reconnect limbo. apply_event touches only
+                    // app state and stores (no terminal I/O) and runs on
+                    // this same task; ExecData/ExecEnded are already peeled
+                    // off above.
+                    Some(other) => apply_event(app, other),
                 }
             }
             _ = sigwinch.recv() => {
@@ -786,6 +802,10 @@ pub async fn session_main(
     // one-paint-per-event — the difference between a trickle and a firehose
     // of terminal bytes over SSH. See `Repaint`.
     let mut repaint = Repaint::Now; // draw the first frame immediately
+    // Animation clock: the loading spinner's own cadence, independent of the
+    // data-repaint budget above. `Some(deadline)` while a spinner is on screen
+    // (re-armed after each paint that drew one); `None` when nothing animates.
+    let mut next_anim: Option<std::time::Instant> = None;
     loop {
         // Context switch: one socket = one context = one session.
         //
@@ -802,9 +822,14 @@ pub async fn session_main(
         // call fired between this line and `mark_stable()` (in
         // `dispatch_app_event` on `ConnectionEstablished`) will be rejected
         // by the `is_stable()` check.
+        // A reconnect may be BACKED OFF (a prior reconnect attempt failed);
+        // defer the rebuild until its deadline so a down daemon isn't
+        // hammered. Context switches are user-initiated and always run now.
+        let reconnect_due = app.reconnect_requested
+            && app.reconnect_at.is_none_or(|t| std::time::Instant::now() >= t);
         let rebuild_ctx = if let Some(new_ctx) = app.kube.context_switch.take_requested() {
             Some(Some(new_ctx))
-        } else if app.reconnect_requested {
+        } else if reconnect_due {
             Some(if app.kube.context.is_empty() { None } else { Some(app.kube.context.clone()) })
         } else {
             None
@@ -822,7 +847,18 @@ pub async fn session_main(
             // Metrics are stale for the new session either way.
             app.kube.metrics.clear();
             app.kube.kubectl_cache.clear();
-            let (new_tx, new_rx) = mpsc::channel::<AppEvent>(256);
+            // Overlays / dialogs awaiting a response from the OLD session
+            // would hang forever (their Yaml/OpResult/ExecEnded died with
+            // the dropped channel) — clear them, the same way a context
+            // switch does. A content view mid-fetch is reset so it re-issues
+            // against the new session.
+            app.ui.overlay = None;
+            app.ui.form_dialog = None;
+            app.ui.confirm_dialog = None;
+            if let crate::app::element::Element::ContentView(cv) = app.nav.top_mut() {
+                cv.awaiting_response = false;
+            }
+            let (new_tx, new_rx) = mpsc::channel::<AppEvent>(EVENT_CHANNEL_CAP);
             event_tx = new_tx;
             event_rx = new_rx;
             data_source = ClientSession::new(
@@ -847,10 +883,23 @@ pub async fn session_main(
             last_tick = std::time::Instant::now();
         }
 
+        // Animation frame due? Advance the spinner's phase and force a paint at
+        // its own cadence (bypassing the data-coalescing budget). Runs before
+        // the paint gate so a due frame renders THIS turn; re-armed after the
+        // paint iff a spinner is still on screen (see the gate below).
+        if next_anim.is_some_and(|t| std::time::Instant::now() >= t) {
+            app.ui.anim.advance();
+            repaint.on_animation();
+            next_anim = None;
+        }
+
         // Top-of-loop paint gate: runs every turn, so a coalesced frame fires
         // as soon as its deadline passes even while the biased arms below keep
         // winning during a flood.
         if repaint.due(std::time::Instant::now()) {
+            // Clear the per-frame liveness flag; the spinner primitive
+            // (`Anim::bar`) sets it again iff a spinner draws this frame.
+            app.ui.anim.begin_frame();
             terminal.draw(|f| {
                 crate::ui::draw(f, &mut app);
             })?;
@@ -873,6 +922,19 @@ pub async fn session_main(
             }
 
             repaint.painted();
+
+            // The spinner declared its own liveness by drawing this frame. Keep
+            // the animation clock running while one is on screen; stop it
+            // otherwise. Nothing here enumerates loading states — the draw is
+            // the single source of truth, so a new spinner surface can't forget
+            // to animate.
+            if app.ui.anim.is_animating() {
+                next_anim.get_or_insert_with(|| {
+                    std::time::Instant::now() + crate::app::anim::FRAME_INTERVAL
+                });
+            } else {
+                next_anim = None;
+            }
         }
 
         // Unified edit flow: if route is EditorReady, run the editor.
@@ -901,11 +963,15 @@ pub async fn session_main(
             }
         }
 
-        // Snapshot the coalesced-paint deadline before the select so the timer
-        // arm below borrows nothing from `repaint`. `None` (idle, or `Now`
-        // which the top-of-loop gate already paints) → the arm parks forever
-        // and the loop blocks on real events.
-        let wake = repaint.wake_at();
+        // Snapshot the next wake deadline before the select so the timer arm
+        // below borrows nothing from `repaint`: the earliest of the coalesced-
+        // paint deadline and the next animation frame. `None` (idle, or `Now`
+        // which the top-of-loop gate already paints, and nothing animating) →
+        // the arm parks forever and the loop blocks on real events.
+        let wake = match (repaint.wake_at(), next_anim) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         tokio::select! {
             // biased: always check key events first so user input (like disabling
             // autoscroll) takes effect before processing queued data events.
@@ -925,6 +991,22 @@ pub async fn session_main(
 
                         repaint.on_input();
                         if let Some(action) = crate::event::handler::handle_key_event(&app, key) {
+                            // Select-mode gate: THE single choke point.
+                            // Every key→Action route (global, per-view,
+                            // overlay fall-through) funnels through here,
+                            // transforming batch-capable ops into their
+                            // distinct Batch* actions and killing
+                            // single-target actions while marks are
+                            // active. Runs BEFORE the readonly check so
+                            // readonly sees the batch variant it must
+                            // block.
+                            let action = match crate::app::select_gate::gate_action(&app, action) {
+                                crate::app::select_gate::Gated::Pass(a) => a,
+                                crate::app::select_gate::Gated::Blocked(msg) => {
+                                    app.ui.flash = Some(crate::app::FlashMessage::warn(msg.to_string()));
+                                    continue;
+                                }
+                            };
                             // Client-side UX shortcut: flash "Read-only mode"
                             // immediately without a wire round-trip. The server
                             // is the real security boundary and rejects every

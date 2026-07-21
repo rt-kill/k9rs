@@ -8,13 +8,6 @@ use ratatui::{
 use crate::app::App;
 use crate::ui::theme::Theme;
 
-/// A keyboard shortcut hint for the UI.
-#[derive(Debug, Clone)]
-pub struct KeyHint {
-    pub key: &'static str,
-    pub description: &'static str,
-}
-
 // ---------------------------------------------------------------------------
 // k9rs ASCII art logo (rendered in orange)
 // ---------------------------------------------------------------------------
@@ -38,7 +31,6 @@ pub fn draw_header(
     app: &App,
     area: Rect,
     theme: &Theme,
-    _draw_center_fn: impl FnOnce(&mut Frame, Rect, &Theme),
 ) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -83,50 +75,6 @@ pub fn draw_header(
     let logo = Paragraph::new(logo_lines)
         .alignment(ratatui::layout::Alignment::Right);
     f.render_widget(logo, cols[1]);
-}
-
-/// Draw a key-hint grid in a two-column layout. Reusable by any view that
-/// wants compact `<key> desc` pairs in its center header panel.
-pub fn draw_key_hint_grid(
-    f: &mut Frame,
-    area: Rect,
-    hints: &[KeyHint],
-    theme: &Theme,
-) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    let col_width = area.width / 2;
-    let entries_per_col = hints.len().div_ceil(2);
-
-    for row in 0..entries_per_col {
-        if row as u16 >= area.height {
-            break;
-        }
-        let y = area.y + row as u16;
-
-        // Left column
-        if row < hints.len() {
-            let hint = &hints[row];
-            let line = Line::from(vec![
-                Span::styled(format!(" <{}>", hint.key), theme.help_key),
-                Span::styled(format!(" {}", hint.description), theme.info_value),
-            ]);
-            f.render_widget(line, Rect::new(area.x, y, col_width, 1));
-        }
-
-        // Right column
-        let right_idx = row + entries_per_col;
-        if right_idx < hints.len() {
-            let hint = &hints[right_idx];
-            let line = Line::from(vec![
-                Span::styled(format!(" <{}>", hint.key), theme.help_key),
-                Span::styled(format!(" {}", hint.description), theme.info_value),
-            ]);
-            f.render_widget(line, Rect::new(area.x + col_width, y, col_width, 1));
-        }
-    }
 }
 
 /// Build a keybinding bar `Line` from a list of `(key, description)` pairs.

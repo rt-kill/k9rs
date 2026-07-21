@@ -60,7 +60,7 @@ pub fn draw_yaml(f: &mut Frame, app: &App, area: Rect) {
             .border_style(theme.border);
         let inner = block.inner(content_area);
         f.render_widget(block, content_area);
-        crate::ui::draw_centered_loading(f, inner, "Loading...", theme.status_pending);
+        crate::ui::draw_centered_loading(f, inner, "Loading...", theme.status_pending, &app.ui.anim);
     }
 
     // Bottom bar: search input or keybinding hints

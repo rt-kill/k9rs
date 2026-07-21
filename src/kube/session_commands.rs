@@ -577,6 +577,14 @@ pub(crate) fn handle_form_dialog_key(
 /// validated by the dialog widget per `FormFieldKind`) and produces a
 /// strongly-typed wire payload. Centralized so adding a new operation
 /// kind only adds an arm here.
+///
+/// INVARIANT this ungated send leans on: a form dialog cannot coexist
+/// with select mode or read-only — its only openers (`Action::Scale` /
+/// `Action::PortForward`) are blocked by the select gate and the
+/// readonly check BEFORE the dialog exists, and while it is open every
+/// Char key is consumed by the form, so no marks can appear under it.
+/// A new form-dialog opener must preserve that, or this becomes a
+/// select/readonly bypass.
 fn dispatch_form_submit(
     app: &mut App,
     data_source: &mut ClientSession,

@@ -226,7 +226,12 @@ async fn handle_connection(
             ServerSession::init_and_run_muxed(mux, state.session_shared.clone()).await;
         }
 
-        // Plain bincode management request (k9rs ctl).
+        // Plain bincode management request (k9rs ctl). NOTE: no version
+        // handshake on this path — ctl/daemon skew is protected only by
+        // the append-only wire-tag discipline (pinned by the envelope
+        // golden tests). Fine while wire changes only ever append; a
+        // non-append change to SessionCommand/SessionEvent must add a
+        // preamble here too.
         CONN_TYPE_MANAGEMENT => {
             let (reader, writer) = peek_stream.into_split();
             let mut reader = BufReader::with_capacity(protocol::IO_BUFFER_SIZE, reader);

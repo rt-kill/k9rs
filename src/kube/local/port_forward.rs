@@ -380,10 +380,14 @@ impl LocalOperator for PortForwardOp {
             }
         };
 
-        // 3. Canary tunnel — one idle stream to the pod whose closure is
-        // the liveness signal (the native analogue of kubectl's child
-        // exiting): pod death, kubelet restart, or a suspended laptop's
-        // dead connection all surface as EOF/error on this read.
+        // 3. Canary tunnel — one idle stream to the pod. Its closure is a
+        // liveness HINT (pod death, kubelet restart, a suspended laptop's
+        // dead connection), but NOT a reliable one: many servers close an
+        // idle connection on their own keepalive timeout while the pod is
+        // perfectly healthy. So a canary close is repaired IN PLACE by
+        // re-opening the canary — only a re-open FAILURE (pod really gone)
+        // tears the attempt down. Critically, the canary is decoupled from
+        // the user's connections: closing it must never abort live pumps.
         let api: Api<Pod> = Api::namespaced(self.req.client.clone(), ns);
         let mut canary_pf = match api.portforward(&target.pod, &[target.port]).await {
             Ok(p) => p,
@@ -398,25 +402,58 @@ impl LocalOperator for PortForwardOp {
         // resets the supervisor's backoff so a long-lived tunnel that later
         // drops reconnects from the minimum delay.
         attempt.active();
+        // When the canary last (re)opened. A canary that closes and re-opens
+        // in QUICK succession is flapping (a dead-but-endpoint-exists pod, or
+        // a proxy that resets on connect) — re-opening it in place with no
+        // throttle would hammer the apiserver with websocket upgrades at
+        // network RTT. So a re-open sooner than PF_BACKOFF_MIN is treated as
+        // pod-death: tear down and Continue, which re-engages the
+        // supervisor's escalating backoff AND re-resolves to a replacement
+        // pod. An OCCASIONAL idle close (>= PF_BACKOFF_MIN apart, e.g. an
+        // application keepalive timeout every ~65s) still re-opens in place
+        // with live pumps untouched.
+        let mut last_canary_open = Instant::now();
 
         // 4. Serve. Each accepted connection gets its own tunnel to the
         // resolved pod, pumped by a task in this JoinSet — dropping the
         // set (attempt ends or is aborted) aborts every in-flight pump.
+        // `canary_pf` is reassigned on canary re-open and held ONLY for its
+        // Drop (dropping the Portforwarder closes the tunnel) — its value
+        // is never read back, hence the allow.
         let mut pumps: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         let mut sink = [0u8; 64];
+        #[allow(unused_assignments)]
         loop {
             tokio::select! {
                 read = canary.read(&mut sink) => match read {
-                    Ok(0) => {
-                        return OperatorExit::Continue(format!(
-                            "tunnel to {} closed", target.pod,
-                        ));
-                    }
-                    Ok(_) => {} // stray bytes on the idle canary — ignore
-                    Err(e) => {
-                        return OperatorExit::Continue(format!(
-                            "tunnel to {} lost: {}", target.pod, e,
-                        ));
+                    Ok(n) if n > 0 => {} // stray bytes on the idle canary — ignore
+                    _ => {
+                        // Ok(0) = idle close; Err = tunnel error.
+                        if last_canary_open.elapsed() < PF_BACKOFF_MIN {
+                            return OperatorExit::Continue(format!(
+                                "tunnel to {} flapping — re-resolving", target.pod,
+                            ));
+                        }
+                        // Re-open IN PLACE — success means the pod is alive and
+                        // this was just an idle timeout (listener and every
+                        // live pump stay untouched); failure means the pod is
+                        // likely gone, so tear down and Continue → the next
+                        // attempt re-resolves to a replacement pod.
+                        match api.portforward(&target.pod, &[target.port]).await {
+                            Ok(mut pf) => match pf.take_stream(target.port) {
+                                Some(stream) => {
+                                    canary_pf = pf;
+                                    canary = stream;
+                                    last_canary_open = Instant::now();
+                                }
+                                None => return OperatorExit::Continue(format!(
+                                    "tunnel to {} lost (no stream on re-open)", target.pod,
+                                )),
+                            },
+                            Err(e) => return OperatorExit::Continue(format!(
+                                "tunnel to {} lost: {}", target.pod, e,
+                            )),
+                        }
                     }
                 },
                 accepted = listener.accept() => match accepted {

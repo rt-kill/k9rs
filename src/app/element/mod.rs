@@ -124,6 +124,13 @@ pub struct TableInteraction {
     pub page_size: usize,
     pub sort: SortSpec,
     pub filter_input: FilterInputState,
+    /// Whether the last PAINTED frame showed select mode. Mode itself is
+    /// derived (`has_marks`), never stored — this records only what the
+    /// user last saw, so a batch-intended keypress that lands after an
+    /// async prune emptied the marks can be refused instead of silently
+    /// falling through to single-item semantics (the "act through the
+    /// last painted view" doctrine, applied to mode).
+    pub rendered_select_mode: bool,
     /// Memo of the ephemeral view — a pure cache, droppable at any time
     /// (cleared when the element is covered; rebuilt on first read).
     cache: Option<(DeriveKey, Arc<PreparedView>)>,
@@ -139,6 +146,7 @@ impl Default for TableInteraction {
             page_size: 40,
             sort: SortSpec::default(),
             filter_input: FilterInputState::default(),
+            rendered_select_mode: false,
             cache: None,
         }
     }
@@ -159,6 +167,7 @@ impl TableInteraction {
             page_size: parent.page_size,
             sort: parent.sort,
             filter_input: FilterInputState::default(),
+            rendered_select_mode: false,
             cache: None,
         }
     }
@@ -198,6 +207,14 @@ impl TableInteraction {
 /// Cache key for the memoized view. The derive is pure over these plus
 /// the store contents (captured by `generation`) and metrics (captured by
 /// `metrics_version`).
+///
+/// NOTE: the draft is keyed by TEXT only, which is correct precisely
+/// because `compile_draft` matches ALL columns while typing (the draft's
+/// column restriction only takes effect at COMMIT, as a predicate that
+/// bumps `generation`). If `compile_draft` is ever changed to honor the
+/// draft's column, that column MUST be added here — otherwise two drafts
+/// with the same text but different target columns would collide on this
+/// key and one would render the other's (now-different) view.
 #[derive(Debug, Clone, PartialEq)]
 struct DeriveKey {
     generation: u64,
@@ -272,6 +289,11 @@ impl LiveQuery {
     /// fresh epoch floor rejects the dead stream's queued stragglers; the
     /// next Baseline replaces rows in place — no blank flash.
     pub fn resubscribe(&mut self, session: &ClientSession) {
+        // Abort the old bridge BEFORE the new subscribe mints its epoch
+        // (subscribe_stream raises expect_epoch as it returns) — a
+        // lingering old bridge minting a HIGHER epoch would permanently
+        // out-floor the successor's baseline.
+        self.stream.abort();
         self.stream = session.subscribe_stream(
             self.spec.rid.clone(),
             self.spec.namespace.clone(),
@@ -286,6 +308,8 @@ impl LiveQuery {
     /// old refresh silently narrowed all-namespace drills to the ambient
     /// namespace).
     pub fn refresh(&mut self, session: &ClientSession) {
+        // Abort-before-mint (see resubscribe).
+        self.stream.abort();
         self.store.clear();
         self.stream = session.subscribe_stream(
             self.spec.rid.clone(),
@@ -451,12 +475,35 @@ pub struct RowFilter {
     source: RowSource,
     label: String,
     /// Same resource as the parent (a refinement doesn't change WHAT you
-    /// look at) — carried for column metadata and actions.
+    /// look at) — the SINGLE home for this element's identity. `rid()`
+    /// reads `policy.rid`; there is no second copy to drift (a separate
+    /// `rid` field used to exist and only half of the resolve path
+    /// updated it, so a CRD resolved under a filter rendered stale
+    /// columns/title).
     policy: ColumnPolicy,
-    rid: Option<ResourceId>,
     title: String,
     scope_label: String,
     pub interaction: TableInteraction,
+}
+
+impl RowFilter {
+    /// The server resolved the underlying rid: a refinement carries a
+    /// VALUE COPY of the parent's identity in `policy`, and actions
+    /// (single and batch `ObjectRef`s) plus column metadata and the title
+    /// scope are all built from it — so the copy must follow the
+    /// resolution the same way the list one level below does.
+    pub(crate) fn apply_resolved(&mut self, original: &ResourceId, resolved: &ResourceId) {
+        if self.policy.rid.as_ref() != Some(original) {
+            return;
+        }
+        self.policy.rid = Some(resolved.clone());
+        if self.title == original.short_label().to_lowercase() {
+            self.title = resolved.short_label().to_lowercase();
+        }
+        if resolved.is_cluster_scoped() {
+            self.scope_label.clear();
+        }
+    }
 }
 
 /// A live client projection of one parent row (containers of a pod).
@@ -475,8 +522,6 @@ pub struct DerivedRows {
     rules: Vec<ColumnRenderRules>,
     label: String,
     title: String,
-    /// Local marks — projected rows have no backing store.
-    marked: HashSet<ObjectKey>,
     pub interaction: TableInteraction,
 }
 
@@ -487,6 +532,29 @@ pub enum DeriveError {
     NoRows,
     /// Nothing is selected (empty view).
     NoSelection,
+}
+
+/// Outcome of a mark keypress. The element stays UI-free — the action
+/// layer turns these into flashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkOutcome {
+    /// Mark state changed.
+    Toggled,
+    /// No row under the cursor — empty view, or the row vanished between
+    /// paint and keypress (stale coalesced frame).
+    RowGone,
+    /// This element kind has no markable rows.
+    Unsupported,
+}
+
+/// Outcome of a span-mark keypress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanOutcome {
+    Applied,
+    /// No marked row is visible in this view to anchor the span.
+    NoAnchor,
+    /// This element kind has no markable rows.
+    Unsupported,
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +705,25 @@ impl LogSession {
         self.view.initial_load = true;
         self.view.scroll = 0;
         self.stream = session.stream_log_substream(self.spec.clone(), Arc::clone(&self.store));
+    }
+
+    /// Whether the underlying substream is still running.
+    pub fn stream_alive(&self) -> bool {
+        self.stream.is_alive()
+    }
+
+    /// Re-establish the stream if it died (daemon restart during a reconnect
+    /// or while covered). Without this a dead log stream renders forever as
+    /// a live, following view — the line store keeps `live = true` because
+    /// the bridge's `Ended` died in the closed channel and `mark_ended`
+    /// never ran. Reuses `restart_range` (resume from the current `since`):
+    /// re-tailing is the honest recovery — the alternative, resuming in
+    /// place, would need a "since now" the tail spec can't express.
+    pub fn revive_if_dead(&mut self, session: &ClientSession) {
+        if !self.stream.is_alive() {
+            let since = self.spec.since.clone();
+            self.restart_range(session, since);
+        }
     }
 
     /// Test-only: a log session over a parked stream.
@@ -793,8 +880,9 @@ impl Element {
         Ok(Element::RowFilter(RowFilter {
             source: source.narrowed(Arc::new(predicate)),
             label,
+            // The policy already carries the parent's rid — that IS this
+            // filter's identity (no separate copy).
             policy: top.column_policy().clone(),
-            rid: top.rid().cloned(),
             title: top.title().to_string(),
             scope_label: top.scope_label().to_string(),
             interaction: TableInteraction::seeded_from(
@@ -816,7 +904,11 @@ impl Element {
         let rules = crate::kube::overlay::build_column_rules(&headers, kind.plural());
         let origin = ObjectRef {
             resource: top.rid().ok_or(DeriveError::NoRows)?.clone(),
-            namespace: Namespace::Named(row.namespace.clone().unwrap_or_default()),
+            // `from_row` maps "" → All (the ""↔All convention); building
+            // `Named("")` directly would be the invalid state that
+            // convention exists to prevent. Safe today (projections are
+            // pod-only, always namespaced) but honest for any future kind.
+            namespace: Namespace::from_row(row.namespace.as_deref().unwrap_or("")),
             name: row.name.clone(),
         };
         let label = format!("{}({})", kind.plural(), row.name);
@@ -829,7 +921,6 @@ impl Element {
             rules,
             title: label.clone(),
             label,
-            marked: HashSet::new(),
             interaction: TableInteraction::default(),
         }))
     }
@@ -906,7 +997,7 @@ impl Element {
     pub fn rid(&self) -> Option<&ResourceId> {
         match self {
             Element::ResourceList(e) => Some(e.rid()),
-            Element::RowFilter(e) => e.rid.as_ref(),
+            Element::RowFilter(e) => e.policy.rid.as_ref(),
             _ => None,
         }
     }
@@ -1231,7 +1322,7 @@ impl Element {
                     inner
                         .rows
                         .iter()
-                        .find(|r| crate::app::store::row_key(r) == e.key)
+                        .find(|r| crate::app::store::row_matches_key(r, &e.key))
                         .map(|r| e.kind.project(r))
                         .unwrap_or_default()
                 });
@@ -1312,17 +1403,17 @@ impl Element {
         match self {
             Element::ResourceList(_) | Element::RowFilter(_) => {
                 self.data_store()?.with_read(|inner| {
-                    inner.rows.iter().find(|r| crate::app::store::row_key(r) == key).cloned()
+                    inner.rows.iter().find(|r| crate::app::store::row_matches_key(r, &key)).cloned()
                 })
             }
             Element::DerivedRows(e) => e.source.store().with_read(|inner| {
                 inner
                     .rows
                     .iter()
-                    .find(|r| crate::app::store::row_key(r) == e.key)
+                    .find(|r| crate::app::store::row_matches_key(r, &e.key))
                     .map(|parent| e.kind.project(parent))
                     .and_then(|rows| {
-                        rows.into_iter().find(|r| crate::app::store::row_key(r) == key)
+                        rows.into_iter().find(|r| crate::app::store::row_matches_key(r, &key))
                     })
             }),
             _ => None,
@@ -1336,33 +1427,45 @@ impl Element {
             .unwrap_or(0)
     }
 
+    // Every move re-anchors the stored cursor to the position the user
+    // SEES (`clamped_selected`) before applying the step. A cursor carried
+    // from a longer view — a child seeded from a deep parent position, or
+    // data that shrank underneath — would otherwise sit out of range and
+    // burn invisible keypresses re-entering it. Moves are interaction
+    // time, so writing the normalized value back here is exactly the
+    // doctrine ("only interaction-time moves mutate these fields"); an
+    // empty view leaves the cursor untouched (nothing to move over, and
+    // the position should survive a transient refresh window).
+
     pub fn select_next(&mut self) {
         let len = self.view_len();
         let Some(it) = self.table_interaction_mut() else { return };
-        if len > 0 && it.selected + 1 < len {
-            it.selected += 1;
-        }
+        if len == 0 { return; }
+        it.selected = (it.clamped_selected(len) + 1).min(len - 1);
         it.adjust_offset();
     }
 
     pub fn select_prev(&mut self) {
+        let len = self.view_len();
         let Some(it) = self.table_interaction_mut() else { return };
-        it.selected = it.selected.saturating_sub(1);
+        if len == 0 { return; }
+        it.selected = it.clamped_selected(len).saturating_sub(1);
         it.adjust_offset();
     }
 
     pub fn page_up(&mut self) {
+        let len = self.view_len();
         let Some(it) = self.table_interaction_mut() else { return };
-        it.selected = it.selected.saturating_sub(it.page_size);
+        if len == 0 { return; }
+        it.selected = it.clamped_selected(len).saturating_sub(it.page_size);
         it.adjust_offset();
     }
 
     pub fn page_down(&mut self) {
         let len = self.view_len();
         let Some(it) = self.table_interaction_mut() else { return };
-        if len > 0 {
-            it.selected = (it.selected + it.page_size).min(len - 1);
-        }
+        if len == 0 { return; }
+        it.selected = (it.clamped_selected(len) + it.page_size).min(len - 1);
         it.adjust_offset();
     }
 
@@ -1405,6 +1508,25 @@ impl Element {
         }
     }
 
+    /// Jump the column cursor to the first (leftmost) column — vim `0`.
+    pub fn col_first(&mut self) {
+        let Some(it) = self.table_interaction_mut() else { return };
+        it.selected_col = 0;
+    }
+
+    /// Jump the column cursor to the last (rightmost) column — vim `$`.
+    pub fn col_last(&mut self) {
+        let num_cols = self
+            .table_interaction()
+            .and_then(|i| i.cached_view())
+            .map(|v| v.visible_cols.len())
+            .unwrap_or(0);
+        let Some(it) = self.table_interaction_mut() else { return };
+        if num_cols > 0 {
+            it.selected_col = num_cols - 1;
+        }
+    }
+
     /// The cursor column as (DATA index, header) — the single source for
     /// `~` column-grep and `S` sort-by-column. Reads the same visible set
     /// the renderer used, so a mis-map is unrepresentable.
@@ -1416,44 +1538,55 @@ impl Element {
     }
 
     // -- Marks -------------------------------------------------------------------
+    //
+    // Markable = store-backed (ResourceList / RowFilter): the kinds whose
+    // marks live where row mutations are applied (pruned atomically with
+    // removals) and can feed batch operations. DerivedRows deliberately
+    // does NOT mark: its projected rows have no backing store, so a local
+    // set could never be pruned by data (dead keys forever) and no batch
+    // consumer exists — the future Aggregate feature gets to design
+    // container marks together with their consumer.
+
+    fn markable(&self) -> bool {
+        matches!(self, Element::ResourceList(_) | Element::RowFilter(_))
+    }
 
     /// Toggle the mark on the row under the cursor.
-    pub fn toggle_mark(&mut self) {
-        let Some(key) = self.selected_key() else { return };
-        match self {
-            Element::ResourceList(_) | Element::RowFilter(_) => {
-                if let Some(store) = self.data_store() {
-                    store.toggle_mark(&key);
-                }
-            }
-            Element::DerivedRows(e) => {
-                if !e.marked.remove(&key) {
-                    e.marked.insert(key);
-                }
-            }
-            _ => {}
+    pub fn toggle_mark(&mut self) -> MarkOutcome {
+        if !self.markable() {
+            return MarkOutcome::Unsupported;
+        }
+        let Some(key) = self.selected_key() else { return MarkOutcome::RowGone };
+        let Some(store) = self.data_store() else { return MarkOutcome::Unsupported };
+        match store.toggle_mark(&key) {
+            Some(_) => MarkOutcome::Toggled,
+            None => MarkOutcome::RowGone,
         }
     }
 
     /// Span-mark, at block granularity and symmetric with Space's
     /// per-row toggle — the state of the row UNDER THE CURSOR decides
     /// the direction:
-    /// - cursor row unmarked → mark the span from the nearest existing
+    /// - cursor row unmarked → mark the span from the nearest VISIBLE
     ///   mark to the cursor (over the derived/visible order);
     /// - cursor row marked → unmark the contiguous marked block
     ///   containing the cursor.
-    pub fn span_mark(&mut self) {
+    pub fn span_mark(&mut self) -> SpanOutcome {
+        if !self.markable() {
+            return SpanOutcome::Unsupported;
+        }
         let Some(view) = self.table_interaction().and_then(|i| i.cached_view()).cloned() else {
-            return;
+            return SpanOutcome::NoAnchor;
         };
         if view.keys.is_empty() {
-            return;
+            return SpanOutcome::NoAnchor;
         }
         let Some(current) = self.table_interaction().map(|i| i.clamped_selected(view.keys.len()))
         else {
-            return;
+            return SpanOutcome::NoAnchor;
         };
         let marked = self.marked_snapshot();
+        let Some(store) = self.data_store() else { return SpanOutcome::Unsupported };
 
         if marked.contains(&view.keys[current]) {
             // Unmark the contiguous marked block around the cursor.
@@ -1465,86 +1598,71 @@ impl Element {
             while end + 1 < view.keys.len() && marked.contains(&view.keys[end + 1]) {
                 end += 1;
             }
-            match self {
-                Element::ResourceList(_) | Element::RowFilter(_) => {
-                    if let Some(store) = self.data_store() {
-                        store.unmark_keys(view.keys[start..=end].iter());
-                    }
-                }
-                Element::DerivedRows(e) => {
-                    for key in &view.keys[start..=end] {
-                        e.marked.remove(key);
-                    }
-                }
-                _ => {}
-            }
-            return;
+            store.unmark_keys(view.keys[start..=end].iter());
+            return SpanOutcome::Applied;
         }
 
-        let anchor = view
+        // Span needs a VISIBLE anchor. With none — no marks at all, or
+        // marks that this element's filter hides — refuse: falling back
+        // to row 0 would silently bulk-mark from the top of the view and
+        // grow an invisible marked set as a side effect of a miss.
+        let Some(anchor) = view
             .keys
             .iter()
             .enumerate()
             .filter(|(_, k)| marked.contains(*k))
             .map(|(pos, _)| pos)
             .min_by_key(|&pos| (pos as isize - current as isize).unsigned_abs())
-            .unwrap_or(0);
+        else {
+            return SpanOutcome::NoAnchor;
+        };
         let (start, end) = if anchor <= current { (anchor, current) } else { (current, anchor) };
-        let keys = view.keys[start..=end].iter().cloned();
-        match self {
-            Element::ResourceList(_) | Element::RowFilter(_) => {
-                if let Some(store) = self.data_store() {
-                    store.mark_keys(keys);
-                }
-            }
-            Element::DerivedRows(e) => e.marked.extend(keys),
-            _ => {}
-        }
+        store.mark_keys(view.keys[start..=end].iter().cloned());
+        SpanOutcome::Applied
     }
 
-    pub fn clear_marks(&mut self) {
-        match self {
-            Element::ResourceList(_) | Element::RowFilter(_) => {
-                if let Some(store) = self.data_store() {
-                    store.clear_marks();
-                }
-            }
-            Element::DerivedRows(e) => e.marked.clear(),
-            _ => {}
+    /// Clear all marks. `false` = this element kind has no markable rows
+    /// (same teaching flash as Toggle/Span — the three marking keys must
+    /// not disagree about where marking exists).
+    pub fn clear_marks(&mut self) -> bool {
+        if !self.markable() {
+            return false;
         }
+        if let Some(store) = self.data_store() {
+            store.clear_marks();
+        }
+        true
     }
 
     pub fn has_marks(&self) -> bool {
-        match self {
-            Element::ResourceList(_) | Element::RowFilter(_) => {
-                self.data_store().map(|s| s.has_marks()).unwrap_or(false)
-            }
-            Element::DerivedRows(e) => !e.marked.is_empty(),
-            _ => false,
-        }
+        self.markable() && self.data_store().map(|s| s.has_marks()).unwrap_or(false)
     }
 
     pub fn marked_keys(&self) -> Vec<ObjectKey> {
-        match self {
-            Element::ResourceList(_) | Element::RowFilter(_) => {
-                self.data_store().map(|s| s.marked_keys()).unwrap_or_default()
-            }
-            Element::DerivedRows(e) => e.marked.iter().cloned().collect(),
-            _ => Vec::new(),
+        if !self.markable() {
+            return Vec::new();
         }
+        self.data_store().map(|s| s.marked_keys()).unwrap_or_default()
     }
 
-    /// Marks for render-time row styling. Local marks for projections;
-    /// store marks otherwise (cloned — small sets, per-frame).
-    pub fn marked_snapshot(&self) -> HashSet<ObjectKey> {
-        match self {
-            Element::ResourceList(_) | Element::RowFilter(_) => self
-                .data_store()
-                .map(|s| s.with_read(|i| i.marked().clone()))
-                .unwrap_or_default(),
-            Element::DerivedRows(e) => e.marked.clone(),
-            _ => HashSet::new(),
+    /// Marked count without cloning the set (for the `[N selected]`
+    /// chrome — the empty-table branch used to clone the whole set just
+    /// to read `.len()`).
+    pub fn marked_count(&self) -> usize {
+        if !self.markable() {
+            return 0;
         }
+        self.data_store().map(|s| s.with_read(|i| i.marked_count())).unwrap_or(0)
+    }
+
+    /// Marks for render-time row styling (cloned — small sets, per-frame).
+    pub fn marked_snapshot(&self) -> HashSet<ObjectKey> {
+        if !self.markable() {
+            return HashSet::new();
+        }
+        self.data_store()
+            .map(|s| s.with_read(|i| i.marked().clone()))
+            .unwrap_or_default()
     }
 
     /// Recently-changed rows for flash styling (identity → change time).
@@ -1958,5 +2076,108 @@ mod tests {
         let (data_idx, header) = named.selected_data_col().unwrap();
         assert_eq!(header, "STATUS");
         assert_eq!(data_idx, 2, "data index counts the hidden NAMESPACE column");
+    }
+
+    /// A cursor carried from a longer view (child seeded from a deep
+    /// parent position, or data that shrank) re-anchors to the position
+    /// the user SEES on the first move — one `k` from the (clamped)
+    /// bottom row moves up one row, instead of burning dozens of
+    /// invisible keypresses re-entering range.
+    #[test]
+    fn moves_normalize_an_out_of_range_cursor() {
+        let mut el = list_element(Namespace::All);
+        seed(
+            &el,
+            &["NAME"],
+            (0..5).map(|i| row(&format!("p{i}"), "ns", &[&format!("p{i}")])).collect(),
+        );
+        let _ = el.view(ColumnLevel::Default, 40);
+
+        // Simulate the seeded-from-parent case: raw cursor way past the
+        // 5-row view (display clamps to row 4).
+        el.table_interaction_mut().unwrap().selected = 50;
+        el.select_prev();
+        assert_eq!(
+            el.table_interaction().unwrap().selected, 3,
+            "one PrevItem from the visible bottom row lands on row 3",
+        );
+
+        el.table_interaction_mut().unwrap().selected = 50;
+        el.select_next();
+        assert_eq!(
+            el.table_interaction().unwrap().selected, 4,
+            "NextItem from past-the-end normalizes to the last row",
+        );
+
+        el.table_interaction_mut().unwrap().selected = 50;
+        el.page_up();
+        assert_eq!(el.table_interaction().unwrap().selected, 0);
+
+        // Empty view: moves are no-ops and the cursor survives untouched
+        // (a transient refresh window must not zero the position).
+        let mut empty = list_element(Namespace::All);
+        seed(&empty, &["NAME"], vec![]);
+        let _ = empty.view(ColumnLevel::Default, 40);
+        empty.table_interaction_mut().unwrap().selected = 7;
+        empty.select_prev();
+        empty.select_next();
+        assert_eq!(empty.table_interaction().unwrap().selected, 7);
+    }
+
+    /// Span with NO visible anchor refuses (it used to anchor at row 0
+    /// and silently bulk-mark from the top of the view).
+    #[test]
+    fn span_mark_without_visible_anchor_is_refused() {
+        let mut el = list_element(Namespace::All);
+        seed(
+            &el,
+            &["NAME"],
+            (0..4).map(|i| row(&format!("p{i}"), "ns", &[&format!("p{i}")])).collect(),
+        );
+        let _ = el.view(ColumnLevel::Default, 40);
+        el.select(2);
+        assert_eq!(el.span_mark(), SpanOutcome::NoAnchor);
+        assert!(el.marked_keys().is_empty(), "nothing was marked");
+
+        // With an anchor it applies as before.
+        el.select(0);
+        assert_eq!(el.toggle_mark(), MarkOutcome::Toggled);
+        el.select(2);
+        assert_eq!(el.span_mark(), SpanOutcome::Applied);
+        assert_eq!(el.marked_keys().len(), 3);
+    }
+
+    /// DerivedRows (container projections) refuse marking outright: their
+    /// rows have no backing store to prune marks against and no batch
+    /// operation consumes them — an unprunable decoration would hold the
+    /// app in a phantom select mode.
+    #[test]
+    fn derived_rows_refuse_marks() {
+        let mut el = list_element(Namespace::All);
+        let mut pod = row("web", "ns", &["web", "Running"]);
+        pod.containers = vec![ContainerInfo {
+            name: "main".into(),
+            kind: Default::default(),
+            image: "img".into(),
+            status: "Running".into(),
+            ready: true,
+            restart_count: 0,
+        }];
+        seed(&el, &["NAME", "STATUS"], vec![pod.clone()]);
+        let _ = el.view(ColumnLevel::Default, 40);
+        let mut derived = Element::derive_projection(&el, &pod, DerivedViewKind::Containers)
+            .expect("containers projection");
+        let _ = derived.view(ColumnLevel::Default, 40);
+        derived.select(0);
+        assert_eq!(derived.toggle_mark(), MarkOutcome::Unsupported);
+        assert_eq!(derived.span_mark(), SpanOutcome::Unsupported);
+        assert!(!derived.has_marks());
+        assert!(derived.marked_keys().is_empty());
+        // And crucially: its mark reads never leak the PARENT store's
+        // marks (data_store() points at the parent's store).
+        el.data_store().unwrap().toggle_mark(&crate::app::store::row_key(&pod));
+        assert!(!derived.has_marks(), "parent marks don't put a projection in select mode");
+        derived.clear_marks();
+        assert!(el.data_store().unwrap().has_marks(), "projection clear_marks can't reach the parent store");
     }
 }

@@ -20,17 +20,25 @@ pub enum AppEvent {
     Store(StoreEvent),
     /// A content-view update (yaml / describe / log line).
     ResourceUpdate(ResourceUpdate),
-    /// A server-sent `CommandResult` — the response to a mutating wire
-    /// command (Apply, Delete, Scale, Restart, Decode, Trigger, Toggle).
-    /// Previously these were collapsed into `Flash`, but that made the
-    /// edit-flow terminal state ambiguous: any unrelated flash popped the
-    /// edit route out of `EditState::Applying` prematurely. Keeping them
-    /// distinct lets the apply path react only to its own response.
+    /// A server-sent `CommandResult` — a management/command-level
+    /// acknowledgment with no resource target (e.g. the daemon's readonly
+    /// gate refusing a whole command). Flash-only.
     ///
     /// `Result<String, String>` rather than `{ ok, message }` so readers
     /// have to branch on success/failure before touching the message —
     /// the struct shape let convention-based code leak.
     CommandResult(Result<String, String>),
+    /// A server-sent `OpResult` — the response to a mutating operation on
+    /// a specific target (Apply, Delete, Scale, Restart, Trigger, Toggle,
+    /// local stop/apply). The target correlates the result back to its
+    /// consumer: the edit flow reacts only to its own apply, a
+    /// [`crate::app::BatchTracker`] consumes its items' results (unmark
+    /// per-success, retain marks on failure, ONE aggregate flash), and
+    /// anything unclaimed flashes directly.
+    OpResult {
+        target: crate::kube::protocol::ObjectRef,
+        result: Result<String, String>,
+    },
     /// A temporary flash message shown in the status bar. Produced by
     /// purely local TUI events (key bindings, nav, info messages).
     Flash(FlashMessage),

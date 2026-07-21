@@ -16,28 +16,25 @@ impl ServerSession {
     // handle_unsubscribe — all deleted. Subscriptions are now per-yamux-substream.
 
     /// Delete a logical entry on a local resource. Looks up the source by
-    /// resource id, dispatches to its `delete` method, and emits a
-    /// `CommandResult`. Readonly is gated once at the top of
+    /// resource id, dispatches to its `delete` method, and emits an
+    /// `OpResult` for the target. Readonly is gated once at the top of
     /// `handle_command` via `SessionCommand::is_mutating`, so this handler
     /// (like every other mutating handler) doesn't re-check.
     pub(super) fn handle_delete_local(&mut self, obj: &protocol::ObjectRef) {
         let tx = self.event_tx.clone();
         let Some(source) = self.locals.get(&obj.resource) else {
-            self.track_task(async move {
-                let _ = tx.send(SessionEvent::CommandResult(Err(
-                    "Unknown local resource".into(),
-                ))).await;
-            });
+            self.reject_async(obj, "Unknown local resource".into());
             return;
         };
         let result = source.delete(&obj.name);
         let name = obj.name.clone();
+        let target = obj.clone();
         self.track_task(async move {
-            let event = match result {
-                Ok(()) => SessionEvent::CommandResult(Ok(format!("Stopped {name}"))),
-                Err(e) => SessionEvent::CommandResult(Err(e)),
+            let result = match result {
+                Ok(()) => Ok(format!("Stopped {name}")),
+                Err(e) => Err(e),
             };
-            let _ = tx.send(event).await;
+            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
         });
     }
 
@@ -47,20 +44,13 @@ impl ServerSession {
     pub(super) fn handle_apply_local(&mut self, obj: &protocol::ObjectRef, yaml: &str) {
         let tx = self.event_tx.clone();
         let Some(source) = self.locals.get(&obj.resource) else {
-            self.track_task(async move {
-                let _ = tx.send(SessionEvent::CommandResult(Err(
-                    "Unknown local resource".into(),
-                ))).await;
-            });
+            self.reject_async(obj, "Unknown local resource".into());
             return;
         };
         let result = source.apply_yaml(&obj.name, yaml);
+        let target = obj.clone();
         self.track_task(async move {
-            let event = match result {
-                Ok(message) => SessionEvent::CommandResult(Ok(message)),
-                Err(e) => SessionEvent::CommandResult(Err(e)),
-            };
-            let _ = tx.send(event).await;
+            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
         });
     }
 
@@ -115,11 +105,11 @@ impl ServerSession {
             }
             .await;
 
-            let event = match result {
-                Ok(()) => SessionEvent::CommandResult(Ok(format!("Applied {}", display))),
-                Err(e) => SessionEvent::CommandResult(Err(format!("Apply failed: {}", e))),
+            let result = match result {
+                Ok(()) => Ok(format!("Applied {}", display)),
+                Err(e) => Err(format!("Apply failed: {}", e)),
             };
-            let _ = tx.send(event).await;
+            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
         });
     }
 
@@ -199,7 +189,7 @@ impl ServerSession {
             return false;
         }
         if target.namespace.as_option().is_none() {
-            self.reject_async(format!(
+            self.reject_async(target, format!(
                 "{} refused: {} has no resolved namespace",
                 action, target.kubectl_target(),
             ));
@@ -223,14 +213,14 @@ impl ServerSession {
         // namespace (force-kill, decode, cron trigger/toggle) — surface
         // a specific message rather than "no resolved namespace".
         if target.resource.is_cluster_scoped() {
-            self.reject_async(format!(
+            self.reject_async(target, format!(
                 "{} refused: {} is cluster-scoped",
                 action, target.kubectl_target(),
             ));
             return None;
         }
         let protocol::Namespace::Named(n) = &target.namespace else {
-            self.reject_async(format!(
+            self.reject_async(target, format!(
                 "{} refused: {} has no resolved namespace",
                 action, target.kubectl_target(),
             ));
@@ -239,13 +229,25 @@ impl ServerSession {
         Some(n.clone())
     }
 
-    /// Spawn a fire-and-forget task that emits a failing `CommandResult`
-    /// with the given message. Used by the synchronous capability gates in
+    /// Spawn a fire-and-forget task that emits a failing `OpResult` for
+    /// the given target. Used by the synchronous capability gates in
     /// the mutating handlers (e.g. "this resource is not scaleable").
-    pub(super) fn reject_async(&mut self, message: String) {
+    pub(super) fn reject_async(&mut self, target: &protocol::ObjectRef, message: String) {
+        let tx = self.event_tx.clone();
+        let event = reject(target, message);
+        self.track_task(async move {
+            let _ = tx.send(event).await;
+        });
+    }
+
+    /// Spawn a fire-and-forget task that emits a failing `CommandResult`
+    /// (no target). Only for rejections of a COMMAND as a whole — the
+    /// centralized readonly gate, which fires before any target-specific
+    /// handler runs. Target-specific gates use [`Self::reject_async`].
+    pub(super) fn reject_command_async(&mut self, message: String) {
         let tx = self.event_tx.clone();
         self.track_task(async move {
-            let _ = tx.send(reject(message)).await;
+            let _ = tx.send(SessionEvent::CommandResult(Err(message))).await;
         });
     }
 
@@ -260,12 +262,12 @@ impl ServerSession {
         action: &str,
     ) -> Option<BuiltInKind> {
         let Some(kind) = target.resource.built_in_kind() else {
-            self.reject_async(format!("{} not supported on {}", action, target.resource.plural()));
+            self.reject_async(target, format!("{} not supported on {}", action, target.resource.plural()));
             return None;
         };
         let def = crate::kube::resource_defs::REGISTRY.by_kind(kind);
         if !def.operations().contains(&required_op) {
-            self.reject_async(format!("{} not supported on {}", action, def.gvr().plural));
+            self.reject_async(target, format!("{} not supported on {}", action, def.gvr().plural));
             return None;
         }
         Some(kind)
@@ -281,11 +283,11 @@ impl ServerSession {
         let display = target.kubectl_target();
         self.track_task(async move {
             let result = crate::kube::ops::execute_delete(&client, &target, &context, &session_env).await;
-            let event = match result {
-                Ok(()) => SessionEvent::CommandResult(Ok(format!("Deleted {}", display))),
-                Err(e) => SessionEvent::CommandResult(Err(format!("Delete failed: {}", e))),
+            let result = match result {
+                Ok(()) => Ok(format!("Deleted {}", display)),
+                Err(e) => Err(format!("Delete failed: {}", e)),
             };
-            let _ = tx.send(event).await;
+            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
         });
     }
 
@@ -298,7 +300,7 @@ impl ServerSession {
     /// client-side capability manifest can't drift.
     pub(super) fn handle_force_kill_async(&mut self, target: &protocol::ObjectRef) {
         if target.resource.built_in_kind() != Some(BuiltInKind::Pod) {
-            self.reject_async(format!("Force-kill is pod-only (got {})", target.resource.plural()));
+            self.reject_async(target, format!("Force-kill is pod-only (got {})", target.resource.plural()));
             return;
         }
         let Some(ns) = self.resolve_namespace_or_reject(target, "Force-kill") else { return; };
@@ -315,11 +317,11 @@ impl ServerSession {
                 propagation_policy: Some(::kube::api::PropagationPolicy::Background),
                 ..DeleteParams::default()
             };
-            let event = match api.delete(&name, &dp).await {
-                Ok(_) => SessionEvent::CommandResult(Ok(format!("Force-killed {}", display))),
-                Err(e) => SessionEvent::CommandResult(Err(format!("Force-kill failed: {}", e))),
+            let result = match api.delete(&name, &dp).await {
+                Ok(_) => Ok(format!("Force-killed {}", display)),
+                Err(e) => Err(format!("Force-kill failed: {}", e)),
             };
-            let _ = tx.send(event).await;
+            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
         });
     }
 
@@ -335,6 +337,7 @@ impl ServerSession {
         let tx = self.event_tx.clone();
         let n = target.name.clone();
         let namespace = target.namespace.clone();
+        let target = target.clone();
         let display = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().plural;
         self.track_task(async move {
             // Use the /scale subresource (same as kubectl scale / k9s).
@@ -356,24 +359,18 @@ impl ServerSession {
                 protocol::Namespace::Named(ns) => kube::Api::namespaced_with(client, ns, &ar),
                 protocol::Namespace::All => kube::Api::all_with(client, &ar),
             };
-            let event = match api.get_scale(&n).await {
+            let result = match api.get_scale(&n).await {
                 Ok(mut scale) => {
                     if let Some(s) = scale.spec.as_mut() { s.replicas = Some(replicas as i32); }
                     let body = serde_json::to_vec(&scale).unwrap_or_default();
                     match api.replace_scale(&n, &kube::api::PostParams::default(), body).await {
-                        Ok(_) => SessionEvent::CommandResult(Ok(
-                            format!("Scaled {}/{} to {} replicas", display, n, replicas),
-                        )),
-                        Err(e) => SessionEvent::CommandResult(Err(
-                            format!("Scale failed: {}", e),
-                        )),
+                        Ok(_) => Ok(format!("Scaled {}/{} to {} replicas", display, n, replicas)),
+                        Err(e) => Err(format!("Scale failed: {}", e)),
                     }
                 }
-                Err(e) => SessionEvent::CommandResult(Err(
-                    format!("Scale failed: {}", e),
-                )),
+                Err(e) => Err(format!("Scale failed: {}", e)),
             };
-            let _ = tx.send(event).await;
+            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
         });
     }
 
@@ -401,15 +398,16 @@ impl ServerSession {
         let tx = self.event_tx.clone();
         let n = target.name.clone();
         let namespace = target.namespace.clone();
+        let target = target.clone();
         let display: &'static str = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().plural;
         self.track_task(async move {
             use ::kube::api::{Patch, PatchParams};
             let api = dynamic_api_for_kind(&client, kind, &namespace);
-            let event = match api.patch(&n, &PatchParams::default(), &Patch::Merge(&patch_body)).await {
-                Ok(_) => SessionEvent::CommandResult(Ok(format!("Restarted {}/{}", display, n))),
-                Err(e) => SessionEvent::CommandResult(Err(format!("Restart failed: {}", e))),
+            let result = match api.patch(&n, &PatchParams::default(), &Patch::Merge(&patch_body)).await {
+                Ok(_) => Ok(format!("Restarted {}/{}", display, n)),
+                Err(e) => Err(format!("Restart failed: {}", e)),
             };
-            let _ = tx.send(event).await;
+            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
         });
     }
 
@@ -477,7 +475,7 @@ impl ServerSession {
         // check is load-bearing: a future workload kind that wants a
         // "manual trigger" would decode the wrong schema.
         if target.resource.built_in_kind() != Some(BuiltInKind::CronJob) {
-            self.reject_async(format!("Trigger not supported on {}", target.resource.plural()));
+            self.reject_async(target, format!("Trigger not supported on {}", target.resource.plural()));
             return;
         }
         let Some(ns) = self.resolve_namespace_or_reject(target, "Trigger") else { return; };
@@ -485,6 +483,7 @@ impl ServerSession {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let n = target.name.clone();
+        let target = target.clone();
         self.track_task(async move {
             use k8s_openapi::api::batch::v1::{CronJob, Job};
 
@@ -492,7 +491,7 @@ impl ServerSession {
             let cj = match cj_api.get(&n).await {
                 Ok(cj) => cj,
                 Err(e) => {
-                    let _ = tx.send(reject(format!("Failed to get CronJob: {}", e))).await;
+                    let _ = tx.send(reject(&target, format!("Failed to get CronJob: {}", e))).await;
                     return;
                 }
             };
@@ -501,11 +500,11 @@ impl ServerSession {
             let job_name = job.metadata.name.clone().unwrap_or_default();
 
             let job_api: kube::Api<Job> = kube::Api::namespaced(client, &ns);
-            let event = match job_api.create(&kube::api::PostParams::default(), &job).await {
-                Ok(_) => SessionEvent::CommandResult(Ok(format!("Triggered job: {}", job_name))),
-                Err(e) => SessionEvent::CommandResult(Err(format!("Failed to trigger CronJob: {}", e))),
+            let result = match job_api.create(&kube::api::PostParams::default(), &job).await {
+                Ok(_) => Ok(format!("Triggered job: {}", job_name)),
+                Err(e) => Err(format!("Failed to trigger CronJob: {}", e)),
             };
-            let _ = tx.send(event).await;
+            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
         });
     }
 
@@ -515,7 +514,7 @@ impl ServerSession {
     /// method, but all cron-likes behave the same way so it lives inline.)
     pub(super) fn handle_toggle_suspend_cronjob_async(&mut self, target: &protocol::ObjectRef) {
         if target.resource.built_in_kind() != Some(BuiltInKind::CronJob) {
-            self.reject_async(format!("Toggle suspend not supported on {}", target.resource.plural()));
+            self.reject_async(target, format!("Toggle suspend not supported on {}", target.resource.plural()));
             return;
         }
         let Some(ns) = self.resolve_namespace_or_reject(target, "Toggle suspend") else { return; };
@@ -523,6 +522,7 @@ impl ServerSession {
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let n = target.name.clone();
+        let target = target.clone();
         self.track_task(async move {
             use k8s_openapi::api::batch::v1::CronJob;
 
@@ -530,20 +530,20 @@ impl ServerSession {
             let cj = match api.get(&n).await {
                 Ok(cj) => cj,
                 Err(e) => {
-                    let _ = tx.send(reject(format!("Failed to read CronJob: {}", e))).await;
+                    let _ = tx.send(reject(&target, format!("Failed to read CronJob: {}", e))).await;
                     return;
                 }
             };
 
             let (new_state, patch_body) = toggle_cron_suspend(&cj);
-            let event = match api.patch(&n, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&patch_body)).await {
+            let result = match api.patch(&n, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&patch_body)).await {
                 Ok(_) => {
                     let action = if new_state { "Suspended" } else { "Resumed" };
-                    SessionEvent::CommandResult(Ok(format!("{} CronJob: {}", action, n)))
+                    Ok(format!("{} CronJob: {}", action, n))
                 }
-                Err(e) => SessionEvent::CommandResult(Err(format!("Failed to update CronJob: {}", e))),
+                Err(e) => Err(format!("Failed to update CronJob: {}", e)),
             };
-            let _ = tx.send(event).await;
+            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
         });
     }
 
@@ -588,9 +588,9 @@ impl ServerSession {
     }
 }
 
-/// Shorthand for a failing `CommandResult` event.
-fn reject(message: String) -> SessionEvent {
-    SessionEvent::CommandResult(Err(message))
+/// Shorthand for a failing `OpResult` event for the given target.
+fn reject(target: &protocol::ObjectRef, message: String) -> SessionEvent {
+    SessionEvent::OpResult { target: target.clone(), result: Err(message) }
 }
 
 /// Build the `kube::api::ApiResource` for a built-in kind directly from the

@@ -22,11 +22,14 @@ use crate::util::content_max_scroll;
 /// help overlay uses at render time so action handlers can store a
 /// stable max and PrevItem decrements move the scroll position
 /// immediately instead of being absorbed by the render-time clamp.
-fn help_max_scroll(caps: &crate::kube::protocol::ResourceCapabilities) -> usize {
+fn help_max_scroll(
+    caps: &crate::kube::protocol::ResourceCapabilities,
+    keys: crate::app::KeysConfig,
+) -> usize {
     let h = crossterm::terminal::size()
         .map(|(_, h)| h)
         .unwrap_or(DEFAULT_TERMINAL_HEIGHT as u16);
-    crate::ui::widgets::HelpOverlay::max_scroll(h, Some(caps))
+    crate::ui::widgets::HelpOverlay::max_scroll(h, Some(caps), keys)
 }
 
 
@@ -85,7 +88,8 @@ pub(crate) fn handle_action(
         // --- Scroll / in-view navigation ---
         a @ (Action::NextItem | Action::PrevItem | Action::PageUp | Action::PageDown
             | Action::Home | Action::End | Action::ScrollUp(_) | Action::ScrollDown(_)
-            | Action::ColLeft | Action::ColRight) => {
+            | Action::ColLeft | Action::ColRight
+            | Action::ColFirst | Action::ColLast) => {
             handle_scroll(app, a);
         }
 
@@ -101,6 +105,11 @@ pub(crate) fn handle_action(
             | Action::Restart | Action::ForceKill | Action::DecodeSecret
             | Action::TriggerCronJob | Action::SuspendCronJob) => {
             return handle_resource_op(app, a, data_source);
+        }
+
+        // --- Batch operations (produced only by the select-mode gate) ---
+        a @ (Action::BatchDelete | Action::BatchRestart | Action::BatchForceKill) => {
+            handle_batch_op(app, a);
         }
 
         // --- Confirmation dialog ---
@@ -151,9 +160,39 @@ pub(crate) fn handle_action(
                 format!("Columns: {}", app.ui.column_level.label())
             ));
         }
-        Action::ToggleMark => app.toggle_mark(),
-        Action::SpanMark => app.span_mark(),
-        Action::ClearMarks => app.clear_marks(),
+        Action::ToggleMark => match app.toggle_mark() {
+            crate::app::element::MarkOutcome::Toggled => {}
+            crate::app::element::MarkOutcome::RowGone => {
+                app.ui.flash = Some(crate::app::FlashMessage::warn(
+                    "No row under the cursor".to_string(),
+                ));
+            }
+            crate::app::element::MarkOutcome::Unsupported => {
+                app.ui.flash = Some(crate::app::FlashMessage::info(
+                    "Marking isn't available in this view".to_string(),
+                ));
+            }
+        },
+        Action::SpanMark => match app.span_mark() {
+            crate::app::element::SpanOutcome::Applied => {}
+            crate::app::element::SpanOutcome::NoAnchor => {
+                app.ui.flash = Some(crate::app::FlashMessage::info(
+                    "No visible mark to span from — Space marks the row".to_string(),
+                ));
+            }
+            crate::app::element::SpanOutcome::Unsupported => {
+                app.ui.flash = Some(crate::app::FlashMessage::info(
+                    "Marking isn't available in this view".to_string(),
+                ));
+            }
+        },
+        Action::ClearMarks => {
+            if !app.clear_marks() {
+                app.ui.flash = Some(crate::app::FlashMessage::info(
+                    "Marking isn't available in this view".to_string(),
+                ));
+            }
+        }
         Action::ToggleLastView => {
             if let Some(crate::app::nav::RootSpec::Resource(last_rid)) = app.nav.prev_root().cloned() {
                 let root = App::root_list_element(
@@ -207,7 +246,7 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
     match (&mut app.ui.overlay, &action) {
         (Some(Overlay::Help { scroll }), a) => {
             let caps = app.nav.top().capabilities();
-            let max = help_max_scroll(&caps);
+            let max = help_max_scroll(&caps, app.config.keys);
             match a {
                 Action::NextItem => *scroll = (*scroll + 1).min(max),
                 Action::PrevItem => *scroll = scroll.saturating_sub(1),
@@ -294,8 +333,24 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
                 _ => {}
             }
         }
-        // Table views (incl. the context picker via its element arms).
-        _ => match action {
+        // Context picker: its cursor lives on its OWN StatefulTable, not
+        // on a TableInteraction — the generic element moves below (which
+        // bail on `table_interaction_mut() == None`) are a silent no-op
+        // for it, which used to freeze the cursor at row 0 and make Enter
+        // always switch to the first context.
+        Element::ContextList(c) => match action {
+            Action::NextItem => c.table.next(),
+            Action::PrevItem => c.table.previous(),
+            Action::PageUp => c.table.page_up(),
+            Action::PageDown => c.table.page_down(),
+            Action::Home => c.table.home(),
+            Action::End => c.table.end(),
+            _ => {}
+        },
+        // Row-bearing table views: cursor lives on the element's
+        // TableInteraction.
+        Element::ResourceList(_) | Element::RowFilter(_) | Element::DerivedRows(_)
+        | Element::Overview(_) => match action {
             Action::NextItem => app.select_next(),
             Action::PrevItem => app.select_prev(),
             Action::PageUp => app.page_up(),
@@ -304,6 +359,8 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
             Action::End => app.go_end(),
             Action::ColLeft => app.col_left(),
             Action::ColRight => app.col_right(),
+            Action::ColFirst => app.col_first(),
+            Action::ColLast => app.col_last(),
             _ => {}
         },
     }
@@ -395,18 +452,12 @@ fn handle_resource_op(
                 }
             }
         }
+        // Single-target by construction: the select-mode gate transforms
+        // these into Batch* while marks are active, so no "marked set
+        // non-empty?" branch exists here to silently substitute batch
+        // semantics (or, stale-frame-wise, single semantics).
         Action::Delete => {
-            let marked = get_marked_resource_infos(app);
-            if !marked.is_empty() {
-                let count = marked.len();
-                let resource = marked[0].resource.display_label().to_string();
-                app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
-                    message: format!("Delete {} {}s?", count, resource),
-                    action_label: "Delete".to_string(),
-                    pending: crate::app::PendingAction::BatchDelete(marked),
-                    action_focused: false,
-                });
-            } else if let Some(info) = get_selected_resource_info(app) {
+            if let Some(info) = get_selected_resource_info(app) {
                 app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Delete".to_string(),
@@ -442,17 +493,7 @@ fn handle_resource_op(
             }
         }
         Action::Restart => {
-            let marked = get_marked_resource_infos(app);
-            if !marked.is_empty() {
-                let count = marked.len();
-                let resource = marked[0].resource.display_label().to_string();
-                app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
-                    message: format!("Restart {} {}s?", count, resource),
-                    action_label: "Restart".to_string(),
-                    pending: crate::app::PendingAction::BatchRestart(marked),
-                    action_focused: false,
-                });
-            } else if let Some(info) = get_selected_resource_info(app) {
+            if let Some(info) = get_selected_resource_info(app) {
                 app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Restart {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Restart".to_string(),
@@ -462,16 +503,7 @@ fn handle_resource_op(
             }
         }
         Action::ForceKill => {
-            let marked = get_marked_resource_infos(app);
-            if !marked.is_empty() {
-                let count = marked.len();
-                app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
-                    message: format!("Force-kill {} pods?", count),
-                    action_label: "Force Kill".to_string(),
-                    pending: crate::app::PendingAction::BatchForceKill(marked),
-                    action_focused: false,
-                });
-            } else if let Some(info) = get_selected_resource_info(app) {
+            if let Some(info) = get_selected_resource_info(app) {
                 app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Force-kill {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Force Kill".to_string(),
@@ -513,6 +545,148 @@ fn handle_resource_op(
 }
 
 // ---------------------------------------------------------------------------
+// Batch operations (select mode)
+// ---------------------------------------------------------------------------
+
+/// Raise the confirm dialog for a batch operation. Targets are captured
+/// HERE, at keypress: marks ∩ present rows (`get_marked_resource_infos`
+/// intersects at read). During the refresh window — marks survive
+/// `clear()`, rows unknown — that capture is honestly empty and we
+/// refuse instead of operating on unverifiable identities.
+pub(crate) fn handle_batch_op(app: &mut App, action: crate::app::actions::Action) {
+    use crate::app::actions::Action;
+
+    // ONE batch at a time. The tracker is cleared the moment its last
+    // result lands (or is taken on disconnect/context-switch), so
+    // `Some` here means results are genuinely outstanding — dispatching
+    // another batch would silently replace the tracker, duplicate the
+    // sends (marks are still set until results arrive), and let the
+    // first batch's late results clobber the second's summary flash.
+    if app.pending_batch.is_some() {
+        app.ui.flash = Some(crate::app::FlashMessage::warn(
+            "A batch is still in flight — wait for its summary".to_string(),
+        ));
+        return;
+    }
+
+    let targets = get_marked_resource_infos(app);
+    if targets.is_empty() {
+        app.ui.flash = Some(crate::app::FlashMessage::warn(
+            "No marked rows present (still refreshing?)".to_string(),
+        ));
+        return;
+    }
+
+    let (verb, label, pending) = match action {
+        Action::BatchDelete => ("Delete", "Delete", crate::app::PendingAction::BatchDelete(targets.clone())),
+        Action::BatchRestart => ("Restart", "Restart", crate::app::PendingAction::BatchRestart(targets.clone())),
+        Action::BatchForceKill => {
+            // Namespace guard BEFORE anything else — a refused batch must
+            // leave the selection untouched (the old flow cleared marks
+            // first, destroying the selection it then refused to act on).
+            if let Some(bad) = targets.iter().find(|t| t.namespace.as_option().is_none()) {
+                app.ui.flash = Some(crate::app::FlashMessage::error(
+                    format!("Batch force-kill refused: pod/{} has no resolved namespace", bad.name)
+                ));
+                return;
+            }
+            ("Force-kill", "Force Kill", crate::app::PendingAction::BatchForceKill(targets.clone()))
+        }
+        _ => return,
+    };
+
+    app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
+        message: batch_confirm_message(verb, &targets),
+        action_label: label.to_string(),
+        pending,
+        action_focused: false,
+    });
+}
+
+/// The batch confirm text names its targets — marks live on the shared
+/// store and may be hidden by the current filter, so a bare count would
+/// let rows the user cannot see die on a `y`. The decision point is
+/// where explicitness must land.
+fn batch_confirm_message(verb: &str, targets: &[crate::kube::protocol::ObjectRef]) -> String {
+    const LISTED: usize = 5;
+    let noun = targets[0].resource.display_label();
+    let names: Vec<&str> = targets.iter().take(LISTED).map(|t| t.name.as_str()).collect();
+    let mut msg = format!(
+        "{} {} {}{}?\n{}",
+        verb,
+        targets.len(),
+        noun,
+        if targets.len() == 1 { "" } else { "s" },
+        names.join(", "),
+    );
+    if targets.len() > LISTED {
+        msg.push_str(&format!(" …and {} more", targets.len() - LISTED));
+    }
+    msg
+}
+
+/// Dispatch a confirmed batch: re-anchor on the CURRENT marked set, send
+/// one command per survivor, and install the tracker that correlates the
+/// per-target results (unmark per-success, retain marks on failure, one
+/// aggregate flash).
+///
+/// The dialog is key-modal — every key while it is open maps to
+/// Confirm/Cancel/Toggle — so the only thing that can have changed the
+/// marked set since capture is the data prune itself (rows deleted
+/// externally). `captured ∩ current-marks` honors exactly that: gone
+/// rows are skipped, not blindly re-targeted at whatever replaced them.
+fn dispatch_batch(
+    app: &mut App,
+    data_source: &mut ClientSession,
+    batch: Vec<crate::kube::protocol::ObjectRef>,
+    verb: &'static str,
+    send: impl Fn(&mut ClientSession, &crate::kube::protocol::ObjectRef) -> anyhow::Result<()>,
+) {
+    use crate::app::BatchTracker;
+
+    let current: std::collections::HashSet<crate::kube::protocol::ObjectKey> =
+        app.nav.top().marked_keys().into_iter().collect();
+    let total = batch.len();
+    let live: Vec<_> = batch
+        .into_iter()
+        .filter(|t| current.contains(&BatchTracker::key_of(t)))
+        .collect();
+    let skipped = total - live.len();
+    if live.is_empty() {
+        app.ui.flash = Some(crate::app::FlashMessage::warn(
+            "Nothing to do — the marked rows are gone".to_string(),
+        ));
+        return;
+    }
+
+    let noun = live[0].resource.display_label().to_string();
+    let rid = live[0].resource.clone();
+    let store = app
+        .nav
+        .top()
+        .data_store()
+        .map(std::sync::Arc::downgrade)
+        .unwrap_or_default();
+    let mut tracker = BatchTracker::new(verb, noun, rid, &live, skipped, store);
+
+    for item in &live {
+        // A send failure is this item's result (recorded, loop continues)
+        // — not a bail that would strand the rest of the batch unsent
+        // and untracked.
+        if let Err(e) = send(data_source, item) {
+            tracker.fail_send(item, format!("send failed: {e}"));
+        }
+    }
+
+    if tracker.is_done() {
+        // Every send failed synchronously — summarize now.
+        app.ui.flash = Some(tracker.summary());
+    } else {
+        app.pending_batch = Some(tracker);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Confirmation dialog
 // ---------------------------------------------------------------------------
 
@@ -538,29 +712,19 @@ fn handle_confirm_action(
                 }
                 ds_try!(app, data_source.force_kill(target));
             }
+            // Marks are NOT cleared here: each Ok result unmarks its row
+            // via the tracker; failures keep theirs so the user can retry
+            // exactly the failed set.
             crate::app::PendingAction::BatchDelete(batch) => {
-                app.clear_marks();
-                for item in &batch {
-                    ds_try!(app, data_source.delete(item));
-                }
+                dispatch_batch(app, data_source, batch, "Deleted", |ds, t| ds.delete(t));
             }
             crate::app::PendingAction::BatchRestart(batch) => {
-                app.clear_marks();
-                for item in &batch {
-                    ds_try!(app, data_source.restart(item));
-                }
+                dispatch_batch(app, data_source, batch, "Restarted", |ds, t| ds.restart(t));
             }
             crate::app::PendingAction::BatchForceKill(batch) => {
-                app.clear_marks();
-                if let Some(bad) = batch.iter().find(|t| t.namespace.as_option().is_none()) {
-                    app.ui.flash = Some(crate::app::FlashMessage::error(
-                        format!("Batch force-kill refused: pod/{} has no resolved namespace", bad.name)
-                    ));
-                    return ActionResult::None;
-                }
-                for item in &batch {
-                    ds_try!(app, data_source.force_kill(item));
-                }
+                // Namespaces were validated at capture (before the dialog
+                // ever opened) and are immutable on the captured refs.
+                dispatch_batch(app, data_source, batch, "Force-killed", |ds, t| ds.force_kill(t));
             }
         }
     }
@@ -1634,27 +1798,43 @@ pub(crate) fn get_selected_resource_info(app: &App) -> Option<ObjectRef> {
     ))
 }
 
-/// Resource refs for all marked rows on the top element's data. Marks are
-/// IDENTITY-keyed on the shared store, so this is the marked set as data
-/// — independent of the current refinement (matching the fused-table
-/// behavior; the marked∩visible question belongs to the batch-ops
-/// feature, not here).
+/// Resource refs for all marked rows on the top element's data,
+/// intersected with the rows PRESENT in the store at read time.
+///
+/// Marks are IDENTITY-keyed on the shared store, so this is the marked
+/// set as data — deliberately independent of the current refinement (a
+/// filter hides rows from view, not from the selection; the confirm
+/// dialog names every target so hidden ones are visible at the decision
+/// point). The row intersection is the other half of the contract:
+/// under `Ready` it is a no-op (marks are pruned atomically with row
+/// removals and inserts are presence-checked), and while `Initializing`
+/// — the Ctrl-R window where marks survive `clear()` but rows are
+/// unknown — it is honestly empty, so nothing can operate on an
+/// identity the store cannot vouch for. Iterating rows also gives the
+/// output a stable (store) order.
 pub(crate) fn get_marked_resource_infos(app: &App) -> Vec<ObjectRef> {
     use crate::kube::protocol::Namespace;
 
     let Some(current_rid) = app.nav.top().rid().cloned() else { return Vec::new(); };
-    app.nav
-        .top()
-        .marked_keys()
-        .into_iter()
-        .map(|key| {
-            ObjectRef::new(
-                current_rid.clone(),
-                key.name,
-                Namespace::from_row(&key.namespace),
-            )
-        })
-        .collect()
+    if !app.nav.top().has_marks() {
+        return Vec::new();
+    }
+    let Some(store) = app.nav.top().data_store() else { return Vec::new(); };
+    store.with_read(|inner| {
+        inner
+            .rows
+            .iter()
+            .map(crate::app::store::row_key)
+            .filter(|k| inner.marked().contains(k))
+            .map(|key| {
+                ObjectRef::new(
+                    current_rid.clone(),
+                    key.name,
+                    Namespace::from_row(&key.namespace),
+                )
+            })
+            .collect()
+    })
 }
 
 // ===========================================================================
@@ -1798,10 +1978,22 @@ pub(crate) fn begin_context_switch(
     app.ui.input_mode = InputMode::Normal;
     app.kube.metrics.clear();
 
+    // An in-flight batch dies with the old session — its remaining
+    // results will never arrive (the rebuild drops the old channels
+    // WITHOUT a DaemonDisconnected, so the disconnect arm can't clean
+    // this up). A stranded tracker would silently consume same-named
+    // results from the NEW cluster; take it and fold the partial tally
+    // into the switch flash instead.
+    let batch_note = app
+        .pending_batch
+        .take()
+        .map(|b| format!(" ({})", b.interrupted_summary().message))
+        .unwrap_or_default();
+
     app.kube.context_switch = crate::app::ContextSwitchState::Requested(ctx_name.clone());
     app.ui.flash = Some(crate::app::FlashMessage::info(format!(
-        "Switching to context: {}...",
-        ctx_name
+        "Switching to context: {}...{}",
+        ctx_name, batch_note
     )));
 }
 

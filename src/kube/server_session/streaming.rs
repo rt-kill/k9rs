@@ -309,37 +309,7 @@ async fn run_discovery_poll(
         .await
     {
         Ok(list) => {
-            let crds: Vec<CachedCrd> = list.items.iter().filter_map(|crd| {
-                let name = crd.metadata.name.clone()?;
-                let spec = &crd.spec;
-                let version = spec.versions.iter()
-                    .find(|v| v.served)
-                    .or(spec.versions.first())
-                    .map(|v| v.name.clone())
-                    .unwrap_or_default();
-                let printer_columns: Vec<crate::kube::cache::PrinterColumn> = spec.versions.iter()
-                    .find(|v| v.served)
-                    .or(spec.versions.first())
-                    .and_then(|v| v.additional_printer_columns.as_ref())
-                    .map(|cols| cols.iter().map(|c| crate::kube::cache::PrinterColumn {
-                        name: c.name.clone(),
-                        json_path: c.json_path.clone(),
-                        column_type: crate::kube::cache::PrinterColumnType::from_k8s(&c.type_),
-                    }).collect())
-                    .unwrap_or_default();
-                let scope = crate::kube::protocol::ResourceScope::from_k8s_spec(&spec.scope);
-                Some(CachedCrd {
-                    name,
-                    gvr: crate::kube::protocol::CrdRef::new(
-                        spec.group.clone(),
-                        version,
-                        spec.names.kind.clone(),
-                        spec.names.plural.clone(),
-                        scope,
-                    ),
-                    printer_columns,
-                })
-            }).collect();
+            let crds: Vec<CachedCrd> = list.items.iter().filter_map(CachedCrd::from_k8s).collect();
             shared.discovery_cache.set_crds(context.clone(), crds.clone());
             crds
         }

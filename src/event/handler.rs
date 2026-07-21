@@ -9,18 +9,35 @@ use crate::app::nav::rid;
 use crate::app::ContainerRef;
 use crate::kube::protocol::OperationKind;
 
-/// Map a key press to an action using the current resource's declared operations.
-/// Returns the action if the resource supports the corresponding operation, None otherwise.
-/// Map a key to an action via the resource's declared operations.
-/// Data-driven: reads `descriptor().default_key` from each operation.
-/// First match wins — resources control priority via `operations()` order.
-fn lookup_view_op_key(app: &App, key: char) -> Option<Action> {
+/// The chord of a key event, if it is a character key (Ctrl tracked,
+/// Shift riding in the character's case, Alt chords excluded — an
+/// Alt-modified key is a different chord, not its bare character).
+fn combo_of(key: &KeyEvent) -> Option<crate::app::KeyCombo> {
+    let KeyCode::Char(c) = key.code else { return None };
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+    Some(crate::app::KeyCombo {
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        ch: c,
+    })
+}
+
+/// Map a key press to an action via the resource's declared operations.
+/// Data-driven: each operation's EFFECTIVE chord is the user's `keys.*`
+/// override or the descriptor default (`KeysConfig::op_key`), matched
+/// EXACTLY (Ctrl state included) — an override to `ctrl-l` neither
+/// leaves plain `l` bound nor lets a stray Ctrl chord alias its bare
+/// character. First match wins — resources control priority via
+/// `operations()` order.
+fn lookup_view_op_key(app: &App, key: &KeyEvent) -> Option<Action> {
+    let combo = combo_of(key)?;
     // Use the top element's capabilities (not the registry) — works for
     // both resource and derived views. Derived views declare their own
     // operations on DerivedViewKind; resource views delegate to ResourceId.
     let caps = app.nav.top().capabilities();
     for op in &caps.operations {
-        if op.descriptor().default_key == Some(key) {
+        if app.config.keys.op_key(op) == Some(combo) {
             return Some(op.to_action());
         }
     }
@@ -171,13 +188,6 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(Action::ToggleWide);
     }
 
-    // Ctrl-L: logs — dispatched via resource operations (same as Shift+L).
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
-        if let Some(action) = lookup_view_op_key(app, 'L') {
-            return Some(action);
-        }
-    }
-
     // Ctrl-Space: span-mark (select range).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(' ') {
         return Some(Action::SpanMark);
@@ -222,6 +232,40 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(Action::ForceKill);
     }
 
+    // Configured column-cursor bindings (exact chord). Checked before the
+    // operation lookup so a user binding `colRight: l` shadows an `l`
+    // operation default. Arrows below are structural and always work.
+    if let Some(combo) = combo_of(&key) {
+        if app.config.keys.col_left == Some(combo) {
+            return Some(Action::ColLeft);
+        }
+        if app.config.keys.col_right == Some(combo) {
+            return Some(Action::ColRight);
+        }
+        if app.config.keys.col_first == Some(combo) {
+            return Some(Action::ColFirst);
+        }
+        if app.config.keys.col_last == Some(combo) {
+            return Some(Action::ColLast);
+        }
+    }
+
+    // Data-driven operation bindings: user override or descriptor
+    // default, matched exactly (Ctrl state included). Before the
+    // structural match so a `ctrl-x` override can't be shadowed by a
+    // modifier-blind `Char(x)` arm.
+    if let Some(action) = lookup_view_op_key(app, &key) {
+        return Some(action);
+    }
+
+    // An UNMATCHED Ctrl chord stops here: the structural arms below
+    // match on `key.code` alone and would silently alias it to its bare
+    // character (Ctrl-Q → quit, Ctrl-G → Home, Ctrl-Y → the overlay 'y'
+    // binding). A chord either means something as a chord or nothing.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+
     match key.code {
         // `q` in resource view: if drilled/filtered, pop one level. Otherwise quit.
         KeyCode::Char('q') => {
@@ -242,11 +286,13 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
             }
         }
 
-        // Navigation.
+        // Navigation. Column-cursor movement is arrow-keys-only by
+        // default (`l` is logs, k9s-style); `keys.colLeft`/`colRight`
+        // above add chords like h/l back for vim-column users.
         KeyCode::Down | KeyCode::Char('j') => Some(Action::NextItem),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::PrevItem),
-        KeyCode::Left | KeyCode::Char('h') => Some(Action::ColLeft),
-        KeyCode::Right | KeyCode::Char('l') => Some(Action::ColRight),
+        KeyCode::Left => Some(Action::ColLeft),
+        KeyCode::Right => Some(Action::ColRight),
         KeyCode::PageDown => Some(Action::PageDown),
         KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::Home | KeyCode::Char('g') => Some(Action::Home),
@@ -255,9 +301,9 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Drill down.
         KeyCode::Enter => Some(Action::Enter),
 
-        // Detail views.
-        KeyCode::Char('d') => Some(Action::Describe),
-        KeyCode::Char('y') => Some(Action::Yaml),
+        // Detail views. Describe/Yaml bind through the operation lookup
+        // above (descriptor defaults d/y, user-rebindable); Edit is a
+        // client-side flow, not an OperationKind, so it stays structural.
         KeyCode::Char('e') => Some(Action::Edit),
         // F: create a new port-forward (opens dialog).
         KeyCode::Char('F') => Some(Action::PortForward),
@@ -312,12 +358,9 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Tab => Some(Action::NextTab),
         KeyCode::BackTab => Some(Action::PrevTab),
 
-        // Resource-specific keys: data-driven from operation descriptors.
-        // Falls through to overlay bindings if no operation matches.
-        KeyCode::Char(c) => {
-            lookup_view_op_key(app, c)
-                .or_else(|| lookup_overlay_key(app, c))
-        }
+        // Operation bindings were tried above the structural match;
+        // remaining chars fall through to user-overlay bindings.
+        KeyCode::Char(c) => lookup_overlay_key(app, c),
 
         _ => None,
     }
@@ -328,7 +371,8 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
 // ---------------------------------------------------------------------------
 
 fn handle_detail_view_keys(key: KeyEvent) -> Option<Action> {
-    // Ctrl-d / Ctrl-u for half-page scroll (vim-style)
+    // Ctrl-d / Ctrl-u for half-page scroll (vim-style). Any other Ctrl
+    // chord is nothing — never its bare character.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('d') => Some(Action::PageDown),
@@ -368,6 +412,12 @@ fn handle_log_view_keys(_app: &App, key: KeyEvent) -> Option<Action> {
     // Shift-C: clear logs.
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Char('C') {
         return Some(Action::ClearLogs);
+    }
+
+    // Unmatched Ctrl chords are nothing — never their bare character
+    // (Ctrl-Q would otherwise alias to 'q' → Back, etc.).
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
     }
 
     match key.code {
@@ -433,6 +483,10 @@ fn handle_help_view_keys(key: KeyEvent) -> Option<Action> {
 // ---------------------------------------------------------------------------
 
 fn handle_overview_keys(key: KeyEvent) -> Option<Action> {
+    // Unmatched Ctrl chords are nothing — never their bare character.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
     match key.code {
         KeyCode::Char('q') => Some(Action::Quit),
         // Tab goes to the first resource view
@@ -443,6 +497,10 @@ fn handle_overview_keys(key: KeyEvent) -> Option<Action> {
 }
 
 fn handle_contexts_view_keys(key: KeyEvent) -> Option<Action> {
+    // Unmatched Ctrl chords are nothing — never their bare character.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
     match key.code {
         // `q` or Esc in context view goes back.
         KeyCode::Char('q') | KeyCode::Esc => Some(Action::Back),

@@ -261,19 +261,36 @@ struct ExecPollOp {
 
 impl LocalOperator for ExecPollOp {
     async fn run_once(&self, _attempt: AttemptHandle) -> OperatorExit {
-        let Some((command, args)) = self
-            .weak
-            .upgrade()
-            .map(|t| (t.config.command.clone(), t.config.args.clone()))
-        else {
+        let Some((command, args, interval)) = self.weak.upgrade().map(|t| {
+            (
+                t.config.command.clone(),
+                t.config.args.clone(),
+                Duration::from_secs(t.config.poll_interval_secs),
+            )
+        }) else {
             return OperatorExit::Gone;
         };
-        let result = tokio::process::Command::new(&command)
+        // `kill_on_drop(true)`: if this operator is aborted mid-run
+        // (source teardown, context death), the child is SIGKILLed rather
+        // than orphaned to run to completion (or forever if wedged) —
+        // honoring the ContextLocals "in-flight attempt drops its
+        // kill_on_drop child" contract. A hung command must also not stall
+        // the poller forever, so cap it at the poll interval: a command
+        // that can't finish within its own cadence is treated as a failed
+        // poll (keep last-known rows, try again next tick).
+        let child = tokio::process::Command::new(&command)
             .args(&args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .output()
-            .await;
+            .kill_on_drop(true)
+            .output();
+        let result = match tokio::time::timeout(interval, child).await {
+            Ok(r) => r,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("exec command exceeded {}s poll interval", interval.as_secs()),
+            )),
+        };
         let Some(this) = self.weak.upgrade() else {
             return OperatorExit::Gone;
         };

@@ -25,11 +25,16 @@ impl<'a> ConfirmDialogWidget<'a> {
 
 impl Widget for ConfirmDialogWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let msg_len = self.dialog.message.width() as u16 + 8;
+        // Multi-line messages: batch confirms carry their target list on
+        // extra lines — the dialog grows so every listed name is shown
+        // (the whole point is seeing what the batch will hit).
+        let msg_lines: Vec<&str> = self.dialog.message.lines().collect();
+        let msg_len = msg_lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 8;
+        let extra_lines = msg_lines.len().saturating_sub(1) as u16;
         let cancel_text = " Cancel ".to_string();
         let action_text = format!(" {} ", self.dialog.action_label);
         let button_width = cancel_text.len() as u16 + action_text.len() as u16 + 4;
-        let w = msg_len.max(button_width + 8).clamp(36, 64);
+        let w = msg_len.max(button_width + 8).clamp(36, 72);
 
         let hints = Line::from(vec![
             Span::styled("<\u{2190}/\u{2192}>", self.theme.status_bar_key),
@@ -43,13 +48,18 @@ impl Widget for ConfirmDialogWidget<'_> {
         let theme = self.theme;
         let dialog = self.dialog;
 
-        ModalOverlay::new(theme, DialogSize { width: w, height: 9 }, |content, buf| {
-            // Centered message.
-            let msg = &dialog.message;
-            let mx = content.x + content.width.saturating_sub(msg.width() as u16) / 2;
-            buf.set_line(mx, content.y, &Line::from(
-                Span::styled(msg.as_str(), theme.help_desc),
-            ), content.width);
+        ModalOverlay::new(theme, DialogSize { width: w, height: 9 + extra_lines }, |content, buf| {
+            // Centered message, line by line.
+            for (i, msg) in msg_lines.iter().enumerate() {
+                let y = content.y + i as u16;
+                if y >= content.y + content.height {
+                    break;
+                }
+                let mx = content.x + content.width.saturating_sub(msg.width() as u16) / 2;
+                buf.set_line(mx, y, &Line::from(
+                    Span::styled(*msg, theme.help_desc),
+                ), content.width);
+            }
 
             // Buttons: [ Cancel ]  [ Action ]
             let by = content.y + content.height.saturating_sub(2);

@@ -34,11 +34,9 @@ pub fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
     let breadcrumb_area = chunks[2];
     let flash_area = chunks[3];
 
-    // 1. Header (shared with resource view, context-specific key hints)
+    // 1. Header (shared with resource view; key hints live in ? help)
     if app.ui.show_header {
-        header::draw_header(f, app, header_area, theme, |f, area, theme| {
-            draw_context_key_hints(f, area, theme);
-        });
+        header::draw_header(f, app, header_area, theme);
     }
 
     // 2. Context table
@@ -52,21 +50,6 @@ pub fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
         let empty = Line::raw("");
         f.render_widget(empty, flash_area);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Context-specific key hints (center panel of header)
-// ---------------------------------------------------------------------------
-
-fn draw_context_key_hints(f: &mut Frame, area: Rect, theme: &Theme) {
-    use crate::ui::header::KeyHint;
-    let hints = vec![
-        KeyHint { key: "j/k", description: "navigate" },
-        KeyHint { key: "Enter", description: "switch" },
-        KeyHint { key: "q/Esc", description: "back" },
-        KeyHint { key: "?", description: "help" },
-    ];
-    header::draw_key_hint_grid(f, area, &hints, theme);
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +104,12 @@ fn draw_context_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         let y = rows_area_y + vi as u16;
         let is_selected = vi + offset == selected;
 
-        let current_marker = if ctx.is_current { "\u{2713}" } else { " " };
+        // Derive "current" from the LIVE active context, not the stored
+        // `is_current` flag — a context switch updates `kube.context` but
+        // the flags only re-sync on a later KubeconfigLoaded, so the `✓`
+        // would otherwise lag the switch.
+        let is_current = !app.kube.context.is_empty() && ctx.name == app.kube.context;
+        let current_marker = if is_current { "\u{2713}" } else { " " };
         let cluster_display: &str = if ctx.identity.cluster.is_empty() {
             ctx.name.as_str()
         } else {
@@ -133,7 +121,7 @@ fn draw_context_table(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
 
         let style = if is_selected {
             theme.selected
-        } else if ctx.is_current {
+        } else if is_current {
             theme.status_running
         } else {
             theme.row_normal

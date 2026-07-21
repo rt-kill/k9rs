@@ -138,6 +138,14 @@ impl SubscriptionStream {
         !self._bridge.is_finished()
     }
 
+    /// Signal the bridge task to stop. Idempotent (Drop also aborts).
+    /// Used to abort an OLD stream BEFORE minting a successor's epoch, so
+    /// a lingering old bridge can't mint a higher epoch that would
+    /// out-floor the successor.
+    pub fn abort(&self) {
+        self._bridge.abort();
+    }
+
     /// Build a handle from a raw abort handle. Test-only — production code gets
     /// a `SubscriptionStream` from `subscribe_stream`, never by hand.
     #[cfg(test)]
@@ -392,9 +400,11 @@ async fn run_connection_pipeline(
         Err(e) => fail!("{}", e),
     };
     // Publish the MuxHandle so subscribe_stream() tasks can open their own
-    // substreams. They'll await the handshake completion before actually
-    // subscribing, but having the handle early lets them start their await
-    // immediately rather than polling.
+    // substreams. They only await the MuxHandle (published here, BEFORE the
+    // Init/Ready handshake) — safety rests on the DAEMON deferring
+    // substream `accept` until its post-handshake session context exists,
+    // plus yamux inbound buffering, NOT on the client awaiting the
+    // handshake. Don't "simplify" the daemon-side deferral away.
     let _ = mux_handle_tx.send(Some(mux.handle()));
     let control_stream = match mux.open().await {
         Ok(s) => s,
@@ -550,7 +560,17 @@ async fn do_handshake(
     // a pre-8 daemon can never mis-parse us, and we detect it deterministically.
     protocol::write_handshake(&mut writer).await
         .map_err(|e| anyhow::anyhow!("Failed to send protocol handshake: {}", e))?;
-    protocol::read_handshake(&mut reader).await?;
+    // A stale daemon of a DIFFERENT version reads our preamble first,
+    // rejects it, and closes without replying — from here that is a bare
+    // EOF, so the context must say what an EOF at this exact point
+    // means. (Only a mismatched same-or-newer daemon can reply with a
+    // version we then reject; read_handshake's own message covers that.)
+    protocol::read_handshake(&mut reader).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Daemon handshake failed — likely a stale daemon from a different \
+             k9rs build. Restart it: pkill k9rs ({e})"
+        )
+    })?;
 
     let init_cmd = ClientSession::build_init_command(params, prepared);
     protocol::write_bincode(&mut writer, &init_cmd).await
@@ -617,7 +637,7 @@ impl ClientSession {
     // `switch_namespace` used to send a server-side command; it was only
     // informational and the server never used the value for subscription
     // scoping. Deleted in favor of fully client-side namespace switching —
-    // `do_switch_namespace` in session_nav.rs handles everything locally.
+    // `do_switch_namespace` in session_actions.rs handles everything locally.
 
     pub fn describe(&mut self, target: &protocol::ObjectRef) -> anyhow::Result<()> {
         self.send_command(SessionCommand::Describe(target.clone()))
@@ -931,6 +951,12 @@ impl ClientSession {
             const SUBSCRIPTION_ERROR_CEILING: u32 = 5;
 
             let mut ever_received_data = false;
+            // `force` (Ctrl-R) is a ONE-SHOT: it must evict the shared
+            // watcher on the first subscribe, but replaying it on every
+            // transient-failure retry would abandon the shared watcher and
+            // force a fresh full LIST each reconnect. Drop it after the
+            // first successful init write.
+            let mut force = force;
             let mut retry_backoff = std::time::Duration::from_secs(2);
             let bridge_start = std::time::Instant::now();
             // Consecutive `StreamEvent::Error`s since the last healthy snapshot,
@@ -1011,6 +1037,9 @@ impl ClientSession {
                     tracing::warn!("subscription bridge init failed for {}: {}, retrying", rid.plural(), e);
                     continue;
                 }
+                // Init sent successfully — the force (if any) has done its
+                // job; subsequent retries reuse the shared watcher.
+                force = false;
 
                 // Bridge: read StreamEvents from the substream, convert to
                 // AppEvents, forward into the main event channel.
@@ -1252,11 +1281,17 @@ fn convert_session_event(event: SessionEvent, current_context: &crate::kube::pro
         // The bridge task in stream_log_substream forwards them.
 
         SessionEvent::CommandResult(result) => {
-            // Surface as a typed `CommandResult` event, not `Flash` —
-            // lets the edit flow react only to its own response and
-            // distinguishes server responses from locally-originated
-            // flash messages (batch delete, force-kill, save, etc).
+            // Management/command-level acknowledgment (no target) — the
+            // TUI just flashes it. Target-ed operation results arrive as
+            // `OpResult` below.
             vec![AppEvent::CommandResult(result)]
+        }
+
+        SessionEvent::OpResult { target, result } => {
+            // Typed pass-through: the event loop correlates by target —
+            // the edit flow reacts only to its own apply, a batch tracker
+            // consumes its items' results, everything else flashes.
+            vec![AppEvent::OpResult { target, result }]
         }
 
         SessionEvent::Discovery { context: ctx, namespaces, crds } => {

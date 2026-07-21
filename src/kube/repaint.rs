@@ -35,6 +35,12 @@ impl Repaint {
         *self = Repaint::Now;
     }
 
+    /// An animation frame is due (the loop's animation clock fired) → paint on
+    /// the next turn, at the spinner's own cadence rather than the data budget.
+    pub fn on_animation(&mut self) {
+        *self = Repaint::Now;
+    }
+
     /// Streamed data or an animation tick changed the display → coalesce.
     /// Arms a deadline `budget` out when idle; keeps the earliest already-armed
     /// deadline (so a burst paints within `budget` of its *first* update, never

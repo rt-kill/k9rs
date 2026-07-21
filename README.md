@@ -58,11 +58,15 @@ Press `?` in any view to see the full help overlay. Key highlights:
 | `Ctrl-c` | Quit |
 
 Resource-specific keys (shown in `?` help when available):
-- `Shift-L` — Logs
+- `l` — Logs
 - `s` — Shell / Scale (context-dependent)
 - `r` — Restart
 - `Shift-F` — Port forward
 - `o` — Show node
+
+Marking rows with `Space` enters **select mode**: single-row keys go
+dead, and `Ctrl-d` / `r` / `Ctrl-k` act on ALL marked rows (with a
+confirm dialog listing the targets). `Ctrl-\` clears the selection.
 
 ## Configuration
 
@@ -70,6 +74,18 @@ Config file: `~/.config/k9rs/config.yaml`
 
 ```yaml
 k9rs:
+  # Key rebindings (resource views). An operation entry MOVES that
+  # operation's binding (its default key stops working); colLeft/colRight
+  # ADD chords for the column cursor (arrows always work) and win over an
+  # operation bound to the same key. Chords: "x", "X", or "ctrl-x".
+  # Rebindable operations: describe, yaml, logs, previousLogs, shell,
+  # restart, scale, delete, forceKill, portForward, showNode, nodeShell,
+  # decodeSecret, triggerCronJob, toggleSuspendCronJob.
+  keys:
+    colLeft: h                 # vim-style column movement …
+    colRight: l
+    logs: ctrl-l               # … freed by moving logs off plain `l`
+
   # TUI preferences
   ui:
     skin: dracula              # skin name (loads from skins/ directory)

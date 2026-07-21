@@ -40,11 +40,12 @@ pub fn draw_centered_loading(
     area: ratatui::layout::Rect,
     message: &str,
     style: ratatui::style::Style,
+    anim: &crate::app::anim::Anim,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let text = crate::util::loading_bar(message);
+    let text = anim.bar(message);
     let text_len = UnicodeWidthStr::width(text.as_str()) as u16;
     let line = ratatui::text::Line::from(ratatui::text::Span::styled(text, style));
     let center_y = area.y + area.height / 2;
@@ -120,7 +121,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_centered_overlay(f, &label, &app.ui.theme);
         }
         Some(Overlay::Shell(shell)) => {
-            views::shell::draw_shell(f, shell, area, &app.ui.theme);
+            views::shell::draw_shell(f, shell, area, &app.ui.theme, &app.ui.anim);
         }
         None => {}
     }
@@ -155,7 +156,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 /// Draw the help overlay on top of the current view.
 fn draw_help_overlay(f: &mut Frame, app: &App, scroll: usize) {
     let theme = &app.ui.theme;
-    let help = HelpOverlay::new(theme, scroll, Some(app.current_capabilities()));
+    let help = HelpOverlay::new(theme, scroll, Some(app.current_capabilities()), app.config.keys);
     f.render_widget(help, f.area());
 }
 

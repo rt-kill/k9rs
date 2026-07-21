@@ -28,7 +28,6 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::kube::cache::PrinterColumn;
 use crate::kube::protocol::{
     ObjectKey, ResourceScope, RowChange, TableBaseline, TableDelta,
 };
@@ -65,11 +64,14 @@ pub(crate) struct BaselineAsk {
     pub reply: oneshot::Sender<TableBaseline>,
 }
 
-/// Broadcast ring capacity, in delta batches. At one batch per 200ms flush
-/// tick this is ~13s of sustained-churn tolerance for a stalled consumer
-/// before it must re-baseline — bounded memory per subscriber, and one
-/// slow subscriber only ever costs itself a resync.
-const FANOUT_RING: usize = 64;
+/// Broadcast ring capacity, in delta batches, from config (default 64).
+/// At one batch per 200ms flush tick, 64 is ~13s of sustained-churn
+/// tolerance for a stalled consumer before it must re-baseline. See
+/// [`crate::kube::daemon_config::DaemonConfig::fanout_ring`] for the
+/// memory-vs-lag-tolerance tradeoff.
+fn fanout_ring() -> usize {
+    crate::kube::daemon_config::daemon_config().fanout_ring.max(1)
+}
 
 // ---------------------------------------------------------------------------
 // Watcher-internal state — ListPhase + PendingChanges
@@ -262,15 +264,35 @@ impl Drop for Subscription {
 }
 
 impl Subscription {
-    /// Ask the watcher for a full baseline; the returned oneshot resolves
-    /// when the (possibly deferred) reply arrives, or errors if the watcher
-    /// task is gone — callers treat that as watcher death. Synchronous send
-    /// so the caller can `select!` over the reply and `recv()` without a
-    /// borrow conflict.
-    pub fn request_baseline(&self, after_initial_list: bool) -> oneshot::Receiver<TableBaseline> {
+    /// Ask the watcher for a full baseline. `Some(rx)` = the ask is
+    /// enqueued; the oneshot resolves when the (possibly deferred) reply
+    /// arrives, or errors if the watcher dies after taking it. `None` =
+    /// the ask channel is CLOSED, i.e. the watcher task is truly gone.
+    ///
+    /// Backpressure (`send().await`) rather than `try_send`: if the ask
+    /// channel is momentarily full — the watcher is sleeping in its
+    /// inline retry backoff — we WAIT for it to drain instead of dropping
+    /// the ask and mis-reading that drop as watcher death (which used to
+    /// send a live watcher's bridge into a permanent wedge). The send is
+    /// awaited to completion before the caller `select!`s on the reply,
+    /// so there is no borrow conflict.
+    pub async fn request_baseline(
+        &self,
+        after_initial_list: bool,
+    ) -> Option<oneshot::Receiver<TableBaseline>> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.ask.try_send(BaselineAsk { after_initial_list, reply });
-        rx
+        match self.ask.send(BaselineAsk { after_initial_list, reply }).await {
+            Ok(()) => Some(rx),
+            Err(_) => None,
+        }
+    }
+
+    /// Whether the watcher task behind this subscription has exited. Used
+    /// to bound death-reason draining — the `Subscription` keeps the
+    /// broadcast `Sender` alive, so the channel's own `Closed` signal can
+    /// never fire.
+    pub(crate) fn watcher_finished(&self) -> bool {
+        self._keepalive.task.is_finished()
     }
 
     /// Receive the next delta batch (or terminal `Dead`). `Err(Lagged)` =
@@ -396,7 +418,7 @@ impl WatcherCache {
         client: &Client,
         streaming_lists: bool,
     ) -> Arc<LiveQuery> {
-        let (delta_tx, _) = broadcast::channel(FANOUT_RING);
+        let (delta_tx, _) = broadcast::channel(fanout_ring());
         let (ask_tx, ask_rx) = mpsc::channel(16);
 
         let args = crate::kube::resource_defs::registry::WatcherArgs {
@@ -445,10 +467,20 @@ impl WatcherCache {
         client: &Client,
         streaming_lists: bool,
     ) -> Subscription {
+        use dashmap::mapref::entry::Entry;
         self.reap_dead();
 
         let live_query = Self::create_watcher(&key, kind, client, streaming_lists);
-        self.entries.insert(key.clone(), Arc::downgrade(&live_query));
+        let weak = Arc::downgrade(&live_query);
+        // Replace UNDER the entry lock — the same claim `subscribe` uses —
+        // so a concurrent normal subscribe's check-and-insert is
+        // serialized with this replace, rather than the two bare inserts
+        // interleaving and stranding a just-created watcher unreachable in
+        // the map (a second live watcher for one key).
+        match self.entries.entry(key.clone()) {
+            Entry::Occupied(mut e) => { e.insert(weak); }
+            Entry::Vacant(e) => { e.insert(weak); }
+        }
 
         Subscription::attach(key, live_query)
     }
@@ -462,10 +494,11 @@ impl WatcherCache {
     /// Subscribe to a dynamic CRD resource type. Reuses an existing watcher if
     /// the Weak upgrades, otherwise creates a new one via the dynamic-object
     /// watcher path.
-    // The args are the dynamic-resource descriptor (gvk/plural/scope/printer
-    // columns) plus the client factory and streaming flag — all intrinsic to
-    // opening a watcher. Kept flat rather than threaded through a struct in
-    // this hot path (matches the `#[allow]` on the table renderer).
+    // The args are the dynamic-resource descriptor (gvk/plural/scope) plus
+    // the discovery handle (the watcher resolves its own printer columns
+    // at birth), the client factory, and the streaming flag — all
+    // intrinsic to opening a watcher. Kept flat rather than threaded
+    // through a struct in this hot path.
     #[allow(clippy::too_many_arguments)]
     pub fn subscribe_dynamic(
         &self,
@@ -474,11 +507,11 @@ impl WatcherCache {
         gvk: GroupVersionKind,
         plural: String,
         scope: ResourceScope,
-        printer_columns: Vec<PrinterColumn>,
+        discovery: Arc<crate::kube::cache::DiscoveryCache>,
         streaming_lists: bool,
     ) -> Subscription {
         self.subscribe_with(key, move |k| {
-            Self::create_dynamic_watcher(k, &make_client(), gvk, plural, scope, printer_columns, streaming_lists)
+            Self::create_dynamic_watcher(k, &make_client(), gvk, plural, scope, discovery, streaming_lists)
         })
     }
 
@@ -489,16 +522,17 @@ impl WatcherCache {
         gvk: GroupVersionKind,
         plural: String,
         scope: ResourceScope,
-        printer_columns: Vec<PrinterColumn>,
+        discovery: Arc<crate::kube::cache::DiscoveryCache>,
         streaming_lists: bool,
     ) -> Arc<LiveQuery> {
-        let (delta_tx, _) = broadcast::channel(FANOUT_RING);
+        let (delta_tx, _) = broadcast::channel(fanout_ring());
         let (ask_tx, ask_rx) = mpsc::channel(16);
         let task_client = client.clone();
         let task_ns = key.namespace.clone();
         let task_tx = delta_tx.clone();
+        let task_context = key.context.clone();
         let task = tokio::spawn(async move {
-            crate::kube::live_query_dynamic::run_dynamic_live_watcher(task_client, task_ns, task_tx, ask_rx, gvk, plural, scope, printer_columns, streaming_lists).await;
+            crate::kube::live_query_dynamic::run_dynamic_live_watcher(task_client, task_ns, task_tx, ask_rx, gvk, plural, scope, discovery, task_context, streaming_lists).await;
         });
         Arc::new(LiveQuery {
             delta_tx,
@@ -825,7 +859,7 @@ mod watcher_tests {
     fn spawn_harness() -> Harness {
         let (events, erx) = mpsc::unbounded_channel();
         let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(erx).boxed();
-        let (delta_tx, delta_rx) = broadcast::channel(FANOUT_RING);
+        let (delta_tx, delta_rx) = broadcast::channel(fanout_ring());
         let (ask_tx, ask_rx) = mpsc::channel(16);
         let rid = crate::kube::protocol::ResourceId::BuiltIn(
             crate::kube::resource_def::BuiltInKind::ConfigMap,

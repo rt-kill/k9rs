@@ -48,6 +48,17 @@ pub fn row_key(row: &ResourceRow) -> ObjectKey {
     ObjectKey::new(row.namespace.clone().unwrap_or_default(), row.name.clone())
 }
 
+/// `row_key(row) == *key` without the allocation (per-row on presence
+/// scans and identity lookups).
+pub(crate) fn row_matches_key(row: &ResourceRow, key: &ObjectKey) -> bool {
+    row.name == key.name && row.namespace.as_deref().unwrap_or("") == key.namespace
+}
+
+/// Whether two rows have the same identity (ns + name), allocation-free.
+fn rows_same_identity(a: &ResourceRow, b: &ResourceRow) -> bool {
+    a.name == b.name && a.namespace == b.namespace
+}
+
 // ---------------------------------------------------------------------------
 // RowPredicate — one client-side refinement
 // ---------------------------------------------------------------------------
@@ -230,23 +241,40 @@ impl RowStore {
                 // one change per key (daemon invariant), so two phases
                 // suffice; application is idempotent by construction.
                 let inner = &mut *inner;
-                let index: HashMap<ObjectKey, usize> = inner
-                    .rows
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| (row_key(r), i))
-                    .collect();
+                // Steady-state batches are tiny (coalesced per key), so a
+                // full O(rows) ObjectKey→index HashMap — two String allocs
+                // per row — is wasteful for a handful of changes. Build it
+                // only for large batches (relist, big churn); otherwise
+                // locate each change by allocation-free linear scan.
+                const INDEX_THRESHOLD: usize = 16;
+                let index: Option<HashMap<ObjectKey, usize>> = if d.changes.len() > INDEX_THRESHOLD {
+                    Some(inner.rows.iter().enumerate().map(|(i, r)| (row_key(r), i)).collect())
+                } else {
+                    None
+                };
+                let locate_upsert = |rows: &[ResourceRow], row: &ResourceRow| -> Option<usize> {
+                    match &index {
+                        Some(m) => m.get(&row_key(row)).copied(),
+                        None => rows.iter().position(|r| rows_same_identity(r, row)),
+                    }
+                };
+                let locate_key = |rows: &[ResourceRow], key: &ObjectKey| -> Option<usize> {
+                    match &index {
+                        Some(m) => m.get(key).copied(),
+                        None => rows.iter().position(|r| row_matches_key(r, key)),
+                    }
+                };
                 let mut replace: Vec<(usize, ResourceRow)> = Vec::new();
                 let mut append: Vec<ResourceRow> = Vec::new();
                 let mut dead: Vec<bool> = vec![false; inner.rows.len()];
                 for change in &d.changes {
                     match change {
-                        RowChange::Upsert(row) => match index.get(&row_key(row)) {
-                            Some(&i) => replace.push((i, row.clone())),
+                        RowChange::Upsert(row) => match locate_upsert(&inner.rows, row) {
+                            Some(i) => replace.push((i, row.clone())),
                             None => append.push(row.clone()),
                         },
                         RowChange::Remove(key) => {
-                            if let Some(&i) = index.get(key) {
+                            if let Some(i) = locate_key(&inner.rows, key) {
                                 dead[i] = true;
                                 // Marks die with their row — atomic with
                                 // the removal that invalidates them.
@@ -274,13 +302,18 @@ impl RowStore {
     }
 
     /// Back to `Initializing` (Ctrl-R refresh, seeding a reused store).
-    /// Marks die with the rows. Flash HASHES survive deliberately: rows
-    /// that changed across the refresh still flash after the recovery
-    /// baseline (same continuity the global tracker used to provide).
+    /// Rows drop; marks and flash hashes both deliberately SURVIVE. Flash
+    /// hashes are memory of the past (rows that changed across the refresh
+    /// still flash after the recovery baseline); marks are intent for the
+    /// future (the recovery baseline re-anchors them, retaining only keys
+    /// that return — the same prune as any baseline). While `Initializing`
+    /// the rows are UNKNOWN, not absent: anything that OPERATES on marks
+    /// must intersect with present rows at use time
+    /// (`get_marked_resource_infos` does), so the window is unobservable
+    /// by batch dispatch.
     pub fn clear(&self) {
         let mut inner = self.lock();
         inner.rows.clear();
-        inner.marked.clear();
         inner.state = TableDataState::Initializing;
         drop(inner);
         self.bump();
@@ -288,24 +321,34 @@ impl RowStore {
 
     // --- Marks (data-keyed; ops are element-mediated) ---------------------
 
-    /// Toggle a mark; returns `true` if the key is now marked. No
-    /// generation bump: marks are read fresh each frame, never baked into
-    /// the derived view (parity with the fused table).
-    pub fn toggle_mark(&self, key: &ObjectKey) -> bool {
+    /// Toggle a mark; `Some(now_marked)`, or `None` when the key names no
+    /// present row — a keypress through a stale coalesced frame (the row
+    /// vanished between paint and key). Refusing the insert here keeps
+    /// `marked ⊆ rows` an invariant of the write paths: a ghost mark
+    /// could never be pruned by deltas (the daemon won't re-Remove an
+    /// absent key) and would wedge select mode until the next baseline.
+    /// No generation bump: marks are read fresh each frame, never baked
+    /// into the derived view (parity with the fused table).
+    pub fn toggle_mark(&self, key: &ObjectKey) -> Option<bool> {
         let mut inner = self.lock();
         if inner.marked.remove(key) {
-            false
-        } else {
+            Some(false)
+        } else if inner.rows.iter().any(|r| row_matches_key(r, key)) {
             inner.marked.insert(key.clone());
-            true
+            Some(true)
+        } else {
+            None
         }
     }
 
     /// Mark every key (span-mark: the element computes the span from its
-    /// own derived order and hands us identities).
+    /// own derived order and hands us identities). Keys naming no present
+    /// row are dropped — same stale-frame guard as [`Self::toggle_mark`].
     pub fn mark_keys(&self, keys: impl IntoIterator<Item = ObjectKey>) {
         let mut inner = self.lock();
-        inner.marked.extend(keys);
+        let inner = &mut *inner;
+        let present: HashSet<ObjectKey> = inner.rows.iter().map(row_key).collect();
+        inner.marked.extend(keys.into_iter().filter(|k| present.contains(k)));
     }
 
     /// Unmark every key (span-unmark of a contiguous marked block).
@@ -430,12 +473,25 @@ impl MetricsHub {
     }
 
     pub fn set_pods(&self, usage: HashMap<ObjectKey, MetricsUsage>) {
-        *self.pods.try_lock().expect("MetricsHub: single-writer convention violated") = Some(usage);
+        let mut slot = self.pods.try_lock().expect("MetricsHub: single-writer convention violated");
+        // Skip the version bump when the map is unchanged: the bump
+        // invalidates every pods-table view memo, forcing a full
+        // O(rows×cols) re-derive on the next paint. A 30s metrics poll on
+        // an idle cluster (or one with no metrics-server) would otherwise
+        // re-derive a 10k-pod table for nothing.
+        if slot.as_ref() == Some(&usage) {
+            return;
+        }
+        *slot = Some(usage);
         self.version.fetch_add(1, Ordering::Release);
     }
 
     pub fn set_nodes(&self, usage: HashMap<NodeName, MetricsUsage>) {
-        *self.nodes.try_lock().expect("MetricsHub: single-writer convention violated") = Some(usage);
+        let mut slot = self.nodes.try_lock().expect("MetricsHub: single-writer convention violated");
+        if slot.as_ref() == Some(&usage) {
+            return;
+        }
+        *slot = Some(usage);
         self.version.fetch_add(1, Ordering::Release);
     }
 
@@ -695,33 +751,42 @@ pub fn derive_view(
     metrics: Option<&MetricsLens<'_>>,
     spec: &DeriveSpec<'_>,
 ) -> PreparedView {
-    // 1. Effective display strings for EVERY cell of EVERY row — one pass
-    //    feeds filtering (greps span all columns), styling, and display.
-    let eff: Vec<Vec<String>> = rows_in
-        .iter()
-        .map(|row| {
-            row.cells
-                .iter()
-                .enumerate()
-                .map(|(ci, cell)| match metrics.and_then(|m| m.effective(row, ci)) {
-                    Some(v) => v.to_string(),
-                    None => cell.to_string(),
-                })
-                .collect()
-        })
-        .collect();
+    // The effective display value of one cell (metrics lens overlaid).
+    let stringify = |row: &ResourceRow, ci: usize| -> String {
+        match metrics.and_then(|m| m.effective(row, ci)) {
+            Some(v) => v.to_string(),
+            None => row.cells.get(ci).map(|c| c.to_string()).unwrap_or_default(),
+        }
+    };
 
-    // 2. Filter: every committed predicate AND the uncommitted draft.
-    let mut order: Vec<usize> = (0..rows_in.len())
-        .filter(|&i| {
-            let row = &rows_in[i];
-            let strings = &eff[i];
-            spec.predicates.iter().all(|p| p.matches(row, strings))
-                && spec
-                    .draft
-                    .is_none_or(|d| strings.iter().any(|c| d.is_match(c)))
-        })
-        .collect();
+    // 1. Effective strings for EVERY cell — needed ONLY when a filter must
+    //    scan all columns (greps span the full row). In the default browse
+    //    state (no predicate, no draft) this whole O(rows×cols) pass is
+    //    skipped and only the visible columns are stringified below.
+    let has_filter = !spec.predicates.is_empty() || spec.draft.is_some();
+    let mut eff: Vec<Vec<String>> = if has_filter {
+        rows_in
+            .iter()
+            .map(|row| (0..row.cells.len()).map(|ci| stringify(row, ci)).collect())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // 2. Filter: every committed predicate AND the uncommitted draft. With
+    //    no filter, every row passes and `eff` is unused.
+    let mut order: Vec<usize> = if has_filter {
+        (0..rows_in.len())
+            .filter(|&i| {
+                let row = &rows_in[i];
+                let strings = &eff[i];
+                spec.predicates.iter().all(|p| p.matches(row, strings))
+                    && spec.draft.is_none_or(|d| strings.iter().any(|c| d.is_match(c)))
+            })
+            .collect()
+    } else {
+        (0..rows_in.len()).collect()
+    };
 
     // 3. Sort by the EFFECTIVE value at the sort column (metrics columns
     //    sort by live usage), typed comparison via CellValue::cmp, stable
@@ -745,14 +810,34 @@ pub fn derive_view(
         });
     }
 
-    // 4. Materialize in screen order.
+    // 4. Materialize the VISIBLE cells in screen order. When `eff` exists
+    //    (filtered), MOVE each visible cell out of it (each row index and
+    //    each visible column is used exactly once, so `mem::take` is safe
+    //    and avoids re-allocating strings we already built). Otherwise
+    //    stringify the visible cells directly — hidden columns are never
+    //    materialized at all.
+    //
+    //    These two branches are EQUIVALENT because rows always carry a cell
+    //    for every schema column: converters emit metric columns as
+    //    `CellValue::Placeholder`, so `cells.len() == headers.len()` and no
+    //    visible index exceeds `eff[i]`'s length. If a converter ever emits
+    //    a SHORT row, the filtered branch would blank the out-of-range
+    //    visible cells (`get_mut` → None → "") while the unfiltered branch
+    //    would synthesize them via the metrics lens — so keep rows
+    //    full-width (the whole derive already assumes it: sort and
+    //    cell_style index `row.cells` directly).
     let rows: Vec<Vec<String>> = order
         .iter()
         .map(|&i| {
-            spec.visible_cols
-                .iter()
-                .map(|&ci| eff[i].get(ci).cloned().unwrap_or_default())
-                .collect()
+            if has_filter {
+                let full = &mut eff[i];
+                spec.visible_cols
+                    .iter()
+                    .map(|&ci| full.get_mut(ci).map(std::mem::take).unwrap_or_default())
+                    .collect()
+            } else {
+                spec.visible_cols.iter().map(|&ci| stringify(&rows_in[i], ci)).collect()
+            }
         })
         .collect();
     let cell_style: Vec<Vec<Option<RowHealth>>> = order
@@ -1034,13 +1119,51 @@ mod tests {
     fn marks_prune_on_baseline_and_remove() {
         let store = RowStore::new("pods");
         store.apply(1, baseline(vec![row("a", "ns", &["a", "ok"]), row("b", "ns", &["b", "ok"])]));
-        assert!(store.toggle_mark(&key("ns", "a")));
-        assert!(store.toggle_mark(&key("ns", "b")));
+        assert_eq!(store.toggle_mark(&key("ns", "a")), Some(true));
+        assert_eq!(store.toggle_mark(&key("ns", "b")), Some(true));
         store.apply(1, delta(vec![RowChange::Remove(key("ns", "a"))]));
         assert_eq!(store.marked_keys(), vec![key("ns", "b")]);
         // Baseline without b prunes it too.
         store.apply(2, baseline(vec![row("c", "ns", &["c", "ok"])]));
         assert!(store.marked_keys().is_empty());
+    }
+
+    /// Ghost-mark guard: a mark can never name a row the store doesn't
+    /// hold. Toggle through a stale frame refuses (`None`); span-style
+    /// bulk marking silently drops absent keys; unmarking a marked row
+    /// still works regardless of presence.
+    #[test]
+    fn mark_inserts_verify_row_presence() {
+        let store = RowStore::new("pods");
+        store.apply(1, baseline(vec![row("a", "ns", &["a", "ok"])]));
+        assert_eq!(store.toggle_mark(&key("ns", "gone")), None);
+        assert!(!store.has_marks());
+        store.mark_keys(vec![key("ns", "a"), key("ns", "gone")]);
+        assert_eq!(store.marked_keys(), vec![key("ns", "a")]);
+        // Toggling an EXISTING mark off never needs presence.
+        assert_eq!(store.toggle_mark(&key("ns", "a")), Some(false));
+        assert!(!store.has_marks());
+    }
+
+    /// Ctrl-R continuity: marks survive `clear()` (like flash hashes);
+    /// the recovery baseline re-anchors them, pruning non-returners.
+    /// While the window is open the store is `Initializing` — use-time
+    /// intersection (get_marked_resource_infos) sees zero present rows.
+    #[test]
+    fn clear_keeps_marks_and_recovery_baseline_reanchors() {
+        let store = RowStore::new("pods");
+        store.apply(1, baseline(vec![row("a", "ns", &["a", "ok"]), row("b", "ns", &["b", "ok"])]));
+        store.toggle_mark(&key("ns", "a"));
+        store.toggle_mark(&key("ns", "b"));
+        store.clear(); // Ctrl-R
+        store.with_read(|i| {
+            assert!(i.rows.is_empty());
+            assert_eq!(i.state, TableDataState::Initializing);
+        });
+        assert!(store.has_marks(), "marks survive the refresh window");
+        // Recovery baseline: only `a` returned — `b`'s mark prunes.
+        store.apply(2, baseline(vec![row("a", "ns", &["a", "ok"])]));
+        assert_eq!(store.marked_keys(), vec![key("ns", "a")]);
     }
 
     #[test]

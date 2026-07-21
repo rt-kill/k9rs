@@ -630,7 +630,7 @@ impl std::fmt::Display for NodeName {
 }
 
 /// CPU and memory usage from the metrics-server.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricsUsage {
     pub cpu: String,
     pub mem: String,
@@ -844,7 +844,7 @@ impl OperationKind {
             OperationKind::Delete => OperationDescriptor { label: "Delete", default_key: None }, // Ctrl-D
             OperationKind::Restart => OperationDescriptor { label: "Restart", default_key: Some('r') },
             OperationKind::Scale => OperationDescriptor { label: "Scale", default_key: Some('s') },
-            OperationKind::StreamLogs => OperationDescriptor { label: "Logs", default_key: Some('L') },
+            OperationKind::StreamLogs => OperationDescriptor { label: "Logs", default_key: Some('l') }, // k9s parity; rebindable via `keys.logs`
             OperationKind::PreviousLogs => OperationDescriptor { label: "Previous logs", default_key: Some('p') },
             OperationKind::PortForward => OperationDescriptor { label: "Port forward", default_key: None }, // Shift-F hardcoded
             OperationKind::Shell => OperationDescriptor { label: "Shell", default_key: Some('s') },
@@ -880,6 +880,46 @@ impl OperationKind {
             OperationKind::Custom(ref name) => Action::OverlayCapability(name.clone()),
         }
     }
+
+    /// Batch stance: whether this operation may act on the MARKED SET
+    /// (select mode) or is inherently single-target. Static manifest like
+    /// [`Self::form_schema`] / [`Self::exec_template`] — NOT a wire type.
+    /// EXHAUSTIVE by design: a new operation (including overlay-defined
+    /// `Custom` ones) must declare its stance here or the build breaks; a
+    /// `_` wildcard would silently classify future operations.
+    pub fn batch_support(&self) -> BatchSupport {
+        match self {
+            OperationKind::Delete | OperationKind::Restart | OperationKind::ForceKill => {
+                BatchSupport::PerItem
+            }
+            OperationKind::Describe
+            | OperationKind::Yaml
+            | OperationKind::Scale
+            | OperationKind::StreamLogs
+            | OperationKind::PreviousLogs
+            | OperationKind::PortForward
+            | OperationKind::Shell
+            | OperationKind::ShowNode
+            | OperationKind::NodeShell
+            | OperationKind::DecodeSecret
+            | OperationKind::TriggerCronJob
+            | OperationKind::ToggleSuspendCronJob
+            | OperationKind::Custom(_) => BatchSupport::SingleOnly,
+        }
+    }
+}
+
+/// Batch stance of an operation (see [`OperationKind::batch_support`]).
+/// `PerItem` = the operation is dispatched once per marked row (each item
+/// is an independent server command); everything else is single-target
+/// and its keybinding is dead in select mode. An `Aggregate` stance
+/// (one operation consuming the whole set, e.g. merged multi-pod logs)
+/// is deliberately absent until a real consumer exists — adding it later
+/// is free precisely because this is not a wire type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchSupport {
+    PerItem,
+    SingleOnly,
 }
 
 /// Single source of truth for client-side form-field name strings.
@@ -932,6 +972,34 @@ pub const DUPLEX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Enforce the frame-size cap on the WRITE side too. Without this, an
+/// oversized frame (e.g. a `TableBaseline` for a pathologically large
+/// cluster — ~100k rows crosses 64 MiB) is serialized and streamed in
+/// full, only to be rejected by the peer's read-side cap AFTER the bytes
+/// are on the wire — which, mid-session, becomes an infinite
+/// serialize→peer-RST→re-attach churn loop. Guarding here turns it into a
+/// clean, caught error the daemon can surface as `StreamEvent::Error`.
+/// Also closes the `as u32` truncation footgun (a >4 GiB frame would wrap
+/// and corrupt framing).
+fn check_frame_size(len: usize) -> anyhow::Result<u32> {
+    if len > MAX_MESSAGE_SIZE as usize {
+        anyhow::bail!(
+            "message too large to send: {} bytes (cap {})",
+            len,
+            MAX_MESSAGE_SIZE
+        );
+    }
+    Ok(len as u32)
+}
+
+/// Whether `msg` would exceed the frame cap on the wire, WITHOUT
+/// serializing it (bincode computes the size from the value). Lets a
+/// caller substitute a small typed error for an undeliverable payload
+/// before paying to serialize/stream it.
+pub fn frame_exceeds_cap<T: Serialize>(msg: &T) -> bool {
+    bincode::serialized_size(msg).map(|n| n > MAX_MESSAGE_SIZE as u64).unwrap_or(true)
+}
+
 /// Write a bincode-serialized message with a 4-byte big-endian length prefix.
 /// Flushes the writer after writing.
 pub async fn write_bincode<W, T>(writer: &mut W, msg: &T) -> anyhow::Result<()>
@@ -940,7 +1008,7 @@ where
     T: Serialize,
 {
     let bytes = bincode::serialize(msg)?;
-    let len = bytes.len() as u32;
+    let len = check_frame_size(bytes.len())?;
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(&bytes).await?;
     writer.flush().await?;
@@ -954,7 +1022,7 @@ where
     T: Serialize,
 {
     let bytes = bincode::serialize(msg)?;
-    let len = bytes.len() as u32;
+    let len = check_frame_size(bytes.len())?;
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(&bytes).await?;
     Ok(())
@@ -1082,6 +1150,21 @@ pub enum StreamEvent {
     },
 }
 
+/// Borrowed mirror of [`StreamEvent`] for ZERO-COPY serialization on the
+/// hot delta path. A per-subscription bridge that doesn't rewrite the
+/// delta (the common non-`OwnerUid` case) would otherwise clone the whole
+/// batch just to wrap it in an owned `StreamEvent::Delta`. bincode tags
+/// are positional, so serializing `StreamEventRef::Delta(&d)` produces
+/// bytes identical to `StreamEvent::Delta(d)` — the variant order MUST
+/// match, which `stream_event_ref_tags_match` pins.
+#[derive(Serialize)]
+pub enum StreamEventRef<'a> {
+    Baseline(&'a TableBaseline),
+    Delta(&'a TableDelta),
+    Error(&'a str),
+    Resolved { original: &'a ResourceId, resolved: &'a ResourceId },
+}
+
 /// Which container(s) a log stream subscribes to. Replaces the previous
 /// magic-string `"all"` sentinel — the closed enum makes the daemon's
 /// kubectl-arg construction exhaustive and protects against typos.
@@ -1141,7 +1224,11 @@ pub struct LogInit {
 /// Exchanged in the raw [`write_handshake`]/[`read_handshake`] preamble
 /// BEFORE any framed message, so a version mismatch can never mis-parse an
 /// enum — stale peers fail fast with a readable error.
-pub const PROTOCOL_VERSION: u32 = 8;
+///
+/// v9: `SessionEvent::OpResult` — mutating-operation results carry their
+/// originating `ObjectRef` (per-item batch correlation; target-gated edit
+/// apply). `CommandResult` narrowed to management acknowledgments.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Handshake magic — "K9RS" as a big-endian u32. Doubles as a poison
 /// length: a pre-8 daemon reads these 4 bytes as a frame-length prefix of
@@ -1467,11 +1554,11 @@ pub enum SessionEvent {
 
     DescribeResult { target: ObjectRef, lines: Vec<DescribeLine> },
     YamlResult { target: ObjectRef, content: String },
-    /// Result of a mutating operation. The message is carried in the Ok/Err
-    /// variant directly so the receiver can't access the message without
-    /// branching on success/failure — the old `{ ok: bool, message: String }`
-    /// shape let callers read the message with unchecked ok, trusting
-    /// convention instead of types.
+    /// Acknowledgment of a MANAGEMENT command (ping/shutdown/stats) — the
+    /// commands with no resource target. Results of mutating operations
+    /// on a resource ride [`Self::OpResult`] instead, which carries the
+    /// target. The message lives inside the Ok/Err variant so the
+    /// receiver can't read it without branching on success/failure.
     CommandResult(Result<String, String>),
 
     // --- Global events ---
@@ -1487,6 +1574,15 @@ pub enum SessionEvent {
     // --- Management responses ---
 
     DaemonStatus(DaemonStatus),
+
+    /// Result of a mutating operation on a specific target (v9). The
+    /// target rides the result so the client can correlate per-item
+    /// outcomes of a batch — aggregate one summary flash, unmark rows
+    /// per-success, retain marks on failures — and gate the edit-apply
+    /// flow on a target match. Same correlation shape as
+    /// `DescribeResult`/`YamlResult`. Appended after `DaemonStatus` so
+    /// every pre-existing tag keeps its position.
+    OpResult { target: ObjectRef, result: Result<String, String> },
 }
 
 #[cfg(test)]
@@ -1625,10 +1721,19 @@ mod tests {
     /// the enums the wire depends on. RULE: any change to these goldens is
     /// a protocol break — bump PROTOCOL_VERSION in the same change.
     /// Appending variants is safe; reordering or mid-enum inserts are not.
+    /// COMPLETE pins for both envelopes: partial head-pins would let a
+    /// swap of two adjacent UNPINNED variants (DescribeResult↔YamlResult)
+    /// sail through while breaking the wire.
     #[test]
     fn envelope_wire_tags_are_stable() {
-        // SessionCommand: pin the head (Init MUST stay tag 0 — the daemon
-        // dispatches on the first frame) and the ops that follow.
+        let obj = ObjectRef {
+            resource: ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
+            namespace: Namespace::All,
+            name: String::new(),
+        };
+
+        // SessionCommand: complete, in declaration order. Init MUST stay
+        // tag 0 — the daemon dispatches on the first frame.
         let init = SessionCommand::Init {
             context: None,
             namespace: Namespace::All,
@@ -1637,26 +1742,69 @@ mod tests {
             env_vars: std::collections::HashMap::new(),
             identity: ClusterIdentity::default(),
         };
-        assert_eq!(&bincode::serialize(&init).unwrap()[..4], 0u32.to_le_bytes());
-        let obj = ObjectRef {
-            resource: ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
-            namespace: Namespace::All,
-            name: String::new(),
-        };
-        assert_eq!(&bincode::serialize(&SessionCommand::Describe(obj.clone())).unwrap()[..4], 1u32.to_le_bytes());
-        assert_eq!(&bincode::serialize(&SessionCommand::Yaml(obj.clone())).unwrap()[..4], 2u32.to_le_bytes());
-        assert_eq!(&bincode::serialize(&SessionCommand::Delete(obj)).unwrap()[..4], 3u32.to_le_bytes());
+        let commands: Vec<SessionCommand> = vec![
+            init,
+            SessionCommand::Describe(obj.clone()),
+            SessionCommand::Yaml(obj.clone()),
+            SessionCommand::Delete(obj.clone()),
+            SessionCommand::ForceKill(obj.clone()),
+            SessionCommand::Scale { target: obj.clone(), replicas: 0 },
+            SessionCommand::Restart(obj.clone()),
+            SessionCommand::GetDiscovery,
+            SessionCommand::Apply { target: obj.clone(), yaml: String::new() },
+            SessionCommand::DecodeSecret(obj.clone()),
+            SessionCommand::TriggerCronJob(obj.clone()),
+            SessionCommand::ToggleSuspendCronJob(obj.clone()),
+            SessionCommand::PortForward { target: obj.clone(), local_port: 0, container_port: 0 },
+            SessionCommand::Ping,
+            SessionCommand::Status,
+            SessionCommand::Shutdown,
+            SessionCommand::Clear { context: None },
+        ];
+        for (i, cmd) in commands.iter().enumerate() {
+            assert_eq!(
+                &bincode::serialize(cmd).unwrap()[..4],
+                (i as u32).to_le_bytes(),
+                "SessionCommand tag drift at index {i}",
+            );
+        }
 
-        // SessionEvent: head pins.
-        let ready = SessionEvent::Ready {
-            context: ContextName::new(String::new()),
-            identity: ClusterIdentity::default(),
-            namespaces: vec![],
-        };
-        assert_eq!(&bincode::serialize(&ready).unwrap()[..4], 0u32.to_le_bytes());
-        assert_eq!(&bincode::serialize(&SessionEvent::SessionError(String::new())).unwrap()[..4], 1u32.to_le_bytes());
+        // SessionEvent: complete, in declaration order.
+        let events: Vec<SessionEvent> = vec![
+            SessionEvent::Ready {
+                context: ContextName::new(String::new()),
+                identity: ClusterIdentity::default(),
+                namespaces: vec![],
+            },
+            SessionEvent::SessionError(String::new()),
+            SessionEvent::DescribeResult { target: obj.clone(), lines: vec![] },
+            SessionEvent::YamlResult { target: obj.clone(), content: String::new() },
+            SessionEvent::CommandResult(Ok(String::new())),
+            SessionEvent::Discovery {
+                context: ContextName::new(String::new()),
+                namespaces: vec![],
+                crds: vec![],
+            },
+            SessionEvent::PodMetrics(HashMap::new()),
+            SessionEvent::NodeMetrics(HashMap::new()),
+            SessionEvent::DaemonStatus(DaemonStatus {
+                pid: 0,
+                uptime_secs: 0,
+                socket_path: String::new(),
+            }),
+            // v9 appendee — after DaemonStatus(8); appending keeps prior tags.
+            SessionEvent::OpResult { target: obj.clone(), result: Ok(String::new()) },
+        ];
+        for (i, ev) in events.iter().enumerate() {
+            assert_eq!(
+                &bincode::serialize(ev).unwrap()[..4],
+                (i as u32).to_le_bytes(),
+                "SessionEvent tag drift at index {i}",
+            );
+        }
 
-        // SubstreamInit: complete (3 variants).
+        // SubstreamInit: complete (3 variants) — a Log↔Exec swap would
+        // otherwise route subscriptions to the wrong handler.
         let sub = SubstreamInit::Subscribe(SubscriptionInit {
             resource: ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
             namespace: Namespace::All,
@@ -1664,6 +1812,45 @@ mod tests {
             force: false,
         });
         assert_eq!(&bincode::serialize(&sub).unwrap()[..4], 0u32.to_le_bytes());
+        let log_sub = SubstreamInit::Log(LogInit {
+            pod: String::new(),
+            namespace: Namespace::All,
+            container: LogContainer::Default,
+            follow: false,
+            tail: None,
+            since: None,
+            previous: false,
+        });
+        assert_eq!(&bincode::serialize(&log_sub).unwrap()[..4], 1u32.to_le_bytes());
+        let exec_sub = SubstreamInit::Exec(ExecInit {
+            kubectl_args: vec![],
+            term_width: 0,
+            term_height: 0,
+        });
+        assert_eq!(&bincode::serialize(&exec_sub).unwrap()[..4], 2u32.to_le_bytes());
+
+        // StreamEvent: complete (4 variants) — the highest-traffic enum;
+        // a Baseline↔Delta swap would corrupt every stream.
+        let obj = ObjectRef {
+            resource: ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
+            namespace: Namespace::All,
+            name: String::new(),
+        };
+        let stream_events: Vec<StreamEvent> = vec![
+            StreamEvent::Baseline(TableBaseline {
+                resource: obj.resource.clone(), headers: vec![], rows: vec![],
+            }),
+            StreamEvent::Delta(TableDelta { changes: vec![] }),
+            StreamEvent::Error(String::new()),
+            StreamEvent::Resolved { original: obj.resource.clone(), resolved: obj.resource.clone() },
+        ];
+        for (i, ev) in stream_events.iter().enumerate() {
+            assert_eq!(
+                &bincode::serialize(ev).unwrap()[..4],
+                (i as u32).to_le_bytes(),
+                "StreamEvent tag drift at index {i}",
+            );
+        }
 
         // OperationKind: complete, in declaration order — capabilities
         // ride the typed enum on both sides.
@@ -1682,11 +1869,50 @@ mod tests {
         }
     }
 
-    /// Wire-tag stability for the proto-8 stream enums (bincode u32 LE
+    /// `StreamEventRef` must serialize byte-identically to `StreamEvent`
+    /// for the variants it mirrors — it's used for zero-copy delta
+    /// serialization on the wire, so any tag/shape drift would silently
+    /// corrupt the stream.
+    #[test]
+    fn stream_event_ref_tags_match() {
+        let baseline = TableBaseline {
+            resource: ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod),
+            headers: vec!["NAME".into()],
+            rows: vec![],
+        };
+        assert_eq!(
+            bincode::serialize(&StreamEvent::Baseline(baseline.clone())).unwrap(),
+            bincode::serialize(&StreamEventRef::Baseline(&baseline)).unwrap(),
+        );
+        let delta = TableDelta {
+            changes: vec![RowChange::Remove(ObjectKey::new(
+                "ns".to_string(), "a".to_string(),
+            ))],
+        };
+        assert_eq!(
+            bincode::serialize(&StreamEvent::Delta(delta.clone())).unwrap(),
+            bincode::serialize(&StreamEventRef::Delta(&delta)).unwrap(),
+        );
+        assert_eq!(
+            bincode::serialize(&StreamEvent::Error("x".into())).unwrap(),
+            bincode::serialize(&StreamEventRef::Error("x")).unwrap(),
+        );
+        let rid = ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod);
+        assert_eq!(
+            bincode::serialize(&StreamEvent::Resolved {
+                original: rid.clone(), resolved: rid.clone(),
+            }).unwrap(),
+            bincode::serialize(&StreamEventRef::Resolved {
+                original: &rid, resolved: &rid,
+            }).unwrap(),
+        );
+    }
+
+    /// Wire-tag stability for the stream enums (bincode u32 LE
     /// declaration-index). Appending is safe; reorder/insert is a break.
     #[test]
     fn stream_wire_tags_are_stable() {
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
         let b = bincode::serialize(&StreamEvent::Error("x".into())).unwrap();
         assert_eq!(&b[..4], 2u32.to_le_bytes()); // Baseline=0, Delta=1, Error=2
         let r = bincode::serialize(&RowChange::Remove(ObjectKey::new(String::new(), String::new()))).unwrap();

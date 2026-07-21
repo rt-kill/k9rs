@@ -45,6 +45,7 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     );
     let Some(store) = element.log_store().cloned() else { return };
     let theme = &app.ui.theme;
+    let anim = &app.ui.anim;
 
     store.with_read(|inner| {
         let total = indices.len();
@@ -132,7 +133,7 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
             let block_inner = block.inner(log_area);
             f.render_widget(block, log_area);
             if inner.live && inner.lines.is_empty() {
-                crate::ui::draw_centered_loading(f, block_inner, "Waiting for logs...", theme.status_pending);
+                crate::ui::draw_centered_loading(f, block_inner, "Waiting for logs...", theme.status_pending, anim);
             } else if block_inner.height > 0 && block_inner.width > 0 {
                 let msg = if inner.lines.is_empty() { "No logs." } else { "No matching lines." };
                 let line = ratatui::text::Line::from(Span::styled(msg, theme.status_pending));

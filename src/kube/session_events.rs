@@ -16,50 +16,18 @@ pub(crate) fn apply_event(
         AppEvent::ResourceUpdate(update) => apply_resource_update(app, update),
         AppEvent::Flash(flash) => {
             // Purely local flashes: just show them. Do NOT pop the edit
-            // route — that's driven by `CommandResult` below.
+            // route — that's driven by the target-gated `OpResult` below.
             app.ui.flash = Some(flash);
         }
         AppEvent::CommandResult(result) => {
-            // Terminal state of the unified edit flow. Only take the
-            // overlay out if we're actually in Edit::Applying — an
-            // unrelated CommandResult must not disturb whatever dialog
-            // is up.
-            let is_applying = matches!(
-                app.ui.overlay,
-                Some(crate::app::Overlay::Edit {
-                    state: crate::app::EditState::Applying { .. }, ..
-                })
-            );
-            if is_applying {
-                // Move the overlay out so we own TempFile (not clone).
-                if let Some(crate::app::Overlay::Edit {
-                    target,
-                    state: crate::app::EditState::Applying { temp_file, original },
-                }) = app.ui.overlay.take() {
-                    match &result {
-                        Ok(_) => {
-                            drop(temp_file);
-                            app.kube.kubectl_cache.clear();
-                        }
-                        Err(msg) => {
-                            let current = std::fs::read_to_string(temp_file.path()).unwrap_or_default();
-                            let with_error = format!(
-                                "# k9rs: Error from server:\n# k9rs: {}\n# k9rs: Save to retry, :cq to abort.\n#\n{}",
-                                msg, current,
-                            );
-                            let _ = std::fs::write(temp_file.path(), &with_error);
-                            app.ui.overlay = Some(crate::app::Overlay::Edit {
-                                target,
-                                state: crate::app::EditState::EditorReady { temp_file, original },
-                            });
-                        }
-                    }
-                }
-            }
+            // Management/command-level acknowledgment (no target): flash.
             app.ui.flash = Some(match result {
                 Ok(msg) => crate::app::FlashMessage::info(msg),
                 Err(msg) => crate::app::FlashMessage::error(msg),
             });
+        }
+        AppEvent::OpResult { target, result } => {
+            apply_op_result(app, target, result);
         }
         AppEvent::ResourceResolved { original, resolved } => {
             // The server discovered the true identity of a resource we
@@ -145,8 +113,17 @@ pub(crate) fn apply_event(
             // loop will drop the old session and create a new one, same
             // as context switching. The user stays in the TUI.
             app.reconnect_requested = true;
+            // A batch's remaining results die with the connection; fold
+            // its partial tally into the message instead of dropping it
+            // silently (single flash slot).
+            let batch_note = app
+                .pending_batch
+                .take()
+                .filter(|b| !b.is_done())
+                .map(|b| format!(" ({})", b.interrupted_summary().message))
+                .unwrap_or_default();
             app.ui.flash = Some(crate::app::FlashMessage::warn(
-                "Connection lost — reconnecting...".to_string()
+                format!("Connection lost — reconnecting...{}", batch_note)
             ));
         }
         AppEvent::ConnectionEstablished { context, identity, namespaces } => {
@@ -158,10 +135,31 @@ pub(crate) fn apply_event(
                 let ns_rows = crate::kube::cache::cached_namespaces_to_rows(&namespaces);
                 app.core.seed(crate::kube::resource_def::BuiltInKind::Namespace, ns_rows);
             }
+            // A connection succeeded: future failures are reconnects, and
+            // the backoff resets.
+            app.has_connected = true;
+            app.reconnect_at = None;
+            app.reconnect_backoff = std::time::Duration::from_millis(500);
         }
         AppEvent::ConnectionFailed(message) => {
-            app.exit_reason = Some(crate::app::ExitReason::Error(message));
-            app.should_quit = true;
+            if app.has_connected {
+                // A RECONNECT failed (the daemon died and hasn't come back
+                // yet). Stay in the TUI and retry with backoff — quitting
+                // on the first failed re-connect contradicts the
+                // DaemonDisconnected "the user stays in the TUI" contract.
+                // The user can Ctrl-C to leave.
+                app.reconnect_requested = true;
+                app.reconnect_at = Some(std::time::Instant::now() + app.reconnect_backoff);
+                app.reconnect_backoff =
+                    (app.reconnect_backoff * 2).min(std::time::Duration::from_secs(5));
+                app.ui.flash = Some(crate::app::FlashMessage::warn(
+                    format!("Reconnecting to daemon... ({})", message)
+                ));
+            } else {
+                // The INITIAL connection failed — nothing to fall back to.
+                app.exit_reason = Some(crate::app::ExitReason::Error(message));
+                app.should_quit = true;
+            }
         }
         AppEvent::KubeconfigLoaded {
             contexts, current_context, current_identity,
@@ -181,6 +179,77 @@ pub(crate) fn apply_event(
             }
         }
     }
+}
+
+/// Route a target-ed operation result to its consumer, in priority order:
+/// the edit-apply flow (overlay in `Applying` for THIS target), then the
+/// in-flight batch tracker, then a plain flash. Target correlation is
+/// what makes each consumer take only its own results — the old
+/// target-less `CommandResult` let any concurrent result pop the edit
+/// overlay, and batch failures vanished behind later flashes.
+fn apply_op_result(
+    app: &mut App,
+    target: crate::kube::protocol::ObjectRef,
+    result: Result<String, String>,
+) {
+    // 1. Edit flow: terminal state of an apply. Only take the overlay out
+    // if it is Applying AND the result is for the edited object.
+    let is_applying_this = matches!(
+        app.ui.overlay,
+        Some(crate::app::Overlay::Edit {
+            target: ref t,
+            state: crate::app::EditState::Applying { .. },
+        }) if *t == target
+    );
+    if is_applying_this {
+        // Move the overlay out so we own TempFile (not clone).
+        if let Some(crate::app::Overlay::Edit {
+            target: edit_target,
+            state: crate::app::EditState::Applying { temp_file, original },
+        }) = app.ui.overlay.take() {
+            match &result {
+                Ok(_) => {
+                    drop(temp_file);
+                    app.kube.kubectl_cache.clear();
+                }
+                Err(msg) => {
+                    let current = std::fs::read_to_string(temp_file.path()).unwrap_or_default();
+                    let with_error = format!(
+                        "# k9rs: Error from server:\n# k9rs: {}\n# k9rs: Save to retry, :cq to abort.\n#\n{}",
+                        msg, current,
+                    );
+                    let _ = std::fs::write(temp_file.path(), &with_error);
+                    app.ui.overlay = Some(crate::app::Overlay::Edit {
+                        target: edit_target,
+                        state: crate::app::EditState::EditorReady { temp_file, original },
+                    });
+                }
+            }
+        }
+        app.ui.flash = Some(match result {
+            Ok(msg) => crate::app::FlashMessage::info(msg),
+            Err(msg) => crate::app::FlashMessage::error(msg),
+        });
+        return;
+    }
+
+    // 2. Batch tracker: consume our items' results silently; ONE summary
+    // flash when the last lands.
+    if let Some(tracker) = app.pending_batch.as_mut() {
+        if tracker.consume(&target, &result) {
+            if tracker.is_done() {
+                app.ui.flash = Some(tracker.summary());
+                app.pending_batch = None;
+            }
+            return;
+        }
+    }
+
+    // 3. Ordinary single-op result: flash it.
+    app.ui.flash = Some(match result {
+        Ok(msg) => crate::app::FlashMessage::info(msg),
+        Err(msg) => crate::app::FlashMessage::error(msg),
+    });
 }
 
 fn apply_resource_update(
@@ -233,7 +302,19 @@ fn apply_resource_update(
                 }
             }
         }
-        ResourceUpdate::Describe { target: response_target, lines } => {
+        ResourceUpdate::Describe { target: response_target, mut lines } => {
+            // Describe text (and Secret-decode output, which rides the same
+            // event) is cluster-controlled and renders through the
+            // Paragraph path, which does NOT strip control chars. Sanitize
+            // once here, at ingest — before the cache and the view both see
+            // it — so no annotation value or decoded byte can smuggle a
+            // terminal escape (OSC 52 clipboard, cursor-report stdin
+            // injection) onto the screen.
+            for line in &mut lines {
+                if line.text.chars().any(|c| c.is_control() && c != '\t') {
+                    line.text = crate::util::sanitize_terminal(&line.text);
+                }
+            }
             use crate::app::element::{ContentSpec, Element};
             if let Element::ContentView(cv) = app.nav.top_mut() {
                 if let ContentSpec::Describe(ref target) = cv.kind {

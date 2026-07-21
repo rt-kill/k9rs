@@ -35,18 +35,9 @@ pub fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
     let tab_bar_area = chunks[3];
     let _flash_area = chunks[4];
 
-    // 1. Header (same as resource view)
+    // 1. Header (same as resource view; key hints live in ? help)
     if app.ui.show_header {
-        header::draw_header(f, app, header_area, theme, |f, area, theme| {
-            use crate::ui::header::KeyHint;
-            let hints = vec![
-                KeyHint { key: ":", description: "command" },
-                KeyHint { key: "Tab", description: "resources" },
-                KeyHint { key: "?", description: "help" },
-                KeyHint { key: "q", description: "quit" },
-            ];
-            header::draw_key_hint_grid(f, area, &hints, theme);
-        });
+        header::draw_header(f, app, header_area, theme);
     }
 
     // 2. Command prompt (same as resource view)

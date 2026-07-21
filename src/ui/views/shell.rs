@@ -12,6 +12,7 @@ pub fn draw_shell(
     shell: &ShellState,
     area: Rect,
     theme: &Theme,
+    anim: &crate::app::anim::Anim,
 ) {
     let block = Block::bordered()
         .title(Span::styled(
@@ -26,7 +27,7 @@ pub fn draw_shell(
         return;
     }
 
-    let loading = crate::util::loading_bar("Connecting...");
+    let loading = anim.bar("Connecting...");
     let line = Line::from(Span::styled(loading, theme.info_value));
     let center_y = inner.y + inner.height / 2;
     let center_x = inner.x + inner.width.saturating_sub(line.width() as u16) / 2;

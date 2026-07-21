@@ -10,7 +10,6 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
-use crate::kube::protocol::{OperationKind, ResourceCapabilities};
 
 use crate::ui::header;
 use crate::ui::theme::Theme;
@@ -19,52 +18,6 @@ use crate::ui::widgets::{FilterBar, ResourceTable, ResourceTableState};
 // ---------------------------------------------------------------------------
 // Key hints (displayed in header center panel)
 // ---------------------------------------------------------------------------
-
-/// Build key hints based on the server-declared capabilities for the
-/// current resource type. Driven entirely by `ResourceCapabilities` —
-/// no static type knowledge needed on the client side.
-fn key_hints_for_resource(caps: &ResourceCapabilities) -> Vec<crate::ui::header::KeyHint> {
-    use crate::ui::header::KeyHint;
-    let mut hints = vec![
-        KeyHint { key: ":", description: "cmd" },
-        KeyHint { key: "/", description: "filter" },
-        KeyHint { key: "d", description: "desc" },
-        KeyHint { key: "y", description: "yaml" },
-        KeyHint { key: "Ctrl-d", description: "del" },
-        KeyHint { key: "?", description: "help" },
-    ];
-    let mut pos = 4;
-    if caps.supports(OperationKind::StreamLogs) {
-        hints.insert(pos, KeyHint { key: "l", description: "logs" });
-        pos += 1;
-    }
-    if caps.supports(OperationKind::Shell) {
-        hints.insert(pos, KeyHint { key: "s", description: "shell" });
-        pos += 1;
-    }
-    if caps.supports(OperationKind::PortForward) {
-        hints.insert(pos, KeyHint { key: "f", description: "pf" });
-        pos += 1;
-    }
-    if caps.supports(OperationKind::PreviousLogs) {
-        hints.insert(pos, KeyHint { key: "p", description: "prev-logs" });
-        pos += 1;
-    }
-    if caps.supports(OperationKind::ShowNode) {
-        hints.insert(pos, KeyHint { key: "o", description: "node" });
-        pos += 1;
-    }
-    if caps.supports(OperationKind::Restart) {
-        hints.insert(pos, KeyHint { key: "r", description: "restart" });
-        pos += 1;
-    }
-    if caps.supports(OperationKind::Scale) {
-        hints.insert(pos, KeyHint { key: "s", description: "scale" });
-    }
-    hints.push(KeyHint { key: "Space", description: "mark" });
-    hints.push(KeyHint { key: "q", description: "quit" });
-    hints
-}
 
 // ---------------------------------------------------------------------------
 // Render a generic resource table given headers and row data.
@@ -177,12 +130,9 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let breadcrumb_area = chunks[4];
     let flash_area = chunks[5];
 
-    // 1. Header section: 3 columns (only when visible)
+    // 1. Header section (cluster info + logo; key hints live in ? help)
     if app.ui.show_header {
-        let caps = app.current_capabilities();
-        header::draw_header(f, app, header_area, theme, |f, area, theme| {
-            draw_key_hints(f, &caps, area, theme);
-        });
+        header::draw_header(f, app, header_area, theme);
     }
 
     // 2. Command prompt (only when command mode active)
@@ -190,49 +140,70 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         draw_command_prompt(f, app, command_area, theme);
     }
 
-    // 3. Filter prompt
+    // Materialize the TOP element's view ONCE up front. The filter bar's
+    // match count must reflect THIS frame's filter — reading the memo
+    // (`counts()`) before deriving showed the PREVIOUS frame's count, so
+    // on quiet data the bar lagged a keystroke behind the table forever.
+    // The Arc is owned, so the mut borrow ends here and the blocks below
+    // re-borrow freely.
+    let level = app.ui.column_level;
+    let max_col_width = app.config.ui.max_column_width;
+    let view = {
+        let element = app.nav.top_mut();
+        let v = element.view(level, max_col_width);
+        // Record what this frame SHOWS the user (select mode or not) on
+        // the element — the select-mode gate refuses batch keys that
+        // arrive after an async prune flipped the mode out from under the
+        // painted frame.
+        let select_mode = element.has_marks();
+        if let Some(it) = element.table_interaction_mut() {
+            it.rendered_select_mode = select_mode;
+        }
+        v
+    };
+
+    // 3. Filter prompt — counts from THIS frame's view.
     if filter_visible {
-        let counts = app.nav.top().counts();
-        let match_count = if app.nav.top().filter_input().text().is_empty() && !app.nav.is_drilled() {
-            counts.total
+        let filtered = view.keys.len();
+        let total = view.total_rows;
+        let fi = app.nav.top().filter_input();
+        let match_count = if fi.text().is_empty() && !app.nav.is_drilled() {
+            total
         } else {
-            counts.filtered
+            filtered
         };
-        let filter_bar = FilterBar::new(
-            app.nav.top().filter_input().active(),
-            app.nav.top().filter_input().text(),
-            match_count,
-            counts.total,
-            theme,
-        );
+        let filter_bar = FilterBar::new(fi.active(), fi.text(), match_count, total, theme);
         f.render_widget(filter_bar, filter_area);
     }
 
-    // 4. Resource table — the TOP element materializes its own view (the
-    // ephemeral "view" of the nav model). Everything rendered here is
-    // element-owned: query + predicates, columns (NAMESPACE membership was
-    // fixed at the element's construction — never the ambient selector),
-    // title, scope label, cursor. Nothing reads ambient state; nothing
-    // reaches below the top.
-    let level = app.ui.column_level;
-    let max_col_width = app.config.ui.max_column_width;
+    // 4. Resource table — element-owned: query + predicates, columns
+    // (NAMESPACE membership fixed at construction), title, scope label,
+    // cursor. Nothing reads ambient state; nothing reaches below the top.
     let element = app.nav.top_mut();
-    let view = element.view(level, max_col_width);
-
     if view.total_rows == 0 {
         // No data at all (loading / failed / genuinely empty): bordered
         // block with a centered status line.
         let text = match element.data_state() {
             crate::app::table::TableDataState::Failed(err) => format!("Error: {}", err),
             crate::app::table::TableDataState::Ready => format!("No {} found.", element.title()),
-            crate::app::table::TableDataState::Initializing => crate::util::loading_bar("Loading..."),
+            crate::app::table::TableDataState::Initializing => app.ui.anim.bar("Loading..."),
         };
         let status_line = Line::from(Span::styled(text, theme.info_value));
         let scope = element.scope_label();
-        let title_str = if scope.is_empty() {
-            format!(" {}[0]", element.title())
+        // The selected-count indicator renders HERE too: this branch is
+        // exactly what shows during the Ctrl-R window, where marks
+        // survive the cleared rows — select mode must not visually
+        // vanish at the one moment its honesty matters most.
+        let marked_count = element.marked_count();
+        let sel_suffix = if marked_count > 0 {
+            format!("[{} selected]", marked_count)
         } else {
-            format!(" {}({})[0]", element.title(), scope)
+            String::new()
+        };
+        let title_str = if scope.is_empty() {
+            format!(" {}[0]{}", element.title(), sel_suffix)
+        } else {
+            format!(" {}({})[0]{}", element.title(), scope, sel_suffix)
         };
         let block = Block::bordered()
             .title(Span::styled(title_str, theme.title))
@@ -301,16 +272,6 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         let empty = Line::raw("");
         f.render_widget(empty, flash_area);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Header: key hints center panel (delegates to shared header module)
-// ---------------------------------------------------------------------------
-
-/// Center panel: compact key hint grid for the resource view.
-fn draw_key_hints(f: &mut Frame, caps: &ResourceCapabilities, area: Rect, theme: &Theme) {
-    let hints = key_hints_for_resource(caps);
-    header::draw_key_hint_grid(f, area, &hints, theme);
 }
 
 // ---------------------------------------------------------------------------

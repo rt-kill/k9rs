@@ -286,11 +286,16 @@ impl StatefulWidget for LogViewer<'_> {
 
         // -- Rendering: wrap vs non-wrap are purely layout concerns --
         if state.wrap {
-            // Window from scroll position to avoid O(n) preparation of all lines.
-            // In wrap mode, a single logical line may occupy multiple visual rows,
-            // so we prepare a generous window and let Paragraph handle wrapping.
+            // Window from scroll position. In wrap mode a single logical
+            // line occupies AT LEAST one visual row, so `visible_height`
+            // logical lines always over-fill the viewport — preparing
+            // only that many (not `[start..]` to end-of-buffer) keeps this
+            // O(height), not O(remaining lines). Without the upper bound a
+            // scrolled-up 50k-line buffer prepared every remaining line
+            // (ANSI parse + span allocs) on every frame.
             let start = state.scroll.min(self.lines.len().saturating_sub(1));
-            let text_lines: Vec<Line<'static>> = self.lines[start..]
+            let end = (start + visible_height).min(self.lines.len());
+            let text_lines: Vec<Line<'static>> = self.lines[start..end]
                 .iter()
                 .map(|&line| prepare_line(line, self.theme, state.show_timestamps, &compiled_patterns))
                 .collect();

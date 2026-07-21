@@ -154,10 +154,41 @@ pub fn process_temp_dir() -> std::io::Result<std::path::PathBuf> {
     let dir = std::env::temp_dir().join(format!("k9rs-{}", std::process::id()));
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The dir already exists — but `env::temp_dir()` is typically
+            // world-writable `/tmp`, so another local user who won the PID
+            // race could have pre-created it and now controls files we
+            // write there (swapping the YAML we're about to apply, or
+            // capturing saved output). Refuse unless it is a REAL
+            // directory (not a symlink), owned by us, mode exactly 0700 —
+            // the same check the daemon socket path already makes.
+            verify_owned_private_dir(&dir)?;
+        }
         Err(e) => return Err(e),
     }
     Ok(dir)
+}
+
+/// Assert `dir` is a directory (not a symlink), owned by the current uid,
+/// with mode `0700` — rejecting a hostile pre-created temp dir.
+fn verify_owned_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // `symlink_metadata` does NOT follow a final symlink, so a planted
+    // symlink-to-attacker-dir is caught (it is not itself a dir).
+    let md = std::fs::symlink_metadata(dir)?;
+    let deny = |msg: &str| Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg));
+    if !md.file_type().is_dir() {
+        return deny("temp dir is not a directory (possible symlink attack)");
+    }
+    // SAFETY: getuid is always successful and thread-safe.
+    let our_uid = unsafe { libc::getuid() };
+    if md.uid() != our_uid {
+        return deny("temp dir is owned by another user");
+    }
+    if md.mode() & 0o777 != 0o700 {
+        return deny("temp dir has unexpected permissions");
+    }
+    Ok(())
 }
 
 /// Atomically create a fresh file inside [`process_temp_dir`] and return
@@ -219,24 +250,6 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
     false
 }
 
-/// Generates a snake-style loading bar string: `[  ===   ]`
-/// The snake is 3 chars wide sliding across an 8-char bar.
-pub fn loading_bar(label: &str) -> String {
-    let bar_width = 8usize;
-    let snake_len = 4usize;
-    let elapsed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as usize;
-    let pos = (elapsed / 100) % (bar_width + snake_len);
-    let bar: String = (0..bar_width)
-        .map(|i| {
-            if i >= pos.saturating_sub(snake_len) && i < pos { '=' } else { ' ' }
-        })
-        .collect();
-    format!("[{}] {}", bar, label)
-}
-
 /// Strip ANSI escape sequences from a string.
 /// Handles CSI sequences (ESC[...m), OSC sequences (ESC]...BEL/ST), and simple ESC sequences.
 pub fn strip_ansi(s: &str) -> String {
@@ -280,15 +293,47 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Strip terminal control characters from cluster-controlled text before
+/// it is rendered through a path that does NOT sanitize (ratatui's
+/// `Paragraph` writes symbols verbatim, unlike `Buffer::set_string`).
+/// Keeps `\t`; drops every other C0 control, DEL, and the C1 range
+/// (`char::is_control` covers U+0000–U+001F and U+007F–U+009F). This is
+/// what stops a hostile resource name / annotation / API-server version
+/// string from smuggling an `ESC]52;…` (OSC 52 clipboard) or `ESC[6n`
+/// (cursor-report → stdin injection) to the terminal.
+pub fn sanitize_terminal(s: &str) -> String {
+    s.chars().filter(|&c| c == '\t' || !c.is_control()).collect()
+}
+
+/// Push a text run as a Span, dropping non-tab control characters. Zero-
+/// copy (borrowed slice) in the common no-control case; allocates a
+/// cleaned `String` only when a control char is present.
+fn push_ansi_text<'a>(
+    spans: &mut Vec<ratatui::text::Span<'a>>,
+    text: &'a str,
+    style: ratatui::style::Style,
+) {
+    use ratatui::text::Span;
+    if text.is_empty() {
+        return;
+    }
+    if text.chars().any(|c| c.is_control() && c != '\t') {
+        spans.push(Span::styled(sanitize_terminal(text), style));
+    } else {
+        spans.push(Span::styled(text, style));
+    }
+}
+
 /// Parse ANSI SGR escape sequences in a log line into ratatui Spans.
 /// Non-SGR escape sequences are stripped (not displayed). Text between
-/// escapes becomes a Span styled with the accumulated SGR state.
+/// escapes becomes a Span styled with the accumulated SGR state. Non-tab
+/// control characters in the text runs are dropped (a hostile log line
+/// can't leak a raw `\r`/BEL or a stray control into the wrap-mode
+/// Paragraph render path).
 ///
 /// The application is the authority on its own output coloring — we
 /// preserve it faithfully instead of stripping and re-guessing.
 pub fn parse_ansi_line<'a>(line: &'a str, base: ratatui::style::Style) -> Vec<ratatui::text::Span<'a>> {
-    use ratatui::text::Span;
-
     let mut spans = Vec::new();
     let mut style = base;
     let bytes = line.as_bytes();
@@ -300,7 +345,7 @@ pub fn parse_ansi_line<'a>(line: &'a str, base: ratatui::style::Style) -> Vec<ra
         if bytes[i] == 0x1b && i + 1 < len && bytes[i + 1] == b'[' {
             // Flush text before this escape.
             if i > text_start {
-                spans.push(Span::styled(&line[text_start..i], style));
+                push_ansi_text(&mut spans, &line[text_start..i], style);
             }
             // Parse CSI sequence: ESC [ <params> <final byte>
             i += 2; // skip ESC [
@@ -319,7 +364,7 @@ pub fn parse_ansi_line<'a>(line: &'a str, base: ratatui::style::Style) -> Vec<ra
         } else if bytes[i] == 0x1b {
             // Non-CSI escape — flush text, skip ESC + next byte (if any).
             if i > text_start {
-                spans.push(Span::styled(&line[text_start..i], style));
+                push_ansi_text(&mut spans, &line[text_start..i], style);
             }
             i += 1; // skip ESC
             if i < len { i += 1; } // skip next byte if present
@@ -330,10 +375,10 @@ pub fn parse_ansi_line<'a>(line: &'a str, base: ratatui::style::Style) -> Vec<ra
     }
     // Flush remaining text.
     if text_start < len {
-        spans.push(Span::styled(&line[text_start..], style));
+        push_ansi_text(&mut spans, &line[text_start..], style);
     }
     if spans.is_empty() {
-        spans.push(Span::styled(line, base));
+        push_ansi_text(&mut spans, line, base);
     }
     spans
 }
@@ -718,6 +763,31 @@ pub fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use chrono::Duration;
+
+    #[test]
+    fn sanitize_terminal_drops_escapes_keeps_tab() {
+        // The OSC 52 clipboard payload and a cursor-report both vanish.
+        assert_eq!(sanitize_terminal("a\x1b]52;c;Zm9v\x07b"), "a]52;c;Zm9vb");
+        assert_eq!(sanitize_terminal("x\x1b[6ny"), "x[6ny");
+        // Tab survives; CR/BEL/DEL/C1 do not.
+        assert_eq!(sanitize_terminal("a\tb\r\x07\x7f\u{0090}c"), "a\tbc");
+        // Plain text is unchanged.
+        assert_eq!(sanitize_terminal("pod-1 Running"), "pod-1 Running");
+    }
+
+    #[test]
+    fn parse_ansi_line_drops_non_tab_controls_from_text() {
+        // SGR coloring is preserved, but a raw CR/BEL in the text run is
+        // dropped so it can't reach the wrap-mode Paragraph render path.
+        let base = ratatui::style::Style::default();
+        let spans = parse_ansi_line("hi\rthere\x07", base);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "hithere");
+        // A real SGR sequence still produces multiple styled spans.
+        let colored = parse_ansi_line("\x1b[31mred\x1b[0m", base);
+        let text: String = colored.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "red");
+    }
 
     #[test]
     fn test_format_age_none() {

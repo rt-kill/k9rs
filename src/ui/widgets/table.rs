@@ -263,6 +263,18 @@ impl<'a> ResourceTable<'a> {
             spans.push(Span::styled(")", self.theme.title));
         }
         spans.push(Span::styled(format!("[{}]", row_count), self.theme.title_counter));
+        // Select mode: the count is the STORE-wide marked set (what a
+        // batch acts on). When the active filter hides some of it, say
+        // so — the title must not imply everything selected is on screen.
+        if !self.marked.is_empty() {
+            let shown = self.row_keys.iter().filter(|k| self.marked.contains(*k)).count();
+            let sel = if shown < self.marked.len() {
+                format!("[{} selected · {} shown]", self.marked.len(), shown)
+            } else {
+                format!("[{} selected]", self.marked.len())
+            };
+            spans.push(Span::styled(sel, self.theme.title_filter_indicator));
+        }
         spans.push(Span::styled(" ", self.theme.title));
         Line::from(spans)
     }

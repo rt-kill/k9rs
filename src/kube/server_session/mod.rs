@@ -51,8 +51,9 @@ pub struct SessionSharedState {
     pub local_registry: Arc<crate::kube::local::LocalRegistry>,
     /// In-memory discovery cache. Per-resource-type storage means a failed
     /// namespace fetch can't erase a prior cached CRD list and vice-versa —
-    /// the cache can't be partially poisoned.
-    pub discovery_cache: super::cache::DiscoveryCache,
+    /// the cache can't be partially poisoned. `Arc` so dynamic watchers can
+    /// hold it: they resolve their own printer columns at birth.
+    pub discovery_cache: Arc<super::cache::DiscoveryCache>,
     /// Shared per-`ContextId` metrics + discovery pollers, so N sessions on one
     /// cluster poll it once instead of N times — the same sharing `watcher_cache`
     /// gives resource watches. See [`crate::kube::shared_poller`].
@@ -95,7 +96,7 @@ impl SessionSharedState {
                 crate::kube::daemon_config::daemon_config().exec_resources.clone(),
                 local_grace,
             )),
-            discovery_cache: super::cache::DiscoveryCache::new(),
+            discovery_cache: Arc::new(super::cache::DiscoveryCache::new()),
             metrics_pollers: crate::kube::shared_poller::PollerCache::new(),
             discovery_pollers: crate::kube::shared_poller::PollerCache::new(),
             client_build_semaphore: Semaphore::new(MAX_CONCURRENT_CLIENT_BUILDS),
@@ -137,6 +138,12 @@ pub(crate) struct SessionContext {
     /// Session ID for structured logging in substream tasks.
     pub session_id: u64,
     pub streaming_lists: bool,
+    /// Read-only stance for this session. The control-substream command
+    /// loop gates mutations via `SessionCommand::is_mutating`, but exec
+    /// substreams ride a DATA substream that skips that gate — so the
+    /// exec handler must consult this directly, or a read-only session
+    /// could `kubectl exec`/`debug` (a mutation) freely.
+    pub readonly: bool,
     /// This session's strong hold on the context's local resources
     /// (port-forwards, exec sources). Held here AND on `ServerSession` so
     /// every path that can serve a local op keeps the slice out of grace;
@@ -319,10 +326,14 @@ impl ServerSession {
 
         // Version handshake BEFORE any framed message — a mismatched peer
         // can never mis-parse an enum (see protocol::PROTOCOL_MAGIC).
-        if protocol::read_handshake(&mut reader).await.is_err() {
+        // WRITE first: a mismatched client then reads our version and can
+        // report the actionable mismatch itself instead of a bare EOF
+        // (this daemon closing after a silent read-side reject).
+        if protocol::write_handshake(&mut buf_writer).await.is_err() {
             return;
         }
-        if protocol::write_handshake(&mut buf_writer).await.is_err() {
+        if let Err(e) = protocol::read_handshake(&mut reader).await {
+            tracing::warn!("session handshake rejected: {e}");
             return;
         }
 
@@ -392,10 +403,13 @@ impl ServerSession {
         let mut buf_writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
         // Version handshake BEFORE any framed message — a mismatched peer
         // can never mis-parse an enum (see protocol::PROTOCOL_MAGIC).
-        if protocol::read_handshake(&mut reader).await.is_err() {
+        // WRITE first so a mismatched client can report the actionable
+        // mismatch itself instead of a bare EOF.
+        if protocol::write_handshake(&mut buf_writer).await.is_err() {
             return;
         }
-        if protocol::write_handshake(&mut buf_writer).await.is_err() {
+        if let Err(e) = protocol::read_handshake(&mut reader).await {
+            tracing::warn!("session handshake rejected: {e}");
             return;
         }
         let init = match protocol::read_bincode::<_, SessionCommand>(&mut reader).await {
@@ -490,7 +504,10 @@ impl ServerSession {
         // 4. Fetch K8s server version (best-effort, non-blocking for Ready).
         let mut identity = init.identity.clone();
         let streaming_lists = if let Ok(info) = client.apiserver_version().await {
-            identity.k8s_version = info.git_version.clone();
+            // The API server's version string is attacker-influenceable
+            // (compromised/hostile apiserver) and renders in the header
+            // through the Paragraph path — sanitize control chars.
+            identity.k8s_version = crate::util::sanitize_terminal(&info.git_version);
             parse_k8s_minor(&info.git_version).is_some_and(|minor| minor >= 32)
         } else {
             false
@@ -537,6 +554,7 @@ impl ServerSession {
                 context: context_id,
                 session_id,
                 streaming_lists,
+                readonly: init.readonly,
                 locals,
             });
             let _ = tx.send(Some(ctx));
@@ -676,6 +694,13 @@ impl ServerSession {
     async fn handle_command(&mut self, cmd: SessionCommand) -> anyhow::Result<()> {
         match &cmd {
             SessionCommand::Init { .. } => debug!("session cmd: Init"),
+            // Apply carries a full object body which, for a Secret, is the
+            // decoded secret YAML — never log it verbatim (the log file may
+            // be shared / world-readable via a lax umask; even at 0600 it
+            // is durable). Log only the target.
+            SessionCommand::Apply { target, .. } => {
+                debug!("session cmd: Apply {{ target: {} }}", target.kubectl_target());
+            }
             other => debug!("session cmd: {:?}", other),
         }
 
@@ -686,7 +711,11 @@ impl ServerSession {
         // `reject_if_readonly` calls; forgetting to call one becomes
         // structurally impossible.
         if cmd.is_mutating() && self.readonly {
-            self.reject_async("Session is read-only".to_string());
+            // Command-level (target-less) rejection: this gate fires on the
+            // whole command before any handler runs. The client blocks
+            // read-only mutations before the wire too, so no batch tracker
+            // can be left waiting on a per-target result here.
+            self.reject_command_async("Session is read-only".to_string());
             return Ok(());
         }
 
@@ -1097,17 +1126,18 @@ async fn handle_subscription_substream_inner(
                 ),
                 filter: key.filter,
             };
-            let printer_columns = ctx.shared.discovery_cache
-                .printer_columns_for(&ctx.context, &gvk.group, &plural)
-                .unwrap_or_default();
             if init.force {
                 ctx.shared.watcher_cache.remove(&resolved_key);
             }
+            // The watcher resolves its own printer columns at birth (see
+            // resolve_printer_columns) — nothing here can hand it a plan
+            // built from a cold cache.
             let sub = ctx.shared.watcher_cache.subscribe_dynamic(
                 resolved_key.clone(), make_client, gvk.clone(),
-                plural.clone(), scope, printer_columns.clone(), ctx.streaming_lists,
+                plural.clone(), scope, Arc::clone(&ctx.shared.discovery_cache),
+                ctx.streaming_lists,
             );
-            (sub, ResubInfo::Dynamic { key: resolved_key, gvk, plural, scope, printer_columns })
+            (sub, ResubInfo::Dynamic { key: resolved_key, gvk, plural, scope })
         }
     };
 
@@ -1133,53 +1163,104 @@ async fn handle_subscription_substream_inner(
     'attach: loop {
         // Cursor is already pinned (sub holds its broadcast receiver), so
         // the baseline can only overlap buffered deltas, never gap.
-        let mut baseline_rx = sub.request_baseline(after_initial_list);
-        let baseline = loop {
-            tokio::select! {
-                b = &mut baseline_rx => match b {
-                    Ok(b) => break Some(b),
-                    Err(_) => break None, // watcher task gone (ask dropped)
-                },
-                msg = sub.recv() => match msg {
-                    Ok(msg) => match &*msg {
-                        // Forward deltas while the baseline is deferred —
-                        // keeps the client fresh during a long re-LIST and
-                        // keeps the ring drained.
-                        crate::kube::live_query::WatcherMsg::Delta(delta) => {
-                            if sent_any_data {
-                                let delta = filter_delta(delta.clone(), &filter);
-                                if protocol::write_bincode(&mut writer, &protocol::StreamEvent::Delta(delta)).await.is_err() { return; }
-                                if writer.flush().await.is_err() { return; }
-                            }
-                        }
-                        crate::kube::live_query::WatcherMsg::Dead(_) => break None,
+        // `None` from request_baseline = the ask channel is closed, i.e.
+        // the watcher is already gone.
+        let step: BaselineStep = match sub.request_baseline(after_initial_list).await {
+            None => BaselineStep::Died(None),
+            Some(mut baseline_rx) => loop {
+                tokio::select! {
+                    b = &mut baseline_rx => break match b {
+                        Ok(b) => BaselineStep::Got(b),
+                        // Reply sender dropped: the watcher took our ask and
+                        // then died. Its terminal Dead is on the ring (sent
+                        // before the task returns) — captured below.
+                        Err(_) => BaselineStep::Died(None),
                     },
-                    Err(_) => break None, // Lagged pre-baseline: the ask repairs it anyway
-                },
-            }
+                    msg = sub.recv() => match msg {
+                        Ok(msg) => match &*msg {
+                            // Forward deltas while the baseline is deferred —
+                            // keeps the client fresh during a long re-LIST and
+                            // keeps the ring drained.
+                            crate::kube::live_query::WatcherMsg::Delta(delta) => {
+                                if sent_any_data {
+                                    let delta = filter_delta(delta, &filter);
+                                    if protocol::write_bincode(&mut writer, &protocol::StreamEventRef::Delta(delta.as_ref())).await.is_err() { return; }
+                                    if writer.flush().await.is_err() { return; }
+                                }
+                            }
+                            // Carry the reason OUT — do NOT fall through to a
+                            // re-drain (the terminal Dead is now consumed, and
+                            // re-draining a keepalive-held-open channel hangs).
+                            crate::kube::live_query::WatcherMsg::Dead(reason) => {
+                                break BaselineStep::Died(Some(reason.clone()));
+                            }
+                        },
+                        // Lagged BEFORE the baseline landed: the fresh
+                        // baseline we re-ask for repairs it — the watcher is
+                        // alive, so this is a retry, never a death.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            break BaselineStep::Retry;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break BaselineStep::Died(None);
+                        }
+                    },
+                }
+            },
         };
 
-        let Some(baseline) = baseline else {
-            // Watcher died before answering. Permanent iff it never
-            // produced data for us (first LIST fail-fast: RBAC, unknown
-            // resource); transient otherwise.
-            let detail = drain_death_reason(&mut sub).await.unwrap_or_default();
-            if !sent_any_data {
-                let msg = if detail.is_empty() {
-                    format!("Watcher failed for {}", rid.plural())
-                } else {
-                    format!("Watcher failed for {}: {}", rid.plural(), detail)
-                };
-                let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Error(msg)).await;
-                return;
+        let baseline = match step {
+            BaselineStep::Got(b) => b,
+            BaselineStep::Retry => {
+                after_initial_list = false;
+                continue 'attach;
             }
-            sub = resubscribe(&ctx, &resub, make_client, &mut retry_backoff, &detail, session_id).await;
-            after_initial_list = true;
-            continue 'attach;
+            BaselineStep::Died(reason) => {
+                // Use the captured reason if we have it; otherwise pull the
+                // terminal Dead off the ring — BOUNDED (the Subscription
+                // keeps the broadcast Sender alive, so a plain recv loop
+                // could never see Closed and would hang).
+                let detail = match reason {
+                    Some(r) => r,
+                    None => drain_death_reason(&mut sub).await.unwrap_or_default(),
+                };
+                // Permanent iff the watcher never produced data for us
+                // (first LIST fail-fast: RBAC, unknown resource, CRD
+                // printer-column resolve error); transient otherwise.
+                if !sent_any_data {
+                    let msg = if detail.is_empty() {
+                        format!("Watcher failed for {}", rid.plural())
+                    } else {
+                        format!("Watcher failed for {}: {}", rid.plural(), detail)
+                    };
+                    let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Error(msg)).await;
+                    let _ = writer.flush().await;
+                    return;
+                }
+                sub = resubscribe(&ctx, &resub, make_client, &mut retry_backoff, &detail, session_id).await;
+                after_initial_list = true;
+                continue 'attach;
+            }
         };
 
         let baseline = filter_baseline(baseline, &filter);
-        if protocol::write_bincode(&mut writer, &protocol::StreamEvent::Baseline(baseline)).await.is_err() { return; }
+        // A baseline that exceeds the frame cap can never be delivered;
+        // sending it would fail on the write cap AND — after a prior
+        // success — churn (re-attach, re-LIST, re-serialize) forever.
+        // Surface it as a TERMINAL typed error instead (the Error frame
+        // itself is tiny), so the client shows a real message and stops
+        // retrying this subscription.
+        let baseline = protocol::StreamEvent::Baseline(baseline);
+        if protocol::frame_exceeds_cap(&baseline) {
+            let msg = format!(
+                "{} is too large to stream ({}): try a namespace or label filter",
+                rid.plural(), init.namespace.display(),
+            );
+            let _ = protocol::write_bincode(&mut writer, &protocol::StreamEvent::Error(msg)).await;
+            let _ = writer.flush().await;
+            return;
+        }
+        if protocol::write_bincode(&mut writer, &baseline).await.is_err() { return; }
         if writer.flush().await.is_err() { return; }
         if !sent_any_data {
             tracing::info!(session = session_id, sub = sub_id,
@@ -1193,8 +1274,8 @@ async fn handle_subscription_substream_inner(
             match sub.recv().await {
                 Ok(msg) => match &*msg {
                     crate::kube::live_query::WatcherMsg::Delta(delta) => {
-                        let delta = filter_delta(delta.clone(), &filter);
-                        if protocol::write_bincode(&mut writer, &protocol::StreamEvent::Delta(delta)).await.is_err() { return; }
+                        let delta = filter_delta(delta, &filter);
+                        if protocol::write_bincode(&mut writer, &protocol::StreamEventRef::Delta(delta.as_ref())).await.is_err() { return; }
                         if writer.flush().await.is_err() { return; }
                     }
                     crate::kube::live_query::WatcherMsg::Dead(reason) => {
@@ -1225,6 +1306,19 @@ async fn handle_subscription_substream_inner(
     }
 }
 
+/// Outcome of one baseline-acquisition attempt in the attach loop.
+enum BaselineStep {
+    /// The baseline arrived — proceed to the steady delta loop.
+    Got(protocol::TableBaseline),
+    /// The subscriber lagged before the baseline landed; re-ask (the
+    /// watcher is alive).
+    Retry,
+    /// The watcher died. `Some(reason)` when we captured the terminal
+    /// Dead directly; `None` when only the ask/channel signalled death
+    /// and the reason must be drained off the ring.
+    Died(Option<String>),
+}
+
 // Capture re-subscription recipe so the bridge can retry after watcher
 // death. Built-ins need (key, kind); CRDs need the resolved identity.
 enum ResubInfo {
@@ -1237,24 +1331,52 @@ enum ResubInfo {
         gvk: kube::api::GroupVersionKind,
         plural: String,
         scope: protocol::ResourceScope,
-        printer_columns: Vec<crate::kube::cache::PrinterColumn>,
+        // No printer_columns snapshot: the respawned watcher re-resolves
+        // its own — a stale or cold plan can't be replayed.
     },
 }
 
 /// After a watcher death, pull the terminal `Dead(reason)` off the ring if
-/// it's still there (it is sent as the task's final act).
+/// it's still there (it is sent as the task's final act, BEFORE the task
+/// returns — so once we observe the ask/channel signalling death, the Dead
+/// is already buffered and this returns in microseconds).
+///
+/// BOUNDED on two axes: the `Subscription` keeps the broadcast `Sender`
+/// alive (via `_keepalive`), so a plain recv loop could never see `Closed`
+/// and would hang if the Dead had already been consumed elsewhere. So we
+/// short-circuit the instant the watcher task is observably finished-with-
+/// no-Dead-pending, and cap the whole thing with a timeout as a backstop.
 async fn drain_death_reason(sub: &mut crate::kube::live_query::Subscription) -> Option<String> {
-    loop {
-        match sub.recv().await {
-            Ok(msg) => {
-                if let crate::kube::live_query::WatcherMsg::Dead(reason) = &*msg {
-                    return Some(reason.clone());
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match sub.recv().await {
+                Ok(msg) => {
+                    if let crate::kube::live_query::WatcherMsg::Dead(reason) = &*msg {
+                        return Some(reason.clone());
+                    }
+                    // A non-Dead message AND the task already finished means
+                    // the terminal Dead was evicted from the ring (a Lagged
+                    // overrun) — nothing more is coming. Give up now rather
+                    // than waiting out the 2s timeout (the Sender is kept
+                    // alive by the Subscription's keepalive, so Closed never
+                    // fires to end the loop otherwise).
+                    if sub.watcher_finished() {
+                        return None;
+                    }
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Skipped past the Dead while lagged: if the task is
+                    // gone there is nothing left to find.
+                    if sub.watcher_finished() {
+                        return None;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
         }
-    }
+    })
+    .await;
+    drained.unwrap_or(None)
 }
 
 /// Backoff, then re-subscribe (the WatcherCache sees the dead watcher and
@@ -1282,10 +1404,11 @@ async fn resubscribe(
         ResubInfo::BuiltIn { key, kind } => {
             ctx.shared.watcher_cache.subscribe(key.clone(), *kind, make_client, ctx.streaming_lists)
         }
-        ResubInfo::Dynamic { key, gvk, plural, scope, printer_columns } => {
+        ResubInfo::Dynamic { key, gvk, plural, scope } => {
             ctx.shared.watcher_cache.subscribe_dynamic(
                 key.clone(), make_client, gvk.clone(),
-                plural.clone(), *scope, printer_columns.clone(), ctx.streaming_lists,
+                plural.clone(), *scope, Arc::clone(&ctx.shared.discovery_cache),
+                ctx.streaming_lists,
             )
         }
     }
@@ -1310,17 +1433,20 @@ fn filter_baseline(
 /// the filter becomes a Remove — the row may never have been shown, but
 /// client removes are idempotent (remove-of-absent is a no-op), so a pod
 /// whose ownerRef mutates away from the drill correctly disappears.
-fn filter_delta(
-    delta: protocol::TableDelta,
+fn filter_delta<'a>(
+    delta: &'a protocol::TableDelta,
     filter: &Option<protocol::SubscriptionFilter>,
-) -> protocol::TableDelta {
+) -> std::borrow::Cow<'a, protocol::TableDelta> {
+    // No owner filter → BORROW the delta unchanged (the common case: no
+    // clone, no rewrite). Only an OwnerUid filter rewrites, and only that
+    // path pays for an owned copy.
     let Some(protocol::SubscriptionFilter::OwnerUid(ref uid)) = filter else {
-        return delta;
+        return std::borrow::Cow::Borrowed(delta);
     };
-    let changes = delta.changes.into_iter().map(|change| match change {
+    let changes = delta.changes.iter().map(|change| match change {
         protocol::RowChange::Upsert(row) => {
             if row.owner_refs.iter().any(|r| r.uid == *uid) {
-                protocol::RowChange::Upsert(row)
+                protocol::RowChange::Upsert(row.clone())
             } else {
                 protocol::RowChange::Remove(protocol::ObjectKey::new(
                     row.namespace.clone().unwrap_or_default(),
@@ -1328,9 +1454,9 @@ fn filter_delta(
                 ))
             }
         }
-        protocol::RowChange::Remove(key) => protocol::RowChange::Remove(key),
+        protocol::RowChange::Remove(key) => protocol::RowChange::Remove(key.clone()),
     }).collect();
-    protocol::TableDelta { changes }
+    std::borrow::Cow::Owned(protocol::TableDelta { changes })
 }
 
 // (`AbortOnDrop` lived here originally; it's now `crate::util::AbortOnDrop`,
@@ -1360,6 +1486,98 @@ async fn handle_log_substream(
     // Fallback: kubectl logs. Spawns a subprocess with its own auth.
     stream_logs_via_kubectl(&init, &mut writer, &ctx).await;
     tracing::debug!("log substream ended (kubectl) for pod={}", init.pod);
+}
+
+/// Cap on a single log line's length. A hostile/broken workload can emit a
+/// line with no newline for gigabytes; `.lines()`/`.next_line()` buffer the
+/// WHOLE line before yielding, so an uncapped read is a daemon OOM (which
+/// kills every session). 1 MiB is generous for any real log line; the
+/// overflow is discarded (up to the next newline) so memory stays bounded.
+const MAX_LOG_LINE_BYTES: usize = 1 << 20;
+
+const LINE_TRUNCATED_MARKER: &str = "…[k9rs: line truncated]";
+
+/// Read one newline-terminated line from a tokio `AsyncBufRead`, capping
+/// accumulated bytes at `max` and DISCARDING the rest of an over-long line
+/// (bounded memory). `Ok(None)` at EOF with nothing buffered.
+async fn read_capped_line_tokio<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+    let mut line: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok((!line.is_empty()).then(|| finish_capped_line(line, truncated)));
+        }
+        let (upto, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(pos) => (pos, true),
+            None => (chunk.len(), false),
+        };
+        if line.len() < max {
+            let take = (max - line.len()).min(upto);
+            line.extend_from_slice(&chunk[..take]);
+            if take < upto {
+                truncated = true;
+            }
+        } else if upto > 0 {
+            truncated = true;
+        }
+        let advance = if done { upto + 1 } else { upto };
+        AsyncBufRead::consume(std::pin::Pin::new(&mut *reader), advance);
+        if done {
+            return Ok(Some(finish_capped_line(line, truncated)));
+        }
+    }
+}
+
+/// Same as [`read_capped_line_tokio`] for a `futures::AsyncBufRead` (what
+/// `Api::log_stream` returns).
+async fn read_capped_line_futures<R: futures::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    use futures::{AsyncBufRead, AsyncBufReadExt};
+    let mut line: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok((!line.is_empty()).then(|| finish_capped_line(line, truncated)));
+        }
+        let (upto, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(pos) => (pos, true),
+            None => (chunk.len(), false),
+        };
+        if line.len() < max {
+            let take = (max - line.len()).min(upto);
+            line.extend_from_slice(&chunk[..take]);
+            if take < upto {
+                truncated = true;
+            }
+        } else if upto > 0 {
+            truncated = true;
+        }
+        let advance = if done { upto + 1 } else { upto };
+        AsyncBufRead::consume(std::pin::Pin::new(&mut *reader), advance);
+        if done {
+            return Ok(Some(finish_capped_line(line, truncated)));
+        }
+    }
+}
+
+fn finish_capped_line(bytes: Vec<u8>, truncated: bool) -> String {
+    let mut s = String::from_utf8_lossy(&bytes).into_owned();
+    // Trim a trailing CR (kubectl/CRLF logs) to match `.lines()` behavior.
+    if s.ends_with('\r') {
+        s.pop();
+    }
+    if truncated {
+        s.push_str(LINE_TRUNCATED_MARKER);
+    }
+    s
 }
 
 /// Stream logs via the kube-rs `Api::log_stream` API.
@@ -1405,20 +1623,16 @@ async fn stream_logs_via_api(
         }
     };
 
-    // kube-rs log_stream returns `impl futures::AsyncBufRead`. Convert
-    // to lines via the futures crate's async line reader.
-    let mut lines = futures::io::AsyncBufReadExt::lines(reader);
-    while let Some(line_result) = futures::StreamExt::next(&mut lines).await {
-        match line_result {
-            Ok(line) => {
-                // API path only serves Named/Default (All falls back to
-                // kubectl), so every line is single-source → untagged.
-                let log_line = protocol::LogLine::untagged(line);
-                if protocol::write_bincode(writer, &log_line).await.is_err() { return Ok(()); }
-                if writer.flush().await.is_err() { return Ok(()); }
-            }
-            Err(_) => break,
-        }
+    // kube-rs log_stream returns `impl futures::AsyncBufRead`. Read
+    // length-capped lines so a workload emitting a giant newline-free line
+    // can't OOM the daemon.
+    let mut reader = reader;
+    while let Ok(Some(line)) = read_capped_line_futures(&mut reader, MAX_LOG_LINE_BYTES).await {
+        // API path only serves Named/Default (All falls back to
+        // kubectl), so every line is single-source → untagged.
+        let log_line = protocol::LogLine::untagged(line);
+        if protocol::write_bincode(writer, &log_line).await.is_err() { return Ok(()); }
+        if writer.flush().await.is_err() { return Ok(()); }
     }
     Ok(())
 }
@@ -1463,8 +1677,6 @@ async fn stream_logs_via_kubectl(
     writer: &mut tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
     ctx: &SessionContext,
 ) {
-    use tokio::io::AsyncBufReadExt;
-
     let mut cmd = ctx.session_env.kubectl();
     cmd.arg("logs").arg(&init.pod);
     match &init.container {
@@ -1502,13 +1714,13 @@ async fn stream_logs_via_kubectl(
         Some(s) => s,
         None => return,
     };
-    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let mut reader = tokio::io::BufReader::new(stdout);
 
     // Only `--all-containers` carries kubectl's `[source] ` prefix; tag those
     // lines with the source container and strip the prefix. Single-container
     // streams have no prefix and ride the wire untagged.
     let all_containers = matches!(init.container, protocol::LogContainer::All);
-    while let Ok(Some(line)) = lines.next_line().await {
+    while let Ok(Some(line)) = read_capped_line_tokio(&mut reader, MAX_LOG_LINE_BYTES).await {
         let parsed = if all_containers { split_all_containers_prefix(&line) } else { None };
         let log_line = match parsed {
             Some((container, body)) => protocol::LogLine {
@@ -1535,6 +1747,21 @@ async fn handle_exec_substream(
     mut writer: tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
     ctx: Arc<SessionContext>,
 ) {
+    // Read-only gate. Exec rides a DATA substream, so it bypasses the
+    // control loop's `is_mutating` check — enforce here. `kubectl exec`
+    // and `kubectl debug` both mutate cluster state (a debug session can
+    // run arbitrary commands; `debug node/...` creates a debug pod), and
+    // a non-cooperative client could send `delete`/`apply` args, so a
+    // read-only session must not open an exec substream at all.
+    if ctx.readonly {
+        tracing::warn!(session = ctx.session_id, "exec refused: session is read-only");
+        let _ = protocol::write_bincode(
+            &mut writer,
+            &protocol::ExecFrame::Data(b"k9rs: exec refused (read-only session)\r\n".to_vec()),
+        ).await;
+        let _ = writer.flush().await;
+        return;
+    }
     // The TUI sends the full kubectl args. The daemon only adds --context
     // from the session's active context (the TUI doesn't know the daemon's
     // context identity).

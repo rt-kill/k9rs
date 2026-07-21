@@ -13,12 +13,14 @@ use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::Client;
 use tracing::warn;
 
-use crate::kube::cache::PrinterColumn;
-use crate::kube::protocol::ResourceScope;
+use crate::kube::cache::{CachedCrd, DiscoveryCache, PrinterColumn};
+use crate::kube::protocol::{ContextId, ResourceScope};
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
-/// Watcher for dynamic CRD instances. Thin wrapper: build the Api + column
-/// plan, then run the shared typed loop with a JSONPath-driven converter.
+/// Watcher for dynamic CRD instances. Thin wrapper: RESOLVE the column
+/// plan (the watcher owns its whole definition — identity AND projection
+/// — from birth; see [`resolve_printer_columns`]), build the Api, then
+/// run the shared typed loop with a JSONPath-driven converter.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_dynamic_live_watcher(
     client: Client,
@@ -28,9 +30,26 @@ pub(crate) async fn run_dynamic_live_watcher(
     gvk: GroupVersionKind,
     plural: String,
     scope: ResourceScope,
-    printer_columns: Vec<PrinterColumn>,
+    discovery: std::sync::Arc<DiscoveryCache>,
+    context: ContextId,
     streaming_lists: bool,
 ) {
+    // First act: resolve the projection recipe from its authoritative
+    // source. Every watcher RUN re-resolves (death-retry, Ctrl-R force,
+    // cache eviction), so a failed or raced resolution can never stick.
+    let printer_columns =
+        match resolve_printer_columns(&client, &discovery, &context, &gvk.group, &plural).await {
+            Ok(cols) => cols,
+            Err(reason) => {
+                // Honest terminal death — the bridge surfaces the error
+                // and its backoff-retry respawns us (re-resolving).
+                let _ = delta_tx.send(std::sync::Arc::new(
+                    super::live_query::WatcherMsg::Dead(reason),
+                ));
+                return;
+            }
+        };
+
     let ar = if plural.is_empty() {
         ApiResource::from_gvk(&gvk)
     } else {
@@ -60,6 +79,66 @@ pub(crate) async fn run_dynamic_live_watcher(
         &ns,
     )
     .await;
+}
+
+/// Resolve a dynamic kind's projection recipe (`additionalPrinterColumns`)
+/// from its authoritative source: the CRD definition object. The
+/// discovery cache ACCELERATES this (warm after the bulk poll) but never
+/// substitutes for it — on a miss we await one GET of the definition and
+/// share the result back into the cache. The old
+/// `printer_columns_for(..).unwrap_or_default()` — which silently turned
+/// a cold cache into a gutted column plan — is unrepresentable now: no
+/// path constructs a plan from absence of knowledge.
+///
+/// Typed outcomes:
+/// - `Ok(cols)` — knowledge (possibly legitimately empty: CRDs may
+///   declare no printer columns);
+/// - 404 → `Ok(empty)` — no CRD object exists (aggregated-API resource):
+///   the metadata plan IS the correct plan, a fact rather than a fallback;
+/// - 403 → `Ok(empty)` + warning — the recipe exists but is forbidden:
+///   explicit, logged degradation;
+/// - anything else → `Err` — the watcher dies honestly and the bridge's
+///   retry machinery respawns (and re-resolves).
+async fn resolve_printer_columns(
+    client: &Client,
+    discovery: &DiscoveryCache,
+    context: &ContextId,
+    group: &str,
+    plural: &str,
+) -> Result<Vec<PrinterColumn>, String> {
+    if let Some(cols) = discovery.printer_columns_for(context, group, plural) {
+        return Ok(cols);
+    }
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+    let api: kube::Api<CustomResourceDefinition> = kube::Api::all(client.clone());
+    let name = if group.is_empty() {
+        plural.to_string()
+    } else {
+        format!("{plural}.{group}")
+    };
+    match api.get(&name).await {
+        Ok(crd) => match CachedCrd::from_k8s(&crd) {
+            Some(cached) => {
+                let cols = cached.printer_columns.clone();
+                discovery.merge_crd(context.clone(), cached);
+                Ok(cols)
+            }
+            // A CRD object without a name can't exist server-side; treat
+            // an unparseable one as declaring no columns.
+            None => Ok(Vec::new()),
+        },
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            // Not a CRD at all (aggregated API server resource) — there
+            // is no recipe to have; metadata columns are the truth.
+            tracing::debug!("{name}: no CRD object (aggregated API?) — metadata columns");
+            Ok(Vec::new())
+        }
+        Err(kube::Error::Api(ae)) if ae.code == 403 => {
+            warn!("{name}: CRD definition read forbidden — printer columns unavailable, showing metadata columns");
+            Ok(Vec::new())
+        }
+        Err(e) => Err(format!("failed to resolve printer columns for {name}: {e}")),
+    }
 }
 
 /// The full ordered column plan for a dynamic resource: NAMESPACE (if
@@ -122,9 +201,15 @@ fn column_plan(
 /// that fails to serialize (shouldn't happen for a well-formed
 /// `DynamicObject`) yields a named row with empty cells + a warning,
 /// rather than silently vanishing.
-fn convert_dynamic(obj: DynamicObject, columns: &[PrinterColumn]) -> ResourceRow {
+fn convert_dynamic(mut obj: DynamicObject, columns: &[PrinterColumn]) -> ResourceRow {
     let namespace = obj.metadata.namespace.clone().unwrap_or_default();
     let name = obj.metadata.name.clone().unwrap_or_default();
+
+    // `managedFields` is frequently 10–50 KB/object and no printer column
+    // addresses it — drop it before serializing to the JSON tree the
+    // JSONPaths walk, so a 10k-instance CRD relist doesn't build (and
+    // discard) that much extra tree per object.
+    obj.metadata.managed_fields = None;
 
     let cells: Vec<CellValue> = match serde_json::to_value(&obj) {
         Ok(json_val) => columns

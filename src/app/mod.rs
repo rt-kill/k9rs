@@ -1,7 +1,9 @@
 pub mod actions;
+pub mod anim;
 pub mod derived;
 pub mod element;
 pub mod nav;
+pub mod select_gate;
 pub mod store;
 pub mod table;
 pub mod types;
@@ -205,6 +207,31 @@ pub struct App {
     /// main loop. Same mechanism as context switching.
     pub reconnect_requested: bool,
 
+    /// True once a session has EVER connected. Distinguishes an initial
+    /// connection failure (fatal — the daemon isn't reachable at startup)
+    /// from a RECONNECT failure (retry — the daemon died and we keep the
+    /// user in the TUI, per the DaemonDisconnected contract, instead of
+    /// quitting on the first failed re-connect).
+    pub has_connected: bool,
+    /// Earliest instant the next reconnect attempt may run. `None` = as
+    /// soon as possible. Set with an exponential backoff after a failed
+    /// reconnect so a truly-down daemon doesn't get hammered.
+    pub reconnect_at: Option<std::time::Instant>,
+    /// Current reconnect backoff; resets on a successful connect.
+    pub reconnect_backoff: Duration,
+
+    /// The in-flight batch operation, if any — correlates per-target
+    /// `OpResult`s (unmark per-success, aggregate ONE summary flash).
+    /// At most one, ENFORCED: `handle_batch_op` refuses to dispatch
+    /// while this is `Some`; it is cleared when the last result lands,
+    /// and taken (partial tally folded into the flash) on daemon
+    /// disconnect and on context switch — the two paths where the
+    /// remaining results can never arrive. Residual: a daemon-side task
+    /// that dies WITHOUT sending its result leaves the tracker waiting
+    /// until one of those paths runs (no timeout; a wire correlation id
+    /// + deadline would be the full fix if it ever bites).
+    pub pending_batch: Option<BatchTracker>,
+
     /// When true, Ctrl-C does not quit the application (`noExitOnCtrlC` config).
     pub no_exit_on_ctrl_c: bool,
     /// When true, destructive actions (delete, edit, scale, restart, force-kill, shell) are disabled.
@@ -220,10 +247,15 @@ pub struct App {
 }
 
 impl App {
+    /// `config` is loaded (and validated, loudly) by `main` BEFORE any
+    /// TUI setup and threaded in — the App never reads the config file
+    /// itself, so tests are hermetic by construction and a config error
+    /// is a visible startup failure, not a silent default fallback.
     pub fn new(
         context: crate::kube::protocol::ContextName,
         namespace: crate::kube::protocol::Namespace,
         session: &crate::kube::client_session::ClientSession,
+        config: AppConfig,
     ) -> Self {
         let _ = session; // the Overview root opens no subscription
         let metrics = store::MetricsHub::new();
@@ -231,11 +263,15 @@ impl App {
         // watch opens until the user navigates to one (startup args or
         // `:cmd` reset to a resource root).
         let root = element::Element::Overview(element::Overview);
-        Self::new_with_root(context, namespace, metrics, root)
+        Self::new_with_root(context, namespace, metrics, root, config)
     }
 
     /// Test-only: an App whose root element rides a parked stream — no
-    /// session, no daemon, no network.
+    /// session, no daemon, no network. The config is the compiled-in
+    /// DEFAULT, never the machine's `~/.config/k9rs/config.yaml` — a
+    /// user's key rebindings (or any other setting) must not change
+    /// what the tests assert. Hermetic by construction: the config is a
+    /// parameter, so no test path can open the file.
     #[cfg(test)]
     pub(crate) fn new_for_test() -> Self {
         let namespace = crate::kube::protocol::Namespace::All;
@@ -249,7 +285,10 @@ impl App {
             &metrics,
             "pods".to_string(),
         ));
-        Self::new_with_root(crate::kube::protocol::ContextName::default(), namespace, metrics, root)
+        Self::new_with_root(
+            crate::kube::protocol::ContextName::default(), namespace, metrics, root,
+            AppConfig::default(),
+        )
     }
 
     fn new_with_root(
@@ -257,8 +296,8 @@ impl App {
         namespace: crate::kube::protocol::Namespace,
         metrics: std::sync::Arc<store::MetricsHub>,
         root: element::Element,
+        config: AppConfig,
     ) -> Self {
-        let config = Self::load_config();
         let cache_capacity = config.ui.cache_capacity;
         let skin_name = config.ui.skin.clone();
         Self {
@@ -272,6 +311,10 @@ impl App {
             no_exit_on_ctrl_c: config.no_exit_on_ctrl_c,
             read_only: config.read_only,
             reconnect_requested: false,
+            has_connected: false,
+            reconnect_at: None,
+            reconnect_backoff: Duration::from_millis(500),
+            pending_batch: None,
             config,
             ui: UiState {
                 flash: None,
@@ -283,6 +326,7 @@ impl App {
                 show_header: true,
                 tick_count: 0,
                 column_level: ColumnLevel::Default,
+                anim: crate::app::anim::Anim::default(),
             },
             kube: KubeState {
                 context,
@@ -333,14 +377,19 @@ impl App {
         ))
     }
 
-    /// Load settings from `~/.config/k9rs/config.yaml`. Uses the shared
-    /// `load_section` helper and serde deserialization — adding a new config
-    /// field is just adding a struct field with `#[serde(default)]`.
-    fn load_config() -> AppConfig {
+    /// Load and VALIDATE settings from `~/.config/k9rs/config.yaml`.
+    /// Missing file/section → defaults; a present-but-invalid file (YAML
+    /// error, unknown field, malformed chord, reserved-key collision) →
+    /// `Err` with the full story. Called by `main` BEFORE the alternate
+    /// screen so the error lands on a visible stderr and the process
+    /// exits — never a silent fallback to defaults.
+    pub fn load_config() -> Result<AppConfig, String> {
         // The top-level k9rs section deserializes directly into AppConfig
         // because AppConfig uses `#[serde(rename_all = "camelCase", default)]`.
-        crate::kube::daemon_config::load_section::<AppConfig>("")
-            .unwrap_or_default()
+        let config = crate::kube::daemon_config::load_section::<AppConfig>("")?
+            .unwrap_or_default();
+        config.keys.validate()?;
+        Ok(config)
     }
 
     // -- Element dispatch -------------------------------------------------------
@@ -376,6 +425,14 @@ impl App {
         self.nav.top_mut().col_right();
     }
 
+    pub fn col_first(&mut self) {
+        self.nav.top_mut().col_first();
+    }
+
+    pub fn col_last(&mut self) {
+        self.nav.top_mut().col_last();
+    }
+
     pub fn select_next(&mut self) {
         self.nav.top_mut().select_next();
     }
@@ -406,18 +463,19 @@ impl App {
     }
 
     /// Toggle mark on the row under the cursor.
-    pub fn toggle_mark(&mut self) {
-        self.nav.top_mut().toggle_mark();
+    pub fn toggle_mark(&mut self) -> element::MarkOutcome {
+        self.nav.top_mut().toggle_mark()
     }
 
-    /// Mark the span from the nearest mark to the cursor.
-    pub fn span_mark(&mut self) {
-        self.nav.top_mut().span_mark();
+    /// Mark the span from the nearest visible mark to the cursor.
+    pub fn span_mark(&mut self) -> element::SpanOutcome {
+        self.nav.top_mut().span_mark()
     }
 
-    /// Clear all marks on the top element's data.
-    pub fn clear_marks(&mut self) {
-        self.nav.top_mut().clear_marks();
+    /// Clear all marks on the top element's data. `false` = the view has
+    /// no markable rows.
+    pub fn clear_marks(&mut self) -> bool {
+        self.nav.top_mut().clear_marks()
     }
 
     /// Sort the top element by the given target column (same column
@@ -452,32 +510,12 @@ impl App {
                 changed = true;
             }
         }
-        // Keep redrawing while a loading state is active (spinner animation).
-        if !changed {
-            // Resource table loading
-            let top = self.nav.top();
-            if top.counts().total == 0
-                && matches!(top.data_state(), crate::app::table::TableDataState::Initializing)
-            {
-                changed = true;
-            }
-            // Log view: animate while streaming with no lines yet.
-            if !changed {
-                if let Some(store) = self.nav.top().log_store() {
-                    if store.with_read(|i| i.live && i.lines.is_empty()) {
-                        changed = true;
-                    }
-                }
-            }
-            // Shell overlay: animate while connecting (waiting for first byte).
-            if !changed {
-                if let Some(Overlay::Shell(ref shell)) = self.ui.overlay {
-                    if shell.connect_state == crate::app::ShellConnectState::Connecting {
-                        changed = true;
-                    }
-                }
-            }
-        }
+        // NOTE: loading-spinner animation is NOT driven from here. It used to
+        // be a hand-maintained list of loading states (resource / log / shell)
+        // that had to mirror every place a spinner is drawn — and drifted
+        // (yaml/describe were never covered). The spinner now owns its own
+        // liveness and cadence via `ui::anim::Anim`, driven by the event loop's
+        // animation clock. See `crate::app::anim`.
         changed
     }
 

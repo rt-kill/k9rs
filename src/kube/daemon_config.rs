@@ -7,9 +7,20 @@ use std::sync::LazyLock;
 
 use serde::Deserialize;
 
-/// Global daemon config, loaded once at startup.
+/// Global daemon config, loaded once at startup. LENIENT on invalid
+/// config (warn + defaults): the TUI is the loud gate — it refuses to
+/// start on the same file's errors before ever spawning a daemon, so a
+/// long-running daemon whose config went bad after launch degrades
+/// rather than dying mid-flight.
 static CONFIG: LazyLock<DaemonConfig> = LazyLock::new(|| {
-    load_section::<DaemonConfig>("daemon").unwrap_or_default()
+    match load_section::<DaemonConfig>("daemon") {
+        Ok(Some(c)) => c,
+        Ok(None) => DaemonConfig::default(),
+        Err(e) => {
+            tracing::warn!("config: {e} — daemon using defaults");
+            DaemonConfig::default()
+        }
+    }
 });
 
 /// Access the daemon config.
@@ -23,6 +34,15 @@ pub fn daemon_config() -> &'static DaemonConfig {
 pub struct DaemonConfig {
     pub watcher_page_size: u32,
     pub discovery_refresh_secs: u64,
+    /// Delta-broadcast ring depth per watcher (batches). A tokio broadcast
+    /// ring retains each value until 63 newer ones overwrite it, so a
+    /// larger ring both tolerates a slower subscriber before it must
+    /// re-baseline (≈ ring × 200 ms flush) AND keeps that many batches
+    /// resident — on a QUIET large resource the initial LIST's batches are
+    /// never overwritten, so the whole dataset stays pinned. Lower this to
+    /// cut daemon memory on big quiet resources; raise it if slow (SSH)
+    /// clients re-baseline too often.
+    pub fanout_ring: usize,
     pub backoff: BackoffConfig,
     /// Exec-backed local resource sources. Each entry defines a command
     /// that is periodically run; its JSON stdout is parsed into table rows.
@@ -35,6 +55,7 @@ impl Default for DaemonConfig {
         Self {
             watcher_page_size: 1000,
             discovery_refresh_secs: 300,
+            fanout_ring: 64,
             backoff: BackoffConfig::default(),
             exec_resources: Vec::new(),
         }
@@ -65,39 +86,45 @@ impl Default for BackoffConfig {
 // ---------------------------------------------------------------------------
 
 /// Read `~/.config/k9rs/config.yaml` and deserialize the `k9rs` root section
-/// (or a sub-section) into `T`. Returns `None` if the file is missing,
-/// the section is absent, or deserialization fails.
+/// (or a sub-section) into `T`.
+///
+/// - `Ok(None)` — the file, the `k9rs` root, or the requested section is
+///   ABSENT. Expected; callers use their defaults.
+/// - `Err` — the file EXISTS but is invalid (unreadable, YAML syntax
+///   error, or strict deserialization failed). The user wrote something
+///   and it is being rejected — callers must never silently collapse
+///   this into "use defaults": a one-letter typo in `keys:` would revert
+///   the whole config (`readOnly` included) with zero feedback, since
+///   the TUI's tracing writes to a sink without `--log-file`.
 ///
 /// - `load_section::<AppConfig>("")` → deserializes the `k9rs` key
 /// - `load_section::<DaemonConfig>("daemon")` → deserializes `k9rs.daemon`
-///
-/// Used by both the TUI and daemon loaders.
-pub(crate) fn load_section<T: serde::de::DeserializeOwned>(section: &str) -> Option<T> {
-    let home = std::env::var("HOME").ok()?;
+pub(crate) fn load_section<T: serde::de::DeserializeOwned>(
+    section: &str,
+) -> Result<Option<T>, String> {
+    let Ok(home) = std::env::var("HOME") else { return Ok(None) };
     let path = std::path::Path::new(&home).join(".config/k9rs/config.yaml");
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return None, // file missing — expected, no warning
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {}", path.display(), e)),
     };
-    let yaml: serde_yaml::Value = match serde_yaml::from_str(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("config: failed to parse {}: {}", path.display(), e);
-            return None;
-        }
-    };
-    let root = yaml.get("k9rs")?;
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&content)
+        .map_err(|e| format!("{}: YAML syntax error: {}", path.display(), e))?;
+    let Some(root) = yaml.get("k9rs") else { return Ok(None) };
     let val = if section.is_empty() {
         root.clone()
     } else {
-        root.get(section)?.clone()
+        match root.get(section) {
+            Some(v) => v.clone(),
+            None => return Ok(None),
+        }
     };
     match serde_yaml::from_value(val) {
-        Ok(v) => Some(v),
+        Ok(v) => Ok(Some(v)),
         Err(e) => {
-            let label = if section.is_empty() { "root" } else { section };
-            tracing::warn!("config: failed to deserialize '{}' section: {}", label, e);
-            None
+            let label = if section.is_empty() { "k9rs" } else { section };
+            Err(format!("{}: invalid '{}' section: {}", path.display(), label, e))
         }
     }
 }

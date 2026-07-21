@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::kube::protocol::{LogContainer, ObjectRef};
+use crate::kube::protocol::{LogContainer, ObjectKey, ObjectRef};
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -27,6 +27,9 @@ pub struct UiState {
     pub theme: crate::ui::theme::Theme,
     pub tick_count: usize,
     pub column_level: crate::kube::resource_def::ColumnLevel,
+    /// Self-contained animation clock for loading spinners — owns its phase,
+    /// liveness, and cadence so it can't be perturbed by the data path.
+    pub anim: crate::app::anim::Anim,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +240,223 @@ pub struct AppConfig {
     pub no_exit_on_ctrl_c: bool,
     pub read_only: bool,
     pub ui: UiConfig,
+    pub keys: KeysConfig,
+    /// The daemon's section of the SAME file. The TUI never reads these
+    /// values (the daemon loads its own section), but the field must
+    /// exist: AppConfig deserializes the whole `k9rs:` root with
+    /// `deny_unknown_fields`, so without it a documented `daemon:`
+    /// section would be rejected as a typo. Typed (not a raw Value) so
+    /// the TUI's loud startup validation covers daemon typos too.
+    pub daemon: Option<crate::kube::daemon_config::DaemonConfig>,
+}
+
+/// A single key chord: a character plus an optional Ctrl modifier.
+/// Parsed from config strings — `"l"`, `"L"` (shift rides in the
+/// character's case), `"ctrl-l"` / `"C-l"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct KeyCombo {
+    pub ctrl: bool,
+    pub ch: char,
+}
+
+impl KeyCombo {
+    pub const fn plain(ch: char) -> Self {
+        Self { ctrl: false, ch }
+    }
+
+    /// Display label for hints/help ("l", "C-l").
+    pub fn label(&self) -> String {
+        if self.ctrl {
+            format!("C-{}", self.ch)
+        } else if self.ch.is_uppercase() {
+            format!("Shift-{}", self.ch.to_lowercase())
+        } else {
+            self.ch.to_string()
+        }
+    }
+}
+
+impl TryFrom<String> for KeyCombo {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        // Raw single character first — BEFORE trimming, so `" "` binds
+        // the space key instead of collapsing to an empty spec.
+        let mut chars = s.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            return Ok(Self::plain(c)); // '-' and ' ' included
+        }
+        let t = s.trim();
+        let mut chars = t.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            return Ok(Self::plain(c));
+        }
+        if let Some((prefix, rest)) = t.rsplit_once('-') {
+            let ctrl = matches!(prefix.to_ascii_lowercase().as_str(), "ctrl" | "c");
+            let mut chars = rest.chars();
+            if let (true, Some(c), None) = (ctrl, chars.next(), chars.next()) {
+                // Lowercased: the terminal delivers Ctrl chords as
+                // lowercase chars (legacy keyboard protocol), so an
+                // uppercase spec like "Ctrl-L" would parse into a chord
+                // no key event can ever produce.
+                return Ok(Self { ctrl: true, ch: c.to_ascii_lowercase() });
+            }
+        }
+        Err(format!(
+            "invalid key spec '{t}': expected a single character or ctrl-<character>"
+        ))
+    }
+}
+
+/// User key rebindings for the resource view (`keys:` config section).
+///
+/// - An OPERATION entry REPLACES that operation's default key (bind
+///   `logs: ctrl-l` and plain `l` no longer streams logs). Operations
+///   whose default is a structural chord outside the descriptor
+///   (delete = Ctrl-D, force-kill = Ctrl-K, port-forward = Shift-F)
+///   keep it; their entry here binds an ADDITIONAL key.
+/// - `colLeft` / `colRight` ADD to the arrow keys (arrows are
+///   structural) and are matched before operation bindings, so
+///   `colRight: l` shadows an `l` operation default. `colFirst` /
+///   `colLast` jump the column cursor to the first / last column
+///   (vim `0` / `$`) and shadow defaults the same way — bind
+///   `colFirst: "0"` and `0` no longer switches to all namespaces.
+///
+/// Overlay-defined (`Custom`) operations bind through the overlay
+/// config, never here.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct KeysConfig {
+    pub col_left: Option<KeyCombo>,
+    pub col_right: Option<KeyCombo>,
+    pub col_first: Option<KeyCombo>,
+    pub col_last: Option<KeyCombo>,
+    pub describe: Option<KeyCombo>,
+    pub yaml: Option<KeyCombo>,
+    pub logs: Option<KeyCombo>,
+    pub previous_logs: Option<KeyCombo>,
+    pub shell: Option<KeyCombo>,
+    pub restart: Option<KeyCombo>,
+    pub scale: Option<KeyCombo>,
+    pub delete: Option<KeyCombo>,
+    pub force_kill: Option<KeyCombo>,
+    pub port_forward: Option<KeyCombo>,
+    pub show_node: Option<KeyCombo>,
+    pub node_shell: Option<KeyCombo>,
+    pub decode_secret: Option<KeyCombo>,
+    pub trigger_cron_job: Option<KeyCombo>,
+    pub toggle_suspend_cron_job: Option<KeyCombo>,
+}
+
+impl KeysConfig {
+    /// The configured override for an operation, if any. Exhaustive so a
+    /// new operation must decide whether it is user-bindable.
+    pub fn op_override(&self, op: &crate::kube::protocol::OperationKind) -> Option<KeyCombo> {
+        use crate::kube::protocol::OperationKind as Op;
+        match op {
+            Op::Describe => self.describe,
+            Op::Yaml => self.yaml,
+            Op::StreamLogs => self.logs,
+            Op::PreviousLogs => self.previous_logs,
+            Op::Shell => self.shell,
+            Op::Restart => self.restart,
+            Op::Scale => self.scale,
+            Op::Delete => self.delete,
+            Op::ForceKill => self.force_kill,
+            Op::PortForward => self.port_forward,
+            Op::ShowNode => self.show_node,
+            Op::NodeShell => self.node_shell,
+            Op::DecodeSecret => self.decode_secret,
+            Op::TriggerCronJob => self.trigger_cron_job,
+            Op::ToggleSuspendCronJob => self.toggle_suspend_cron_job,
+            Op::Custom(_) => None,
+        }
+    }
+
+    /// The EFFECTIVE chord for an operation: the user override, or the
+    /// descriptor's default key as a plain chord. `None` = only bound
+    /// structurally (Ctrl-D / Ctrl-K / Shift-F) or not at all.
+    pub fn op_key(&self, op: &crate::kube::protocol::OperationKind) -> Option<KeyCombo> {
+        self.op_override(op)
+            .or_else(|| op.descriptor().default_key.map(KeyCombo::plain))
+    }
+
+    /// Every configured binding as `(config name, chord)`.
+    fn entries(&self) -> Vec<(&'static str, KeyCombo)> {
+        [
+            ("colLeft", self.col_left),
+            ("colRight", self.col_right),
+            ("colFirst", self.col_first),
+            ("colLast", self.col_last),
+            ("describe", self.describe),
+            ("yaml", self.yaml),
+            ("logs", self.logs),
+            ("previousLogs", self.previous_logs),
+            ("shell", self.shell),
+            ("restart", self.restart),
+            ("scale", self.scale),
+            ("delete", self.delete),
+            ("forceKill", self.force_kill),
+            ("portForward", self.port_forward),
+            ("showNode", self.show_node),
+            ("nodeShell", self.node_shell),
+            ("decodeSecret", self.decode_secret),
+            ("triggerCronJob", self.trigger_cron_job),
+            ("toggleSuspendCronJob", self.toggle_suspend_cron_job),
+        ]
+        .into_iter()
+        .filter_map(|(name, combo)| combo.map(|c| (name, c)))
+        .collect()
+    }
+
+    /// Reject bindings that could never fire: chords consumed by earlier
+    /// dispatch layers (globals, structural Ctrl-D/Ctrl-K, the `:`/`/`/`?`
+    /// prompts) would leave the binding dead AND — since an override
+    /// REPLACES the default — the operation unreachable, silently.
+    /// Duplicates are rejected too (only the first-checked entry would
+    /// win, invisibly). Runs in the LOUD config-load path so a rejected
+    /// binding is a startup error, not a mystery.
+    pub fn validate(&self) -> Result<(), String> {
+        // Chords an earlier dispatch layer always consumes before
+        // bindings are consulted. Ctrl-K is capability-dependent at
+        // dispatch (force-kill views only) — reserved anyway, because a
+        // binding that works on configmaps but dies on pods is worse
+        // than a rejected one.
+        const RESERVED: &[(KeyCombo, &str)] = &[
+            (KeyCombo { ctrl: true, ch: 'c' }, "quit"),
+            (KeyCombo { ctrl: true, ch: 'r' }, "refresh"),
+            (KeyCombo { ctrl: true, ch: 'e' }, "toggle header"),
+            (KeyCombo { ctrl: true, ch: 's' }, "save table/logs"),
+            (KeyCombo { ctrl: true, ch: 'a' }, "aliases"),
+            (KeyCombo { ctrl: true, ch: 'w' }, "wide columns"),
+            (KeyCombo { ctrl: true, ch: 'z' }, "fault filter"),
+            (KeyCombo { ctrl: true, ch: ' ' }, "span-mark"),
+            (KeyCombo { ctrl: true, ch: '\\' }, "clear marks"),
+            (KeyCombo { ctrl: true, ch: 'd' }, "delete"),
+            (KeyCombo { ctrl: true, ch: 'k' }, "force-kill"),
+            (KeyCombo { ctrl: false, ch: ':' }, "command mode"),
+            (KeyCombo { ctrl: false, ch: '/' }, "filter"),
+            (KeyCombo { ctrl: false, ch: '?' }, "help"),
+        ];
+        let mut seen: std::collections::HashMap<KeyCombo, &'static str> =
+            std::collections::HashMap::new();
+        for (name, combo) in self.entries() {
+            if let Some((_, what)) = RESERVED.iter().find(|(r, _)| *r == combo) {
+                return Err(format!(
+                    "keys.{name}: '{}' is reserved ({what}) — the binding could never fire",
+                    combo.label(),
+                ));
+            }
+            if let Some(first) = seen.insert(combo, name) {
+                return Err(format!(
+                    "keys.{name}: '{}' is already bound by keys.{first}",
+                    combo.label(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// TUI rendering and interaction preferences.
@@ -484,8 +704,8 @@ pub enum Overlay {
     ///      and transitions to `EditState::EditorReady`.
     ///   3. The session loop sees `EditorReady`, suspends raw mode, runs
     ///      `$EDITOR`, sends `Apply`, transitions to `Applying`.
-    ///   4. `CommandResult` clears the overlay (or re-opens the editor
-    ///      with the server error prepended).
+    ///   4. The target-gated `OpResult` clears the overlay (or re-opens
+    ///      the editor with the server error prepended).
     Edit {
         target: crate::kube::protocol::ObjectRef,
         state: EditState,
@@ -586,8 +806,8 @@ pub enum EditState {
     /// YAML on disk, ready for the session loop to suspend + exec the
     /// editor. `original` is the unmodified YAML for diff comparison.
     EditorReady { temp_file: TempFile, original: String },
-    /// Sent the `Apply { target, yaml }` command, waiting for the
-    /// `CommandResult` to know whether the apply succeeded. Carries
+    /// Sent the `Apply { target, yaml }` command, waiting for this
+    /// target's `OpResult` to know whether the apply succeeded. Carries
     /// the temp file and original YAML so the editor can re-open on
     /// server error (same UX as `kubectl edit`).
     Applying { temp_file: TempFile, original: String },
@@ -705,6 +925,402 @@ pub struct ConfirmDialog {
     pub pending: PendingAction,
     /// True = action button focused, false = cancel focused (safe default).
     pub action_focused: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Batch tracker — correlates per-target OpResults back to a batch launch
+// ---------------------------------------------------------------------------
+
+/// An in-flight batch operation. Marks are NOT cleared at dispatch: each
+/// Ok result unmarks its row (so "what is still marked" always means
+/// "not yet succeeded"), failures keep their marks — retrying exactly
+/// the failed set is one keypress away. Results aggregate into ONE
+/// summary flash instead of N racing per-item flashes (single flash
+/// slot, last write wins — failures used to vanish behind a final Ok).
+#[derive(Debug)]
+pub struct BatchTracker {
+    /// Past-tense verb for the summary ("Deleted", "Restarted", …).
+    verb: &'static str,
+    /// Resource noun for the summary ("pod", "deployment", …).
+    noun: String,
+    /// The batch's resource kind. Every item of one batch shares it
+    /// (targets are built from one element's rid), and `consume` requires
+    /// it — without the check, a result for a DIFFERENT kind with the
+    /// same ns+name (delete service `web` while a deployment-`web` batch
+    /// is outstanding) would be silently misattributed. Same-kind
+    /// duplicates (a second op on the same object racing the batch)
+    /// remain ambiguous — full disambiguation needs a wire correlation
+    /// id on OpResult; documented, not attempted here.
+    rid: crate::kube::protocol::ResourceId,
+    /// Keys still awaiting a result.
+    outstanding: std::collections::HashSet<ObjectKey>,
+    ok: usize,
+    /// (name, error) per failed item.
+    failures: Vec<(String, String)>,
+    /// Confirmed targets that were already gone at confirm time.
+    skipped: usize,
+    /// The store the batch launched from — weak: result bookkeeping must
+    /// not keep a popped element's store alive.
+    store: std::sync::Weak<crate::app::store::RowStore>,
+}
+
+impl BatchTracker {
+    pub fn new(
+        verb: &'static str,
+        noun: String,
+        rid: crate::kube::protocol::ResourceId,
+        targets: &[ObjectRef],
+        skipped: usize,
+        store: std::sync::Weak<crate::app::store::RowStore>,
+    ) -> Self {
+        Self {
+            verb,
+            noun,
+            rid,
+            outstanding: targets.iter().map(Self::key_of).collect(),
+            ok: 0,
+            failures: Vec::new(),
+            skipped,
+            store,
+        }
+    }
+
+    /// The mark-identity of a target — inverse of how batch `ObjectRef`s
+    /// are built from marked keys (`Namespace::from_row` maps "" ↔ `All`).
+    pub fn key_of(target: &ObjectRef) -> ObjectKey {
+        ObjectKey::new(
+            target.namespace.as_option().unwrap_or("").to_string(),
+            target.name.clone(),
+        )
+    }
+
+    /// Record a send failure at dispatch time (the command never left the
+    /// client) — same accounting as a server-side Err.
+    pub fn fail_send(&mut self, target: &ObjectRef, error: String) {
+        self.outstanding.remove(&Self::key_of(target));
+        self.failures.push((target.name.clone(), error));
+    }
+
+    /// Consume a result if it belongs to this batch; `false` = not ours
+    /// (the caller should handle it as an ordinary single-op result).
+    /// Correlation = resource kind AND identity: the daemon echoes the
+    /// request's full `ObjectRef`, so both are authoritative.
+    pub fn consume(&mut self, target: &ObjectRef, result: &Result<String, String>) -> bool {
+        if target.resource != self.rid {
+            return false;
+        }
+        let key = Self::key_of(target);
+        if !self.outstanding.remove(&key) {
+            return false;
+        }
+        match result {
+            Ok(_) => {
+                self.ok += 1;
+                // Success unmarks the row. For Delete/ForceKill the row's
+                // removal prunes the mark anyway; Restart leaves the row
+                // in place, so this is the path that clears it.
+                if let Some(store) = self.store.upgrade() {
+                    store.unmark_keys(std::iter::once(&key));
+                }
+            }
+            Err(e) => self.failures.push((target.name.clone(), e.clone())),
+        }
+        true
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.outstanding.is_empty()
+    }
+
+    /// The aggregate flash. Info when everything succeeded; error with
+    /// the first failure spelled out otherwise.
+    pub fn summary(&self) -> FlashMessage {
+        let mut msg = format!("{} {} {}{}", self.verb, self.ok, self.noun,
+            if self.ok == 1 { "" } else { "s" });
+        if self.skipped > 0 {
+            msg.push_str(&format!(", {} skipped (gone)", self.skipped));
+        }
+        if self.failures.is_empty() {
+            FlashMessage::info(msg)
+        } else {
+            let (name, err) = &self.failures[0];
+            msg.push_str(&format!(
+                ", {} FAILED — {}: {}",
+                self.failures.len(), name, err,
+            ));
+            FlashMessage::error(msg)
+        }
+    }
+
+    /// Summary for a batch cut short (daemon disconnected with results
+    /// still outstanding).
+    pub fn interrupted_summary(&self) -> FlashMessage {
+        FlashMessage::warn(format!(
+            "Batch interrupted: {} ok, {} failed, {} unanswered",
+            self.ok, self.failures.len(), self.outstanding.len(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod batch_tracker_tests {
+    use super::*;
+    use crate::kube::protocol::{Namespace, ResourceId};
+    use crate::kube::resource_def::BuiltInKind;
+
+    fn target(name: &str, ns: &str) -> ObjectRef {
+        ObjectRef::new(
+            ResourceId::BuiltIn(BuiltInKind::Pod),
+            name.to_string(),
+            Namespace::from_row(ns),
+        )
+    }
+
+    /// key_of is the exact inverse of how batch ObjectRefs are built from
+    /// marked keys (Namespace::from_row): "" ↔ All round-trips.
+    #[test]
+    fn key_of_round_trips_the_marked_key() {
+        let key = crate::kube::protocol::ObjectKey::new("ns1".to_string(), "a".to_string());
+        let t = ObjectRef::new(
+            ResourceId::BuiltIn(BuiltInKind::Pod),
+            key.name.clone(),
+            Namespace::from_row(&key.namespace),
+        );
+        assert_eq!(BatchTracker::key_of(&t), key);
+
+        let cluster_key = crate::kube::protocol::ObjectKey::new(String::new(), "n1".to_string());
+        let t = ObjectRef::new(
+            ResourceId::BuiltIn(BuiltInKind::Node),
+            cluster_key.name.clone(),
+            Namespace::from_row(&cluster_key.namespace),
+        );
+        assert_eq!(BatchTracker::key_of(&t), cluster_key);
+    }
+
+    fn pod_rid() -> ResourceId {
+        ResourceId::BuiltIn(BuiltInKind::Pod)
+    }
+
+    #[test]
+    fn consume_correlates_and_aggregates() {
+        let targets = [target("a", "ns"), target("b", "ns"), target("c", "ns")];
+        let mut tr = BatchTracker::new("Deleted", "pod".to_string(), pod_rid(), &targets, 1, std::sync::Weak::new());
+        assert!(!tr.is_done());
+
+        // A result for a foreign target is NOT ours.
+        assert!(!tr.consume(&target("other", "ns"), &Ok("Deleted".into())));
+
+        // A result for a DIFFERENT KIND with the same ns+name is NOT
+        // ours either — the rid gate is what keeps a concurrent
+        // single-op on a same-named object of another kind from being
+        // misattributed to the batch.
+        let foreign_kind = ObjectRef::new(
+            ResourceId::BuiltIn(BuiltInKind::Deployment),
+            "a".to_string(),
+            Namespace::from_row("ns"),
+        );
+        assert!(!tr.consume(&foreign_kind, &Ok("Deleted".into())));
+        assert!(!tr.is_done());
+
+        assert!(tr.consume(&targets[0], &Ok("Deleted pod/a".into())));
+        assert!(tr.consume(&targets[1], &Err("Forbidden".into())));
+        assert!(!tr.is_done());
+        // A duplicate result for an already-consumed target is not ours.
+        assert!(!tr.consume(&targets[0], &Ok("again".into())));
+
+        assert!(tr.consume(&targets[2], &Ok("Deleted pod/c".into())));
+        assert!(tr.is_done());
+
+        let summary = tr.summary();
+        assert!(summary.message.contains("Deleted 2 pods"), "{}", summary.message);
+        assert!(summary.message.contains("1 skipped"), "{}", summary.message);
+        assert!(summary.message.contains("1 FAILED"), "{}", summary.message);
+        assert!(summary.message.contains("Forbidden"), "{}", summary.message);
+    }
+
+    #[test]
+    fn ok_results_unmark_their_rows_through_the_weak_store() {
+        use crate::app::store::{RowStore, StorePayload};
+        use crate::kube::protocol::TableBaseline;
+        use crate::kube::resources::row::{CellValue, ResourceRow};
+
+        let store = RowStore::new("pods");
+        let row = ResourceRow {
+            cells: vec![CellValue::Text("a".into())],
+            name: "a".into(),
+            namespace: Some("ns".into()),
+            ..Default::default()
+        };
+        store.apply(1, StorePayload::Baseline(TableBaseline {
+            resource: ResourceId::BuiltIn(BuiltInKind::Pod),
+            headers: vec!["NAME".into()],
+            rows: vec![row],
+        }));
+        let key = crate::kube::protocol::ObjectKey::new("ns".to_string(), "a".to_string());
+        assert_eq!(store.toggle_mark(&key), Some(true));
+
+        let t = target("a", "ns");
+        let mut tr = BatchTracker::new(
+            "Restarted", "pod".to_string(), pod_rid(), std::slice::from_ref(&t), 0,
+            std::sync::Arc::downgrade(&store),
+        );
+        assert!(tr.consume(&t, &Ok("Restarted".into())));
+        assert!(!store.has_marks(), "success unmarked the row (restart keeps rows in place)");
+        assert!(tr.is_done());
+    }
+
+    #[test]
+    fn failed_results_keep_their_marks() {
+        use crate::app::store::{RowStore, StorePayload};
+        use crate::kube::protocol::TableBaseline;
+        use crate::kube::resources::row::{CellValue, ResourceRow};
+
+        let store = RowStore::new("pods");
+        let row = ResourceRow {
+            cells: vec![CellValue::Text("a".into())],
+            name: "a".into(),
+            namespace: Some("ns".into()),
+            ..Default::default()
+        };
+        store.apply(1, StorePayload::Baseline(TableBaseline {
+            resource: ResourceId::BuiltIn(BuiltInKind::Pod),
+            headers: vec!["NAME".into()],
+            rows: vec![row],
+        }));
+        let key = crate::kube::protocol::ObjectKey::new("ns".to_string(), "a".to_string());
+        store.toggle_mark(&key);
+
+        let t = target("a", "ns");
+        let mut tr = BatchTracker::new(
+            "Deleted", "pod".to_string(), pod_rid(), std::slice::from_ref(&t), 0,
+            std::sync::Arc::downgrade(&store),
+        );
+        assert!(tr.consume(&t, &Err("RBAC".into())));
+        assert!(store.has_marks(), "failure keeps the mark for retry");
+        let summary = tr.summary();
+        assert!(summary.message.contains("Deleted 0 pods"), "{}", summary.message);
+        assert!(summary.message.contains("RBAC"), "{}", summary.message);
+    }
+
+    #[test]
+    fn fail_send_counts_as_a_result() {
+        let t = target("a", "ns");
+        let mut tr = BatchTracker::new(
+            "Deleted", "pod".to_string(), pod_rid(), std::slice::from_ref(&t), 0, std::sync::Weak::new(),
+        );
+        tr.fail_send(&t, "send failed: broken pipe".into());
+        assert!(tr.is_done());
+        assert!(tr.summary().message.contains("broken pipe"));
+    }
+}
+
+#[cfg(test)]
+mod key_combo_tests {
+    use super::*;
+
+    fn parse(s: &str) -> Result<KeyCombo, String> {
+        KeyCombo::try_from(s.to_string())
+    }
+
+    #[test]
+    fn parses_plain_ctrl_and_case() {
+        assert_eq!(parse("l"), Ok(KeyCombo::plain('l')));
+        assert_eq!(parse("L"), Ok(KeyCombo::plain('L')));
+        assert_eq!(parse("-"), Ok(KeyCombo::plain('-')), "a lone dash is a character");
+        assert_eq!(parse(" "), Ok(KeyCombo::plain(' ')), "space is a character");
+        assert_eq!(parse("ctrl-l"), Ok(KeyCombo { ctrl: true, ch: 'l' }));
+        // Ctrl chords arrive lowercase from the terminal — an uppercase
+        // spec is normalized so it can actually match.
+        assert_eq!(parse("Ctrl-L"), Ok(KeyCombo { ctrl: true, ch: 'l' }));
+        assert_eq!(parse("C-x"), Ok(KeyCombo { ctrl: true, ch: 'x' }));
+        assert_eq!(parse(" ctrl-l "), Ok(KeyCombo { ctrl: true, ch: 'l' }), "trimmed");
+    }
+
+    #[test]
+    fn rejects_malformed_specs() {
+        for bad in ["", "ctrl-", "meta-l", "ll", "ctrl-ll", "alt-x"] {
+            assert!(parse(bad).is_err(), "'{bad}' must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_reserved_and_duplicate_chords() {
+        // Reserved: a binding an earlier dispatch layer always consumes.
+        let keys = KeysConfig {
+            logs: Some(KeyCombo { ctrl: true, ch: 'r' }),
+            ..Default::default()
+        };
+        let err = keys.validate().unwrap_err();
+        assert!(err.contains("keys.logs") && err.contains("reserved"), "{err}");
+
+        // Duplicate chords across entries.
+        let keys = KeysConfig {
+            col_right: Some(KeyCombo::plain('x')),
+            logs: Some(KeyCombo::plain('x')),
+            ..Default::default()
+        };
+        let err = keys.validate().unwrap_err();
+        assert!(err.contains("already bound"), "{err}");
+
+        // The user's real shape is fine.
+        let keys = KeysConfig {
+            col_left: Some(KeyCombo::plain('h')),
+            col_right: Some(KeyCombo::plain('l')),
+            logs: Some(KeyCombo { ctrl: true, ch: 'l' }),
+            ..Default::default()
+        };
+        assert!(keys.validate().is_ok());
+    }
+
+    #[test]
+    fn op_key_override_replaces_default() {
+        use crate::kube::protocol::OperationKind as Op;
+        let mut keys = KeysConfig::default();
+        // Default: descriptor key as a plain chord.
+        assert_eq!(keys.op_key(&Op::StreamLogs), Some(KeyCombo::plain('l')));
+        // Override REPLACES it (the default char is no longer the binding).
+        keys.logs = Some(KeyCombo { ctrl: true, ch: 'l' });
+        assert_eq!(keys.op_key(&Op::StreamLogs), Some(KeyCombo { ctrl: true, ch: 'l' }));
+        // Structural-default ops have no chord unless the user adds one.
+        assert_eq!(keys.op_key(&Op::Delete), None);
+        keys.delete = Some(KeyCombo::plain('x'));
+        assert_eq!(keys.op_key(&Op::Delete), Some(KeyCombo::plain('x')));
+        // Overlay-defined ops are never bindable here.
+        assert_eq!(keys.op_key(&Op::Custom("z".into())), None);
+    }
+
+    #[test]
+    fn labels_render_ctrl_and_shift() {
+        assert_eq!(KeyCombo::plain('l').label(), "l");
+        assert_eq!(KeyCombo::plain('L').label(), "Shift-l");
+        assert_eq!(KeyCombo { ctrl: true, ch: 'l' }.label(), "C-l");
+    }
+
+    /// Pins the documented config shape (what `load_section` hands to
+    /// AppConfig after stripping the `k9rs:` root) — INCLUDING a sibling
+    /// `daemon:` section, which the README documents in the same file
+    /// and must not be rejected as an unknown field.
+    #[test]
+    fn app_config_parses_keys_section() {
+        let yaml = "keys:\n  colLeft: h\n  colRight: l\n  colFirst: \"0\"\n  colLast: \"$\"\n  logs: ctrl-l\n\
+                    daemon:\n  watcherPageSize: 500\n";
+        let cfg: AppConfig = serde_yaml::from_str(yaml).expect("keys + daemon sections parse");
+        assert_eq!(cfg.keys.col_left, Some(KeyCombo::plain('h')));
+        assert_eq!(cfg.keys.col_right, Some(KeyCombo::plain('l')));
+        assert_eq!(cfg.keys.col_first, Some(KeyCombo::plain('0')));
+        assert_eq!(cfg.keys.col_last, Some(KeyCombo::plain('$')));
+        // `0` / `$` are not reserved chords, so the binding validates.
+        assert!(cfg.keys.validate().is_ok(), "vim 0/$ column jumps must validate");
+        assert_eq!(cfg.keys.logs, Some(KeyCombo { ctrl: true, ch: 'l' }));
+        // A typo'd binding name is a load-time error (deny_unknown_fields),
+        // not a silently ignored key.
+        assert!(serde_yaml::from_str::<AppConfig>("keys:\n  colleft: h\n").is_err());
+        // A malformed chord is too.
+        assert!(serde_yaml::from_str::<AppConfig>("keys:\n  logs: meta-l\n").is_err());
+        // And so is a typo inside the daemon section — the TUI's loud
+        // startup validation covers the whole file.
+        assert!(serde_yaml::from_str::<AppConfig>("daemon:\n  watcherPagesize: 5\n").is_err());
+    }
 }
 
 // ---------------------------------------------------------------------------

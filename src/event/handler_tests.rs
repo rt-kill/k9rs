@@ -139,16 +139,22 @@ fn test_resource_view_describe_yaml() {
 
 #[test]
 fn test_pods_logs_key() {
-    // Logs are Shift+L (uppercase), plain 'l' is column-right.
+    // Logs are plain 'l' by default (k9s parity); column movement is
+    // arrow-keys-only unless the user binds keys.colLeft/colRight.
     let mut app = make_resource_app();
     reset_to_kind(&mut app, crate::kube::resource_def::BuiltInKind::Pod);
     assert!(matches!(
-        handle_key_event(&app, make_key(KeyCode::Char('L'))),
+        handle_key_event(&app, make_key(KeyCode::Char('l'))),
         Some(Action::Logs)
     ));
-    // Plain 'l' should be ColRight, not Logs.
+    // 'h' is unbound by default; arrows move the column cursor.
+    assert!(handle_key_event(&app, make_key(KeyCode::Char('h'))).is_none());
     assert!(matches!(
-        handle_key_event(&app, make_key(KeyCode::Char('l'))),
+        handle_key_event(&app, make_key(KeyCode::Left)),
+        Some(Action::ColLeft)
+    ));
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Right)),
         Some(Action::ColRight)
     ));
 }
@@ -160,7 +166,7 @@ fn test_workload_types_have_logs() {
         let mut app = make_resource_app();
         reset_to_kind(&mut app, kind);
         assert!(
-            matches!(handle_key_event(&app, make_key(KeyCode::Char('L'))), Some(Action::Logs)),
+            matches!(handle_key_event(&app, make_key(KeyCode::Char('l'))), Some(Action::Logs)),
             "Expected Logs action for {:?}",
             kind,
         );
@@ -174,11 +180,82 @@ fn test_non_workload_no_logs() {
         let mut app = make_resource_app();
         reset_to_kind(&mut app, kind);
         assert!(
-            !matches!(handle_key_event(&app, make_key(KeyCode::Char('L'))), Some(Action::Logs)),
+            !matches!(handle_key_event(&app, make_key(KeyCode::Char('l'))), Some(Action::Logs)),
             "Expected no Logs action for {:?}",
             kind,
         );
     }
+}
+
+/// User rebinds: `keys.logs: ctrl-l` MOVES the binding (plain `l` no
+/// longer streams logs), and `keys.colLeft/colRight: h/l` add vim-style
+/// column movement that shadows any op default on the same chord.
+#[test]
+fn test_key_rebinding_moves_and_shadows() {
+    use crate::app::KeyCombo;
+    let mut app = make_resource_app();
+    reset_to_kind(&mut app, crate::kube::resource_def::BuiltInKind::Pod);
+    app.config.keys.logs = Some(KeyCombo { ctrl: true, ch: 'l' });
+    app.config.keys.col_left = Some(KeyCombo::plain('h'));
+    app.config.keys.col_right = Some(KeyCombo::plain('l'));
+
+    assert!(matches!(
+        handle_key_event(&app, make_ctrl_key(KeyCode::Char('l'))),
+        Some(Action::Logs)
+    ));
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char('l'))),
+        Some(Action::ColRight)
+    ));
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char('h'))),
+        Some(Action::ColLeft)
+    ));
+
+    // Override alone (no col binding claiming `l`): the old default is
+    // STILL unbound — a rebind replaces, never duplicates.
+    app.config.keys.col_right = None;
+    assert!(handle_key_event(&app, make_key(KeyCode::Char('l'))).is_none());
+}
+
+/// `keys.colFirst: "0"` / `keys.colLast: "$"` jump the column cursor to
+/// the first / last column (vim 0/$). Matched before the structural
+/// arms, so `0` shadows its default (switch to all namespaces).
+#[test]
+fn test_column_jump_bindings_shadow_defaults() {
+    use crate::app::KeyCombo;
+    let mut app = make_resource_app();
+    reset_to_kind(&mut app, crate::kube::resource_def::BuiltInKind::Pod);
+
+    // Unbound by default: `0` still switches to all namespaces; `$` is nothing.
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char('0'))),
+        Some(Action::SwitchNamespace(crate::kube::protocol::Namespace::All))
+    ));
+    assert!(handle_key_event(&app, make_key(KeyCode::Char('$'))).is_none());
+
+    app.config.keys.col_first = Some(KeyCombo::plain('0'));
+    app.config.keys.col_last = Some(KeyCombo::plain('$'));
+
+    // Now they move the column cursor, shadowing the all-namespaces default.
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char('0'))),
+        Some(Action::ColFirst)
+    ));
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char('$'))),
+        Some(Action::ColLast)
+    ));
+}
+
+/// An exact-chord miss must not alias: with logs on plain `l`, Ctrl-L is
+/// nothing (the old global fired logs off the hovered row from ANY view
+/// state — it is gone in favor of the binding system).
+#[test]
+fn test_ctrl_chord_does_not_alias_bare_char() {
+    let mut app = make_resource_app();
+    reset_to_kind(&mut app, crate::kube::resource_def::BuiltInKind::Pod);
+    assert!(handle_key_event(&app, make_ctrl_key(KeyCode::Char('l'))).is_none());
 }
 
 #[test]
@@ -550,6 +627,103 @@ fn test_resource_view_sort_by_age() {
     let app = make_resource_app();
     let action = handle_key_event(&app, make_key(KeyCode::Char('A')));
     assert!(matches!(action, Some(Action::Sort(crate::app::SortTarget::Last))));
+}
+
+// ---------------------------------------------------------------------------
+// Batch capture (marks ∩ present rows)
+// ---------------------------------------------------------------------------
+
+/// Batch targets are captured as marks ∩ PRESENT rows. During the Ctrl-R
+/// window (marks survive `clear()`, rows unknown/Initializing) capture is
+/// honestly empty — nothing can operate on an identity the store cannot
+/// vouch for. The recovery baseline re-anchors and capture works again.
+#[test]
+fn test_batch_capture_is_empty_during_refresh_window() {
+    use crate::app::store::StorePayload;
+    use crate::kube::protocol::{ObjectKey, TableBaseline};
+    use crate::kube::resources::row::{CellValue, ResourceRow};
+
+    let row = |name: &str| ResourceRow {
+        cells: vec![CellValue::Text(name.into())],
+        name: name.into(),
+        namespace: Some("ns".into()),
+        ..Default::default()
+    };
+    let baseline = |rows: Vec<ResourceRow>| {
+        StorePayload::Baseline(TableBaseline {
+            resource: rid(crate::kube::resource_def::BuiltInKind::Pod),
+            headers: vec!["NAME".into()],
+            rows,
+        })
+    };
+
+    let app = App::new_for_test();
+    let store = std::sync::Arc::clone(app.nav.top().data_store().unwrap());
+    store.apply(1, baseline(vec![row("a"), row("b")]));
+    store.toggle_mark(&ObjectKey::new("ns".to_string(), "a".to_string()));
+
+    let captured = crate::kube::session_actions::get_marked_resource_infos(&app);
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].name, "a");
+
+    // Ctrl-R: rows drop, marks survive — capture must go empty, and the
+    // app is STILL in select mode (the title says so; batch keys flash).
+    store.clear();
+    assert!(app.select_mode());
+    assert!(crate::kube::session_actions::get_marked_resource_infos(&app).is_empty());
+
+    // Recovery baseline re-anchors the surviving mark.
+    store.apply(2, baseline(vec![row("a")]));
+    let captured = crate::kube::session_actions::get_marked_resource_infos(&app);
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].name, "a");
+}
+
+/// ONE batch at a time: while a tracker is outstanding, a second batch
+/// dispatch is refused (a silent tracker replacement would duplicate the
+/// sends and let the first batch's late results clobber the second's
+/// summary).
+#[test]
+fn test_second_batch_refused_while_one_outstanding() {
+    use crate::app::store::StorePayload;
+    use crate::kube::protocol::{ObjectKey, TableBaseline};
+    use crate::kube::resources::row::{CellValue, ResourceRow};
+
+    let row = |name: &str| ResourceRow {
+        cells: vec![CellValue::Text(name.into())],
+        name: name.into(),
+        namespace: Some("ns".into()),
+        ..Default::default()
+    };
+    let mut app = App::new_for_test();
+    let store = std::sync::Arc::clone(app.nav.top().data_store().unwrap());
+    store.apply(1, StorePayload::Baseline(TableBaseline {
+        resource: rid(crate::kube::resource_def::BuiltInKind::Pod),
+        headers: vec!["NAME".into()],
+        rows: vec![row("a")],
+    }));
+    store.toggle_mark(&ObjectKey::new("ns".to_string(), "a".to_string()));
+
+    // Outstanding tracker → refuse, no dialog, selection untouched.
+    let t = crate::kube::protocol::ObjectRef::new(
+        rid(crate::kube::resource_def::BuiltInKind::Pod),
+        "a".to_string(),
+        crate::kube::protocol::Namespace::from_row("ns"),
+    );
+    app.pending_batch = Some(crate::app::BatchTracker::new(
+        "Deleted", "pod".to_string(),
+        rid(crate::kube::resource_def::BuiltInKind::Pod),
+        std::slice::from_ref(&t), 0, std::sync::Weak::new(),
+    ));
+    crate::kube::session_actions::handle_batch_op(&mut app, Action::BatchDelete);
+    assert!(app.ui.confirm_dialog.is_none());
+    assert!(app.ui.flash.as_ref().is_some_and(|f| f.message.contains("in flight")));
+    assert!(app.nav.top().has_marks(), "refusal leaves the selection untouched");
+
+    // Tracker cleared → the same dispatch opens the confirm dialog.
+    app.pending_batch = None;
+    crate::kube::session_actions::handle_batch_op(&mut app, Action::BatchDelete);
+    assert!(app.ui.confirm_dialog.is_some());
 }
 
 // ---------------------------------------------------------------------------

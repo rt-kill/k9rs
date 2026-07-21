@@ -131,6 +131,10 @@ pub enum Action {
     ColLeft,
     /// Move the column cursor right.
     ColRight,
+    /// Move the column cursor to the first (leftmost) column.
+    ColFirst,
+    /// Move the column cursor to the last (rightmost) column.
+    ColLast,
     /// Open the filter input restricted to the currently hovered column.
     ColumnFilter,
     /// Toggle wide column mode.
@@ -160,6 +164,16 @@ pub enum Action {
     /// Currently only Drill (read-only navigation) is supported. If
     /// mutating capability types are added, update `is_mutating()`.
     OverlayCapability(String),
+    /// Delete every marked row (select mode). Distinct from [`Self::Delete`]
+    /// BY CONSTRUCTION: the keymap never produces these — only the
+    /// select-mode gate does, by transforming the single-target action
+    /// while marks are active. There is no "marked set non-empty?" branch
+    /// at dispatch that could silently fall through to the hovered row.
+    BatchDelete,
+    /// Rollout-restart every marked row (select mode).
+    BatchRestart,
+    /// Force-kill every marked row (select mode).
+    BatchForceKill,
 }
 
 impl Action {
@@ -192,10 +206,14 @@ impl Action {
                 | Action::Restart
                 | Action::ForceKill
                 | Action::Shell
+                | Action::NodeShell
                 | Action::PortForward
                 | Action::DecodeSecret
                 | Action::TriggerCronJob
                 | Action::SuspendCronJob
+                | Action::BatchDelete
+                | Action::BatchRestart
+                | Action::BatchForceKill
         )
     }
 }
