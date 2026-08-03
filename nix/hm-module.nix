@@ -83,8 +83,8 @@ in
     daemon = {
       enable = mkOption {
         type = types.bool;
-        default = pkgs.stdenv.hostPlatform.isLinux;
-        defaultText = literalExpression "pkgs.stdenv.hostPlatform.isLinux";
+        default = true;
+        defaultText = literalExpression "true";
         description = ''
           Run the k9rs cache daemon as a background service: a systemd user
           service on Linux, a launchd agent on Darwin. The daemon holds the
