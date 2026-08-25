@@ -418,7 +418,7 @@ impl Widget for HelpOverlay<'_> {
 
         // Clear + guaranteed-visible bg (consistent with ModalOverlay).
         Clear.render(dialog_area, buf);
-        crate::ui::fill_dialog_bg(buf, dialog_area);
+        crate::ui::fill_dialog_bg(buf, dialog_area, self.theme);
 
         // Build all lines first to know total count
         let sections = self.sections();

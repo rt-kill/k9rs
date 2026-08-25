@@ -300,6 +300,7 @@ impl App {
     ) -> Self {
         let cache_capacity = config.ui.cache_capacity;
         let skin_name = config.ui.skin.clone();
+        let theme_mode = config.ui.theme;
         Self {
             should_quit: false,
             exit_reason: None,
@@ -320,7 +321,7 @@ impl App {
                 flash: None,
                 confirm_dialog: None,
                 form_dialog: None,
-                theme: crate::ui::theme::Theme::load(skin_name.as_deref()),
+                theme: crate::ui::theme::Theme::load(skin_name.as_deref(), theme_mode),
                 input_mode: InputMode::Normal,
                 overlay: None,
                 show_header: true,
