@@ -73,7 +73,7 @@ where
         // This ensures the border cells also have the dialog bg, not
         // the terminal default left by Clear.
         Clear.render(dialog_area, buf);
-        crate::ui::fill_dialog_bg(buf, dialog_area);
+        crate::ui::fill_dialog_bg(buf, dialog_area, self.theme);
 
         let title_str = if self.title.is_empty() {
             String::new()

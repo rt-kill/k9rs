@@ -10,6 +10,7 @@ A Kubernetes TUI written in Rust, inspired by [k9s](https://k9scli.io/).
 - Log streaming with filtering, timestamps, and wrap mode
 - Drill-down navigation (deployment → pods → containers → logs)
 - Context and namespace switching
+- Light and dark themes, auto-detected from the terminal background
 - k9s-compatible skin/theme support
 - User-defined overlays (custom columns, coloring rules, key bindings)
 - Configurable TUI preferences and daemon tuning
@@ -38,6 +39,7 @@ k9rs pods               # start on pods
 k9rs -n kube-system     # start in a specific namespace
 k9rs --context prod     # start with a specific context
 k9rs --readonly         # read-only mode (no mutations)
+k9rs --theme light      # force the light palette (auto-detected by default)
 ```
 
 ## Key Bindings
@@ -88,6 +90,7 @@ k9rs:
 
   # TUI preferences
   ui:
+    theme: auto                # auto | dark | light (auto detects the terminal bg)
     skin: dracula              # skin name (loads from skins/ directory)
     pageScrollLines: 40        # lines per PageUp/PageDown
     maxColumnWidth: 64         # max column width before truncation
@@ -178,6 +181,34 @@ coloring:
 
 ## Themes
 
+### Light and dark
+
+k9rs ships a dark palette (Nord) and a light one, and picks between them by
+looking at the terminal:
+
+1. **OSC 11** — it asks the terminal for its background color and matches it.
+   Works in xterm, kitty, foot, wezterm, alacritty, iTerm2, Ghostty,
+   Terminal.app and tmux.
+2. **`COLORFGBG`** — the fallback for terminals that don't answer (urxvt,
+   konsole).
+3. **Dark**, if neither says anything.
+
+The query runs once at startup, before the alternate screen is entered, and
+costs a few milliseconds on a terminal that answers. Pin it if you'd rather
+not ask — or if your terminal answers wrongly:
+
+```yaml
+# ~/.config/k9rs/config.yaml
+k9rs:
+  ui:
+    theme: light   # auto (default) | dark | light
+```
+
+`--theme light` / `--theme dark` overrides the config for a single run and
+skips detection entirely.
+
+### Skins
+
 k9s-compatible skin files. Place in `~/.config/k9rs/skins/` and reference by name in config.
 
 ```yaml
@@ -188,6 +219,8 @@ k9rs:
 ```
 
 The skin file format matches [k9s skin YAML](https://k9scli.io/topics/skins/).
+A skin layers on top of the light/dark palette, so it only overrides the
+colors it actually sets.
 
 ## License
 

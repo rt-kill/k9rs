@@ -55,6 +55,11 @@ struct Cli {
     #[arg(long)]
     readonly: bool,
 
+    /// Color scheme: auto (detect the terminal background), dark, or light.
+    /// Overrides `ui.theme` in the config file.
+    #[arg(long, value_name = "MODE")]
+    theme: Option<crate::ui::theme::ThemeMode>,
+
     /// Navigation path: resource [filter] [resource [filter]] ...
     ///
     /// Each arg that matches a known resource (pods, deploy, svc, ...) starts
@@ -144,13 +149,20 @@ async fn main() -> Result<()> {
     // validation (unknown fields, malformed/reserved key chords) is
     // only worth anything if its rejection reaches the user — a silent
     // fallback to defaults would quietly drop settings like readOnly.
-    let config = match App::load_config() {
+    let mut config = match App::load_config() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("k9rs: config error: {e}");
             std::process::exit(2);
         }
     };
+    // `--theme` wins over `ui.theme`: it has to be applied before
+    // `App::new`, which builds the theme (and, for `auto`, queries the
+    // terminal — still safe here, before raw mode and the alternate
+    // screen).
+    if let Some(mode) = cli.theme {
+        config.ui.theme = mode;
+    }
 
     // Construct the data source FIRST — `ClientSession::new` is
     // non-blocking (it spawns a background manager that does the
