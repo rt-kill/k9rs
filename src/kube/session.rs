@@ -168,6 +168,13 @@ impl<'a, B: ratatui::backend::Backend + std::io::Write> SuspendGuard<'a, B> {
         input_suspend_ack: &mut mpsc::Receiver<()>,
         input_rx: &'a mut mpsc::Receiver<CtEvent>,
     ) -> Result<Self> {
+        // Drain any STALE ack first: if a previous suspend timed out (bridge
+        // wedged >1s) and the bridge acked late, that ack sits in the cap-1
+        // channel and would satisfy THIS wait instantly — proceeding while
+        // the bridge is still reading stdin, racing keystrokes between the
+        // subprocess and the TUI. An empty channel makes the recv below wait
+        // for an ack to *this* request.
+        while input_suspend_ack.try_recv().is_ok() {}
         let _ = input_suspend.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(1), input_suspend_ack.recv()).await;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -191,12 +198,14 @@ impl<'a, B: ratatui::backend::Backend + std::io::Write> SuspendGuard<'a, B> {
     /// Normal exit path: restore the screen, then drain the stale terminal
     /// responses the transition provokes over a short settling window. They
     /// arrive a few ms after the bridge resumes and re-reads stdin, so a
-    /// single synchronous drain races them. Consuming `self` runs `Drop`
-    /// immediately afterwards, but the `restored` flag makes it a no-op.
-    pub(crate) async fn restore(mut self) {
+    /// single synchronous drain races them. Real type-ahead caught in the
+    /// window is returned for the session loop to replay. Consuming `self`
+    /// runs `Drop` immediately afterwards, but the `restored` flag makes it
+    /// a no-op.
+    pub(crate) async fn restore(mut self) -> Vec<CtEvent> {
         self.restored = true;
         self.restore_screen();
-        drain_stale_input(self.input_rx).await;
+        drain_stale_input(self.input_rx).await
     }
 }
 
@@ -217,17 +226,164 @@ impl<B: ratatui::backend::Backend + std::io::Write> Drop for SuspendGuard<'_, B>
 /// Drain stale terminal input provoked by an alt-screen / raw-mode transition.
 /// When the TUI suspends for a subprocess (editor) or the shell bridge, the
 /// terminal emits response sequences (cursor-position / device-status reports)
-/// in reply to the mode changes; crossterm parses the leftover bytes as key
-/// events, and a stray 'r' would pop the restart dialog. The responses can land
-/// a few milliseconds after the screen is restored — the input bridge has to
-/// wake and re-read stdin first — so one synchronous drain races them. Drain in
-/// a few short passes instead; the ~45ms total is imperceptible on return.
-async fn drain_stale_input(input_rx: &mut mpsc::Receiver<CtEvent>) {
-    for _ in 0..3 {
-        while input_rx.try_recv().is_ok() {}
-        tokio::time::sleep(Duration::from_millis(15)).await;
+/// in reply to the mode changes; crossterm shreds the ones it can't parse
+/// whole into key events, and a stray 'r' would pop the restart dialog. The
+/// responses can land a few milliseconds after the screen is restored — the
+/// input bridge has to wake and re-read stdin first — so one synchronous drain
+/// races them; settle over a few short passes instead.
+///
+/// CONTENT-aware, not a blanket drop: only events matching the shredded-
+/// response shape (see [`is_resume_debris`]) are discarded. Real type-ahead
+/// keyed during the ~45ms window is KEPT — returned in arrival order for the
+/// caller to replay — honoring the input arm's "keys are never dropped"
+/// contract, which the old drain-everything version quietly violated.
+async fn drain_stale_input(input_rx: &mut mpsc::Receiver<CtEvent>) -> Vec<CtEvent> {
+    let mut kept = Vec::new();
+    let mut state = DebrisState::Idle;
+    for pass in 0..4 {
+        while let Ok(ev) = input_rx.try_recv() {
+            state = debris_step(state, ev, &mut kept);
+        }
+        if pass < 3 {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
     }
-    while input_rx.try_recv().is_ok() {}
+    // A trailing unconfirmed Esc is a REAL keypress: debris Esc is always
+    // followed by its sequence body well inside the settling window.
+    if let DebrisState::PendingEsc(esc) = state {
+        kept.push(esc);
+    }
+    kept
+}
+
+/// Shred-shape state for the settling window, carried across the drain's
+/// passes (one response can straddle two stdin reads).
+enum DebrisState {
+    Idle,
+    /// Saw a bare Esc — debris only if a sequence introducer follows; the
+    /// event is held, not judged, until the next event decides.
+    PendingEsc(CtEvent),
+    /// Inside a confirmed `Esc [` / `Esc O` shred — body until a final byte.
+    InSeq,
+}
+
+/// One classifier step. A response sequence crossterm can't parse whole
+/// (cursor reports, DA / DSR / kitty-query replies) shreds into a bare
+/// `Esc` key, an introducer (`[` for CSI, `O` for SS3), body characters
+/// (digits, `;`, `?`, …), and a final letter — e.g. the `R` of a cursor
+/// report, or the spurious `r` that used to pop the restart dialog. Real
+/// type-ahead never takes that full shape: crossterm parses KNOWN
+/// sequences (arrows, F-keys) into proper key events, plain typing arrives
+/// as ordinary chars, and a real Esc press is followed by something other
+/// than an introducer — so the held Esc is released as real the moment the
+/// shape breaks. The trade is deliberate: an exotic response type (OSC/DCS
+/// replies, never provoked by our transitions) could still leak keys, but
+/// real typing is never eaten — the reverse of the old blanket drop's
+/// failure mode.
+fn debris_step(state: DebrisState, ev: CtEvent, kept: &mut Vec<CtEvent>) -> DebrisState {
+    use crossterm::event::KeyCode;
+    let code = match &ev {
+        CtEvent::Key(k) => Some(k.code),
+        // Focus/resize churn from the mode transition — never replayed
+        // (the resume paint re-observes the real size), never state-changing.
+        _ => None,
+    };
+    match state {
+        DebrisState::Idle => match code {
+            Some(KeyCode::Esc) => DebrisState::PendingEsc(ev),
+            None => DebrisState::Idle,
+            Some(_) => {
+                kept.push(ev);
+                DebrisState::Idle
+            }
+        },
+        DebrisState::PendingEsc(esc) => match code {
+            // Introducer confirms the shred: drop the Esc and consume on.
+            Some(KeyCode::Char('[' | 'O')) => DebrisState::InSeq,
+            // Anything else: the Esc was a real keypress after all.
+            _ => {
+                kept.push(esc);
+                debris_step(DebrisState::Idle, ev, kept)
+            }
+        },
+        DebrisState::InSeq => match code {
+            Some(KeyCode::Char(c))
+                if c.is_ascii_digit() || matches!(c, ';' | '?' | ':' | '<' | '=' | '>') =>
+            {
+                DebrisState::InSeq
+            }
+            Some(KeyCode::Char(c)) if c.is_ascii_alphabetic() || c == '~' => {
+                DebrisState::Idle // final byte — sequence complete
+            }
+            None => DebrisState::InSeq,
+            // Malformed tail — stop consuming, judge this event afresh.
+            _ => debris_step(DebrisState::Idle, ev, kept),
+        },
+    }
+}
+
+/// Outcome of handling one key inside the input-drain loop.
+enum KeyDrain {
+    /// Keep draining any further keys batched into this turn.
+    Continue,
+    /// A terminal-suspending (`Exec`) or quit transition happened — stop
+    /// draining so the outer loop's editor/shell gates run and it repaints.
+    Stop,
+}
+
+/// Handle exactly ONE key through the full mode → gate → readonly → action
+/// pipeline (the path the input arm used to inline). Painting is the caller's
+/// job — done ONCE after the whole batch drains, so an SSH-batched burst of
+/// keystrokes no longer costs one blocking remote repaint apiece. Returns
+/// whether the drain loop should keep going.
+async fn handle_one_key(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    data_source: &mut ClientSession,
+    event_tx: &mpsc::Sender<AppEvent>,
+    repaint: &mut crate::kube::repaint::Repaint,
+) -> KeyDrain {
+    // Terminals that report key RELEASES (kitty keyboard protocol, Windows
+    // console) would double-fire every binding without this guard. Repeats
+    // pass — holding `j` must keep scrolling.
+    if key.kind == crossterm::event::KeyEventKind::Release {
+        return KeyDrain::Continue;
+    }
+    // Input modes get priority over normal key handling.
+    if try_handle_input_mode(app, key, data_source, event_tx) {
+        repaint.on_input();
+        return KeyDrain::Continue;
+    }
+
+    repaint.on_input();
+    let Some(action) = crate::event::handler::handle_key_event(app, key) else {
+        return KeyDrain::Continue;
+    };
+    // Select-mode gate: THE single choke point — every key→Action route
+    // funnels through here, transforming batch-capable ops into their Batch*
+    // variants and killing single-target actions while marks are active. Runs
+    // BEFORE the readonly check so readonly sees the batch variant.
+    let action = match crate::app::select_gate::gate_action(app, action) {
+        crate::app::select_gate::Gated::Pass(a) => a,
+        crate::app::select_gate::Gated::Blocked(msg) => {
+            app.ui.flash = Some(crate::app::FlashMessage::warn(msg.to_string()));
+            return KeyDrain::Continue;
+        }
+    };
+    // Client-side UX shortcut: flash "Read-only mode" without a wire round-
+    // trip. The server is the real boundary and rejects mutations itself.
+    if app.read_only && action.is_mutating() {
+        app.ui.flash = Some(crate::app::FlashMessage::info("Read-only mode".to_string()));
+        return KeyDrain::Continue;
+    }
+    let result = handle_action(app, action, event_tx, data_source);
+    let suspends = matches!(result, ActionResult::Exec { .. });
+    handle_action_result(result, app, data_source, event_tx).await;
+    if suspends || app.should_quit {
+        KeyDrain::Stop
+    } else {
+        KeyDrain::Continue
+    }
 }
 
 
@@ -241,6 +397,7 @@ async fn run_editor_flow(
     input_suspend: &tokio::sync::watch::Sender<bool>,
     input_suspend_ack: &mut mpsc::Receiver<()>,
     input_rx: &mut mpsc::Receiver<CtEvent>,
+    replay: &mut std::collections::VecDeque<CtEvent>,
 ) -> bool {
     let is_editor_ready = matches!(
         app.ui.overlay,
@@ -276,7 +433,7 @@ async fn run_editor_flow(
     let exit_status = match run_interactive_local(
         terminal, &editor, &args,
         crate::kube::session_commands::InteractiveKind::Editor,
-        input_suspend, input_suspend_ack, input_rx,
+        input_suspend, input_suspend_ack, input_rx, replay,
     ).await {
         Ok(s) => s,
         Err(e) => {
@@ -376,6 +533,7 @@ async fn run_shell_bridge(
     input_suspend: &tokio::sync::watch::Sender<bool>,
     input_suspend_ack: &mut mpsc::Receiver<()>,
     input_rx: &mut mpsc::Receiver<crossterm::event::Event>,
+    replay: &mut std::collections::VecDeque<CtEvent>,
 ) {
     use tokio::io::AsyncWriteExt;
 
@@ -399,7 +557,9 @@ async fn run_shell_bridge(
     ).await;
 
     // Suspend TUI: stop the input bridge (releases stdin), leave alternate
-    // screen. Raw mode stays on — we need raw byte passthrough.
+    // screen. Raw mode stays on — we need raw byte passthrough. Stale-ack
+    // drain first, same rationale as `SuspendGuard::new`.
+    while input_suspend_ack.try_recv().is_ok() {}
     let _ = input_suspend.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(1), input_suspend_ack.recv()).await;
     let _ = execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen);
@@ -523,8 +683,9 @@ async fn run_shell_bridge(
     // Resume the input bridge first, then drain the stale terminal responses
     // the transition provokes — they arrive *after* resume, once the bridge
     // re-reads stdin, so the old pre-resume one-shot drain caught nothing.
+    // Real type-ahead caught in the window comes back for the loop to replay.
     let _ = input_suspend.send(false);
-    drain_stale_input(input_rx).await;
+    replay.extend(drain_stale_input(input_rx).await);
 
     // Clear the shell overlay (the view underneath was never displaced).
     app.ui.overlay = None;
@@ -622,21 +783,57 @@ async fn handle_action_result(
 fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: AppEvent) {
     match event {
         event @ AppEvent::ConnectionEstablished { .. } => {
-            // Apply the event first (populates context/cluster/user/namespaces).
+            // Was a context SWITCH resolving here (vs a plain reconnect)? Read
+            // it BEFORE `settle()` clears the state. ONLY `InFlight` counts:
+            // `Requested` means the switch's session hasn't been BUILT yet
+            // (the main loop takes it at the top of its next turn), so an
+            // establishment arriving in that state belongs to a prior attempt
+            // — treating it as the switch landing would destroy the user's
+            // nav stack over a coincidental reconnect, and settling would
+            // silently discard their queued switch. (`target()` deliberately
+            // spans both states; this edge needs the narrower question.)
+            // A switch that reaches this arm IN FLIGHT succeeded: drop the
+            // OLD context's core data and namespace selection now that the
+            // new connection is confirmed. (The nav stack was already reset
+            // to home by `begin_context_switch` — a switch is a root-level
+            // change and shouldn't leave you staring at the old cluster's
+            // view while the new one connects. Only the CHROME teardown
+            // waits, because clearing it early would blank data the fallback
+            // still needs if the switch fails.) Done BEFORE `apply_event` so
+            // `core.clear()` doesn't wipe the namespaces the event is about
+            // to seed. A reconnect (was_switch == false, incl. the recovered
+            // fallback after a FAILED switch, which already settled to
+            // Stable) leaves core in place and revives streams below.
+            let switch_target = match &app.kube.context_switch {
+                crate::app::ContextSwitchState::InFlight(t) => Some(t.clone()),
+                _ => None,
+            };
+            let was_switch = switch_target.is_some();
+            if let Some(target) = switch_target {
+                // `app.kube.context` is still the OUTGOING context here —
+                // `apply_event` below overwrites it — so this is the one
+                // moment both names are in hand.
+                app.core.switch_context(app.kube.context.clone(), &target);
+                app.kube.selected_ns = crate::kube::protocol::Namespace::All;
+            }
+            // Apply the event (populates context/cluster/user, seeds the new
+            // namespaces, flips `link` → Live).
             apply_event(app, event);
-            // Transition: InFlight → Stable. The new session is live; a
-            // subsequent `begin_context_switch` is now allowed.
-            app.kube.context_switch.mark_stable();
-            // Open the always-on core subscriptions (namespaces, nodes)
-            // into the app-level core stores now that the connection is
-            // ready.
+            // Resolve the switch: InFlight → Stable (the success edge). A
+            // subsequent `begin_context_switch` is now allowed. Gated on
+            // `was_switch` so a queued-but-not-yet-taken `Requested` can
+            // never be settled away by an unrelated establishment.
+            if was_switch {
+                app.kube.context_switch.settle();
+            }
+            // Open the always-on core subscriptions (namespaces, nodes) into
+            // the app-level core stores now that the connection is ready.
             app.core.open_streams(data_source);
-            // Revive the subscription feeding the TOP element's data if
-            // its bridge died during the rebuild — the owner is found by
-            // store pointer identity, re-subscribed with its OWN stored
-            // query spec, and its next Baseline replaces rows in place
-            // (no "Loading..." limbo, no blank flash). Covered elements
-            // revive lazily on pop.
+            // Revive the subscription feeding the TOP element's data if its
+            // bridge died during the rebuild (reconnect, or the recovered
+            // fallback after a failed switch) — re-subscribed with its OWN
+            // stored spec; its next Baseline replaces rows in place. On a fresh
+            // switch the top is now Overview (no stream), so this is a no-op.
             app.nav.ensure_top_live(data_source);
         }
         other => apply_event(app, other),
@@ -752,7 +949,7 @@ fn handle_content_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> 
                 state.update_search();
                 if let Some(&t) = state.search_matches.first() {
                     state.current_match = 0;
-                    state.scroll = t.saturating_sub(search_context_lines);
+                    state.viewport.scroll_to(t.saturating_sub(search_context_lines));
                 }
             }
             true
@@ -806,6 +1003,11 @@ pub async fn session_main(
     // data-repaint budget above. `Some(deadline)` while a spinner is on screen
     // (re-armed after each paint that drew one); `None` when nothing animates.
     let mut next_anim: Option<std::time::Instant> = None;
+    // Real type-ahead the suspend-resume settling drain kept instead of
+    // dropping (see `drain_stale_input`). Processed at the top of the loop,
+    // AFTER the editor/shell gates, through the exact same per-key pipeline
+    // as live input — order preserved, keys never dropped.
+    let mut replay: std::collections::VecDeque<CtEvent> = std::collections::VecDeque::new();
     loop {
         // Context switch: one socket = one context = one session.
         //
@@ -818,24 +1020,49 @@ pub async fn session_main(
         // is structurally impossible.
         //
         // `take_requested()` atomically transitions the state from
-        // `Requested(name)` to `InFlight`, so a second `begin_context_switch`
-        // call fired between this line and `mark_stable()` (in
-        // `dispatch_app_event` on `ConnectionEstablished`) will be rejected
-        // by the `is_stable()` check.
+        // `Requested(name)` to `InFlight(name)`, so a second
+        // `begin_context_switch` call fired between this line and `settle()`
+        // (on `ConnectionEstablished` success or `ConnectionFailed` for the
+        // target) will be rejected by the `is_stable()` check.
         // A reconnect may be BACKED OFF (a prior reconnect attempt failed);
         // defer the rebuild until its deadline so a down daemon isn't
         // hammered. Context switches are user-initiated and always run now.
-        let reconnect_due = app.reconnect_requested
-            && app.reconnect_at.is_none_or(|t| std::time::Instant::now() >= t);
+        let reconnect_due = app.conn.rebuild_due(std::time::Instant::now());
         let rebuild_ctx = if let Some(new_ctx) = app.kube.context_switch.take_requested() {
+            // A fresh switch request (Requested → InFlight): connect to it.
             Some(Some(new_ctx))
         } else if reconnect_due {
-            Some(if app.kube.context.is_empty() { None } else { Some(app.kube.context.clone()) })
+            // A reconnect fired. If a switch is STILL in flight (InFlight — its
+            // target was already taken above on a prior turn), keep aiming at
+            // the SWITCH target, not the previous context: a mid-switch daemon
+            // blip must not silently abandon the switch and strand the user on
+            // the old context. Otherwise reconnect to the last-confirmed context.
+            let target = app
+                .kube
+                .context_switch
+                .target()
+                .cloned()
+                .or_else(|| app.kube.context.clone());
+            Some(target)
         } else {
             None
         };
         if let Some(ctx) = rebuild_ctx {
-            app.reconnect_requested = false;
+            // The old live session is being dropped and replaced (reconnect
+            // OR context switch): consume the reconnect plan and mark the
+            // link Connecting so the render gate shows the connecting
+            // screen for the whole gap, not stale rows — this is the single
+            // choke point every session replacement passes through. Cleared
+            // to Live only on ConnectionEstablished.
+            app.conn.begin_rebuild();
+            // Stop the old per-subscription bridges retrying against the mux
+            // we're about to drop — they'd otherwise burn a backoff loop for
+            // the whole gap. Revived on ConnectionEstablished (top) / on pop
+            // (covered), or dropped by a switch's nav reset. BOTH stream
+            // owners: nav elements AND the always-on core subscriptions
+            // (replaced wholesale by `open_streams` on ConnectionEstablished).
+            app.nav.abort_all_streams();
+            app.core.abort_streams();
             let no_daemon = data_source.is_no_daemon();
             drop(data_source);
             drop(event_rx);
@@ -850,14 +1077,21 @@ pub async fn session_main(
             // Overlays / dialogs awaiting a response from the OLD session
             // would hang forever (their Yaml/OpResult/ExecEnded died with
             // the dropped channel) — clear them, the same way a context
-            // switch does. A content view mid-fetch is reset so it re-issues
-            // against the new session.
+            // switch does. Content fetches in flight against the old
+            // session can never complete either: mark every such view
+            // Failed, WHEREVER it sits in the stack (the old top-only
+            // reset left covered views wedged in an eternal spinner), so
+            // it renders an honest error with the retry hint.
             app.ui.overlay = None;
             app.ui.form_dialog = None;
             app.ui.confirm_dialog = None;
-            if let crate::app::element::Element::ContentView(cv) = app.nav.top_mut() {
-                cv.awaiting_response = false;
-            }
+            app.nav.for_each_content_view(|cv| {
+                if cv.phase == crate::app::element::ContentPhase::Fetching {
+                    cv.phase = crate::app::element::ContentPhase::Failed(
+                        "fetch interrupted by reconnect".to_string(),
+                    );
+                }
+            });
             let (new_tx, new_rx) = mpsc::channel::<AppEvent>(EVENT_CHANNEL_CAP);
             event_tx = new_tx;
             event_rx = new_rx;
@@ -941,6 +1175,7 @@ pub async fn session_main(
         if run_editor_flow(
             &mut app, &mut terminal, &mut data_source,
             &input.suspend_tx, &mut input.suspend_ack_rx, &mut input.input_rx,
+            &mut replay,
         ).await {
             // The stale-input drain now lives in the suspend guard's
             // `restore()` (with a settling window), so no ad-hoc drain here.
@@ -956,11 +1191,47 @@ pub async fn session_main(
                 run_shell_bridge(
                     &mut app, &mut terminal, &mut event_rx,
                     &input.suspend_tx, &mut input.suspend_ack_rx,
-                    &mut input.input_rx,
+                    &mut input.input_rx, &mut replay,
                 ).await;
                 repaint.on_input();
                 continue;
             }
+        }
+
+        // Replay type-ahead kept by a settling drain, through the same
+        // pipeline live keys use. Placed AFTER the gates above so a replayed
+        // key that opens the editor/shell has its gate run before the next
+        // key routes; on such a transition (`Stop`) the remainder stays
+        // queued and resumes here next iteration. Any replay activity
+        // `continue`s the loop: the paint gate at the top already ran this
+        // iteration, so falling into the select would sit on the dirty frame.
+        let mut replayed_any = false;
+        while let Some(ev) = replay.pop_front() {
+            match ev {
+                CtEvent::Key(k) => {
+                    replayed_any = true;
+                    if matches!(
+                        handle_one_key(&mut app, k, &mut data_source, &event_tx, &mut repaint)
+                            .await,
+                        KeyDrain::Stop
+                    ) {
+                        break;
+                    }
+                }
+                CtEvent::Resize(_, _) => {
+                    replayed_any = true;
+                    repaint.on_input();
+                }
+                _ => {}
+            }
+        }
+        if replayed_any {
+            // Mirror the bottom-of-loop quit check: a replayed `q` must not
+            // park in the select waiting for an unrelated event to notice it.
+            if app.should_quit {
+                break;
+            }
+            continue;
         }
 
         // Snapshot the next wake deadline before the select so the timer arm
@@ -980,54 +1251,30 @@ pub async fn session_main(
             Some(ct_event) = input.input_rx.recv() => {
                 match ct_event {
                     CtEvent::Key(key) => {
-                        // Input modes get priority over normal key handling.
-                        // Each mode handler returns true if the key was consumed.
-                        if try_handle_input_mode(
-                            &mut app, key, &mut data_source, &event_tx,
-                        ) {
-                            repaint.on_input();
-                            continue;
-                        }
-
-                        repaint.on_input();
-                        if let Some(action) = crate::event::handler::handle_key_event(&app, key) {
-                            // Select-mode gate: THE single choke point.
-                            // Every key→Action route (global, per-view,
-                            // overlay fall-through) funnels through here,
-                            // transforming batch-capable ops into their
-                            // distinct Batch* actions and killing
-                            // single-target actions while marks are
-                            // active. Runs BEFORE the readonly check so
-                            // readonly sees the batch variant it must
-                            // block.
-                            let action = match crate::app::select_gate::gate_action(&app, action) {
-                                crate::app::select_gate::Gated::Pass(a) => a,
-                                crate::app::select_gate::Gated::Blocked(msg) => {
-                                    app.ui.flash = Some(crate::app::FlashMessage::warn(msg.to_string()));
-                                    continue;
+                        // Handle this key, then DRAIN the rest of an SSH-batched
+                        // burst in the SAME turn, painting ONCE after (the top-of-
+                        // loop gate). Processing one key per blocking remote paint
+                        // is what made fast typing feel sluggish over SSH. Stop
+                        // early on an Exec/quit transition so the outer editor/shell
+                        // gates run; cap the batch so a paste can't monopolize the
+                        // loop — undrained keys stay queued for the next turn and
+                        // are never dropped (the channel keeps them).
+                        let mut drain = handle_one_key(
+                            &mut app, key, &mut data_source, &event_tx, &mut repaint,
+                        ).await;
+                        let mut drained = 0;
+                        while matches!(drain, KeyDrain::Continue) && drained < EVENT_DRAIN_CAP {
+                            match input.input_rx.try_recv() {
+                                Ok(CtEvent::Key(k)) => {
+                                    drain = handle_one_key(
+                                        &mut app, k, &mut data_source, &event_tx, &mut repaint,
+                                    ).await;
                                 }
-                            };
-                            // Client-side UX shortcut: flash "Read-only mode"
-                            // immediately without a wire round-trip. The server
-                            // is the real security boundary and rejects every
-                            // mutating command in readonly mode via its own
-                            // `reject_if_readonly` — if `is_mutating()` ever
-                            // drifts from the server's classification, the
-                            // server still refuses. This is polish, not a
-                            // second source of truth.
-                            if app.read_only && action.is_mutating() {
-                                app.ui.flash = Some(crate::app::FlashMessage::info("Read-only mode".to_string()));
-                                continue;
+                                Ok(CtEvent::Resize(_, _)) => repaint.on_input(),
+                                Ok(_) => {}
+                                Err(_) => break,
                             }
-                            let result = handle_action(
-                                &mut app,
-                                action,
-                                &event_tx,
-                                &mut data_source,
-                            );
-                            handle_action_result(
-                                result, &mut app, &data_source, &event_tx,
-                            ).await;
+                            drained += 1;
                         }
                     }
                     // Pure-keyboard TUI by design — mouse events are
@@ -1110,54 +1357,5 @@ pub async fn session_main(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::kube::protocol::ExecPlaceholder;
-
-    fn pod_target() -> ExecTarget {
-        ExecTarget::Pod {
-            pod: "my-pod".into(),
-            namespace: "default".into(),
-            container: "nginx".into(),
-        }
-    }
-
-    fn node_target() -> ExecTarget {
-        ExecTarget::Node { node: "worker-1".into() }
-    }
-
-    #[test]
-    fn resolve_namespace_on_pod() {
-        let result = resolve_placeholder(&ExecPlaceholder::Namespace, &pod_target());
-        assert_eq!(result, Some("default".into()));
-    }
-
-    #[test]
-    fn resolve_namespace_on_node_returns_none() {
-        let result = resolve_placeholder(&ExecPlaceholder::Namespace, &node_target());
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn resolve_node_name_on_node() {
-        let result = resolve_placeholder(&ExecPlaceholder::NodeName, &node_target());
-        assert_eq!(result, Some("node/worker-1".into()));
-    }
-
-    #[test]
-    fn resolve_pod_name_on_node_returns_none() {
-        let result = resolve_placeholder(&ExecPlaceholder::PodName, &node_target());
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn resolve_container_on_pod_with_empty_container() {
-        let target = ExecTarget::Pod {
-            pod: "p".into(),
-            namespace: "ns".into(),
-            container: String::new(),
-        };
-        let result = resolve_placeholder(&ExecPlaceholder::Container, &target);
-        assert_eq!(result, Some(String::new()), "empty container is valid — ConditionalPair skips it");
-    }
-}
+#[path = "../tests/kube/session.rs"]
+mod tests;

@@ -93,7 +93,7 @@ impl Drop for TerminalGuard {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Subcommand dispatch: daemon, ctl, get, contexts
+    // Subcommand dispatch: daemon, ctl, contexts
     if let Some(subcmd) = cli.subcmd {
         return crate::cli::dispatch(subcmd).await;
     }
@@ -129,7 +129,16 @@ async fn main() -> Result<()> {
     let namespace = crate::kube::protocol::Namespace::from_user_command(
         cli.namespace.as_deref().unwrap_or("all"),
     );
-    let cli_context: Option<crate::kube::protocol::ContextName> = cli.context.clone().map(Into::into);
+    // `--context ""` is a typo, not a request: reject it loudly here rather
+    // than letting a nameless context reach the daemon.
+    let cli_context: Option<crate::kube::protocol::ContextName> =
+        match cli.context.as_deref().map(crate::kube::protocol::ContextName::try_from).transpose() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("k9rs: --context: {e}");
+                std::process::exit(2);
+            }
+        };
 
     // Parse startup navigation from positional args or legacy -c flag.
     let startup_segments = parse_startup_segments(&cli);
@@ -168,9 +177,9 @@ async fn main() -> Result<()> {
         event_tx.clone(),
     );
 
-    let mut app = App::new(
-        crate::kube::protocol::ContextName::default(), namespace, &data_source, config,
-    );
+    // `None`: no context is confirmed until the daemon says so (or, with
+    // nothing to connect to, until the user picks one in the contexts view).
+    let mut app = App::new(None, namespace, &data_source, config);
     if cli.readonly {
         app.read_only = true;
     }
@@ -220,8 +229,12 @@ async fn main() -> Result<()> {
             if suspended {
                 if suspend_rx.changed().await.is_err() { break; }
                 if !*suspend_rx.borrow() {
+                    // Resume by simply polling the SAME stream again — it was
+                    // never dropped, only unpolled. Rebuilding it here used to
+                    // race the old stream's teardown against the new one's
+                    // registration and could eat the first real keypress after
+                    // an editor/shell returned.
                     suspended = false;
-                    event_stream = EventStream::new();
                 }
                 continue;
             }
@@ -278,10 +291,6 @@ async fn main() -> Result<()> {
     drop(_terminal_guard);
 
     match exit_reason {
-        Some(crate::app::ExitReason::DaemonDisconnected) => {
-            eprintln!("k9rs: lost connection to daemon");
-            std::process::exit(1);
-        }
         Some(crate::app::ExitReason::Error(msg)) => {
             eprintln!("k9rs: {}", msg);
             std::process::exit(1);
@@ -345,6 +354,7 @@ fn apply_startup_nav(
     let root = App::root_list_element(
         data_source,
         &app.kube.metrics,
+                &app.core,
         first_rid,
         app.kube.selected_ns.clone(),
     );

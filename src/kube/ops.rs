@@ -46,7 +46,7 @@ pub async fn execute_delete(
     let mut cmd = session_env.kubectl();
     cmd.arg("delete").arg(target.kubectl_target());
     if let Some(ns) = target.namespace.as_option() { cmd.arg("-n").arg(ns); }
-    if !context.is_empty() { cmd.arg("--context").arg(context.as_str()); }
+    cmd.arg("--context").arg(context.as_str());
     cmd.kill_on_drop(true);
     let output = cmd.output().await?;
     if !output.status.success() {

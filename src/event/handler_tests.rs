@@ -46,7 +46,7 @@ fn push_content_element(app: &mut App, yaml: bool) {
         crate::app::element::ContentSpec::Describe(target)
     };
     app.nav.push(crate::app::element::Element::ContentView(
-        crate::app::element::ContentView::new(spec, crate::app::ContentViewState::default(), false),
+        crate::app::element::ContentView::new(spec, crate::app::ContentViewState::default(), crate::app::element::ContentPhase::Ready),
     ));
 }
 
@@ -246,6 +246,19 @@ fn test_column_jump_bindings_shadow_defaults() {
         handle_key_event(&app, make_key(KeyCode::Char('$'))),
         Some(Action::ColLast)
     ));
+
+    // With `0` taken by colFirst, `namespaceAll` restores the shadowed
+    // switch-to-all-namespaces action on another key (Shift-0 = `)`).
+    app.config.keys.namespace_all = Some(KeyCombo::plain(')'));
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char(')'))),
+        Some(Action::SwitchNamespace(crate::kube::protocol::Namespace::All))
+    ));
+    // …and `0` still moves the column cursor (the rebind does not reshadow it).
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char('0'))),
+        Some(Action::ColFirst)
+    ));
 }
 
 /// An exact-chord miss must not alias: with logs on plain `l`, Ctrl-L is
@@ -369,17 +382,7 @@ fn test_log_view_shift_c_clears_logs() {
 #[test]
 fn test_q_goes_back_in_help_view() {
     let mut app = App::new_for_test();
-    app.ui.overlay = Some(crate::app::Overlay::Help { scroll: 0 });
-    let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
-    assert!(matches!(action, Some(Action::Back)));
-}
-
-#[test]
-fn test_q_goes_back_in_contexts_view() {
-    let mut app = App::new_for_test();
-    app.nav.push(crate::app::element::Element::ContextList(
-        crate::app::element::ContextList::new(Vec::new()),
-    ));
+    app.ui.overlay = Some(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() });
     let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
     assert!(matches!(action, Some(Action::Back)));
 }
@@ -411,17 +414,7 @@ fn test_esc_goes_back_in_log_view() {
 #[test]
 fn test_esc_goes_back_in_help_view() {
     let mut app = App::new_for_test();
-    app.ui.overlay = Some(crate::app::Overlay::Help { scroll: 0 });
-    let action = handle_key_event(&app, make_key(KeyCode::Esc));
-    assert!(matches!(action, Some(Action::Back)));
-}
-
-#[test]
-fn test_esc_goes_back_in_contexts_view() {
-    let mut app = App::new_for_test();
-    app.nav.push(crate::app::element::Element::ContextList(
-        crate::app::element::ContextList::new(Vec::new()),
-    ));
+    app.ui.overlay = Some(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() });
     let action = handle_key_event(&app, make_key(KeyCode::Esc));
     assert!(matches!(action, Some(Action::Back)));
 }
@@ -714,6 +707,7 @@ fn test_second_batch_refused_while_one_outstanding() {
         "Deleted", "pod".to_string(),
         rid(crate::kube::resource_def::BuiltInKind::Pod),
         std::slice::from_ref(&t), 0, std::sync::Weak::new(),
+        crate::kube::protocol::OperationKind::Delete,
     ));
     crate::kube::session_actions::handle_batch_op(&mut app, Action::BatchDelete);
     assert!(app.ui.confirm_dialog.is_none());
@@ -840,16 +834,13 @@ fn test_resource_view_ctrl_s_save_table() {
 }
 
 #[test]
-fn test_log_view_search_next_prev() {
+fn test_log_view_n_and_shift_n_unbound() {
+    // n/N are NOT bound in log views: logs have no separate search (their `/`
+    // grep IS the filter), and the old branch compared a logical line index to
+    // a physical wrap-offset (broken under wrap). The binding was removed.
     let app = make_log_app();
-    assert!(matches!(
-        handle_key_event(&app, make_key(KeyCode::Char('n'))),
-        Some(Action::SearchNext)
-    ));
-    assert!(matches!(
-        handle_key_event(&app, make_key(KeyCode::Char('N'))),
-        Some(Action::SearchPrev)
-    ));
+    assert!(handle_key_event(&app, make_key(KeyCode::Char('n'))).is_none());
+    assert!(handle_key_event(&app, make_key(KeyCode::Char('N'))).is_none());
 }
 
 #[test]

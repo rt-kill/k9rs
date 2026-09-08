@@ -176,6 +176,37 @@ pub enum Action {
     BatchForceKill,
 }
 
+/// Operation-manifest → key-dispatch bridge. Lives HERE (client side), not
+/// on `OperationKind`, so the wire module never imports client action types
+/// — protocol stays pure shared substrate; the dependency flows
+/// client → protocol only.
+impl From<&crate::kube::protocol::OperationKind> for Action {
+    fn from(op: &crate::kube::protocol::OperationKind) -> Self {
+        use crate::kube::protocol::OperationKind as Op;
+        match op {
+            Op::Describe => Action::Describe,
+            Op::Yaml => Action::Yaml,
+            Op::Delete => Action::Delete,
+            Op::Restart => Action::Restart,
+            Op::Scale => Action::Scale,
+            Op::StreamLogs => Action::Logs,
+            Op::PreviousLogs => Action::PreviousLogs,
+            Op::PortForward => Action::PortForward,
+            Op::Shell => Action::Shell,
+            Op::ShowNode => Action::ShowNode,
+            Op::ForceKill => Action::ForceKill,
+            Op::NodeShell => Action::NodeShell,
+            Op::DecodeSecret => Action::DecodeSecret,
+            Op::TriggerCronJob => Action::TriggerCronJob,
+            Op::ToggleSuspendCronJob => Action::SuspendCronJob,
+            Op::Custom(name) => Action::OverlayCapability(name.clone()),
+            // Wire-only correlation variant; the user-facing flow that
+            // produces an apply is Edit.
+            Op::Apply => Action::Edit,
+        }
+    }
+}
+
 impl Action {
     /// Whether this action should be blocked in readonly mode with a local
     /// "Read-only mode" flash, BEFORE the wire round-trip.

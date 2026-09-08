@@ -47,7 +47,61 @@ use crate::kube::resources::row::ResourceRow;
 #[derive(Debug)]
 pub(crate) enum WatcherMsg {
     Delta(TableDelta),
+    /// A health TRANSITION, broadcast the moment it happens and never
+    /// repeated. A subscriber that attaches DURING a degraded stretch
+    /// therefore can't learn from the ring — its cursor is pinned after the
+    /// transition went out — so the current value also rides every
+    /// [`BaselineReply`].
+    Health(WatchHealth),
     Dead(String),
+}
+
+/// Whether the watch behind this store is still feeding it — the
+/// cluster-side half of liveness (the client↔daemon half is the TUI's
+/// `Connection`). Rows are only as live as the watch that produces them,
+/// and a broken watch is patient: it relists with backoff for two minutes
+/// before it gives up and reports [`WatcherMsg::Dead`], during which every
+/// row on screen is frozen. Without a health signal that whole window is
+/// indistinguishable from a quiet cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchHealth {
+    /// The watch is live: the store tracks the cluster.
+    Feeding,
+    /// The watch stream is failing and relisting behind a backoff. The
+    /// store still holds its last known rows; they just stopped moving.
+    Degraded(String),
+}
+
+impl WatchHealth {
+    /// The transition to broadcast after a watch error, or `None` to stay
+    /// put. A pure rule so the two things that make it subtle are testable
+    /// without a cluster: one error is NOT staleness (kube-rs surfaces
+    /// routine watch restarts as errors and recovers inside a backoff step,
+    /// and flagging those would strobe a banner across every open table), and
+    /// a degradation is announced ONCE, not re-broadcast per retry.
+    ///
+    /// `stuck_for` is time since the watch last made progress — not time
+    /// since the error — because that is what actually decides whether the
+    /// rows on screen have gone cold.
+    fn after_error(&self, stuck_for: std::time::Duration, err: &str) -> Option<WatchHealth> {
+        match self {
+            WatchHealth::Degraded(_) => None,
+            WatchHealth::Feeding if stuck_for > DEGRADE_AFTER => {
+                Some(WatchHealth::Degraded(err.to_string()))
+            }
+            WatchHealth::Feeding => None,
+        }
+    }
+}
+
+/// A baseline plus the health of the watch that produced it. They travel
+/// together because a joining subscriber pins its broadcast cursor BEFORE
+/// asking, so it can never see the [`WatcherMsg::Health`] transition that
+/// preceded its own attach — and would otherwise treat an already-degraded
+/// watcher's rows as live until the next transition.
+pub struct BaselineReply {
+    pub baseline: TableBaseline,
+    pub health: WatchHealth,
 }
 
 /// Baseline request, answered by the watcher task from its store. The
@@ -61,7 +115,7 @@ pub(crate) struct BaselineAsk {
     /// anything real to show — deferred only while the FIRST list is still
     /// empty, so a joining client never sees a false "No resources found".
     pub after_initial_list: bool,
-    pub reply: oneshot::Sender<TableBaseline>,
+    pub reply: oneshot::Sender<BaselineReply>,
 }
 
 /// Broadcast ring capacity, in delta batches, from config (default 64).
@@ -227,10 +281,26 @@ pub(crate) fn watcher_page_size() -> u32 {
 /// row is sent exactly once, so total init bytes ≈ one full list at any
 /// cluster size — the old 2000-row cap is gone, dissolved not raised).
 pub(crate) const INIT_FLUSH_INTERVAL_MS: u64 = 200;
-/// If no kube-rs watch events arrive within this window, the watcher
-/// self-terminates with Dead. The daemon bridge's retry loop creates a
-/// fresh watcher with a new initial list.
-pub(crate) const STALE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+// Staleness (a half-open TCP connection after suspend/network loss) is
+// detected by the TRANSPORT, not by this module: `client_build.rs` sets
+// `read_timeout: 300s` on the kube Config, and the watch request's server
+// side recycles every ~290s (`timeoutSeconds` default) with bookmarks
+// keeping bytes flowing in between — so a live-but-quiet watch always
+// delivers bytes inside the read window, and a dead one errors the stream
+// within ~5 minutes, landing in the normal error/backoff/relist path
+// below. An event-level timer here CANNOT do this job: "no yielded events
+// in N seconds" is the steady state of any quiet resource (bookmarks and
+// watch recycling never surface as yielded events), so such a timer either
+// never fires (the bug this comment replaced: a `timeout()` rebuilt every
+// select iteration, reset by the 200ms flush tick) or kills healthy
+// watchers.
+/// How long a watch must stay stuck before its rows are declared frozen.
+/// Below this, an error is just a watch restart — kube-rs surfaces those
+/// and recovers inside a backoff step, and reporting each one would flicker
+/// a staleness banner across every open table on routine churn. Above it,
+/// nothing has moved for long enough that "live" is a lie.
+pub(crate) const DEGRADE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Backoff config — loaded from daemon config at runtime.
 pub(crate) fn initial_backoff_ms() -> u64 {
     crate::kube::daemon_config::daemon_config().backoff.initial_ms
@@ -279,7 +349,7 @@ impl Subscription {
     pub async fn request_baseline(
         &self,
         after_initial_list: bool,
-    ) -> Option<oneshot::Receiver<TableBaseline>> {
+    ) -> Option<oneshot::Receiver<BaselineReply>> {
         let (reply, rx) = oneshot::channel();
         match self.ask.send(BaselineAsk { after_initial_list, reply }).await {
             Ok(()) => Some(rx),
@@ -625,8 +695,8 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
     let mut phase = ListPhase::Listing { seen: HashSet::new(), first: true };
     // Asks parked until their deferral condition clears (see BaselineAsk).
     // Dropped-on-exit oneshots surface as Err at the bridge = watcher death.
-    let mut deferred_joins: Vec<oneshot::Sender<TableBaseline>> = Vec::new();
-    let mut deferred_relist: Vec<oneshot::Sender<TableBaseline>> = Vec::new();
+    let mut deferred_joins: Vec<oneshot::Sender<BaselineReply>> = Vec::new();
+    let mut deferred_relist: Vec<oneshot::Sender<BaselineReply>> = Vec::new();
 
     let mut backoff_ms: u64 = initial_backoff_ms();
     let mut backoff_start = std::time::Instant::now();
@@ -640,25 +710,23 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
         crate::kube::protocol::Namespace::Named(n) => n.as_str(),
     };
 
-    let make_baseline = |store: &HashMap<ObjectKey, ResourceRow>| TableBaseline {
-        resource: resource_id.clone(),
-        headers: headers.clone(),
-        rows: store.values().cloned().collect(),
+    // `health` is a parameter rather than a capture so the closure stays
+    // usable while the loop below mutates it.
+    let make_baseline = |store: &HashMap<ObjectKey, ResourceRow>, health: &WatchHealth| BaselineReply {
+        baseline: TableBaseline {
+            resource: resource_id.clone(),
+            headers: headers.clone(),
+            rows: store.values().cloned().collect(),
+        },
+        health: health.clone(),
     };
 
     let mut exit_reason: Option<String> = None;
+    let mut health = WatchHealth::Feeding;
 
     loop {
         tokio::select! {
-            timeout_result = tokio::time::timeout(STALE_TIMEOUT, stream.try_next()) => {
-                let event_result = match timeout_result {
-                    Ok(r) => r,
-                    Err(_) => {
-                        warn!("live_query: watcher stale for {}({}), no events in {:?}", rt, ns_label, STALE_TIMEOUT);
-                        exit_reason = Some(format!("watch stale: no events in {:?}", STALE_TIMEOUT));
-                        break;
-                    }
-                };
+            event_result = stream.try_next() => {
                 match event_result {
                     Ok(Some(event)) => {
                         match event {
@@ -692,6 +760,14 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                             WatcherEvent::InitDone => {
                                 backoff_ms = initial_backoff_ms();
                                 backoff_start = std::time::Instant::now();
+                                // The relist finished: the store is
+                                // authoritative again. Announce recovery
+                                // BEFORE the flush and the deferred replies
+                                // below, so both carry the fresh truth.
+                                if health != WatchHealth::Feeding {
+                                    health = WatchHealth::Feeding;
+                                    let _ = delta_tx.send(Arc::new(WatcherMsg::Health(health.clone())));
+                                }
                                 if let ListPhase::Listing { seen, .. } = &phase {
                                     // Tombstones: everything the relist did
                                     // not enumerate is gone.
@@ -713,7 +789,7 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                                 }
                                 // Answer everyone parked on "after the list".
                                 for reply in deferred_relist.drain(..).chain(deferred_joins.drain(..)) {
-                                    let _ = reply.send(make_baseline(&store));
+                                    let _ = reply.send(make_baseline(&store, &health));
                                 }
                             }
                             WatcherEvent::Apply(obj) => {
@@ -758,6 +834,14 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                             exit_reason = Some(format!("{}", e));
                             break;
                         }
+                        // `backoff_start` is reset only by actual PROGRESS
+                        // (Init / InitDone / Apply / Delete), so it measures
+                        // exactly what the rule wants: how long the store has
+                        // been frozen. See `WatchHealth::after_error`.
+                        if let Some(next) = health.after_error(backoff_start.elapsed(), &format!("{}", e)) {
+                            health = next;
+                            let _ = delta_tx.send(Arc::new(WatcherMsg::Health(health.clone())));
+                        }
                         warn!("live_query: watcher error for {}: {}, retrying in {}ms", rt, e, backoff_ms);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         backoff_ms = (backoff_ms * 2).min(max_backoff_ms());
@@ -773,7 +857,7 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                 // page, and the progressive deltas continue from there.
                 if !deferred_joins.is_empty() && !store.is_empty() {
                     for reply in deferred_joins.drain(..) {
-                        let _ = reply.send(make_baseline(&store));
+                        let _ = reply.send(make_baseline(&store, &health));
                     }
                 }
             }
@@ -788,7 +872,7 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                 } else if defer_join {
                     deferred_joins.push(ask.reply);
                 } else {
-                    let _ = ask.reply.send(make_baseline(&store));
+                    let _ = ask.reply.send(make_baseline(&store, &health));
                 }
             }
         }
@@ -891,6 +975,7 @@ mod watcher_tests {
                 .expect("channel open");
             match &*msg {
                 WatcherMsg::Delta(d) => d.clone(),
+                WatcherMsg::Health(h) => panic!("unexpected Health({h:?})"),
                 WatcherMsg::Dead(r) => panic!("unexpected Dead({r})"),
             }
         }
@@ -901,7 +986,7 @@ mod watcher_tests {
             assert!(res.is_err(), "expected NO delta, got {:?}", res.map(|m| m.map(|a| format!("{:?}", a))));
         }
 
-        fn ask(&self, after_initial_list: bool) -> oneshot::Receiver<TableBaseline> {
+        fn ask(&self, after_initial_list: bool) -> oneshot::Receiver<BaselineReply> {
             let (reply, rx) = oneshot::channel();
             self.ask_tx
                 .try_send(BaselineAsk { after_initial_list, reply })
@@ -953,8 +1038,8 @@ mod watcher_tests {
             .await
             .expect("join baseline unparked at first page")
             .expect("watcher alive");
-        assert_eq!(baseline.rows.len(), 1);
-        assert_eq!(baseline.headers, vec!["NAME", "V"]);
+        assert_eq!(baseline.baseline.rows.len(), 1);
+        assert_eq!(baseline.baseline.headers, vec!["NAME", "V"]);
         // Progressive init continues as deltas.
         h.send(WatcherEvent::InitApply(cm("ns", "b", "1")));
         h.send(WatcherEvent::InitDone);
@@ -962,7 +1047,7 @@ mod watcher_tests {
         assert_eq!(keys_of(&d).0, vec!["b"]);
         // Steady ask answers immediately with the full store.
         let baseline = h.ask(false).await.expect("steady baseline");
-        assert_eq!(baseline.rows.len(), 2);
+        assert_eq!(baseline.baseline.rows.len(), 2);
     }
 
     /// C1/C2/H1: relist does NOT clear the store (asks answered mid-relist
@@ -977,7 +1062,7 @@ mod watcher_tests {
         h.send(WatcherEvent::InitApply(cm("ns", "a", "1"))); // unchanged
         // Mid-relist join: store retained → immediate, full answer.
         let baseline = h.ask(false).await.expect("mid-relist baseline");
-        assert_eq!(baseline.rows.len(), 2, "store not cleared during relist");
+        assert_eq!(baseline.baseline.rows.len(), 2, "store not cleared during relist");
         h.send(WatcherEvent::InitApply(cm("ns", "c", "1"))); // new
         h.send(WatcherEvent::InitDone); // b was not re-enumerated
         let d = h.next_delta().await;
@@ -1006,7 +1091,7 @@ mod watcher_tests {
             .await
             .expect("resolved at InitDone")
             .expect("watcher alive");
-        let mut names: Vec<_> = baseline.rows.iter().map(|r| r.name.clone()).collect();
+        let mut names: Vec<_> = baseline.baseline.rows.iter().map(|r| r.name.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["c"], "a tombstoned, c present");
     }
@@ -1098,5 +1183,41 @@ mod watcher_tests {
             Err(RecvError::Closed) => {}
             other => panic!("nothing may follow Dead, got {other:?}"),
         }
+    }
+
+    /// A healthy watcher vouches for its own baseline. This is the channel
+    /// through which a bridge attaching to an ALREADY-degraded shared
+    /// watcher learns it missed the transition — the broadcast can't tell
+    /// it, since its cursor is pinned after the transition went out.
+    #[tokio::test]
+    async fn a_baseline_carries_the_health_of_the_watch_that_built_it() {
+        let mut h = spawn_harness();
+        h.init_steady(vec![cm("ns", "a", "1")]).await;
+        let reply = h.ask(false).await.expect("baseline");
+        assert_eq!(reply.health, WatchHealth::Feeding);
+        assert_eq!(reply.baseline.rows.len(), 1);
+    }
+
+    /// The two subtleties of the degrade rule, without a cluster or a clock:
+    /// a single error is not staleness, and a degradation is announced once.
+    #[test]
+    fn one_watch_error_is_not_staleness_and_degradation_is_announced_once() {
+        let brief = DEGRADE_AFTER / 2;
+        let long = DEGRADE_AFTER * 2;
+
+        // Routine restart: kube-rs surfaces it as an error and recovers
+        // inside a backoff step. Flagging it would strobe every open table.
+        assert_eq!(WatchHealth::Feeding.after_error(brief, "hiccup"), None);
+
+        // Nothing has moved for long enough that "live" is a lie.
+        assert_eq!(
+            WatchHealth::Feeding.after_error(long, "connection reset"),
+            Some(WatchHealth::Degraded("connection reset".into())),
+        );
+
+        // Already said so — retries must not re-broadcast it (the ring is
+        // small, and a repeat would lag real subscribers into a re-baseline).
+        let degraded = WatchHealth::Degraded("connection reset".into());
+        assert_eq!(degraded.after_error(long, "connection reset again"), None);
     }
 }

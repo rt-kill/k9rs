@@ -45,6 +45,9 @@ struct TableSnapshot<'a> {
     /// [`PreparedView`] so the widget doesn't re-scan rows each frame.
     col_widths: &'a [u16],
     search_patterns: &'a [crate::util::SearchPattern],
+    /// Non-live rows are still painted, but never silently — see
+    /// [`crate::app::Liveness::warning`].
+    warning: Option<&'a str>,
 }
 
 /// Render a resource table from a pre-built snapshot. Returns the new
@@ -56,8 +59,6 @@ fn draw_resource_table(
     snap: &TableSnapshot<'_>,
     theme: &Theme,
 ) -> (usize, usize, u16) {
-    let visible_height = (area.height as usize).saturating_sub(3);
-
     let rt = ResourceTable::new(snap.headers.clone(), snap.rows, title, theme)
         .sort(snap.display_sort_col, snap.sort_ascending)
         .namespace(snap.namespace)
@@ -67,7 +68,8 @@ fn draw_resource_table(
         .row_health(snap.row_health)
         .cell_style(snap.cell_style)
         .col_widths(snap.col_widths)
-        .search_patterns(snap.search_patterns);
+        .search_patterns(snap.search_patterns)
+        .warning(snap.warning);
 
     let mut state = ResourceTableState {
         selected: snap.selected,
@@ -75,11 +77,14 @@ fn draw_resource_table(
         selected_col: snap.selected_col,
         col_offset: snap.col_offset,
         filtered_count: 0,
+        visible_height: 0,
     };
 
     f.render_stateful_widget(rt, area, &mut state);
 
-    (state.offset, visible_height, state.col_offset)
+    // The widget measured the true data-row height from the real Rect and wrote
+    // it into `state.visible_height`; return THAT, not a re-derived `area - 3`.
+    (state.offset, state.visible_height, state.col_offset)
 }
 
 
@@ -179,15 +184,17 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     // 4. Resource table — element-owned: query + predicates, columns
     // (NAMESPACE membership fixed at construction), title, scope label,
     // cursor. Nothing reads ambient state; nothing reaches below the top.
+    //
+    // Whether these rows may be painted is NOT decided here: it's one
+    // question about both hops (client↔daemon and daemon↔cluster), and every
+    // view that answered it locally answered it slightly differently. Ask
+    // the authority instead.
+    let liveness = app.nav.top().liveness(&app.conn);
     let element = app.nav.top_mut();
-    if view.total_rows == 0 {
-        // No data at all (loading / failed / genuinely empty): bordered
-        // block with a centered status line.
-        let text = match element.data_state() {
-            crate::app::table::TableDataState::Failed(err) => format!("Error: {}", err),
-            crate::app::table::TableDataState::Ready => format!("No {} found.", element.title()),
-            crate::app::table::TableDataState::Initializing => app.ui.anim.bar("Loading..."),
-        };
+    if !liveness.shows_data() || view.total_rows == 0 {
+        // Nothing paintable (connecting / loading), or genuinely empty:
+        // bordered block with a centered status line.
+        let text = liveness.status_text(&app.ui.anim, || format!("No {} found.", element.title()));
         let status_line = Line::from(Span::styled(text, theme.info_value));
         let scope = element.scope_label();
         // The selected-count indicator renders HERE too: this branch is
@@ -216,6 +223,13 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
             f.render_widget(status_line, Rect::new(center_x, center_y, inner.width, 1));
         }
     } else {
+        // Rows that are resident but not live (a dead cluster-side watch, a
+        // terminal subscription error) still paint — the link is up, so every
+        // operation on them still works and blanking the table would throw
+        // away the cursor, the marks and the scroll position. What must never
+        // happen is painting them SILENTLY, which is what a `Failed` store
+        // with surviving rows used to do.
+        let warning = liveness.warning();
         let marked = element.marked_snapshot();
         let changed = element.changed_snapshot();
         let patterns = element.grep_patterns();
@@ -227,7 +241,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
             headers,
             rows: &view.rows,
             selected: it.selected.min(view.keys.len().saturating_sub(1)),
-            offset: it.offset,
+            offset: it.viewport.offset(),
             selected_col: it.selected_col.min(view.visible_cols.len().saturating_sub(1)),
             col_offset: it.col_offset,
             sort_ascending: it.sort.ascending,
@@ -240,12 +254,12 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
             cell_style: &view.cell_style,
             col_widths: &view.col_widths,
             search_patterns: &patterns,
+            warning: warning.as_deref(),
         };
-        let (new_offset, new_page_size, new_col_offset) =
+        let (new_offset, new_viewport_rows, new_col_offset) =
             draw_resource_table(f, table_area, &title, &snap, theme);
         if let Some(it) = element.table_interaction_mut() {
-            it.offset = new_offset;
-            it.page_size = new_page_size;
+            it.viewport.apply_render(new_offset, view.rows.len(), new_viewport_rows);
             it.col_offset = new_col_offset;
         }
     }

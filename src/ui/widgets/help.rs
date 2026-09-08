@@ -32,6 +32,21 @@ pub struct HelpOverlay<'a> {
 }
 
 impl<'a> HelpOverlay<'a> {
+    /// Dialog height as a percentage of the screen. The widget owns its
+    /// geometry — `inner_rows` derives the viewport metrics from these
+    /// same constants, so the clamp and the paint can never disagree.
+    const HEIGHT_PCT: u32 = 85;
+    /// Chrome rows inside the dialog: 2 border rows + 1 top-padding row
+    /// (matches the `Padding::new(1, 1, 1, 0)` in `render`).
+    const CHROME_ROWS: u16 = 3;
+
+    /// Rows of scrollable content visible at a given screen height — the
+    /// number the help viewport should clamp against.
+    pub fn inner_rows(screen_height: u16) -> usize {
+        (screen_height as u32 * Self::HEIGHT_PCT / 100).saturating_sub(Self::CHROME_ROWS as u32)
+            as usize
+    }
+
     pub fn new(
         theme: &'a Theme,
         scroll: usize,
@@ -57,31 +72,18 @@ impl<'a> HelpOverlay<'a> {
         total
     }
 
-    /// Maximum sensible value for `help_scroll` given the current terminal
-    /// height. Mirrors the render-time clamp (see [`Widget::render`]) so action
-    /// handlers can store a stable max instead of a `usize::MAX` sentinel
-    /// (which made PrevItem decrements appear to do nothing for
-    /// ~`visible_height` keystrokes before they overcame the difference).
-    ///
-    /// Returns 0 if the content fits without scrolling.
-    pub fn max_scroll(
-        terminal_height: u16,
+    /// Total content line count, published to the help viewport as its
+    /// `content_rows`. The viewport clamps the offset now — the widget no
+    /// longer mirrors the dialog geometry (that duplication was the smell).
+    pub fn content_line_count(
         caps: Option<&crate::kube::protocol::ResourceCapabilities>,
         keys: crate::app::KeysConfig,
     ) -> usize {
-        // Dialog is `centered_rect(area, 42, 85)` — 85% of terminal height.
-        // Block overhead is 3 rows (2 borders + 1 top pad). See render.
-        let dialog_height = (terminal_height as usize) * 85 / 100;
-        let visible_height = dialog_height.saturating_sub(3).max(1);
-        // Compute total lines from a temporary instance. The theme is
-        // only needed for rendering, not for counting lines, so we use
-        // a stack-local theme whose lifetime is confined to this call.
+        // Theme is only needed for rendering, not counting; a stack-local one
+        // keeps the lifetime confined to this call.
         let theme = Theme::default();
-        let total = {
-            let tmp = HelpOverlay { theme: &theme, scroll: 0, caps: caps.cloned(), keys };
-            tmp.total_lines()
-        };
-        total.saturating_sub(visible_height)
+        let tmp = HelpOverlay { theme: &theme, scroll: 0, caps: caps.cloned(), keys };
+        tmp.total_lines()
     }
 
     fn sections(&self) -> Vec<HelpSection> {
@@ -411,9 +413,9 @@ impl<'a> HelpOverlay<'a> {
 
 impl Widget for HelpOverlay<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // Percentage-based centering (42% width, 85% height).
+        // Percentage-based centering (42% width, HEIGHT_PCT height).
         let w = (area.width as u32 * 42 / 100) as u16;
-        let h = (area.height as u32 * 85 / 100) as u16;
+        let h = (area.height as u32 * Self::HEIGHT_PCT / 100) as u16;
         let dialog_area = crate::ui::centered_rect(area, w, h);
 
         // Clear + guaranteed-visible bg (consistent with ModalOverlay).
@@ -451,14 +453,14 @@ impl Widget for HelpOverlay<'_> {
         let total = all_lines.len();
 
         // Re-clamp scroll to the content height before formatting the title.
-        // The End action stores a real max (via `help_max_scroll`), not a
-        // `usize::MAX` sentinel, but the terminal may have shrunk since — so
-        // clamp here too, which also keeps the `scroll + 1` title indicator
-        // from exceeding `total`.
+        // The offset was already clamped by the Viewport's `set_metrics` at the
+        // start of the draw, but the terminal may have shrunk since — so clamp
+        // this throwaway snapshot too, which also keeps the `scroll + 1` title
+        // indicator from exceeding `total`.
         //
-        // Block overhead is 2 border rows + 1 top-padding row + 0 bottom-
-        // padding row = 3 (matches `Padding::new(1, 1, 1, 0)` below).
-        let visible_height = dialog_area.height.saturating_sub(3) as usize;
+        // Block overhead: `CHROME_ROWS` (borders + top padding, matching
+        // `Padding::new(1, 1, 1, 0)` below).
+        let visible_height = dialog_area.height.saturating_sub(Self::CHROME_ROWS) as usize;
         let has_more = total > visible_height;
         let scroll = self.scroll.min(total.saturating_sub(visible_height.max(1)));
         let title = if has_more {

@@ -53,7 +53,11 @@ pub struct ConnectionParams {
 /// then split into the daemon Init payload (`prepared`) and the TUI's
 /// `KubeconfigLoaded` event (`contexts`, `current_*`).
 struct KubeconfigBundle {
-    prepared: PreparedKubeconfig,
+    /// `None` when the kubeconfig names no usable context (none requested on
+    /// the command line, and `current-context` absent or blank). The TUI
+    /// still starts — `contexts` below is everything the picker needs — it
+    /// just has no session to open until the user chooses one.
+    prepared: Option<PreparedKubeconfig>,
     contexts: Vec<KubeContext>,
 }
 
@@ -127,13 +131,13 @@ impl Drop for SubscriptionStream {
 
 impl SubscriptionStream {
     /// Whether the bridge task is still running. Goes `false` once the bridge
-    /// has terminated by any path — retry give-up, EOF, or panic.
+    /// has terminated by any path — retry give-up, EOF, abort, or panic.
     ///
-    /// Every such terminal path also emits `SubscriptionFailed`, which clears
-    /// the nav stack's handle reactively; this method lets the nav layer's
-    /// re-subscribe decision observe liveness *directly* instead of trusting
-    /// that convention, so a present-but-dead handle can never masquerade as a
-    /// live subscription owner.
+    /// This is THE liveness mechanism: the nav layer's re-subscribe decision
+    /// (`ensure_top_live`) reads it directly, so a present-but-dead handle
+    /// can never masquerade as a live subscription owner. (`SubscriptionFailed`
+    /// events are flash-only display; no reactive handle-clearing convention
+    /// exists to trust or distrust.)
     pub fn is_alive(&self) -> bool {
         !self._bridge.is_finished()
     }
@@ -188,6 +192,13 @@ impl LogStream {
     /// Whether the bridge task behind this stream is still running.
     pub fn is_alive(&self) -> bool {
         !self._bridge.is_finished()
+    }
+
+    /// Signal the bridge task to stop. Idempotent (Drop also aborts). Used at
+    /// the reconnect/switch choke point to stop the stream retrying against a
+    /// dropped session's dead mux; revived later if still needed.
+    pub fn abort(&self) {
+        self._bridge.abort();
     }
 
     /// Build a handle from a raw abort handle. Test-only.
@@ -269,39 +280,47 @@ impl ClientSession {
         let kubeconfig = Kubeconfig::read()
             .map_err(|e| anyhow::anyhow!("Failed to read kubeconfig: {}", e))?;
 
-        let context_name: crate::kube::protocol::ContextName = cli_context
+        // `and_then(ContextName::new)` is the load-bearing bit: `kubectl
+        // config unset current-context` does not remove the key, it writes
+        // `current-context: ""`, so kube-rs hands back `Some("")`. Absence
+        // has to collapse to `None` HERE — the one place a name enters the
+        // process — or it travels on as a context named "" and the daemon
+        // fails on a name that cannot exist.
+        let context_name: Option<crate::kube::protocol::ContextName> = cli_context
             .cloned()
-            .or_else(|| kubeconfig.current_context.clone().map(Into::into))
-            .ok_or_else(|| anyhow::anyhow!("No context specified and no current-context in kubeconfig"))?;
+            .or_else(|| kubeconfig.current_context.clone().and_then(crate::kube::protocol::ContextName::new));
 
-        let identity = lookup_cluster_user(&kubeconfig, &context_name);
-
-        let contexts: Vec<KubeContext> = kubeconfig.contexts.iter().map(|nc| {
+        // A nameless entry is unselectable, so it is dropped rather than
+        // listed as a blank row the user can put the cursor on.
+        let contexts: Vec<KubeContext> = kubeconfig.contexts.iter().filter_map(|nc| {
+            let name = crate::kube::protocol::ContextName::new(nc.name.as_str())?;
             let identity = nc.context.as_ref()
                 .map(|c| crate::kube::protocol::ClusterIdentity::new(
                     c.cluster.clone(),
                     c.user.clone().unwrap_or_default(),
                 ))
                 .unwrap_or_default();
-            KubeContext {
-                name: nc.name.as_str().into(),
+            Some(KubeContext {
+                is_current: context_name.as_ref() == Some(&name),
+                name,
                 identity,
-                is_current: nc.name.as_str() == context_name.as_str(),
-            }
+            })
         }).collect();
 
         let kubeconfig_yaml = serde_yaml::to_string(&kubeconfig)
             .map_err(|e| anyhow::anyhow!("Failed to serialize kubeconfig: {}", e))?;
 
-        Ok(KubeconfigBundle {
-            prepared: PreparedKubeconfig {
-                kubeconfig_yaml,
-                env_vars: collect_env_vars(),
-                context_name,
-                identity,
-            },
-            contexts,
-        })
+        // No context is NOT an error: the kubeconfig is readable and its
+        // contexts list is exactly what the picker needs. What's missing is
+        // only which one to connect to — a question the user answers.
+        let prepared = context_name.map(|context_name| PreparedKubeconfig {
+            identity: lookup_cluster_user(&kubeconfig, &context_name),
+            kubeconfig_yaml,
+            env_vars: collect_env_vars(),
+            context_name,
+        });
+
+        Ok(KubeconfigBundle { prepared, contexts })
     }
 
     fn build_init_command(
@@ -386,10 +405,20 @@ async fn run_connection_pipeline(
         Err(e) => fail!("kubeconfig: {}", e),
     };
     let _ = event_tx.send(AppEvent::KubeconfigLoaded {
-        current_context: bundle.prepared.context_name.clone(),
-        current_identity: bundle.prepared.identity.clone(),
+        current_context: bundle.prepared.as_ref().map(|p| p.context_name.clone()),
+        current_identity: bundle.prepared.as_ref().map(|p| p.identity.clone()).unwrap_or_default(),
         contexts: bundle.contexts,
     }).await;
+
+    // No context to connect to. Stop here — deliberately NOT `fail!`, which
+    // would report a failure the user can't act on and schedule retries
+    // against a target that doesn't exist. The contexts list went out with
+    // the event above, so the picker has everything it needs; when the user
+    // chooses, the switch path builds a fresh session with that context.
+    let Some(prepared) = bundle.prepared else {
+        let _ = event_tx.send(AppEvent::NoContextConfigured).await;
+        return;
+    };
 
     // Stage 2: open the transport and establish the yamux multiplexed
     // connection. The first substream we open is the CONTROL stream, which
@@ -428,7 +457,7 @@ async fn run_connection_pipeline(
     let outcome = match do_handshake(
         reader, writer,
         &params,
-        &bundle.prepared,
+        &prepared,
     ).await {
         Ok(o) => o,
         Err(e) => fail!("{}", e),
@@ -443,10 +472,10 @@ async fn run_connection_pipeline(
         event_tx.clone(),
         outcome.context.clone(),
     ));
-    let _io_guard = AbortOnDrop::new([
-        writer_handle.abort_handle(),
-        reader_handle.abort_handle(),
-    ]);
+    let _io_guard = [
+        crate::util::AbortOnDrop::new(writer_handle.abort_handle()),
+        crate::util::AbortOnDrop::new(reader_handle.abort_handle()),
+    ];
 
     let _ = event_tx.send(AppEvent::ConnectionEstablished {
         context: outcome.context,
@@ -464,27 +493,6 @@ async fn run_connection_pipeline(
         _ = reader_handle => {}
     }
     drop(mux); // explicit for clarity — driver task dies here
-}
-
-/// RAII guard: aborts a fixed set of tokio tasks when dropped. Used by the
-/// connection pipeline to guarantee its child I/O loops die when the pipeline
-/// future is cancelled (e.g. by `connection_manager`'s shutdown select).
-struct AbortOnDrop<const N: usize> {
-    handles: [tokio::task::AbortHandle; N],
-}
-
-impl<const N: usize> AbortOnDrop<N> {
-    fn new(handles: [tokio::task::AbortHandle; N]) -> Self {
-        Self { handles }
-    }
-}
-
-impl<const N: usize> Drop for AbortOnDrop<N> {
-    fn drop(&mut self) {
-        for h in &self.handles {
-            h.abort();
-        }
-    }
 }
 
 /// Stage 1: read and parse the kubeconfig on a blocking thread.
@@ -592,10 +600,12 @@ async fn do_handshake(
     }
 }
 
-/// The writer half of the I/O pair: drains the unbounded command channel
-/// (which the TUI fills via `ClientSession::send_command`) and serializes
-/// each `SessionCommand` onto the wire as length-prefixed bincode. Exits on
-/// any write error or when all senders on `cmd_rx` are dropped.
+/// The writer half of the I/O pair: drains the command channel (bounded at
+/// [`CMD_CHANNEL_CAPACITY`]; the TUI fills it via
+/// `ClientSession::send_command`, whose `try_send` surfaces a full queue as
+/// a user-visible error instead of blocking the UI) and serializes each
+/// `SessionCommand` onto the wire as length-prefixed bincode. Exits on any
+/// write error or when all senders on `cmd_rx` are dropped.
 async fn writer_loop(
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
     mut writer: BufWriter<Box<dyn AsyncWrite + Unpin + Send>>,
@@ -1000,6 +1010,16 @@ impl ClientSession {
                             }).await;
                             return;
                         }
+                        // Session death check: the mux watch's RETAINED value
+                        // lets a bridge of a dropped session skip the wait
+                        // loop above (borrow yields the stale handle after
+                        // the sender dies), so this retry branch is the only
+                        // place that can observe the session is gone. Without
+                        // it the bridge zombie-retries against the dead mux
+                        // for the whole outage.
+                        if event_tx.is_closed() {
+                            return;
+                        }
                         tracing::warn!("subscription bridge reopen failed for {}: {}", rid.plural(), e);
                         let jitter = crate::util::retry_jitter(rid.plural().as_bytes(), retry_backoff.as_millis() as u64);
                         let jittered = retry_backoff.mul_f64(jitter);
@@ -1092,6 +1112,30 @@ impl ClientSession {
                             current_rid = resolved.clone();
                             retry_backoff = std::time::Duration::from_secs(2);
                             AppEvent::ResourceResolved { original, resolved }
+                        }
+                        protocol::StreamEvent::Stale(reason) => {
+                            // The CLUSTER hop broke, not this one: the
+                            // substream is healthy and delivered this frame,
+                            // so it is progress for backoff — but it is the
+                            // opposite of a healthy snapshot, so (like
+                            // `Resolved`) it does not clear the error ceiling.
+                            // Reconnecting the substream would not help.
+                            retry_backoff = std::time::Duration::from_secs(2);
+                            AppEvent::Store(crate::event::StoreEvent {
+                                store: store.clone(),
+                                epoch,
+                                payload: crate::app::store::StorePayload::Stale(reason),
+                            })
+                        }
+                        protocol::StreamEvent::Live => {
+                            consecutive_errors = 0;
+                            last_flashed_error = None;
+                            retry_backoff = std::time::Duration::from_secs(2);
+                            AppEvent::Store(crate::event::StoreEvent {
+                                store: store.clone(),
+                                epoch,
+                                payload: crate::app::store::StorePayload::Live,
+                            })
                         }
                         protocol::StreamEvent::Error(msg) => {
                             // Server-side subscription error (RBAC denied, CRD
@@ -1287,11 +1331,11 @@ fn convert_session_event(event: SessionEvent, current_context: &crate::kube::pro
             vec![AppEvent::CommandResult(result)]
         }
 
-        SessionEvent::OpResult { target, result } => {
-            // Typed pass-through: the event loop correlates by target —
-            // the edit flow reacts only to its own apply, a batch tracker
-            // consumes its items' results, everything else flashes.
-            vec![AppEvent::OpResult { target, result }]
+        SessionEvent::OpResult { op, target, result } => {
+            // Typed pass-through: the event loop correlates by (op, target)
+            // — the edit flow reacts only to its own apply, a batch tracker
+            // consumes its own operation's results, everything else flashes.
+            vec![AppEvent::OpResult { op, target, result }]
         }
 
         SessionEvent::Discovery { context: ctx, namespaces, crds } => {

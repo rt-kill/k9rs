@@ -339,12 +339,13 @@ impl ConvertToRow<Pod> for PodDef {
     let init_containers: Vec<ContainerInfo> = init_container_statuses
         .iter()
         .map(|cs| {
-            let (status, ready) = container_status_and_ready(cs);
+            let (state, reason, ready) = container_status_and_ready(cs);
             ContainerInfo {
                 name: cs.name.clone(),
                 kind: crate::kube::resources::row::ContainerKind::Init,
                 image: cs.image.clone(),
-                status,
+                state,
+                reason,
                 ready,
                 restart_count: cs.restart_count,
             }
@@ -354,12 +355,13 @@ impl ConvertToRow<Pod> for PodDef {
     let regular_containers: Vec<ContainerInfo> = container_statuses
         .iter()
         .map(|cs| {
-            let (status, ready) = container_status_and_ready(cs);
+            let (state, reason, ready) = container_status_and_ready(cs);
             ContainerInfo {
                 name: cs.name.clone(),
                 kind: crate::kube::resources::row::ContainerKind::Regular,
                 image: cs.image.clone(),
-                status,
+                state,
+                reason,
                 ready,
                 restart_count: cs.restart_count,
             }
@@ -528,41 +530,27 @@ impl ConvertToRow<Pod> for PodDef {
 }
 
 /// Extract status string and ready flag from a container status.
-fn container_status_and_ready(cs: &k8s_openapi::api::core::v1::ContainerStatus) -> (String, bool) {
+fn container_status_and_ready(
+    cs: &k8s_openapi::api::core::v1::ContainerStatus,
+) -> (crate::kube::resources::row::ContainerState, Option<String>, bool) {
+    use crate::kube::resources::row::ContainerState;
     let ready = cs.ready;
-    let status = if let Some(ref state) = cs.state {
+    let (state, reason) = if let Some(ref state) = cs.state {
         if state.running.is_some() {
-            "Running".to_string()
+            (ContainerState::Running, None)
         } else if let Some(ref w) = state.waiting {
-            w.reason.clone().unwrap_or_else(|| "Waiting".to_string())
+            (ContainerState::Waiting, w.reason.clone())
         } else if let Some(ref t) = state.terminated {
-            t.reason.clone().unwrap_or_else(|| "Terminated".to_string())
+            (ContainerState::Terminated, t.reason.clone())
         } else {
-            "Unknown".to_string()
+            (ContainerState::Unknown, None)
         }
     } else {
-        "Unknown".to_string()
+        (ContainerState::Unknown, None)
     };
-    (status, ready)
+    (state, reason, ready)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::kube::resource_def::{ConvertToRow, ResourceDef};
-
-    /// Pods are the highest-risk converter: 24 columns and a metrics overlay
-    /// that writes cells *by index* derived from `column_defs()`. Guard that
-    /// the `cells` vec aligns with the headers so a one-off drift can't silently
-    /// land a CPU value under the wrong column. (The headers↔column_defs half is
-    /// covered registry-wide in `resource_defs::registry::tests`.)
-    #[test]
-    fn pod_cells_align_with_headers() {
-        let row = PodDef::convert(k8s_openapi::api::core::v1::Pod::default());
-        assert_eq!(
-            row.cells.len(),
-            PodDef.default_headers().len(),
-            "pod cells vec must align with default_headers",
-        );
-    }
-}
+#[path = "../../tests/kube/resources/pods.rs"]
+mod tests;

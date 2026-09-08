@@ -56,7 +56,6 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
 use tokio_stream::StreamExt as _;
 
 /// Bidirectional multiplexed transport between two peers. Owns the
@@ -75,7 +74,7 @@ pub struct MuxedConnection {
     inbound_rx: mpsc::Receiver<MuxedStream>,
     /// Aborts the driver task on drop. Closing the driver in turn closes
     /// the underlying socket, sending an EOF to the peer.
-    _driver: AbortOnDrop,
+    _driver: crate::util::AbortOnDrop,
 }
 
 /// A cheap clone-able handle for opening outbound substreams from any task.
@@ -95,18 +94,6 @@ pub struct MuxHandle {
 /// `tokio_yamux::StreamHandle::Drop`). The peer's read returns EOF.
 pub struct MuxedStream {
     inner: tokio_yamux::StreamHandle,
-}
-
-/// RAII guard that aborts a tokio task when dropped. Used to make sure
-/// the muxer driver task dies when its [`MuxedConnection`] does.
-struct AbortOnDrop(Option<AbortHandle>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        if let Some(h) = self.0.take() {
-            h.abort();
-        }
-    }
 }
 
 /// Yamux configuration tuned for the k9rs workload. Large clusters (9k+
@@ -183,7 +170,7 @@ impl MuxedConnection {
         Self {
             control,
             inbound_rx,
-            _driver: AbortOnDrop(Some(driver.abort_handle())),
+            _driver: crate::util::AbortOnDrop::new(driver.abort_handle()),
         }
     }
 

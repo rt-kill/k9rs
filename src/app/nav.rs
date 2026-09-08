@@ -209,6 +209,18 @@ impl NavStack {
         }
     }
 
+    /// Abort every element's owned live stream — called at the reconnect /
+    /// switch choke point so old bridges stop retrying against the dropped
+    /// session's now-dead mux (the parked ones exit cleanly on their own, but
+    /// the mid-retry ones would otherwise burn a backoff loop). Streams are
+    /// revived on `ConnectionEstablished` (top) / on pop (covered), or the
+    /// elements are dropped by a switch's nav reset. No-op for streamless kinds.
+    pub fn abort_all_streams(&self) {
+        for element in self.items.iter() {
+            element.abort_data_stream();
+        }
+    }
+
     /// Ctrl-R: force-refresh the subscription feeding the TOP's data —
     /// found by store pointer identity, re-run with the element's OWN
     /// stored query spec (never the ambient selector).
@@ -220,6 +232,25 @@ impl NavStack {
                     list.query_mut().refresh(session);
                     return;
                 }
+            }
+        }
+    }
+
+    /// Run `f` over every ContentView in the stack — the delivery walk for
+    /// fetched content (yaml / describe / decoded secrets) and the
+    /// failure-marking walk at the session-rebuild choke point. Routing is
+    /// by each view's OWN spec (content identity), wherever it sits:
+    /// covered views fill while hidden, so a pop-reveal shows the content
+    /// instead of a spinner orphaned by a deliver-to-top-only rule. Same
+    /// named-walk discipline as `ensure_top_live` — data-plane maintenance,
+    /// not scope interpretation.
+    pub fn for_each_content_view(
+        &mut self,
+        mut f: impl FnMut(&mut crate::app::element::ContentView),
+    ) {
+        for element in self.items.iter_mut() {
+            if let Element::ContentView(cv) = element {
+                f(cv);
             }
         }
     }
@@ -400,115 +431,5 @@ impl FilterInputState {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::app::element::{ContentSpec, ContentView, Element, QuerySpec, ResourceList};
-    use crate::app::store::{MetricsHub, RowPredicate};
-    use crate::kube::protocol::Namespace;
-    use crate::kube::resource_def::BuiltInKind;
-
-    fn list(kind: BuiltInKind) -> Element {
-        Element::ResourceList(ResourceList::open_for_test(
-            QuerySpec {
-                rid: ResourceId::BuiltIn(kind),
-                namespace: Namespace::All,
-                filter: None,
-            },
-            &MetricsHub::new(),
-            ResourceId::BuiltIn(kind).short_label().to_lowercase(),
-        ))
-    }
-
-    #[test]
-    fn pop_refuses_the_root_and_lifo_holds() {
-        let mut stack = NavStack::new(list(BuiltInKind::Pod));
-        assert!(stack.pop().is_none(), "root never pops");
-        stack.push(list(BuiltInKind::Deployment));
-        assert_eq!(stack.depth(), 2);
-        assert!(stack.is_drilled());
-        assert!(stack.pop().is_some());
-        assert_eq!(stack.depth(), 1);
-        assert!(!stack.is_drilled());
-        assert!(stack.pop().is_none());
-    }
-
-    #[test]
-    fn reset_drains_everything_and_records_prev_root() {
-        let mut stack = NavStack::new(list(BuiltInKind::Pod));
-        let root_store = std::sync::Arc::clone(stack.top().data_store().unwrap());
-        stack.push(
-            Element::derive_filter(
-                stack.top(),
-                RowPredicate::Grep(CompiledGrep::new("x")),
-            )
-            .unwrap(),
-        );
-        assert_eq!(stack.depth(), 2);
-        stack.reset(list(BuiltInKind::Node));
-        assert_eq!(stack.depth(), 1);
-        // Every old element dropped — no leaked backward Arcs (only our
-        // local handle survives).
-        assert_eq!(std::sync::Arc::strong_count(&root_store), 1);
-        // The recipe of the OLD root was recorded for `-`.
-        assert_eq!(
-            stack.prev_root(),
-            Some(&RootSpec::Resource(ResourceId::BuiltIn(BuiltInKind::Pod)))
-        );
-        assert_eq!(
-            stack.root_spec(),
-            Some(RootSpec::Resource(ResourceId::BuiltIn(BuiltInKind::Node)))
-        );
-    }
-
-    #[test]
-    fn breadcrumb_is_a_label_fold() {
-        let mut stack = NavStack::new(list(BuiltInKind::Pod));
-        stack.push(
-            Element::derive_filter(
-                stack.top(),
-                RowPredicate::Grep(CompiledGrep::new("api")),
-            )
-            .unwrap(),
-        );
-        stack.push(Element::ContentView(ContentView::new(
-            ContentSpec::Aliases,
-            crate::app::ContentViewState::default(),
-            false,
-        )));
-        assert_eq!(stack.breadcrumb(), "pods > /api > aliases");
-    }
-
-    #[test]
-    fn fault_helpers_see_only_elements() {
-        let mut stack = NavStack::new(list(BuiltInKind::Pod));
-        assert!(!stack.top_is_fault());
-        assert!(!stack.any_fault());
-        stack.push(Element::derive_filter(stack.top(), RowPredicate::Fault).unwrap());
-        assert!(stack.top_is_fault());
-        assert!(stack.any_fault());
-        // Bury it: a grep on top — Ctrl-Z must NOT splice; the helpers
-        // report "buried" (top no, any yes).
-        stack.push(
-            Element::derive_filter(
-                stack.top(),
-                RowPredicate::Grep(CompiledGrep::new("x")),
-            )
-            .unwrap(),
-        );
-        assert!(!stack.top_is_fault());
-        assert!(stack.any_fault());
-    }
-
-    #[test]
-    fn apply_resolved_updates_matching_lists_in_place() {
-        let unresolved = ResourceId::CrdUnresolved("widgets".to_string());
-        let mut stack = NavStack::new(Element::ResourceList(ResourceList::open_for_test(
-            QuerySpec { rid: unresolved.clone(), namespace: Namespace::All, filter: None },
-            &MetricsHub::new(),
-            "widgets".to_string(),
-        )));
-        let resolved = ResourceId::BuiltIn(BuiltInKind::Pod);
-        stack.apply_resolved(&unresolved, &resolved);
-        assert_eq!(stack.resource_id(), Some(&resolved));
-    }
-}
+#[path = "../tests/app/nav.rs"]
+mod tests;

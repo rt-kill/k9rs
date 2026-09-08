@@ -154,7 +154,8 @@ pub struct PortForwardSource {
     /// Self-reference set by `Arc::new_cyclic` during construction. Lets
     /// `&self` methods (e.g. `apply_yaml` from the trait) reach the `Arc`
     /// they live inside without interior mutability — `create()` needs the
-    /// `Arc` to spawn a monitor task that outlives the call.
+    /// `Arc` to downgrade into the supervised operator it registers (the
+    /// operator holds only a `Weak` back, per the `supervise` contract).
     self_weak: Weak<Self>,
 }
 
@@ -599,8 +600,8 @@ impl LocalResourceSource for PortForwardSource {
 
         // Reconcile by stop + recreate. The new entry gets a fresh id; the
         // old row disappears from the next snapshot. `create` requires
-        // `Arc<Self>` because it spawns a long-lived monitor task — we
-        // recover the Arc via the cyclic `self_weak`.
+        // `Arc<Self>` because it downgrades it for the supervised operator
+        // it registers — we recover the Arc via the cyclic `self_weak`.
         self.stop(id)?;
         let arc = self.arc_self();
         let new_id = arc.create(PortForwardRequest {
@@ -630,7 +631,7 @@ fn format_describe(entry: &PortForwardEntry) -> String {
     let row_name = format!("pf-{}", entry.id);
     let age = crate::util::format_age_duration(entry.started_at.elapsed());
     let ns_display = if entry.namespace.is_empty() { "-" } else { entry.namespace.as_str() };
-    let ctx_display = if entry.context.is_empty() { "-" } else { entry.context.as_str() };
+    let ctx_display = entry.context.as_str();
     let msg_display = if entry.last_message.is_empty() { "-" } else { entry.last_message.as_str() };
 
     out.push_str(&format!("Name:          {}\n", row_name));

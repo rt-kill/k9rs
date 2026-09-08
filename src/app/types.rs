@@ -40,7 +40,13 @@ pub struct UiState {
 /// from daemon events and read by the UI for display — they represent the
 /// current cluster identity, namespace selection, metrics, and caches.
 pub struct KubeState {
-    pub context: crate::kube::protocol::ContextName,
+    /// The context we are actually on, or `None` before any has been
+    /// confirmed — startup before the first `Ready`, or a launch with no
+    /// resolvable context at all (the contexts picker is the whole UI then).
+    /// An `Option` rather than an empty name so "not known yet" is a state
+    /// the compiler makes every reader handle, instead of a blank string
+    /// that renders as a context called "".
+    pub context: Option<crate::kube::protocol::ContextName>,
     pub identity: crate::kube::protocol::ClusterIdentity,
     pub selected_ns: crate::kube::protocol::Namespace,
     pub context_switch: ContextSwitchState,
@@ -322,6 +328,10 @@ impl TryFrom<String> for KeyCombo {
 ///   `colLast` jump the column cursor to the first / last column
 ///   (vim `0` / `$`) and shadow defaults the same way — bind
 ///   `colFirst: "0"` and `0` no longer switches to all namespaces.
+/// - `namespaceAll` rebinds the switch-to-all-namespaces action
+///   (structural default `0`); set it (e.g. `namespaceAll: ")"` for
+///   Shift-0) to restore the action after `colFirst: "0"` shadowed
+///   the `0` key.
 ///
 /// Overlay-defined (`Custom`) operations bind through the overlay
 /// config, never here.
@@ -332,6 +342,7 @@ pub struct KeysConfig {
     pub col_right: Option<KeyCombo>,
     pub col_first: Option<KeyCombo>,
     pub col_last: Option<KeyCombo>,
+    pub namespace_all: Option<KeyCombo>,
     pub describe: Option<KeyCombo>,
     pub yaml: Option<KeyCombo>,
     pub logs: Option<KeyCombo>,
@@ -371,6 +382,9 @@ impl KeysConfig {
             Op::TriggerCronJob => self.trigger_cron_job,
             Op::ToggleSuspendCronJob => self.toggle_suspend_cron_job,
             Op::Custom(_) => None,
+            // Not user-bindable: the edit overlay drives Apply; it exists
+            // on the wire for OpResult correlation only.
+            Op::Apply => None,
         }
     }
 
@@ -389,6 +403,7 @@ impl KeysConfig {
             ("colRight", self.col_right),
             ("colFirst", self.col_first),
             ("colLast", self.col_last),
+            ("namespaceAll", self.namespace_all),
             ("describe", self.describe),
             ("yaml", self.yaml),
             ("logs", self.logs),
@@ -467,7 +482,6 @@ pub struct UiConfig {
     #[serde(default)]
     pub skin: Option<String>,
     pub max_column_width: u16,
-    pub page_scroll_lines: usize,
     pub search_context_lines: usize,
     pub command_history_size: usize,
     pub change_highlight_secs: u64,
@@ -481,7 +495,6 @@ impl Default for UiConfig {
         Self {
             skin: None,
             max_column_width: 64,
-            page_scroll_lines: 40,
             search_context_lines: 10,
             command_history_size: 50,
             change_highlight_secs: 5,
@@ -539,17 +552,23 @@ impl Default for LogConfig {
 ///   pick it up at the top of its next iteration and drop the current
 ///   `ClientSession`.
 /// - [`InFlight`] — main loop has taken the request and is bringing up
-///   the new connection. Blocks further switches until `ConnectionEstablished`
-///   transitions back to `Stable`.
+///   the new connection; it carries the target so the state fully
+///   describes the switch in progress. Blocks further switches until the
+///   connection *resolves*, either way.
 ///
-/// Transitions are linear: Stable → Requested → InFlight → Stable.
+/// Transitions form a single cycle: Stable → Requested → InFlight → Stable.
+/// The closing edge fires on EITHER outcome of the connection attempt —
+/// `ConnectionEstablished` (success) or `ConnectionFailed` (the target was
+/// unreachable) — both via [`settle`](Self::settle). There is deliberately
+/// no lingering `Failed` state: a resolved switch is `Stable` or it is still
+/// in flight, nothing in between, so "stuck InFlight" is unrepresentable.
 /// Attempting a new switch from Requested or InFlight is rejected at
 /// `begin_context_switch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextSwitchState {
     Stable,
     Requested(crate::kube::protocol::ContextName),
-    InFlight,
+    InFlight(crate::kube::protocol::ContextName),
 }
 
 impl ContextSwitchState {
@@ -558,26 +577,211 @@ impl ContextSwitchState {
         matches!(self, Self::Stable)
     }
 
+    /// The context this switch is aiming at. `Some` for both [`Requested`]
+    /// and [`InFlight`], `None` for [`Stable`] — the RECONNECT path uses it
+    /// ("keep aiming at the switch target across a mid-switch daemon blip"),
+    /// which genuinely wants both states.
+    ///
+    /// CAUTION for connection-OUTCOME edges (`ConnectionEstablished` /
+    /// `ConnectionFailed`): those must match [`InFlight`] explicitly, never
+    /// this method. `Requested` means the switch's session hasn't been built
+    /// yet, so an outcome arriving in that state belongs to a PRIOR attempt
+    /// — reading it as the switch's outcome tears down the wrong world (or
+    /// settles away a switch the user just queued).
+    pub fn target(&self) -> Option<&crate::kube::protocol::ContextName> {
+        match self {
+            Self::Stable => None,
+            Self::Requested(name) | Self::InFlight(name) => Some(name),
+        }
+    }
+
     /// If the state is [`Requested`], take the target name and
-    /// transition to [`InFlight`]. Returns `None` in any other state
-    /// and leaves the state alone. Used by the main loop to atomically
-    /// consume a pending request without racing a second call.
+    /// transition to [`InFlight`], which keeps the target for the duration
+    /// of the connection attempt. Returns `None` in any other state and
+    /// leaves the state alone. Used by the main loop to atomically consume
+    /// a pending request without racing a second call.
     pub fn take_requested(&mut self) -> Option<crate::kube::protocol::ContextName> {
         // Discriminant check first so we don't swap out state we can't
         // recover from. If it's not Requested, bail untouched.
-        let Self::Requested(_) = self else { return None; };
+        let Self::Requested(name) = self else { return None; };
+        let name = name.clone();
         // Safe: we just checked the discriminant on the line above, and
         // `&mut self` means nothing else can mutate in between.
-        let Self::Requested(name) = std::mem::replace(self, Self::InFlight) else {
-            unreachable!("discriminant checked immediately above")
-        };
+        *self = Self::InFlight(name.clone());
         Some(name)
     }
 
-    /// Reset to [`Stable`]. Called on `ConnectionEstablished` once the
-    /// new session is up.
-    pub fn mark_stable(&mut self) {
+    /// Resolve an in-flight switch back to [`Stable`], so the next switch is
+    /// accepted. This is the closing edge of the cycle and fires on EITHER
+    /// outcome: `ConnectionEstablished` (the new session is up) or
+    /// `ConnectionFailed` (the target was unreachable). Idempotent — a no-op
+    /// from `Stable`, so a steady-state reconnect success can call it freely.
+    pub fn settle(&mut self) {
         *self = Self::Stable;
+    }
+}
+
+/// Whether the daemon connection is LIVE right now — handshake complete and
+/// not since dropped. The single authority the render layer consults to show
+/// a "Connecting…" screen instead of stale, no-longer-live rows during a
+/// reconnect or context switch.
+///
+/// One axis of [`Connection`]; see its docs for how the axes divide. It is
+/// a STORED flag, deliberately NOT derived from the reconnect plan — the
+/// plan is consumed at the *start* of the rebuild (i.e. mid-gap), so a
+/// derived predicate would flicker the screen back to stale rows before
+/// the new connection is actually up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkState {
+    /// No session is wanted: no context has been chosen. Nothing is being
+    /// attempted and nothing will be until the user picks one. Distinct from
+    /// [`Connecting`](Self::Connecting), which promises the screen is about
+    /// to fill in on its own — here it never will, and saying "connecting…"
+    /// forever would be the same lie in a new place.
+    NoContext,
+    Connecting,
+    Live,
+}
+
+/// When the main loop should next attempt a session rebuild. Replaces the
+/// `reconnect_requested: bool` + `reconnect_at: Option<Instant>` pair,
+/// whose meaning lived in the cross-product ("`at` is only read under
+/// `requested`") — the exact two-fields-one-truth shape
+/// [`ContextSwitchState`] was created to kill for switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectPlan {
+    /// No rebuild wanted.
+    Idle,
+    /// Rebuild on the next loop turn.
+    Now,
+    /// Rebuild once the backoff deadline passes (a previous attempt
+    /// failed; don't hammer a down daemon).
+    At(std::time::Instant),
+}
+
+/// The client↔daemon connection lifecycle, owned as ONE value with total
+/// edges — previously five loose `App` fields (`link`, `has_connected`,
+/// `reconnect_requested`, `reconnect_at`, `reconnect_backoff`) that every
+/// event arm had to co-update in the right combination; the 2026-07
+/// context-lock bug and the 2026-08 audit's top findings were both missed
+/// edges of that implicit machine.
+///
+/// Three independent axes, each with one owner:
+/// - **link**: is the connection live THIS FRAME (render gate)?
+/// - **has_connected**: did any session EVER connect (initial-failure-is-
+///   fatal rule)? Monotonic.
+/// - **plan** + **backoff**: when should the loop rebuild next?
+///
+/// [`ContextSwitchState`] stays deliberately separate: it answers WHICH
+/// context is being brought up; this type doesn't care why the link is
+/// down, only that it is and when to try again.
+#[derive(Debug)]
+pub struct Connection {
+    link: LinkState,
+    has_connected: bool,
+    plan: ReconnectPlan,
+    backoff: Duration,
+}
+
+impl Connection {
+    const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+    const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+    /// Startup state: the initial handshake hasn't landed yet.
+    pub fn new() -> Self {
+        Self {
+            link: LinkState::Connecting,
+            has_connected: false,
+            plan: ReconnectPlan::Idle,
+            backoff: Self::INITIAL_BACKOFF,
+        }
+    }
+
+    /// The link's own state — read by [`crate::app::Liveness::of_link`],
+    /// which is the one place the render layer asks.
+    pub fn link(&self) -> LinkState {
+        self.link
+    }
+
+    /// There is no context to connect to. Terminal until a switch is
+    /// requested: no plan, so the main loop never rebuilds — a retry with
+    /// nothing to retry against would just be a loop.
+    pub fn no_context(&mut self) {
+        self.link = LinkState::NoContext;
+        self.plan = ReconnectPlan::Idle;
+    }
+
+    /// Whether any session EVER connected — distinguishes a fatal initial
+    /// failure from a retryable reconnect failure.
+    pub fn has_ever_connected(&self) -> bool {
+        self.has_connected
+    }
+
+    /// Is a rebuild due at `now`? Pure read — the choke point consumes the
+    /// plan via [`Self::begin_rebuild`] once it commits.
+    pub fn rebuild_due(&self, now: std::time::Instant) -> bool {
+        match self.plan {
+            ReconnectPlan::Idle => false,
+            ReconnectPlan::Now => true,
+            ReconnectPlan::At(t) => now >= t,
+        }
+    }
+
+    /// The choke point committed to a session rebuild (reconnect OR context
+    /// switch): consume the plan and show the connecting screen for the
+    /// whole gap. Cleared to Live only by [`Self::established`].
+    pub fn begin_rebuild(&mut self) {
+        self.plan = ReconnectPlan::Idle;
+        self.link = LinkState::Connecting;
+    }
+
+    /// A context switch was REQUESTED (session not rebuilt yet — that
+    /// happens at the top of the next loop turn): show the connecting
+    /// screen immediately rather than one stale frame later.
+    pub fn switch_requested(&mut self) {
+        self.link = LinkState::Connecting;
+    }
+
+    /// `ConnectionEstablished`: the link is live, future failures are
+    /// reconnects, the backoff resets. A still-pending plan (arrived
+    /// between a failure and its deadline) collapses to Now — its backoff
+    /// deadline was aimed at a connection that no longer exists.
+    pub fn established(&mut self) {
+        self.link = LinkState::Live;
+        self.has_connected = true;
+        self.backoff = Self::INITIAL_BACKOFF;
+        if self.plan != ReconnectPlan::Idle {
+            self.plan = ReconnectPlan::Now;
+        }
+    }
+
+    /// `DaemonDisconnected`: the live session died — rebuild on the next
+    /// turn and show the connecting screen NOW (this frame).
+    pub fn disconnected(&mut self) {
+        self.link = LinkState::Connecting;
+        if self.plan == ReconnectPlan::Idle {
+            self.plan = ReconnectPlan::Now;
+        }
+    }
+
+    /// A context SWITCH failed and we're falling back to the previous
+    /// context: reconnect immediately (the daemon is up — the TARGET was
+    /// unreachable — so no backoff).
+    pub fn switch_failed_fallback(&mut self) {
+        self.plan = ReconnectPlan::Now;
+    }
+
+    /// A steady-state RECONNECT attempt failed: schedule the next one a
+    /// backoff out, and double the backoff (clamped).
+    pub fn reconnect_failed_backoff(&mut self, now: std::time::Instant) {
+        self.plan = ReconnectPlan::At(now + self.backoff);
+        self.backoff = (self.backoff * 2).min(Self::MAX_BACKOFF);
+    }
+}
+
+impl Default for Connection {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -685,7 +889,7 @@ impl ContainerRef {
 /// [`TempFile`]) and the view underneath was never displaced.
 pub enum Overlay {
     /// The `?` help sheet.
-    Help { scroll: usize },
+    Help { viewport: crate::app::viewport::Viewport },
     /// "Which container?" picker for multi-container pods. Captures its
     /// container list at construction — self-contained (no table lookups
     /// under a dialog that may outlive the row).
@@ -710,16 +914,53 @@ pub enum Overlay {
         target: crate::kube::protocol::ObjectRef,
         state: EditState,
     },
-    /// Live shell session. During Connecting the TUI shows a loading bar
-    /// with full navigation; once Connected the session loop suspends the
-    /// TUI and raw-bridges stdin↔daemon bytes. Drop aborts the bridge.
+    /// Live shell session. During Connecting the TUI shows a full-frame
+    /// connect screen (all keys blocked except Esc); once Connected the
+    /// session loop suspends the TUI and raw-bridges stdin↔daemon bytes.
+    /// Drop aborts the bridge.
     Shell(Box<ShellState>),
+}
+
+/// How much of the frame an overlay claims — the single authority for what
+/// is erased before it paints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayExtent {
+    /// A self-positioned dialog box over a view that stays honest around
+    /// it: the renderer erases its OWN rect as part of drawing its chrome,
+    /// and everything outside that rect belongs to the view.
+    Dialog,
+    /// The overlay claims the WHOLE frame. [`crate::ui::draw`] erases the
+    /// frame before the overlay paints, so no part of the view beneath can
+    /// show through — a full-frame renderer that draws only chrome (a
+    /// bordered block leaves its interior cells untouched) cannot end up
+    /// framing the stale view it was supposed to replace.
+    FullFrame,
+}
+
+impl Overlay {
+    /// The frame area this overlay claims. EXHAUSTIVE: a new overlay kind
+    /// must declare its extent, and full-frame erasure happens centrally in
+    /// [`crate::ui::draw`] rather than being re-remembered by each renderer.
+    pub fn extent(&self) -> OverlayExtent {
+        match self {
+            // All three clear their own rect (Clear + dialog chrome) and
+            // sit over a view that is still live and worth seeing.
+            Overlay::Help { .. } => OverlayExtent::Dialog,
+            Overlay::ContainerSelect { .. } => OverlayExtent::Dialog,
+            Overlay::Edit { .. } => OverlayExtent::Dialog,
+            // The connect screen is a full-screen titled frame: the view
+            // beneath must not render inside it. It used to — the shell
+            // block painted its border over the resource table and left
+            // every interior cell as the table had drawn it.
+            Overlay::Shell(_) => OverlayExtent::FullFrame,
+        }
+    }
 }
 
 impl std::fmt::Debug for Overlay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Overlay::Help { scroll } => f.debug_struct("Help").field("scroll", scroll).finish(),
+            Overlay::Help { viewport } => f.debug_struct("Help").field("offset", &viewport.offset()).finish(),
             Overlay::ContainerSelect { target, .. } => {
                 f.debug_struct("ContainerSelect").field("target", target).finish_non_exhaustive()
             }
@@ -943,14 +1184,18 @@ pub struct BatchTracker {
     verb: &'static str,
     /// Resource noun for the summary ("pod", "deployment", …).
     noun: String,
+    /// The batch's operation. `consume` requires the result to carry the
+    /// SAME op (v10 wire discriminant) — without it, an edit-apply or any
+    /// other operation on a batch member could claim (or be claimed by)
+    /// the batch's result for that target. What remains ambiguous is only
+    /// the same-op+same-target race (two concurrent restarts of one pod)
+    /// — full disambiguation would need a per-request correlation id.
+    op: crate::kube::protocol::OperationKind,
     /// The batch's resource kind. Every item of one batch shares it
     /// (targets are built from one element's rid), and `consume` requires
     /// it — without the check, a result for a DIFFERENT kind with the
     /// same ns+name (delete service `web` while a deployment-`web` batch
-    /// is outstanding) would be silently misattributed. Same-kind
-    /// duplicates (a second op on the same object racing the batch)
-    /// remain ambiguous — full disambiguation needs a wire correlation
-    /// id on OpResult; documented, not attempted here.
+    /// is outstanding) would be silently misattributed.
     rid: crate::kube::protocol::ResourceId,
     /// Keys still awaiting a result.
     outstanding: std::collections::HashSet<ObjectKey>,
@@ -972,10 +1217,12 @@ impl BatchTracker {
         targets: &[ObjectRef],
         skipped: usize,
         store: std::sync::Weak<crate::app::store::RowStore>,
+        op: crate::kube::protocol::OperationKind,
     ) -> Self {
         Self {
             verb,
             noun,
+            op,
             rid,
             outstanding: targets.iter().map(Self::key_of).collect(),
             ok: 0,
@@ -1003,9 +1250,18 @@ impl BatchTracker {
 
     /// Consume a result if it belongs to this batch; `false` = not ours
     /// (the caller should handle it as an ordinary single-op result).
-    /// Correlation = resource kind AND identity: the daemon echoes the
-    /// request's full `ObjectRef`, so both are authoritative.
-    pub fn consume(&mut self, target: &ObjectRef, result: &Result<String, String>) -> bool {
+    /// Correlation = operation AND resource kind AND identity: the daemon
+    /// echoes the request's op + full `ObjectRef`, so all three are
+    /// authoritative.
+    pub fn consume(
+        &mut self,
+        op: &crate::kube::protocol::OperationKind,
+        target: &ObjectRef,
+        result: &Result<String, String>,
+    ) -> bool {
+        if *op != self.op {
+            return false;
+        }
         if target.resource != self.rid {
             return false;
         }
@@ -1104,11 +1360,20 @@ mod batch_tracker_tests {
     #[test]
     fn consume_correlates_and_aggregates() {
         let targets = [target("a", "ns"), target("b", "ns"), target("c", "ns")];
-        let mut tr = BatchTracker::new("Deleted", "pod".to_string(), pod_rid(), &targets, 1, std::sync::Weak::new());
+        let mut tr = BatchTracker::new(
+            "Deleted", "pod".to_string(), pod_rid(), &targets, 1, std::sync::Weak::new(),
+            crate::kube::protocol::OperationKind::Delete,
+        );
         assert!(!tr.is_done());
 
         // A result for a foreign target is NOT ours.
-        assert!(!tr.consume(&target("other", "ns"), &Ok("Deleted".into())));
+        assert!(!tr.consume(&crate::kube::protocol::OperationKind::Delete, &target("other", "ns"), &Ok("Deleted".into())));
+
+        // A result for the RIGHT target but a DIFFERENT OPERATION is not
+        // ours either — the op gate (v10) is what keeps a concurrent
+        // edit-apply on a batch member from being consumed as the batch's
+        // delete outcome (and vice versa).
+        assert!(!tr.consume(&crate::kube::protocol::OperationKind::Apply, &targets[0], &Ok("Applied pod/a".into())));
 
         // A result for a DIFFERENT KIND with the same ns+name is NOT
         // ours either — the rid gate is what keeps a concurrent
@@ -1119,16 +1384,16 @@ mod batch_tracker_tests {
             "a".to_string(),
             Namespace::from_row("ns"),
         );
-        assert!(!tr.consume(&foreign_kind, &Ok("Deleted".into())));
+        assert!(!tr.consume(&crate::kube::protocol::OperationKind::Delete, &foreign_kind, &Ok("Deleted".into())));
         assert!(!tr.is_done());
 
-        assert!(tr.consume(&targets[0], &Ok("Deleted pod/a".into())));
-        assert!(tr.consume(&targets[1], &Err("Forbidden".into())));
+        assert!(tr.consume(&crate::kube::protocol::OperationKind::Delete, &targets[0], &Ok("Deleted pod/a".into())));
+        assert!(tr.consume(&crate::kube::protocol::OperationKind::Delete, &targets[1], &Err("Forbidden".into())));
         assert!(!tr.is_done());
         // A duplicate result for an already-consumed target is not ours.
-        assert!(!tr.consume(&targets[0], &Ok("again".into())));
+        assert!(!tr.consume(&crate::kube::protocol::OperationKind::Delete, &targets[0], &Ok("again".into())));
 
-        assert!(tr.consume(&targets[2], &Ok("Deleted pod/c".into())));
+        assert!(tr.consume(&crate::kube::protocol::OperationKind::Delete, &targets[2], &Ok("Deleted pod/c".into())));
         assert!(tr.is_done());
 
         let summary = tr.summary();
@@ -1162,9 +1427,9 @@ mod batch_tracker_tests {
         let t = target("a", "ns");
         let mut tr = BatchTracker::new(
             "Restarted", "pod".to_string(), pod_rid(), std::slice::from_ref(&t), 0,
-            std::sync::Arc::downgrade(&store),
+            std::sync::Arc::downgrade(&store), crate::kube::protocol::OperationKind::Restart,
         );
-        assert!(tr.consume(&t, &Ok("Restarted".into())));
+        assert!(tr.consume(&crate::kube::protocol::OperationKind::Restart, &t, &Ok("Restarted".into())));
         assert!(!store.has_marks(), "success unmarked the row (restart keeps rows in place)");
         assert!(tr.is_done());
     }
@@ -1193,9 +1458,9 @@ mod batch_tracker_tests {
         let t = target("a", "ns");
         let mut tr = BatchTracker::new(
             "Deleted", "pod".to_string(), pod_rid(), std::slice::from_ref(&t), 0,
-            std::sync::Arc::downgrade(&store),
+            std::sync::Arc::downgrade(&store), crate::kube::protocol::OperationKind::Delete,
         );
-        assert!(tr.consume(&t, &Err("RBAC".into())));
+        assert!(tr.consume(&crate::kube::protocol::OperationKind::Delete, &t, &Err("RBAC".into())));
         assert!(store.has_marks(), "failure keeps the mark for retry");
         let summary = tr.summary();
         assert!(summary.message.contains("Deleted 0 pods"), "{}", summary.message);
@@ -1207,6 +1472,7 @@ mod batch_tracker_tests {
         let t = target("a", "ns");
         let mut tr = BatchTracker::new(
             "Deleted", "pod".to_string(), pod_rid(), std::slice::from_ref(&t), 0, std::sync::Weak::new(),
+            crate::kube::protocol::OperationKind::Delete,
         );
         tr.fail_send(&t, "send failed: broken pipe".into());
         assert!(tr.is_done());
@@ -1302,15 +1568,17 @@ mod key_combo_tests {
     /// and must not be rejected as an unknown field.
     #[test]
     fn app_config_parses_keys_section() {
-        let yaml = "keys:\n  colLeft: h\n  colRight: l\n  colFirst: \"0\"\n  colLast: \"$\"\n  logs: ctrl-l\n\
+        let yaml = "keys:\n  colLeft: h\n  colRight: l\n  colFirst: \"0\"\n  colLast: \"$\"\n  namespaceAll: \")\"\n  logs: ctrl-l\n\
                     daemon:\n  watcherPageSize: 500\n";
         let cfg: AppConfig = serde_yaml::from_str(yaml).expect("keys + daemon sections parse");
         assert_eq!(cfg.keys.col_left, Some(KeyCombo::plain('h')));
         assert_eq!(cfg.keys.col_right, Some(KeyCombo::plain('l')));
         assert_eq!(cfg.keys.col_first, Some(KeyCombo::plain('0')));
         assert_eq!(cfg.keys.col_last, Some(KeyCombo::plain('$')));
-        // `0` / `$` are not reserved chords, so the binding validates.
-        assert!(cfg.keys.validate().is_ok(), "vim 0/$ column jumps must validate");
+        // Shift-0 (`)`) restores switch-to-all-namespaces once `0` is colFirst.
+        assert_eq!(cfg.keys.namespace_all, Some(KeyCombo::plain(')')));
+        // `0` / `$` / `)` are not reserved chords, so the binding validates.
+        assert!(cfg.keys.validate().is_ok(), "vim 0/$ column jumps + namespaceAll must validate");
         assert_eq!(cfg.keys.logs, Some(KeyCombo { ctrl: true, ch: 'l' }));
         // A typo'd binding name is a load-time error (deny_unknown_fields),
         // not a silently ignored key.
@@ -1544,7 +1812,9 @@ pub struct ContentViewState {
     /// renderer styles by the producer's role tags instead of re-inferring
     /// structure from `content`.
     pub describe_lines: Vec<crate::kube::protocol::DescribeLine>,
-    pub scroll: usize,
+    /// Vertical scroll relationship — content views never wrap, so one line is
+    /// one row; the render publishes the extent back via `set_metrics`.
+    pub viewport: crate::app::viewport::Viewport,
     pub search: Option<String>,
     pub search_matches: Vec<usize>,
     pub current_match: usize,
@@ -1595,17 +1865,15 @@ impl ContentViewState {
         }
     }
 
-    pub fn next_match(&mut self, visible: usize) {
+    pub fn next_match(&mut self) {
         if self.search_matches.is_empty() {
             return;
         }
         self.current_match = (self.current_match + 1) % self.search_matches.len();
-        let target = self.search_matches[self.current_match];
-        let max = crate::util::content_max_scroll(self.line_count(), visible);
-        self.scroll = target.saturating_sub(visible / 2).min(max);
+        self.viewport.center_on(self.search_matches[self.current_match]);
     }
 
-    pub fn prev_match(&mut self, visible: usize) {
+    pub fn prev_match(&mut self) {
         if self.search_matches.is_empty() {
             return;
         }
@@ -1614,9 +1882,7 @@ impl ContentViewState {
         } else {
             self.current_match - 1
         };
-        let target = self.search_matches[self.current_match];
-        let max = crate::util::content_max_scroll(self.line_count(), visible);
-        self.scroll = target.saturating_sub(visible / 2).min(max);
+        self.viewport.center_on(self.search_matches[self.current_match]);
     }
 
     /// Clear search state.
@@ -1766,6 +2032,7 @@ impl KubectlCache {
 #[cfg(test)]
 mod context_switch_tests {
     use super::*;
+    use crate::kube::protocol::ContextName;
 
     #[test]
     fn stable_accepts_new_switches() {
@@ -1775,21 +2042,35 @@ mod context_switch_tests {
 
     #[test]
     fn requested_rejects_new_switches() {
-        let s = ContextSwitchState::Requested("prod".into());
+        let s = ContextSwitchState::Requested(ContextName::new("prod").unwrap());
         assert!(!s.is_stable());
     }
 
     #[test]
     fn in_flight_rejects_new_switches() {
-        let s = ContextSwitchState::InFlight;
+        let s = ContextSwitchState::InFlight(ContextName::new("prod").unwrap());
         assert!(!s.is_stable());
     }
 
     #[test]
-    fn take_requested_transitions_requested_to_in_flight() {
-        let mut s = ContextSwitchState::Requested("prod".into());
+    fn target_names_the_context_in_flight() {
+        assert_eq!(ContextSwitchState::Stable.target(), None);
+        assert_eq!(
+            ContextSwitchState::Requested(ContextName::new("prod").unwrap()).target().map(|c| c.as_str()),
+            Some("prod")
+        );
+        assert_eq!(
+            ContextSwitchState::InFlight(ContextName::new("prod").unwrap()).target().map(|c| c.as_str()),
+            Some("prod")
+        );
+    }
+
+    #[test]
+    fn take_requested_transitions_requested_to_in_flight_keeping_target() {
+        let mut s = ContextSwitchState::Requested(ContextName::new("prod").unwrap());
         assert_eq!(s.take_requested().as_ref().map(|c| c.as_str()), Some("prod"));
-        assert_eq!(s, ContextSwitchState::InFlight);
+        // InFlight carries the target forward, so the failure path can name it.
+        assert_eq!(s, ContextSwitchState::InFlight(ContextName::new("prod").unwrap()));
     }
 
     #[test]
@@ -1801,34 +2082,45 @@ mod context_switch_tests {
 
     #[test]
     fn take_requested_is_noop_from_in_flight() {
-        let mut s = ContextSwitchState::InFlight;
+        let mut s = ContextSwitchState::InFlight(ContextName::new("prod").unwrap());
         assert!(s.take_requested().is_none());
-        assert_eq!(s, ContextSwitchState::InFlight);
+        assert_eq!(s, ContextSwitchState::InFlight(ContextName::new("prod").unwrap()));
     }
 
     #[test]
-    fn mark_stable_from_any_state() {
+    fn settle_from_any_state() {
         for mut s in [
             ContextSwitchState::Stable,
-            ContextSwitchState::Requested("prod".into()),
-            ContextSwitchState::InFlight,
+            ContextSwitchState::Requested(ContextName::new("prod").unwrap()),
+            ContextSwitchState::InFlight(ContextName::new("prod").unwrap()),
         ] {
-            s.mark_stable();
+            s.settle();
             assert_eq!(s, ContextSwitchState::Stable);
         }
     }
 
     #[test]
+    fn settle_resolves_a_failed_switch() {
+        // The failure edge: an in-flight switch whose connection never comes
+        // up settles back to Stable, so the next switch is accepted (no lock).
+        let mut s = ContextSwitchState::Requested(ContextName::new("does-not-exist").unwrap());
+        s.take_requested();
+        assert!(!s.is_stable(), "in flight while connecting");
+        s.settle(); // ConnectionFailed for the target
+        assert!(s.is_stable(), "a failed switch must not stay stuck InFlight");
+    }
+
+    #[test]
     fn full_lifecycle() {
-        // Stable → Requested(name) → InFlight → Stable
+        // Stable → Requested(name) → InFlight(name) → Stable
         let mut s = ContextSwitchState::Stable;
         assert!(s.is_stable());
-        s = ContextSwitchState::Requested("prod".into());
+        s = ContextSwitchState::Requested(ContextName::new("prod").unwrap());
         assert!(!s.is_stable());
         let taken = s.take_requested();
         assert_eq!(taken.as_ref().map(|c| c.as_str()), Some("prod"));
-        assert_eq!(s, ContextSwitchState::InFlight);
-        s.mark_stable();
+        assert_eq!(s, ContextSwitchState::InFlight(ContextName::new("prod").unwrap()));
+        s.settle();
         assert!(s.is_stable());
     }
 }
@@ -1942,3 +2234,7 @@ mod form_submit_tests {
 }
 
 
+
+#[cfg(test)]
+#[path = "../tests/app/types.rs"]
+mod mirror_tests;

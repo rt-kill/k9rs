@@ -53,6 +53,26 @@ pub fn draw_centered_loading(
     f.render_widget(line, ratatui::layout::Rect::new(center_x, center_y, area.width, 1));
 }
 
+/// Static counterpart of [`draw_centered_loading`]: one centered message,
+/// NO spinner and no animation liveness — for terminal states (a failed
+/// fetch, honest emptiness) where animated chrome would falsely promise
+/// that something is still in flight.
+pub fn draw_centered_message(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    message: &str,
+    style: ratatui::style::Style,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let text_len = UnicodeWidthStr::width(message) as u16;
+    let line = ratatui::text::Line::from(ratatui::text::Span::styled(message.to_string(), style));
+    let center_y = area.y + area.height / 2;
+    let center_x = area.x + area.width.saturating_sub(text_len) / 2;
+    f.render_widget(line, ratatui::layout::Rect::new(center_x, center_y, area.width, 1));
+}
+
 /// Fill a single-row area with a background style without allocating a string.
 pub fn fill_line_bg(f: &mut ratatui::Frame, area: ratatui::layout::Rect, style: ratatui::style::Style) {
     let buf = f.buffer_mut();
@@ -94,16 +114,26 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Element::LogSession(_) | Element::LogFilter(_) => {
             views::log::draw_logs(f, app, area);
         }
-        Element::ContextList(_) => {
-            views::context::draw_contexts(f, app, area);
-        }
     }
 
-    // The single modal slot, over whatever view is showing.
+    // An overlay that claims the whole frame gets an ERASED frame. The view
+    // above still painted (it publishes the render geometry and the
+    // select-mode bit that the action layer reads back), but nothing of it
+    // may show through. Driven by the overlay's own declared extent, so the
+    // erase can't be forgotten by an individual renderer — and a renderer
+    // that paints only chrome can't leave the old view inside its border.
+    if app.ui.overlay.as_ref().map(Overlay::extent) == Some(crate::app::OverlayExtent::FullFrame) {
+        f.render_widget(Clear, area);
+    }
+
+    // The single modal slot, over whatever view is showing. Help renders first
+    // — it needs &mut App to publish its scroll extent to the viewport; the
+    // shared match below handles the other (immutable) overlays.
+    if matches!(app.ui.overlay, Some(Overlay::Help { .. })) {
+        draw_help_overlay(f, app);
+    }
     match &app.ui.overlay {
-        Some(Overlay::Help { scroll }) => {
-            draw_help_overlay(f, app, *scroll);
-        }
+        Some(Overlay::Help { .. }) => {}
         Some(Overlay::ContainerSelect { target, containers, selected, .. }) => {
             let names: Vec<String> = containers.iter().map(|ci| ci.display_name()).collect();
             let target = target.clone();
@@ -130,7 +160,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // active. In table/context views this is handled inline, but sub-views
     // (logs, describe, yaml) need it as an overlay so the user can see
     // what they're typing.
-    let top_is_inline = app.nav.top().is_table() || matches!(app.nav.top(), Element::ContextList(_));
+    let top_is_inline = app.nav.top().renders_command_inline();
     if !top_is_inline {
         if app.ui.input_mode.is_active() {
             draw_command_overlay(f, app);
@@ -154,10 +184,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 /// Draw the help overlay on top of the current view.
-fn draw_help_overlay(f: &mut Frame, app: &App, scroll: usize) {
-    let theme = &app.ui.theme;
-    let help = HelpOverlay::new(theme, scroll, Some(app.current_capabilities()), app.config.keys);
-    f.render_widget(help, f.area());
+fn draw_help_overlay(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let caps = app.current_capabilities();
+    let keys = app.config.keys;
+    // Publish the dialog extent so the viewport clamps. The widget owns the
+    // geometry (`HelpOverlay::inner_rows`) — nothing here to keep in sync.
+    let inner_rows = HelpOverlay::inner_rows(area.height);
+    let total = HelpOverlay::content_line_count(Some(&caps), keys);
+    let offset = if let Some(crate::app::Overlay::Help { viewport }) = &mut app.ui.overlay {
+        viewport.set_metrics(total, inner_rows, false);
+        viewport.offset()
+    } else {
+        0
+    };
+    let help = HelpOverlay::new(&app.ui.theme, offset, Some(caps), keys);
+    f.render_widget(help, area);
 }
 
 /// Draw a single status line centered horizontally in the visible area.
@@ -397,3 +439,7 @@ fn draw_filter_overlay(f: &mut Frame, app: &App) {
     );
     f.render_widget(filter_bar, overlay_area);
 }
+
+#[cfg(test)]
+#[path = "../tests/ui/draw.rs"]
+mod mirror_tests;

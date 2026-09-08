@@ -19,6 +19,17 @@ pub enum LocalResourceKind {
     ExecResource,
     /// User-defined local resource from daemon config.
     Custom(String),
+    /// The kubeconfig's contexts. The one kind the daemon does NOT serve:
+    /// the rows are a fact about the CLIENT's kubeconfig, and the whole
+    /// point of the view is to be usable when there is no session at all
+    /// (no `current-context`, or the one you have is unreachable). Its
+    /// store is seeded in-process — see [`crate::app::element::LiveQuery::client`].
+    ///
+    /// APPENDED, not slotted in next to its siblings: this enum rides
+    /// `ResourceId` on the wire, so inserting mid-enum silently re-tags
+    /// `Custom`. (`local_resource_kind_wire_tags_are_stable` caught exactly
+    /// that when this variant was first written in the obvious place.)
+    Context,
 }
 
 impl LocalResourceKind {
@@ -26,7 +37,7 @@ impl LocalResourceKind {
     /// at runtime and are not part of this list — callers that need to
     /// enumerate customs maintain their own registry.
     pub fn all() -> Vec<Self> {
-        vec![Self::PortForward, Self::ExecResource]
+        vec![Self::PortForward, Self::ExecResource, Self::Context]
     }
 
     /// Canonical singular name (e.g. `"portforward"`).
@@ -34,6 +45,7 @@ impl LocalResourceKind {
         match self {
             Self::PortForward => "portforward",
             Self::ExecResource => "execresource",
+            Self::Context => "context",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -44,6 +56,7 @@ impl LocalResourceKind {
         match self {
             Self::PortForward => "v1",
             Self::ExecResource => "v1",
+            Self::Context => "v1",
             Self::Custom(_) => "v1",
         }
     }
@@ -54,6 +67,7 @@ impl LocalResourceKind {
         match self {
             Self::PortForward => "PortForward",
             Self::ExecResource => "ExecResource",
+            Self::Context => "Context",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -65,6 +79,7 @@ impl LocalResourceKind {
         match self {
             Self::PortForward => "portforwards",
             Self::ExecResource => "execresources",
+            Self::Context => "contexts",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -74,6 +89,7 @@ impl LocalResourceKind {
         match self {
             Self::PortForward => ResourceScope::Cluster,
             Self::ExecResource => ResourceScope::Cluster,
+            Self::Context => ResourceScope::Cluster,
             Self::Custom(_) => ResourceScope::Cluster,
         }
     }
@@ -85,6 +101,7 @@ impl LocalResourceKind {
         match self {
             Self::PortForward => &["pf", "portforward", "portforwards", "port-forwards"],
             Self::ExecResource => &["exec", "execresource", "execresources"],
+            Self::Context => &["ctx", "context", "contexts"],
             Self::Custom(_) => &[],
         }
     }
@@ -95,7 +112,32 @@ impl LocalResourceKind {
         match self {
             Self::PortForward => "PF",
             Self::ExecResource => "EXEC",
+            Self::Context => "CTX",
             Self::Custom(name) => name.as_str(),
+        }
+    }
+
+    /// Column metadata, same shape built-ins get from their `ResourceDef`.
+    /// Consulted by `ColumnPolicy` for display level AND width ceiling, so a
+    /// local resource is no more special about its columns than any other.
+    /// An empty slice means "infer everything", which is what the built-in
+    /// path already does for columns a def doesn't mention.
+    pub fn column_defs(&self) -> &'static [crate::kube::resource_def::ColumnDef] {
+        use crate::kube::resource_def::ColumnDef;
+        match self {
+            // Cluster and user are usually long and rarely the thing you are
+            // reading — on EKS they are full ARNs, which at the global cap
+            // push NAME and ACTIVE off the screen entirely.
+            Self::Context => {
+                static COLS: &[ColumnDef] = &[
+                    ColumnDef::new("NAME").max_width(40),
+                    ColumnDef::new("CLUSTER").max_width(28),
+                    ColumnDef::new("USER").max_width(24),
+                    ColumnDef::new("ACTIVE").max_width(8),
+                ];
+                COLS
+            }
+            Self::PortForward | Self::ExecResource | Self::Custom(_) => &[],
         }
     }
 
@@ -125,6 +167,10 @@ impl LocalResourceKind {
                 OperationKind::Yaml,
                 OperationKind::Delete,
             ],
+            // A context is switched to (Enter, via `DrillTarget`), not
+            // described or deleted — every other operation would have to ask
+            // a daemon about the client's own kubeconfig.
+            Self::Context => vec![],
             // Custom resources get the standard trio.
             Self::Custom(_) => vec![
                 OperationKind::Describe,
@@ -144,48 +190,5 @@ pub fn find_by_alias(alias: &str) -> Option<LocalResourceKind> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn port_forward_is_findable() {
-        let kind = find_by_alias("pf").expect("pf alias should resolve");
-        assert_eq!(kind, LocalResourceKind::PortForward);
-        assert_eq!(kind.plural(), "portforwards");
-        assert_eq!(kind.kind_str(), "PortForward");
-        let rid = kind.to_resource_id();
-        assert_eq!(rid.group(), crate::kube::protocol::LOCAL_GROUP);
-        assert!(rid.is_local());
-    }
-
-    #[test]
-    fn unknown_alias_returns_none() {
-        assert!(find_by_alias("definitely-not-a-thing").is_none());
-    }
-
-    // The former `kind_table_complete` drift-guard test is deleted: the
-    // exhaustive match inside every metadata accessor above enforces
-    // "every variant has a definition" at compile time, so a separate
-    // runtime test would only be testing the compiler.
-
-    #[test]
-    fn custom_kind_metadata() {
-        let kind = LocalResourceKind::Custom("my-resource".into());
-        assert_eq!(kind.name(), "my-resource");
-        assert_eq!(kind.version(), "v1");
-        assert_eq!(kind.scope(), ResourceScope::Cluster);
-        assert!(kind.aliases().is_empty());
-    }
-
-    /// Wire-tag stability for the local-resource identity enum (bincode encodes
-    /// the variant as its u32 declaration-index, LE). Reordering/inserting
-    /// remaps existing wire values; appending is safe.
-    #[test]
-    fn local_resource_kind_wire_tags_are_stable() {
-        assert_eq!(bincode::serialize(&LocalResourceKind::PortForward).unwrap(), 0u32.to_le_bytes());
-        assert_eq!(bincode::serialize(&LocalResourceKind::ExecResource).unwrap(), 1u32.to_le_bytes());
-        // Custom carries a payload; pin only its 4-byte tag.
-        let custom = bincode::serialize(&LocalResourceKind::Custom("x".into())).unwrap();
-        assert_eq!(&custom[..4], 2u32.to_le_bytes());
-    }
-}
+#[path = "../../tests/kube/local/types.rs"]
+mod tests;

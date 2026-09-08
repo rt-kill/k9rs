@@ -34,15 +34,10 @@ pub async fn run(cmd: CtlCommand, json: bool) -> Result<()> {
 }
 
 async fn connect_or_bail() -> Result<DaemonClient> {
-    match DaemonClient::connect().await {
-        Some(dc) => Ok(dc),
-        None => {
-            bail!(
-                "Daemon not running (socket: {:?})",
-                crate::kube::daemon::socket_path()
-            );
-        }
-    }
+    // Connect errors are already actionable ("daemon not running", or a
+    // version mismatch from the v10 management handshake naming both
+    // versions and suggesting a daemon restart).
+    DaemonClient::connect().await
 }
 
 async fn cmd_status(json: bool) -> Result<()> {

@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{mpsc, watch, Semaphore};
-use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::live_query::WatcherCache;
@@ -27,6 +26,44 @@ use crate::kube::session_env::SessionEnv;
 // ---------------------------------------------------------------------------
 // InitParams — extracted from the Init command for ergonomic access
 // ---------------------------------------------------------------------------
+
+/// How long a failed session stays up waiting for the client to read its
+/// error. Only bounds a peer that reads the error and then sits there — the
+/// normal path is milliseconds (the client reports the error and hangs up,
+/// which ends the wait immediately).
+const LINGER_AFTER_FATAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send a terminal [`SessionEvent::SessionError`] and stay alive until the
+/// client has actually read it.
+///
+/// The lingering is the entire point. A yamux `StreamHandle`'s `poll_flush`
+/// is a NO-OP, so `write_bincode` returning `Ok` means the frame reached the
+/// muxer's channel — NOT the socket. Only the connection's driver task ever
+/// writes it out, and that task is killed (`AbortOnDrop` on
+/// `MuxedConnection`) the instant `init_and_run_muxed` returns, which is the
+/// instant this session task returns. So every early-return diagnostic used
+/// to die in the queue and reach the user as `Failed to read Ready: early
+/// eof` — silencing precisely the errors most likely to happen at startup
+/// (unknown context, expired credentials, unreachable cluster).
+///
+/// Reading to EOF is what keeps the driver alive long enough, and the peer's
+/// hangup is the acknowledgment: it read the error, reported it, and dropped
+/// the connection.
+async fn fail_session(
+    reader: &mut BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    writer: &mut BufWriter<Box<dyn AsyncWrite + Unpin + Send>>,
+    message: String,
+) {
+    use tokio::io::AsyncReadExt;
+    if protocol::write_bincode(writer, &SessionEvent::SessionError(message)).await.is_err() {
+        return;
+    }
+    let mut sink = [0u8; 64];
+    let _ = tokio::time::timeout(LINGER_AFTER_FATAL, async {
+        while reader.read(&mut sink).await.unwrap_or(0) > 0 {}
+    })
+    .await;
+}
 
 /// Holds the fields from `SessionCommand::Init` in a flat struct so
 /// `init_and_run` doesn't have to juggle a dozen local variables.
@@ -173,11 +210,17 @@ pub struct ServerSession {
     /// slice out of grace for the session's whole life (see
     /// `SessionContext::locals` for the substream half).
     locals: crate::kube::local::ContextKeepalive,
-    metrics_task: Option<JoinHandle<()>>,
+    /// Guard, not a bare handle: `cleanup()` is reachable only on the
+    /// normal exit path (the run-loop select can be cancelled by its sibling
+    /// arm), so these forwarders are abort-on-drop — dropping the session
+    /// reaps them structurally, the same protection the reader task gets
+    /// from its inline guard.
+    metrics_task: Option<crate::util::AbortOnDrop>,
     /// Background loop that periodically re-runs discovery (namespaces +
     /// CRDs), so new namespaces / new CRDs land in the cache and reach the
-    /// client without the user having to reconnect. Aborted in `cleanup()`.
-    discovery_refresher_task: Option<JoinHandle<()>>,
+    /// client without the user having to reconnect. Same guard rationale as
+    /// `metrics_task`.
+    discovery_refresher_task: Option<crate::util::AbortOnDrop>,
     /// Tracks every `handle_*_async` background task (describe, yaml,
     /// delete, apply, scale, restart, decode, cron-trigger,
     /// cron-toggle-suspend, force-kill, save, etc). On `cleanup()` we
@@ -345,15 +388,13 @@ impl ServerSession {
                 InitParams { context, namespace, readonly, kubeconfig_yaml, env_vars, identity }
             }
             Ok(_) => {
-                let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
-                    "Expected Init command as first message".to_string(),
-                )).await;
+                fail_session(&mut reader, &mut buf_writer,
+                    "Expected Init command as first message".to_string()).await;
                 return;
             }
             Err(e) => {
-                let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
-                    format!("Failed to read Init command: {}", e),
-                )).await;
+                fail_session(&mut reader, &mut buf_writer,
+                    format!("Failed to read Init command: {}", e)).await;
                 return;
             }
         };
@@ -365,7 +406,7 @@ impl ServerSession {
     /// Used by the daemon where the first command was already read for routing.
     pub async fn init_and_run_with_parsed(
         first_cmd: SessionCommand,
-        reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+        mut reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
         writer: Box<dyn AsyncWrite + Unpin + Send>,
         shared: Arc<SessionSharedState>,
     ) {
@@ -381,9 +422,8 @@ impl ServerSession {
                 InitParams { context, namespace, readonly, kubeconfig_yaml, env_vars, identity }
             }
             _ => {
-                let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
-                    "Expected Init command".to_string(),
-                )).await;
+                fail_session(&mut reader, &mut buf_writer,
+                    "Expected Init command".to_string()).await;
                 return;
             }
         };
@@ -420,15 +460,13 @@ impl ServerSession {
                 InitParams { context, namespace, readonly, kubeconfig_yaml, env_vars, identity }
             }
             Ok(_) => {
-                let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
-                    "Expected Init command as first message".to_string(),
-                )).await;
+                fail_session(&mut reader, &mut buf_writer,
+                    "Expected Init command as first message".to_string()).await;
                 return;
             }
             Err(e) => {
-                let _ = protocol::write_bincode(&mut buf_writer, &SessionEvent::SessionError(
-                    format!("Failed to read Init command: {}", e),
-                )).await;
+                fail_session(&mut reader, &mut buf_writer,
+                    format!("Failed to read Init command: {}", e)).await;
                 return;
             }
         };
@@ -448,7 +486,7 @@ impl ServerSession {
     /// Shared implementation.
     async fn run_session_inner(
         init: InitParams,
-        reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+        mut reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
         mut buf_writer: BufWriter<Box<dyn AsyncWrite + Unpin + Send>>,
         shared: Arc<SessionSharedState>,
         session_ctx_tx: Option<watch::Sender<Option<Arc<SessionContext>>>>,
@@ -463,10 +501,8 @@ impl ServerSession {
         let context_name = match init.context.clone() {
             Some(c) => c,
             None => {
-                let event = SessionEvent::SessionError(
-                    "Init command missing context name".to_string(),
-                );
-                let _ = protocol::write_bincode(&mut buf_writer, &event).await;
+                fail_session(&mut reader, &mut buf_writer,
+                    "Init command missing context name".to_string()).await;
                 return;
             }
         };
@@ -484,10 +520,8 @@ impl ServerSession {
             }
             Err(e) => {
                 warn!("Failed to create client for context {}: {}", context_name, e);
-                let event = SessionEvent::SessionError(
-                    format!("Failed to create client: {}", e),
-                );
-                let _ = protocol::write_bincode(&mut buf_writer, &event).await;
+                fail_session(&mut reader, &mut buf_writer,
+                    format!("Failed to create client for context '{}': {}", context_name, e)).await;
                 return;
             }
         };
@@ -863,8 +897,10 @@ impl ServerSession {
         // Subscription bridges are gone — subscriptions live on per-yamux
         // substreams now. When the mux connection drops (session exits),
         // all substream reads return EOF and the bridge tasks exit naturally.
-        if let Some(h) = self.metrics_task.take() { h.abort(); }
-        if let Some(h) = self.discovery_refresher_task.take() { h.abort(); }
+        // Guards abort on drop; taking them here keeps teardown explicit on
+        // the normal path (and drop covers the cancelled-select path).
+        drop(self.metrics_task.take());
+        drop(self.discovery_refresher_task.take());
         // Abort every pending mutating handler (scale/restart/apply/delete
         // /etc) and drain. Without this, a session that exits while a
         // handler is mid-`api.patch().await` would leave the task running
@@ -1188,6 +1224,13 @@ async fn handle_subscription_substream_inner(
                                     if writer.flush().await.is_err() { return; }
                                 }
                             }
+                            // Health transitions ride through even while the
+                            // baseline is deferred: a re-LIST that takes a
+                            // minute is exactly when the client most needs to
+                            // know its rows stopped moving.
+                            crate::kube::live_query::WatcherMsg::Health(h) => {
+                                if sent_any_data && !announce_health(&mut writer, h).await { return; }
+                            }
                             // Carry the reason OUT — do NOT fall through to a
                             // re-drain (the terminal Dead is now consumed, and
                             // re-draining a keepalive-held-open channel hangs).
@@ -1209,8 +1252,8 @@ async fn handle_subscription_substream_inner(
             },
         };
 
-        let baseline = match step {
-            BaselineStep::Got(b) => b,
+        let (baseline, attach_health) = match step {
+            BaselineStep::Got(reply) => (reply.baseline, reply.health),
             BaselineStep::Retry => {
                 after_initial_list = false;
                 continue 'attach;
@@ -1237,7 +1280,11 @@ async fn handle_subscription_substream_inner(
                     let _ = writer.flush().await;
                     return;
                 }
-                sub = resubscribe(&ctx, &resub, make_client, &mut retry_backoff, &detail, session_id).await;
+                let Some(next) = resubscribe(
+                    &ctx, &resub, make_client, &mut retry_backoff, &detail, session_id,
+                    &mut writer,
+                ).await else { return };
+                sub = next;
                 after_initial_list = true;
                 continue 'attach;
             }
@@ -1269,6 +1316,16 @@ async fn handle_subscription_substream_inner(
         }
         sent_any_data = true;
         retry_backoff = std::time::Duration::from_secs(5);
+        // Attaching to a SHARED watcher that is already degraded: the
+        // transition went out before this bridge pinned its cursor, so the
+        // ring can never tell us. The baseline reply does. (Announced after
+        // the baseline so the client applies rows first, then learns they
+        // are frozen — the other order would be cleared by the baseline.)
+        if attach_health != crate::kube::live_query::WatchHealth::Feeding
+            && !announce_health(&mut writer, &attach_health).await
+        {
+            return;
+        }
 
         loop {
             match sub.recv().await {
@@ -1278,9 +1335,16 @@ async fn handle_subscription_substream_inner(
                         if protocol::write_bincode(&mut writer, &protocol::StreamEventRef::Delta(delta.as_ref())).await.is_err() { return; }
                         if writer.flush().await.is_err() { return; }
                     }
+                    crate::kube::live_query::WatcherMsg::Health(h) => {
+                        if !announce_health(&mut writer, h).await { return; }
+                    }
                     crate::kube::live_query::WatcherMsg::Dead(reason) => {
                         let detail = reason.clone();
-                        sub = resubscribe(&ctx, &resub, make_client, &mut retry_backoff, &detail, session_id).await;
+                        let Some(next) = resubscribe(
+                            &ctx, &resub, make_client, &mut retry_backoff, &detail, session_id,
+                            &mut writer,
+                        ).await else { return };
+                        sub = next;
                         after_initial_list = true;
                         continue 'attach;
                     }
@@ -1297,7 +1361,11 @@ async fn handle_subscription_substream_inner(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     let detail = String::new();
-                    sub = resubscribe(&ctx, &resub, make_client, &mut retry_backoff, &detail, session_id).await;
+                    let Some(next) = resubscribe(
+                        &ctx, &resub, make_client, &mut retry_backoff, &detail, session_id,
+                        &mut writer,
+                    ).await else { return };
+                    sub = next;
                     after_initial_list = true;
                     continue 'attach;
                 }
@@ -1308,8 +1376,10 @@ async fn handle_subscription_substream_inner(
 
 /// Outcome of one baseline-acquisition attempt in the attach loop.
 enum BaselineStep {
-    /// The baseline arrived — proceed to the steady delta loop.
-    Got(protocol::TableBaseline),
+    /// The baseline arrived — proceed to the steady delta loop. It carries
+    /// the watcher's health, which is the ONLY way a bridge attaching to an
+    /// already-degraded shared watcher can learn it missed the transition.
+    Got(crate::kube::live_query::BaselineReply),
     /// The subscriber lagged before the baseline landed; re-ask (the
     /// watcher is alive).
     Retry,
@@ -1379,9 +1449,37 @@ async fn drain_death_reason(sub: &mut crate::kube::live_query::Subscription) -> 
     drained.unwrap_or(None)
 }
 
+/// Tell the client whether the CLUSTER hop is feeding this subscription.
+/// One function so every path that changes the answer — watcher transition,
+/// bridge backoff, attach-time catch-up — speaks with the same voice.
+/// `false` = the substream is broken and the bridge should return.
+async fn announce_health(
+    writer: &mut tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
+    health: &crate::kube::live_query::WatchHealth,
+) -> bool {
+    use crate::kube::live_query::WatchHealth;
+    let event = match health {
+        WatchHealth::Feeding => protocol::StreamEventRef::Live,
+        WatchHealth::Degraded(reason) => protocol::StreamEventRef::Stale(reason),
+    };
+    protocol::write_bincode(writer, &event).await.is_ok() && writer.flush().await.is_ok()
+}
+
 /// Backoff, then re-subscribe (the WatcherCache sees the dead watcher and
 /// spawns a fresh one). ±25% jitter prevents thundering herd when many
 /// watchers die simultaneously (e.g., after laptop suspend/resume).
+///
+/// Owns the staleness announcement rather than leaving it to the three call
+/// sites: this function IS the outage — it is the only place that knows the
+/// client is about to wait, and for how long — so a resubscribe path can't
+/// be added that forgets to say so. `None` = the substream broke while
+/// announcing; the bridge returns.
+///
+/// PRECONDITION: the client already has rows. Every caller is downstream of
+/// the `!sent_any_data` fail-fast (a watcher that never produced data is a
+/// terminal `StreamEvent::Error`, not a retry), so there is always something
+/// on screen to declare frozen.
+#[allow(clippy::too_many_arguments)]
 async fn resubscribe(
     ctx: &Arc<SessionContext>,
     resub: &ResubInfo,
@@ -1389,7 +1487,8 @@ async fn resubscribe(
     retry_backoff: &mut std::time::Duration,
     detail: &str,
     session_id: u64,
-) -> crate::kube::live_query::Subscription {
+    writer: &mut tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
+) -> Option<crate::kube::live_query::Subscription> {
     let rid_label = match resub {
         ResubInfo::BuiltIn { key, .. } | ResubInfo::Dynamic { key, .. } => key.resource.plural(),
     };
@@ -1397,10 +1496,21 @@ async fn resubscribe(
     let jittered = retry_backoff.mul_f64(jitter_factor);
     tracing::info!(session = session_id,
         "watcher died for {}, retrying in {:?}: {}", rid_label, jittered, detail);
+    // Say so BEFORE sleeping — the whole point is that the client is not
+    // left painting frozen rows for the length of the backoff (up to a
+    // minute).
+    let reason = if detail.is_empty() {
+        format!("watch for {} stopped — retrying in {:?}", rid_label, jittered)
+    } else {
+        format!("watch for {} failed ({}) — retrying in {:?}", rid_label, detail, jittered)
+    };
+    if !announce_health(writer, &crate::kube::live_query::WatchHealth::Degraded(reason)).await {
+        return None;
+    }
     tokio::time::sleep(jittered).await;
     *retry_backoff = (*retry_backoff * 2).min(std::time::Duration::from_secs(60));
 
-    match resub {
+    Some(match resub {
         ResubInfo::BuiltIn { key, kind } => {
             ctx.shared.watcher_cache.subscribe(key.clone(), *kind, make_client, ctx.streaming_lists)
         }
@@ -1411,7 +1521,7 @@ async fn resubscribe(
                 ctx.streaming_lists,
             )
         }
-    }
+    })
 }
 
 /// Owner-uid post-filter, baseline flavor. OwnerUid is the one
@@ -1687,9 +1797,7 @@ async fn stream_logs_via_kubectl(
     if let Some(ns) = init.namespace.as_option() {
         cmd.arg("-n").arg(ns);
     }
-    if !ctx.context.name.is_empty() {
-        cmd.arg("--context").arg(ctx.context.name.as_str());
-    }
+    cmd.arg("--context").arg(ctx.context.name.as_str());
     if init.follow { cmd.arg("-f"); }
     if let Some(tail) = init.tail {
         cmd.arg("--tail").arg(tail.to_string());
@@ -1766,10 +1874,8 @@ async fn handle_exec_substream(
     // from the session's active context (the TUI doesn't know the daemon's
     // context identity).
     let mut args = Vec::with_capacity(init.kubectl_args.len() + 2);
-    if !ctx.context.name.is_empty() {
-        args.push("--context".to_string());
-        args.push(ctx.context.name.to_string());
-    }
+    args.push("--context".to_string());
+    args.push(ctx.context.name.to_string());
     args.extend(init.kubectl_args);
 
     // Create PTY with initial terminal size.
@@ -1798,11 +1904,10 @@ async fn handle_exec_substream(
     // even if the tokio task is aborted (daemon shutdown).
     let _child_guard = ChildGuard(Some(child));
 
-    // Transfer master fd ownership from Pty to File. consume_master_fd
-    // marks the fd as transferred so Pty::drop skips closing it.
-    let master_fd = pty.consume_master_fd();
-    let master_file = unsafe { std::fs::File::from_raw_fd(master_fd) };
-    drop(pty); // Only closes slave (master already consumed).
+    // Transfer master ownership from the PTY into a File — a plain typed
+    // move (`OwnedFd` → `File`), no raw-fd unsafe. Consumes the Pty; the
+    // slave was already handed to kubectl by `spawn`.
+    let master_file = std::fs::File::from(pty.into_master());
     let master = match tokio::io::unix::AsyncFd::new(master_file) {
         Ok(m) => m,
         Err(e) => {
@@ -1822,16 +1927,23 @@ async fn handle_exec_substream(
             };
             match frame {
                 protocol::ExecFrame::Data(bytes) => {
-                    loop {
+                    // Plain `write` with an offset, NOT `write_all`: on this
+                    // O_NONBLOCK fd a partial `write_all` returns WouldBlock
+                    // without reporting progress, and retrying it from the
+                    // start re-sends the already-written prefix — duplicated
+                    // bytes in the remote shell (fast paste, ^S flow-stop).
+                    let mut written = 0;
+                    while written < bytes.len() {
                         let mut guard = match master.writable().await {
                             Ok(g) => g,
                             Err(_) => return,
                         };
                         match guard.try_io(|inner| {
                             use std::io::Write;
-                            inner.get_ref().write_all(&bytes)
+                            inner.get_ref().write(&bytes[written..])
                         }) {
-                            Ok(Ok(())) => break,
+                            Ok(Ok(0)) => return, // PTY closed
+                            Ok(Ok(n)) => written += n,
                             Ok(Err(_)) => return,
                             Err(_would_block) => continue,
                         }
@@ -1842,7 +1954,7 @@ async fn handle_exec_substream(
                         ws_row: height, ws_col: width,
                         ws_xpixel: 0, ws_ypixel: 0,
                     };
-                    unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws); }
+                    unsafe { libc::ioctl(master.get_ref().as_raw_fd(), libc::TIOCSWINSZ, &ws); }
                 }
                 protocol::ExecFrame::Resize { .. } => {} // zero dimensions ignored
             }
@@ -1900,13 +2012,19 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Minimal PTY wrapper using raw libc. No external crate needed.
+/// Minimal PTY wrapper using raw libc. Fd lifetimes are [`OwnedFd`]s — a
+/// consumed or closed fd is UNREPRESENTABLE. (The previous `RawFd` version
+/// tracked ownership with `-1` sentinels that three methods had to maintain
+/// by hand; one slip there is a double-close, which in a multi-threaded
+/// daemon means fd-reuse corruption of an unrelated socket.)
 struct Pty {
-    master: std::os::unix::io::RawFd,
-    slave: std::os::unix::io::RawFd,
+    master: OwnedFd,
+    /// `Some` until `spawn` hands it to the child (the parent's copy closes
+    /// on that take-drop); a second spawn is an error, not a double-close.
+    slave: Option<OwnedFd>,
 }
 
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 impl Pty {
     fn open(cols: u16, rows: u16) -> std::io::Result<Self> {
@@ -1927,29 +2045,40 @@ impl Pty {
         if ret != 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: openpty succeeded, so both fds are freshly opened and held
+        // by nobody else — wrapping transfers that sole ownership here. Every
+        // error path below closes them by drop.
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         // Set master to non-blocking for async I/O.
-        let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
-        if flags == -1 || unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-            let err = std::io::Error::last_os_error();
-            unsafe { libc::close(master); libc::close(slave); }
-            return Err(err);
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                == -1
+        {
+            return Err(std::io::Error::last_os_error());
         }
-        Ok(Pty { master, slave })
+        Ok(Pty { master, slave: Some(slave) })
     }
 
-    /// Transfer ownership of the master fd. After this call, Drop will
-    /// NOT close the master — the caller owns it (typically via File).
-    fn consume_master_fd(&mut self) -> RawFd {
-        let fd = self.master;
-        self.master = -1; // Sentinel: Drop skips -1.
-        fd
+    /// Hand the master to the caller (typically wrapped into a `File` /
+    /// `AsyncFd`), consuming the PTY. By now `spawn` has taken the slave,
+    /// so the move IS the complete ownership transfer — nothing is left
+    /// behind to leak or double-close.
+    fn into_master(self) -> OwnedFd {
+        self.master
     }
 
     /// Spawn a process with the slave PTY as its controlling terminal.
     fn spawn(&mut self, cmd: &str, args: &[String], env: &SessionEnv) -> std::io::Result<std::process::Child> {
         use std::os::unix::process::CommandExt;
-        let slave = self.slave;
-        let master = self.master;
+        let Some(slave) = self.slave.take() else {
+            return Err(std::io::Error::other("PTY slave already consumed"));
+        };
+        // Raw COPIES for the pre-exec closure (it runs post-fork in the
+        // child, where the parent's OwnedFds don't exist as owners).
+        let slave_fd = slave.as_raw_fd();
+        let master_fd = self.master.as_raw_fd();
         let mut command = std::process::Command::new(cmd);
         command.args(args);
         // Authenticate as this session, not the daemon's startup env. Applied
@@ -1964,27 +2093,19 @@ impl Pty {
                 // New session → detach from parent's controlling terminal.
                 libc::setsid();
                 // Set the slave PTY as the controlling terminal.
-                libc::ioctl(slave, libc::TIOCSCTTY as libc::c_ulong, 0);
-                libc::dup2(slave, 0);
-                libc::dup2(slave, 1);
-                libc::dup2(slave, 2);
-                if slave > 2 { libc::close(slave); }
-                libc::close(master);
+                libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
+                libc::dup2(slave_fd, 0);
+                libc::dup2(slave_fd, 1);
+                libc::dup2(slave_fd, 2);
+                if slave_fd > 2 { libc::close(slave_fd); }
+                libc::close(master_fd);
                 Ok(())
             });
         }
         let child = command.spawn()?;
-        // Close slave on parent side — only kubectl should hold it.
-        unsafe { libc::close(self.slave); }
-        self.slave = -1; // Mark as consumed.
+        // Parent's copy of the slave closes here — only kubectl holds it now.
+        drop(slave);
         Ok(child)
-    }
-}
-
-impl Drop for Pty {
-    fn drop(&mut self) {
-        if self.master >= 0 { unsafe { libc::close(self.master); } }
-        if self.slave >= 0 { unsafe { libc::close(self.slave); } }
     }
 }
 
@@ -1994,66 +2115,5 @@ fn parse_k8s_minor(git_version: &str) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{parse_k8s_minor, split_all_containers_prefix};
-
-    #[test]
-    fn parse_standard_versions() {
-        assert_eq!(parse_k8s_minor("v1.32.1"), Some(32));
-        assert_eq!(parse_k8s_minor("v1.30.0"), Some(30));
-        assert_eq!(parse_k8s_minor("v1.28.11"), Some(28));
-    }
-
-    #[test]
-    fn parse_eks_version() {
-        assert_eq!(parse_k8s_minor("v1.30.14-eks-40737a8"), Some(30));
-    }
-
-    #[test]
-    fn parse_no_prefix() {
-        assert_eq!(parse_k8s_minor("1.32.0"), Some(32));
-    }
-
-    #[test]
-    fn parse_edge_cases() {
-        assert_eq!(parse_k8s_minor("v1"), None);
-        assert_eq!(parse_k8s_minor(""), None);
-        assert_eq!(parse_k8s_minor("garbage"), None);
-        assert_eq!(parse_k8s_minor("v1.abc.3"), None);
-    }
-
-    #[test]
-    fn all_containers_prefix_pod_slash_container() {
-        assert_eq!(split_all_containers_prefix("[mypod/web] hello"), Some(("web", "hello")));
-    }
-
-    #[test]
-    fn all_containers_prefix_bare_container() {
-        // Single-pod streams may emit just `[container]`; rsplit still works.
-        assert_eq!(split_all_containers_prefix("[web] hello"), Some(("web", "hello")));
-    }
-
-    #[test]
-    fn all_containers_prefix_multi_segment_source() {
-        // Any `/`-separated source resolves to its final (container) segment.
-        assert_eq!(split_all_containers_prefix("[ns/mypod/web] hi"), Some(("web", "hi")));
-    }
-
-    #[test]
-    fn all_containers_prefix_preserves_bracketed_body() {
-        // kubectl prepends its prefix once; the container's own `[INFO]` text
-        // follows untouched (we split on the FIRST `] `, which is the prefix).
-        assert_eq!(
-            split_all_containers_prefix("[mypod/web] [INFO] up] done"),
-            Some(("web", "[INFO] up] done")),
-        );
-    }
-
-    #[test]
-    fn all_containers_prefix_unprefixed_is_none() {
-        // A line without kubectl's prefix rides untagged rather than guessing.
-        assert_eq!(split_all_containers_prefix("plain log line"), None);
-        assert_eq!(split_all_containers_prefix("[no-close-bracket hi"), None);
-    }
-}
-
+#[path = "../../tests/kube/server_session.rs"]
+mod tests;

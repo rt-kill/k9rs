@@ -26,8 +26,8 @@ pub(crate) fn apply_event(
                 Err(msg) => crate::app::FlashMessage::error(msg),
             });
         }
-        AppEvent::OpResult { target, result } => {
-            apply_op_result(app, target, result);
+        AppEvent::OpResult { op, target, result } => {
+            apply_op_result(app, op, target, result);
         }
         AppEvent::ResourceResolved { original, resolved } => {
             // The server discovered the true identity of a resource we
@@ -97,22 +97,32 @@ pub(crate) fn apply_event(
             }
         }
         AppEvent::ExecEnded => {
-            // During the Connecting phase, ExecEnded means the connection
-            // failed before we entered bridge mode. Clear the overlay and
-            // flash. During bridge mode this event is consumed directly by
-            // the bridge loop (it never reaches this handler).
-            if matches!(app.ui.overlay, Some(crate::app::Overlay::Shell(_))) {
-                app.ui.flash = Some(crate::app::FlashMessage::error(
-                    "Shell connection failed".to_string()
-                ));
+            // Pre-bridge ExecEnded. During bridge mode this event is consumed
+            // directly by the bridge loop (it never reaches this handler), so
+            // arriving here means the shell ended in the one-turn window
+            // before the bridge took over — and the overlay's own state says
+            // which story that is: still `Connecting` = the connection FAILED
+            // (error flash); already `Connected` = the shell came up and
+            // exited immediately (fast command / instant exit — a normal end,
+            // not a failure).
+            if let Some(crate::app::Overlay::Shell(ref shell)) = app.ui.overlay {
+                app.ui.flash = Some(match shell.connect_state {
+                    crate::app::ShellConnectState::Connecting => {
+                        crate::app::FlashMessage::error("Shell connection failed".to_string())
+                    }
+                    crate::app::ShellConnectState::Connected => {
+                        crate::app::FlashMessage::info("Shell session ended".to_string())
+                    }
+                });
                 app.ui.overlay = None;
             }
         }
         AppEvent::DaemonDisconnected => {
-            // Don't quit — trigger auto-reconnection instead. The main
-            // loop will drop the old session and create a new one, same
-            // as context switching. The user stays in the TUI.
-            app.reconnect_requested = true;
+            // Don't quit — trigger auto-reconnection instead (the main
+            // loop drops the old session and builds a new one, same as
+            // context switching; the user stays in the TUI) and show the
+            // connecting screen NOW (this frame), not stale rows.
+            app.conn.disconnected();
             // A batch's remaining results die with the connection; fold
             // its partial tally into the message instead of dropping it
             // silently (single flash slot).
@@ -129,29 +139,55 @@ pub(crate) fn apply_event(
         AppEvent::ConnectionEstablished { context, identity, namespaces } => {
             // Daemon's view is authoritative — overwrite whatever the
             // KubeconfigLoaded stage put there.
-            app.kube.context = context;
+            app.kube.context = Some(context);
             app.kube.identity = identity;
             if !namespaces.is_empty() {
                 let ns_rows = crate::kube::cache::cached_namespaces_to_rows(&namespaces);
                 app.core.seed(crate::kube::resource_def::BuiltInKind::Namespace, ns_rows);
             }
-            // A connection succeeded: future failures are reconnects, and
-            // the backoff resets.
-            app.has_connected = true;
-            app.reconnect_at = None;
-            app.reconnect_backoff = std::time::Duration::from_millis(500);
+            // The connection is LIVE — the render gate stops showing the
+            // connecting screen, future failures are reconnects, and the
+            // backoff resets.
+            app.conn.established();
         }
         AppEvent::ConnectionFailed(message) => {
-            if app.has_connected {
-                // A RECONNECT failed (the daemon died and hasn't come back
-                // yet). Stay in the TUI and retry with backoff — quitting
-                // on the first failed re-connect contradicts the
+            let in_flight_target = match &app.kube.context_switch {
+                crate::app::ContextSwitchState::InFlight(t) => Some(t.clone()),
+                // `Requested` is NOT the switch failing: its session hasn't
+                // been built yet (the main loop takes the request at the top
+                // of its next turn), so a failure arriving in that state
+                // belongs to a PRIOR attempt — fall through to the reconnect
+                // arms and leave the queued switch to proceed. (`target()`
+                // deliberately spans both states; this edge needs the
+                // narrower question.)
+                _ => None,
+            };
+            if let Some(target) = in_flight_target {
+                // A context SWITCH failed: the target we asked for is
+                // unreachable. The daemon itself is fine — this is NOT a
+                // daemon disconnect (which would fire from a `Stable` state),
+                // so it must NOT be treated as a reconnect-to-the-target, or
+                // the loop would hammer an unreachable context forever while
+                // the switch stayed stuck InFlight and locked out every later
+                // `:context`. Settle the switch (unlock) and fall back to the
+                // last CONFIRMED context — still in `app.kube.context`, since
+                // a switch no longer clobbers it — by requesting an immediate
+                // reconnect (`reconnect_at = None`; the daemon is up, no need
+                // to back off). If that fallback itself fails, we're now
+                // `Stable` again so it lands in the steady-state arm below and
+                // backs off normally — no lock either way.
+                app.kube.context_switch.settle();
+                app.conn.switch_failed_fallback();
+                app.ui.flash = Some(crate::app::FlashMessage::error(
+                    format!("Couldn't reach context {}: {}", target, message)
+                ));
+            } else if app.conn.has_ever_connected() {
+                // A steady-state RECONNECT failed (the daemon died and hasn't
+                // come back yet). Stay in the TUI and retry with backoff —
+                // quitting on the first failed re-connect contradicts the
                 // DaemonDisconnected "the user stays in the TUI" contract.
                 // The user can Ctrl-C to leave.
-                app.reconnect_requested = true;
-                app.reconnect_at = Some(std::time::Instant::now() + app.reconnect_backoff);
-                app.reconnect_backoff =
-                    (app.reconnect_backoff * 2).min(std::time::Duration::from_secs(5));
+                app.conn.reconnect_failed_backoff(std::time::Instant::now());
                 app.ui.flash = Some(crate::app::FlashMessage::warn(
                     format!("Reconnecting to daemon... ({})", message)
                 ));
@@ -168,39 +204,63 @@ pub(crate) fn apply_event(
             // published its own (authoritative) values via ConnectionEstablished.
             // In the normal startup order KubeconfigLoaded arrives first and
             // ConnectionEstablished arrives later, so this branch is taken.
-            if app.kube.context.is_empty() {
+            if app.kube.context.is_none() {
                 app.kube.context = current_context;
                 app.kube.identity = current_identity;
             }
-            app.data.contexts.set_items(contexts.clone());
-            // A showing context picker refreshes in place (top-only touch).
-            if let crate::app::element::Element::ContextList(c) = app.nav.top_mut() {
-                c.table.set_items(contexts);
+            // One store, re-seeded in place: a contexts view that is already
+            // open sees the new rows on its next derive, exactly as a
+            // resource table sees a fresh baseline. No second copy to sync.
+            app.core.seed_contexts(&contexts);
+        }
+        AppEvent::NoContextConfigured => {
+            // Nothing to connect to, so don't pretend to be connecting: the
+            // link goes to `NoContext` (no retry plan — a retry with no
+            // target is just a loop) and the picker becomes the whole UI.
+            // `KubeconfigLoaded` always precedes this event, so the contexts
+            // are already loaded.
+            app.conn.no_context();
+            // RESET, not push: everything below belongs to a context we do
+            // not have. Making it the ROOT is also what makes it
+            // un-escapable — `NavStack::pop` refuses at depth 1, so Esc has
+            // nothing to fall back to and needs no special case.
+            if let Some(root) = app.core.client_root_element(
+                &app.kube.metrics,
+                &crate::kube::local::LocalResourceKind::Context.to_resource_id(),
+                crate::kube::protocol::Namespace::All,
+            ) {
+                app.nav.reset(root);
             }
+            app.ui.flash = Some(crate::app::FlashMessage::info(
+                "No current-context set — select one with Enter (or start with --context)".to_string(),
+            ));
         }
     }
 }
 
 /// Route a target-ed operation result to its consumer, in priority order:
 /// the edit-apply flow (overlay in `Applying` for THIS target), then the
-/// in-flight batch tracker, then a plain flash. Target correlation is
-/// what makes each consumer take only its own results — the old
+/// in-flight batch tracker, then a plain flash. (op, target) correlation
+/// is what makes each consumer take only its own results — the old
 /// target-less `CommandResult` let any concurrent result pop the edit
-/// overlay, and batch failures vanished behind later flashes.
+/// overlay, and the v9 target-only shape still let an edit-apply and a
+/// batch op on the SAME object claim each other's outcomes.
 fn apply_op_result(
     app: &mut App,
+    op: crate::kube::protocol::OperationKind,
     target: crate::kube::protocol::ObjectRef,
     result: Result<String, String>,
 ) {
     // 1. Edit flow: terminal state of an apply. Only take the overlay out
-    // if it is Applying AND the result is for the edited object.
-    let is_applying_this = matches!(
-        app.ui.overlay,
-        Some(crate::app::Overlay::Edit {
-            target: ref t,
-            state: crate::app::EditState::Applying { .. },
-        }) if *t == target
-    );
+    // if this result IS an apply for the edited object.
+    let is_applying_this = op == crate::kube::protocol::OperationKind::Apply
+        && matches!(
+            app.ui.overlay,
+            Some(crate::app::Overlay::Edit {
+                target: ref t,
+                state: crate::app::EditState::Applying { .. },
+            }) if *t == target
+        );
     if is_applying_this {
         // Move the overlay out so we own TempFile (not clone).
         if let Some(crate::app::Overlay::Edit {
@@ -236,7 +296,7 @@ fn apply_op_result(
     // 2. Batch tracker: consume our items' results silently; ONE summary
     // flash when the last lands.
     if let Some(tracker) = app.pending_batch.as_mut() {
-        if tracker.consume(&target, &result) {
+        if tracker.consume(&op, &target, &result) {
             if tracker.is_done() {
                 app.ui.flash = Some(tracker.summary());
                 app.pending_batch = None;
@@ -259,27 +319,35 @@ fn apply_resource_update(
     match update {
         ResourceUpdate::Yaml { target: response_target, content } => {
             // Two consumers:
-            //   1. A `ContentView` element showing this target's YAML —
-            //      delivery is peek-top-and-match (a response for a view
-            //      the user already left is dropped; re-entering re-fetches).
+            //   1. Every `ContentView` showing this target's YAML — routed
+            //      by content identity, WHEREVER it sits in the stack
+            //      (covered views fill while hidden, so a pop-reveal shows
+            //      content instead of an orphaned spinner).
             //   2. The Edit overlay in `AwaitingYaml` — write the temp
-            //      file and hand off to the main loop's editor poll.
-            use crate::app::element::{ContentSpec, Element};
-            if let Element::ContentView(cv) = app.nav.top_mut() {
+            //      file and hand off to the main loop's editor poll. A
+            //      matched view takes priority (the fetch was the view's).
+            use crate::app::element::{ContentPhase, ContentSpec};
+            let nav = &mut app.nav;
+            let cache = &mut app.kube.kubectl_cache;
+            let mut view_took_it = false;
+            nav.for_each_content_view(|cv| {
                 if let ContentSpec::Yaml(ref target) = cv.kind {
                     if *target == response_target {
-                        if cv.awaiting_response {
-                            app.kube.kubectl_cache.insert(
+                        if cv.phase == ContentPhase::Fetching {
+                            cache.insert(
                                 target.clone(),
                                 crate::app::ContentKind::Yaml,
                                 content.clone(),
                             );
-                            cv.awaiting_response = false;
                         }
-                        cv.state.set_content(content);
-                        return;
+                        cv.phase = ContentPhase::Ready;
+                        cv.state.set_content(content.clone());
+                        view_took_it = true;
                     }
                 }
+            });
+            if view_took_it {
+                return;
             }
             if let Some(crate::app::Overlay::Edit { ref target, ref mut state }) = app.ui.overlay {
                 if *target != response_target { return; }
@@ -315,18 +383,33 @@ fn apply_resource_update(
                     line.text = crate::util::sanitize_terminal(&line.text);
                 }
             }
-            use crate::app::element::{ContentSpec, Element};
-            if let Element::ContentView(cv) = app.nav.top_mut() {
-                if let ContentSpec::Describe(ref target) = cv.kind {
-                    if *target == response_target {
-                        if cv.awaiting_response {
-                            app.kube.kubectl_cache.insert_describe(target.clone(), lines.clone());
-                            cv.awaiting_response = false;
+            // Delivery walk, same shape as Yaml above. `DecodedSecret`
+            // views ride the same wire event by design — they receive the
+            // lines but NEVER cache them (decoded secret bytes must not
+            // become the target's cached describe text; that mistake is
+            // what the distinct spec kind exists to prevent). Residual
+            // wire-level ambiguity: a describe view and a decode view for
+            // the SAME secret both match this event and both display it —
+            // disambiguating needs an op discriminant on the wire event.
+            use crate::app::element::{ContentPhase, ContentSpec};
+            let nav = &mut app.nav;
+            let cache = &mut app.kube.kubectl_cache;
+            nav.for_each_content_view(|cv| {
+                match cv.kind {
+                    ContentSpec::Describe(ref target) if *target == response_target => {
+                        if cv.phase == ContentPhase::Fetching {
+                            cache.insert_describe(target.clone(), lines.clone());
                         }
-                        cv.state.set_describe_lines(lines);
+                        cv.phase = ContentPhase::Ready;
+                        cv.state.set_describe_lines(lines.clone());
                     }
+                    ContentSpec::DecodedSecret(ref target) if *target == response_target => {
+                        cv.phase = ContentPhase::Ready;
+                        cv.state.set_describe_lines(lines.clone());
+                    }
+                    _ => {}
                 }
-            }
+            });
         }
     }
 }
@@ -355,3 +438,7 @@ fn write_edit_temp_file(
     );
     crate::util::safe_write_temp(&filename, yaml.as_bytes())
 }
+
+#[cfg(test)]
+#[path = "../tests/kube/session_events.rs"]
+mod tests;

@@ -17,6 +17,10 @@ pub struct ResourceTableState {
     pub selected_col: usize,
     pub col_offset: u16,
     pub filtered_count: usize,
+    /// The widget's true data-row height, measured from the real `Rect` and
+    /// written back so the caller publishes it to the Viewport rather than
+    /// re-deriving `area.height - 3`.
+    pub visible_height: usize,
 }
 
 /// Pre-computed layout for all columns: positions, widths, viewport bounds.
@@ -131,6 +135,11 @@ pub struct ResourceTable<'a> {
     /// Active search patterns for match highlighting. When non-empty,
     /// matched regions within cells are rendered with `theme.search_match`.
     search_patterns: &'a [crate::util::SearchPattern],
+    /// Set when the rows are being painted despite not being live
+    /// ([`crate::app::Liveness::warning`]). Rides the TITLE rather than an
+    /// extra line: the title is on the border, always on screen, and can't
+    /// be scrolled past or pushed off by a full table.
+    warning: Option<&'a str>,
 }
 
 impl<'a> ResourceTable<'a> {
@@ -151,6 +160,7 @@ impl<'a> ResourceTable<'a> {
             row_health: &[],
             cell_style: &[],
             search_patterns: &[],
+            warning: None,
         }
     }
 
@@ -164,6 +174,7 @@ impl<'a> ResourceTable<'a> {
     pub fn namespace(mut self, ns: &'a str) -> Self { self.namespace = ns; self }
     pub fn changed_rows(mut self, changed: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>) -> Self { self.changed_rows = changed; self }
     pub fn search_patterns(mut self, pats: &'a [crate::util::SearchPattern]) -> Self { self.search_patterns = pats; self }
+    pub fn warning(mut self, w: Option<&'a str>) -> Self { self.warning = w; self }
 
     fn health_at(&self, idx: usize) -> crate::kube::resources::row::RowHealth {
         self.row_health.get(idx).copied().unwrap_or_default()
@@ -275,6 +286,13 @@ impl<'a> ResourceTable<'a> {
             };
             spans.push(Span::styled(sel, self.theme.title_filter_indicator));
         }
+        // Liveness last, so it reads as the final word on everything left
+        // of it: these counts describe rows that stopped tracking the
+        // cluster. Never silent — if the rows are painted and not live, the
+        // title says which.
+        if let Some(w) = self.warning {
+            spans.push(Span::styled(format!(" {}", w), self.theme.status_failed));
+        }
         spans.push(Span::styled(" ", self.theme.title));
         Line::from(spans)
     }
@@ -363,6 +381,11 @@ impl StatefulWidget for ResourceTable<'_> {
         block.render(area, buf);
         if inner.height == 0 || inner.width == 0 { return; }
 
+        // Report the true data-row height (inner minus the 1 header row) back to
+        // the Viewport BEFORE the column early-return below, so paging keeps a
+        // real page size even on a (degenerate) zero-column frame.
+        state.visible_height = (inner.height as usize).saturating_sub(1);
+
         // Column layout — widths are pre-computed with the memoized view
         // (see `PreparedView::col_widths`), not re-scanned per frame.
         let col_widths = self.col_widths.to_vec();
@@ -383,7 +406,27 @@ impl StatefulWidget for ResourceTable<'_> {
             layout.reposition(state.col_offset, inner.width);
         }
         if sel_end > state.col_offset + inner.width {
-            state.col_offset = sel_end.saturating_sub(inner.width);
+            // Scroll to a column BOUNDARY, never into the middle of one.
+            //
+            // `sel_end - inner.width` is the minimum shift that reveals the
+            // selected column, but it usually lands inside the first column
+            // still on screen — and a partially-scrolled column renders
+            // wrong: `screen_x` saturates at the left edge, so that column
+            // pins in place at FULL width while every column after it moves,
+            // and they overlap. Nothing clips a hidden left-hand prefix.
+            //
+            // Rather than teach the cell renderer to clip one, keep offsets
+            // column-aligned: take the first column start that still leaves
+            // the selection visible. Scrolling is then column-granular in
+            // both directions, matching the column-granular cursor the
+            // keymap already gives (arrows / colLeft / colRight).
+            let min_offset = sel_end.saturating_sub(inner.width);
+            state.col_offset = layout
+                .positions
+                .iter()
+                .copied()
+                .find(|&start| start >= min_offset)
+                .unwrap_or(min_offset);
             layout.reposition(state.col_offset, inner.width);
         }
 

@@ -13,6 +13,8 @@
 /// - `Ready` → `Failed` (subscription error arrives)
 /// - `Failed` → `Initializing` (clear resets)
 /// - `Initializing` → `Failed` (subscription fails before first baseline)
+/// - `Ready` → `Stale` (the daemon's watch stopped feeding this store)
+/// - `Stale` → `Ready` (the watch recovered, or any data arrived)
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum TableDataState {
     /// No data received yet. The UI shows a loading spinner.
@@ -24,6 +26,12 @@ pub enum TableDataState {
     /// The subscription failed. The UI shows this error message instead
     /// of the loading spinner.
     Failed(String),
+    /// Rows are resident and were true when they arrived, but the daemon's
+    /// watch is no longer feeding them (cluster-side outage; it is
+    /// retrying). Deliberately NOT `Initializing`: these rows are the last
+    /// known truth and worth acting on, they are just not current — and
+    /// deliberately NOT `Failed`: nothing is broken permanently.
+    Stale(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -41,8 +49,9 @@ pub enum TableDataState {
 pub struct StatefulTable<T: Clone> {
     items: Vec<T>,
     selected: usize,
-    offset: usize,
-    page_size: usize,
+    /// Vertical scroll relationship (offset + render-published page height).
+    /// The cursor is primary; the viewport trails it via `reveal`.
+    viewport: crate::app::viewport::Viewport,
     pub data_state: TableDataState,
 }
 
@@ -51,8 +60,7 @@ impl<T: Clone> Default for StatefulTable<T> {
         Self {
             items: Vec::new(),
             selected: 0,
-            offset: 0,
-            page_size: 40,
+            viewport: crate::app::viewport::Viewport::seeded(40),
             data_state: TableDataState::Initializing,
         }
     }
@@ -76,11 +84,15 @@ impl<T: Clone> StatefulTable<T> {
     }
 
     pub fn offset(&self) -> usize {
-        self.offset
+        self.viewport.offset()
     }
 
+    /// Render write-back: publish the real page height (the widget's inner row
+    /// count) and reveal the cursor. Called each frame by the context render,
+    /// so paging and scroll use the true height, not a hardcoded default.
     pub fn set_page_size(&mut self, size: usize) {
-        self.page_size = size;
+        self.viewport.set_metrics(self.items.len(), size, false);
+        self.viewport.reveal(self.selected);
     }
 
     pub fn set_items(&mut self, items: Vec<T>) {
@@ -99,11 +111,12 @@ impl<T: Clone> StatefulTable<T> {
     }
 
     pub fn visible_items(&self) -> Vec<&T> {
-        let end = (self.offset + self.page_size).min(self.items.len());
-        if self.offset >= self.items.len() {
+        let start = self.viewport.offset();
+        if start >= self.items.len() {
             return Vec::new();
         }
-        self.items[self.offset..end].iter().collect()
+        let end = (start + self.viewport.viewport_rows()).min(self.items.len());
+        self.items[start..end].iter().collect()
     }
 
     pub fn next(&mut self) {
@@ -119,20 +132,20 @@ impl<T: Clone> StatefulTable<T> {
     }
 
     pub fn page_up(&mut self) {
-        self.selected = self.selected.saturating_sub(self.page_size);
+        self.selected = self.selected.saturating_sub(self.viewport.viewport_rows());
         self.adjust_offset();
     }
 
     pub fn page_down(&mut self) {
         if !self.items.is_empty() {
-            self.selected = (self.selected + self.page_size).min(self.items.len() - 1);
+            self.selected = (self.selected + self.viewport.viewport_rows()).min(self.items.len() - 1);
         }
         self.adjust_offset();
     }
 
     pub fn home(&mut self) {
         self.selected = 0;
-        self.offset = 0;
+        self.viewport.reveal(0);
     }
 
     pub fn end(&mut self) {
@@ -147,22 +160,15 @@ impl<T: Clone> StatefulTable<T> {
     fn clamp_selection(&mut self) {
         if self.items.is_empty() {
             self.selected = 0;
-            self.offset = 0;
+            self.viewport.reveal(0);
         } else if self.selected >= self.items.len() {
             self.selected = self.items.len() - 1;
         }
     }
 
     fn adjust_offset(&mut self) {
-        if self.page_size == 0 {
-            return;
-        }
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        }
-        if self.selected >= self.offset + self.page_size {
-            self.offset = self.selected - self.page_size + 1;
-        }
+        // Reveal the cursor within the render-published viewport height.
+        self.viewport.reveal(self.selected);
     }
 }
 
@@ -171,75 +177,5 @@ impl<T: Clone> StatefulTable<T> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn table(n: usize) -> StatefulTable<usize> {
-        let mut t = StatefulTable::new();
-        t.set_items((0..n).collect());
-        t
-    }
-
-    #[test]
-    fn cursor_moves_and_clamps() {
-        let mut t = table(3);
-        t.next();
-        t.next();
-        assert_eq!(t.selected(), 2);
-        t.next(); // at end: stays
-        assert_eq!(t.selected(), 2);
-        t.previous();
-        assert_eq!(t.selected(), 1);
-        t.home();
-        assert_eq!(t.selected(), 0);
-        t.end();
-        assert_eq!(t.selected(), 2);
-    }
-
-    #[test]
-    fn paging_respects_bounds() {
-        let mut t = table(100);
-        t.set_page_size(10);
-        t.page_down();
-        assert_eq!(t.selected(), 10);
-        t.page_up();
-        assert_eq!(t.selected(), 0);
-        t.page_up(); // at start: stays
-        assert_eq!(t.selected(), 0);
-    }
-
-    #[test]
-    fn set_items_clamps_selection_and_sets_ready() {
-        let mut t = table(10);
-        t.end();
-        assert_eq!(t.selected(), 9);
-        t.set_items(vec![1, 2, 3]);
-        assert_eq!(t.selected(), 2);
-        assert_eq!(t.data_state, TableDataState::Ready);
-        t.set_items(Vec::new());
-        assert_eq!(t.selected(), 0);
-        assert!(t.selected_item().is_none());
-    }
-
-    #[test]
-    fn visible_items_windows_by_offset_and_page() {
-        let mut t = table(50);
-        t.set_page_size(5);
-        t.end();
-        let visible: Vec<usize> = t.visible_items().into_iter().copied().collect();
-        assert_eq!(visible, vec![45, 46, 47, 48, 49]);
-        assert_eq!(t.offset(), 45);
-    }
-
-    #[test]
-    fn empty_table_is_safe_everywhere() {
-        let mut t: StatefulTable<usize> = StatefulTable::new();
-        t.next();
-        t.previous();
-        t.page_down();
-        t.end();
-        assert_eq!(t.selected(), 0);
-        assert!(t.visible_items().is_empty());
-        assert!(t.selected_item().is_none());
-    }
-}
+#[path = "../tests/app/table.rs"]
+mod tests;

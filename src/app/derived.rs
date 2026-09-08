@@ -5,19 +5,20 @@
 //! table. Adding a new derived view means adding a function here and a
 //! match arm in [`DerivedViewKind::project`].
 
-use crate::kube::resources::k8s_const::{PHASE_COMPLETED, PHASE_RUNNING};
+use crate::kube::resources::k8s_const::PHASE_COMPLETED;
 use crate::kube::resources::row::{CellValue, ContainerInfo, ResourceRow, RowHealth};
 
-/// Classify container health from ready state, status string, and restart
-/// count. Single source of truth — used for both the row health AND the
-/// Status cell health so they can't diverge.
+/// Classify container health from ready state, typed container state,
+/// reason, and restart count. Single source of truth — used for both the
+/// row health AND the Status cell health so they can't diverge.
 fn container_health(c: &ContainerInfo) -> RowHealth {
     if c.ready {
         RowHealth::Normal
-    } else if c.status == PHASE_RUNNING {
+    } else if c.state == crate::kube::resources::row::ContainerState::Running {
         // Running but not ready — starting up.
         RowHealth::Pending
-    } else if c.status == PHASE_COMPLETED {
+    } else if c.reason.as_deref() == Some(PHASE_COMPLETED) {
+        // A cleanly-completed (terminated) container.
         RowHealth::Normal
     } else if c.restart_count > 0 {
         // Not ready + has restarts → likely crash-looping.
@@ -38,7 +39,7 @@ pub(crate) fn project_containers(parent: &ResourceRow) -> Vec<ResourceRow> {
         let cells = vec![
             CellValue::Text(display_name.clone()),
             CellValue::Text(c.image.clone()),
-            CellValue::Status { text: c.status.clone(), health },
+            CellValue::Status { text: c.status_label().to_string(), health },
             CellValue::Bool(c.ready),
             CellValue::Count(c.restart_count as i64),
         ];

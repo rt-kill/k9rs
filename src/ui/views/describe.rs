@@ -14,7 +14,7 @@ use crate::app::App;
 /// Layout:
 /// - Scrollable text content with search highlighting
 /// - Bottom bar with keybindings (or search input)
-pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
+pub fn draw_describe(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.ui.theme;
 
     let chunks = Layout::vertical([
@@ -26,13 +26,23 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
     let content_area = chunks[0];
     let bar_area = chunks[1];
 
+    // Publish the (non-wrapping) extent to the viewport before reading the
+    // offset. inner = content area minus the 2 border rows.
+    let inner_rows = content_area.height.saturating_sub(2) as usize;
+    if let crate::app::element::Element::ContentView(cv) = app.nav.top_mut() {
+        let lc = cv.state.line_count();
+        cv.state.viewport.set_metrics(lc, inner_rows, false);
+    }
+
     // The top element IS the view: its spec carries the target identity,
     // its state carries scroll/search.
     use crate::app::element::{ContentSpec, Element};
     let Element::ContentView(cv) = app.nav.top() else { return };
     let (describe, resource_type, resource_name) = match &cv.kind {
         ContentSpec::Aliases => (&cv.state, "aliases", ""),
-        ContentSpec::Describe(target) | ContentSpec::Yaml(target) => {
+        ContentSpec::Describe(target)
+        | ContentSpec::Yaml(target)
+        | ContentSpec::DecodedSecret(target) => {
             (&cv.state, target.resource.display_label(), target.name.as_str())
         }
     };
@@ -68,7 +78,7 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
                 " Describe: {}/{} [{}/{}] ",
                 resource_type,
                 resource_name,
-                describe.scroll + 1,
+                describe.viewport.offset() + 1,
                 total_lines
             )
         };
@@ -84,8 +94,7 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
         if inner.height > 0 && inner.width > 0 {
             let visible_height = inner.height as usize;
 
-            let max_scroll = crate::util::content_max_scroll(total_lines, visible_height);
-            let start = describe.scroll.min(max_scroll);
+            let start = describe.viewport.offset();
             let end = (start + visible_height).min(total_lines);
 
             // A search match (current or other) overrides the per-line role
@@ -143,9 +152,9 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
 
         let inner = Block::bordered().inner(content_area);
         if total_lines > inner.height as usize {
-            let max_scroll = crate::util::content_max_scroll(total_lines, inner.height as usize);
+            let max_scroll = total_lines.saturating_sub(inner.height as usize);
             let mut scrollbar_state = ScrollbarState::new(max_scroll)
-                .position(describe.scroll.min(max_scroll));
+                .position(describe.viewport.offset().min(max_scroll));
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
             f.render_stateful_widget(scrollbar, content_area, &mut scrollbar_state);
         }
@@ -156,7 +165,26 @@ pub fn draw_describe(f: &mut Frame, app: &App, area: Rect) {
             .border_style(theme.border);
         let inner = block.inner(content_area);
         f.render_widget(block, content_area);
-        crate::ui::draw_centered_loading(f, inner, "Loading...", theme.status_pending, &app.ui.anim);
+        // Empty content: the PHASE says which story — a live fetch gets the
+        // spinner, a failed one says so statically (an animated bar here
+        // was the old wedge: it promised progress no request was making),
+        // and Ready-but-empty is honest emptiness.
+        match &cv.phase {
+            crate::app::element::ContentPhase::Fetching => {
+                crate::ui::draw_centered_loading(f, inner, "Loading...", theme.status_pending, &app.ui.anim);
+            }
+            crate::app::element::ContentPhase::Failed(reason) => {
+                crate::ui::draw_centered_message(
+                    f,
+                    inner,
+                    &format!("✗ {} — Ctrl-R retries", reason),
+                    theme.status_failed,
+                );
+            }
+            crate::app::element::ContentPhase::Ready => {
+                crate::ui::draw_centered_message(f, inner, "No content", theme.status_pending);
+            }
+        }
     }
 
     // Bottom bar: search input or keybinding hints

@@ -193,10 +193,24 @@ pub(super) fn fingerprint_auth(auth: &kube::config::AuthInfo) -> u64 {
     use std::hash::{Hash, Hasher};
     // `to_value` on an `AuthInfo` (plain strings/maps + exposable secrets) does
     // not fail in practice; the fallback exists only so a hypothetical failure
-    // can't collapse *every* failing auth onto one fingerprint (fail-open = a
-    // cross-tenant merge). `Debug` still varies by the non-secret fields.
-    let mut value = serde_json::to_value(auth)
-        .unwrap_or_else(|_| serde_json::Value::String(format!("{auth:?}")));
+    // cannot MERGE sessions it can't tell apart. Fail-CLOSED: mint a unique
+    // never-shared fingerprint. Hashing a lossy stand-in (the old
+    // `format!("{auth:?}")`) would be fail-open — kube-rs REDACTS secret
+    // material in `Debug`, so two auths differing only in secret values would
+    // fingerprint equal and share a watcher: the exact cross-tenant merge
+    // this fingerprint exists to prevent. A never-shared watcher merely costs
+    // one duplicate poll; a wrongly-shared one leaks another tenant's rows.
+    let mut value = match serde_json::to_value(auth) {
+        Ok(v) => v,
+        Err(_) => {
+            static UNSHARED: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
+            let nonce = UNSHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            ("k9rs-unshareable-auth", nonce).hash(&mut hasher);
+            return hasher.finish();
+        }
+    };
     // Canonicalize the one HashMap-ordered array so identical creds with the
     // exec env listed in a different order still hash equal.
     if let Some(env) = value.pointer_mut("/exec/env").and_then(|e| e.as_array_mut()) {

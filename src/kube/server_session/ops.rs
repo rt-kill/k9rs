@@ -1,9 +1,13 @@
 //! Namespace switching, describe/YAML, and mutating operations (delete,
 //! scale, restart, secret decode, CronJob trigger/suspend).
 
-// No field manager identity — k9rs uses plain merge patches so it
-// doesn't claim SSA ownership of fields. This avoids conflicts with
-// GitOps tools (Pulumi, ArgoCD, Flux) that use their own field managers.
+// Patch strategy, two tiers: the full-YAML EDIT apply is server-side
+// apply as field manager "k9rs" with `force()` — an interactive "make it
+// exactly this" edit must win, and plain merge lost to resourceVersion
+// races (rationale at `handle_apply_async`). The small targeted
+// mutations (restart annotation, cron suspend) stay plain merge patches
+// with NO field-manager claim, minimizing ownership friction with GitOps
+// controllers (Pulumi, ArgoCD, Flux) for fields k9rs merely pokes.
 
 use crate::kube::protocol::{self, SessionEvent};
 use crate::kube::resource_def::BuiltInKind;
@@ -23,7 +27,7 @@ impl ServerSession {
     pub(super) fn handle_delete_local(&mut self, obj: &protocol::ObjectRef) {
         let tx = self.event_tx.clone();
         let Some(source) = self.locals.get(&obj.resource) else {
-            self.reject_async(obj, "Unknown local resource".into());
+            self.reject_async(protocol::OperationKind::Delete, obj, "Unknown local resource".into());
             return;
         };
         let result = source.delete(&obj.name);
@@ -34,7 +38,9 @@ impl ServerSession {
                 Ok(()) => Ok(format!("Stopped {name}")),
                 Err(e) => Err(e),
             };
-            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
+            let _ = tx
+                .send(SessionEvent::OpResult { op: protocol::OperationKind::Delete, target, result })
+                .await;
         });
     }
 
@@ -44,13 +50,15 @@ impl ServerSession {
     pub(super) fn handle_apply_local(&mut self, obj: &protocol::ObjectRef, yaml: &str) {
         let tx = self.event_tx.clone();
         let Some(source) = self.locals.get(&obj.resource) else {
-            self.reject_async(obj, "Unknown local resource".into());
+            self.reject_async(protocol::OperationKind::Apply, obj, "Unknown local resource".into());
             return;
         };
         let result = source.apply_yaml(&obj.name, yaml);
         let target = obj.clone();
         self.track_task(async move {
-            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
+            let _ = tx
+                .send(SessionEvent::OpResult { op: protocol::OperationKind::Apply, target, result })
+                .await;
         });
     }
 
@@ -59,7 +67,7 @@ impl ServerSession {
     /// the typed `api_resource_for(target.resource)` so built-ins skip the
     /// discovery HTTP roundtrip and CRDs use their stored GVR if populated.
     pub(super) fn handle_apply_async(&mut self, target: &protocol::ObjectRef, yaml: String) {
-        if self.reject_if_namespace_unresolved(target, "Apply") { return; }
+        if self.reject_if_namespace_unresolved(protocol::OperationKind::Apply, target, "Apply") { return; }
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let target = target.clone();
@@ -73,11 +81,16 @@ impl ServerSession {
                     crate::kube::describe::api_resource_for(&client, &target.resource).await?;
                 let api = crate::kube::describe::dynamic_api_for(&client, &ar, scope, &target.namespace);
 
-                // Parse the user's YAML and apply as a JSON merge patch (RFC 7386
-                // — what `Patch::Merge` sends; arrays replace wholesale, matching a
-                // full-object editor's intent). No SSA (no field manager) — avoids
-                // claiming field ownership that would conflict with GitOps tools.
-                let parsed: DynamicObject = serde_yaml::from_str(&yaml)
+                // Parse the user's edited object and write it back with Server-Side
+                // Apply. SSA is declarative — the object is reconciled to *exactly*
+                // the applied shape. The old primitive, a JSON merge patch, can only
+                // add or overwrite keys: a field the user DELETED is simply absent
+                // from the patch, and "absent" means "leave untouched", so the stale
+                // field survived on the server (deleting `strategy.rollingUpdate`
+                // left it in place, and the apiserver then rejected it as invalid
+                // under `type: Recreate`). SSA drops the omitted field and re-defaults
+                // against the new object — what a full-object editor actually means.
+                let mut parsed: DynamicObject = serde_yaml::from_str(&yaml)
                     .map_err(|e| anyhow::anyhow!("yaml parse error: {}", e))?;
 
                 // Validate that the parsed YAML targets the expected resource.
@@ -91,15 +104,33 @@ impl ServerSession {
                     }
                 }
 
-                // Keep resourceVersion: carrying it in the merge patch makes the
-                // write conditional on the object not having changed since we
-                // fetched it for editing. If another writer touched it in the
-                // meantime, the apiserver enforces it as a precondition and returns
-                // 409 Conflict (surfaced as "Apply failed") rather than silently
-                // clobbering them. Stricter than `kubectl edit` (which sends a
-                // surgical diff with no RV precondition) — we round-trip the whole
-                // object, so the entire write is conditional.
-                api.patch(&target.name, &PatchParams::default(), &Patch::Merge(&parsed))
+                // Two request-body fields must be cleared before SSA:
+                //
+                // - `managedFields`: SSA rejects a body that carries them
+                //   ("metadata.managedFields must be nil"). The API-fetch edit path
+                //   strips them, but the `kubectl get -o yaml` fallback
+                //   (`describe::fetch_yaml_via_kubectl`) does not — clear here so the
+                //   write is correct regardless of how the edited YAML was produced.
+                //
+                // - `resourceVersion`: dropping it removes the optimistic-concurrency
+                //   PRECONDITION. Keeping it 409s on a churning object — a controller
+                //   writing status/annotations while the user sits in $EDITOR bumps
+                //   the RV, so the apply fails even when the field edit collides with
+                //   nobody, and retry dead-ends (the overlay re-sends the same
+                //   stale-RV YAML). k9s sidesteps this by shelling out to `kubectl
+                //   edit`, whose diff-based patch carries no RV precondition; we match
+                //   that behavior. Concurrency is now governed by SSA field OWNERSHIP:
+                //   `force` makes this interactive "make it exactly this" edit
+                //   authoritative over a field another manager owns (equivalent to
+                //   `kubectl apply --server-side --force-conflicts`). Trade-off vs
+                //   `kubectl edit`: we round-trip the whole object, so this is
+                //   last-writer-wins on a genuinely concurrent edit rather than
+                //   field-granular.
+                parsed.metadata.managed_fields = None;
+                parsed.metadata.resource_version = None;
+
+                let params = PatchParams::apply("k9rs").force();
+                api.patch(&target.name, &params, &Patch::Apply(&parsed))
                     .await?;
                 Ok(())
             }
@@ -109,7 +140,9 @@ impl ServerSession {
                 Ok(()) => Ok(format!("Applied {}", display)),
                 Err(e) => Err(format!("Apply failed: {}", e)),
             };
-            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
+            let _ = tx
+                .send(SessionEvent::OpResult { op: protocol::OperationKind::Apply, target, result })
+                .await;
         });
     }
 
@@ -181,6 +214,7 @@ impl ServerSession {
     /// Handlers opt in by checking their own scope first.
     pub(super) fn reject_if_namespace_unresolved(
         &mut self,
+        op: protocol::OperationKind,
         target: &protocol::ObjectRef,
         action: &str,
     ) -> bool {
@@ -189,7 +223,7 @@ impl ServerSession {
             return false;
         }
         if target.namespace.as_option().is_none() {
-            self.reject_async(target, format!(
+            self.reject_async(op, target, format!(
                 "{} refused: {} has no resolved namespace",
                 action, target.kubectl_target(),
             ));
@@ -206,6 +240,7 @@ impl ServerSession {
     /// the check, we destructure once and bind the name or reject.
     pub(super) fn resolve_namespace_or_reject(
         &mut self,
+        op: protocol::OperationKind,
         target: &protocol::ObjectRef,
         action: &str,
     ) -> Option<String> {
@@ -213,14 +248,14 @@ impl ServerSession {
         // namespace (force-kill, decode, cron trigger/toggle) — surface
         // a specific message rather than "no resolved namespace".
         if target.resource.is_cluster_scoped() {
-            self.reject_async(target, format!(
+            self.reject_async(op.clone(), target, format!(
                 "{} refused: {} is cluster-scoped",
                 action, target.kubectl_target(),
             ));
             return None;
         }
         let protocol::Namespace::Named(n) = &target.namespace else {
-            self.reject_async(target, format!(
+            self.reject_async(op, target, format!(
                 "{} refused: {} has no resolved namespace",
                 action, target.kubectl_target(),
             ));
@@ -232,9 +267,14 @@ impl ServerSession {
     /// Spawn a fire-and-forget task that emits a failing `OpResult` for
     /// the given target. Used by the synchronous capability gates in
     /// the mutating handlers (e.g. "this resource is not scaleable").
-    pub(super) fn reject_async(&mut self, target: &protocol::ObjectRef, message: String) {
+    pub(super) fn reject_async(
+        &mut self,
+        op: protocol::OperationKind,
+        target: &protocol::ObjectRef,
+        message: String,
+    ) {
         let tx = self.event_tx.clone();
-        let event = reject(target, message);
+        let event = reject(op, target, message);
         self.track_task(async move {
             let _ = tx.send(event).await;
         });
@@ -262,19 +302,19 @@ impl ServerSession {
         action: &str,
     ) -> Option<BuiltInKind> {
         let Some(kind) = target.resource.built_in_kind() else {
-            self.reject_async(target, format!("{} not supported on {}", action, target.resource.plural()));
+            self.reject_async(required_op.clone(), target, format!("{} not supported on {}", action, target.resource.plural()));
             return None;
         };
         let def = crate::kube::resource_defs::REGISTRY.by_kind(kind);
         if !def.operations().contains(&required_op) {
-            self.reject_async(target, format!("{} not supported on {}", action, def.gvr().plural));
+            self.reject_async(required_op, target, format!("{} not supported on {}", action, def.gvr().plural));
             return None;
         }
         Some(kind)
     }
 
     pub(super) fn handle_delete_async(&mut self, target: &protocol::ObjectRef) {
-        if self.reject_if_namespace_unresolved(target, "Delete") { return; }
+        if self.reject_if_namespace_unresolved(protocol::OperationKind::Delete, target, "Delete") { return; }
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let context = self.context.name.clone();
@@ -287,7 +327,9 @@ impl ServerSession {
                 Ok(()) => Ok(format!("Deleted {}", display)),
                 Err(e) => Err(format!("Delete failed: {}", e)),
             };
-            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
+            let _ = tx
+                .send(SessionEvent::OpResult { op: protocol::OperationKind::Delete, target, result })
+                .await;
         });
     }
 
@@ -300,10 +342,10 @@ impl ServerSession {
     /// client-side capability manifest can't drift.
     pub(super) fn handle_force_kill_async(&mut self, target: &protocol::ObjectRef) {
         if target.resource.built_in_kind() != Some(BuiltInKind::Pod) {
-            self.reject_async(target, format!("Force-kill is pod-only (got {})", target.resource.plural()));
+            self.reject_async(protocol::OperationKind::ForceKill, target, format!("Force-kill is pod-only (got {})", target.resource.plural()));
             return;
         }
-        let Some(ns) = self.resolve_namespace_or_reject(target, "Force-kill") else { return; };
+        let Some(ns) = self.resolve_namespace_or_reject(protocol::OperationKind::ForceKill, target, "Force-kill") else { return; };
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let target = target.clone();
@@ -321,12 +363,14 @@ impl ServerSession {
                 Ok(_) => Ok(format!("Force-killed {}", display)),
                 Err(e) => Err(format!("Force-kill failed: {}", e)),
             };
-            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
+            let _ = tx
+                .send(SessionEvent::OpResult { op: protocol::OperationKind::ForceKill, target, result })
+                .await;
         });
     }
 
     pub(super) fn handle_scale_async(&mut self, target: &protocol::ObjectRef, replicas: u32) {
-        if self.reject_if_namespace_unresolved(target, "Scale") { return; }
+        if self.reject_if_namespace_unresolved(protocol::OperationKind::Scale, target, "Scale") { return; }
         let Some(kind) = self.require_capability(
             target,
             protocol::OperationKind::Scale,
@@ -370,12 +414,14 @@ impl ServerSession {
                 }
                 Err(e) => Err(format!("Scale failed: {}", e)),
             };
-            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
+            let _ = tx
+                .send(SessionEvent::OpResult { op: protocol::OperationKind::Scale, target, result })
+                .await;
         });
     }
 
     pub(super) fn handle_restart_async(&mut self, target: &protocol::ObjectRef) {
-        if self.reject_if_namespace_unresolved(target, "Restart") { return; }
+        if self.reject_if_namespace_unresolved(protocol::OperationKind::Restart, target, "Restart") { return; }
 
         let Some(kind) = self.require_capability(
             target,
@@ -407,7 +453,9 @@ impl ServerSession {
                 Ok(_) => Ok(format!("Restarted {}/{}", display, n)),
                 Err(e) => Err(format!("Restart failed: {}", e)),
             };
-            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
+            let _ = tx
+                .send(SessionEvent::OpResult { op: protocol::OperationKind::Restart, target, result })
+                .await;
         });
     }
 
@@ -447,7 +495,7 @@ impl ServerSession {
             return;
         }
 
-        let Some(ns) = self.resolve_namespace_or_reject(target, "Decode") else { return; };
+        let Some(ns) = self.resolve_namespace_or_reject(protocol::OperationKind::DecodeSecret, target, "Decode") else { return; };
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let n = target.name.clone();
@@ -475,10 +523,10 @@ impl ServerSession {
         // check is load-bearing: a future workload kind that wants a
         // "manual trigger" would decode the wrong schema.
         if target.resource.built_in_kind() != Some(BuiltInKind::CronJob) {
-            self.reject_async(target, format!("Trigger not supported on {}", target.resource.plural()));
+            self.reject_async(protocol::OperationKind::TriggerCronJob, target, format!("Trigger not supported on {}", target.resource.plural()));
             return;
         }
-        let Some(ns) = self.resolve_namespace_or_reject(target, "Trigger") else { return; };
+        let Some(ns) = self.resolve_namespace_or_reject(protocol::OperationKind::TriggerCronJob, target, "Trigger") else { return; };
 
         let client = self.client.clone();
         let tx = self.event_tx.clone();
@@ -491,7 +539,7 @@ impl ServerSession {
             let cj = match cj_api.get(&n).await {
                 Ok(cj) => cj,
                 Err(e) => {
-                    let _ = tx.send(reject(&target, format!("Failed to get CronJob: {}", e))).await;
+                    let _ = tx.send(reject(protocol::OperationKind::TriggerCronJob, &target, format!("Failed to get CronJob: {}", e))).await;
                     return;
                 }
             };
@@ -504,7 +552,9 @@ impl ServerSession {
                 Ok(_) => Ok(format!("Triggered job: {}", job_name)),
                 Err(e) => Err(format!("Failed to trigger CronJob: {}", e)),
             };
-            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
+            let _ = tx
+                .send(SessionEvent::OpResult { op: protocol::OperationKind::TriggerCronJob, target, result })
+                .await;
         });
     }
 
@@ -514,10 +564,10 @@ impl ServerSession {
     /// method, but all cron-likes behave the same way so it lives inline.)
     pub(super) fn handle_toggle_suspend_cronjob_async(&mut self, target: &protocol::ObjectRef) {
         if target.resource.built_in_kind() != Some(BuiltInKind::CronJob) {
-            self.reject_async(target, format!("Toggle suspend not supported on {}", target.resource.plural()));
+            self.reject_async(protocol::OperationKind::ToggleSuspendCronJob, target, format!("Toggle suspend not supported on {}", target.resource.plural()));
             return;
         }
-        let Some(ns) = self.resolve_namespace_or_reject(target, "Toggle suspend") else { return; };
+        let Some(ns) = self.resolve_namespace_or_reject(protocol::OperationKind::ToggleSuspendCronJob, target, "Toggle suspend") else { return; };
 
         let client = self.client.clone();
         let tx = self.event_tx.clone();
@@ -530,7 +580,7 @@ impl ServerSession {
             let cj = match api.get(&n).await {
                 Ok(cj) => cj,
                 Err(e) => {
-                    let _ = tx.send(reject(&target, format!("Failed to read CronJob: {}", e))).await;
+                    let _ = tx.send(reject(protocol::OperationKind::ToggleSuspendCronJob, &target, format!("Failed to read CronJob: {}", e))).await;
                     return;
                 }
             };
@@ -543,7 +593,9 @@ impl ServerSession {
                 }
                 Err(e) => Err(format!("Failed to update CronJob: {}", e)),
             };
-            let _ = tx.send(SessionEvent::OpResult { target, result }).await;
+            let _ = tx
+                .send(SessionEvent::OpResult { op: protocol::OperationKind::ToggleSuspendCronJob, target, result })
+                .await;
         });
     }
 
@@ -562,7 +614,7 @@ impl ServerSession {
         local_port: u16,
         container_port: u16,
     ) {
-        if self.reject_if_namespace_unresolved(target, "Port-forward") { return; }
+        if self.reject_if_namespace_unresolved(protocol::OperationKind::PortForward, target, "Port-forward") { return; }
         let kubectl_target = target.kubectl_target();
 
         // The per-context PortForwardSource, owned by this session's
@@ -589,8 +641,8 @@ impl ServerSession {
 }
 
 /// Shorthand for a failing `OpResult` event for the given target.
-fn reject(target: &protocol::ObjectRef, message: String) -> SessionEvent {
-    SessionEvent::OpResult { target: target.clone(), result: Err(message) }
+fn reject(op: protocol::OperationKind, target: &protocol::ObjectRef, message: String) -> SessionEvent {
+    SessionEvent::OpResult { op, target: target.clone(), result: Err(message) }
 }
 
 /// Build the `kube::api::ApiResource` for a built-in kind directly from the

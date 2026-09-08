@@ -36,6 +36,10 @@ pub enum AppEvent {
     /// per-success, retain marks on failure, ONE aggregate flash), and
     /// anything unclaimed flashes directly.
     OpResult {
+        /// WHICH operation produced this result — target alone was
+        /// ambiguous (an edit-apply and a batch op on the same object
+        /// could claim each other's outcomes).
+        op: crate::kube::protocol::OperationKind,
         target: crate::kube::protocol::ObjectRef,
         result: Result<String, String>,
     },
@@ -92,9 +96,15 @@ pub enum AppEvent {
     /// contexts panel and `:ctx <tab>` completion before the daemon answers.
     KubeconfigLoaded {
         contexts: Vec<crate::app::KubeContext>,
-        current_context: crate::kube::protocol::ContextName,
+        current_context: Option<crate::kube::protocol::ContextName>,
         current_identity: crate::kube::protocol::ClusterIdentity,
     },
+    /// The kubeconfig is fine but names no context to connect to (none on
+    /// the command line, `current-context` absent or blank). NOT a
+    /// `ConnectionFailed`: nothing failed and nothing should be retried —
+    /// there is simply no target until the user picks one, which is what
+    /// the contexts picker is for.
+    NoContextConfigured,
 }
 
 /// A table-stream event plus its destination store. CLIENT-INTERNAL:

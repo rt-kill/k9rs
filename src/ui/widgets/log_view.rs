@@ -3,11 +3,97 @@ use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph, StatefulWidget, Widget, Wrap},
+    widgets::{Block, StatefulWidget, Widget},
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::kube::protocol::LogLine;
 use crate::ui::theme::Theme;
+
+/// Feed a text run into a running `(col, rows)` char-wrap accumulator at width
+/// `w`. When `ansi`, escapes are skipped via [`crate::util::skip_ansi_escape`]
+/// — the SAME tokenizer `parse_ansi_line` (the renderer) uses — so the counted
+/// width cannot drift from the rendered width. Raw runs (container prefix,
+/// timestamp) pass `ansi = false` and count every byte, matching how the
+/// renderer emits those as raw (un-parsed) spans. Non-tab control chars are
+/// width-0 (`unwrap_or(0)`), which equals the renderer dropping them.
+fn wrap_feed(text: &str, ansi: bool, w: usize, col: &mut usize, rows: &mut usize) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if ansi {
+            if let Some(next) = crate::util::skip_ansi_escape(bytes, i) {
+                i = next;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if *col + cw > w {
+            *rows += 1;
+            *col = cw;
+        } else {
+            *col += cw;
+        }
+    }
+}
+
+/// Physical (char-wrapped) row count of a log line at width `w`. MUST agree
+/// with `wrap_line` exactly so the Viewport's physical extent is truthful and
+/// `end()` reaches the real last row. Mirrors `prepare_line`'s visible text:
+/// container prefix + optional timestamp + body.
+fn line_phys_rows(line: &LogLine, show_ts: bool, w: usize) -> usize {
+    if w == 0 {
+        return 1;
+    }
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    if let Some(container) = &line.container {
+        wrap_feed(&format!("{} ", container), false, w, &mut col, &mut rows);
+    }
+    match LogViewer::parse_timestamp(&line.content) {
+        Some(LogTimestamp { timestamp, content }) if show_ts => {
+            wrap_feed(timestamp, false, w, &mut col, &mut rows);
+            wrap_feed(" ", false, w, &mut col, &mut rows);
+            wrap_feed(content, true, w, &mut col, &mut rows);
+        }
+        Some(LogTimestamp { content, .. }) => wrap_feed(content, true, w, &mut col, &mut rows),
+        None => wrap_feed(&line.content, true, w, &mut col, &mut rows),
+    }
+    rows
+}
+
+/// Char-wrap an already-styled line into physical rows of at most `w` display
+/// columns, preserving span styles across the break. Same column logic as
+/// [`line_phys_rows`], so heights and rendering agree exactly.
+fn wrap_line(line: &Line<'static>, w: usize) -> Vec<Line<'static>> {
+    if w == 0 {
+        return vec![line.clone()];
+    }
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut col = 0usize;
+    for span in &line.spans {
+        let style = span.style;
+        let mut cur = String::new();
+        for c in span.content.chars() {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if col + cw > w {
+                if !cur.is_empty() {
+                    rows.last_mut().unwrap().push(Span::styled(std::mem::take(&mut cur), style));
+                }
+                rows.push(Vec::new());
+                col = 0;
+            }
+            cur.push(c);
+            col += cw;
+        }
+        if !cur.is_empty() {
+            rows.last_mut().unwrap().push(Span::styled(cur, style));
+        }
+    }
+    rows.into_iter().map(Line::from).collect()
+}
 
 /// Parsed timestamp and content from a Kubernetes log line.
 struct LogTimestamp<'a> {
@@ -32,20 +118,18 @@ fn container_color(name: &str) -> Color {
     PALETTE[hash % PALETTE.len()]
 }
 
-/// State for the log viewer widget.
+/// State for the log viewer widget. Pure data, snapshotted each draw.
 pub struct LogViewState {
-    pub scroll: usize,
+    /// Physical (wrap-expanded) row offset — from the element's Viewport.
+    pub offset: usize,
+    /// Autoscroll flag — for the title indicator only; the snap itself lives
+    /// in the Viewport.
     pub follow: bool,
-    /// True during initial tail fetch — suppresses follow-mode auto-scroll
-    /// so the view doesn't jump as lines stream in.
-    pub initial_load: bool,
     pub wrap: bool,
     pub show_timestamps: bool,
-    pub total_lines: usize,
-    /// When the caller pre-windows the line data, this field holds the real
-    /// scroll offset for accurate scrollbar rendering. If `None`, the widget
-    /// uses `scroll` for the scrollbar.
-    pub scroll_display: Option<usize>,
+    /// WRITTEN BACK by the widget: total physical (wrap-expanded) row count,
+    /// which the caller publishes to the Viewport via `set_metrics`.
+    pub content_rows: usize,
     /// All active filter patterns (committed + draft) for highlighting.
     pub active_patterns: Vec<String>,
     /// Whether the filter input bar is active (draft being typed).
@@ -133,12 +217,6 @@ impl StatefulWidget for LogViewer<'_> {
     type State = LogViewState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        // Only update total_lines from the slice length if the caller hasn't
-        // already set a higher value (e.g. when the caller pre-windows the data).
-        if state.total_lines < self.lines.len() {
-            state.total_lines = self.lines.len();
-        }
-
         // Build title with follow/wrap/since indicators
         let follow_indicator = if state.follow { " \u{25cf}" } else { " \u{25cb}" }; // ● / ○
         let wrap_indicator = if state.wrap { " [WRAP]" } else { "" };
@@ -161,24 +239,17 @@ impl StatefulWidget for LogViewer<'_> {
         }
 
         let visible_height = inner.height as usize;
+        let w = inner.width as usize;
+        // Autoscroll (follow) and the offset clamp now live in the element's
+        // Viewport (published back by the caller via `set_metrics`); the widget
+        // just windows PHYSICAL rows from the offset it is handed.
 
-        // In follow mode, snap to the latest lines — but skip during
-        // initial_load to prevent the view from jumping as the initial
-        // tail batch streams in. The snap happens once when initial_load
-        // transitions to false.
-        if state.follow && !state.initial_load && self.lines.len() > visible_height {
-            state.scroll = self.lines.len() - visible_height;
-        }
-
-        // Clamp scroll
-        let max_scroll = self.lines.len().saturating_sub(visible_height);
-        if state.scroll > max_scroll {
-            state.scroll = max_scroll;
-        }
-
-        // -- Content preparation: single pipeline for both wrap/non-wrap --
-        // Rendering is agnostic — wrap flows lines into a Paragraph,
-        // non-wrap renders line-by-line. Same content logic for both.
+        // -- Content preparation (shared by wrap and non-wrap) --
+        // Both modes style each line with `prepare_line`; wrap mode then
+        // CHAR-wraps the styled spans into physical rows (`wrap_line`, breaking
+        // mid-word at the column edge — deliberately char-wrap, unlike the
+        // word-wrap the pre-Viewport `Paragraph` render used), non-wrap windows
+        // logical lines directly.
         // Precompile filter patterns ONCE per frame (not per line).
         let compiled_patterns: Vec<crate::util::SearchPattern> = state.active_patterns.iter()
             .filter(|s| !s.is_empty())
@@ -225,11 +296,18 @@ impl StatefulWidget for LogViewer<'_> {
             //    ranges on stripped text and apply highlight to matching spans.
             let ansi_spans = crate::util::parse_ansi_line(body, theme.log_text);
             if !compiled.is_empty() {
-                let stripped = crate::util::strip_ansi(body);
+                // Match on the ACTUAL rendered text — the concatenated span
+                // content — so the offsets align with the spans indexed below.
+                // `strip_ansi` would be a THIRD, differently-tokenized view of
+                // the line (different control-char/OSC/CSI rules than
+                // `parse_ansi_line`) whose offsets don't map onto these spans,
+                // causing mis-highlights and a mid-char / reversed-range slice
+                // panic under multibyte content.
+                let visible: String = ansi_spans.iter().map(|s| s.content.as_ref()).collect();
                 let match_ranges = {
                     let mut ranges = Vec::new();
                     for pat in compiled {
-                        ranges.extend(pat.find_all(&stripped));
+                        ranges.extend(pat.find_all(&visible));
                     }
                     ranges.sort_unstable();
                     // Merge overlapping ranges from multiple patterns.
@@ -284,50 +362,55 @@ impl StatefulWidget for LogViewer<'_> {
             Line::from(spans)
         };
 
-        // -- Rendering: wrap vs non-wrap are purely layout concerns --
-        if state.wrap {
-            // Window from scroll position. In wrap mode a single logical
-            // line occupies AT LEAST one visual row, so `visible_height`
-            // logical lines always over-fill the viewport — preparing
-            // only that many (not `[start..]` to end-of-buffer) keeps this
-            // O(height), not O(remaining lines). Without the upper bound a
-            // scrolled-up 50k-line buffer prepared every remaining line
-            // (ANSI parse + span allocs) on every frame.
-            let start = state.scroll.min(self.lines.len().saturating_sub(1));
-            let end = (start + visible_height).min(self.lines.len());
-            let text_lines: Vec<Line<'static>> = self.lines[start..end]
-                .iter()
-                .map(|&line| prepare_line(line, self.theme, state.show_timestamps, &compiled_patterns))
+        // -- Rendering: window PHYSICAL (wrap-expanded) rows from the offset. --
+        let total_physical = if state.wrap {
+            // Per-line physical heights (cheap: width measurement, no styling).
+            let heights: Vec<usize> = self.lines.iter()
+                .map(|l| line_phys_rows(l, state.show_timestamps, w))
                 .collect();
-            let paragraph = Paragraph::new(text_lines)
-                .wrap(Wrap { trim: false })
-                .scroll((0, 0));
-            paragraph.render(inner, buf);
-        } else {
-            let end = (state.scroll + visible_height).min(self.lines.len());
-            for (vi, line_idx) in (state.scroll..end).enumerate() {
-                let y = inner.y + vi as u16;
-                let styled = prepare_line(self.lines[line_idx], self.theme, state.show_timestamps, &compiled_patterns);
-                buf.set_line(inner.x, y, &styled, inner.width);
+            let total: usize = heights.iter().sum();
+            let offset = state.offset.min(total.saturating_sub(visible_height));
+            // Map the physical offset to (start logical line, intra-line skip).
+            let mut acc = 0usize;
+            let mut start = 0usize;
+            while start < heights.len() && acc + heights[start] <= offset {
+                acc += heights[start];
+                start += 1;
             }
-        }
+            let skip = offset - acc;
+            // Style + char-wrap forward only until the window fills — O(height).
+            let mut phys: Vec<Line<'static>> = Vec::with_capacity(visible_height + 4);
+            let mut li = start;
+            while li < self.lines.len() && phys.len() < skip + visible_height {
+                let styled = prepare_line(self.lines[li], self.theme, state.show_timestamps, &compiled_patterns);
+                phys.extend(wrap_line(&styled, w));
+                li += 1;
+            }
+            for (vi, row) in phys.iter().skip(skip).take(visible_height).enumerate() {
+                buf.set_line(inner.x, inner.y + vi as u16, row, inner.width);
+            }
+            total
+        } else {
+            let total = self.lines.len();
+            let offset = state.offset.min(total.saturating_sub(visible_height));
+            let end = (offset + visible_height).min(total);
+            for (vi, idx) in (offset..end).enumerate() {
+                let styled = prepare_line(self.lines[idx], self.theme, state.show_timestamps, &compiled_patterns);
+                buf.set_line(inner.x, inner.y + vi as u16, &styled, inner.width);
+            }
+            total
+        };
+        // Publish the physical extent for the caller to feed back to the Viewport.
+        state.content_rows = total_physical;
 
-        // Scrollbar indicator (simple right-edge marks).
-        // Use total_lines (the full log size) rather than self.lines.len()
-        // so the scrollbar is correct even when the caller pre-windows the data.
-        let total_for_scrollbar = state.total_lines;
-        let max_scroll_total = total_for_scrollbar.saturating_sub(visible_height);
-        if total_for_scrollbar > visible_height {
+        // Scrollbar — physical units throughout.
+        let max_scroll_total = total_physical.saturating_sub(visible_height);
+        if total_physical > visible_height {
             let scrollbar_height = visible_height;
-            let thumb_size = ((visible_height as f64 / total_for_scrollbar as f64)
+            let thumb_size = ((visible_height as f64 / total_physical as f64)
                 * scrollbar_height as f64)
                 .max(1.0) as usize;
-            // Use scroll_display (the real scroll offset before windowing) if
-            // the caller pre-windowed the data, otherwise fall back to scroll.
-            let scroll_for_bar = state
-                .scroll_display
-                .unwrap_or(state.scroll)
-                .min(max_scroll_total);
+            let scroll_for_bar = state.offset.min(max_scroll_total);
             let thumb_pos = if max_scroll_total > 0 {
                 ((scroll_for_bar as f64 / max_scroll_total as f64)
                     * (scrollbar_height - thumb_size) as f64) as usize
@@ -378,3 +461,7 @@ impl StatefulWidget for LogViewer<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/ui/widgets/log_view.rs"]
+mod tests;

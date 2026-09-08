@@ -26,7 +26,7 @@ use std::time::Instant;
 use crate::app::nav::{CompiledGrep, FilterInputState};
 use crate::app::store::{
     derive_view, DeriveSpec, LineStore, MetricsBinding, MetricsHub, PreparedView, RowPredicate,
-    RowSource, RowStore, SortSpec, StorePayload,
+    RowSource, RowStore, SortSpec,
 };
 use crate::app::table::TableDataState;
 use crate::app::types::ItemCounts;
@@ -34,9 +34,7 @@ use crate::app::view::DerivedViewKind;
 use crate::app::ColumnLevel;
 use crate::kube::client_session::{ClientSession, LogStream, SubscriptionStream};
 use crate::kube::overlay::ColumnRenderRules;
-use crate::kube::protocol::{
-    Namespace, ObjectKey, ObjectRef, ResourceId, SubscriptionFilter, TableBaseline,
-};
+use crate::kube::protocol::{Namespace, ObjectKey, ObjectRef, ResourceId, SubscriptionFilter};
 use crate::kube::resources::row::ResourceRow;
 use crate::util::SearchPattern;
 
@@ -68,6 +66,27 @@ impl ColumnPolicy {
     /// Display level for a column by header name — overlay override, then
     /// built-in def metadata, then inference. (The old `column_level_for`,
     /// minus the `ViewId` indirection.)
+    /// This column's declared metadata, if any resource declares it.
+    /// Built-ins answer from the registry, local resources from their own
+    /// `column_defs` — same question, one lookup, so level and width can't
+    /// disagree about where a column's description lives.
+    fn def_for(&self, name: &str) -> Option<crate::app::ColumnDef> {
+        let rid = self.rid.as_ref()?;
+        let find = |defs: &[crate::app::ColumnDef]| {
+            defs.iter().find(|c| c.header.eq_ignore_ascii_case(name)).copied()
+        };
+        match rid {
+            ResourceId::BuiltIn(k) => {
+                find(&crate::kube::resource_defs::REGISTRY.by_kind(*k).column_defs())
+            }
+            ResourceId::Local(k) => find(k.column_defs()),
+            // CRD columns are server-resolved printer columns; nothing
+            // declares them client-side, so inference and the global cap
+            // stay in charge.
+            ResourceId::Crd(_) | ResourceId::CrdUnresolved(_) => None,
+        }
+    }
+
     fn level_for(&self, name: &str) -> ColumnLevel {
         let Some(rid) = &self.rid else {
             return crate::app::ColumnDef::infer(name);
@@ -79,15 +98,16 @@ impl ColumnPolicy {
                 }
             }
         }
-        if let Some(k) = rid.built_in_kind() {
-            let def = crate::kube::resource_defs::REGISTRY.by_kind(k);
-            for col in def.column_defs() {
-                if col.header.eq_ignore_ascii_case(name) {
-                    return col.level;
-                }
-            }
+        if let Some(def) = self.def_for(name) {
+            return def.level;
         }
         crate::app::ColumnDef::infer(name)
+    }
+
+    /// This column's width ceiling: the column's own declaration if it has
+    /// one, else the global `ui.maxColumnWidth` fallback.
+    fn max_width_for(&self, name: &str, fallback: u16) -> u16 {
+        self.def_for(name).and_then(|d| d.max_width).unwrap_or(fallback)
     }
 
     /// DATA indices of the columns visible at `level`, in header order.
@@ -118,10 +138,12 @@ impl ColumnPolicy {
 #[derive(Debug)]
 pub struct TableInteraction {
     pub selected: usize,
-    pub offset: usize,
     pub selected_col: usize,
     pub col_offset: u16,
-    pub page_size: usize,
+    /// Vertical scroll relationship (offset + render-published extent). The
+    /// cursor (`selected`) is primary; the viewport trails it via
+    /// `Viewport::reveal` / `apply_render`.
+    pub viewport: crate::app::viewport::Viewport,
     pub sort: SortSpec,
     pub filter_input: FilterInputState,
     /// Whether the last PAINTED frame showed select mode. Mode itself is
@@ -140,10 +162,9 @@ impl Default for TableInteraction {
     fn default() -> Self {
         Self {
             selected: 0,
-            offset: 0,
             selected_col: 0,
             col_offset: 0,
-            page_size: 40,
+            viewport: crate::app::viewport::Viewport::seeded(40),
             sort: SortSpec::default(),
             filter_input: FilterInputState::default(),
             rendered_select_mode: false,
@@ -161,10 +182,9 @@ impl TableInteraction {
     pub fn seeded_from(parent: &TableInteraction) -> Self {
         Self {
             selected: parent.selected,
-            offset: parent.offset,
             selected_col: parent.selected_col,
             col_offset: parent.col_offset,
-            page_size: parent.page_size,
+            viewport: parent.viewport,
             sort: parent.sort,
             filter_input: FilterInputState::default(),
             rendered_select_mode: false,
@@ -192,15 +212,9 @@ impl TableInteraction {
     }
 
     fn adjust_offset(&mut self) {
-        if self.page_size == 0 {
-            return;
-        }
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        }
-        if self.selected >= self.offset + self.page_size {
-            self.offset = self.selected - self.page_size + 1;
-        }
+        // Reveal the cursor within the last-published viewport — the same
+        // one-frame-settle contract the old page_size-based reveal had.
+        self.viewport.reveal(self.selected);
     }
 }
 
@@ -240,13 +254,33 @@ pub struct QuerySpec {
     pub filter: Option<SubscriptionFilter>,
 }
 
-/// A live subscription: spec + store + stream, none optional — a live
+/// Where a query's rows come from. Most resources are fed by the daemon
+/// over a subscription; a few are facts the CLIENT already holds and the
+/// daemon has no business reporting on — the kubeconfig's contexts, whose
+/// whole point is to be listable when there is no session at all.
+///
+/// Typed rather than conventional because the difference is load-bearing at
+/// the reconnect/switch choke point: that path aborts and re-opens every
+/// element's stream, and a client-owned query has no stream to re-open.
+/// Doing it anyway would ask the daemon to serve a resource it doesn't know
+/// — so `Client` simply carries no `SubscriptionStream`, and the compiler
+/// keeps the two cases from being confused.
+enum QueryOrigin {
+    /// Fed by a daemon subscription; the stream must be kept alive, aborted
+    /// at the choke point, and revived on reconnect.
+    Daemon(SubscriptionStream),
+    /// Seeded in-process. Nothing to keep alive, nothing to revive, and no
+    /// connection state that could make the rows stale.
+    Client,
+}
+
+/// A live subscription: spec + store + origin, none optional — a live
 /// query ALWAYS has all three ("`None` means look elsewhere" is gone).
-/// Drop aborts the bridge and RSTs the substream.
+/// Drop aborts a daemon bridge and RSTs the substream.
 pub struct LiveQuery {
     spec: QuerySpec,
     store: Arc<RowStore>,
-    stream: SubscriptionStream,
+    origin: QueryOrigin,
 }
 
 impl LiveQuery {
@@ -262,14 +296,16 @@ impl LiveQuery {
             Arc::clone(&store),
             false,
         );
-        Self { spec, store, stream }
+        Self { spec, store, origin: QueryOrigin::Daemon(stream) }
     }
 
-    /// Seed an already-populated store (local/offline sources, tests).
-    pub fn seeded(session: &ClientSession, spec: QuerySpec, baseline: TableBaseline) -> Self {
-        let this = Self::open(session, spec);
-        this.store.apply(0, StorePayload::Baseline(baseline));
-        this
+    /// A query over a store the CLIENT owns and seeds (see
+    /// [`QueryOrigin::Client`]). The store is passed in rather than created
+    /// here because its lifetime isn't the element's — it lives in
+    /// [`crate::app::CoreData`] and is re-seeded whenever its source of
+    /// truth changes, so opening and closing the view doesn't lose the rows.
+    pub fn client(spec: QuerySpec, store: Arc<RowStore>) -> Self {
+        Self { spec, store, origin: QueryOrigin::Client }
     }
 
     pub fn spec(&self) -> &QuerySpec {
@@ -280,44 +316,87 @@ impl LiveQuery {
         &self.store
     }
 
+    /// Whether these rows are seeded in-process rather than fed by a
+    /// daemon subscription (see [`QueryOrigin`]).
+    /// Delegated to the store so the fact has ONE home: `QueryOrigin`
+    /// answers "is there a stream to manage", the store answers "do these
+    /// rows depend on the connection". Keeping the second on the store is
+    /// what lets a `/` filter over the contexts list inherit it for free.
+    pub fn is_client_owned(&self) -> bool {
+        self.store.is_client_owned()
+    }
+
     /// Whether the bridge task behind this subscription is still running.
+    /// A client-owned query is always live: there is no bridge that could
+    /// die, and nothing to re-subscribe if it did.
     pub fn is_live(&self) -> bool {
-        self.stream.is_alive()
+        match &self.origin {
+            QueryOrigin::Daemon(stream) => stream.is_alive(),
+            QueryOrigin::Client => true,
+        }
+    }
+
+    /// Abort the subscription bridge without minting a successor. Called at the
+    /// reconnect/switch choke point so the old bridge stops retrying against
+    /// the dropped session's dead mux; the stream is revived later by
+    /// `resubscribe` (top / on pop) or the element is dropped by a switch's
+    /// nav reset. Idempotent, and a no-op for a client-owned query — its
+    /// rows never depended on the connection being torn down.
+    pub fn abort(&self) {
+        match &self.origin {
+            QueryOrigin::Daemon(stream) => stream.abort(),
+            QueryOrigin::Client => {}
+        }
     }
 
     /// Re-open the stream against the SAME store (reconnect revive). The
-    /// fresh epoch floor rejects the dead stream's queued stragglers; the
-    /// next Baseline replaces rows in place — no blank flash.
+    /// fresh epoch floor rejects the dead stream's queued stragglers. Rows
+    /// stay RESIDENT so the next Baseline replaces them in place (flash /
+    /// mark continuity), but the store is flagged reinitializing so the view
+    /// shows a "Connecting…" screen instead of the stale, no-longer-live rows
+    /// while the stream re-establishes.
+    /// Client-owned queries are exempt: there is no connection whose loss
+    /// could have stalled them, so hiding their rows behind a "Connecting…"
+    /// screen would be a lie, and re-subscribing would ask the daemon for a
+    /// resource it has never heard of.
     pub fn resubscribe(&mut self, session: &ClientSession) {
+        let QueryOrigin::Daemon(stream) = &self.origin else { return };
         // Abort the old bridge BEFORE the new subscribe mints its epoch
         // (subscribe_stream raises expect_epoch as it returns) — a
         // lingering old bridge minting a HIGHER epoch would permanently
         // out-floor the successor's baseline.
-        self.stream.abort();
-        self.stream = session.subscribe_stream(
+        stream.abort();
+        // Rows stay put (in-place replacement on recovery), but report
+        // Initializing so the stale rows hide behind the loading screen.
+        self.store.mark_reinitializing();
+        self.origin = QueryOrigin::Daemon(session.subscribe_stream(
             self.spec.rid.clone(),
             self.spec.namespace.clone(),
             self.spec.filter.clone(),
             Arc::clone(&self.store),
             false,
-        );
+        ));
     }
 
     /// Ctrl-R: clear to a spinner and force a fresh server-side watcher —
     /// re-running the element's OWN spec (never the ambient selector; the
     /// old refresh silently narrowed all-namespace drills to the ambient
     /// namespace).
+    /// A client-owned query has no server-side watcher to force; its rows
+    /// are re-seeded by whatever owns them, so Ctrl-R leaves it alone rather
+    /// than clearing a store nothing will refill.
     pub fn refresh(&mut self, session: &ClientSession) {
+        let QueryOrigin::Daemon(stream) = &self.origin else { return };
         // Abort-before-mint (see resubscribe).
-        self.stream.abort();
+        stream.abort();
         self.store.clear();
-        self.stream = session.subscribe_stream(
+        self.origin = QueryOrigin::Daemon(session.subscribe_stream(
             self.spec.rid.clone(),
             self.spec.namespace.clone(),
             self.spec.filter.clone(),
             Arc::clone(&self.store),
             true,
-        );
+        ));
     }
 
     /// The server resolved our rid to its true identity (`:nodeclaims` →
@@ -330,12 +409,12 @@ impl LiveQuery {
 
 #[cfg(test)]
 impl LiveQuery {
-    /// Test-only: a query with a parked (never-connecting) stream — no
-    /// session, no daemon, no network. The store can be seeded directly.
+    /// Test-only: a query with no daemon behind it — no session, no
+    /// network. The store can be seeded directly. Shares its shape with
+    /// [`LiveQuery::client`], which is the production form of the same idea.
     pub(crate) fn for_test(spec: QuerySpec) -> Self {
         let store = RowStore::new(spec.rid.plural());
-        let stream = crate::app::test_support::parked_stream();
-        Self { spec, store, stream }
+        Self { spec, store, origin: QueryOrigin::Client }
     }
 }
 
@@ -397,6 +476,32 @@ impl ResourceList {
         }
     }
 
+    /// Same shape as [`Self::open`], but over a store the CLIENT owns and
+    /// seeds — no session, no subscription, no connection state. Everything
+    /// downstream (columns, sort, grep, column filter, marks, the render
+    /// path) is identical, which is the whole point: a resource whose rows
+    /// come from disk is still just a resource.
+    pub fn client(
+        spec: QuerySpec,
+        store: Arc<RowStore>,
+        hub: &Arc<MetricsHub>,
+        label: String,
+    ) -> Self {
+        let policy = ColumnPolicy::for_query(spec.rid.clone(), &spec.namespace);
+        let metrics = MetricsBinding::for_rid(&spec.rid, hub);
+        let title = spec.rid.short_label().to_lowercase();
+        let source = RowSource::new(Arc::clone(&store), metrics);
+        Self {
+            query: LiveQuery::client(spec, store),
+            source,
+            label,
+            title,
+            scope_label: String::new(),
+            policy,
+            interaction: TableInteraction::default(),
+        }
+    }
+
     /// Same, but seed the child cursor/sort from the element being
     /// covered (cross-resource drills keep visual continuity).
     pub fn open_from(
@@ -410,7 +515,7 @@ impl ResourceList {
         if let Some(parent) = top.table_interaction() {
             el.interaction = TableInteraction::seeded_from(parent);
             el.interaction.selected = 0; // fresh list: cursor starts at the top
-            el.interaction.offset = 0;
+            el.interaction.viewport.reveal(0);
         }
         el
     }
@@ -566,8 +671,10 @@ pub enum SpanOutcome {
 /// the ephemeral view: derived on read, memoized, droppable.
 #[derive(Debug)]
 pub struct LogViewState {
-    pub scroll: usize,
-    pub follow: bool,
+    /// Vertical scroll relationship, in PHYSICAL (wrap-expanded) rows — owned
+    /// by the render pass, which alone knows the width and wrap layout. Carries
+    /// the follow/autoscroll flag too.
+    pub viewport: crate::app::viewport::Viewport,
     pub wrap: bool,
     pub show_timestamps: bool,
     /// True during the initial tail fetch — the render path skips
@@ -592,8 +699,11 @@ struct LogDeriveKey {
 impl LogViewState {
     fn from_config(cfg: &crate::app::LogConfig, follow: bool) -> Self {
         Self {
-            scroll: 0,
-            follow,
+            viewport: if follow {
+                crate::app::viewport::Viewport::tailing()
+            } else {
+                crate::app::viewport::Viewport::default()
+            },
             wrap: cfg.default_wrap,
             show_timestamps: cfg.default_timestamps,
             initial_load: true,
@@ -605,8 +715,7 @@ impl LogViewState {
 
     fn seeded_from(parent: &LogViewState) -> Self {
         Self {
-            scroll: parent.scroll,
-            follow: parent.follow,
+            viewport: parent.viewport,
             wrap: parent.wrap,
             show_timestamps: parent.show_timestamps,
             initial_load: false,
@@ -701,15 +810,20 @@ impl LogSession {
         self.spec.tail = if since.is_none() { Some(self.tail_default) } else { None };
         self.spec.follow = true;
         self.store.clear();
-        self.view.follow = true;
+        self.view.viewport = crate::app::viewport::Viewport::tailing();
         self.view.initial_load = true;
-        self.view.scroll = 0;
         self.stream = session.stream_log_substream(self.spec.clone(), Arc::clone(&self.store));
     }
 
     /// Whether the underlying substream is still running.
     pub fn stream_alive(&self) -> bool {
         self.stream.is_alive()
+    }
+
+    /// Abort the log substream without minting a successor — the reconnect/
+    /// switch choke-point counterpart to `revive_if_dead`. Idempotent.
+    pub fn abort(&self) {
+        self.stream.abort();
     }
 
     /// Re-establish the stream if it died (daemon restart during a reconnect
@@ -779,62 +893,69 @@ pub struct LogFilter {
 }
 
 // ---------------------------------------------------------------------------
-// ContentView / ContextList / Overview elements
+// ContentView / Overview elements
 // ---------------------------------------------------------------------------
 
-/// What a content element shows. Yaml/Describe carry their target — the
-/// response-delivery gate ("does this response belong to the top?") and
-/// the refresh spec in one.
+/// What a content element shows. Targeted kinds carry their target — the
+/// response-delivery identity and the refresh spec in one.
+/// `DecodedSecret` is its own kind, NOT a `Describe`: its content arrives
+/// on the same wire event but must never be cached as the target's
+/// describe text, and Ctrl-R must re-DECODE, not re-describe — labeling it
+/// `Describe` (as it once was) made both mistakes representable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentSpec {
     Yaml(ObjectRef),
     Describe(ObjectRef),
+    DecodedSecret(ObjectRef),
     Aliases,
 }
 
-/// A one-shot fetched text view (yaml / describe / aliases).
+/// Fetch lifecycle of a one-shot content view. Replaces an
+/// `awaiting_response: bool` that had no failure edge: a fetch orphaned by
+/// a session rebuild left the flag `true` forever — an eternally animated
+/// "Loading..." with no request in flight behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentPhase {
+    /// A fetch for this element is in flight on the CURRENT session.
+    Fetching,
+    /// Content present (delivered, cache-served, or locally built).
+    Ready,
+    /// The fetch can no longer complete (the session it was issued on is
+    /// gone). Renders the reason; Ctrl-R re-issues.
+    Failed(String),
+}
+
+/// A one-shot fetched text view (yaml / describe / decoded secret /
+/// aliases).
 #[derive(Debug)]
 pub struct ContentView {
     pub kind: ContentSpec,
-    /// True while a fetch for this element is in flight (gates cache
-    /// writes on delivery, exactly like the old route flag).
-    pub awaiting_response: bool,
+    /// See [`ContentPhase`]. Also gates the delivery-time cache write:
+    /// only a view with the fetch in flight caches what arrives.
+    pub phase: ContentPhase,
     pub state: crate::app::ContentViewState,
     label: String,
 }
 
 impl ContentView {
-    pub fn new(kind: ContentSpec, state: crate::app::ContentViewState, awaiting_response: bool) -> Self {
+    pub fn new(kind: ContentSpec, state: crate::app::ContentViewState, phase: ContentPhase) -> Self {
         let label = match &kind {
             ContentSpec::Yaml(t) => format!("yaml({})", t.name),
             ContentSpec::Describe(t) => format!("describe({})", t.name),
+            ContentSpec::DecodedSecret(t) => format!("decoded({})", t.name),
             ContentSpec::Aliases => "aliases".to_string(),
         };
-        Self { kind, awaiting_response, state, label }
+        Self { kind, phase, state, label }
     }
 
     /// The target this content was fetched for, if any.
     pub fn target(&self) -> Option<&ObjectRef> {
         match &self.kind {
-            ContentSpec::Yaml(t) | ContentSpec::Describe(t) => Some(t),
+            ContentSpec::Yaml(t) | ContentSpec::Describe(t) | ContentSpec::DecodedSecret(t) => {
+                Some(t)
+            }
             ContentSpec::Aliases => None,
         }
-    }
-}
-
-/// The context picker — a real table view (cursor, copy, Enter-to-switch),
-/// seeded from the kubeconfig at construction. The top-of-stack copy is
-/// refreshed if a later `KubeconfigLoaded` arrives while it is showing.
-#[derive(Debug)]
-pub struct ContextList {
-    pub table: crate::app::table::StatefulTable<crate::app::KubeContext>,
-}
-
-impl ContextList {
-    pub fn new(contexts: Vec<crate::app::KubeContext>) -> Self {
-        let mut table = crate::app::table::StatefulTable::new();
-        table.set_items(contexts);
-        Self { table }
     }
 }
 
@@ -858,7 +979,6 @@ pub enum Element {
     LogSession(Box<LogSession>),
     LogFilter(LogFilter),
     ContentView(ContentView),
-    ContextList(ContextList),
     Overview(Overview),
 }
 
@@ -936,7 +1056,6 @@ impl Element {
             Element::LogSession(e) => &e.label,
             Element::LogFilter(e) => &e.label,
             Element::ContentView(e) => &e.label,
-            Element::ContextList(_) => "contexts",
             Element::Overview(_) => "overview",
         }
     }
@@ -989,6 +1108,25 @@ impl Element {
             self,
             Element::ResourceList(_) | Element::RowFilter(_) | Element::DerivedRows(_)
         )
+    }
+
+    /// Whether the TOP element renders its own command/filter prompt inside
+    /// its own layout, so the shared bottom overlay in `ui::draw` must NOT
+    /// also draw one. EXHAUSTIVE over kinds on purpose: a new element kind
+    /// must declare its placement here rather than silently defaulting into
+    /// the overlay path — which is exactly how the Overview double-command-bar
+    /// bug arose (it drew inline AND fell through to the overlay).
+    pub fn renders_command_inline(&self) -> bool {
+        match self {
+            // Table-like views + the overview clone draw the prompt inside
+            // their own layout (resource.rs / overview.rs).
+            Element::ResourceList(_)
+            | Element::RowFilter(_)
+            | Element::DerivedRows(_)
+            | Element::Overview(_) => true,
+            // Sub-views have no inline prompt row — they rely on the overlay.
+            Element::ContentView(_) | Element::LogSession(_) | Element::LogFilter(_) => false,
+        }
     }
 
     /// The resource this element shows, if it is resource-backed.
@@ -1131,10 +1269,12 @@ impl Element {
         }
         let draft = view.draft.clone().filter(|d| !d.is_empty()).map(|d| SearchPattern::new(&d));
         let indices = store.with_read(|inner| {
-            // Heal scroll for lines evicted since this element last looked.
+            // Heal the scroll offset for lines evicted since this element last
+            // looked (best-effort: logical evicted-count vs physical offset —
+            // re-clamped next frame; see `Viewport::shift_up`).
             let newly_evicted = inner.evicted.saturating_sub(view.evicted_seen);
-            if newly_evicted > 0 && !view.follow {
-                view.scroll = view.scroll.saturating_sub(newly_evicted as usize);
+            if newly_evicted > 0 && !view.viewport.following() {
+                view.viewport.shift_up(newly_evicted as usize);
             }
             view.evicted_seen = inner.evicted;
             if source_patterns.is_empty() && draft.is_none() {
@@ -1237,6 +1377,47 @@ impl Element {
         }
     }
 
+    /// This element's liveness — the ONE question the render layer asks
+    /// before painting rows. The element answers rather than the view,
+    /// because the element is what knows where its rows came from: over a
+    /// CLIENT-owned query the connection is irrelevant, and consulting it
+    /// would blank the contexts list exactly when the daemon is unreachable
+    /// and you need to pick a different context.
+    pub fn liveness(&self, conn: &crate::app::types::Connection) -> crate::app::Liveness {
+        if self.is_client_owned() {
+            crate::app::Liveness::of_store(self.data_state())
+        } else {
+            crate::app::Liveness::of(conn, self.data_state())
+        }
+    }
+
+    /// Whether this element's rows are seeded in-process rather than fed by
+    /// a daemon subscription. Derived kinds inherit the answer from the
+    /// source they ride.
+    pub fn is_client_owned(&self) -> bool {
+        match self {
+            Element::ResourceList(e) => e.query.is_client_owned(),
+            // A filter/projection over a client-owned store is equally
+            // independent of the connection.
+            Element::RowFilter(e) => e.source.is_client_owned(),
+            Element::DerivedRows(e) => e.source.is_client_owned(),
+            _ => false,
+        }
+    }
+
+    /// Abort the live stream this element OWNS (if any), pre-empting a retry
+    /// loop against a dead mux at the reconnect/switch choke point. Derived
+    /// (filter / projection) kinds own no stream — they ride an ancestor's —
+    /// so this is a no-op for them (the ancestor is aborted on its own turn in
+    /// the walk). Overview / context / content kinds own no subscription.
+    pub fn abort_data_stream(&self) {
+        match self {
+            Element::ResourceList(e) => e.query().abort(),
+            Element::LogSession(s) => s.abort(),
+            _ => {}
+        }
+    }
+
     // -- Interaction state ----------------------------------------------------
 
     /// Persistent table-interaction state — `Some` for the row-bearing
@@ -1290,7 +1471,6 @@ impl Element {
             Element::LogSession(_)
             | Element::LogFilter(_)
             | Element::ContentView(_)
-            | Element::ContextList(_)
             | Element::Overview(_) => {
                 unreachable!("view() is table-kind-only; the draw dispatch matches kinds")
             }
@@ -1339,12 +1519,27 @@ impl Element {
                         sort: e.interaction.sort,
                         visible_cols: &visible,
                         headers: &headers,
-                        max_col_width,
+                        // Projections declare no columns, so every one takes
+                        // the global fallback.
+                        max_col_widths: &vec![max_col_width; headers.len()],
                     },
                 ));
                 e.interaction.cache = Some((key, Arc::clone(&view)));
                 view
             }
+        }
+    }
+
+    /// Warm the memoized view cache if this is a table-kind element (no-op
+    /// otherwise). Pure OPTIMIZATION: selection reads are total on their own
+    /// (cold cache → `derive_selection_keys` fallback), but warming here
+    /// memoizes the full view once so the action's resolution and the next
+    /// paint share one derive instead of running two. Also gives relative
+    /// cursor moves (`view_len`) something to clamp against pre-paint.
+    /// Cheap: `view()` returns the memo when the cache is already warm.
+    pub fn ensure_view_cached(&mut self, level: ColumnLevel, max_col_width: u16) {
+        if self.is_table() {
+            let _ = self.view(level, max_col_width);
         }
     }
 
@@ -1387,13 +1582,69 @@ impl Element {
     }
 
     // -- Selection / cursor (act through the LAST PAINTED view — the user
-    //    acts on what they see) ------------------------------------------------
+    //    acts on what they see; with none painted, through what the NEXT
+    //    paint will show) -----------------------------------------------------
 
-    /// Identity of the row under the cursor.
+    /// The screen-order identities a FRESH derive would produce — the
+    /// fallback that makes selection reads total when no painted view
+    /// exists (the memo is dropped on cover, absent on new elements).
+    /// Mirrors `view()`'s per-kind data plumbing minus presentation,
+    /// which never affects row order. `None` for non-table kinds.
+    fn derive_selection_keys(&self) -> Option<Vec<ObjectKey>> {
+        use crate::app::store::derive_key_order;
+        let it = self.table_interaction()?;
+        let draft = compile_draft(&it.filter_input);
+        match self {
+            Element::ResourceList(e) => {
+                let lens = e.source.metrics().map(|m| m.lens());
+                Some(e.query.store.with_read(|inner| {
+                    derive_key_order(
+                        &inner.rows,
+                        lens.as_ref(),
+                        e.source.predicates(),
+                        draft.as_ref(),
+                        it.sort,
+                    )
+                }))
+            }
+            Element::RowFilter(e) => {
+                let lens = e.source.metrics().map(|m| m.lens());
+                Some(e.source.store().with_read(|inner| {
+                    derive_key_order(
+                        &inner.rows,
+                        lens.as_ref(),
+                        e.source.predicates(),
+                        draft.as_ref(),
+                        it.sort,
+                    )
+                }))
+            }
+            Element::DerivedRows(e) => {
+                let projected: Vec<ResourceRow> = e.source.store().with_read(|inner| {
+                    inner
+                        .rows
+                        .iter()
+                        .find(|r| crate::app::store::row_matches_key(r, &e.key))
+                        .map(|r| e.kind.project(r))
+                        .unwrap_or_default()
+                });
+                Some(derive_key_order(&projected, None, &[], draft.as_ref(), it.sort))
+            }
+            _ => None,
+        }
+    }
+
+    /// Identity of the row under the cursor. TOTAL for table kinds: acts
+    /// through the last painted view when one exists; when none does, it
+    /// resolves against a fresh derive of the same order — a cold memo
+    /// right after a nav reveal is no longer a silent no-op.
     pub fn selected_key(&self) -> Option<ObjectKey> {
         let it = self.table_interaction()?;
-        let view = it.cached_view()?;
-        view.keys.get(it.clamped_selected(view.keys.len())).cloned()
+        if let Some(view) = it.cached_view() {
+            return view.keys.get(it.clamped_selected(view.keys.len())).cloned();
+        }
+        let keys = self.derive_selection_keys()?;
+        keys.get(it.clamped_selected(keys.len())).cloned()
     }
 
     /// The full row under the cursor, resolved by identity against the
@@ -1457,7 +1708,7 @@ impl Element {
         let len = self.view_len();
         let Some(it) = self.table_interaction_mut() else { return };
         if len == 0 { return; }
-        it.selected = it.clamped_selected(len).saturating_sub(it.page_size);
+        it.selected = it.clamped_selected(len).saturating_sub(it.viewport.viewport_rows());
         it.adjust_offset();
     }
 
@@ -1465,14 +1716,14 @@ impl Element {
         let len = self.view_len();
         let Some(it) = self.table_interaction_mut() else { return };
         if len == 0 { return; }
-        it.selected = (it.clamped_selected(len) + it.page_size).min(len - 1);
+        it.selected = (it.clamped_selected(len) + it.viewport.viewport_rows()).min(len - 1);
         it.adjust_offset();
     }
 
     pub fn go_home(&mut self) {
         let Some(it) = self.table_interaction_mut() else { return };
         it.selected = 0;
-        it.offset = 0;
+        it.viewport.reveal(0);
     }
 
     pub fn go_end(&mut self) {
@@ -1575,30 +1826,33 @@ impl Element {
         if !self.markable() {
             return SpanOutcome::Unsupported;
         }
-        let Some(view) = self.table_interaction().and_then(|i| i.cached_view()).cloned() else {
-            return SpanOutcome::NoAnchor;
+        // Same totality contract as `selected_key`: the last painted
+        // view's order when one exists, else a fresh derive of the same.
+        let keys: Vec<ObjectKey> = match self.table_interaction().and_then(|i| i.cached_view()) {
+            Some(view) => view.keys.clone(),
+            None => self.derive_selection_keys().unwrap_or_default(),
         };
-        if view.keys.is_empty() {
+        if keys.is_empty() {
             return SpanOutcome::NoAnchor;
         }
-        let Some(current) = self.table_interaction().map(|i| i.clamped_selected(view.keys.len()))
+        let Some(current) = self.table_interaction().map(|i| i.clamped_selected(keys.len()))
         else {
             return SpanOutcome::NoAnchor;
         };
         let marked = self.marked_snapshot();
         let Some(store) = self.data_store() else { return SpanOutcome::Unsupported };
 
-        if marked.contains(&view.keys[current]) {
+        if marked.contains(&keys[current]) {
             // Unmark the contiguous marked block around the cursor.
             let mut start = current;
-            while start > 0 && marked.contains(&view.keys[start - 1]) {
+            while start > 0 && marked.contains(&keys[start - 1]) {
                 start -= 1;
             }
             let mut end = current;
-            while end + 1 < view.keys.len() && marked.contains(&view.keys[end + 1]) {
+            while end + 1 < keys.len() && marked.contains(&keys[end + 1]) {
                 end += 1;
             }
-            store.unmark_keys(view.keys[start..=end].iter());
+            store.unmark_keys(keys[start..=end].iter());
             return SpanOutcome::Applied;
         }
 
@@ -1606,8 +1860,7 @@ impl Element {
         // marks that this element's filter hides — refuse: falling back
         // to row 0 would silently bulk-mark from the top of the view and
         // grow an invisible marked set as a side effect of a miss.
-        let Some(anchor) = view
-            .keys
+        let Some(anchor) = keys
             .iter()
             .enumerate()
             .filter(|(_, k)| marked.contains(*k))
@@ -1617,7 +1870,7 @@ impl Element {
             return SpanOutcome::NoAnchor;
         };
         let (start, end) = if anchor <= current { (anchor, current) } else { (current, anchor) };
-        store.mark_keys(view.keys[start..=end].iter().cloned());
+        store.mark_keys(keys[start..=end].iter().cloned());
         SpanOutcome::Applied
     }
 
@@ -1748,6 +2001,8 @@ fn view_over_store(
             .iter()
             .map(|&i| inner.headers.get(i).map(String::as_str).unwrap_or(""))
             .collect();
+        let caps: Vec<u16> =
+            headers.iter().map(|h| policy.max_width_for(h, max_col_width)).collect();
         Arc::new(derive_view(
             &inner.rows,
             &inner.column_rules,
@@ -1758,7 +2013,7 @@ fn view_over_store(
                 sort: interaction.sort,
                 visible_cols: &visible,
                 headers: &headers,
-                max_col_width,
+                max_col_widths: &caps,
             },
         ))
     });
@@ -1796,388 +2051,5 @@ pub fn predicate_for_commit(text: String, column: Option<(usize, String)>) -> Ro
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::app::store::StorePayload;
-    use crate::kube::protocol::{RowChange, TableBaseline, TableDelta};
-    use crate::kube::resource_def::BuiltInKind;
-    use crate::kube::resources::row::{CellValue, ContainerInfo};
-
-    fn pod_rid() -> ResourceId {
-        ResourceId::BuiltIn(BuiltInKind::Pod)
-    }
-
-    fn row(name: &str, ns: &str, cells: &[&str]) -> ResourceRow {
-        ResourceRow {
-            name: name.into(),
-            namespace: Some(ns.into()),
-            cells: cells.iter().map(|c| CellValue::Text((*c).to_string())).collect(),
-            ..Default::default()
-        }
-    }
-
-    fn list_element(namespace: Namespace) -> Element {
-        Element::ResourceList(ResourceList::open_for_test(
-            QuerySpec { rid: pod_rid(), namespace, filter: None },
-            &MetricsHub::new(),
-            "pods".to_string(),
-        ))
-    }
-
-    fn seed(el: &Element, headers: &[&str], rows: Vec<ResourceRow>) {
-        el.data_store().expect("table element").apply(
-            1,
-            StorePayload::Baseline(TableBaseline {
-                resource: pod_rid(),
-                headers: headers.iter().map(|h| (*h).to_string()).collect(),
-                rows,
-            }),
-        );
-    }
-
-    #[test]
-    fn element_owns_its_namespace_column_decision() {
-        // The flagship regression: an all-namespaces element SHOWS the
-        // NAMESPACE column, a named-namespace element hides it — decided
-        // at construction, no ambient selector anywhere to consult.
-        let headers = ["NAMESPACE", "NAME", "STATUS"];
-        let rows = vec![row("a", "ns1", &["ns1", "a", "ok"])];
-
-        let mut all = list_element(Namespace::All);
-        seed(&all, &headers, rows.clone());
-        let view = all.view(ColumnLevel::Default, 40);
-        assert!(view.headers.iter().any(|h| h == "NAMESPACE"));
-
-        let mut named = list_element(Namespace::Named("ns1".to_string()));
-        seed(&named, &headers, rows);
-        let view = named.view(ColumnLevel::Default, 40);
-        assert!(!view.headers.iter().any(|h| h == "NAMESPACE"));
-        assert_eq!(named.scope_label(), "ns1");
-        assert_eq!(all.scope_label(), "");
-    }
-
-    #[test]
-    fn view_is_memoized_and_invalidated_by_data_draft_and_sort() {
-        let mut el = list_element(Namespace::All);
-        seed(&el, &["NAME"], vec![row("b", "ns", &["b"]), row("a", "ns", &["a"])]);
-
-        let v1 = el.view(ColumnLevel::Default, 40);
-        let v2 = el.view(ColumnLevel::Default, 40);
-        assert!(Arc::ptr_eq(&v1, &v2), "same inputs must hit the memo");
-
-        // Data change invalidates.
-        el.data_store().unwrap().apply(
-            1,
-            StorePayload::Delta(TableDelta {
-                changes: vec![RowChange::Upsert(row("c", "ns", &["c"]))],
-            }),
-        );
-        let v3 = el.view(ColumnLevel::Default, 40);
-        assert!(!Arc::ptr_eq(&v2, &v3));
-        assert_eq!(v3.total_rows, 3);
-
-        // Draft change invalidates (the draft is a derive input — no
-        // explicit re-filter call exists anywhere).
-        el.filter_input_mut().unwrap().start();
-        el.filter_input_mut().unwrap().push_char('a');
-        let v4 = el.view(ColumnLevel::Default, 40);
-        assert_eq!(v4.keys.len(), 1);
-        assert_eq!(v4.rows[0][0], "a");
-
-        // Sort change invalidates.
-        el.filter_input_mut().unwrap().cancel();
-        // Default sort is already (col 0, ascending) — one call toggles
-        // to descending.
-        el.sort_by(crate::app::SortTarget::Column(0));
-        let v5 = el.view(ColumnLevel::Default, 40);
-        assert_eq!(v5.rows[0][0], "c");
-    }
-
-    #[test]
-    fn derive_filter_chains_and_shares_the_store() {
-        let mut root = list_element(Namespace::All);
-        seed(
-            &root,
-            &["NAME"],
-            vec![
-                row("web-api", "ns", &["web-api"]),
-                row("web-cache", "ns", &["web-cache"]),
-                row("db-api", "ns", &["db-api"]),
-            ],
-        );
-        let _ = root.view(ColumnLevel::Default, 40);
-
-        let mut first = Element::derive_filter(
-            &root,
-            RowPredicate::Grep(CompiledGrep::new("web")),
-        )
-        .expect("root has row output");
-        assert_eq!(first.label(), "/web");
-        // Same store, narrowed chain.
-        assert!(Arc::ptr_eq(
-            root.data_store().unwrap(),
-            first.data_store().unwrap()
-        ));
-        let v = first.view(ColumnLevel::Default, 40);
-        assert_eq!(v.keys.len(), 2);
-
-        let mut second = Element::derive_filter(
-            &first,
-            RowPredicate::Grep(CompiledGrep::new("api")),
-        )
-        .expect("filters compose");
-        let v = second.view(ColumnLevel::Default, 40);
-        assert_eq!(v.keys.len(), 1);
-        assert_eq!(v.rows[0][0], "web-api");
-        // The fault helpers see through the chain.
-        assert!(!second.is_fault_filter());
-    }
-
-    #[test]
-    fn fault_filter_identity() {
-        let mut root = list_element(Namespace::All);
-        seed(&root, &["NAME"], vec![row("a", "ns", &["a"])]);
-        let _ = root.view(ColumnLevel::Default, 40);
-        let fault = Element::derive_filter(&root, RowPredicate::Fault).unwrap();
-        assert!(fault.is_fault_filter());
-        assert_eq!(fault.label(), "⚠ fault");
-        // A grep on top of the fault is NOT itself a fault filter.
-        let grep = Element::derive_filter(&fault, RowPredicate::Grep(CompiledGrep::new("x"))).unwrap();
-        assert!(!grep.is_fault_filter());
-    }
-
-    #[test]
-    fn derived_projection_is_live() {
-        let mut root = list_element(Namespace::All);
-        let mut pod = row("web-1", "ns", &["web-1", "Running"]);
-        pod.containers = vec![ContainerInfo {
-            name: "api".into(),
-            image: "img:1".into(),
-            status: "Running".into(),
-            ready: true,
-            restart_count: 0,
-            kind: crate::kube::resources::row::ContainerKind::Regular,
-        }];
-        seed(&root, &["NAME", "STATUS"], vec![pod.clone()]);
-        let _ = root.view(ColumnLevel::Default, 40);
-        root.select(0);
-
-        let mut containers =
-            Element::derive_projection(&root, &pod, DerivedViewKind::Containers).unwrap();
-        assert_eq!(containers.label(), "containers(web-1)");
-        let v = containers.view(ColumnLevel::Default, 40);
-        assert_eq!(v.keys.len(), 1);
-
-        // LIVE: the parent row's container status changes → the projection
-        // re-derives from the parent's store (no frozen snapshot).
-        let mut updated = pod.clone();
-        updated.containers[0].restart_count = 3;
-        root.data_store().unwrap().apply(
-            1,
-            StorePayload::Delta(TableDelta { changes: vec![RowChange::Upsert(updated)] }),
-        );
-        let v = containers.view(ColumnLevel::Default, 40);
-        assert_eq!(v.keys.len(), 1);
-        let restarts_col = v.headers.iter().position(|h| h == "RESTARTS").unwrap();
-        assert_eq!(v.rows[0][restarts_col], "3");
-
-        // Row gone → honest empty view.
-        containers.data_store().unwrap().apply(
-            1,
-            StorePayload::Delta(TableDelta {
-                changes: vec![RowChange::Remove(crate::app::store::row_key(&pod))],
-            }),
-        );
-        let v = containers.view(ColumnLevel::Default, 40);
-        assert_eq!(v.keys.len(), 0);
-    }
-
-    #[test]
-    fn log_filters_chain_and_scroll_heals_on_eviction() {
-        use crate::kube::protocol::{LogContainer, LogLine};
-        let mut session = Element::LogSession(Box::new(LogSession::for_test(
-            crate::app::ContainerRef::new("pod-x", "default", LogContainer::Default),
-        )));
-        let store = Arc::clone(session.log_store().unwrap());
-        for i in 0..10 {
-            store.push(1, LogLine { content: format!("line-{i} {}", if i % 2 == 0 { "err" } else { "ok" }), container: None });
-        }
-        assert_eq!(session.log_visible().unwrap().len(), 10);
-        assert_eq!(session.log_header().unwrap().0, "pod-x");
-
-        let mut filter =
-            Element::derive_log_filter(&session, CompiledGrep::new("err")).unwrap();
-        assert_eq!(filter.label(), "/err");
-        assert_eq!(filter.log_committed_count(), 1);
-        assert_eq!(filter.log_visible().unwrap().len(), 5);
-        // Draft narrows further (a derive input — no rebuild call).
-        filter.log_view_mut().unwrap().draft = Some("line-2".to_string());
-        assert_eq!(filter.log_visible().unwrap().len(), 1);
-        filter.log_view_mut().unwrap().draft = None;
-
-        // Scroll healing: park the cursor, evict past the ring cap, and
-        // the next read pulls the scroll back by the evicted count.
-        filter.log_view_mut().unwrap().follow = false;
-        filter.log_view_mut().unwrap().scroll = 4;
-        let cap = 50_000; // default LogConfig max_lines
-        for i in 0..(cap - 10 + 3) {
-            store.push(1, LogLine { content: format!("fill-{i}"), container: None });
-        }
-        let _ = filter.log_visible();
-        assert_eq!(filter.log_view().unwrap().scroll, 1, "scroll healed by 3 evictions");
-    }
-
-    #[test]
-    fn span_mark_toggles_at_block_granularity() {
-        let mut el = list_element(Namespace::All);
-        seed(
-            &el,
-            &["NAME"],
-            (0..8).map(|i| row(&format!("p{i}"), "ns", &[&format!("p{i}")])).collect(),
-        );
-        let _ = el.view(ColumnLevel::Default, 40);
-
-        // Mark p1, span to p4 → block [1..=4] marked.
-        el.select(1);
-        el.toggle_mark();
-        el.select(4);
-        el.span_mark();
-        assert_eq!(el.marked_keys().len(), 4);
-
-        // Cursor on a marked row (p2): span-mark UNMARKS the contiguous
-        // block containing it — the whole [1..=4] run.
-        el.select(2);
-        el.span_mark();
-        assert!(el.marked_keys().is_empty(), "contiguous block unselected");
-
-        // Two separate blocks: unmarking one leaves the other.
-        el.select(0);
-        el.toggle_mark(); // p0
-        el.select(6);
-        el.toggle_mark();
-        el.select(7);
-        el.span_mark(); // p6..p7
-        assert_eq!(el.marked_keys().len(), 3);
-        el.select(7);
-        el.span_mark(); // unmark the p6..p7 block only
-        assert_eq!(el.marked_keys().len(), 1, "p0 survives");
-    }
-
-    #[test]
-    fn selected_data_col_maps_through_the_rendered_view() {
-        // With NAMESPACE hidden (named scope), the cursor's visible index
-        // maps to the DATA index through the element's own last view —
-        // the `~`/`S` mis-map is unrepresentable.
-        let headers = ["NAMESPACE", "NAME", "STATUS"];
-        let mut named = list_element(Namespace::Named("ns1".to_string()));
-        seed(&named, &headers, vec![row("a", "ns1", &["ns1", "a", "ok"])]);
-        let _ = named.view(ColumnLevel::Default, 40);
-        named.col_right(); // visible col 1 = STATUS (NAME=0, NAMESPACE hidden)
-        let (data_idx, header) = named.selected_data_col().unwrap();
-        assert_eq!(header, "STATUS");
-        assert_eq!(data_idx, 2, "data index counts the hidden NAMESPACE column");
-    }
-
-    /// A cursor carried from a longer view (child seeded from a deep
-    /// parent position, or data that shrank) re-anchors to the position
-    /// the user SEES on the first move — one `k` from the (clamped)
-    /// bottom row moves up one row, instead of burning dozens of
-    /// invisible keypresses re-entering range.
-    #[test]
-    fn moves_normalize_an_out_of_range_cursor() {
-        let mut el = list_element(Namespace::All);
-        seed(
-            &el,
-            &["NAME"],
-            (0..5).map(|i| row(&format!("p{i}"), "ns", &[&format!("p{i}")])).collect(),
-        );
-        let _ = el.view(ColumnLevel::Default, 40);
-
-        // Simulate the seeded-from-parent case: raw cursor way past the
-        // 5-row view (display clamps to row 4).
-        el.table_interaction_mut().unwrap().selected = 50;
-        el.select_prev();
-        assert_eq!(
-            el.table_interaction().unwrap().selected, 3,
-            "one PrevItem from the visible bottom row lands on row 3",
-        );
-
-        el.table_interaction_mut().unwrap().selected = 50;
-        el.select_next();
-        assert_eq!(
-            el.table_interaction().unwrap().selected, 4,
-            "NextItem from past-the-end normalizes to the last row",
-        );
-
-        el.table_interaction_mut().unwrap().selected = 50;
-        el.page_up();
-        assert_eq!(el.table_interaction().unwrap().selected, 0);
-
-        // Empty view: moves are no-ops and the cursor survives untouched
-        // (a transient refresh window must not zero the position).
-        let mut empty = list_element(Namespace::All);
-        seed(&empty, &["NAME"], vec![]);
-        let _ = empty.view(ColumnLevel::Default, 40);
-        empty.table_interaction_mut().unwrap().selected = 7;
-        empty.select_prev();
-        empty.select_next();
-        assert_eq!(empty.table_interaction().unwrap().selected, 7);
-    }
-
-    /// Span with NO visible anchor refuses (it used to anchor at row 0
-    /// and silently bulk-mark from the top of the view).
-    #[test]
-    fn span_mark_without_visible_anchor_is_refused() {
-        let mut el = list_element(Namespace::All);
-        seed(
-            &el,
-            &["NAME"],
-            (0..4).map(|i| row(&format!("p{i}"), "ns", &[&format!("p{i}")])).collect(),
-        );
-        let _ = el.view(ColumnLevel::Default, 40);
-        el.select(2);
-        assert_eq!(el.span_mark(), SpanOutcome::NoAnchor);
-        assert!(el.marked_keys().is_empty(), "nothing was marked");
-
-        // With an anchor it applies as before.
-        el.select(0);
-        assert_eq!(el.toggle_mark(), MarkOutcome::Toggled);
-        el.select(2);
-        assert_eq!(el.span_mark(), SpanOutcome::Applied);
-        assert_eq!(el.marked_keys().len(), 3);
-    }
-
-    /// DerivedRows (container projections) refuse marking outright: their
-    /// rows have no backing store to prune marks against and no batch
-    /// operation consumes them — an unprunable decoration would hold the
-    /// app in a phantom select mode.
-    #[test]
-    fn derived_rows_refuse_marks() {
-        let mut el = list_element(Namespace::All);
-        let mut pod = row("web", "ns", &["web", "Running"]);
-        pod.containers = vec![ContainerInfo {
-            name: "main".into(),
-            kind: Default::default(),
-            image: "img".into(),
-            status: "Running".into(),
-            ready: true,
-            restart_count: 0,
-        }];
-        seed(&el, &["NAME", "STATUS"], vec![pod.clone()]);
-        let _ = el.view(ColumnLevel::Default, 40);
-        let mut derived = Element::derive_projection(&el, &pod, DerivedViewKind::Containers)
-            .expect("containers projection");
-        let _ = derived.view(ColumnLevel::Default, 40);
-        derived.select(0);
-        assert_eq!(derived.toggle_mark(), MarkOutcome::Unsupported);
-        assert_eq!(derived.span_mark(), SpanOutcome::Unsupported);
-        assert!(!derived.has_marks());
-        assert!(derived.marked_keys().is_empty());
-        // And crucially: its mark reads never leak the PARENT store's
-        // marks (data_store() points at the parent's store).
-        el.data_store().unwrap().toggle_mark(&crate::app::store::row_key(&pod));
-        assert!(!derived.has_marks(), "parent marks don't put a projection in select mode");
-        derived.clear_marks();
-        assert!(el.data_store().unwrap().has_marks(), "projection clear_marks can't reach the parent store");
-    }
-}
+#[path = "../../tests/app/element.rs"]
+mod tests;

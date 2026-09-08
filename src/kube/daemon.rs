@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::{UnixListener, UnixStream};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::protocol::{self, DaemonStatus, SessionCommand, SessionEvent};
 use super::server_session::{ServerSession, SessionSharedState};
@@ -139,7 +139,20 @@ pub async fn run_daemon() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, _) = result?;
+                let stream = match result {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        // Transient accept failures (classically EMFILE /
+                        // ENFILE under fd pressure) must not kill the whole
+                        // daemon — that would tear down every session on
+                        // every cluster over one refused connection. Log,
+                        // breathe (so an fd-exhaustion storm doesn't spin
+                        // this loop hot), and keep serving.
+                        warn!("accept failed: {} — continuing", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 info!("New connection accepted");
                 let conn_state = state.clone();
                 connections.spawn(async move {
@@ -226,16 +239,20 @@ async fn handle_connection(
             ServerSession::init_and_run_muxed(mux, state.session_shared.clone()).await;
         }
 
-        // Plain bincode management request (k9rs ctl). NOTE: no version
-        // handshake on this path — ctl/daemon skew is protected only by
-        // the append-only wire-tag discipline (pinned by the envelope
-        // golden tests). Fine while wire changes only ever append; a
-        // non-append change to SessionCommand/SessionEvent must add a
-        // preamble here too.
+        // Plain bincode management request (k9rs ctl). Since v10 this path
+        // exchanges the same version preamble as sessions — previously it
+        // was unversioned and a skewed ctl could only fail by misparse.
+        // Symmetric write-then-read (both sides write first), mirroring
+        // the session handshake; a stale peer fails fast and readably.
         CONN_TYPE_MANAGEMENT => {
             let (reader, writer) = peek_stream.into_split();
             let mut reader = BufReader::with_capacity(protocol::IO_BUFFER_SIZE, reader);
             let mut writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
+            protocol::write_handshake(&mut writer).await?;
+            if let Err(e) = protocol::read_handshake(&mut reader).await {
+                warn!("management connection version mismatch: {e:#}");
+                return Ok(());
+            }
             let first_cmd: SessionCommand = protocol::read_bincode(&mut reader).await?;
             handle_management_command(first_cmd, &mut writer, &state).await?;
         }
@@ -313,20 +330,27 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
-    /// Connect to the daemon. Returns None if the daemon isn't running.
-    /// Writes the `CONN_TYPE_MANAGEMENT` discriminator byte immediately so
-    /// the daemon's accept loop routes this connection to the plain-bincode
-    /// management handler (not the yamux session path).
-    pub async fn connect() -> Option<Self> {
+    /// Connect to the daemon. Writes the `CONN_TYPE_MANAGEMENT`
+    /// discriminator byte so the daemon's accept loop routes this
+    /// connection to the plain-bincode management handler, then exchanges
+    /// the SAME version preamble as the session path (v10 — management was
+    /// the one unversioned door; a skewed `k9rs ctl` vs daemon could only
+    /// fail by misparse). Symmetric write-then-read, no deadlock; a
+    /// version mismatch surfaces as an actionable error instead of a
+    /// silent timeout.
+    pub async fn connect() -> anyhow::Result<Self> {
         use tokio::io::AsyncWriteExt;
         let path = socket_path();
-        let mut stream = UnixStream::connect(&path).await.ok()?;
-        stream.write_all(&[CONN_TYPE_MANAGEMENT]).await.ok()?;
+        let mut stream = UnixStream::connect(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("daemon not running (socket {:?}): {}", path, e))?;
+        stream.write_all(&[CONN_TYPE_MANAGEMENT]).await?;
         let (read_half, write_half) = stream.into_split();
-        Some(Self {
-            reader: BufReader::new(read_half),
-            writer: BufWriter::new(write_half),
-        })
+        let mut reader = BufReader::new(read_half);
+        let mut writer = BufWriter::new(write_half);
+        protocol::write_handshake(&mut writer).await?;
+        protocol::read_handshake(&mut reader).await?;
+        Ok(Self { reader, writer })
     }
 
     /// Send a command and read the response (binary).

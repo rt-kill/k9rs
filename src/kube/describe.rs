@@ -335,7 +335,7 @@ fn format_describe(obj: &kube::api::DynamicObject) -> Vec<DescribeLine> {
 async fn fetch_describe_via_kubectl(target: &ObjectRef, context: &crate::kube::protocol::ContextName, session_env: &SessionEnv) -> Vec<DescribeLine> {
     let mut cmd = session_env.kubectl();
     cmd.arg("describe").arg(target.kubectl_target());
-    if !context.is_empty() { cmd.arg("--context").arg(context.as_str()); }
+    cmd.arg("--context").arg(context.as_str());
     if let Some(ns) = target.namespace.as_option() { cmd.arg("-n").arg(ns); }
     cmd.kill_on_drop(true);
     // kubectl's output has no producer-side structure for us — classify each
@@ -353,7 +353,7 @@ async fn fetch_describe_via_kubectl(target: &ObjectRef, context: &crate::kube::p
 async fn fetch_yaml_via_kubectl(target: &ObjectRef, context: &crate::kube::protocol::ContextName, session_env: &SessionEnv) -> String {
     let mut cmd = session_env.kubectl();
     cmd.arg("get").arg(target.kubectl_target()).arg("-o").arg("yaml");
-    if !context.is_empty() { cmd.arg("--context").arg(context.as_str()); }
+    cmd.arg("--context").arg(context.as_str());
     if let Some(ns) = target.namespace.as_option() { cmd.arg("-n").arg(ns); }
     cmd.kill_on_drop(true);
     match cmd.output().await {

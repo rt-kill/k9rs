@@ -38,7 +38,7 @@ fn lookup_view_op_key(app: &App, key: &KeyEvent) -> Option<Action> {
     let caps = app.nav.top().capabilities();
     for op in &caps.operations {
         if app.config.keys.op_key(op) == Some(combo) {
-            return Some(op.to_action());
+            return Some(Action::from(op));
         }
     }
     None
@@ -115,7 +115,6 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
         }
         Element::ContentView(_) => handle_detail_view_keys(key),
         Element::LogSession(_) | Element::LogFilter(_) => handle_log_view_keys(app, key),
-        Element::ContextList(_) => handle_contexts_view_keys(key),
     }
 }
 
@@ -247,6 +246,13 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         }
         if app.config.keys.col_last == Some(combo) {
             return Some(Action::ColLast);
+        }
+        // Rebound switch-to-all-namespaces (structural default `0`).
+        // Checked here, before the `Char('0')` structural arm below, so a
+        // user who bound `colFirst: "0"` can still reach the action on
+        // another key (e.g. `namespaceAll: ")"`).
+        if app.config.keys.namespace_all == Some(combo) {
+            return Some(Action::SwitchNamespace(crate::kube::protocol::Namespace::All));
         }
     }
 
@@ -441,10 +447,6 @@ fn handle_log_view_keys(_app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('w') => Some(Action::ToggleLogWrap),
         KeyCode::Char('t') => Some(Action::ToggleLogTimestamps),
 
-        // Search navigation.
-        KeyCode::Char('n') => Some(Action::SearchNext),
-        KeyCode::Char('N') => Some(Action::SearchPrev),
-
         // Copy.
         KeyCode::Char('c') => Some(Action::Copy),
 
@@ -492,32 +494,6 @@ fn handle_overview_keys(key: KeyEvent) -> Option<Action> {
         // Tab goes to the first resource view
         KeyCode::Tab => Some(Action::NextTab),
         KeyCode::BackTab => Some(Action::PrevTab),
-        _ => None,
-    }
-}
-
-fn handle_contexts_view_keys(key: KeyEvent) -> Option<Action> {
-    // Unmatched Ctrl chords are nothing — never their bare character.
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        return None;
-    }
-    match key.code {
-        // `q` or Esc in context view goes back.
-        KeyCode::Char('q') | KeyCode::Esc => Some(Action::Back),
-
-        // Navigation.
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::NextItem),
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::PrevItem),
-        KeyCode::PageDown => Some(Action::PageDown),
-        KeyCode::PageUp => Some(Action::PageUp),
-        KeyCode::Home | KeyCode::Char('g') => Some(Action::Home),
-        KeyCode::End | KeyCode::Char('G') => Some(Action::End),
-
-        // Clipboard.
-        KeyCode::Char('c') => Some(Action::Copy),
-
-        // Switch to selected context.
-        KeyCode::Enter => Some(Action::Enter),
         _ => None,
     }
 }

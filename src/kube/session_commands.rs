@@ -19,6 +19,7 @@ pub(crate) enum InteractiveKind {
 /// fallback for shell). The caller hands in a typed `InteractiveKind` so
 /// this function doesn't have to inspect `args` to guess what it's about
 /// to launch.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_interactive_local(
     terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
     command: &str,
@@ -27,6 +28,7 @@ pub(crate) async fn run_interactive_local(
     input_suspend: &tokio::sync::watch::Sender<bool>,
     input_suspend_ack: &mut mpsc::Receiver<()>,
     input_rx: &mut mpsc::Receiver<crossterm::event::Event>,
+    replay: &mut std::collections::VecDeque<crossterm::event::Event>,
 ) -> Result<Option<std::process::ExitStatus>> {
     use crate::kube::session::SuspendGuard;
 
@@ -80,7 +82,8 @@ pub(crate) async fn run_interactive_local(
     // Restore the screen, resume input, and drain stale terminal responses
     // (the settling drain catches the spurious-'r' that the mode-reset escapes
     // above don't fully suppress — e.g. the alt-screen re-entry's own reply).
-    guard.restore().await;
+    // Real type-ahead caught in the window comes back for the loop to replay.
+    replay.extend(guard.restore().await);
     Ok(status.ok())
 }
 
@@ -101,8 +104,6 @@ pub(crate) enum ParsedCommand {
     Aliases,
     /// `:overview`, `:home`
     Overview,
-    /// `:ctx`, `:context`, `:contexts`
-    ContextList,
     /// `:ctx <name>`, `:context <name>`
     ContextSwitch(crate::kube::protocol::ContextName),
     /// `:ns <name>`, `:namespace <name>`
@@ -141,7 +142,10 @@ pub(crate) fn parse_command_input(raw_cmd: &str, cmd: &str, app: &App) -> Parsed
     if matches!(cmd, "help" | "h" | "?") { return ParsedCommand::Help; }
     if matches!(cmd, "alias" | "aliases" | "a") { return ParsedCommand::Aliases; }
     if matches!(cmd, "overview" | "home") { return ParsedCommand::Overview; }
-    if matches!(cmd, "ctx" | "context" | "contexts") { return ParsedCommand::ContextList; }
+    // `:ctx` / `:context` / `:contexts` are NOT special-cased here — they
+    // resolve through the ordinary resource-alias path below, because
+    // contexts ARE an ordinary resource (a client-owned one). That is what
+    // makes `:ctx` reset the nav stack like every other resource command.
 
     // 2. `:ctx <name>` / `:context <name>`. The prefix lives in `cmd` (the
     // lowercased form) so alias matching is case-insensitive, but the
@@ -149,7 +153,18 @@ pub(crate) fn parse_command_input(raw_cmd: &str, cmd: &str, app: &App) -> Parsed
     // Slicing `raw_cmd` by the ASCII prefix length is safe (the prefix
     // is always ASCII; it doesn't shift under lowercasing).
     if let Some(value) = strip_ascii_prefix(raw_cmd, cmd, &["ctx ", "context "]) {
-        return ParsedCommand::ContextSwitch(value.into());
+        // `strip_ascii_prefix` already refuses an empty tail, so this is a
+        // real name; the fallback keeps the mapping TOTAL rather than
+        // leaning on that with an unwrap.
+        return match crate::kube::protocol::ContextName::new(value) {
+            Some(name) => ParsedCommand::ContextSwitch(name),
+            // `strip_ascii_prefix` already refuses an empty tail, so this is
+            // unreachable; falling back to the list keeps the map TOTAL
+            // rather than leaning on that with an unwrap.
+            None => ParsedCommand::Resource(
+                crate::kube::local::LocalResourceKind::Context.to_resource_id(),
+            ),
+        };
     }
 
     // 3. `:ns <name>` / `:namespace <name>`. Same case-preserving slice.
@@ -374,7 +389,7 @@ fn handle_command_submit(
             app.should_quit = true;
         }
         ParsedCommand::Help => {
-            app.ui.overlay = Some(crate::app::Overlay::Help { scroll: 0 });
+            app.ui.overlay = Some(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() });
         }
         ParsedCommand::Aliases => {
             handle_action(
@@ -387,13 +402,8 @@ fn handle_command_submit(
                 crate::app::element::Overview,
             ));
         }
-        ParsedCommand::ContextList => {
-            app.nav.push(crate::app::element::Element::ContextList(
-                crate::app::element::ContextList::new(app.data.contexts.items().to_vec()),
-            ));
-        }
         ParsedCommand::ContextSwitch(ctx_name) => {
-            begin_context_switch(app, data_source, &ctx_name);
+            begin_context_switch(app, &ctx_name);
         }
         ParsedCommand::NamespaceSwitch(ns) => {
             do_switch_namespace(app, data_source, ns);
@@ -405,13 +415,15 @@ fn handle_command_submit(
                 app.kube.selected_ns = crate::kube::protocol::Namespace::All;
             }
             let root = App::root_list_element(
-                data_source, &app.kube.metrics, rid, app.kube.selected_ns.clone(),
+                data_source, &app.kube.metrics,
+                &app.core, rid, app.kube.selected_ns.clone(),
             );
             app.nav.reset(root);
         }
         ParsedCommand::ResourceFilter { rid, filter } => {
             let root = App::root_list_element(
-                data_source, &app.kube.metrics, rid, app.kube.selected_ns.clone(),
+                data_source, &app.kube.metrics,
+                &app.core, rid, app.kube.selected_ns.clone(),
             );
             app.nav.reset(root);
             let predicate = crate::app::store::RowPredicate::Grep(
@@ -426,7 +438,8 @@ fn handle_command_submit(
             // scope; the selector follows it (explicit selector write).
             app.kube.selected_ns = namespace.clone();
             let root = App::root_list_element(
-                data_source, &app.kube.metrics, rid.clone(), namespace.clone(),
+                data_source, &app.kube.metrics,
+                &app.core, rid.clone(), namespace.clone(),
             );
             app.nav.reset(root);
             app.ui.flash = Some(crate::app::FlashMessage::info(format!(
@@ -440,7 +453,8 @@ fn handle_command_submit(
                 crd.kind.clone(), crd.plural.clone(), crd.scope,
             );
             let root = App::root_list_element(
-                data_source, &app.kube.metrics, crd_rid, namespace.clone(),
+                data_source, &app.kube.metrics,
+                &app.core, crd_rid, namespace.clone(),
             );
             app.nav.reset(root);
             app.ui.flash = Some(crate::app::FlashMessage::info(
@@ -470,7 +484,8 @@ fn handle_command_submit(
                 app.kube.selected_ns = crate::kube::protocol::Namespace::All;
             }
             let root = App::root_list_element(
-                data_source, &app.kube.metrics, crd_rid, app.kube.selected_ns.clone(),
+                data_source, &app.kube.metrics,
+                &app.core, crd_rid, app.kube.selected_ns.clone(),
             );
             app.nav.reset(root);
             app.ui.flash = Some(crate::app::FlashMessage::info(format!("Browsing: {}", kind_label)));
@@ -676,7 +691,24 @@ mod parser_tests {
         assert!(matches!(parse("?"), ParsedCommand::Help));
         assert!(matches!(parse("alias"), ParsedCommand::Aliases));
         assert!(matches!(parse("home"), ParsedCommand::Overview));
-        assert!(matches!(parse("ctx"), ParsedCommand::ContextList));
+    }
+
+    /// `:ctx` is not a special word any more — it resolves through the same
+    /// alias path as `:pods` and `:pf`, which is what makes it RESET the nav
+    /// stack (contexts are a root, not a drill) and pick up grep, sort and
+    /// the rest of the table machinery for free.
+    #[test]
+    fn ctx_resolves_as_an_ordinary_resource_alias() {
+        for word in ["ctx", "context", "contexts"] {
+            match parse(word) {
+                ParsedCommand::Resource(rid) => assert_eq!(
+                    rid,
+                    crate::kube::local::LocalResourceKind::Context.to_resource_id(),
+                    "`:{word}` must name the contexts resource",
+                ),
+                _ => panic!("`:{word}` should resolve to a resource"),
+            }
+        }
     }
 
     #[test]

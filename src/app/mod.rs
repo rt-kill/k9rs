@@ -2,14 +2,17 @@ pub mod actions;
 pub mod anim;
 pub mod derived;
 pub mod element;
+pub mod liveness;
 pub mod nav;
 pub mod select_gate;
 pub mod store;
 pub mod table;
 pub mod types;
+pub mod viewport;
 pub mod view;
 
 pub use actions::SortTarget;
+pub use liveness::Liveness;
 pub use table::*;
 pub use types::*;
 pub use view::*;
@@ -40,9 +43,36 @@ pub struct KubeContext {
     pub is_current: bool,
 }
 
-// ---------------------------------------------------------------------------
-// AppData — all resource tables
-// ---------------------------------------------------------------------------
+/// Column headers for the contexts table. Same shape as any other
+/// resource's `headers()` — the contexts view is an ordinary table, so grep,
+/// column filter, sort and column movement all work without knowing that
+/// these rows came from a file rather than a cluster.
+pub fn context_headers() -> Vec<String> {
+    vec!["NAME".into(), "CLUSTER".into(), "USER".into(), "ACTIVE".into()]
+}
+
+/// Project the kubeconfig's contexts into rows. Enter rides on the row as a
+/// [`DrillTarget`], so switching needs no special case in the key handler.
+pub fn context_rows(contexts: &[KubeContext]) -> Vec<crate::kube::resources::row::ResourceRow> {
+    use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
+    contexts
+        .iter()
+        .map(|c| ResourceRow {
+            cells: vec![
+                CellValue::Text(c.name.to_string()),
+                CellValue::Text(c.identity.cluster.clone()),
+                CellValue::Text(c.identity.user.clone()),
+                CellValue::Text(if c.is_current { "✓".into() } else { String::new() }),
+            ],
+            name: c.name.to_string(),
+            // Cluster-scoped: a context isn't in a namespace.
+            namespace: None,
+            drill_target: Some(DrillTarget::SwitchContext(c.name.clone())),
+            health: RowHealth::Normal,
+            ..Default::default()
+        })
+        .collect()
+}
 
 // `ColumnLevel` now lives in `kube::resource_def` next to `ColumnDef` — the
 // metadata is co-located with the definitions it describes. `pub use`
@@ -69,10 +99,26 @@ pub struct CoreData {
     pub namespaces: std::sync::Arc<store::RowStore>,
     pub nodes: std::sync::Arc<store::RowStore>,
     pub crds: std::sync::Arc<store::RowStore>,
+    /// The kubeconfig's contexts. Here for the same reason as the others —
+    /// command completion reads it and the `:ctx` view points at it, so it
+    /// must outlive any single element — but seeded from DISK rather than
+    /// watched, and deliberately NOT in `streams`: there is nothing to
+    /// subscribe to. See [`crate::app::element::LiveQuery::client`].
+    pub contexts: std::sync::Arc<store::RowStore>,
     /// The always-on subscriptions feeding the stores above. Replaced
     /// wholesale on (re)connect — the old streams drop, RSTing their
     /// substreams.
     streams: Vec<crate::kube::client_session::SubscriptionStream>,
+    /// The previous context's core stores, kept so switching back is not a
+    /// cold load. See [`CoreData::switch_context`].
+    parked: Option<(crate::kube::protocol::ContextName, ParkedCore)>,
+}
+
+/// One context's core stores, set aside while another context is active.
+struct ParkedCore {
+    namespaces: std::sync::Arc<store::RowStore>,
+    nodes: std::sync::Arc<store::RowStore>,
+    crds: std::sync::Arc<store::RowStore>,
 }
 
 impl Default for CoreData {
@@ -81,7 +127,9 @@ impl Default for CoreData {
             namespaces: store::RowStore::new("namespaces"),
             nodes: store::RowStore::new("nodes"),
             crds: store::RowStore::new("customresourcedefinitions"),
+            contexts: store::RowStore::client("contexts"),
             streams: Vec::new(),
+            parked: None,
         }
     }
 }
@@ -148,12 +196,120 @@ impl CoreData {
         }
     }
 
-    /// Context switch: all core data belongs to the old cluster.
-    pub fn clear(&mut self) {
+    /// The store a CLIENT-OWNED resource reads from, or `None` for the
+    /// ordinary daemon-backed kind. One place holds this knowledge, so
+    /// `root_list_element` can route without every call site learning which
+    /// resources happen to be local — and adding another client-owned
+    /// resource later is one arm here, not a new special case everywhere.
+    pub fn client_store(&self, rid: &ResourceId) -> Option<&std::sync::Arc<store::RowStore>> {
+        match rid {
+            ResourceId::Local(crate::kube::local::LocalResourceKind::Context) => {
+                Some(&self.contexts)
+            }
+            _ => None,
+        }
+    }
+
+    /// A root element for a client-owned resource, or `None` if `rid` names
+    /// an ordinary daemon-backed one. Takes NO session — that is the point:
+    /// the contexts view has to be buildable with no daemon at all, which is
+    /// exactly the situation it exists for.
+    pub fn client_root_element(
+        &self,
+        metrics: &std::sync::Arc<store::MetricsHub>,
+        rid: &ResourceId,
+        namespace: crate::kube::protocol::Namespace,
+    ) -> Option<element::Element> {
+        let store = self.client_store(rid)?;
+        Some(element::Element::ResourceList(element::ResourceList::client(
+            element::QuerySpec { rid: rid.clone(), namespace, filter: None },
+            std::sync::Arc::clone(store),
+            metrics,
+            rid.short_label().to_lowercase(),
+        )))
+    }
+
+    /// Re-seed the contexts table from a fresh kubeconfig read. Not a
+    /// subscription: the rows come from the client's own disk, so this is
+    /// the only writer, and it re-runs whenever the kubeconfig is re-read.
+    pub fn seed_contexts(&self, contexts: &[KubeContext]) {
+        self.contexts.apply(
+            Self::SEED_EPOCH,
+            store::StorePayload::Baseline(crate::kube::protocol::TableBaseline {
+                resource: crate::kube::local::LocalResourceKind::Context.to_resource_id(),
+                headers: context_headers(),
+                rows: context_rows(contexts),
+            }),
+        );
+    }
+
+    /// Context switch: set the OUTGOING context's core stores aside and
+    /// bring back the INCOMING context's if we still hold them.
+    ///
+    /// The daemon already keeps its watchers warm for a minute, but the
+    /// client used to throw its own rows away on every switch — so
+    /// re-entering a context you were just on walked
+    /// Initializing → Loading → baseline from zero while the answer sat
+    /// ready in the daemon.
+    ///
+    /// Restored rows come back marked **stale, not ready**. They were true
+    /// when they arrived and are worth showing at once, but nothing is
+    /// feeding them until the fresh subscription's baseline lands (which
+    /// clears the mark). That is the same honesty rule as a dead
+    /// cluster-side watch, and it is what keeps this from being the "stale
+    /// rows painted as live" bug wearing a cache for a costume.
+    ///
+    /// ONE parked slot, not a map: the pattern this serves is A→B→A, and an
+    /// unbounded map would pin every cluster's rows for the life of the
+    /// process. `contexts` is never parked — the kubeconfig is a property of
+    /// this machine, not of any cluster.
+    pub fn switch_context(
+        &mut self,
+        outgoing: Option<crate::kube::protocol::ContextName>,
+        incoming: &crate::kube::protocol::ContextName,
+    ) {
+        // Drop the old subscriptions FIRST: a live bridge would keep writing
+        // into a store we are about to park.
         self.streams.clear();
-        self.namespaces.clear();
-        self.nodes.clear();
-        self.crds.clear();
+
+        let restored = match self.parked.take() {
+            Some((name, core)) if &name == incoming => Some(core),
+            _ => None,
+        };
+        let incoming_stores = match restored {
+            Some(core) => {
+                for store in [&core.namespaces, &core.nodes, &core.crds] {
+                    store.mark_stale("from your previous visit — refreshing");
+                }
+                core
+            }
+            None => ParkedCore {
+                namespaces: store::RowStore::new("namespaces"),
+                nodes: store::RowStore::new("nodes"),
+                crds: store::RowStore::new("customresourcedefinitions"),
+            },
+        };
+        let outgoing_stores = ParkedCore {
+            namespaces: std::mem::replace(&mut self.namespaces, incoming_stores.namespaces),
+            nodes: std::mem::replace(&mut self.nodes, incoming_stores.nodes),
+            crds: std::mem::replace(&mut self.crds, incoming_stores.crds),
+        };
+        // No outgoing context (first connect) means nothing worth keeping.
+        self.parked = outgoing.map(|name| (name, outgoing_stores));
+    }
+
+    /// Abort the always-on subscriptions' bridges — the core-store half of
+    /// the reconnect/switch choke point's `abort_all_streams` (which walks
+    /// only nav elements). Established bridges hold the DEAD session's mux
+    /// watch, whose retained value lets them skip the wait and burn a
+    /// backoff-retry loop against the dropped mux for the whole gap; abort
+    /// them here, and `open_streams` replaces them wholesale on
+    /// `ConnectionEstablished`. Handles stay resident (`abort` ≠ drop) so
+    /// the stores keep their rows for the reconnect-continuity display.
+    pub fn abort_streams(&self) {
+        for stream in &self.streams {
+            stream.abort();
+        }
     }
 
     /// Namespace names, for completion and the picker.
@@ -162,27 +318,18 @@ impl CoreData {
     }
 }
 
-pub struct AppData {
-    pub contexts: StatefulTable<KubeContext>,
-}
-
-impl Default for AppData {
-    fn default() -> Self {
-        Self { contexts: StatefulTable::new() }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // App — main application state
 // ---------------------------------------------------------------------------
 
 /// Why the TUI is exiting. Printed to stderr after terminal restoration.
+/// (No "daemon disconnected" variant: a lost daemon triggers auto-reconnect
+/// and the user stays in the TUI — disconnection stopped being an exit when
+/// that rework landed.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitReason {
     /// User requested quit (q, :quit, Ctrl-C).
     UserQuit,
-    /// Daemon connection was lost.
-    DaemonDisconnected,
     /// An error occurred.
     Error(String),
 }
@@ -191,7 +338,6 @@ pub struct App {
     pub should_quit: bool,
     pub exit_reason: Option<ExitReason>,
 
-    pub data: AppData,
     /// App-level shared stores (completion / picker / overview chrome).
     pub core: CoreData,
 
@@ -203,22 +349,11 @@ pub struct App {
     /// Command history for `:` command mode (max 50 entries).
     pub command_history: Vec<String>,
 
-    /// Set by DaemonDisconnected to trigger auto-reconnection in the
-    /// main loop. Same mechanism as context switching.
-    pub reconnect_requested: bool,
-
-    /// True once a session has EVER connected. Distinguishes an initial
-    /// connection failure (fatal — the daemon isn't reachable at startup)
-    /// from a RECONNECT failure (retry — the daemon died and we keep the
-    /// user in the TUI, per the DaemonDisconnected contract, instead of
-    /// quitting on the first failed re-connect).
-    pub has_connected: bool,
-    /// Earliest instant the next reconnect attempt may run. `None` = as
-    /// soon as possible. Set with an exponential backoff after a failed
-    /// reconnect so a truly-down daemon doesn't get hammered.
-    pub reconnect_at: Option<std::time::Instant>,
-    /// Current reconnect backoff; resets on a successful connect.
-    pub reconnect_backoff: Duration,
+    /// The daemon connection lifecycle — link liveness (the render gate),
+    /// ever-connected fatality rule, and the reconnect plan/backoff — as
+    /// ONE value with total edges. See [`Connection`]. (Replaced five
+    /// loose fields whose implicit machine shipped two real bugs.)
+    pub conn: Connection,
 
     /// The in-flight batch operation, if any — correlates per-target
     /// `OpResult`s (unmark per-success, aggregate ONE summary flash).
@@ -252,7 +387,7 @@ impl App {
     /// itself, so tests are hermetic by construction and a config error
     /// is a visible startup failure, not a silent default fallback.
     pub fn new(
-        context: crate::kube::protocol::ContextName,
+        context: Option<crate::kube::protocol::ContextName>,
         namespace: crate::kube::protocol::Namespace,
         session: &crate::kube::client_session::ClientSession,
         config: AppConfig,
@@ -285,14 +420,11 @@ impl App {
             &metrics,
             "pods".to_string(),
         ));
-        Self::new_with_root(
-            crate::kube::protocol::ContextName::default(), namespace, metrics, root,
-            AppConfig::default(),
-        )
+        Self::new_with_root(None, namespace, metrics, root, AppConfig::default())
     }
 
     fn new_with_root(
-        context: crate::kube::protocol::ContextName,
+        context: Option<crate::kube::protocol::ContextName>,
         namespace: crate::kube::protocol::Namespace,
         metrics: std::sync::Arc<store::MetricsHub>,
         root: element::Element,
@@ -303,17 +435,13 @@ impl App {
         Self {
             should_quit: false,
             exit_reason: None,
-            data: AppData::default(),
             core: CoreData::default(),
             nav: nav::NavStack::new(root),
             pinned_resources: default_pinned_resources(),
             command_history: Vec::new(),
             no_exit_on_ctrl_c: config.no_exit_on_ctrl_c,
             read_only: config.read_only,
-            reconnect_requested: false,
-            has_connected: false,
-            reconnect_at: None,
-            reconnect_backoff: Duration::from_millis(500),
+            conn: Connection::new(),
             pending_batch: None,
             config,
             ui: UiState {
@@ -343,12 +471,20 @@ impl App {
     /// the one construction site where the ambient selector is a
     /// legitimate input (roots are built FROM the selector; drills carry
     /// their own intrinsic scope).
+    /// Build a root list element for `rid`. Routes on where the rows come
+    /// from: a client-owned resource (the kubeconfig's contexts) reads a
+    /// store the app already holds and opens no subscription, so it works
+    /// with no daemon at all; everything else subscribes as usual.
     pub fn root_list_element(
         session: &crate::kube::client_session::ClientSession,
         metrics: &std::sync::Arc<store::MetricsHub>,
+        core: &CoreData,
         rid: ResourceId,
         namespace: crate::kube::protocol::Namespace,
     ) -> element::Element {
+        if let Some(el) = core.client_root_element(metrics, &rid, namespace.clone()) {
+            return el;
+        }
         let label = rid.short_label().to_lowercase();
         element::Element::ResourceList(element::ResourceList::open(
             session,
@@ -525,7 +661,7 @@ impl App {
             InputMode::Command { input, .. } => input.as_str(),
             _ => return Vec::new(),
         };
-        complete_command(cmd_input, &self.core, &self.data.contexts)
+        complete_command(cmd_input, &self.core)
     }
 
     /// Returns the best (first) completion match, if any.
@@ -635,12 +771,11 @@ fn resource_commands() -> Vec<&'static str> {
 }
 
 /// Build completion candidates for the given command input. Reads the
-/// app-level core stores for namespace/CRD names and the contexts panel
-/// for context names. Pure function — no App needed.
+/// app-level core stores for namespace/CRD/context names. Pure function —
+/// no App needed.
 fn complete_command(
     cmd_input: &str,
     core: &CoreData,
-    contexts: &StatefulTable<KubeContext>,
 ) -> Vec<String> {
     let input_lower = cmd_input.trim_start().to_lowercase();
 
@@ -675,8 +810,13 @@ fn complete_command(
     // Context completion: "ctx <tab>" or "context <tab>"
     if input_lower.starts_with("ctx ") || input_lower.starts_with("context ") {
         let cmd_prefix = if input_lower.starts_with("ctx ") { "ctx " } else { "context " };
-        let mut completions: Vec<String> = contexts.items().iter()
-            .map(|c| format!("{}{}", cmd_prefix, c.name))
+        // Same store the `:ctx` view renders from — one source, so a
+        // context can never be completable but unlistable, or vice versa.
+        let names = core.contexts.with_read(|i| {
+            i.rows.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+        });
+        let mut completions: Vec<String> = names.iter()
+            .map(|n| format!("{}{}", cmd_prefix, n))
             .filter(|s| s.to_lowercase().starts_with(&input_lower))
             .collect();
         completions.sort();
@@ -751,14 +891,10 @@ pub(crate) mod test_support {
             .expect("test runtime")
     });
 
-    /// A subscription handle backed by a parked task: alive until
-    /// dropped, touches no socket, no daemon, no cluster.
-    pub(crate) fn parked_stream() -> crate::kube::client_session::SubscriptionStream {
-        let handle = RT.handle().spawn(std::future::pending::<()>());
-        crate::kube::client_session::SubscriptionStream::from_abort_handle(handle.abort_handle())
-    }
-
-    /// Same, for log streams.
+    /// A parked handle for LOG streams: alive until dropped, touches no
+    /// socket, no daemon, no cluster. (Table queries no longer need one —
+    /// `LiveQuery::for_test` uses the real `QueryOrigin::Client`, which
+    /// carries no stream at all.)
     pub(crate) fn parked_log_stream() -> crate::kube::client_session::LogStream {
         let handle = RT.handle().spawn(std::future::pending::<()>());
         crate::kube::client_session::LogStream::from_abort_handle(handle.abort_handle())

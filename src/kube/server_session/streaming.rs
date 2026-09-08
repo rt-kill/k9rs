@@ -81,7 +81,8 @@ impl ServerSession {
                 }).await.is_err() { break; }
             }
         });
-        self.discovery_refresher_task = Some(handle);
+        self.discovery_refresher_task =
+            Some(crate::util::AbortOnDrop::new(handle.abort_handle()));
     }
 
     // -----------------------------------------------------------------------
@@ -112,7 +113,7 @@ impl ServerSession {
                 if sub.changed().await.is_err() { break; }
             }
         });
-        self.metrics_task = Some(handle);
+        self.metrics_task = Some(crate::util::AbortOnDrop::new(handle.abort_handle()));
     }
 }
 

@@ -25,6 +25,42 @@ pub const LOGO: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 /// Compact header: context/cluster/user stacked vertically on the left,
+/// What the chrome should call the active context.
+///
+/// ONE function because the header and the overview both need it and both
+/// used to work it out separately — which is how the picker came to say
+/// "connecting…" while nothing was connecting.
+///
+/// A context name only means something together with the link state, and
+/// there are three distinct stories the field has to tell:
+/// - **No context at all.** Nothing is being attempted and nothing will be
+///   until the user picks one. Saying "connecting…" here is the same lie the
+///   connecting screen exists to stop telling.
+/// - **A switch in flight.** `kube.context` is the LAST-CONFIRMED context,
+///   kept deliberately so a failed switch can fall back to it — but right
+///   now we are attached to neither it nor the target. Naming it reads as
+///   "you are on prod" when prod is precisely what you just left, so name
+///   the TARGET instead: that is what the screen is waiting for.
+/// - **Otherwise** the confirmed context, marked while the link is down.
+pub fn context_label(app: &App) -> String {
+    use crate::app::Liveness;
+    let connecting_to = |name: &dyn std::fmt::Display| format!("{} (connecting…)", name);
+    match Liveness::of_link(&app.conn) {
+        Liveness::NoContext => "none — press Enter to select".to_string(),
+        live if live.shows_data() => match &app.kube.context {
+            Some(c) => c.to_string(),
+            // Linked but nothing confirmed yet: the initial handshake.
+            None => "connecting...".to_string(),
+        },
+        // Link down. A switch target outranks the last-confirmed name.
+        _ => match (app.kube.context_switch.target(), &app.kube.context) {
+            (Some(target), _) => connecting_to(target),
+            (None, Some(c)) => connecting_to(c),
+            (None, None) => "connecting...".to_string(),
+        },
+    }
+}
+
 /// k9rs logo on the right. No key hints — those live in the ? help dialog.
 pub fn draw_header(
     f: &mut Frame,
@@ -36,7 +72,7 @@ pub fn draw_header(
         return;
     }
 
-    let ctx = if app.kube.context.is_empty() { "connecting..." } else { app.kube.context.as_str() };
+    let ctx = context_label(app);
     let cluster = if app.kube.identity.cluster.is_empty() { "n/a" } else { &app.kube.identity.cluster };
     let user = if app.kube.identity.user.is_empty() { "n/a" } else { &app.kube.identity.user };
     let k8s_ver = if app.kube.identity.k8s_version.is_empty() { "n/a" } else { &app.kube.identity.k8s_version };

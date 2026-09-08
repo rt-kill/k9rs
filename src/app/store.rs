@@ -112,6 +112,16 @@ pub enum StorePayload {
     Delta(TableDelta),
     /// The subscription failed; the UI shows the message instead of rows.
     Failed(String),
+    /// The daemon's watch stopped feeding this store (cluster-side). Rows
+    /// stay resident and remain the last known truth — they just stopped
+    /// tracking the cluster, and the view says so instead of implying they
+    /// are current.
+    Stale(String),
+    /// The watch resumed with no row change to report. `Baseline` and
+    /// `Delta` clear staleness implicitly (data arriving IS liveness); this
+    /// is the quiet recovery, where nothing changed while the watch was
+    /// down and nothing else would clear it.
+    Live,
 }
 
 /// One live data source. Owned strongly by the subscription-owning
@@ -123,6 +133,12 @@ pub struct RowStore {
     /// Resource plural, pinned at construction — resolves overlay column
     /// rules when headers (re)arrive.
     plural: String,
+    /// These rows are seeded in-process rather than delivered by the
+    /// daemon. Lives on the STORE, not on the query, so every derived view
+    /// (`/` filter, projection) inherits it without threading a flag: what
+    /// is client-owned is the row set, and anything reading that row set is
+    /// equally independent of the connection.
+    client_owned: bool,
     /// Lock-free data version: one `Acquire` load per frame decides
     /// cache-hit vs re-derive. Bumped by every content mutation.
     generation: AtomicU64,
@@ -140,7 +156,7 @@ pub struct RowStoreInner {
     pub headers: Vec<String>,
     /// Pre-resolved overlay coloring rules, parallel to `headers`.
     pub column_rules: Vec<ColumnRenderRules>,
-    /// Initializing / Ready / Failed lifecycle.
+    /// Initializing / Ready / Stale / Failed lifecycle.
     pub state: TableDataState,
     /// Stream-epoch floor: events with `epoch < floor` are stale (from a
     /// superseded stream targeting this same store) and are dropped. An
@@ -162,8 +178,26 @@ impl RowStore {
     /// A fresh store in `Initializing` state. `plural` pins overlay
     /// column-rule resolution for this resource.
     pub fn new(plural: impl Into<String>) -> Arc<Self> {
+        Self::build(plural, false)
+    }
+
+    /// A store whose rows the CLIENT seeds (the kubeconfig's contexts).
+    /// Marks the row set as connection-independent — see `client_owned`.
+    pub fn client(plural: impl Into<String>) -> Arc<Self> {
+        Self::build(plural, true)
+    }
+
+    /// Whether these rows are seeded in-process. Read by the render layer
+    /// through `Element::liveness`: a dead daemon says nothing about rows
+    /// that never came from it.
+    pub fn is_client_owned(&self) -> bool {
+        self.client_owned
+    }
+
+    fn build(plural: impl Into<String>, client_owned: bool) -> Arc<Self> {
         Arc::new(Self {
             plural: plural.into(),
+            client_owned,
             generation: AtomicU64::new(0),
             inner: Mutex::new(RowStoreInner {
                 rows: Vec::new(),
@@ -208,6 +242,32 @@ impl RowStore {
     pub fn expect_epoch(&self, epoch: u64) {
         let mut inner = self.lock();
         inner.epoch_floor = inner.epoch_floor.max(epoch);
+    }
+
+    /// Flag the store as (re)initializing WITHOUT dropping rows — the
+    /// reconnect-revive counterpart to [`RowStore::clear`]. Rows stay
+    /// resident so the recovery Baseline can replace them in place (flash /
+    /// mark continuity), but `data_state()` now honestly reports
+    /// `Initializing`, so the view renders a "Connecting…" screen instead of
+    /// the stale, no-longer-live rows. Generation is deliberately NOT bumped:
+    /// no row DATA changed, the render gate keys off `state` (not the view),
+    /// and the recovery Baseline bumps generation when it lands.
+    pub fn mark_reinitializing(&self) {
+        self.lock().state = TableDataState::Initializing;
+    }
+
+    /// Flag resident rows as no longer fed — the counterpart to
+    /// [`RowStore::mark_reinitializing`] for rows brought back from a
+    /// previous visit to a context. Deliberately NOT epoch-gated: this is a
+    /// LOCAL transition the client is making about its own cache, not
+    /// something a stream said, and the store's floor is still whatever its
+    /// last baseline set. Only `Ready` goes stale — the same rule
+    /// `StorePayload::Stale` follows.
+    pub fn mark_stale(&self, reason: impl Into<String>) {
+        let mut inner = self.lock();
+        if matches!(inner.state, TableDataState::Ready) {
+            inner.state = TableDataState::Stale(reason.into());
+        }
     }
 
     /// Sole stream-data write path. Epoch-gated; see [`StorePayload`] for
@@ -292,9 +352,28 @@ impl RowStore {
                 }
                 inner.rows.extend(append);
                 inner.flash.apply_changes(&d.changes);
+                // Data arriving IS liveness: a delta can only come from a
+                // watch that is feeding again.
+                if matches!(inner.state, TableDataState::Stale(_)) {
+                    inner.state = TableDataState::Ready;
+                }
             }
             StorePayload::Failed(msg) => {
                 inner.state = TableDataState::Failed(msg);
+            }
+            StorePayload::Stale(reason) => {
+                // Only `Ready` can go stale. A store still `Initializing`
+                // has no rows to freeze (it is already showing a loading
+                // screen), and `Failed` is terminal — downgrading a real
+                // error to "stale" would hide it behind a softer message.
+                if matches!(inner.state, TableDataState::Ready) {
+                    inner.state = TableDataState::Stale(reason);
+                }
+            }
+            StorePayload::Live => {
+                if matches!(inner.state, TableDataState::Stale(_)) {
+                    inner.state = TableDataState::Ready;
+                }
             }
         }
         drop(inner);
@@ -431,6 +510,12 @@ impl RowSource {
 
     pub fn store(&self) -> &Arc<RowStore> {
         &self.store
+    }
+
+    /// Inherited from the store this source (and every narrowing of it)
+    /// reads.
+    pub fn is_client_owned(&self) -> bool {
+        self.store.is_client_owned()
     }
 
     pub fn predicates(&self) -> &[Arc<RowPredicate>] {
@@ -705,7 +790,11 @@ pub struct DeriveSpec<'a> {
     /// Headers for the visible columns (parallel to `visible_cols`) —
     /// seeds column widths.
     pub headers: &'a [&'a str],
-    pub max_col_width: u16,
+    /// Per-column width ceiling, parallel to `headers`. Resolved by
+    /// `ColumnPolicy::max_width_for` (the column's own declaration, else the
+    /// global `ui.maxColumnWidth`) — a single number for every column of
+    /// every resource was never a policy, just a backstop.
+    pub max_col_widths: &'a [u16],
 }
 
 /// The materialized view: parallel arrays of visible-column display
@@ -751,64 +840,10 @@ pub fn derive_view(
     metrics: Option<&MetricsLens<'_>>,
     spec: &DeriveSpec<'_>,
 ) -> PreparedView {
-    // The effective display value of one cell (metrics lens overlaid).
-    let stringify = |row: &ResourceRow, ci: usize| -> String {
-        match metrics.and_then(|m| m.effective(row, ci)) {
-            Some(v) => v.to_string(),
-            None => row.cells.get(ci).map(|c| c.to_string()).unwrap_or_default(),
-        }
-    };
-
-    // 1. Effective strings for EVERY cell — needed ONLY when a filter must
-    //    scan all columns (greps span the full row). In the default browse
-    //    state (no predicate, no draft) this whole O(rows×cols) pass is
-    //    skipped and only the visible columns are stringified below.
+    // Steps 1–3 — the IDENTITY half (shared with `derive_key_order`, the
+    // selection fallback): effective strings, filter, sort.
+    let (order, mut eff) = filter_and_sort(rows_in, metrics, spec.predicates, spec.draft, spec.sort);
     let has_filter = !spec.predicates.is_empty() || spec.draft.is_some();
-    let mut eff: Vec<Vec<String>> = if has_filter {
-        rows_in
-            .iter()
-            .map(|row| (0..row.cells.len()).map(|ci| stringify(row, ci)).collect())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // 2. Filter: every committed predicate AND the uncommitted draft. With
-    //    no filter, every row passes and `eff` is unused.
-    let mut order: Vec<usize> = if has_filter {
-        (0..rows_in.len())
-            .filter(|&i| {
-                let row = &rows_in[i];
-                let strings = &eff[i];
-                spec.predicates.iter().all(|p| p.matches(row, strings))
-                    && spec.draft.is_none_or(|d| strings.iter().any(|c| d.is_match(c)))
-            })
-            .collect()
-    } else {
-        (0..rows_in.len()).collect()
-    };
-
-    // 3. Sort by the EFFECTIVE value at the sort column (metrics columns
-    //    sort by live usage), typed comparison via CellValue::cmp, stable
-    //    (namespace, name) tiebreaker. Screen order = this order.
-    {
-        let empty = CellValue::Text(String::new());
-        let value_at = |i: usize| -> std::borrow::Cow<'_, CellValue> {
-            let row = &rows_in[i];
-            match metrics.and_then(|m| m.effective(row, spec.sort.col)) {
-                Some(v) => std::borrow::Cow::Owned(v),
-                None => std::borrow::Cow::Borrowed(row.cells.get(spec.sort.col).unwrap_or(&empty)),
-            }
-        };
-        order.sort_by(|&a, &b| {
-            let primary = value_at(a).as_ref().cmp(value_at(b).as_ref());
-            let primary = if spec.sort.ascending { primary } else { primary.reverse() };
-            primary.then_with(|| {
-                let (ra, rb) = (&rows_in[a], &rows_in[b]);
-                ra.namespace().cmp(rb.namespace()).then_with(|| ra.name().cmp(rb.name()))
-            })
-        });
-    }
 
     // 4. Materialize the VISIBLE cells in screen order. When `eff` exists
     //    (filtered), MOVE each visible cell out of it (each row index and
@@ -836,7 +871,7 @@ pub fn derive_view(
                     .map(|&ci| full.get_mut(ci).map(std::mem::take).unwrap_or_default())
                     .collect()
             } else {
-                spec.visible_cols.iter().map(|&ci| stringify(&rows_in[i], ci)).collect()
+                spec.visible_cols.iter().map(|&ci| effective_cell(&rows_in[i], ci, metrics)).collect()
             }
         })
         .collect();
@@ -871,7 +906,7 @@ pub fn derive_view(
         .collect();
     let health: Vec<RowHealth> = order.iter().map(|&i| rows_in[i].health).collect();
     let keys: Vec<ObjectKey> = order.iter().map(|&i| row_key(&rows_in[i])).collect();
-    let col_widths = column_widths(spec.headers, &rows, spec.max_col_width);
+    let col_widths = column_widths(spec.headers, &rows, spec.max_col_widths);
 
     PreparedView {
         rows,
@@ -885,9 +920,105 @@ pub fn derive_view(
     }
 }
 
+/// The effective display value of one cell (metrics lens overlaid).
+fn effective_cell(row: &ResourceRow, ci: usize, metrics: Option<&MetricsLens<'_>>) -> String {
+    match metrics.and_then(|m| m.effective(row, ci)) {
+        Some(v) => v.to_string(),
+        None => row.cells.get(ci).map(|c| c.to_string()).unwrap_or_default(),
+    }
+}
+
+/// Steps 1–3 of the derive — the IDENTITY half: effective strings (built
+/// only when a filter must scan all columns; greps span the full row),
+/// predicate+draft filter, sort by the EFFECTIVE value at the sort column
+/// (metrics columns sort by live usage), typed comparison via
+/// `CellValue::cmp`, stable (namespace, name) tiebreaker. Returns
+/// (screen order, effective strings) — the strings ride along so
+/// `derive_view` can move materialized cells out instead of
+/// re-stringifying them.
+///
+/// Deliberately free of presentation inputs (visible columns, width
+/// clamp, column level): filtering scans ALL columns and the sort column
+/// is a DATA index, so the screen ORDER is pure over element-owned state
+/// plus store contents. That purity is what lets selection resolve
+/// without a painted view.
+fn filter_and_sort(
+    rows_in: &[ResourceRow],
+    metrics: Option<&MetricsLens<'_>>,
+    predicates: &[Arc<RowPredicate>],
+    draft: Option<&SearchPattern>,
+    sort: SortSpec,
+) -> (Vec<usize>, Vec<Vec<String>>) {
+    // 1. Effective strings for EVERY cell — needed ONLY when a filter must
+    //    scan all columns. In the default browse state (no predicate, no
+    //    draft) this whole O(rows×cols) pass is skipped.
+    let has_filter = !predicates.is_empty() || draft.is_some();
+    let eff: Vec<Vec<String>> = if has_filter {
+        rows_in
+            .iter()
+            .map(|row| (0..row.cells.len()).map(|ci| effective_cell(row, ci, metrics)).collect())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // 2. Filter: every committed predicate AND the uncommitted draft. With
+    //    no filter, every row passes and `eff` is unused.
+    let mut order: Vec<usize> = if has_filter {
+        (0..rows_in.len())
+            .filter(|&i| {
+                let row = &rows_in[i];
+                let strings = &eff[i];
+                predicates.iter().all(|p| p.matches(row, strings))
+                    && draft.is_none_or(|d| strings.iter().any(|c| d.is_match(c)))
+            })
+            .collect()
+    } else {
+        (0..rows_in.len()).collect()
+    };
+
+    // 3. Sort. Screen order = this order.
+    {
+        let empty = CellValue::Text(String::new());
+        let value_at = |i: usize| -> std::borrow::Cow<'_, CellValue> {
+            let row = &rows_in[i];
+            match metrics.and_then(|m| m.effective(row, sort.col)) {
+                Some(v) => std::borrow::Cow::Owned(v),
+                None => std::borrow::Cow::Borrowed(row.cells.get(sort.col).unwrap_or(&empty)),
+            }
+        };
+        order.sort_by(|&a, &b| {
+            let primary = value_at(a).as_ref().cmp(value_at(b).as_ref());
+            let primary = if sort.ascending { primary } else { primary.reverse() };
+            primary.then_with(|| {
+                let (ra, rb) = (&rows_in[a], &rows_in[b]);
+                ra.namespace().cmp(rb.namespace()).then_with(|| ra.name().cmp(rb.name()))
+            })
+        });
+    }
+    (order, eff)
+}
+
+/// The row-identity order a derive over these inputs would produce —
+/// `derive_view`'s `keys`, without materializing any presentation.
+/// Selection reads fall back to this when no painted view exists (the
+/// memo is dropped on cover and absent on fresh elements): since
+/// presentation params never influence WHICH rows show or their order,
+/// the fallback resolves exactly what the next paint will show.
+pub fn derive_key_order(
+    rows_in: &[ResourceRow],
+    metrics: Option<&MetricsLens<'_>>,
+    predicates: &[Arc<RowPredicate>],
+    draft: Option<&SearchPattern>,
+    sort: SortSpec,
+) -> Vec<ObjectKey> {
+    let (order, _) = filter_and_sort(rows_in, metrics, predicates, draft, sort);
+    order.iter().map(|&i| row_key(&rows_in[i])).collect()
+}
+
 /// Natural per-column display widths: seed from header widths, expand to
 /// the widest cell, pad (`+3`: left border + two spaces), clamp.
-fn column_widths(headers: &[&str], rows: &[Vec<String>], max_col_width: u16) -> Vec<u16> {
+fn column_widths(headers: &[&str], rows: &[Vec<String>], max_col_widths: &[u16]) -> Vec<u16> {
     use unicode_width::UnicodeWidthStr;
     if headers.is_empty() {
         return Vec::new();
@@ -900,8 +1031,12 @@ fn column_widths(headers: &[&str], rows: &[Vec<String>], max_col_width: u16) -> 
             }
         }
     }
-    for w in &mut widths {
-        *w = (*w + 3).min(max_col_width);
+    for (i, w) in widths.iter_mut().enumerate() {
+        // A header must stay readable even under a tight per-column cap, so
+        // the ceiling never cuts below the header itself.
+        let header_floor = headers[i].width() as u16 + 3;
+        let cap = max_col_widths.get(i).copied().unwrap_or(u16::MAX).max(header_floor);
+        *w = (*w + 3).min(cap);
     }
     widths
 }
@@ -1023,375 +1158,5 @@ impl LineStore {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::app::nav::CompiledGrep;
-    use crate::kube::protocol::{TableBaseline, TableDelta};
-    use crate::kube::resource_def::BuiltInKind;
-
-    fn rid() -> ResourceId {
-        ResourceId::BuiltIn(BuiltInKind::Pod)
-    }
-
-    fn row(name: &str, ns: &str, cells: &[&str]) -> ResourceRow {
-        ResourceRow {
-            name: name.into(),
-            namespace: Some(ns.into()),
-            cells: cells.iter().map(|c| CellValue::Text((*c).to_string())).collect(),
-            ..Default::default()
-        }
-    }
-
-    fn baseline(rows: Vec<ResourceRow>) -> StorePayload {
-        StorePayload::Baseline(TableBaseline {
-            resource: rid(),
-            headers: vec!["NAME".into(), "STATUS".into()],
-            rows,
-        })
-    }
-
-    fn delta(changes: Vec<RowChange>) -> StorePayload {
-        StorePayload::Delta(TableDelta { changes })
-    }
-
-    fn key(ns: &str, name: &str) -> ObjectKey {
-        ObjectKey::new(ns.to_string(), name.to_string())
-    }
-
-    fn spec<'a>(
-        predicates: &'a [Arc<RowPredicate>],
-        visible: &'a [usize],
-        headers: &'a [&'a str],
-    ) -> DeriveSpec<'a> {
-        DeriveSpec {
-            predicates,
-            draft: None,
-            sort: SortSpec::default(),
-            visible_cols: visible,
-            headers,
-            max_col_width: 40,
-        }
-    }
-
-    #[test]
-    fn baseline_replaces_and_delta_edits_in_wire_order() {
-        let store = RowStore::new("pods");
-        store.apply(1, baseline(vec![row("b", "ns", &["b", "ok"]), row("a", "ns", &["a", "ok"])]));
-        // Wire order preserved — the store never sorts.
-        store.with_read(|i| {
-            assert_eq!(i.rows[0].name, "b");
-            assert_eq!(i.state, TableDataState::Ready);
-        });
-        let g1 = store.generation();
-        store.apply(
-            1,
-            delta(vec![
-                RowChange::Upsert(row("a", "ns", &["a", "changed"])),
-                RowChange::Upsert(row("c", "ns", &["c", "new"])),
-                RowChange::Remove(key("ns", "b")),
-                RowChange::Remove(key("ns", "ghost")), // absent: no-op
-            ]),
-        );
-        store.with_read(|i| {
-            let names: Vec<&str> = i.rows.iter().map(|r| r.name.as_str()).collect();
-            assert_eq!(names, ["a", "c"]); // replaced in place, compacted, appended
-            assert_eq!(i.rows[0].cells[1].to_string(), "changed");
-        });
-        assert!(store.generation() > g1);
-    }
-
-    #[test]
-    fn epoch_floor_gates_stale_streams() {
-        let store = RowStore::new("pods");
-        store.apply(5, baseline(vec![row("live", "ns", &["live", "ok"])]));
-        // A successor stream exists the moment expect_epoch runs.
-        store.expect_epoch(9);
-        // Predecessor events (epoch < 9) are rejected — baseline AND delta.
-        store.apply(5, baseline(vec![row("stale", "ns", &["stale", "old"])]));
-        store.apply(8, delta(vec![RowChange::Remove(key("ns", "live"))]));
-        store.with_read(|i| assert_eq!(i.rows[0].name, "live"));
-        // The successor's baseline lands.
-        store.apply(9, baseline(vec![row("fresh", "ns", &["fresh", "ok"])]));
-        store.with_read(|i| assert_eq!(i.rows[0].name, "fresh"));
-    }
-
-    #[test]
-    fn marks_prune_on_baseline_and_remove() {
-        let store = RowStore::new("pods");
-        store.apply(1, baseline(vec![row("a", "ns", &["a", "ok"]), row("b", "ns", &["b", "ok"])]));
-        assert_eq!(store.toggle_mark(&key("ns", "a")), Some(true));
-        assert_eq!(store.toggle_mark(&key("ns", "b")), Some(true));
-        store.apply(1, delta(vec![RowChange::Remove(key("ns", "a"))]));
-        assert_eq!(store.marked_keys(), vec![key("ns", "b")]);
-        // Baseline without b prunes it too.
-        store.apply(2, baseline(vec![row("c", "ns", &["c", "ok"])]));
-        assert!(store.marked_keys().is_empty());
-    }
-
-    /// Ghost-mark guard: a mark can never name a row the store doesn't
-    /// hold. Toggle through a stale frame refuses (`None`); span-style
-    /// bulk marking silently drops absent keys; unmarking a marked row
-    /// still works regardless of presence.
-    #[test]
-    fn mark_inserts_verify_row_presence() {
-        let store = RowStore::new("pods");
-        store.apply(1, baseline(vec![row("a", "ns", &["a", "ok"])]));
-        assert_eq!(store.toggle_mark(&key("ns", "gone")), None);
-        assert!(!store.has_marks());
-        store.mark_keys(vec![key("ns", "a"), key("ns", "gone")]);
-        assert_eq!(store.marked_keys(), vec![key("ns", "a")]);
-        // Toggling an EXISTING mark off never needs presence.
-        assert_eq!(store.toggle_mark(&key("ns", "a")), Some(false));
-        assert!(!store.has_marks());
-    }
-
-    /// Ctrl-R continuity: marks survive `clear()` (like flash hashes);
-    /// the recovery baseline re-anchors them, pruning non-returners.
-    /// While the window is open the store is `Initializing` — use-time
-    /// intersection (get_marked_resource_infos) sees zero present rows.
-    #[test]
-    fn clear_keeps_marks_and_recovery_baseline_reanchors() {
-        let store = RowStore::new("pods");
-        store.apply(1, baseline(vec![row("a", "ns", &["a", "ok"]), row("b", "ns", &["b", "ok"])]));
-        store.toggle_mark(&key("ns", "a"));
-        store.toggle_mark(&key("ns", "b"));
-        store.clear(); // Ctrl-R
-        store.with_read(|i| {
-            assert!(i.rows.is_empty());
-            assert_eq!(i.state, TableDataState::Initializing);
-        });
-        assert!(store.has_marks(), "marks survive the refresh window");
-        // Recovery baseline: only `a` returned — `b`'s mark prunes.
-        store.apply(2, baseline(vec![row("a", "ns", &["a", "ok"])]));
-        assert_eq!(store.marked_keys(), vec![key("ns", "a")]);
-    }
-
-    #[test]
-    fn clear_keeps_flash_continuity_across_refresh() {
-        let store = RowStore::new("pods");
-        store.apply(1, baseline(vec![row("a", "ns", &["a", "Running"])]));
-        store.clear(); // Ctrl-R
-        store.with_read(|i| {
-            assert!(i.rows.is_empty());
-            assert_eq!(i.state, TableDataState::Initializing);
-        });
-        // Recovery baseline: the row changed while we weren't looking — it
-        // must flash (hash continuity survived the clear).
-        store.apply(2, baseline(vec![row("a", "ns", &["a", "CrashLoopBackOff"])]));
-        store.with_read(|i| assert!(i.flash.changed_rows().contains_key(&key("ns", "a"))));
-    }
-
-    #[test]
-    fn derive_filters_sorts_and_projects() {
-        let store = RowStore::new("pods");
-        store.apply(
-            1,
-            baseline(vec![
-                row("web-2", "ns", &["web-2", "Running"]),
-                row("web-1", "ns", &["web-1", "Failed"]),
-                row("db-1", "ns", &["db-1", "Running"]),
-            ]),
-        );
-        let preds = [Arc::new(RowPredicate::Grep(CompiledGrep::new("web")))];
-        let visible = [0usize, 1usize];
-        let headers = ["NAME", "STATUS"];
-        let mut sp = spec(&preds, &visible, &headers);
-        sp.sort = SortSpec { col: 0, ascending: false };
-        let view = store.with_read(|i| derive_view(&i.rows, &i.column_rules,None, &sp));
-        // db-1 filtered out; descending by NAME.
-        assert_eq!(view.rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(), ["web-2", "web-1"]);
-        assert_eq!(view.keys[0], key("ns", "web-2"));
-        assert_eq!(view.total_rows, 3);
-        assert_eq!(view.col_widths.len(), 2);
-    }
-
-    #[test]
-    fn narrowed_composes_grep_on_grep() {
-        let store = RowStore::new("pods");
-        store.apply(
-            1,
-            baseline(vec![
-                row("web-api", "ns", &["web-api", "ok"]),
-                row("web-cache", "ns", &["web-cache", "ok"]),
-                row("db-api", "ns", &["db-api", "ok"]),
-            ]),
-        );
-        let base = RowSource::new(Arc::clone(&store), None);
-        let first = base.narrowed(Arc::new(RowPredicate::Grep(CompiledGrep::new("web"))));
-        let second = first.narrowed(Arc::new(RowPredicate::Grep(CompiledGrep::new("api"))));
-        assert_eq!(second.predicates().len(), 2);
-        let visible = [0usize];
-        let headers = ["NAME"];
-        let view = store.with_read(|i| derive_view(&i.rows, &i.column_rules,None, &spec(second.predicates(), &visible, &headers)));
-        assert_eq!(view.rows.len(), 1);
-        assert_eq!(view.rows[0][0], "web-api");
-        // The parent chain is untouched — sources are values.
-        assert_eq!(first.predicates().len(), 1);
-    }
-
-    #[test]
-    fn fault_and_draft_predicates() {
-        let store = RowStore::new("pods");
-        let mut bad = row("bad", "ns", &["bad", "CrashLoop"]);
-        bad.health = RowHealth::Failed;
-        store.apply(1, baseline(vec![row("good", "ns", &["good", "Running"]), bad]));
-        let preds = [Arc::new(RowPredicate::Fault)];
-        let visible = [0usize];
-        let headers = ["NAME"];
-        let mut sp = spec(&preds, &visible, &headers);
-        let draft = SearchPattern::new("ba");
-        sp.draft = Some(&draft);
-        let view = store.with_read(|i| derive_view(&i.rows, &i.column_rules,None, &sp));
-        assert_eq!(view.rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(), ["bad"]);
-    }
-
-    #[test]
-    fn pod_metrics_overlay_display_and_sort() {
-        let hub = MetricsHub::new();
-        let binding = MetricsBinding::for_rid(&rid(), &hub).expect("pods have metrics columns");
-        // Resolve the real CPU column index from the registry so the test
-        // rows can size their cells accordingly.
-        let MetricsCols::Pod(cols) = binding.cols else { panic!("pod binding") };
-        let cpu_col = cols.cpu.expect("pod def has a CPU column");
-
-        let mk_row = |name: &str| {
-            let mut r = ResourceRow {
-                name: name.into(),
-                namespace: Some("ns".into()),
-                ..Default::default()
-            };
-            r.cells = (0..=cpu_col).map(|_| CellValue::Text(String::new())).collect();
-            r.cells[0] = CellValue::Text(name.into());
-            r
-        };
-        let store = RowStore::new("pods");
-        store.apply(
-            1,
-            StorePayload::Baseline(TableBaseline {
-                resource: rid(),
-                headers: (0..=cpu_col).map(|i| format!("H{i}")).collect(),
-                rows: vec![mk_row("low"), mk_row("high")],
-            }),
-        );
-
-        // Before any poll: stored (empty) cells win.
-        let visible = [cpu_col];
-        let headers = ["CPU"];
-        let preds: [Arc<RowPredicate>; 0] = [];
-        let sp_plain = spec(&preds, &visible, &headers);
-        let lens = binding.lens();
-        let view = store.with_read(|i| derive_view(&i.rows, &i.column_rules,Some(&lens), &sp_plain));
-        assert_eq!(view.rows[0][0], "");
-        drop(lens);
-
-        let mut usage = HashMap::new();
-        usage.insert(key("ns", "high"), MetricsUsage { cpu_milli: 900, mem_bytes: 0, ..Default::default() });
-        usage.insert(key("ns", "low"), MetricsUsage { cpu_milli: 100, mem_bytes: 0, ..Default::default() });
-        hub.set_pods(usage);
-
-        // Overlaid values display AND drive the sort (descending by CPU).
-        let mut sp = spec(&preds, &visible, &headers);
-        sp.sort = SortSpec { col: cpu_col, ascending: false };
-        let lens = binding.lens();
-        let view = store.with_read(|i| derive_view(&i.rows, &i.column_rules,Some(&lens), &sp));
-        assert_eq!(view.rows[0][0], "900m");
-        assert_eq!(view.keys[0], key("ns", "high"));
-        assert_eq!(view.rows[1][0], "100m");
-    }
-
-    #[test]
-    fn node_metrics_absent_vs_never_polled() {
-        use crate::kube::protocol::NodeName;
-        let hub = MetricsHub::new();
-        let node_rid = ResourceId::BuiltIn(BuiltInKind::Node);
-        let binding = MetricsBinding::for_rid(&node_rid, &hub).expect("nodes have metrics columns");
-        let MetricsCols::Node(cols) = binding.cols else { panic!("node binding") };
-        let cpu_col = cols.cpu.expect("node def has a CPU column");
-
-        let mut r = ResourceRow { name: "worker-1".into(), namespace: None, ..Default::default() };
-        r.cells = (0..=cpu_col).map(|_| CellValue::Text("stored".into())).collect();
-        let store = RowStore::new("nodes");
-        store.apply(
-            1,
-            StorePayload::Baseline(TableBaseline {
-                resource: node_rid.clone(),
-                headers: (0..=cpu_col).map(|i| format!("H{i}")).collect(),
-                rows: vec![r],
-            }),
-        );
-        let visible = [cpu_col];
-        let headers = ["CPU"];
-        let preds: [Arc<RowPredicate>; 0] = [];
-        let sp = spec(&preds, &visible, &headers);
-
-        // Never polled → stored cell shows.
-        let lens = binding.lens();
-        let view = store.with_read(|i| derive_view(&i.rows, &i.column_rules,Some(&lens), &sp));
-        assert_eq!(view.rows[0][0], "stored");
-        drop(lens);
-
-        // Polled, node absent → n/a placeholder, not a frozen stale value.
-        hub.set_nodes(HashMap::<NodeName, MetricsUsage>::new());
-        let lens = binding.lens();
-        let view = store.with_read(|i| derive_view(&i.rows, &i.column_rules,Some(&lens), &sp));
-        assert_eq!(view.rows[0][0], CellValue::Placeholder.to_string());
-    }
-
-    #[test]
-    fn line_store_pushes_evicts_and_counts() {
-        use crate::kube::protocol::LogLine;
-        let store = LineStore::new(3);
-        for i in 0..5 {
-            store.push(1, LogLine { content: format!("l{i}"), container: None });
-        }
-        store.with_read(|inner| {
-            assert_eq!(inner.lines.len(), 3);
-            assert_eq!(inner.evicted, 2, "front evictions are counted for scroll healing");
-            assert_eq!(inner.lines.front().unwrap().content, "l2");
-        });
-        // clear keeps the counter monotonic.
-        store.clear();
-        store.with_read(|inner| {
-            assert!(inner.lines.is_empty());
-            assert_eq!(inner.evicted, 5);
-        });
-    }
-
-    #[test]
-    fn line_store_epoch_floor_gates_stale_streams() {
-        use crate::kube::protocol::LogLine;
-        let store = LineStore::new(10);
-        store.push(1, LogLine { content: "old".into(), container: None });
-        // A range restart raised the floor before the old stream's queued
-        // lines drained.
-        store.expect_epoch(5);
-        store.push(1, LogLine { content: "stale".into(), container: None });
-        store.mark_ended(1); // the old stream's EOF must not mark the new one dead
-        store.with_read(|inner| {
-            assert_eq!(inner.lines.len(), 1);
-            assert!(inner.live);
-        });
-        store.push(5, LogLine { content: "fresh".into(), container: None });
-        store.mark_ended(5);
-        store.with_read(|inner| {
-            assert_eq!(inner.lines.back().unwrap().content, "fresh");
-            assert!(!inner.live);
-        });
-    }
-
-    #[test]
-    fn failed_is_epoch_gated_and_sets_state() {
-        let store = RowStore::new("pods");
-        store.apply(3, baseline(vec![row("a", "ns", &["a", "ok"])]));
-        store.expect_epoch(7);
-        // A superseded stream's death must not mark the successor failed.
-        store.apply(3, StorePayload::Failed("old stream died".into()));
-        store.with_read(|i| assert_eq!(i.state, TableDataState::Ready));
-        store.apply(7, StorePayload::Failed("real failure".into()));
-        store.with_read(|i| {
-            assert_eq!(i.state, TableDataState::Failed("real failure".into()));
-            // Rows are retained — the UI decides what to show for Failed.
-            assert_eq!(i.rows.len(), 1);
-        });
-    }
-}
+#[path = "../tests/app/store.rs"]
+mod tests;

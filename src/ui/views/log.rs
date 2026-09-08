@@ -28,6 +28,16 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     let indicator_area = chunks[1];
     let bar_area = chunks[2];
 
+    // Same authority as every other data view. `of_link` rather than `of`
+    // because a log stream has no cluster-side stream state to consult: the
+    // store can't self-report either — its `live` flag stays true across a
+    // daemon gap (the bridge's `Ended` died in the closed channel, which is
+    // why `revive_if_dead` exists at all) — so the link IS the whole answer,
+    // and without it the view keeps advertising AutoScroll over a tail that
+    // stopped arriving.
+    let liveness = crate::app::Liveness::of_link(&app.conn);
+    let link_connecting = !liveness.shows_data();
+
     // Materialize the element's visible-line set (the ephemeral log view),
     // then copy out the small display fields so the store read below can't
     // conflict with anything.
@@ -37,8 +47,13 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     let active_patterns = element.log_patterns();
     let committed_filter_count = element.log_committed_count();
     let Some(view) = element.log_view() else { return };
-    let (follow, wrap, show_timestamps, initial_load, scroll_pos) =
-        (view.follow, view.wrap, view.show_timestamps, view.initial_load, view.scroll);
+    let (offset, follow, wrap, show_timestamps, initial_load) = (
+        view.viewport.offset(),
+        view.viewport.following(),
+        view.wrap,
+        view.show_timestamps,
+        view.initial_load,
+    );
     let (filter_input_active, filter_input) = (
         view.is_filtering(),
         view.draft.clone().unwrap_or_default(),
@@ -47,34 +62,46 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.ui.theme;
     let anim = &app.ui.anim;
 
-    store.with_read(|inner| {
-        let total = indices.len();
-        if total > 0 {
-            let inner_height = log_area.height.saturating_sub(2) as usize; // border
-            let height = if inner_height == 0 { 1 } else { inner_height };
+    // Physical viewport height (inner area minus 2 border rows) — published back
+    // into the element's Viewport after the render measures the true extent.
+    let inner_height = log_area.height.saturating_sub(2) as usize;
 
-            if wrap {
-                // Wrap mode: pass all visible lines; the widget handles
-                // wrapping and scrolling internally.
+    // Frame shared by every status screen (connecting / empty / no match),
+    // so a reconnect doesn't shift the layout under the user.
+    let since_title = if since_label == "tail" {
+        String::new()
+    } else {
+        format!(" [{}]", since_label)
+    };
+    let status_block = || {
+        ratatui::widgets::Block::bordered()
+            .title(format!(" Logs: {}/{}{} ", pod_name, container_label, since_title))
+            .title_style(theme.title)
+            .border_style(theme.border)
+    };
+
+    let mut content_rows = 0usize;
+    if link_connecting {
+        let block = status_block();
+        let block_inner = block.inner(log_area);
+        f.render_widget(block, log_area);
+        crate::ui::draw_centered_loading(f, block_inner, "Connecting...", theme.status_pending, anim);
+    } else {
+        store.with_read(|inner| {
+            let total = indices.len();
+            if total > 0 {
+                // Pass ALL visible lines; the widget windows PHYSICAL (wrap-
+                // expanded) rows from the offset and reports the extent back.
                 let all_lines: Vec<&LogLine> =
                     indices.iter().filter_map(|&i| inner.lines.get(i)).collect();
-
-                let log_viewer = LogViewer::new(
-                    &all_lines,
-                    &pod_name,
-                    &container_label,
-                    &since_label,
-                    theme,
-                );
-                let scroll = if follow { total.saturating_sub(1) } else { scroll_pos };
+                let log_viewer =
+                    LogViewer::new(&all_lines, &pod_name, &container_label, &since_label, theme);
                 let mut view_state = crate::ui::widgets::LogViewState {
-                    scroll,
+                    offset,
                     follow,
-                    initial_load,
                     wrap,
                     show_timestamps,
-                    total_lines: total,
-                    scroll_display: None,
+                    content_rows: 0,
                     active_patterns: active_patterns.clone(),
                     filter_input_active,
                     filter_input: filter_input.clone(),
@@ -82,67 +109,35 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
                     committed_filter_count,
                 };
                 f.render_stateful_widget(log_viewer, log_area, &mut view_state);
+                content_rows = view_state.content_rows;
             } else {
-                // No wrap: only collect the visible window.
-                let scroll = if follow {
-                    total.saturating_sub(height)
-                } else {
-                    scroll_pos.min(total.saturating_sub(height))
-                };
-                let start = scroll;
-                let end = (start + height).min(total);
-                let visible_lines: Vec<&LogLine> = indices[start..end]
-                    .iter()
-                    .filter_map(|&i| inner.lines.get(i))
-                    .collect();
+                // No visible lines — show a status by streaming state.
+                let block = status_block();
+                let block_inner = block.inner(log_area);
+                f.render_widget(block, log_area);
+                if inner.live && inner.lines.is_empty() {
+                    crate::ui::draw_centered_loading(f, block_inner, "Waiting for logs...", theme.status_pending, anim);
+                } else if block_inner.height > 0 && block_inner.width > 0 {
+                    let msg = if inner.lines.is_empty() { "No logs." } else { "No matching lines." };
+                    let line = ratatui::text::Line::from(Span::styled(msg, theme.status_pending));
+                    let cx = block_inner.x + block_inner.width.saturating_sub(msg.len() as u16) / 2;
+                    let cy = block_inner.y + block_inner.height / 2;
+                    f.render_widget(line, ratatui::layout::Rect::new(cx, cy, block_inner.width, 1));
+                }
+            }
+        });
+    }
 
-                let log_viewer = LogViewer::new(
-                    &visible_lines,
-                    &pod_name,
-                    &container_label,
-                    &since_label,
-                    theme,
-                );
-                let mut view_state = crate::ui::widgets::LogViewState {
-                    scroll: 0,
-                    follow,
-                    initial_load,
-                    wrap,
-                    show_timestamps,
-                    total_lines: total,
-                    scroll_display: Some(scroll),
-                    active_patterns: active_patterns.clone(),
-                    filter_input_active,
-                    filter_input: filter_input.clone(),
-                    visible_count: total,
-                    committed_filter_count,
-                };
-                f.render_stateful_widget(log_viewer, log_area, &mut view_state);
-            }
-        } else {
-            // No visible lines — show a status by streaming state.
-            let since_title = if since_label == "tail" {
-                String::new()
-            } else {
-                format!(" [{}]", since_label)
-            };
-            let block = ratatui::widgets::Block::bordered()
-                .title(format!(" Logs: {}/{}{} ", pod_name, container_label, since_title))
-                .title_style(theme.title)
-                .border_style(theme.border);
-            let block_inner = block.inner(log_area);
-            f.render_widget(block, log_area);
-            if inner.live && inner.lines.is_empty() {
-                crate::ui::draw_centered_loading(f, block_inner, "Waiting for logs...", theme.status_pending, anim);
-            } else if block_inner.height > 0 && block_inner.width > 0 {
-                let msg = if inner.lines.is_empty() { "No logs." } else { "No matching lines." };
-                let line = ratatui::text::Line::from(Span::styled(msg, theme.status_pending));
-                let cx = block_inner.x + block_inner.width.saturating_sub(msg.len() as u16) / 2;
-                let cy = block_inner.y + block_inner.height / 2;
-                f.render_widget(line, ratatui::layout::Rect::new(cx, cy, block_inner.width, 1));
-            }
+    // Publish the physical extent the render measured back into the Viewport —
+    // the single write-back site; autoscroll is gated on the initial tail load.
+    // Skipped while the connecting screen is up: that frame measured no
+    // content, and publishing a zero extent would clamp the offset to 0 and
+    // lose the user's scroll position across the gap.
+    if !link_connecting {
+        if let Some(view) = app.nav.top_mut().log_view_mut() {
+            view.viewport.set_metrics(content_rows, inner_height, follow && !initial_load);
         }
-    });
+    }
 
     // Indicator bar: element-owned toggle states.
     let follow_state = if follow { "On" } else { "Off" };

@@ -91,14 +91,26 @@ pub struct ColumnDef {
     pub header: &'static str,
     pub level: ColumnLevel,
     pub metrics: Option<MetricsColumn>,
+    /// Per-column width ceiling. `None` = fall back to the global
+    /// `ui.maxColumnWidth`, which is a last resort, not a policy: one number
+    /// for every column of every resource means a column whose values are
+    /// long-but-uninteresting (an EKS cluster ARN, a full image ref) eats the
+    /// width that the columns you are actually reading needed. Declared HERE,
+    /// next to the column it describes, so it travels with the column instead
+    /// of living in a table someone has to remember to update.
+    pub max_width: Option<u16>,
 }
 
 impl ColumnDef {
     pub const fn new(header: &'static str) -> Self {
-        Self { header, level: ColumnLevel::Default, metrics: None }
+        Self { header, level: ColumnLevel::Default, metrics: None, max_width: None }
     }
     pub const fn extra(header: &'static str) -> Self {
-        Self { header, level: ColumnLevel::Extra, metrics: None }
+        Self { header, level: ColumnLevel::Extra, metrics: None, max_width: None }
+    }
+    /// Cap this column's width regardless of how long its values run.
+    pub const fn max_width(self, w: u16) -> Self {
+        Self { max_width: Some(w), ..self }
     }
     // (`age`/`extra_age` ctors removed — they were byte-identical to
     // `new`/`extra`. Age columns are rendered from `CellValue::Age` in the
@@ -329,52 +341,5 @@ pub trait ConvertToRow<K> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use crate::kube::resource_defs::REGISTRY;
-    use crate::kube::protocol::OperationKind;
-
-    /// Every resource must include the base operations (Describe, Yaml, Delete).
-    #[test]
-    fn all_resources_have_base_operations() {
-        for def in REGISTRY.all() {
-            let ops = def.operations();
-            for base in [OperationKind::Describe, OperationKind::Yaml, OperationKind::Delete] {
-                assert!(
-                    ops.contains(&base),
-                    "def `{}` missing base operation {:?}",
-                    def.gvr().kind, base,
-                );
-            }
-        }
-    }
-
-    /// bincode encodes a fieldless enum as its u32 declaration-index (LE), so
-    /// these tags are the on-wire identity of every `ResourceId::BuiltIn`.
-    /// Appending a variant is safe; reordering or inserting one silently remaps
-    /// every existing row on the wire. `ordered` MUST be in declaration order —
-    /// the test asserts each variant serializes to its position, so a reorder
-    /// fails here and an append trips the count assert (extend the slice and
-    /// bump `PROTOCOL_VERSION`).
-    #[test]
-    fn builtin_kind_wire_tags_are_stable() {
-        use super::BuiltInKind::*;
-        let ordered = [
-            Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob,
-            Service, ConfigMap, Secret, ServiceAccount, Ingress, NetworkPolicy,
-            Hpa, Endpoints, EndpointSlice, LimitRange, ResourceQuota,
-            PodDisruptionBudget, Event, PersistentVolumeClaim, Lease,
-            Namespace, Node, PersistentVolume, StorageClass, PriorityClass,
-            Role, ClusterRole, RoleBinding, ClusterRoleBinding,
-            ValidatingWebhookConfiguration, MutatingWebhookConfiguration,
-            CustomResourceDefinition,
-        ];
-        assert_eq!(ordered.len(), 34, "BuiltInKind variant count changed");
-        for (i, kind) in ordered.iter().enumerate() {
-            assert_eq!(
-                bincode::serialize(kind).expect("serialize"),
-                (i as u32).to_le_bytes(),
-                "{:?}: wire tag drifted from {}", kind, i,
-            );
-        }
-    }
-}
+#[path = "../tests/kube/resource_def.rs"]
+mod tests;

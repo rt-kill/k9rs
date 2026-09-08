@@ -76,9 +76,12 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         Line::from(""),
     ];
 
-    // Cluster info — centered, one field per line
+    // Cluster info — centered, one field per line. The context label comes
+    // from the same place the header's does; two derivations of it is how
+    // "connecting…" ended up on a screen where nothing was connecting.
+    let ctx_label = header::context_label(app);
     let info_fields: &[(&str, &str)] = &[
-        ("Context: ", if app.kube.context.is_empty() { "connecting..." } else { app.kube.context.as_str() }),
+        ("Context: ", ctx_label.as_str()),
         ("Cluster: ", if app.kube.identity.cluster.is_empty() { "n/a" } else { &app.kube.identity.cluster }),
         ("User: ", if app.kube.identity.user.is_empty() { "n/a" } else { &app.kube.identity.user }),
         ("K8s: ", if app.kube.identity.k8s_version.is_empty() { "n/a" } else { &app.kube.identity.k8s_version }),
@@ -95,7 +98,14 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     // pure predicate over the same data, computed independently of the
     // per-label formatting rather than flagged as a side effect inside it.
     let has_unhealthy = core_stats.iter().any(|(_, total, healthy)| total - healthy > 0);
-    let stats = if core_stats.is_empty() {
+    // `of_link`: these counters are aggregated across several core stores, so
+    // there is no single store state to ask — but the link answers for all of
+    // them at once. Down means the counts are no-longer-live, so show the
+    // connecting state rather than stale numbers.
+    let liveness = crate::app::Liveness::of_link(&app.conn);
+    let stats = if !liveness.shows_data() {
+        liveness.status_text(&app.ui.anim, String::new)
+    } else if core_stats.is_empty() {
         "Loading...".to_string()
     } else {
         core_stats.iter().map(|(label, total, healthy)| {
@@ -109,7 +119,13 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             }
         }).collect::<Vec<_>>().join("  |  ")
     };
-    let stats_style = if has_unhealthy { theme.status_pending } else { theme.status_running };
+    // Neutral style while connecting — `has_unhealthy` is computed from the
+    // stale counts we're deliberately not showing.
+    let stats_style = if liveness.shows_data() && has_unhealthy {
+        theme.status_pending
+    } else {
+        theme.status_running
+    };
     lines.push(Line::from(
         Span::styled(stats, stats_style)
     ).alignment(Alignment::Center));

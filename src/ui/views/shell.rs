@@ -7,6 +7,12 @@ use crate::ui::theme::Theme;
 /// Render the shell overlay. Only visible during the Connecting phase —
 /// once the daemon confirms the connection, the session loop suspends
 /// the TUI and enters raw bridge mode (this code is never reached).
+///
+/// Claims the whole frame, so it declares
+/// [`crate::app::OverlayExtent::FullFrame`] and `ui::draw` erases the frame
+/// first: the block below paints a border and one centered line, and every
+/// interior cell it never writes would otherwise still hold the view
+/// underneath.
 pub fn draw_shell(
     f: &mut Frame,
     shell: &ShellState,

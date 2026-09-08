@@ -10,28 +10,6 @@ use crate::app::element::Element;
 use crate::app::store::RowPredicate;
 use crate::kube::session::{ds_try, ActionResult};
 
-const HELP_PAGE_SCROLL_LINES: usize = 10;
-const DEFAULT_TERMINAL_HEIGHT: usize = 24;
-const LOG_CHROME_LINES: usize = 4;
-const CONTENT_CHROME_LINES: usize = 3;
-
-use crate::util::content_max_scroll;
-
-
-/// Render-clamp-aware max for `help_scroll`. Mirrors the formula the
-/// help overlay uses at render time so action handlers can store a
-/// stable max and PrevItem decrements move the scroll position
-/// immediately instead of being absorbed by the render-time clamp.
-fn help_max_scroll(
-    caps: &crate::kube::protocol::ResourceCapabilities,
-    keys: crate::app::KeysConfig,
-) -> usize {
-    let h = crossterm::terminal::size()
-        .map(|(_, h)| h)
-        .unwrap_or(DEFAULT_TERMINAL_HEIGHT as u16);
-    crate::ui::widgets::HelpOverlay::max_scroll(h, Some(caps), keys)
-}
-
 
 // ---------------------------------------------------------------------------
 // Main dispatcher — thin routing table, delegates to focused sub-functions
@@ -44,6 +22,15 @@ pub(crate) fn handle_action(
     data_source: &mut ClientSession,
 ) -> ActionResult {
     use crate::app::actions::Action;
+
+    // Optimization, not a correctness gate: selection reads are total
+    // (cold cache → fresh order derive inside `selected_key`), but warming
+    // the memo here lets the action's resolution and the next paint share
+    // ONE derive, and gives relative moves a length to clamp against
+    // pre-paint. Cheap + no-op for non-table tops.
+    let level = app.ui.column_level;
+    let max_col_width = app.config.ui.max_column_width;
+    app.nav.top_mut().ensure_view_cached(level, max_col_width);
 
     match action {
         // --- Lifecycle ---
@@ -65,7 +52,7 @@ pub(crate) fn handle_action(
             if matches!(app.ui.overlay, Some(crate::app::Overlay::Help { .. })) {
                 app.ui.overlay = None;
             } else {
-                app.ui.overlay = Some(crate::app::Overlay::Help { scroll: 0 });
+                app.ui.overlay = Some(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() });
             }
         }
 
@@ -73,14 +60,16 @@ pub(crate) fn handle_action(
         Action::NextTab => {
             let new_rid = app.next_tab();
             let root = App::root_list_element(
-                data_source, &app.kube.metrics, new_rid, app.kube.selected_ns.clone(),
+                data_source, &app.kube.metrics,
+                &app.core, new_rid, app.kube.selected_ns.clone(),
             );
             app.nav.reset(root);
         }
         Action::PrevTab => {
             let new_rid = app.prev_tab();
             let root = App::root_list_element(
-                data_source, &app.kube.metrics, new_rid, app.kube.selected_ns.clone(),
+                data_source, &app.kube.metrics,
+                &app.core, new_rid, app.kube.selected_ns.clone(),
             );
             app.nav.reset(root);
         }
@@ -147,7 +136,7 @@ pub(crate) fn handle_action(
 
         // --- Simple inline actions ---
         Action::SwitchNamespace(ns) => do_switch_namespace(app, data_source, ns),
-        Action::SwitchContext(ctx) => begin_context_switch(app, data_source, &ctx),
+        Action::SwitchContext(ctx) => begin_context_switch(app, &ctx),
         Action::CommandMode => {
             app.ui.input_mode = InputMode::Command { input: String::new(), history_index: None };
         }
@@ -196,7 +185,8 @@ pub(crate) fn handle_action(
         Action::ToggleLastView => {
             if let Some(crate::app::nav::RootSpec::Resource(last_rid)) = app.nav.prev_root().cloned() {
                 let root = App::root_list_element(
-                    data_source, &app.kube.metrics, last_rid, app.kube.selected_ns.clone(),
+                    data_source, &app.kube.metrics,
+                &app.core, last_rid, app.kube.selected_ns.clone(),
                 );
                 app.nav.reset(root);
             }
@@ -244,16 +234,14 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
 
     // Overlays capture scroll keys first (help sheet, container picker).
     match (&mut app.ui.overlay, &action) {
-        (Some(Overlay::Help { scroll }), a) => {
-            let caps = app.nav.top().capabilities();
-            let max = help_max_scroll(&caps, app.config.keys);
+        (Some(Overlay::Help { viewport }), a) => {
             match a {
-                Action::NextItem => *scroll = (*scroll + 1).min(max),
-                Action::PrevItem => *scroll = scroll.saturating_sub(1),
-                Action::PageUp => *scroll = scroll.saturating_sub(HELP_PAGE_SCROLL_LINES),
-                Action::PageDown => *scroll = (*scroll + HELP_PAGE_SCROLL_LINES).min(max),
-                Action::Home => *scroll = 0,
-                Action::End => *scroll = max,
+                Action::NextItem => viewport.line_down(1),
+                Action::PrevItem => viewport.line_up(1),
+                Action::PageUp => viewport.page_up(),
+                Action::PageDown => viewport.page_down(),
+                Action::Home => viewport.home(),
+                Action::End => viewport.end(),
                 _ => {}
             }
             return;
@@ -273,80 +261,34 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
         _ => {}
     }
 
-    let page_lines = app.config.ui.page_scroll_lines;
     match app.nav.top_mut() {
         // Log views: scroll over the derived visible-line set.
         el @ (Element::LogSession(_) | Element::LogFilter(_)) => {
-            let total = el.log_visible().map(|v| v.len()).unwrap_or(0);
-            let visible = crossterm::terminal::size()
-                .map(|(_, h)| h as usize)
-                .unwrap_or(DEFAULT_TERMINAL_HEIGHT)
-                .saturating_sub(LOG_CHROME_LINES);
-            let max = total.saturating_sub(visible);
+            // Pure intent — the log widget owns the physical (wrap-expanded)
+            // geometry and publishes it back into the viewport each frame, so
+            // the action layer never guesses a height or a line-to-row count.
             let Some(view) = el.log_view_mut() else { return };
             match action {
-                Action::PageUp => {
-                    view.follow = false;
-                    view.scroll = view.scroll.saturating_sub(page_lines);
-                }
-                Action::PageDown => {
-                    view.follow = false;
-                    view.scroll = (view.scroll + page_lines).min(max);
-                }
-                Action::Home => {
-                    view.follow = false;
-                    view.scroll = 0;
-                }
-                Action::End => {
-                    view.scroll = max;
-                    view.follow = true;
-                }
-                Action::ScrollUp(n) => {
-                    if view.follow {
-                        view.scroll = max;
-                        view.follow = false;
-                    }
-                    view.scroll = view.scroll.saturating_sub(n);
-                }
-                Action::ScrollDown(n) => {
-                    if !view.follow {
-                        view.scroll = (view.scroll + n).min(max);
-                    }
-                }
+                Action::PageUp => view.viewport.page_up(),
+                Action::PageDown => view.viewport.page_down(),
+                Action::Home => view.viewport.home(),
+                Action::End => view.viewport.end(),
+                Action::ScrollUp(n) => view.viewport.line_up(n),
+                Action::ScrollDown(n) => view.viewport.line_down(n),
                 _ => {}
             }
         }
-        // Content views: scroll over the cached line count.
-        Element::ContentView(cv) => {
-            let visible = crossterm::terminal::size()
-                .map(|(_, h)| h as usize)
-                .unwrap_or(DEFAULT_TERMINAL_HEIGHT)
-                .saturating_sub(CONTENT_CHROME_LINES);
-            let max = content_max_scroll(cv.state.line_count(), visible);
-            match action {
-                Action::NextItem => cv.state.scroll = (cv.state.scroll + 1).min(max),
-                Action::PrevItem => cv.state.scroll = cv.state.scroll.saturating_sub(1),
-                Action::PageUp => cv.state.scroll = cv.state.scroll.saturating_sub(page_lines),
-                Action::PageDown => cv.state.scroll = (cv.state.scroll + page_lines).min(max),
-                Action::Home => cv.state.scroll = 0,
-                Action::End => cv.state.scroll = max,
-                _ => {}
-            }
-        }
-        // Context picker: its cursor lives on its OWN StatefulTable, not
-        // on a TableInteraction — the generic element moves below (which
-        // bail on `table_interaction_mut() == None`) are a silent no-op
-        // for it, which used to freeze the cursor at row 0 and make Enter
-        // always switch to the first context.
-        Element::ContextList(c) => match action {
-            Action::NextItem => c.table.next(),
-            Action::PrevItem => c.table.previous(),
-            Action::PageUp => c.table.page_up(),
-            Action::PageDown => c.table.page_down(),
-            Action::Home => c.table.home(),
-            Action::End => c.table.end(),
+        // Content views: pure intent — the render publishes the (non-wrapping)
+        // extent back into the viewport, so no geometry is guessed here.
+        Element::ContentView(cv) => match action {
+            Action::NextItem => cv.state.viewport.line_down(1),
+            Action::PrevItem => cv.state.viewport.line_up(1),
+            Action::PageUp => cv.state.viewport.page_up(),
+            Action::PageDown => cv.state.viewport.page_down(),
+            Action::Home => cv.state.viewport.home(),
+            Action::End => cv.state.viewport.end(),
             _ => {}
-        },
+        }
         // Row-bearing table views: cursor lives on the element's
         // TableInteraction.
         Element::ResourceList(_) | Element::RowFilter(_) | Element::DerivedRows(_)
@@ -457,7 +399,7 @@ fn handle_resource_op(
         // non-empty?" branch exists here to silently substitute batch
         // semantics (or, stale-frame-wise, single semantics).
         Action::Delete => {
-            if let Some(info) = get_selected_resource_info(app) {
+            if let Some(info) = require_selected(app) {
                 app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Delete".to_string(),
@@ -471,7 +413,7 @@ fn handle_resource_op(
                 app.ui.flash = Some(crate::app::FlashMessage::warn("Edit already in progress".to_string()));
                 return ActionResult::None;
             }
-            if let Some(info) = get_selected_resource_info(app) {
+            if let Some(info) = require_selected(app) {
                 ds_try!(app, data_source.yaml(&info));
                 app.ui.confirm_dialog = None;
                 app.ui.form_dialog = None;
@@ -482,7 +424,7 @@ fn handle_resource_op(
             }
         }
         Action::Scale => {
-            if let Some(info) = get_selected_resource_info(app) {
+            if let Some(info) = require_selected(app) {
                 let schema = crate::kube::protocol::OperationKind::Scale.form_schema()
                     .expect("Scale always has a form schema");
                 let row = app.nav.top().selected_row();
@@ -493,7 +435,7 @@ fn handle_resource_op(
             }
         }
         Action::Restart => {
-            if let Some(info) = get_selected_resource_info(app) {
+            if let Some(info) = require_selected(app) {
                 app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Restart {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Restart".to_string(),
@@ -503,7 +445,7 @@ fn handle_resource_op(
             }
         }
         Action::ForceKill => {
-            if let Some(info) = get_selected_resource_info(app) {
+            if let Some(info) = require_selected(app) {
                 app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
                     message: format!("Force-kill {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Force Kill".to_string(),
@@ -513,29 +455,31 @@ fn handle_resource_op(
             }
         }
         Action::DecodeSecret => {
-            if let Some(info) = get_selected_resource_info(app) {
-                let mut state = crate::app::ContentViewState::default();
-                state.set_content(format!("Decoding secret {}/{}...", info.namespace, info.name));
+            if let Some(info) = require_selected(app) {
                 ds_try!(app, data_source.decode_secret(&info));
+                // Its OWN spec kind, not `Describe`: the decoded bytes must
+                // never land in the describe cache, and Ctrl-R must
+                // re-decode. Fetching → the honest spinner (the old version
+                // painted fake "Decoding..." text as if it were content).
                 let el = crate::app::element::Element::ContentView(
                     crate::app::element::ContentView::new(
-                        crate::app::element::ContentSpec::Describe(info),
-                        state,
-                        false,
+                        crate::app::element::ContentSpec::DecodedSecret(info),
+                        crate::app::ContentViewState::default(),
+                        crate::app::element::ContentPhase::Fetching,
                     ),
                 );
                 app.nav.push(el);
             }
         }
         Action::TriggerCronJob => {
-            if let Some(info) = get_selected_resource_info(app) {
+            if let Some(info) = require_selected(app) {
                 let name = info.name.clone();
                 ds_try!(app, data_source.trigger_cronjob(&info));
                 app.ui.flash = Some(crate::app::FlashMessage::info(format!("Triggering CronJob: {}", name)));
             }
         }
         Action::SuspendCronJob => {
-            if let Some(info) = get_selected_resource_info(app) {
+            if let Some(info) = require_selected(app) {
                 ds_try!(app, data_source.toggle_suspend_cronjob(&info));
             }
         }
@@ -640,6 +584,7 @@ fn dispatch_batch(
     data_source: &mut ClientSession,
     batch: Vec<crate::kube::protocol::ObjectRef>,
     verb: &'static str,
+    op: crate::kube::protocol::OperationKind,
     send: impl Fn(&mut ClientSession, &crate::kube::protocol::ObjectRef) -> anyhow::Result<()>,
 ) {
     use crate::app::BatchTracker;
@@ -667,7 +612,7 @@ fn dispatch_batch(
         .data_store()
         .map(std::sync::Arc::downgrade)
         .unwrap_or_default();
-    let mut tracker = BatchTracker::new(verb, noun, rid, &live, skipped, store);
+    let mut tracker = BatchTracker::new(verb, noun, rid, &live, skipped, store, op);
 
     for item in &live {
         // A send failure is this item's result (recorded, loop continues)
@@ -716,15 +661,15 @@ fn handle_confirm_action(
             // via the tracker; failures keep theirs so the user can retry
             // exactly the failed set.
             crate::app::PendingAction::BatchDelete(batch) => {
-                dispatch_batch(app, data_source, batch, "Deleted", |ds, t| ds.delete(t));
+                dispatch_batch(app, data_source, batch, "Deleted", crate::kube::protocol::OperationKind::Delete, |ds, t| ds.delete(t));
             }
             crate::app::PendingAction::BatchRestart(batch) => {
-                dispatch_batch(app, data_source, batch, "Restarted", |ds, t| ds.restart(t));
+                dispatch_batch(app, data_source, batch, "Restarted", crate::kube::protocol::OperationKind::Restart, |ds, t| ds.restart(t));
             }
             crate::app::PendingAction::BatchForceKill(batch) => {
                 // Namespaces were validated at capture (before the dialog
                 // ever opened) and are immutable on the captured refs.
-                dispatch_batch(app, data_source, batch, "Force-killed", |ds, t| ds.force_kill(t));
+                dispatch_batch(app, data_source, batch, "Force-killed", crate::kube::protocol::OperationKind::ForceKill, |ds, t| ds.force_kill(t));
             }
         }
     }
@@ -821,39 +766,18 @@ fn handle_filter_search(
             }
         }
         Action::SearchNext => {
-            let el = app.nav.top_mut();
-            if let crate::app::element::Element::ContentView(cv) = el {
-                let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
-                cv.state.next_match(visible);
-            } else if let Some(indices) = el.log_visible() {
-                if let Some(view) = el.log_view_mut() {
-                    let current_scroll = view.scroll;
-                    if let Some(&next_idx) = indices.iter().find(|&&idx| idx > current_scroll) {
-                        view.scroll = next_idx;
-                        view.follow = false;
-                    } else if let Some(&first) = indices.first() {
-                        view.scroll = first;
-                        view.follow = false;
-                    }
-                }
+            // Detail views (yaml/describe) only. Logs have no separate search —
+            // their `/` grep IS the filter — and the old log branch compared a
+            // logical line index against a PHYSICAL wrap-offset (broken under
+            // wrap, and already muddled with filters); n/N is unbound in logs.
+            if let crate::app::element::Element::ContentView(cv) = app.nav.top_mut() {
+                cv.state.next_match();
             }
         }
         Action::SearchPrev => {
-            let el = app.nav.top_mut();
-            if let crate::app::element::Element::ContentView(cv) = el {
-                let visible = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(DEFAULT_TERMINAL_HEIGHT).saturating_sub(CONTENT_CHROME_LINES);
-                cv.state.prev_match(visible);
-            } else if let Some(indices) = el.log_visible() {
-                if let Some(view) = el.log_view_mut() {
-                    let current_scroll = view.scroll;
-                    if let Some(&prev_idx) = indices.iter().rev().find(|&&idx| idx < current_scroll) {
-                        view.scroll = prev_idx;
-                        view.follow = false;
-                    } else if let Some(&last) = indices.last() {
-                        view.scroll = last;
-                        view.follow = false;
-                    }
-                }
+            // Detail views only — see SearchNext. The log n/N branch was removed.
+            if let crate::app::element::Element::ContentView(cv) = app.nav.top_mut() {
+                cv.state.prev_match();
             }
         }
         Action::SearchClear => {
@@ -880,16 +804,8 @@ fn handle_log_action(
 
     match action {
         Action::ToggleLogFollow => {
-            let total = app.nav.top_mut().log_visible().map(|v| v.len()).unwrap_or(0);
             if let Some(view) = app.nav.top_mut().log_view_mut() {
-                view.follow = !view.follow;
-                if view.follow {
-                    view.scroll = total.saturating_sub(1);
-                } else {
-                    let (_, rows) = crossterm::terminal::size().unwrap_or((80, DEFAULT_TERMINAL_HEIGHT as u16));
-                    let visible = (rows as usize).saturating_sub(LOG_CHROME_LINES);
-                    view.scroll = total.saturating_sub(visible);
-                }
+                view.viewport.toggle_follow();
             }
         }
         Action::ToggleLogWrap => {
@@ -1016,7 +932,7 @@ fn handle_drill(
             }
         }
         Action::UsedBy => {
-            if let Some(info) = get_selected_resource_info(app) {
+            if let Some(info) = require_selected(app) {
                 let name = info.name.clone();
                 let kind = info.resource.display_label().to_string();
                 // A pods list (scoped by the selector at construction) plus
@@ -1162,24 +1078,6 @@ fn handle_io(
                         (joined, format!("Copied {} lines to clipboard", count))
                     }
                 }
-                Element::ContextList(c) => {
-                    if c.table.items().is_empty() {
-                        (String::new(), String::new())
-                    } else {
-                        let mut lines = vec!["CURRENT\tNAME\tCLUSTER".to_string()];
-                        for ctx in c.table.items() {
-                            let marker = if ctx.is_current { "*" } else { "" };
-                            let cluster = if ctx.identity.cluster.is_empty() {
-                                ctx.name.as_str()
-                            } else {
-                                &ctx.identity.cluster
-                            };
-                            lines.push(format!("{}\t{}\t{}", marker, ctx.name, cluster));
-                        }
-                        let count = c.table.items().len();
-                        (lines.join("\n"), format!("Copied {} contexts to clipboard", count))
-                    }
-                }
                 _ => {
                     let dump = build_table_dump(app);
                     if dump.is_empty() {
@@ -1254,11 +1152,15 @@ fn handle_show_port_forwards(app: &mut App, data_source: &mut ClientSession) {
 fn handle_refresh(app: &mut App, data_source: &mut ClientSession) {
     use crate::app::element::{ContentSpec, Element};
 
-    // Inside a describe/yaml element: re-fetch ITS OWN target directly.
+    // Inside a content element: re-issue ITS OWN fetch directly — each
+    // kind re-runs its own operation (a decoded secret re-DECODES; the old
+    // Describe-labeled decode view re-described here, silently replacing
+    // the decoded bytes with plain describe text).
     if let Element::ContentView(cv) = app.nav.top_mut() {
         let result = match &cv.kind {
             ContentSpec::Describe(target) => Some(data_source.describe(target)),
             ContentSpec::Yaml(target) => Some(data_source.yaml(target)),
+            ContentSpec::DecodedSecret(target) => Some(data_source.decode_secret(target)),
             ContentSpec::Aliases => None,
         };
         if let Some(result) = result {
@@ -1267,7 +1169,7 @@ fn handle_refresh(app: &mut App, data_source: &mut ClientSession) {
                 Ok(()) => {
                     if let Element::ContentView(cv) = app.nav.top_mut() {
                         cv.state = crate::app::ContentViewState::default();
-                        cv.awaiting_response = true;
+                        cv.phase = crate::app::element::ContentPhase::Fetching;
                     }
                     app.ui.flash = Some(crate::app::FlashMessage::info("Refreshing..."));
                 }
@@ -1316,7 +1218,11 @@ fn handle_show_aliases(app: &mut App) {
     let mut state = crate::app::ContentViewState::default();
     state.set_content(content);
     app.nav.push(crate::app::element::Element::ContentView(
-        crate::app::element::ContentView::new(crate::app::element::ContentSpec::Aliases, state, false),
+        crate::app::element::ContentView::new(
+            crate::app::element::ContentSpec::Aliases,
+            state,
+            crate::app::element::ContentPhase::Ready,
+        ),
     ));
 }
 
@@ -1343,15 +1249,6 @@ pub(crate) fn handle_enter(
     // Derived view Enter: open logs for the selected container.
     if app.nav.top().derived_kind().is_some() {
         open_logs_from_derived(app, data_source, false);
-        return ActionResult::None;
-    }
-
-    // Handle context-picker Enter: switch to the selected context.
-    if let crate::app::element::Element::ContextList(c) = app.nav.top() {
-        if let Some(ctx) = c.table.selected_item() {
-            let ctx_name = ctx.name.clone();
-            begin_context_switch(app, data_source, &ctx_name);
-        }
         return ActionResult::None;
     }
 
@@ -1414,6 +1311,13 @@ pub(crate) fn handle_enter(
     match row.drill_target.clone() {
         Some(DrillTarget::PodsInNamespace(ns)) => {
             drill_to_pods_in_namespace(app, data_source, ns);
+        }
+        Some(DrillTarget::SwitchContext(name)) => {
+            // Not a drill: the nav stack below belongs to the context we are
+            // leaving. `begin_context_switch` defers the `nav.reset` to the
+            // point the switch is CONFIRMED, so a failed switch leaves the
+            // user on the picker instead of a wiped view of nowhere.
+            begin_context_switch(app, &name);
         }
         Some(DrillTarget::BrowseCrd(crd_ref)) => {
             let kind_label = crd_ref.kind.clone();
@@ -1496,15 +1400,15 @@ pub(crate) fn handle_describe(
     app: &mut App,
     data_source: &mut ClientSession,
 ) {
-    use crate::app::element::{ContentSpec, ContentView, Element};
-    if let Some(info) = get_selected_resource_info(app) {
+    use crate::app::element::{ContentPhase, ContentSpec, ContentView, Element};
+    if let Some(info) = require_selected(app) {
         if let Some(lines) = app.kube.kubectl_cache.get_describe_lines(&info) {
             let mut state = crate::app::ContentViewState::default();
             state.set_describe_lines(lines);
             app.nav.push(Element::ContentView(ContentView::new(
                 ContentSpec::Describe(info),
                 state,
-                false,
+                ContentPhase::Ready,
             )));
             return;
         }
@@ -1513,7 +1417,7 @@ pub(crate) fn handle_describe(
         app.nav.push(Element::ContentView(ContentView::new(
             ContentSpec::Describe(info),
             crate::app::ContentViewState::default(),
-            true,
+            ContentPhase::Fetching,
         )));
     }
 }
@@ -1522,15 +1426,15 @@ pub(crate) fn handle_yaml(
     app: &mut App,
     data_source: &mut ClientSession,
 ) {
-    use crate::app::element::{ContentSpec, ContentView, Element};
-    if let Some(info) = get_selected_resource_info(app) {
+    use crate::app::element::{ContentPhase, ContentSpec, ContentView, Element};
+    if let Some(info) = require_selected(app) {
         if let Some(cached) = app.kube.kubectl_cache.get(&info, crate::app::ContentKind::Yaml) {
             let mut state = crate::app::ContentViewState::default();
             state.set_content(cached.to_string());
             app.nav.push(Element::ContentView(ContentView::new(
                 ContentSpec::Yaml(info),
                 state,
-                false,
+                ContentPhase::Ready,
             )));
             return;
         }
@@ -1539,7 +1443,7 @@ pub(crate) fn handle_yaml(
         app.nav.push(Element::ContentView(ContentView::new(
             ContentSpec::Yaml(info),
             crate::app::ContentViewState::default(),
-            true,
+            ContentPhase::Fetching,
         )));
     }
 }
@@ -1585,7 +1489,7 @@ fn open_logs(
         return;
     }
 
-    let Some(info) = get_selected_resource_info(app) else { return; };
+    let Some(info) = require_selected(app) else { return; };
     let name = info.name.clone();
     let namespace_typed = info.namespace.clone();
     let namespace_display = namespace_typed.display().to_string();
@@ -1786,6 +1690,19 @@ pub(crate) fn build_form_from_schema(
     })
 }
 
+/// The row under the cursor for a SELECTION-DRIVEN action, or an honest
+/// flash when there is none (empty view / non-resource top). Every
+/// keypress that names a single target routes here — a miss must say so,
+/// not silently swallow the key.
+pub(crate) fn require_selected(app: &mut App) -> Option<ObjectRef> {
+    let info = get_selected_resource_info(app);
+    if info.is_none() {
+        app.ui.flash =
+            Some(crate::app::FlashMessage::warn("No resource selected".to_string()));
+    }
+    info
+}
+
 pub(crate) fn get_selected_resource_info(app: &App) -> Option<ObjectRef> {
     use crate::kube::protocol::Namespace;
 
@@ -1945,9 +1862,12 @@ pub(crate) fn drill_to_pods_in_namespace(
 }
 
 /// Begin a context switch.
+/// Takes no `ClientSession`: a switch only *requests* one. The main loop's
+/// rebuild choke point is what drops the old session and builds the new one,
+/// so this function is pure app-state mutation — which is also what makes the
+/// whole switch FLOW testable without a daemon.
 pub(crate) fn begin_context_switch(
     app: &mut App,
-    _data_source: &mut ClientSession,
     ctx_name: &crate::kube::protocol::ContextName,
 ) {
     if !app.kube.context_switch.is_stable() {
@@ -1957,20 +1877,30 @@ pub(crate) fn begin_context_switch(
         return;
     }
 
-    // All core data belongs to the old cluster; elements drop with the
-    // stack reset (their streams RST; the new root's stream binds to the
-    // NEW session after the rebuild via the revive path).
-    app.core.clear();
-    app.kube.context = ctx_name.clone();
-    app.kube.selected_ns = crate::kube::protocol::Namespace::All;
-    app.kube.identity = app.data.contexts.items().iter()
-        .find(|c| c.name == *ctx_name)
-        .map(|ctx| ctx.identity.clone())
-        .unwrap_or_default();
-    // Land on the Overview root for the new context (matching the old
-    // Route::Overview landing) — no resource watch opens until the user
-    // navigates to one.
-    app.nav.reset(crate::app::element::Element::Overview(crate::app::element::Overview));
+    // `app.kube.context` / `identity` are NOT set here — they mean "last
+    // CONFIRMED", updated only by `ConnectionEstablished`; the target being
+    // switched TO lives in `context_switch` (below). This keeps the previous
+    // good context available for the fallback. See `ContextSwitchState`.
+    app.conn.switch_requested();
+    // Land on home NOW, not when the connection completes.
+    //
+    // A context switch is a ROOT-level change: everything on the stack
+    // describes a cluster you have just asked to leave, and sitting on
+    // "pods (prod)" while staging connects is the same disorientation as
+    // sitting on the picker after you have already picked. Every entry point
+    // does this — `:ctx <name>`, Enter on a context row — so the two can't
+    // drift apart again.
+    //
+    // The teardown used to be deferred here so a FAILED switch could put you
+    // back on your previous view. That is the cost: a failure now leaves you
+    // on the fallback context's home with the error flash, rather than the
+    // exact view you left. Worth it — the deferral bought one rare case and
+    // charged for it on every switch. `core.clear()` and the namespace reset
+    // still wait for confirmation (see `dispatch_app_event`), because unlike
+    // the nav stack they would blank chrome the fallback still needs.
+    app.nav.reset(crate::app::element::Element::Overview(
+        crate::app::element::Overview,
+    ));
     app.kube.kubectl_cache.clear();
     app.ui.confirm_dialog = None;
     app.ui.form_dialog = None;
@@ -2005,10 +1935,11 @@ pub(crate) fn do_switch_namespace(
 ) {
     app.kube.selected_ns = ns.clone();
 
-    if app.current_tab_is_cluster_scoped() {
-        return;
-    }
-
+    // Rebuild unconditionally — identical to the `:<res> <ns>` command path.
+    // For a cluster-scoped tab the daemon forces effective_ns=All, so the
+    // rebuild yields byte-identical data; the old early-return here made `0`
+    // (all-namespaces) a silent no-op on cluster-scoped tabs — including CRDs
+    // that resolve to Cluster scope — while the equivalent command still worked.
     app.ui.confirm_dialog = None;
     app.ui.form_dialog = None;
     app.ui.overlay = None;
@@ -2022,7 +1953,8 @@ pub(crate) fn do_switch_namespace(
         Some(crate::app::nav::RootSpec::Resource(r)) => r,
         None => rid(BuiltInKind::Pod),
     };
-    let root = App::root_list_element(data_source, &app.kube.metrics, root_rid, ns.clone());
+    let root = App::root_list_element(data_source, &app.kube.metrics,
+                &app.core, root_rid, ns.clone());
     app.nav.reset(root);
 
     app.ui.flash = Some(crate::app::FlashMessage::info(format!(

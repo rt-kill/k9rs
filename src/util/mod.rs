@@ -324,6 +324,50 @@ fn push_ansi_text<'a>(
     }
 }
 
+/// If `bytes[i]` begins an ANSI escape, return the index just past the WHOLE
+/// escape (which contributes zero display columns); otherwise `None` (`bytes[i]`
+/// begins a visible character). THE single source of truth for "what is an
+/// escape": [`parse_ansi_line`] (the renderer) and the log wrap-height counter
+/// (`log_view::wrap_feed`) both tokenize through this, so their visible-width
+/// accounting cannot drift — and a divergence here silently reintroduces the
+/// "wrap mode can't scroll to the last line" bug.
+pub(crate) fn skip_ansi_escape(bytes: &[u8], i: usize) -> Option<usize> {
+    let len = bytes.len();
+    if bytes.get(i) != Some(&0x1b) {
+        return None;
+    }
+    if bytes.get(i + 1) == Some(&b'[') {
+        // CSI: ESC '[' <params> <final byte in 0x40..=0x7E>. The final-byte range
+        // is ASCII, so `j` only ever stops on an ASCII (char-boundary) byte.
+        let mut j = i + 2;
+        while j < len && !(0x40..=0x7E).contains(&bytes[j]) {
+            j += 1;
+        }
+        Some((j + 1).min(len)) // also consume the final byte
+    } else {
+        // Any other escape (including the OSC opener `ESC ]`): drop ESC + the
+        // next CHARACTER. Advance by that char's full UTF-8 length (not a fixed
+        // +2) so the returned index is always a char boundary — a fixed +2 lands
+        // mid-char for `ESC` + a multibyte glyph and panics the callers' slices.
+        match bytes.get(i + 1) {
+            None => Some(len),
+            Some(&lead) => Some((i + 1 + utf8_char_len(lead)).min(len)),
+        }
+    }
+}
+
+/// Byte length (1–4) of the UTF-8 char beginning with lead byte `b`. Used to
+/// step past a whole char after a bare ESC without splitting it.
+fn utf8_char_len(b: u8) -> usize {
+    match b {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1, // continuation/invalid lead — can't follow ESC in valid UTF-8
+    }
+}
+
 /// Parse ANSI SGR escape sequences in a log line into ratatui Spans.
 /// Non-SGR escape sequences are stripped (not displayed). Text between
 /// escapes becomes a Span styled with the accumulated SGR state. Non-tab
@@ -342,32 +386,17 @@ pub fn parse_ansi_line<'a>(line: &'a str, base: ratatui::style::Style) -> Vec<ra
     let mut text_start = 0;
 
     while i < len {
-        if bytes[i] == 0x1b && i + 1 < len && bytes[i + 1] == b'[' {
-            // Flush text before this escape.
+        if let Some(next) = skip_ansi_escape(bytes, i) {
+            // Flush the visible run before this escape.
             if i > text_start {
                 push_ansi_text(&mut spans, &line[text_start..i], style);
             }
-            // Parse CSI sequence: ESC [ <params> <final byte>
-            i += 2; // skip ESC [
-            let param_start = i;
-            while i < len && !(bytes[i] >= 0x40 && bytes[i] <= 0x7E) {
-                i += 1;
+            // An SGR (`CSI … m`) updates the style; every other escape just
+            // vanishes. `next - 1` is the final byte (guaranteed ≥ i+2 for a CSI).
+            if bytes.get(i + 1) == Some(&b'[') && next > i + 2 && bytes[next - 1] == b'm' {
+                style = apply_sgr(&line[i + 2..next - 1], base, style);
             }
-            if i < len && bytes[i] == b'm' {
-                // SGR sequence — parse parameters and update style.
-                let params_str = &line[param_start..i];
-                style = apply_sgr(params_str, base, style);
-            }
-            // Skip the final byte (m, or whatever it is for non-SGR).
-            if i < len { i += 1; }
-            text_start = i;
-        } else if bytes[i] == 0x1b {
-            // Non-CSI escape — flush text, skip ESC + next byte (if any).
-            if i > text_start {
-                push_ansi_text(&mut spans, &line[text_start..i], style);
-            }
-            i += 1; // skip ESC
-            if i < len { i += 1; } // skip next byte if present
+            i = next;
             text_start = i;
         } else {
             i += 1;
@@ -377,9 +406,11 @@ pub fn parse_ansi_line<'a>(line: &'a str, base: ratatui::style::Style) -> Vec<ra
     if text_start < len {
         push_ansi_text(&mut spans, &line[text_start..], style);
     }
-    if spans.is_empty() {
-        push_ansi_text(&mut spans, line, base);
-    }
+    // A line that is ENTIRELY escapes has no visible content — return no spans
+    // (renders blank). Do NOT fall back to pushing the raw line here: that
+    // would render the escape bytes as text AND make the wrap-height count
+    // (which skips escapes via `skip_ansi_escape`) disagree with the render,
+    // reintroducing the "wrap mode can't reach the last line" bug.
     spans
 }
 
@@ -486,11 +517,6 @@ pub fn retry_jitter(seed: &[u8], attempt: u64) -> f64 {
         acc.wrapping_mul(31).wrapping_add(b as u64)
     });
     0.75 + (hash % 50) as f64 / 100.0
-}
-
-pub fn content_max_scroll(total_lines: usize, visible: usize) -> usize {
-    let base = total_lines.saturating_sub(visible);
-    if base > 0 { base + visible / 4 } else { 0 }
 }
 
 /// Truncate a string to fit within `max_width` display columns.
@@ -760,217 +786,5 @@ pub fn truncate(s: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Duration;
-
-    #[test]
-    fn sanitize_terminal_drops_escapes_keeps_tab() {
-        // The OSC 52 clipboard payload and a cursor-report both vanish.
-        assert_eq!(sanitize_terminal("a\x1b]52;c;Zm9v\x07b"), "a]52;c;Zm9vb");
-        assert_eq!(sanitize_terminal("x\x1b[6ny"), "x[6ny");
-        // Tab survives; CR/BEL/DEL/C1 do not.
-        assert_eq!(sanitize_terminal("a\tb\r\x07\x7f\u{0090}c"), "a\tbc");
-        // Plain text is unchanged.
-        assert_eq!(sanitize_terminal("pod-1 Running"), "pod-1 Running");
-    }
-
-    #[test]
-    fn parse_ansi_line_drops_non_tab_controls_from_text() {
-        // SGR coloring is preserved, but a raw CR/BEL in the text run is
-        // dropped so it can't reach the wrap-mode Paragraph render path.
-        let base = ratatui::style::Style::default();
-        let spans = parse_ansi_line("hi\rthere\x07", base);
-        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(joined, "hithere");
-        // A real SGR sequence still produces multiple styled spans.
-        let colored = parse_ansi_line("\x1b[31mred\x1b[0m", base);
-        let text: String = colored.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "red");
-    }
-
-    #[test]
-    fn test_format_age_none() {
-        assert_eq!(format_age(None), "<unknown>");
-    }
-
-    #[test]
-    fn test_format_age_seconds() {
-        let ts = Utc::now() - Duration::seconds(30);
-        assert_eq!(format_age(Some(ts)), "30s");
-    }
-
-    #[test]
-    fn test_format_age_minutes() {
-        let ts = Utc::now() - Duration::minutes(5) - Duration::seconds(10);
-        assert_eq!(format_age(Some(ts)), "5m10s");
-    }
-
-    #[test]
-    fn test_format_age_hours() {
-        let ts = Utc::now() - Duration::hours(3) - Duration::minutes(15);
-        assert_eq!(format_age(Some(ts)), "3h15m");
-    }
-
-    #[test]
-    fn test_format_age_days() {
-        let ts = Utc::now() - Duration::days(2) - Duration::hours(5);
-        assert_eq!(format_age(Some(ts)), "2d5h");
-    }
-
-    #[test]
-    fn test_format_cpu_nanocores() {
-        assert_eq!(format_cpu("250000000n"), "250m");
-    }
-
-    #[test]
-    fn test_format_cpu_millicores() {
-        assert_eq!(format_cpu("500m"), "500m");
-    }
-
-    #[test]
-    fn test_format_cpu_whole_cores() {
-        assert_eq!(format_cpu("2"), "2");
-    }
-
-    #[test]
-    fn test_format_mem_ki() {
-        assert_eq!(format_mem("131072Ki"), "128Mi");
-    }
-
-    #[test]
-    fn test_format_mem_mi() {
-        assert_eq!(format_mem("256Mi"), "256Mi");
-    }
-
-    #[test]
-    fn test_format_mem_gi() {
-        assert_eq!(format_mem("2Gi"), "2Gi");
-    }
-
-    #[test]
-    fn test_truncate_short() {
-        assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn test_truncate_exact() {
-        assert_eq!(truncate("hello", 5), "hello");
-    }
-
-    #[test]
-    fn test_truncate_long() {
-        let result = truncate("hello world", 8);
-        assert_eq!(result, "hello w\u{2026}");
-    }
-
-    #[test]
-    fn test_truncate_zero() {
-        assert_eq!(truncate("hello", 0), "");
-    }
-
-    // -- vim magic mode tests -------------------------------------------------
-
-    #[test]
-    fn vim_magic_literal_dash() {
-        let pat = SearchPattern::new("-wal");
-        assert!(pat.is_match("kube-wallet"));
-        assert!(!pat.is_match("firewall-proxy")); // wall-, not -wal
-    }
-
-    #[test]
-    fn vim_magic_dot_is_special() {
-        let pat = SearchPattern::new("foo.bar");
-        assert!(pat.is_match("foo-bar")); // . matches any char
-        assert!(pat.is_match("foo.bar"));
-    }
-
-    #[test]
-    fn vim_magic_star_is_special() {
-        let pat = SearchPattern::new("ng.*proxy");
-        assert!(pat.is_match("nginx-proxy"));
-        assert!(pat.is_match("ngproxy")); // .* matches zero chars
-    }
-
-    #[test]
-    fn vim_magic_parens_are_literal() {
-        let pat = SearchPattern::new("foo(bar)");
-        assert!(pat.is_match("foo(bar)"));
-        assert!(!pat.is_match("foobar")); // parens NOT a capture group
-    }
-
-    #[test]
-    fn vim_magic_plus_is_literal() {
-        let pat = SearchPattern::new("a+b");
-        assert!(pat.is_match("a+b"));
-        assert!(!pat.is_match("aab")); // + NOT a quantifier
-    }
-
-    #[test]
-    fn vim_magic_pipe_is_literal() {
-        let pat = SearchPattern::new("a|b");
-        assert!(pat.is_match("a|b"));
-        assert!(!pat.is_match("a")); // | NOT alternation
-        assert!(!pat.is_match("b"));
-    }
-
-    #[test]
-    fn vim_magic_question_is_literal() {
-        let pat = SearchPattern::new("a?b");
-        assert!(pat.is_match("a?b"));
-        assert!(!pat.is_match("ab")); // ? NOT optional
-        assert!(!pat.is_match("b"));
-    }
-
-    #[test]
-    fn vim_magic_escaped_pipe_is_alternation() {
-        let pat = SearchPattern::new(r"foo\|bar");
-        assert!(pat.is_match("foo"));
-        assert!(pat.is_match("bar"));
-        assert!(!pat.is_match("baz"));
-    }
-
-    #[test]
-    fn vim_magic_escaped_plus_is_quantifier() {
-        let pat = SearchPattern::new(r"ab\+c");
-        assert!(pat.is_match("abc"));
-        assert!(pat.is_match("abbc"));
-        assert!(!pat.is_match("ac")); // + requires at least one b
-    }
-
-    #[test]
-    fn vim_magic_escaped_parens_are_group() {
-        let pat = SearchPattern::new(r"\(foo\)\|bar");
-        assert!(pat.is_match("foo"));
-        assert!(pat.is_match("bar"));
-        assert!(!pat.is_match("baz"));
-    }
-
-    #[test]
-    fn vim_magic_escaped_question_is_optional() {
-        let pat = SearchPattern::new(r"colou\?r");
-        assert!(pat.is_match("color"));
-        assert!(pat.is_match("colour"));
-    }
-
-    #[test]
-    fn vim_magic_backslash_non_special_passes_through() {
-        let pat = SearchPattern::new(r"foo\dbar");
-        assert!(pat.is_match("foo7bar")); // \d is regex digit
-    }
-
-    #[test]
-    fn vim_magic_trailing_backslash() {
-        let pat = SearchPattern::new(r"foo\");
-        assert!(pat.is_match(r"foo\"));
-    }
-
-    #[test]
-    fn vim_magic_smartcase() {
-        let lower = SearchPattern::new("nginx");
-        assert!(lower.is_match("NGINX")); // case-insensitive
-        let upper = SearchPattern::new("Nginx");
-        assert!(!upper.is_match("nginx")); // case-sensitive
-        assert!(upper.is_match("Nginx"));
-    }
-}
+#[path = "../tests/util.rs"]
+mod tests;
