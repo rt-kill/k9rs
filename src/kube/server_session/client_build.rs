@@ -63,9 +63,75 @@ pub(super) async fn build_session_client(
         let config = config.clone();
         tokio::task::spawn_blocking(move || kube::Client::try_from(config))
             .await
-            .map_err(|e| anyhow::anyhow!("client build task panicked: {}", e))??
+            .map_err(|e| anyhow::anyhow!("client build task panicked: {}", e))?
+            .map_err(summarize_client_error)?
     };
     Ok((client, config))
+}
+
+/// Turn a `kube::Error` into something a human can act on.
+///
+/// kube-rs formats a failed credential plugin as
+/// `auth exec command '{cmd}' failed with status {status}: {out:?}` — where
+/// `cmd` is the command with its ENTIRE environment inlined (PATH, HOME,
+/// AWS_PROFILE, every nix store path) and `out` is a `Debug`-printed
+/// `Output`. The result is a several-thousand-character line whose only
+/// useful content is the plugin's own stderr, and which leaks the session's
+/// environment into the log.
+///
+/// So we match the TYPED variant and keep the part that says what to do:
+/// the plugin's stderr. Same boundary discipline as everywhere else —
+/// translate a foreign error into our own vocabulary at the point it enters,
+/// rather than passing its formatting through to the user.
+pub(super) fn summarize_client_error(err: kube::Error) -> anyhow::Error {
+    // Nothing is lost — the untouched chain is one `-v` away.
+    tracing::debug!("client build failed: {err:?}");
+    let kube::Error::Auth(kube::client::AuthError::AuthExecRun { cmd, out, .. }) = &err else {
+        return anyhow::Error::new(err);
+    };
+    // The plugin usually explains itself on stderr; fall back to stdout,
+    // then to the exit status, so this is never LESS informative.
+    let detail = first_nonempty([
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    ])
+    .unwrap_or_else(|| format!("exited with {}", out.status));
+
+    // `cmd` is env-prefixed; the program is the first token that isn't an
+    // `NAME=value` assignment.
+    let program = cmd
+        .split_whitespace()
+        .find(|tok| !tok.contains('='))
+        .unwrap_or("credential plugin")
+        .trim_matches('"');
+
+    match auth_hint(&detail) {
+        Some(hint) => anyhow::anyhow!("{program}: {detail} ({hint})"),
+        None => anyhow::anyhow!("{program}: {detail}"),
+    }
+}
+
+fn first_nonempty<const N: usize>(candidates: [String; N]) -> Option<String> {
+    candidates.into_iter().find(|c| !c.is_empty())
+}
+
+/// The one-line "so do this" for credential failures we recognise. Kept
+/// deliberately small: a wrong guess is worse than none, so anything
+/// unrecognised gets the plugin's own words and nothing else.
+fn auth_hint(detail: &str) -> Option<&'static str> {
+    let lower = detail.to_lowercase();
+    if lower.contains("sso") && (lower.contains("token") || lower.contains("session")) {
+        return Some("run `aws sso login`");
+    }
+    if lower.contains("expired") {
+        return Some("credentials expired — re-authenticate");
+    }
+    if lower.contains("could not connect to the endpoint")
+        || lower.contains("failed to resolve")
+    {
+        return Some("check your network / VPN");
+    }
+    None
 }
 
 /// Pin a session's credential environment into the kubeconfig it builds from,

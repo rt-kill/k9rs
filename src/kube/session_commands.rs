@@ -282,7 +282,6 @@ fn parse_crd_in_namespace(cmd: &str, app: &App) -> Option<(crate::app::CrdInfo, 
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use crate::app::InputMode;
 use crate::kube::client_session::ClientSession;
 use crate::kube::session::ds_try;
 use crate::kube::session_actions::do_switch_namespace;
@@ -296,15 +295,15 @@ pub(crate) fn handle_command_key(
     data_source: &mut ClientSession,
     event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
 ) -> bool {
-    if !matches!(app.ui.input_mode, InputMode::Command { .. }) {
+    if app.ui.command_input().is_none() {
         return false;
     }
     match key.code {
         KeyCode::Esc => {
-            app.ui.input_mode = InputMode::Normal;
+            app.ui.close_modal();
         }
         KeyCode::Enter => {
-            let raw_cmd = if let InputMode::Command { ref input, .. } = app.ui.input_mode {
+            let raw_cmd = if let Some((input, _)) = app.ui.command_input() {
                 input.trim().to_string()
             } else {
                 String::new()
@@ -316,7 +315,7 @@ pub(crate) fn handle_command_key(
                     app.command_history.remove(0);
                 }
             }
-            app.ui.input_mode = InputMode::Normal;
+            app.ui.close_modal();
             handle_command_submit(app, &raw_cmd, &cmd, data_source, event_tx);
         }
         KeyCode::Tab => {
@@ -324,7 +323,7 @@ pub(crate) fn handle_command_key(
         }
         KeyCode::Up => {
             if !app.command_history.is_empty() {
-                if let InputMode::Command { ref mut input, ref mut history_index } = app.ui.input_mode {
+                if let Some((input, history_index)) = app.ui.command_input_mut() {
                     let idx = match *history_index {
                         None => app.command_history.len() - 1,
                         Some(i) => i.saturating_sub(1),
@@ -335,7 +334,7 @@ pub(crate) fn handle_command_key(
             }
         }
         KeyCode::Down => {
-            if let InputMode::Command { ref mut input, ref mut history_index } = app.ui.input_mode {
+            if let Some((input, history_index)) = app.ui.command_input_mut() {
                 if let Some(idx) = *history_index {
                     if idx + 1 < app.command_history.len() {
                         *history_index = Some(idx + 1);
@@ -348,13 +347,13 @@ pub(crate) fn handle_command_key(
             }
         }
         KeyCode::Backspace => {
-            if let InputMode::Command { ref mut input, ref mut history_index } = app.ui.input_mode {
+            if let Some((input, history_index)) = app.ui.command_input_mut() {
                 input.pop();
                 *history_index = None;
             }
         }
         KeyCode::Char(c) => {
-            if let InputMode::Command { ref mut input, ref mut history_index } = app.ui.input_mode {
+            if let Some((input, history_index)) = app.ui.command_input_mut() {
                 input.push(c);
                 *history_index = None;
             }
@@ -389,7 +388,7 @@ fn handle_command_submit(
             app.should_quit = true;
         }
         ParsedCommand::Help => {
-            app.ui.overlay = Some(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() });
+            app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() }));
         }
         ParsedCommand::Aliases => {
             handle_action(
@@ -407,6 +406,14 @@ fn handle_command_submit(
         }
         ParsedCommand::NamespaceSwitch(ns) => {
             do_switch_namespace(app, data_source, ns);
+        }
+        ParsedCommand::Resource(rid) if !app.can_open_resource_view(&rid) => {
+            // Same hole Tab had: with no context this opens a subscription
+            // against a session that doesn't exist and `nav.reset`s the
+            // picker away, stranding the user on an empty table.
+            app.ui.flash = Some(crate::app::FlashMessage::warn(
+                "Select a context first".to_string(),
+            ));
         }
         ParsedCommand::Resource(rid) => {
             if rid.is_cluster_scoped() && !app.kube.selected_ns.is_all() {
@@ -511,36 +518,46 @@ pub(crate) fn handle_form_dialog_key(
     key: KeyEvent,
     data_source: &mut ClientSession,
 ) -> bool {
+    // A Ctrl chord is never text. Both `Char` arms below match on `key.code`
+    // alone, so without this Ctrl-C typed a literal `c` into the buffer
+    // instead of quitting — and the fall-through comment at the bottom cited
+    // Ctrl-C as the very thing it was preserving. Same rule the per-view
+    // handlers already follow: an unmatched Ctrl chord is nothing, never its
+    // bare character.
+    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        return false;
+    }
+
     use crate::app::FormFieldKind;
-    if app.ui.form_dialog.is_none() {
+    if app.ui.form_dialog().is_none() {
         return false;
     }
     match key.code {
         KeyCode::Esc => {
-            app.ui.form_dialog = None;
+            app.ui.close_modal();
         }
         KeyCode::Tab | KeyCode::Down => {
-            if let Some(ref mut d) = app.ui.form_dialog {
+            if let Some(d) = app.ui.form_dialog_mut() {
                 d.focus_next();
             }
         }
         KeyCode::BackTab | KeyCode::Up => {
-            if let Some(ref mut d) = app.ui.form_dialog {
+            if let Some(d) = app.ui.form_dialog_mut() {
                 d.focus_prev();
             }
         }
         KeyCode::Enter => {
-            let ok = app.ui.form_dialog.as_ref().is_some_and(|d| d.ok_focused());
+            let ok = app.ui.form_dialog().as_ref().is_some_and(|d| d.ok_focused());
             if ok {
-                if let Some(dialog) = app.ui.form_dialog.take() {
+                if let Some(dialog) = app.ui.take_modal().into_form() {
                     dispatch_form_submit(app, data_source, dialog);
                 }
-            } else if let Some(ref mut d) = app.ui.form_dialog {
+            } else if let Some(d) = app.ui.form_dialog_mut() {
                 d.focus_next();
             }
         }
         KeyCode::Left | KeyCode::Right => {
-            if let Some(ref mut d) = app.ui.form_dialog {
+            if let Some(d) = app.ui.form_dialog_mut() {
                 if let Some(field) = d.current_field_mut() {
                     if let FormFieldKind::Select { ref options, ref mut selected } = field.kind {
                         if !options.is_empty() {
@@ -556,7 +573,7 @@ pub(crate) fn handle_form_dialog_key(
             }
         }
         KeyCode::Backspace => {
-            if let Some(ref mut d) = app.ui.form_dialog {
+            if let Some(d) = app.ui.form_dialog_mut() {
                 if let Some(field) = d.current_field_mut() {
                     if field.is_text_input() {
                         field.value.pop();
@@ -565,7 +582,7 @@ pub(crate) fn handle_form_dialog_key(
             }
         }
         KeyCode::Char(c) => {
-            if let Some(ref mut d) = app.ui.form_dialog {
+            if let Some(d) = app.ui.form_dialog_mut() {
                 if let Some(field) = d.current_field_mut() {
                     let accept = match field.kind {
                         FormFieldKind::Text { max_len } => {
@@ -621,11 +638,16 @@ fn dispatch_form_submit(
 }
 
 /// Handle a keystroke while the nav filter bar is active. Returns true if consumed.
-pub(crate) fn handle_filter_key(
-    app: &mut App,
-    key: KeyEvent,
-    _data_source: &mut ClientSession,
-) -> bool {
+/// Takes no `ClientSession`: filtering is pure client-side state. The unused
+/// parameter it used to carry is the same shape that kept the context-switch
+/// flow untestable — an argument nothing reads still forces every test to
+/// build a live daemon connection.
+pub(crate) fn handle_filter_key(app: &mut App, key: KeyEvent) -> bool {
+    // A Ctrl chord is never text — see `handle_form_dialog_key`.
+    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        return false;
+    }
+
     if !app.nav.top().filter_input().active() {
         return false;
     }

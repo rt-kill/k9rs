@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::{UnixListener, UnixStream};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::protocol::{self, DaemonStatus, SessionCommand, SessionEvent};
 use super::server_session::{ServerSession, SessionSharedState};
@@ -109,7 +109,7 @@ pub async fn run_daemon() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
-    info!("k9rs cache daemon listening on {:?}", path);
+    info!(socket = ?path, "daemon listening");
 
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
@@ -153,11 +153,11 @@ pub async fn run_daemon() -> anyhow::Result<()> {
                         continue;
                     }
                 };
-                info!("New connection accepted");
+                debug!("connection accepted");
                 let conn_state = state.clone();
                 connections.spawn(async move {
                     if let Err(e) = handle_connection(stream, conn_state).await {
-                        info!("Connection ended: {}", e);
+                        debug!("connection ended: {e}");
                     }
                 });
             }
@@ -168,19 +168,19 @@ pub async fn run_daemon() -> anyhow::Result<()> {
             _ = discovery_sweep.tick() => {
                 let removed = state.session_shared.discovery_cache.sweep_stale(DISCOVERY_CACHE_TTL);
                 if removed > 0 {
-                    info!("Discovery cache: swept {} idle context(s)", removed);
+                    debug!("discovery cache: swept {removed} idle context(s)");
                 }
             }
             _ = sigterm.recv() => {
-                info!("Daemon received SIGTERM — shutting down");
+                info!("shutting down (SIGTERM)");
                 break;
             }
             _ = sigint.recv() => {
-                info!("Daemon received SIGINT — shutting down");
+                info!("shutting down (SIGINT)");
                 break;
             }
             _ = state.shutdown.notified() => {
-                info!("Daemon received shutdown request — shutting down");
+                info!("shutting down (requested)");
                 break;
             }
         }
@@ -189,12 +189,12 @@ pub async fn run_daemon() -> anyhow::Result<()> {
     // Abort any in-flight connections so we don't leak them across
     // process exit. Handlers that are mid-write to a TUI session will
     // see their substreams RST, which the TUI handles cleanly.
-    info!("Aborting {} in-flight connection(s)", connections.len());
+    debug!("aborting {} in-flight connection(s)", connections.len());
     connections.abort_all();
     while connections.join_next().await.is_some() {}
 
     let _ = std::fs::remove_file(&path);
-    info!("Daemon stopped");
+    info!("daemon stopped");
     Ok(())
 }
 
@@ -234,7 +234,7 @@ async fn handle_connection(
     match conn_type[0] {
         // Yamux-multiplexed TUI session.
         CONN_TYPE_SESSION => {
-            info!("Routing connection as yamux TUI session");
+            debug!("routing connection as yamux TUI session");
             let mux = crate::kube::mux::MuxedConnection::server(peek_stream);
             ServerSession::init_and_run_muxed(mux, state.session_shared.clone()).await;
         }

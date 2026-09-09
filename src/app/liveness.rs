@@ -20,8 +20,11 @@
 //! keep re-deriving a fact about the whole world.
 //!
 //! So: one value, computed once per frame from both hops, consulted by every
-//! data view. A new surface gets liveness by asking, and a new failure mode
-//! is added here — where every surface picks it up at once.
+//! view that paints LIVE data — tables, logs, the overview's counters, the
+//! header. (One-shot snapshots — yaml, describe — deliberately don't ask:
+//! they are a fetch, not a stream, and carry their own `ContentPhase`.) A new
+//! streaming surface gets liveness by asking, and a new failure mode is added
+//! here, where every surface picks it up at once.
 
 use crate::app::table::TableDataState;
 use crate::app::types::Connection;
@@ -117,10 +120,18 @@ impl Liveness {
     /// `Some` exactly when [`Self::shows_data`] is true but the data isn't
     /// live — the pairing that keeps "we showed stale rows" from ever being
     /// silent.
+    /// The reason text is CLUSTER-CONTROLLED (an apiserver `Status.message`
+    /// reaches here via `StreamEvent::Error`/`Stale`), and this string is
+    /// rendered into a `Block` title — a path that writes symbols verbatim,
+    /// unlike `Buffer::set_string`. Sanitising here, where the display string
+    /// is BUILT, means no render site has to know that; the receive boundary
+    /// cleans it too, but this is the last line and the one that travels with
+    /// the string.
     pub fn warning(&self) -> Option<String> {
+        use crate::util::sanitize_terminal as clean;
         match self {
-            Liveness::Stale(reason) => Some(format!("⚠ STALE — {}", reason)),
-            Liveness::Failed(err) => Some(format!("✗ ERROR — {}", err)),
+            Liveness::Stale(reason) => Some(format!("⚠ STALE — {}", clean(reason))),
+            Liveness::Failed(err) => Some(format!("✗ ERROR — {}", clean(err))),
             Liveness::Live | Liveness::Connecting | Liveness::Loading | Liveness::NoContext => None,
         }
     }
@@ -138,8 +149,9 @@ impl Liveness {
             Liveness::NoContext => "No context selected — pick one to connect.".to_string(),
             Liveness::Connecting => anim.bar("Connecting..."),
             Liveness::Loading => anim.bar("Loading..."),
-            Liveness::Failed(err) => format!("Error: {}", err),
-            Liveness::Stale(reason) => format!("Stale: {}", reason),
+            // Cluster-controlled; see `warning` above.
+            Liveness::Failed(err) => format!("Error: {}", crate::util::sanitize_terminal(err)),
+            Liveness::Stale(reason) => format!("Stale: {}", crate::util::sanitize_terminal(reason)),
             Liveness::Live => empty_label(),
         }
     }

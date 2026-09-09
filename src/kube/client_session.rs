@@ -100,9 +100,12 @@ pub struct ClientSession {
     /// Tracks fire-and-forget background tasks launched by TUI action
     /// handlers (copy-to-clipboard, save-table). Mirrors
     /// `ServerSession::pending_tasks` on the server side. On
-    /// `ClientSession::drop` these are aborted via the JoinSet's built-in
-    /// abort-on-drop behavior, preventing clipboard tools from outliving
-    /// the TUI process.
+    /// `ClientSession::drop` the JoinSet aborts them. NOTE the limit: these
+    /// tasks delegate to `spawn_blocking`, and a blocking closure is not
+    /// cancellable — aborting drops the `JoinHandle` while the closure runs
+    /// on to completion. So this bounds the async half only; a clipboard
+    /// helper that never exits would still hold the runtime at shutdown.
+    /// (`pbcopy`/`wl-copy`/`xclip` all fork and exit, so it has not bitten.)
     pending_tasks: tokio::task::JoinSet<()>,
 }
 
@@ -1054,7 +1057,9 @@ impl ClientSession {
                         }).await;
                         return;
                     }
-                    tracing::warn!("subscription bridge init failed for {}: {}, retrying", rid.plural(), e);
+                    // Routine: the bridge retries and the next attempt usually
+                    // lands. The ceiling path below is what warns.
+                    tracing::debug!(resource = %rid.plural(), "subscription init failed, retrying: {e}");
                     continue;
                 }
                 // Init sent successfully — the force (if any) has done its
@@ -1114,6 +1119,15 @@ impl ClientSession {
                             AppEvent::ResourceResolved { original, resolved }
                         }
                         protocol::StreamEvent::Stale(reason) => {
+                            // Cluster-controlled text (the apiserver's
+                            // `Status.message` rides this) — clean it HERE,
+                            // on receipt, not at each render site. It reaches
+                            // `Liveness::warning()` and from there a `Block`
+                            // TITLE, and ratatui writes title/`Span` symbols
+                            // verbatim; only `Buffer::set_string`/`set_line`
+                            // filter. Sanitising at the boundary means a new
+                            // render sink can't reintroduce the hole.
+                            let reason = crate::util::sanitize_terminal(&reason);
                             // The CLUSTER hop broke, not this one: the
                             // substream is healthy and delivered this frame,
                             // so it is progress for backoff — but it is the
@@ -1138,6 +1152,8 @@ impl ClientSession {
                             })
                         }
                         protocol::StreamEvent::Error(msg) => {
+                            // Same boundary rule as `Stale` above.
+                            let msg = crate::util::sanitize_terminal(&msg);
                             // Server-side subscription error (RBAC denied, CRD
                             // missing, ...). The bridge re-probes on retry, so it
                             // self-heals once the cause is fixed — but a PERMANENT
@@ -1311,6 +1327,15 @@ async fn reader_loop(
 /// they flow on per-subscription yamux substreams via `StreamEvent` and
 /// are converted inside the per-subscription bridge task in
 /// `subscribe_stream`.
+/// Clean cluster-controlled text out of an operation result. Both arms:
+/// an apiserver `Status.message` can arrive on either.
+fn sanitize_result(result: Result<String, String>) -> Result<String, String> {
+    match result {
+        Ok(m) => Ok(crate::util::sanitize_terminal(&m)),
+        Err(m) => Err(crate::util::sanitize_terminal(&m)),
+    }
+}
+
 fn convert_session_event(event: SessionEvent, current_context: &crate::kube::protocol::ContextName) -> Vec<AppEvent> {
     match event {
         SessionEvent::DescribeResult { target, lines } => {
@@ -1327,15 +1352,17 @@ fn convert_session_event(event: SessionEvent, current_context: &crate::kube::pro
         SessionEvent::CommandResult(result) => {
             // Management/command-level acknowledgment (no target) — the
             // TUI just flashes it. Target-ed operation results arrive as
-            // `OpResult` below.
-            vec![AppEvent::CommandResult(result)]
+            // `OpResult` below. Sanitised for the same reason as the stream
+            // errors: this is cluster-controlled text, and which renderer it
+            // reaches should not be what decides whether it is safe.
+            vec![AppEvent::CommandResult(sanitize_result(result))]
         }
 
         SessionEvent::OpResult { op, target, result } => {
             // Typed pass-through: the event loop correlates by (op, target)
             // — the edit flow reacts only to its own apply, a batch tracker
             // consumes its own operation's results, everything else flashes.
-            vec![AppEvent::OpResult { op, target, result }]
+            vec![AppEvent::OpResult { op, target, result: sanitize_result(result) }]
         }
 
         SessionEvent::Discovery { context: ctx, namespaces, crds } => {
@@ -1358,7 +1385,7 @@ fn convert_session_event(event: SessionEvent, current_context: &crate::kube::pro
         }
 
         SessionEvent::SessionError(message) => {
-            vec![AppEvent::Flash(FlashMessage::error(message))]
+            vec![AppEvent::Flash(FlashMessage::error(crate::util::sanitize_terminal(&message)))]
         }
 
         // Ready and DaemonStatus are handled during handshake / by ctl, not in the reader loop.

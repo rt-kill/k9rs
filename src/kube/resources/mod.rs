@@ -67,10 +67,10 @@ pub mod leases;
 pub mod priorityclasses;
 pub mod webhooks;
 
-/// The contract for anything that can live inside a `StatefulTable`. The
-/// only implementor is `ResourceRow`; this trait is the bound used by
-/// generic table machinery (`StatefulTable<T>`, `live_query`'s sort
-/// helpers) so they don't have to depend on the concrete row type.
+/// The row contract the derivation machinery reads through: cells, name,
+/// namespace. The only implementor is `ResourceRow`; the trait exists so
+/// [`crate::app::store::derive_view`] and the sort/filter helpers don't have
+/// to name the concrete row type.
 pub trait KubeResource: Clone + std::fmt::Debug + Send + Sync + 'static {
     /// The typed cell values for this row, in header order.
     fn cells(&self) -> &[row::CellValue];

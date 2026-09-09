@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-use crate::app::{App, ContainerRef, InputMode};
+use crate::app::{App, ContainerRef};
 use crate::app::nav::rid;
 use crate::event::AppEvent;
 use crate::kube::client_session::ClientSession;
@@ -42,21 +42,37 @@ pub(crate) fn handle_action(
             // ONE undo path: close the overlay if any, else pop the top
             // element (reviving its data if the subscription died while
             // covered). At the root: no-op.
-            if app.ui.overlay.is_some() {
-                app.ui.overlay = None;
+            if app.ui.overlay().is_some() {
+                app.ui.close_modal();
             } else if app.nav.pop().is_some() {
                 app.nav.ensure_top_live(data_source);
             }
         }
         Action::Help => {
-            if matches!(app.ui.overlay, Some(crate::app::Overlay::Help { .. })) {
-                app.ui.overlay = None;
+            if matches!(app.ui.overlay(), Some(crate::app::Overlay::Help { .. })) {
+                app.ui.close_modal();
             } else {
-                app.ui.overlay = Some(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() });
+                app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() }));
             }
         }
 
         // --- Tab switching ---
+        //
+        // Refused with no context: every resource root would open a
+        // subscription against a session that doesn't exist, landing the user
+        // on a permanently empty table — and, because it `nav.reset`s, taking
+        // the picker with it. The picker is the ROOT precisely so it can't be
+        // escaped; Tab was walking around that.
+        Action::NextTab | Action::PrevTab
+            if matches!(
+                crate::app::Liveness::of_link(&app.conn),
+                crate::app::Liveness::NoContext
+            ) =>
+        {
+            app.ui.flash = Some(crate::app::FlashMessage::warn(
+                "Select a context first".to_string(),
+            ));
+        }
         Action::NextTab => {
             let new_rid = app.next_tab();
             let root = App::root_list_element(
@@ -103,9 +119,9 @@ pub(crate) fn handle_action(
 
         // --- Confirmation dialog ---
         Action::Confirm => return handle_confirm_action(app, data_source),
-        Action::Cancel => { app.ui.confirm_dialog = None; }
+        Action::Cancel => { app.ui.close_modal(); }
         Action::ToggleDialogButton => {
-            if let Some(ref mut dialog) = app.ui.confirm_dialog {
+            if let Some(dialog) = app.ui.confirm_dialog_mut() {
                 dialog.action_focused = !dialog.action_focused;
             }
         }
@@ -138,7 +154,7 @@ pub(crate) fn handle_action(
         Action::SwitchNamespace(ns) => do_switch_namespace(app, data_source, ns),
         Action::SwitchContext(ctx) => begin_context_switch(app, &ctx),
         Action::CommandMode => {
-            app.ui.input_mode = InputMode::Command { input: String::new(), history_index: None };
+            app.ui.open(crate::app::Modal::Command { input: String::new(), history_index: None });
         }
         Action::Sort(target) => app.sort_by(target),
         Action::ToggleSortDirection => app.toggle_sort_direction(),
@@ -196,13 +212,12 @@ pub(crate) fn handle_action(
             if !app.current_capabilities().supports(crate::kube::protocol::OperationKind::PortForward) {
                 return ActionResult::None;
             }
-            let schema = crate::kube::protocol::OperationKind::PortForward.form_schema()
-                .expect("PortForward always has a form schema");
+            let schema = &crate::kube::protocol::FormSchema::PORT_FORWARD;
             let row = app.nav.top().selected_row();
             let headers = app.nav.top().headers_snapshot();
             if let Some(info) = get_selected_resource_info(app) {
                 if let Some(dialog) = build_form_from_schema(schema, crate::kube::protocol::OperationKind::PortForward, info, row.as_ref(), &headers) {
-                    app.ui.form_dialog = Some(dialog);
+                    app.ui.open(crate::app::Modal::Form(dialog));
                 } else {
                     app.ui.flash = Some(crate::app::FlashMessage::error(
                         "No target found for port-forward".to_string()
@@ -233,7 +248,7 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
     use crate::app::Overlay;
 
     // Overlays capture scroll keys first (help sheet, container picker).
-    match (&mut app.ui.overlay, &action) {
+    match (app.ui.overlay_mut(), &action) {
         (Some(Overlay::Help { viewport }), a) => {
             match a {
                 Action::NextItem => viewport.line_down(1),
@@ -375,14 +390,14 @@ fn handle_resource_op(
                         crate::kube::protocol::Namespace::from_row(&pod_ns),
                     );
                     if containers.len() > 1 {
-                        app.ui.confirm_dialog = None;
-                        app.ui.form_dialog = None;
-                        app.ui.overlay = Some(crate::app::Overlay::ContainerSelect {
+                        app.ui.close_modal();
+                        app.ui.close_modal();
+                        app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::ContainerSelect {
                             target,
                             containers: containers.clone(),
                             selected: 0,
                             action: crate::app::ContainerAction::Shell,
-                        });
+                        }));
                     } else {
                         let container = containers.first().map(|c| c.name.clone()).unwrap_or_default();
                         return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget::Pod {
@@ -400,58 +415,57 @@ fn handle_resource_op(
         // semantics (or, stale-frame-wise, single semantics).
         Action::Delete => {
             if let Some(info) = require_selected(app) {
-                app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
+                app.ui.open(crate::app::Modal::Confirm(crate::app::ConfirmDialog {
                     message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Delete".to_string(),
                     pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::Delete, target: info },
                     action_focused: false,
-                });
+                }));
             }
         }
         Action::Edit => {
-            if matches!(app.ui.overlay, Some(crate::app::Overlay::Edit { .. })) {
+            if matches!(app.ui.overlay(), Some(crate::app::Overlay::Edit { .. })) {
                 app.ui.flash = Some(crate::app::FlashMessage::warn("Edit already in progress".to_string()));
                 return ActionResult::None;
             }
             if let Some(info) = require_selected(app) {
                 ds_try!(app, data_source.yaml(&info));
-                app.ui.confirm_dialog = None;
-                app.ui.form_dialog = None;
-                app.ui.overlay = Some(crate::app::Overlay::Edit {
+                app.ui.close_modal();
+                app.ui.close_modal();
+                app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Edit {
                     target: info,
                     state: crate::app::EditState::AwaitingYaml,
-                });
+                }));
             }
         }
         Action::Scale => {
             if let Some(info) = require_selected(app) {
-                let schema = crate::kube::protocol::OperationKind::Scale.form_schema()
-                    .expect("Scale always has a form schema");
+                let schema = &crate::kube::protocol::FormSchema::SCALE;
                 let row = app.nav.top().selected_row();
                 let headers = app.nav.top().headers_snapshot();
                 if let Some(dialog) = build_form_from_schema(schema, crate::kube::protocol::OperationKind::Scale, info, row.as_ref(), &headers) {
-                    app.ui.form_dialog = Some(dialog);
+                    app.ui.open(crate::app::Modal::Form(dialog));
                 }
             }
         }
         Action::Restart => {
             if let Some(info) = require_selected(app) {
-                app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
+                app.ui.open(crate::app::Modal::Confirm(crate::app::ConfirmDialog {
                     message: format!("Restart {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Restart".to_string(),
                     pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::Restart, target: info },
                     action_focused: false,
-                });
+                }));
             }
         }
         Action::ForceKill => {
             if let Some(info) = require_selected(app) {
-                app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
+                app.ui.open(crate::app::Modal::Confirm(crate::app::ConfirmDialog {
                     message: format!("Force-kill {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Force Kill".to_string(),
                     pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::ForceKill, target: info },
                     action_focused: false,
-                });
+                }));
             }
         }
         Action::DecodeSecret => {
@@ -539,12 +553,12 @@ pub(crate) fn handle_batch_op(app: &mut App, action: crate::app::actions::Action
         _ => return,
     };
 
-    app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
+    app.ui.open(crate::app::Modal::Confirm(crate::app::ConfirmDialog {
         message: batch_confirm_message(verb, &targets),
         action_label: label.to_string(),
         pending,
         action_focused: false,
-    });
+    }));
 }
 
 /// The batch confirm text names its targets — marks live on the shared
@@ -639,7 +653,7 @@ fn handle_confirm_action(
     app: &mut App,
     data_source: &mut ClientSession,
 ) -> ActionResult {
-    if let Some(dialog) = app.ui.confirm_dialog.take() {
+    if let Some(dialog) = app.ui.take_modal().into_confirm() {
         app.kube.kubectl_cache.clear();
         match dialog.pending {
             crate::app::PendingAction::Single { op: crate::app::SingleOp::Delete, ref target } => {
@@ -710,15 +724,17 @@ fn handle_filter_search(
         }
         Action::ClearFilter => {
             // Esc, unified: cancel a draft → close the overlay → pop the
-            // top element. First press pops; marks are never touched.
+            // top element. This handler never touches marks — in select mode
+            // `select_gate` has already shadowed Esc into `ClearMarks`, so
+            // reaching here at all means the mode is off.
             if let Some(view) = app.nav.top_mut().log_view_mut() {
                 if view.is_filtering() {
                     view.draft = None;
                     return;
                 }
             }
-            if app.ui.overlay.is_some() {
-                app.ui.overlay = None;
+            if app.ui.overlay().is_some() {
+                app.ui.close_modal();
             } else if app.nav.pop().is_some() {
                 // Pop = drop: the popped element's stream RSTs, its
                 // backward Arcs release. The revealed element still owns
@@ -1062,20 +1078,22 @@ fn handle_io(
                     }
                 }
                 el @ (Element::LogSession(_) | Element::LogFilter(_)) => {
-                    let indices = el.log_visible().unwrap_or_default();
-                    let store = el.log_store().expect("log kinds have a store");
-                    if indices.is_empty() {
-                        (String::new(), String::new())
-                    } else {
-                        let joined: String = store.with_read(|i| {
-                            indices.iter()
-                                .filter_map(|&idx| i.lines.get(idx))
-                                .map(|l| crate::util::strip_ansi(&l.flat_text()))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        });
-                        let count = indices.len();
-                        (joined, format!("Copied {} lines to clipboard", count))
+                    match el.log_lines() {
+                        None => (String::new(), String::new()),
+                        Some((indices, _)) if indices.is_empty() => {
+                            (String::new(), String::new())
+                        }
+                            Some((indices, store)) => {
+                            let joined: String = store.with_read(|i| {
+                                indices.iter()
+                                    .filter_map(|&idx| i.lines.get(idx))
+                                    .map(|l| crate::util::strip_ansi(&l.flat_text()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            });
+                                let count = indices.len();
+                            (joined, format!("Copied {} lines to clipboard", count))
+                        }
                     }
                 }
                 _ => {
@@ -1253,21 +1271,31 @@ pub(crate) fn handle_enter(
     }
 
     // Handle ContainerSelect overlay: open logs or shell for the pick.
-    if let Some(crate::app::Overlay::ContainerSelect { ref target, ref containers, selected, action }) = app.ui.overlay {
-        let target = target.clone();
+    // Copy what we need OUT of the overlay before touching `app.ui` again —
+    // the borrow would otherwise still be live across the flash and the close.
+    let pick = match app.ui.overlay() {
+        Some(crate::app::Overlay::ContainerSelect { target, containers, selected, action }) => Some((
+            target.clone(),
+            containers.get(*selected).map(|ci| ci.name.clone()),
+            *selected,
+            *action,
+        )),
+        _ => None,
+    };
+    if let Some((target, picked, selected, action)) = pick {
         let pod_ns_str = target.namespace.display().to_string();
         // The dialog captured its container list at construction.
-        let container_name = match containers.get(selected).map(|ci| ci.name.clone()) {
+        let container_name = match picked {
             Some(n) => n,
             None => {
                 app.ui.flash = Some(crate::app::FlashMessage::error(
                     format!("Pod {}/{} no longer has a container at index {}", pod_ns_str, target.name, selected)
                 ));
-                app.ui.overlay = None;
+                app.ui.close_modal();
                 return ActionResult::None;
             }
         };
-        app.ui.overlay = None;
+        app.ui.close_modal();
 
         if matches!(action, crate::app::ContainerAction::Shell) {
             return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget::Pod {
@@ -1313,10 +1341,10 @@ pub(crate) fn handle_enter(
             drill_to_pods_in_namespace(app, data_source, ns);
         }
         Some(DrillTarget::SwitchContext(name)) => {
-            // Not a drill: the nav stack below belongs to the context we are
-            // leaving. `begin_context_switch` defers the `nav.reset` to the
-            // point the switch is CONFIRMED, so a failed switch leaves the
-            // user on the picker instead of a wiped view of nowhere.
+            // Not a drill: the nav stack below belongs to the context we
+            // are leaving, so `begin_context_switch` resets to home at once
+            // (a failed switch lands on the fallback context's home with an
+            // error flash, not back on this row).
             begin_context_switch(app, &name);
         }
         Some(DrillTarget::BrowseCrd(crd_ref)) => {
@@ -1499,9 +1527,9 @@ fn open_logs(
         .unwrap_or_default();
 
     if containers.len() > 1 {
-        app.ui.confirm_dialog = None;
-        app.ui.form_dialog = None;
-        app.ui.overlay = Some(crate::app::Overlay::ContainerSelect {
+        app.ui.close_modal();
+        app.ui.close_modal();
+        app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::ContainerSelect {
             target: info.clone(),
             containers: containers.clone(),
             selected: 0,
@@ -1510,7 +1538,7 @@ fn open_logs(
             } else {
                 crate::app::ContainerAction::Logs
             },
-        });
+        }));
         return;
     }
 
@@ -1902,10 +1930,7 @@ pub(crate) fn begin_context_switch(
         crate::app::element::Overview,
     ));
     app.kube.kubectl_cache.clear();
-    app.ui.confirm_dialog = None;
-    app.ui.form_dialog = None;
-    app.ui.overlay = None;
-    app.ui.input_mode = InputMode::Normal;
+    app.ui.close_modal();
     app.kube.metrics.clear();
 
     // An in-flight batch dies with the old session — its remaining
@@ -1940,10 +1965,7 @@ pub(crate) fn do_switch_namespace(
     // rebuild yields byte-identical data; the old early-return here made `0`
     // (all-namespaces) a silent no-op on cluster-scoped tabs — including CRDs
     // that resolve to Cluster scope — while the equivalent command still worked.
-    app.ui.confirm_dialog = None;
-    app.ui.form_dialog = None;
-    app.ui.overlay = None;
-    app.ui.input_mode = InputMode::Normal;
+    app.ui.close_modal();
     app.kube.kubectl_cache.clear();
 
     // Same root recipe, re-scoped: a fresh element with a fresh store —

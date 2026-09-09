@@ -968,6 +968,21 @@ pub struct Overview;
 // Element — the closed sum the stack holds
 // ---------------------------------------------------------------------------
 
+/// The behavioural classes an [`Element`] can belong to. Closed, so adding
+/// an element kind forces a choice — and the choice is then CHECKED against
+/// what the element's accessors actually return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ElementClass {
+    /// Rows in a [`RowStore`]: cursor, sort, grep, column filter, marks.
+    Table,
+    /// A log stream: line store plus a log view.
+    Log,
+    /// Static fetched content (yaml, describe, aliases).
+    Content,
+    /// App chrome with no data source of its own.
+    Chrome,
+}
+
 /// One nav-stack element. A closed enum: the renderer, key dispatch, and
 /// crumb builder all match exhaustively — adding a kind forces every
 /// consumer to decide, which is the point.
@@ -1104,10 +1119,32 @@ impl Element {
 
     /// Capabilities for the help footer / key gating on non-table kinds.
     pub fn is_table(&self) -> bool {
-        matches!(
-            self,
-            Element::ResourceList(_) | Element::RowFilter(_) | Element::DerivedRows(_)
-        )
+        matches!(self.class(), ElementClass::Table)
+    }
+
+    /// What KIND of surface this element is — the ONE declaration the
+    /// framework accessors must agree with.
+    ///
+    /// This exists because nothing could catch the contexts view opting out
+    /// of the framework: it answered `None` from `table_interaction`,
+    /// `filter_input`, `data_store`, `rid` and `marked_count`, so `/`, sort,
+    /// column filters, column movement and marks all dispatched correctly
+    /// and then silently did nothing. It was reported a year of little
+    /// papercuts later as "`/` doesn't work on the contexts page".
+    ///
+    /// A kind declares its class here; `element_accessors_match_their_class`
+    /// checks the accessors actually deliver it. A future element that
+    /// claims `Table` and forgets to wire a `TableInteraction` fails the
+    /// test instead of quietly losing half the keymap.
+    pub fn class(&self) -> ElementClass {
+        match self {
+            Element::ResourceList(_) | Element::RowFilter(_) | Element::DerivedRows(_) => {
+                ElementClass::Table
+            }
+            Element::LogSession(_) | Element::LogFilter(_) => ElementClass::Log,
+            Element::ContentView(_) => ElementClass::Content,
+            Element::Overview(_) => ElementClass::Chrome,
+        }
     }
 
     /// Whether the TOP element renders its own command/filter prompt inside
@@ -1221,6 +1258,19 @@ impl Element {
         }
     }
 
+    /// The visible line indices together with the store they index into.
+    /// ONE accessor because they are only meaningful as a pair — asking for
+    /// them separately forced callers to match on a kind, get an `Option`
+    /// back anyway, and unwrap it.
+    pub fn log_lines(&mut self) -> Option<(Arc<Vec<usize>>, Arc<LineStore>)> {
+        let store = match self {
+            Element::LogSession(e) => Arc::clone(&e.store),
+            Element::LogFilter(e) => Arc::clone(e.source.store()),
+            _ => return None,
+        };
+        Some((self.log_visible()?, store))
+    }
+
     /// The log store this element reads (session's own, or the filter's
     /// backing store).
     pub fn log_store(&self) -> Option<&Arc<LineStore>> {
@@ -1252,12 +1302,17 @@ impl Element {
     /// view, derived on read, memoized on (store generation, draft).
     /// Heals the element's scroll against ring evictions first.
     pub fn log_visible(&mut self) -> Option<Arc<Vec<usize>>> {
-        let (source_patterns, store) = match self {
-            Element::LogSession(e) => (Vec::new(), Arc::clone(&e.store)),
-            Element::LogFilter(e) => (e.source.patterns.clone(), Arc::clone(e.source.store())),
+        // Store, patterns AND view come out of ONE destructure. Fetching the
+        // view separately meant asking a question this match had already
+        // answered and unwrapping the reply — the Option-as-deferred-lookup
+        // shape, which is only ever one refactor away from a panic.
+        let (source_patterns, store, view) = match self {
+            Element::LogSession(e) => (Vec::new(), Arc::clone(&e.store), &mut e.view),
+            Element::LogFilter(e) => {
+                (e.source.patterns.clone(), Arc::clone(e.source.store()), &mut e.view)
+            }
             _ => return None,
         };
-        let view = self.log_view_mut().expect("log kinds have a log view");
         let key = LogDeriveKey { generation: store.generation(), draft: view.draft.clone() };
         // Scroll healing happens even on a cache hit (evictions bump the
         // generation, so a hit implies no NEW evictions — but the first
@@ -1798,8 +1853,22 @@ impl Element {
     // consumer exists — the future Aggregate feature gets to design
     // container marks together with their consumer.
 
-    fn markable(&self) -> bool {
-        matches!(self, Element::ResourceList(_) | Element::RowFilter(_))
+    /// Whether marking rows here can lead to anything.
+    ///
+    /// Row-bearing is necessary but not sufficient: select mode exists to
+    /// feed BATCH operations, so a resource that declares none has no
+    /// consumer for a mark. The contexts view is exactly that — marking a
+    /// context did nothing except silently enter select mode, which then
+    /// blocked `Enter`, the picker's only function, on the one screen a
+    /// first-run user is forced onto.
+    pub fn markable(&self) -> bool {
+        if !matches!(self, Element::ResourceList(_) | Element::RowFilter(_)) {
+            return false;
+        }
+        let Some(rid) = self.rid() else { return false };
+        rid.capabilities().operations.iter().any(|op| {
+            matches!(op.batch_support(), crate::kube::protocol::BatchSupport::PerItem)
+        })
     }
 
     /// Toggle the mark on the row under the cursor.

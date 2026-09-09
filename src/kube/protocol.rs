@@ -642,20 +642,59 @@ impl ObjectKey {
 ///
 /// `#[serde(transparent)]` keeps the wire encoding byte-identical to
 /// the pre-newtype `HashMap<String, MetricsUsage>` shape.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Non-empty by construction, for the same reason [`ContextName`] is: this
+/// is a HASH-MAP KEY (node metrics are stored by it), so an empty one would
+/// silently collide with every other empty one rather than failing loudly.
+/// No infallible `From` and no `Default` — a name that can be blank isn't a
+/// name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct NodeName(String);
 
+/// A node name was empty. Its own type so boundary conversions can be
+/// `TryFrom` without inventing an error at each site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyNodeName;
+
+impl std::fmt::Display for EmptyNodeName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("node name is empty")
+    }
+}
+
+impl std::error::Error for EmptyNodeName {}
+
 impl NodeName {
+    /// A node name, or `None` for the empty string.
+    pub fn new(s: impl Into<String>) -> Option<Self> {
+        let s = s.into();
+        (!s.is_empty()).then_some(Self(s))
+    }
     pub fn as_str(&self) -> &str { &self.0 }
 }
 
-impl From<String> for NodeName {
-    fn from(s: String) -> Self { Self(s) }
+impl TryFrom<String> for NodeName {
+    type Error = EmptyNodeName;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::new(s).ok_or(EmptyNodeName)
+    }
 }
 
-impl From<&str> for NodeName {
-    fn from(s: &str) -> Self { Self(s.to_owned()) }
+impl TryFrom<&str> for NodeName {
+    type Error = EmptyNodeName;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        Self::new(s).ok_or(EmptyNodeName)
+    }
+}
+
+/// Fail-closed off the WIRE too — a peer sending `""` gets a decode error
+/// rather than a map key that swallows every other nameless node.
+/// `Serialize` stays derived + transparent, so the encoding is unchanged.
+impl<'de> Deserialize<'de> for NodeName {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::new(s).ok_or_else(|| serde::de::Error::custom(EmptyNodeName))
+    }
 }
 
 impl std::borrow::Borrow<str> for NodeName {
@@ -769,7 +808,10 @@ pub enum DynamicSelectFallback {
     Port,
 }
 
-static SCALE_SCHEMA: FormSchema = FormSchema {
+impl FormSchema {
+    /// The `Scale` dialog — referenced directly by the scale action, which
+    /// knows statically that it has one.
+    pub const SCALE: FormSchema = FormSchema {
     title_template: "Scale: {{kind}}/{{name}}",
     fields: &[FormFieldSchema {
         name: "replicas",
@@ -779,9 +821,10 @@ static SCALE_SCHEMA: FormSchema = FormSchema {
             default_column: Some("READY"),
         },
     }],
-};
+    };
 
-static PORT_FORWARD_SCHEMA: FormSchema = FormSchema {
+    /// The `PortForward` dialog — likewise statically known.
+    pub const PORT_FORWARD: FormSchema = FormSchema {
     title_template: "Port forward: {{kind}}/{{name}}",
     fields: &[
         FormFieldSchema {
@@ -797,15 +840,39 @@ static PORT_FORWARD_SCHEMA: FormSchema = FormSchema {
             kind: FormFieldSchemaKind::Port,
         },
     ],
-};
+    };
+}
 
 impl OperationKind {
     /// The form schema for this operation, if it needs user input.
+    /// EXHAUSTIVE, no wildcard — same discipline as
+    /// [`OperationKind::batch_support`]. A `_ => None` arm meant a new
+    /// operation silently got no form dialog instead of forcing the author
+    /// to decide, which is the whole reason these manifests are written as
+    /// closed matches.
+    ///
+    /// Call sites that already KNOW the kind should use [`FormSchema::SCALE`]
+    /// / [`FormSchema::PORT_FORWARD`] directly rather than asking here and
+    /// unwrapping — the guarantee is theirs to have statically.
     pub fn form_schema(&self) -> Option<&'static FormSchema> {
         match self {
-            OperationKind::Scale => Some(&SCALE_SCHEMA),
-            OperationKind::PortForward => Some(&PORT_FORWARD_SCHEMA),
-            _ => None,
+            OperationKind::Scale => Some(&FormSchema::SCALE),
+            OperationKind::PortForward => Some(&FormSchema::PORT_FORWARD),
+            OperationKind::Describe
+            | OperationKind::Yaml
+            | OperationKind::Delete
+            | OperationKind::Restart
+            | OperationKind::StreamLogs
+            | OperationKind::PreviousLogs
+            | OperationKind::Shell
+            | OperationKind::ShowNode
+            | OperationKind::ForceKill
+            | OperationKind::NodeShell
+            | OperationKind::DecodeSecret
+            | OperationKind::TriggerCronJob
+            | OperationKind::ToggleSuspendCronJob
+            | OperationKind::Apply
+            | OperationKind::Custom(_) => None,
         }
     }
 }
@@ -1392,9 +1459,12 @@ impl RowChange {
 }
 
 /// All commands from any client (TUI session or management CLI).
-/// The first command on a connection determines the connection type:
-/// - `Init` → long-lived TUI session
-/// - `Ping`/`Status`/`Shutdown`/`Clear` → one-shot management request
+///
+/// The connection type is decided by the `CONN_TYPE` byte the daemon reads
+/// before any framed message (see `daemon.rs`) — NOT by which command
+/// arrives first, as this said until 2026-09-09. `Init` opens a long-lived
+/// TUI session; `Ping`/`Status`/`Shutdown`/`Clear` are one-shot management
+/// requests. Both doors exchange the version handshake first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionCommand {
     // --- Session lifecycle ---

@@ -90,7 +90,6 @@ fn gate_passes_navigation_marking_and_view_ops_in_select_mode() {
         Action::SpanMark,
         Action::ClearMarks,
         Action::Filter(String::new()),
-        Action::ClearFilter,
         Action::Refresh,
         Action::Copy,
         Action::SaveTable,
@@ -102,6 +101,43 @@ fn gate_passes_navigation_marking_and_view_ops_in_select_mode() {
     ] {
         assert_eq!(gate_action(&app, action.clone()), Gated::Pass(action));
     }
+}
+
+/// Esc is the mode's exit, not the scope's, while marks exist. Vim-like:
+/// the same key that leaves visual mode. Only the FIRST press is shadowed —
+/// clearing the marks ends select mode, so the next Esc pops as always.
+#[test]
+fn esc_clears_the_selection_before_it_pops_the_stack() {
+    let app = seeded_app(&["a"]);
+    assert_eq!(
+        gate_action(&app, Action::ClearFilter),
+        Gated::Pass(Action::ClearMarks),
+        "in select mode Esc leaves the MODE",
+    );
+    let app = seeded_app(&[]);
+    assert_eq!(
+        gate_action(&app, Action::ClearFilter),
+        Gated::Pass(Action::ClearFilter),
+        "with nothing marked Esc is the ordinary nav pop",
+    );
+}
+
+/// The FULL chain, key→action→gate — the half that was actually broken.
+/// The gate transform was only ever reachable if the key handler emitted
+/// something for Esc, and at a root list it emitted `None`.
+#[test]
+fn esc_reaches_the_gate_even_at_an_undrilled_root() {
+    let app = seeded_app(&["a"]);
+    assert!(!app.nav.is_drilled(), "the case that used to swallow the key");
+    let action = crate::event::handler::handle_key_event(
+        &app,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+    )
+    .expect("Esc must produce an action for the gate to shadow");
+    assert_eq!(gate_action(&app, action), Gated::Pass(Action::ClearMarks));
 }
 
 #[test]

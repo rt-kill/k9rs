@@ -1,5 +1,8 @@
 pub mod actions;
 pub mod anim;
+pub mod batch;
+pub mod form;
+pub mod kubectl_cache;
 pub mod derived;
 pub mod element;
 pub mod liveness;
@@ -12,6 +15,9 @@ pub mod viewport;
 pub mod view;
 
 pub use actions::SortTarget;
+pub use batch::*;
+pub use form::*;
+pub use kubectl_cache::*;
 pub use liveness::Liveness;
 pub use table::*;
 pub use types::*;
@@ -208,6 +214,24 @@ impl CoreData {
             }
             _ => None,
         }
+    }
+
+    /// Why the core counters can't be vouched for, if they can't.
+    ///
+    /// The Overview's stats are aggregated across these stores, so liveness
+    /// is a property of the SET — a number is only as live as the least live
+    /// store behind it. Without this the `mark_stale` in `switch_context` had
+    /// no reader at all: A→B→A restored the parked rows and painted the
+    /// previous visit's counts byte-identically to live ones.
+    pub fn stale_reason(&self) -> Option<String> {
+        for store in [&self.namespaces, &self.nodes, &self.crds] {
+            if let crate::app::TableDataState::Stale(reason) =
+                store.with_read(|i| i.state.clone())
+            {
+                return Some(reason);
+            }
+        }
+        None
     }
 
     /// A root element for a client-owned resource, or `None` if `rid` names
@@ -444,20 +468,10 @@ impl App {
             conn: Connection::new(),
             pending_batch: None,
             config,
-            ui: UiState {
-                flash: None,
-                confirm_dialog: None,
-                form_dialog: None,
-                theme: crate::ui::theme::Theme::load(skin_name.as_deref()),
-                input_mode: InputMode::Normal,
-                overlay: None,
-                show_header: true,
-                tick_count: 0,
-                column_level: ColumnLevel::Default,
-                anim: crate::app::anim::Anim::default(),
-            },
+            ui: UiState::new(crate::ui::theme::Theme::load(skin_name.as_deref())),
             kube: KubeState {
                 context,
+                connecting: None,
                 identity: crate::kube::protocol::ClusterIdentity::default(),
                 selected_ns: namespace,
                 context_switch: ContextSwitchState::Stable,
@@ -471,6 +485,24 @@ impl App {
     /// the one construction site where the ambient selector is a
     /// legitimate input (roots are built FROM the selector; drills carry
     /// their own intrinsic scope).
+    /// Whether a DAEMON-backed resource view can be opened at all.
+    ///
+    /// False with no context: such a root subscribes against a session that
+    /// doesn't exist, so it lands the user on a permanently empty table — and
+    /// because every one of those paths `nav.reset`s, it takes the contexts
+    /// picker with it. The picker is the root precisely so it can't be
+    /// escaped; Tab and `:pods` were walking around that.
+    ///
+    /// Client-owned resources (the picker itself) are exempt — they need no
+    /// session, which is the whole point of them.
+    pub fn can_open_resource_view(&self, rid: &ResourceId) -> bool {
+        self.core.client_store(rid).is_some()
+            || !matches!(
+                crate::app::Liveness::of_link(&self.conn),
+                crate::app::Liveness::NoContext
+            )
+    }
+
     /// Build a root list element for `rid`. Routes on where the rows come
     /// from: a client-owned resource (the kubeconfig's contexts) reads a
     /// store the app already holds and opens no subscription, so it works
@@ -657,27 +689,23 @@ impl App {
 
     /// Build completion candidates dynamically based on command input.
     pub fn command_completions(&self) -> Vec<String> {
-        let cmd_input = match &self.ui.input_mode {
-            InputMode::Command { input, .. } => input.as_str(),
-            _ => return Vec::new(),
-        };
+        let Some((cmd_input, _)) = self.ui.command_input() else { return Vec::new() };
         complete_command(cmd_input, &self.core)
     }
 
     /// Returns the best (first) completion match, if any.
     pub fn best_completion(&self) -> Option<String> {
-        if let InputMode::Command { ref input, .. } = self.ui.input_mode {
-            if input.trim().is_empty() { return None; }
-            self.command_completions().into_iter().next()
-        } else {
-            None
+        let (input, _) = self.ui.command_input()?;
+        if input.trim().is_empty() {
+            return None;
         }
+        self.command_completions().into_iter().next()
     }
 
     /// Accept the current ghost-text completion into the command input.
     pub fn accept_completion(&mut self) {
         if let Some(completion) = self.best_completion() {
-            if let InputMode::Command { ref mut input, .. } = self.ui.input_mode {
+            if let Some((input, _)) = self.ui.command_input_mut() {
                 *input = completion;
             }
         }

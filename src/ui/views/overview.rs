@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, InputMode};
+use crate::app::App;
 use crate::ui::header;
 use crate::ui::theme::Theme;
 
@@ -18,7 +18,7 @@ pub fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.ui.theme;
 
     let header_height: u16 = if app.ui.show_header { crate::ui::HEADER_HEIGHT } else { 0 };
-    let command_height: u16 = if matches!(app.ui.input_mode, InputMode::Command { .. }) { 3 } else { 0 };
+    let command_height: u16 = if app.ui.command_input().is_some() { 3 } else { 0 };
 
     let chunks = Layout::vertical([
         Constraint::Length(header_height),      // header
@@ -41,7 +41,7 @@ pub fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // 2. Command prompt (same as resource view)
-    if matches!(app.ui.input_mode, InputMode::Command { .. }) {
+    if app.ui.command_input().is_some() {
         super::resource::draw_command_prompt(f, app, command_area, theme);
     }
 
@@ -80,11 +80,14 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     // from the same place the header's does; two derivations of it is how
     // "connecting…" ended up on a screen where nothing was connecting.
     let ctx_label = header::context_label(app);
+    // Same helper as the header: the identity must not describe the context
+    // we are leaving while the name describes the one we are going to.
+    let id = header::display_identity(app);
     let info_fields: &[(&str, &str)] = &[
         ("Context: ", ctx_label.as_str()),
-        ("Cluster: ", if app.kube.identity.cluster.is_empty() { "n/a" } else { &app.kube.identity.cluster }),
-        ("User: ", if app.kube.identity.user.is_empty() { "n/a" } else { &app.kube.identity.user }),
-        ("K8s: ", if app.kube.identity.k8s_version.is_empty() { "n/a" } else { &app.kube.identity.k8s_version }),
+        ("Cluster: ", if id.cluster.is_empty() { "n/a" } else { &id.cluster }),
+        ("User: ", if id.user.is_empty() { "n/a" } else { &id.user }),
+        ("K8s: ", if id.k8s_version.is_empty() { "n/a" } else { &id.k8s_version }),
     ];
     for (label, value) in info_fields {
         lines.push(Line::from(vec![
@@ -129,6 +132,18 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     lines.push(Line::from(
         Span::styled(stats, stats_style)
     ).alignment(Alignment::Center));
+
+    // Restored-from-cache counters say so, in the SAME words the table banner
+    // uses — `Liveness` owns the wording so the two can't drift.
+    if liveness.shows_data() {
+        if let Some(reason) = app.core.stale_reason() {
+            if let Some(warning) = crate::app::Liveness::Stale(reason).warning() {
+                lines.push(Line::from(
+                    Span::styled(warning, theme.status_failed)
+                ).alignment(Alignment::Center));
+            }
+        }
+    }
 
     lines.push(Line::from(""));
     lines.push(Line::from(""));

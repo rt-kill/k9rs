@@ -122,17 +122,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // may show through. Driven by the overlay's own declared extent, so the
     // erase can't be forgotten by an individual renderer — and a renderer
     // that paints only chrome can't leave the old view inside its border.
-    if app.ui.overlay.as_ref().map(Overlay::extent) == Some(crate::app::OverlayExtent::FullFrame) {
+    if app.ui.overlay().map(Overlay::extent) == Some(crate::app::OverlayExtent::FullFrame) {
         f.render_widget(Clear, area);
     }
 
     // The single modal slot, over whatever view is showing. Help renders first
     // — it needs &mut App to publish its scroll extent to the viewport; the
     // shared match below handles the other (immutable) overlays.
-    if matches!(app.ui.overlay, Some(Overlay::Help { .. })) {
+    if matches!(app.ui.overlay(), Some(Overlay::Help { .. })) {
         draw_help_overlay(f, app);
     }
-    match &app.ui.overlay {
+    match &app.ui.overlay() {
         Some(Overlay::Help { .. }) => {}
         Some(Overlay::ContainerSelect { target, containers, selected, .. }) => {
             let names: Vec<String> = containers.iter().map(|ci| ci.display_name()).collect();
@@ -162,7 +162,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // what they're typing.
     let top_is_inline = app.nav.top().renders_command_inline();
     if !top_is_inline {
-        if app.ui.input_mode.is_active() {
+        if app.ui.command_input().is_some() {
             draw_command_overlay(f, app);
         }
         if app.nav.top().filter_input().active() {
@@ -177,7 +177,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_confirm_dialog(f, app);
 
     // Draw the generic form dialog if present (Scale, PortForward, …).
-    if let Some(ref dialog) = app.ui.form_dialog {
+    if let Some(dialog) = app.ui.form_dialog() {
         let widget = FormDialogWidget::new(dialog, &app.ui.theme);
         f.render_widget(widget, f.area());
     }
@@ -192,7 +192,7 @@ fn draw_help_overlay(f: &mut Frame, app: &mut App) {
     // geometry (`HelpOverlay::inner_rows`) — nothing here to keep in sync.
     let inner_rows = HelpOverlay::inner_rows(area.height);
     let total = HelpOverlay::content_line_count(Some(&caps), keys);
-    let offset = if let Some(crate::app::Overlay::Help { viewport }) = &mut app.ui.overlay {
+    let offset = if let Some(crate::app::Overlay::Help { viewport }) = app.ui.overlay_mut() {
         viewport.set_metrics(total, inner_rows, false);
         viewport.offset()
     } else {
@@ -349,7 +349,7 @@ fn draw_container_select(
 
 /// Draw the confirmation dialog overlay.
 fn draw_confirm_dialog(f: &mut Frame, app: &App) {
-    if let Some(ref dialog) = app.ui.confirm_dialog {
+    if let Some(dialog) = app.ui.confirm_dialog() {
         let theme = &app.ui.theme;
         let dialog_widget = ConfirmDialogWidget::new(dialog, theme);
         f.render_widget(dialog_widget, f.area());
@@ -382,12 +382,12 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
         return;
     }
 
-    let input = app.ui.input_mode.input().unwrap_or("");
+    let input = app.ui.command_input().map_or("", |(i, _)| i);
     let ghost: String = app.best_completion()
         .and_then(|c| c.strip_prefix(input).map(str::to_string))
         .unwrap_or_default();
 
-    let prefix = app.ui.input_mode.prompt();
+    let prefix = app.ui.command_prompt();
     let prefix_len: u16 = prefix.width() as u16;
     let typed_len = input.width() as u16;
 

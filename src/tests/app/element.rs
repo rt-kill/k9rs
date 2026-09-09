@@ -441,3 +441,112 @@ fn cold_selection_on_empty_store_is_honestly_none() {
     seed(&el, &["NAME"], vec![]);
     assert_eq!(el.selected_key(), None, "totality means resolving, not inventing");
 }
+
+// ---------------------------------------------------------------------------
+// Framework conformance — the pin that would have caught the contexts view
+// ---------------------------------------------------------------------------
+
+/// One live instance of EVERY element kind. Deliberately exhaustive by
+/// construction: the match below has no wildcard, so a new kind fails to
+/// compile until it is built here and given a class.
+fn one_of_every_kind() -> Vec<crate::app::element::Element> {
+    use crate::app::element::{ContentPhase, ContentSpec, ContentView, Element, LogSession};
+    use crate::app::store::RowPredicate;
+    use crate::kube::protocol::{LogContainer, Namespace};
+
+    let hub = std::sync::Arc::new(crate::app::store::MetricsHub::default());
+    let rid = crate::app::nav::rid(BuiltInKind::Pod);
+    let table = Element::ResourceList(crate::app::element::ResourceList::client(
+        crate::app::element::QuerySpec { rid: rid.clone(), namespace: Namespace::All, filter: None },
+        crate::app::store::RowStore::client("pods"),
+        &hub,
+        "pods".to_string(),
+    ));
+    let filtered = Element::derive_filter(
+        &table,
+        RowPredicate::Grep(crate::app::nav::CompiledGrep::new("x")),
+    )
+    .expect("a table can be filtered");
+
+    let log = Element::LogSession(Box::new(LogSession::for_test(crate::app::ContainerRef::new(
+        "pod", "ns", LogContainer::Default,
+    ))));
+    let log_filtered =
+        Element::derive_log_filter(&log, crate::app::nav::CompiledGrep::new("y"))
+            .expect("a log can be filtered");
+
+    let content = Element::ContentView(ContentView::new(
+        ContentSpec::Aliases,
+        crate::app::ContentViewState::default(),
+        ContentPhase::Ready,
+    ));
+
+    vec![table, filtered, log, log_filtered, content, Element::Overview(crate::app::element::Overview)]
+}
+
+/// Every element's ACCESSORS must deliver what its declared class promises.
+///
+/// This is the test that did not exist when the contexts view was written.
+/// That view claimed to be a table, then answered `None` from
+/// `table_interaction`, `filter_input`, `data_store` and `rid` — so `/`,
+/// sort, column filters, column movement and marks all dispatched cleanly
+/// and then did nothing at all, silently, for as long as nobody tried them.
+#[test]
+fn element_accessors_match_their_class() {
+    use crate::app::element::ElementClass;
+    for mut el in one_of_every_kind() {
+        let class = el.class();
+        let label = format!("{:?} ({:?})", el.label(), class);
+        match class {
+            ElementClass::Table => {
+                assert!(el.is_table(), "{label}: must report is_table");
+                assert!(el.rid().is_some(), "{label}: a table has a resource identity");
+                assert!(el.data_store().is_some(), "{label}: a table has rows");
+                assert!(
+                    el.table_interaction().is_some(),
+                    "{label}: a table has a cursor/sort — without it every column \
+                     and selection key is a silent no-op",
+                );
+                assert!(
+                    el.filter_input_mut().is_some(),
+                    "{label}: a table takes `/` — this is exactly what the contexts \
+                     view lacked while looking like it worked",
+                );
+                assert!(el.log_store().is_none(), "{label}: a table is not a log");
+            }
+            ElementClass::Log => {
+                assert!(el.log_store().is_some(), "{label}: a log has a line store");
+                assert!(el.log_view().is_some(), "{label}: a log has a view");
+                assert!(el.log_lines().is_some(), "{label}: a log can materialize lines");
+                assert!(!el.is_table(), "{label}: a log is not a table");
+                assert!(el.data_store().is_none(), "{label}: a log has no row store");
+            }
+            ElementClass::Content | ElementClass::Chrome => {
+                assert!(!el.is_table(), "{label}: not a table");
+                assert!(el.data_store().is_none(), "{label}: no row store");
+                assert!(el.log_store().is_none(), "{label}: no line store");
+                assert!(
+                    el.table_interaction().is_none(),
+                    "{label}: claims no cursor, so it must not have one",
+                );
+            }
+        }
+    }
+}
+
+/// Every class is actually exercised above — otherwise the test could pass
+/// by covering only the easy kinds.
+#[test]
+fn every_element_class_is_covered() {
+    use crate::app::element::ElementClass;
+    use std::collections::HashSet;
+    let seen: HashSet<ElementClass> = one_of_every_kind().iter().map(|e| e.class()).collect();
+    for expected in [
+        ElementClass::Table,
+        ElementClass::Log,
+        ElementClass::Content,
+        ElementClass::Chrome,
+    ] {
+        assert!(seen.contains(&expected), "no element built for {expected:?}");
+    }
+}

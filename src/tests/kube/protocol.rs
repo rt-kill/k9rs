@@ -276,7 +276,7 @@ fn envelope_wire_tags_are_stable() {
     for (i, op) in [Describe, Yaml, Delete, Restart, Scale, StreamLogs,
                     PreviousLogs, PortForward, Shell, ShowNode, ForceKill,
                     NodeShell, DecodeSecret, TriggerCronJob,
-                    ToggleSuspendCronJob]
+                    ToggleSuspendCronJob, Custom(String::new()), Apply]
         .iter().enumerate()
     {
         assert_eq!(
@@ -348,6 +348,84 @@ fn stream_wire_tags_are_stable() {
     assert_eq!(&r[..4], 1u32.to_le_bytes()); // Upsert=0, Remove=1
     // Handshake preamble bytes are pinned: magic then version, BE.
     assert_eq!(PROTOCOL_MAGIC.to_be_bytes(), [0x4B, 0x39, 0x52, 0x53]);
+}
+
+/// The wire enums that carry no pin of their own. Grouped here because the
+/// 2026-09-09 audit found nine of them — every one rides a hot path
+/// (`ResourceId` is in every baseline; `Namespace` decides whether a delete
+/// gets `-n`; an `ExecFrame` swap feeds a resize struct to a PTY as terminal
+/// bytes) and a reorder would corrupt silently while every same-build test
+/// stayed green.
+#[test]
+fn remaining_wire_enum_tags_are_stable() {
+    use crate::kube::protocol::*;
+    use crate::kube::resources::row::{ContainerKind, ContainerState};
+
+    let tag = |bytes: Vec<u8>| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let rid = ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Pod);
+
+    // ResourceId: BuiltIn=0, Crd=1, CrdUnresolved=2, Local=3.
+    assert_eq!(tag(bincode::serialize(&rid).unwrap()), 0);
+    assert_eq!(
+        tag(bincode::serialize(&ResourceId::Local(
+            crate::kube::local::LocalResourceKind::PortForward
+        )).unwrap()),
+        3,
+    );
+
+    // Namespace: All=0, Named=1. A swap silently drops `-n` from mutations.
+    assert_eq!(tag(bincode::serialize(&Namespace::All).unwrap()), 0);
+    assert_eq!(tag(bincode::serialize(&Namespace::Named("x".into())).unwrap()), 1);
+
+    // SubscriptionFilter: Labels=0, Field=1, OwnerUid=2.
+    assert_eq!(
+        tag(bincode::serialize(&SubscriptionFilter::Labels(Default::default())).unwrap()),
+        0,
+    );
+    assert_eq!(tag(bincode::serialize(&SubscriptionFilter::Field("f".into())).unwrap()), 1);
+    assert_eq!(tag(bincode::serialize(&SubscriptionFilter::OwnerUid("u".into())).unwrap()), 2);
+
+    // ExecFrame: Data=0, Resize=1. A swap feeds a resize into the PTY.
+    assert_eq!(tag(bincode::serialize(&ExecFrame::Data(vec![])).unwrap()), 0);
+    assert_eq!(
+        tag(bincode::serialize(&ExecFrame::Resize { width: 1, height: 1 }).unwrap()),
+        1,
+    );
+
+    // LogContainer: All=0, Named=1, Default=2.
+    assert_eq!(tag(bincode::serialize(&LogContainer::All).unwrap()), 0);
+    assert_eq!(tag(bincode::serialize(&LogContainer::Named("c".into())).unwrap()), 1);
+    assert_eq!(tag(bincode::serialize(&LogContainer::Default).unwrap()), 2);
+
+    // ResourceScope: Cluster=0, Namespaced=1 (declaration order — NOT the
+    // alphabetical/intuitive order; I guessed the other way writing this and
+    // the pin corrected me, which is the point of having one).
+    assert_eq!(tag(bincode::serialize(&ResourceScope::Cluster).unwrap()), 0);
+    assert_eq!(tag(bincode::serialize(&ResourceScope::Namespaced).unwrap()), 1);
+
+    // Per-pod-row enums (v10). Both are complete: `Unknown` is `#[default]`
+    // but LAST, so a "move the default to the front" tidy-up is a break.
+    assert_eq!(tag(bincode::serialize(&ContainerState::Running).unwrap()), 0);
+    assert_eq!(tag(bincode::serialize(&ContainerState::Waiting).unwrap()), 1);
+    assert_eq!(tag(bincode::serialize(&ContainerState::Terminated).unwrap()), 2);
+    assert_eq!(tag(bincode::serialize(&ContainerState::Unknown).unwrap()), 3);
+    assert_eq!(tag(bincode::serialize(&ContainerKind::Regular).unwrap()), 0);
+    assert_eq!(tag(bincode::serialize(&ContainerKind::Init).unwrap()), 1);
+
+    // LocalResourceKind: Context was APPENDED after Custom (tag 3), which the
+    // pre-existing pin stops one short of.
+    assert_eq!(
+        tag(bincode::serialize(&crate::kube::local::LocalResourceKind::Context).unwrap()),
+        3,
+    );
+
+    // DrillTarget: SwitchContext appended at 8.
+    assert_eq!(
+        tag(bincode::serialize(&crate::kube::resources::row::DrillTarget::SwitchContext(
+            ContextName::new("c").unwrap()
+        )).unwrap()),
+        8,
+    );
 }
 
 /// `BuiltInKind` is a WIRE enum (rides inside `ResourceId::BuiltIn` and

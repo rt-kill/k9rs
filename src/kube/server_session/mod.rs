@@ -228,7 +228,6 @@ pub struct ServerSession {
     /// detached tasks holding kube clients and channel senders.
     pending_tasks: tokio::task::JoinSet<()>,
     event_tx: mpsc::Sender<SessionEvent>,
-    event_rx: Option<mpsc::Receiver<SessionEvent>>,
 }
 
 impl ServerSession {
@@ -240,9 +239,9 @@ impl ServerSession {
         readonly: bool,
         session_env: SessionEnv,
         locals: crate::kube::local::ContextKeepalive,
-    ) -> Self {
+    ) -> (Self, mpsc::Receiver<SessionEvent>) {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        Self {
+        let session = Self {
             writer,
             shared,
             client,
@@ -255,8 +254,14 @@ impl ServerSession {
             discovery_refresher_task: None,
             pending_tasks: tokio::task::JoinSet::new(),
             event_tx,
-            event_rx: Some(event_rx),
-        }
+        };
+        // The receiver goes to the CALLER, not into the struct. It belongs to
+        // the run loop, which is the only thing that ever drains it — parking
+        // it in an `Option` and `take().expect()`-ing it in `run` encoded
+        // "already started" in a field that nothing else reads, and turned a
+        // state the type system already prevents (`run` consumes `self`) into
+        // a runtime panic.
+        (session, event_rx)
     }
 
     // -----------------------------------------------------------------------
@@ -349,87 +354,7 @@ impl ServerSession {
         while substream_tasks.join_next().await.is_some() {}
     }
 
-    /// Create and run a session from a raw binary connection.
-    /// Reads Init command via bincode, creates kube::Client, sends Ready,
-    /// then enters the binary command loop.
-    /// Used by local mode (--no-daemon) where the client writes Init to the stream.
-    ///
-    /// NOTE: The protocol version check below is duplicated across the three
-    /// `init_and_run*` entry points. It's only 5 lines per site (if/write/return)
-    /// and is embedded inside match arms that destructure different input shapes
-    /// (read-from-stream vs already-parsed enum), so extracting a helper would
-    /// add more ceremony (mutable writer ref, Option<InitParams> return) than
-    /// the duplication it removes. If a fourth entry point appears, reconsider.
-    pub async fn init_and_run(
-        mut reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
-        writer: Box<dyn AsyncWrite + Unpin + Send>,
-        shared: Arc<SessionSharedState>,
-    ) {
-        let mut buf_writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
 
-        // Version handshake BEFORE any framed message — a mismatched peer
-        // can never mis-parse an enum (see protocol::PROTOCOL_MAGIC).
-        // WRITE first: a mismatched client then reads our version and can
-        // report the actionable mismatch itself instead of a bare EOF
-        // (this daemon closing after a silent read-side reject).
-        if protocol::write_handshake(&mut buf_writer).await.is_err() {
-            return;
-        }
-        if let Err(e) = protocol::read_handshake(&mut reader).await {
-            tracing::warn!("session handshake rejected: {e}");
-            return;
-        }
-
-        let init = match protocol::read_bincode::<_, SessionCommand>(&mut reader).await {
-            Ok(SessionCommand::Init {
-                context, namespace, readonly,
-                kubeconfig_yaml, env_vars, identity,
-            }) => {
-                InitParams { context, namespace, readonly, kubeconfig_yaml, env_vars, identity }
-            }
-            Ok(_) => {
-                fail_session(&mut reader, &mut buf_writer,
-                    "Expected Init command as first message".to_string()).await;
-                return;
-            }
-            Err(e) => {
-                fail_session(&mut reader, &mut buf_writer,
-                    format!("Failed to read Init command: {}", e)).await;
-                return;
-            }
-        };
-
-        Self::run_session(init, reader, buf_writer, shared).await;
-    }
-
-    /// Create and run a session from an already-parsed Init command.
-    /// Used by the daemon where the first command was already read for routing.
-    pub async fn init_and_run_with_parsed(
-        first_cmd: SessionCommand,
-        mut reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
-        writer: Box<dyn AsyncWrite + Unpin + Send>,
-        shared: Arc<SessionSharedState>,
-    ) {
-        let mut buf_writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
-
-        // Versioning lives in the connection handshake (performed by the
-        // caller before any framed read).
-        let init = match first_cmd {
-            SessionCommand::Init {
-                context, namespace, readonly,
-                kubeconfig_yaml, env_vars, identity,
-            } => {
-                InitParams { context, namespace, readonly, kubeconfig_yaml, env_vars, identity }
-            }
-            _ => {
-                fail_session(&mut reader, &mut buf_writer,
-                    "Expected Init command".to_string()).await;
-                return;
-            }
-        };
-
-        Self::run_session(init, reader, buf_writer, shared).await;
-    }
 
     /// Variant used by `init_and_run_muxed` — passes the watch sender so we
     /// can publish the `SessionContext` once the kube client is ready.
@@ -473,15 +398,6 @@ impl ServerSession {
         Self::run_session_inner(init, reader, buf_writer, shared, Some(session_ctx_tx), session_id).await;
     }
 
-    /// Common session setup: create client, send Ready, enter command loop.
-    async fn run_session(
-        init: InitParams,
-        reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
-        buf_writer: BufWriter<Box<dyn AsyncWrite + Unpin + Send>>,
-        shared: Arc<SessionSharedState>,
-    ) {
-        Self::run_session_inner(init, reader, buf_writer, shared, None, 0).await;
-    }
 
     /// Shared implementation.
     async fn run_session_inner(
@@ -519,9 +435,9 @@ impl ServerSession {
                 c
             }
             Err(e) => {
-                warn!("Failed to create client for context {}: {}", context_name, e);
+                warn!(context = %context_name, "cannot authenticate: {e}");
                 fail_session(&mut reader, &mut buf_writer,
-                    format!("Failed to create client for context '{}': {}", context_name, e)).await;
+                    format!("Can't connect to '{context_name}' — {e}")).await;
                 return;
             }
         };
@@ -565,7 +481,7 @@ impl ServerSession {
         let locals = shared.local_registry.attach(&context_id);
 
         // 5. Build ServerSession and enter command loop.
-        let mut session = ServerSession::new(
+        let (mut session, event_rx) = ServerSession::new(
             buf_writer,
             shared.clone(),
             client.clone(),
@@ -609,7 +525,7 @@ impl ServerSession {
         session.spawn_metrics_poller();
 
         info!("session ready, entering command loop (context={})", session.context.name);
-        if let Err(e) = session.run(reader).await {
+        if let Err(e) = session.run(reader, event_rx).await {
             info!("session ended: {}", e);
         } else {
             debug!("session ended cleanly");
@@ -645,7 +561,11 @@ impl ServerSession {
     /// Run the session until the TUI disconnects or an error occurs.
     /// Uses a spawned reader task to avoid partial-read corruption from
     /// select! cancellation.
-    pub async fn run(mut self, reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>) -> anyhow::Result<()> {
+    pub async fn run(
+        mut self,
+        reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+        mut event_rx: mpsc::Receiver<SessionEvent>,
+    ) -> anyhow::Result<()> {
         debug!("ServerSession started: context={}", self.context.name);
 
         // Spawn a reader task that reads binary commands and sends them
@@ -659,11 +579,6 @@ impl ServerSession {
             binary_reader_loop(reader, cmd_tx).await;
         });
         let _reader_guard = crate::util::AbortOnDrop::new(reader_handle.abort_handle());
-
-        let mut event_rx = self
-            .event_rx
-            .take()
-            .expect("ServerSession::run called without event_rx");
 
         loop {
             tokio::select! {
@@ -995,18 +910,85 @@ async fn handle_data_substream(
 
     let sid = ctx.session_id;
     match init {
+        // Subscribe and Log are WRITE-ONLY from here on, so the client
+        // dropping its end is invisible to them — the only liveness signal a
+        // bridge has is a failing write, and on a quiet resource that write
+        // may never come. A parked bridge holds its `Subscription`, which
+        // keeps the watcher (and its apiserver watch, and its full row store)
+        // alive for the whole session, bypassing the 60s grace entirely; a
+        // `follow` log likewise leaves its `kubectl logs -f` running.
+        //
+        // So race the bridge against the read half we otherwise ignore.
+        // Losing the race drops the bridge future, which drops the
+        // `Subscription` / kills the child — the teardown that was supposed
+        // to happen on close.
         protocol::SubstreamInit::Subscribe(sub_init) => {
-            handle_subscription_substream_inner(sub_init, writer, ctx, sid, sub_id).await;
+            let bridge = handle_subscription_substream_inner(sub_init, writer, ctx, sid, sub_id);
+            tokio::pin!(bridge);
+            tokio::select! {
+                _ = &mut bridge => {}
+                _ = peer_closed(&mut reader) => {
+                    tracing::debug!(session = sid, sub = sub_id, "subscription substream closed by client");
+                }
+            }
         }
         protocol::SubstreamInit::Log(log_init) => {
             tracing::debug!(session = sid, sub = sub_id, "log: pod={} container={:?}", log_init.pod, log_init.container);
-            handle_log_substream(log_init, writer, ctx).await;
+            let bridge = handle_log_substream(log_init, writer, ctx);
+            tokio::pin!(bridge);
+            tokio::select! {
+                _ = &mut bridge => {}
+                _ = peer_closed(&mut reader) => {
+                    tracing::debug!(session = sid, sub = sub_id, "log substream closed by client");
+                }
+            }
         }
         protocol::SubstreamInit::Exec(exec_init) => {
             tracing::debug!(session = sid, sub = sub_id, "exec: {:?}", exec_init.kubectl_args);
             handle_exec_substream(exec_init, reader, writer, ctx).await;
         }
     }
+}
+
+/// Resolves when the peer closes its end of a data substream.
+///
+/// A client only ever WRITES its `SubstreamInit` and then reads, so anything
+/// observable on this half afterwards is EOF or a reset — i.e. the client is
+/// gone. Cancel-safe (`read` is), so it is sound as a `select!` branch.
+pub(super) async fn peer_closed<R: AsyncRead + Unpin>(reader: &mut R) {
+    use tokio::io::AsyncReadExt;
+    let mut sink = [0u8; 64];
+    while reader.read(&mut sink).await.unwrap_or(0) > 0 {}
+}
+
+/// Write a delta, degrading an over-cap one into a fresh baseline request
+/// rather than a silent stream death.
+///
+/// The BASELINE path has guarded this since v8 — an over-cap frame can never
+/// be delivered, and retrying it churns (re-attach, re-LIST, re-serialize)
+/// forever. Deltas had no such guard: `write_bincode` failed the size check,
+/// the bridge returned, the client saw EOF and re-subscribed, and the whole
+/// thing repeated with no typed error anywhere. Reachable when one flush
+/// window coalesces a very large relist.
+///
+/// Returning `false` asks the caller to re-attach, which lands on the guarded
+/// baseline path — so an oversized delta degrades into either a fresh
+/// baseline or a real error message, never a silent loop.
+async fn write_delta(
+    writer: &mut tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
+    delta: &protocol::TableDelta,
+    rid: &protocol::ResourceId,
+) -> bool {
+    let frame = protocol::StreamEventRef::Delta(delta);
+    if protocol::frame_exceeds_cap(&frame) {
+        tracing::warn!(
+            resource = %rid.plural(),
+            changes = delta.changes.len(),
+            "delta exceeds the frame cap — re-baselining instead",
+        );
+        return false;
+    }
+    protocol::write_bincode(writer, &frame).await.is_ok() && writer.flush().await.is_ok()
 }
 
 async fn handle_subscription_substream_inner(
@@ -1218,10 +1200,13 @@ async fn handle_subscription_substream_inner(
                             // keeps the client fresh during a long re-LIST and
                             // keeps the ring drained.
                             crate::kube::live_query::WatcherMsg::Delta(delta) => {
-                                if sent_any_data {
-                                    let delta = filter_delta(delta, &filter);
-                                    if protocol::write_bincode(&mut writer, &protocol::StreamEventRef::Delta(delta.as_ref())).await.is_err() { return; }
-                                    if writer.flush().await.is_err() { return; }
+                                if sent_any_data
+                                    && !write_delta(&mut writer, filter_delta(delta, &filter).as_ref(), &rid).await
+                                {
+                                    // Either the peer is gone or the frame is
+                                    // too big; the deferred baseline that
+                                    // follows repairs the latter.
+                                    break BaselineStep::Retry;
                                 }
                             }
                             // Health transitions ride through even while the
@@ -1331,9 +1316,12 @@ async fn handle_subscription_substream_inner(
             match sub.recv().await {
                 Ok(msg) => match &*msg {
                     crate::kube::live_query::WatcherMsg::Delta(delta) => {
-                        let delta = filter_delta(delta, &filter);
-                        if protocol::write_bincode(&mut writer, &protocol::StreamEventRef::Delta(delta.as_ref())).await.is_err() { return; }
-                        if writer.flush().await.is_err() { return; }
+                        if !write_delta(&mut writer, filter_delta(delta, &filter).as_ref(), &rid).await {
+                            // Re-attach: the baseline path is capped and will
+                            // report a real error if the state is undeliverable.
+                            after_initial_list = false;
+                            continue 'attach;
+                        }
                     }
                     crate::kube::live_query::WatcherMsg::Health(h) => {
                         if !announce_health(&mut writer, h).await { return; }

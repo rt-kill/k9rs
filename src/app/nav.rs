@@ -14,9 +14,12 @@
 //!   derivation constructors on [`Element`] take an element, never the
 //!   stack.
 //! - **Top-to-bottom teardown**: children hold backward `Arc`s into
-//!   parents' stores, so parents must outlive children. A bare `Vec`
-//!   drops front-to-back (= bottom-first = WRONG); [`Drop`] and
-//!   [`NavStack::reset`] drain via `pop()` back-to-front.
+//!   parents' stores. `Arc` makes any order memory-SAFE (a child's clone
+//!   keeps the store alive), so this is about ordering EFFECTS, not
+//!   soundness: bottom-first would abort a parent's subscription while a
+//!   child was still reading its store. A bare `Vec` drops front-to-back
+//!   (= bottom-first); [`Drop`] and [`NavStack::reset`] drain via `pop()`
+//!   back-to-front instead.
 //! - Ancestor access happens only through named semantic methods that
 //!   walk internally (`ensure_top_live`, `apply_resolved`) — data-plane
 //!   maintenance, not scope interpretation.

@@ -10,7 +10,7 @@ use crossterm::{
 };
 use tokio::sync::mpsc;
 
-use crate::app::{App, InputMode};
+use crate::app::App;
 use crate::event::AppEvent;
 use crate::kube::client_session::ClientSession;
 use crate::kube::repaint::Repaint;
@@ -104,14 +104,14 @@ pub(crate) async fn open_exec_overlay(
 ) -> Result<()> {
     let stream = data_source.open_exec_stream(exec_init.clone(), event_tx.clone()).await?;
 
-    app.ui.confirm_dialog = None;
-    app.ui.form_dialog = None;
-    app.ui.overlay = Some(crate::app::Overlay::Shell(Box::new(crate::app::ShellState {
+    app.ui.close_modal();
+    app.ui.close_modal();
+    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Shell(Box::new(crate::app::ShellState {
         title,
         stream: Some(stream),
         connect_state: crate::app::ShellConnectState::Connecting,
         pending_output: Vec::new(),
-    })));
+    }))));
     Ok(())
 }
 
@@ -400,7 +400,7 @@ async fn run_editor_flow(
     replay: &mut std::collections::VecDeque<CtEvent>,
 ) -> bool {
     let is_editor_ready = matches!(
-        app.ui.overlay,
+        app.ui.overlay(),
         Some(crate::app::Overlay::Edit {
             state: crate::app::EditState::EditorReady { .. }, ..
         })
@@ -410,7 +410,7 @@ async fn run_editor_flow(
     }
 
     // Take the overlay out so we own TempFile (move, not borrow).
-    let (target, temp_file, original) = match app.ui.overlay.take() {
+    let (target, temp_file, original) = match app.ui.take_modal().into_overlay() {
         Some(crate::app::Overlay::Edit {
             target,
             state: crate::app::EditState::EditorReady { temp_file, original },
@@ -497,18 +497,18 @@ async fn run_editor_flow(
 
     // Send Apply. Move TempFile to the Applying state.
     let target_clone = target.clone();
-    app.ui.overlay = Some(crate::app::Overlay::Edit {
+    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Edit {
         target,
         state: crate::app::EditState::Applying {
             temp_file,
             original,
         },
-    });
+    }));
     if let Err(e) = data_source.apply(&target_clone, stripped.to_string()) {
         app.ui.flash = Some(crate::app::FlashMessage::error(
             format!("Apply failed: {}", e)
         ));
-        app.ui.overlay = None;
+        app.ui.close_modal();
     }
     true
 }
@@ -538,7 +538,7 @@ async fn run_shell_bridge(
     use tokio::io::AsyncWriteExt;
 
     // Extract the exec stream and pending output from the Shell overlay.
-    let (mut stream, pending) = match &mut app.ui.overlay {
+    let (mut stream, pending) = match app.ui.overlay_mut() {
         Some(crate::app::Overlay::Shell(ref mut shell)) => {
             let s = shell.stream.take();
             let p = std::mem::take(&mut shell.pending_output);
@@ -688,7 +688,7 @@ async fn run_shell_bridge(
     replay.extend(drain_stale_input(input_rx).await);
 
     // Clear the shell overlay (the view underneath was never displaced).
-    app.ui.overlay = None;
+    app.ui.close_modal();
     app.ui.flash = Some(crate::app::FlashMessage::info("Shell session ended".to_string()));
 }
 
@@ -800,8 +800,9 @@ fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: App
             // view while the new one connects. Only the CHROME teardown
             // waits, because clearing it early would blank data the fallback
             // still needs if the switch fails.) Done BEFORE `apply_event` so
-            // `core.clear()` doesn't wipe the namespaces the event is about
-            // to seed. A reconnect (was_switch == false, incl. the recovered
+            // `switch_context` doesn't wipe the namespaces the event would
+            // seed. (`Ready.namespaces` is currently always empty — the seed
+            // is a live path only if the daemon starts populating it.) A reconnect (was_switch == false, incl. the recovered
             // fallback after a FAILED switch, which already settled to
             // Stable) leaves core in place and revives streams below.
             let switch_target = match &app.kube.context_switch {
@@ -859,7 +860,7 @@ fn try_handle_input_mode(
         return true;
     }
     // 3. Resource filter input (`/` in resource view)
-    if handle_filter_key(app, key, data_source) {
+    if handle_filter_key(app, key) {
         return true;
     }
     // 4. Log filter input (`/` in log view)
@@ -1082,9 +1083,9 @@ pub async fn session_main(
             // Failed, WHEREVER it sits in the stack (the old top-only
             // reset left covered views wedged in an eternal spinner), so
             // it renders an honest error with the retry hint.
-            app.ui.overlay = None;
-            app.ui.form_dialog = None;
-            app.ui.confirm_dialog = None;
+            app.ui.close_modal();
+            app.ui.close_modal();
+            app.ui.close_modal();
             app.nav.for_each_content_view(|cv| {
                 if cv.phase == crate::app::element::ContentPhase::Fetching {
                     cv.phase = crate::app::element::ContentPhase::Failed(
@@ -1143,8 +1144,8 @@ pub async fn session_main(
                 crate::app::element::Element::ContentView(c) => c.state.search_input_active,
                 el => el.log_view().is_some_and(|v| v.is_filtering()),
             };
-            let in_input_mode = matches!(app.ui.input_mode, InputMode::Command { .. })
-                || app.ui.form_dialog.as_ref().is_some_and(|d| {
+            let in_input_mode = app.ui.command_input().is_some()
+                || app.ui.form_dialog().as_ref().is_some_and(|d| {
                     d.fields.get(d.focused).is_some_and(|field| field.is_text_input())
                 })
                 || app.nav.top().filter_input().active()
@@ -1186,7 +1187,7 @@ pub async fn session_main(
         // Shell bridge: when the daemon confirms the shell is connected,
         // suspend the TUI and enter a raw byte bridge. stdin→daemon,
         // daemon→stdout, no parsing. Restores TUI on exit.
-        if let Some(crate::app::Overlay::Shell(ref shell)) = app.ui.overlay {
+        if let Some(crate::app::Overlay::Shell(ref shell)) = app.ui.overlay() {
             if shell.connect_state == crate::app::ShellConnectState::Connected {
                 run_shell_bridge(
                     &mut app, &mut terminal, &mut event_rx,

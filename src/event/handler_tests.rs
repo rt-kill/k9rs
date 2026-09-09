@@ -274,7 +274,7 @@ fn test_ctrl_chord_does_not_alias_bare_char() {
 #[test]
 fn test_confirm_dialog_keys() {
     let mut app = App::new_for_test();
-    app.ui.confirm_dialog = Some(crate::app::ConfirmDialog {
+    app.ui.open(crate::app::Modal::Confirm(crate::app::ConfirmDialog {
         message: "Are you sure?".to_string(),
         pending: crate::app::PendingAction::Single {
             op: crate::app::SingleOp::Delete,
@@ -286,7 +286,7 @@ fn test_confirm_dialog_keys() {
         },
         action_label: "Delete".to_string(),
         action_focused: false,
-    });
+    }));
 
     assert!(matches!(
         handle_key_event(&app, make_key(KeyCode::Char('y'))),
@@ -382,17 +382,20 @@ fn test_log_view_shift_c_clears_logs() {
 #[test]
 fn test_q_goes_back_in_help_view() {
     let mut app = App::new_for_test();
-    app.ui.overlay = Some(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() });
+    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() }));
     let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
     assert!(matches!(action, Some(Action::Back)));
 }
 
 #[test]
-fn test_esc_noop_in_resource_view_no_filter() {
+fn test_esc_emits_clear_filter_in_resource_view() {
     let app = make_resource_app();
-    // No active filter, Esc is a no-op at root.
+    // Esc always emits; whether it DOES anything is the action layer's call
+    // ("nothing to pop at the root" lives there). Swallowing it here used to
+    // hide the key from `select_gate`, which is what stopped Esc from ever
+    // reaching select mode.
     let action = handle_key_event(&app, make_key(KeyCode::Esc));
-    assert!(action.is_none());
+    assert!(matches!(action, Some(Action::ClearFilter)));
 }
 
 #[test]
@@ -414,7 +417,7 @@ fn test_esc_goes_back_in_log_view() {
 #[test]
 fn test_esc_goes_back_in_help_view() {
     let mut app = App::new_for_test();
-    app.ui.overlay = Some(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() });
+    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() }));
     let action = handle_key_event(&app, make_key(KeyCode::Esc));
     assert!(matches!(action, Some(Action::Back)));
 }
@@ -422,7 +425,7 @@ fn test_esc_goes_back_in_help_view() {
 #[test]
 fn test_q_goes_back_in_container_select() {
     let mut app = App::new_for_test();
-    app.ui.overlay = Some(crate::app::Overlay::ContainerSelect {
+    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::ContainerSelect {
         target: crate::kube::protocol::ObjectRef::new(
             rid(crate::kube::resource_def::BuiltInKind::Pod),
             String::new(),
@@ -431,7 +434,7 @@ fn test_q_goes_back_in_container_select() {
         containers: Vec::new(),
         selected: 0,
         action: crate::app::ContainerAction::Logs,
-    });
+    }));
     let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
     assert!(matches!(action, Some(Action::Back)));
 }
@@ -710,14 +713,14 @@ fn test_second_batch_refused_while_one_outstanding() {
         crate::kube::protocol::OperationKind::Delete,
     ));
     crate::kube::session_actions::handle_batch_op(&mut app, Action::BatchDelete);
-    assert!(app.ui.confirm_dialog.is_none());
+    assert!(app.ui.confirm_dialog().is_none());
     assert!(app.ui.flash.as_ref().is_some_and(|f| f.message.contains("in flight")));
     assert!(app.nav.top().has_marks(), "refusal leaves the selection untouched");
 
     // Tracker cleared → the same dispatch opens the confirm dialog.
     app.pending_batch = None;
     crate::kube::session_actions::handle_batch_op(&mut app, Action::BatchDelete);
-    assert!(app.ui.confirm_dialog.is_some());
+    assert!(app.ui.confirm_dialog().is_some());
 }
 
 // ---------------------------------------------------------------------------

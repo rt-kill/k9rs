@@ -385,3 +385,173 @@ fn only_the_previous_context_is_parked() {
         assert!(i.rows.is_empty(), "A was evicted when B took the slot");
     });
 }
+
+#[test]
+fn an_unconfirmed_context_never_becomes_the_confirmed_one() {
+    // SEV-1 from the 2026-09-09 audit. `KubeconfigLoaded` fires BEFORE the
+    // handshake and names the context the session is aiming at. It used to be
+    // written into `kube.context` under an `is_none()` guard — which is
+    // permanently true after a no-context start — so a failed pick fell back
+    // to the context that had just failed, and the second failure tripped the
+    // initial-failure-is-fatal rule and QUIT THE APP.
+    use crate::kube::protocol::{ClusterIdentity, ContextName};
+    let mut app = App::new_for_test();
+    apply_event(&mut app, AppEvent::NoContextConfigured);
+    assert!(app.kube.context.is_none());
+
+    // Pick `prod` — the real path: the picker's Enter, then the main loop
+    // taking the request and building a session for it.
+    crate::kube::session_actions::begin_context_switch(
+        &mut app,
+        &ContextName::new("prod").unwrap(),
+    );
+    assert_eq!(
+        app.kube.context_switch.take_requested(),
+        Some(ContextName::new("prod").unwrap()),
+    );
+
+    // That session announces its candidate before the handshake.
+    apply_event(&mut app, AppEvent::KubeconfigLoaded {
+        contexts: vec![],
+        current_context: Some(ContextName::new("prod").unwrap()),
+        current_identity: ClusterIdentity::new("prod-eks".into(), "prod-admin".into()),
+    });
+    assert!(
+        app.kube.context.is_none(),
+        "aiming at a context is not being on it — nothing is confirmed yet",
+    );
+    assert!(app.kube.connecting.is_some(), "…but the candidate is remembered");
+
+    // It fails. The fallback must have no context to retry, so the app
+    // returns to the picker instead of retrying prod and quitting.
+    apply_event(&mut app, AppEvent::ConnectionFailed("unreachable".into()));
+    assert!(!app.should_quit, "a failed pick must not exit the TUI");
+    assert!(app.kube.context.is_none(), "still nothing confirmed to fall back to");
+    // …and the fallback rebuild therefore aims at NO context, so it re-reports
+    // `NoContextConfigured` and lands back on the picker — instead of
+    // retrying the context that just failed and tripping the fatal rule.
+    assert!(app.kube.context_switch.is_stable(), "the switch unlocked");
+    assert!(
+        app.kube.context_switch.target().is_none() && app.kube.context.is_none(),
+        "nothing for the rebuild to aim at",
+    );
+}
+
+#[test]
+fn the_identity_never_describes_the_context_being_left() {
+    // The same root cause's second symptom: the header named the TARGET while
+    // the three lines under it still described the context we were leaving.
+    use crate::kube::protocol::{ClusterIdentity, ContextName};
+    let mut app = App::new_for_test();
+    apply_event(&mut app, AppEvent::ConnectionEstablished {
+        context: ContextName::new("prod").unwrap(),
+        identity: ClusterIdentity::new("prod-eks".into(), "prod-admin".into()),
+        namespaces: vec![],
+    });
+    // Switch away: link down, candidate announced by the new session.
+    crate::kube::session_actions::begin_context_switch(
+        &mut app,
+        &ContextName::new("staging").unwrap(),
+    );
+    apply_event(&mut app, AppEvent::KubeconfigLoaded {
+        contexts: vec![],
+        current_context: Some(ContextName::new("staging").unwrap()),
+        current_identity: ClusterIdentity::new("staging-eks".into(), "staging-admin".into()),
+    });
+
+    let label = crate::ui::header::context_label(&app);
+    let id = crate::ui::header::display_identity(&app);
+    assert!(label.contains("staging"), "names what we're connecting to: {label}");
+    assert_eq!(id.cluster, "staging-eks", "…and the cluster line agrees with it");
+    assert_eq!(id.user, "staging-admin");
+}
+
+#[test]
+fn ctrl_chords_are_never_typed_as_text() {
+    // From the 2026-09-09 audit. The filter and form handlers matched on
+    // `key.code` alone, so every Ctrl chord was swallowed as a literal
+    // character — Ctrl-C typed a `c` instead of quitting. The comment those
+    // handlers ended with cited Ctrl-C as the example of what DID fall
+    // through, which is what made it easy to miss.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = App::new_for_test();
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    // Open the `/` filter and type into it.
+    app.nav.top_mut().filter_input_mut().expect("table takes a filter").start();
+    assert!(
+        !crate::kube::session_commands::handle_filter_key(&mut app, ctrl_c),
+        "a Ctrl chord must fall through to the global handler, not be consumed",
+    );
+    let typed = app.nav.top().filter_input().text().to_string();
+    assert!(typed.is_empty(), "Ctrl-C must not appear in the filter: {typed:?}");
+
+    // A plain character still types.
+    let plain = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+    assert!(crate::kube::session_commands::handle_filter_key(&mut app, plain));
+    assert_eq!(app.nav.top().filter_input().text(), "c");
+}
+
+#[test]
+fn the_contexts_picker_offers_only_what_it_supports() {
+    // Three findings from the 2026-09-09 audit, one root cause: the contexts
+    // view is an ordinary `ResourceList`, so it inherited row machinery that
+    // its capability manifest says it doesn't support (`operations()` is
+    // deliberately empty — a kubeconfig context is switched to, not deleted).
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = App::new_for_test();
+    apply_event(&mut app, AppEvent::NoContextConfigured);
+    let ctx_rid = crate::kube::local::LocalResourceKind::Context.to_resource_id();
+    assert_eq!(app.nav.top().rid(), Some(&ctx_rid), "on the picker");
+
+    // Space must not silently enter select mode — which blocked `Enter`,
+    // the picker's ONLY function, on the one screen a first-run user is
+    // forced onto.
+    assert!(
+        !app.nav.top().markable(),
+        "marking a context has no consumer: no batch operation accepts one",
+    );
+
+    // Ctrl-D must not offer "Delete Context/prod?".
+    let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert!(
+        !matches!(
+            crate::event::handler::handle_key_event(&app, ctrl_d),
+            Some(crate::app::actions::Action::Delete)
+        ),
+        "delete is not a thing you can do to a kubeconfig context",
+    );
+
+    // A resource that DOES support batch ops is unaffected.
+    let mut normal = App::new_for_test();
+    assert!(normal.nav.top_mut().markable(), "pods are still markable");
+}
+
+#[test]
+fn a_daemon_backed_view_cannot_be_opened_without_a_context() {
+    // The picker is the nav ROOT so Esc can't escape it — but `Tab` and
+    // `:pods` both `nav.reset`, which replaced the root outright and left the
+    // user on a permanently empty table with no way back except knowing
+    // `:ctx`. Both now consult one predicate.
+    let mut app = App::new_for_test();
+    apply_event(&mut app, AppEvent::NoContextConfigured);
+
+    let pods = crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod);
+    assert!(
+        !app.can_open_resource_view(&pods),
+        "a daemon-backed view has no session to subscribe against",
+    );
+    let contexts = crate::kube::local::LocalResourceKind::Context.to_resource_id();
+    assert!(
+        app.can_open_resource_view(&contexts),
+        "the picker itself needs no session — that is the point of it",
+    );
+
+    // With a context, ordinary views open again.
+    apply_event(&mut app, AppEvent::ConnectionEstablished {
+        context: crate::kube::protocol::ContextName::new("prod").unwrap(),
+        identity: crate::kube::protocol::ClusterIdentity::default(),
+        namespaces: vec![],
+    });
+    assert!(app.can_open_resource_view(&pods));
+}

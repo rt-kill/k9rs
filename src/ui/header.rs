@@ -52,12 +52,36 @@ pub fn context_label(app: &App) -> String {
             // Linked but nothing confirmed yet: the initial handshake.
             None => "connecting...".to_string(),
         },
-        // Link down. A switch target outranks the last-confirmed name.
-        _ => match (app.kube.context_switch.target(), &app.kube.context) {
-            (Some(target), _) => connecting_to(target),
-            (None, Some(c)) => connecting_to(c),
-            (None, None) => "connecting...".to_string(),
+        // Link down. What we are AIMING at outranks what we last confirmed:
+        // a switch target first, then the session's candidate from disk, and
+        // only then the last-confirmed name.
+        _ => match (
+            app.kube.context_switch.target(),
+            app.kube.connecting.as_ref(),
+            &app.kube.context,
+        ) {
+            (Some(target), _, _) => connecting_to(target),
+            (None, Some((candidate, _)), _) => connecting_to(candidate),
+            (None, None, Some(c)) => connecting_to(c),
+            (None, None, None) => "connecting...".to_string(),
         },
+    }
+}
+
+/// The cluster/user/version to display beside [`context_label`].
+///
+/// While the link is down, `kube.identity` still describes the context we are
+/// LEAVING — so pairing it with the target's name reads as "you are on
+/// staging" above prod's cluster and user. The candidate carries the
+/// kubeconfig's own view of the target, which is the honest thing to show
+/// until the daemon confirms.
+pub fn display_identity(app: &App) -> &crate::kube::protocol::ClusterIdentity {
+    match (
+        crate::app::Liveness::of_link(&app.conn).shows_data(),
+        app.kube.connecting.as_ref(),
+    ) {
+        (false, Some((_, identity))) => identity,
+        _ => &app.kube.identity,
     }
 }
 
@@ -73,9 +97,10 @@ pub fn draw_header(
     }
 
     let ctx = context_label(app);
-    let cluster = if app.kube.identity.cluster.is_empty() { "n/a" } else { &app.kube.identity.cluster };
-    let user = if app.kube.identity.user.is_empty() { "n/a" } else { &app.kube.identity.user };
-    let k8s_ver = if app.kube.identity.k8s_version.is_empty() { "n/a" } else { &app.kube.identity.k8s_version };
+    let id = display_identity(app);
+    let cluster = if id.cluster.is_empty() { "n/a" } else { &id.cluster };
+    let user = if id.user.is_empty() { "n/a" } else { &id.user };
+    let k8s_ver = if id.k8s_version.is_empty() { "n/a" } else { &id.k8s_version };
 
     let logo_width = LOGO.iter().map(|l| l.len()).max().unwrap_or(0) as u16 + 2;
     let cols = Layout::horizontal([

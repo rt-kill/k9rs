@@ -168,8 +168,19 @@ fn spawn_metrics_task(client: Client, snapshot_tx: watch::Sender<MetricsSnapshot
                     node_fails.record_success("node metrics");
                     let mut nodes = HashMap::new();
                     for item in &list.items {
-                        let name = item.metadata.name.clone().unwrap_or_default();
-                        nodes.insert(name.into(), parse_node_metrics_usage(&item.data));
+                        // A metrics item with no name can't be matched to a
+                        // node row anyway, and the old `unwrap_or_default()`
+                        // filed every one of them under the same empty key —
+                        // each silently overwriting the last.
+                        let Some(name) = item
+                            .metadata
+                            .name
+                            .as_deref()
+                            .and_then(protocol::NodeName::new)
+                        else {
+                            continue;
+                        };
+                        nodes.insert(name, parse_node_metrics_usage(&item.data));
                     }
                     snapshot.nodes = nodes;
                 }

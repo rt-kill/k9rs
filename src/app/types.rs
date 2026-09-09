@@ -1,7 +1,10 @@
+use crate::app::form::FormDialog;
+use crate::app::kubectl_cache::KubectlCache;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::kube::protocol::{LogContainer, ObjectKey, ObjectRef};
+use crate::kube::protocol::{LogContainer, ObjectRef};
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -16,13 +19,13 @@ use std::hash::{Hash, Hasher};
 /// cluster data semantics.
 pub struct UiState {
     pub flash: Option<FlashMessage>,
-    pub confirm_dialog: Option<ConfirmDialog>,
-    pub form_dialog: Option<FormDialog>,
-    pub input_mode: InputMode,
-    /// The single modal slot: dialogues and operations ABOUT the current
-    /// view (help, container picker, edit flow, live shell). Mutually
-    /// exclusive by construction; Esc closes; closing is not navigation.
-    pub overlay: Option<Overlay>,
+    /// THE modal slot. One field, so "two modals at once" is unrepresentable
+    /// rather than something 53 write sites each had to remember to prevent
+    /// by clearing the other three. Private: reads go through the accessors
+    /// below, writes through [`UiState::open`] / [`UiState::close_modal`],
+    /// which is what makes the exclusivity structural instead of a
+    /// convention. See [`Modal`].
+    modal: Modal,
     pub show_header: bool,
     pub theme: crate::ui::theme::Theme,
     pub tick_count: usize,
@@ -47,6 +50,23 @@ pub struct KubeState {
     /// the compiler makes every reader handle, instead of a blank string
     /// that renders as a context called "".
     pub context: Option<crate::kube::protocol::ContextName>,
+    /// The context this session is being BROUGHT UP against, with the
+    /// identity the kubeconfig says it has — read from disk, not confirmed by
+    /// any daemon. `Some` from the moment a session starts connecting until
+    /// it succeeds or is replaced.
+    ///
+    /// Separate from `context` because they answer different questions, and
+    /// conflating them cost two bugs: the kubeconfig's candidate used to be
+    /// written straight into `context` under an `is_none()` guard, so after a
+    /// no-context start (where `context` stays `None`) a FAILED switch fell
+    /// back to the context that had just failed and quit the app — and
+    /// `identity` kept asserting the OLD cluster through every switch,
+    /// because the candidate's identity arrived in the same event and was
+    /// dropped with it.
+    pub connecting: Option<(
+        crate::kube::protocol::ContextName,
+        crate::kube::protocol::ClusterIdentity,
+    )>,
     pub identity: crate::kube::protocol::ClusterIdentity,
     pub selected_ns: crate::kube::protocol::Namespace,
     pub context_switch: ContextSwitchState,
@@ -58,6 +78,174 @@ pub struct KubeState {
 }
 
 
+
+/// Everything that can be modal over the current view — the `:` prompt, a
+/// confirm dialog, a form, or an overlay (help / container picker / edit /
+/// shell).
+///
+/// These were four independent fields (`input_mode`, `confirm_dialog`,
+/// `form_dialog`, `overlay`) that were mutually exclusive *by intent*: every
+/// path that opened one had to clear the other three, at 53 write sites.
+/// `begin_context_switch` cleared all four in a row. Any path that forgot
+/// left a modal buried under another, invisible until the top one closed.
+///
+/// One field makes that impossible: opening a modal is an assignment, and an
+/// assignment displaces whatever was there.
+pub enum Modal {
+    /// Nothing modal — keys go to the view.
+    None,
+    /// The `:` command prompt.
+    Command {
+        input: String,
+        history_index: Option<usize>,
+    },
+    Confirm(ConfirmDialog),
+    Form(FormDialog),
+    /// Dialogues and operations ABOUT the current view (help, container
+    /// picker, edit flow, live shell). Esc closes; closing is not navigation.
+    Overlay(Overlay),
+}
+
+impl UiState {
+    /// Fresh UI state with nothing modal. A constructor rather than a
+    /// struct literal so `modal` can stay private — which is what stops a
+    /// fifth modal slot from being bolted on beside it later.
+    pub fn new(theme: crate::ui::theme::Theme) -> Self {
+        Self {
+            flash: None,
+            modal: Modal::None,
+            show_header: true,
+            tick_count: 0,
+            column_level: crate::kube::resource_def::ColumnLevel::Default,
+            theme,
+            anim: crate::app::anim::Anim::default(),
+        }
+    }
+
+    /// Open a modal, displacing whatever was open. The ONLY way in.
+    pub fn open(&mut self, modal: Modal) {
+        self.modal = modal;
+    }
+
+    /// Close whatever is open. Idempotent.
+    pub fn close_modal(&mut self) {
+        self.modal = Modal::None;
+    }
+
+    pub fn modal(&self) -> &Modal {
+        &self.modal
+    }
+
+    pub fn modal_mut(&mut self) -> &mut Modal {
+        &mut self.modal
+    }
+
+    pub fn overlay(&self) -> Option<&Overlay> {
+        match &self.modal {
+            Modal::Overlay(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    pub fn overlay_mut(&mut self) -> Option<&mut Overlay> {
+        match &mut self.modal {
+            Modal::Overlay(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    pub fn confirm_dialog(&self) -> Option<&ConfirmDialog> {
+        match &self.modal {
+            Modal::Confirm(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    pub fn confirm_dialog_mut(&mut self) -> Option<&mut ConfirmDialog> {
+        match &mut self.modal {
+            Modal::Confirm(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    pub fn form_dialog(&self) -> Option<&FormDialog> {
+        match &self.modal {
+            Modal::Form(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    pub fn form_dialog_mut(&mut self) -> Option<&mut FormDialog> {
+        match &mut self.modal {
+            Modal::Form(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// The `:` prompt's buffer, if it is the open modal.
+    pub fn command_input(&self) -> Option<(&str, Option<usize>)> {
+        match &self.modal {
+            Modal::Command { input, history_index } => Some((input, *history_index)),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the `:` prompt's buffer, for the editing keys.
+    pub fn command_input_mut(&mut self) -> Option<(&mut String, &mut Option<usize>)> {
+        match &mut self.modal {
+            Modal::Command { input, history_index } => Some((input, history_index)),
+            _ => None,
+        }
+    }
+
+    /// Take whatever is open, leaving nothing. For flows that need to OWN
+    /// the modal they are closing (the edit flow moves its `TempFile` out).
+    pub fn take_modal(&mut self) -> Modal {
+        std::mem::replace(&mut self.modal, Modal::None)
+    }
+
+}
+
+impl Modal {
+    /// Owned-variant extractors, for flows that must MOVE what they close
+    /// out of the slot (the edit flow moves its `TempFile`).
+    pub fn into_overlay(self) -> Option<Overlay> {
+        match self {
+            Modal::Overlay(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    pub fn into_form(self) -> Option<FormDialog> {
+        match self {
+            Modal::Form(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    pub fn into_confirm(self) -> Option<ConfirmDialog> {
+        match self {
+            Modal::Confirm(d) => Some(d),
+            _ => None,
+        }
+    }
+}
+
+impl UiState {
+    /// The `:` prompt's rendered prefix, or `""` when it isn't open.
+    pub fn command_prompt(&self) -> &'static str {
+        match &self.modal {
+            Modal::Command { .. } => ":",
+            _ => "",
+        }
+    }
+
+    /// Whether ANY modal is capturing input — the old
+    /// `input_mode.is_active() || dialog.is_some() || …` chain.
+    pub fn is_modal(&self) -> bool {
+        !matches!(self.modal, Modal::None)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DeltaTracker — atomic ownership of row-change detection state
@@ -1055,42 +1243,6 @@ pub enum EditState {
 }
 
 // ---------------------------------------------------------------------------
-// InputMode — text input overlay state
-// ---------------------------------------------------------------------------
-
-/// Active text input overlay. Each variant carries only the state it needs.
-#[derive(Debug, Clone)]
-pub enum InputMode {
-    /// No text input active.
-    Normal,
-    /// `:` command prompt.
-    Command {
-        input: String,
-        history_index: Option<usize>,
-    },
-}
-
-impl InputMode {
-    pub fn is_active(&self) -> bool {
-        !matches!(self, InputMode::Normal)
-    }
-
-    /// The text buffer for the active input, if any.
-    pub fn input(&self) -> Option<&str> {
-        match self {
-            InputMode::Normal => None,
-            InputMode::Command { input, .. } => Some(input),
-        }
-    }
-
-    /// The prompt string for the active input.
-    pub fn prompt(&self) -> &'static str {
-        match self {
-            InputMode::Normal => "",
-            InputMode::Command { .. } => ":",
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Flash / Filter / Confirm / Log / Yaml / Describe state
@@ -1166,318 +1318,6 @@ pub struct ConfirmDialog {
     pub pending: PendingAction,
     /// True = action button focused, false = cancel focused (safe default).
     pub action_focused: bool,
-}
-
-// ---------------------------------------------------------------------------
-// Batch tracker — correlates per-target OpResults back to a batch launch
-// ---------------------------------------------------------------------------
-
-/// An in-flight batch operation. Marks are NOT cleared at dispatch: each
-/// Ok result unmarks its row (so "what is still marked" always means
-/// "not yet succeeded"), failures keep their marks — retrying exactly
-/// the failed set is one keypress away. Results aggregate into ONE
-/// summary flash instead of N racing per-item flashes (single flash
-/// slot, last write wins — failures used to vanish behind a final Ok).
-#[derive(Debug)]
-pub struct BatchTracker {
-    /// Past-tense verb for the summary ("Deleted", "Restarted", …).
-    verb: &'static str,
-    /// Resource noun for the summary ("pod", "deployment", …).
-    noun: String,
-    /// The batch's operation. `consume` requires the result to carry the
-    /// SAME op (v10 wire discriminant) — without it, an edit-apply or any
-    /// other operation on a batch member could claim (or be claimed by)
-    /// the batch's result for that target. What remains ambiguous is only
-    /// the same-op+same-target race (two concurrent restarts of one pod)
-    /// — full disambiguation would need a per-request correlation id.
-    op: crate::kube::protocol::OperationKind,
-    /// The batch's resource kind. Every item of one batch shares it
-    /// (targets are built from one element's rid), and `consume` requires
-    /// it — without the check, a result for a DIFFERENT kind with the
-    /// same ns+name (delete service `web` while a deployment-`web` batch
-    /// is outstanding) would be silently misattributed.
-    rid: crate::kube::protocol::ResourceId,
-    /// Keys still awaiting a result.
-    outstanding: std::collections::HashSet<ObjectKey>,
-    ok: usize,
-    /// (name, error) per failed item.
-    failures: Vec<(String, String)>,
-    /// Confirmed targets that were already gone at confirm time.
-    skipped: usize,
-    /// The store the batch launched from — weak: result bookkeeping must
-    /// not keep a popped element's store alive.
-    store: std::sync::Weak<crate::app::store::RowStore>,
-}
-
-impl BatchTracker {
-    pub fn new(
-        verb: &'static str,
-        noun: String,
-        rid: crate::kube::protocol::ResourceId,
-        targets: &[ObjectRef],
-        skipped: usize,
-        store: std::sync::Weak<crate::app::store::RowStore>,
-        op: crate::kube::protocol::OperationKind,
-    ) -> Self {
-        Self {
-            verb,
-            noun,
-            op,
-            rid,
-            outstanding: targets.iter().map(Self::key_of).collect(),
-            ok: 0,
-            failures: Vec::new(),
-            skipped,
-            store,
-        }
-    }
-
-    /// The mark-identity of a target — inverse of how batch `ObjectRef`s
-    /// are built from marked keys (`Namespace::from_row` maps "" ↔ `All`).
-    pub fn key_of(target: &ObjectRef) -> ObjectKey {
-        ObjectKey::new(
-            target.namespace.as_option().unwrap_or("").to_string(),
-            target.name.clone(),
-        )
-    }
-
-    /// Record a send failure at dispatch time (the command never left the
-    /// client) — same accounting as a server-side Err.
-    pub fn fail_send(&mut self, target: &ObjectRef, error: String) {
-        self.outstanding.remove(&Self::key_of(target));
-        self.failures.push((target.name.clone(), error));
-    }
-
-    /// Consume a result if it belongs to this batch; `false` = not ours
-    /// (the caller should handle it as an ordinary single-op result).
-    /// Correlation = operation AND resource kind AND identity: the daemon
-    /// echoes the request's op + full `ObjectRef`, so all three are
-    /// authoritative.
-    pub fn consume(
-        &mut self,
-        op: &crate::kube::protocol::OperationKind,
-        target: &ObjectRef,
-        result: &Result<String, String>,
-    ) -> bool {
-        if *op != self.op {
-            return false;
-        }
-        if target.resource != self.rid {
-            return false;
-        }
-        let key = Self::key_of(target);
-        if !self.outstanding.remove(&key) {
-            return false;
-        }
-        match result {
-            Ok(_) => {
-                self.ok += 1;
-                // Success unmarks the row. For Delete/ForceKill the row's
-                // removal prunes the mark anyway; Restart leaves the row
-                // in place, so this is the path that clears it.
-                if let Some(store) = self.store.upgrade() {
-                    store.unmark_keys(std::iter::once(&key));
-                }
-            }
-            Err(e) => self.failures.push((target.name.clone(), e.clone())),
-        }
-        true
-    }
-
-    pub fn is_done(&self) -> bool {
-        self.outstanding.is_empty()
-    }
-
-    /// The aggregate flash. Info when everything succeeded; error with
-    /// the first failure spelled out otherwise.
-    pub fn summary(&self) -> FlashMessage {
-        let mut msg = format!("{} {} {}{}", self.verb, self.ok, self.noun,
-            if self.ok == 1 { "" } else { "s" });
-        if self.skipped > 0 {
-            msg.push_str(&format!(", {} skipped (gone)", self.skipped));
-        }
-        if self.failures.is_empty() {
-            FlashMessage::info(msg)
-        } else {
-            let (name, err) = &self.failures[0];
-            msg.push_str(&format!(
-                ", {} FAILED — {}: {}",
-                self.failures.len(), name, err,
-            ));
-            FlashMessage::error(msg)
-        }
-    }
-
-    /// Summary for a batch cut short (daemon disconnected with results
-    /// still outstanding).
-    pub fn interrupted_summary(&self) -> FlashMessage {
-        FlashMessage::warn(format!(
-            "Batch interrupted: {} ok, {} failed, {} unanswered",
-            self.ok, self.failures.len(), self.outstanding.len(),
-        ))
-    }
-}
-
-#[cfg(test)]
-mod batch_tracker_tests {
-    use super::*;
-    use crate::kube::protocol::{Namespace, ResourceId};
-    use crate::kube::resource_def::BuiltInKind;
-
-    fn target(name: &str, ns: &str) -> ObjectRef {
-        ObjectRef::new(
-            ResourceId::BuiltIn(BuiltInKind::Pod),
-            name.to_string(),
-            Namespace::from_row(ns),
-        )
-    }
-
-    /// key_of is the exact inverse of how batch ObjectRefs are built from
-    /// marked keys (Namespace::from_row): "" ↔ All round-trips.
-    #[test]
-    fn key_of_round_trips_the_marked_key() {
-        let key = crate::kube::protocol::ObjectKey::new("ns1".to_string(), "a".to_string());
-        let t = ObjectRef::new(
-            ResourceId::BuiltIn(BuiltInKind::Pod),
-            key.name.clone(),
-            Namespace::from_row(&key.namespace),
-        );
-        assert_eq!(BatchTracker::key_of(&t), key);
-
-        let cluster_key = crate::kube::protocol::ObjectKey::new(String::new(), "n1".to_string());
-        let t = ObjectRef::new(
-            ResourceId::BuiltIn(BuiltInKind::Node),
-            cluster_key.name.clone(),
-            Namespace::from_row(&cluster_key.namespace),
-        );
-        assert_eq!(BatchTracker::key_of(&t), cluster_key);
-    }
-
-    fn pod_rid() -> ResourceId {
-        ResourceId::BuiltIn(BuiltInKind::Pod)
-    }
-
-    #[test]
-    fn consume_correlates_and_aggregates() {
-        let targets = [target("a", "ns"), target("b", "ns"), target("c", "ns")];
-        let mut tr = BatchTracker::new(
-            "Deleted", "pod".to_string(), pod_rid(), &targets, 1, std::sync::Weak::new(),
-            crate::kube::protocol::OperationKind::Delete,
-        );
-        assert!(!tr.is_done());
-
-        // A result for a foreign target is NOT ours.
-        assert!(!tr.consume(&crate::kube::protocol::OperationKind::Delete, &target("other", "ns"), &Ok("Deleted".into())));
-
-        // A result for the RIGHT target but a DIFFERENT OPERATION is not
-        // ours either — the op gate (v10) is what keeps a concurrent
-        // edit-apply on a batch member from being consumed as the batch's
-        // delete outcome (and vice versa).
-        assert!(!tr.consume(&crate::kube::protocol::OperationKind::Apply, &targets[0], &Ok("Applied pod/a".into())));
-
-        // A result for a DIFFERENT KIND with the same ns+name is NOT
-        // ours either — the rid gate is what keeps a concurrent
-        // single-op on a same-named object of another kind from being
-        // misattributed to the batch.
-        let foreign_kind = ObjectRef::new(
-            ResourceId::BuiltIn(BuiltInKind::Deployment),
-            "a".to_string(),
-            Namespace::from_row("ns"),
-        );
-        assert!(!tr.consume(&crate::kube::protocol::OperationKind::Delete, &foreign_kind, &Ok("Deleted".into())));
-        assert!(!tr.is_done());
-
-        assert!(tr.consume(&crate::kube::protocol::OperationKind::Delete, &targets[0], &Ok("Deleted pod/a".into())));
-        assert!(tr.consume(&crate::kube::protocol::OperationKind::Delete, &targets[1], &Err("Forbidden".into())));
-        assert!(!tr.is_done());
-        // A duplicate result for an already-consumed target is not ours.
-        assert!(!tr.consume(&crate::kube::protocol::OperationKind::Delete, &targets[0], &Ok("again".into())));
-
-        assert!(tr.consume(&crate::kube::protocol::OperationKind::Delete, &targets[2], &Ok("Deleted pod/c".into())));
-        assert!(tr.is_done());
-
-        let summary = tr.summary();
-        assert!(summary.message.contains("Deleted 2 pods"), "{}", summary.message);
-        assert!(summary.message.contains("1 skipped"), "{}", summary.message);
-        assert!(summary.message.contains("1 FAILED"), "{}", summary.message);
-        assert!(summary.message.contains("Forbidden"), "{}", summary.message);
-    }
-
-    #[test]
-    fn ok_results_unmark_their_rows_through_the_weak_store() {
-        use crate::app::store::{RowStore, StorePayload};
-        use crate::kube::protocol::TableBaseline;
-        use crate::kube::resources::row::{CellValue, ResourceRow};
-
-        let store = RowStore::new("pods");
-        let row = ResourceRow {
-            cells: vec![CellValue::Text("a".into())],
-            name: "a".into(),
-            namespace: Some("ns".into()),
-            ..Default::default()
-        };
-        store.apply(1, StorePayload::Baseline(TableBaseline {
-            resource: ResourceId::BuiltIn(BuiltInKind::Pod),
-            headers: vec!["NAME".into()],
-            rows: vec![row],
-        }));
-        let key = crate::kube::protocol::ObjectKey::new("ns".to_string(), "a".to_string());
-        assert_eq!(store.toggle_mark(&key), Some(true));
-
-        let t = target("a", "ns");
-        let mut tr = BatchTracker::new(
-            "Restarted", "pod".to_string(), pod_rid(), std::slice::from_ref(&t), 0,
-            std::sync::Arc::downgrade(&store), crate::kube::protocol::OperationKind::Restart,
-        );
-        assert!(tr.consume(&crate::kube::protocol::OperationKind::Restart, &t, &Ok("Restarted".into())));
-        assert!(!store.has_marks(), "success unmarked the row (restart keeps rows in place)");
-        assert!(tr.is_done());
-    }
-
-    #[test]
-    fn failed_results_keep_their_marks() {
-        use crate::app::store::{RowStore, StorePayload};
-        use crate::kube::protocol::TableBaseline;
-        use crate::kube::resources::row::{CellValue, ResourceRow};
-
-        let store = RowStore::new("pods");
-        let row = ResourceRow {
-            cells: vec![CellValue::Text("a".into())],
-            name: "a".into(),
-            namespace: Some("ns".into()),
-            ..Default::default()
-        };
-        store.apply(1, StorePayload::Baseline(TableBaseline {
-            resource: ResourceId::BuiltIn(BuiltInKind::Pod),
-            headers: vec!["NAME".into()],
-            rows: vec![row],
-        }));
-        let key = crate::kube::protocol::ObjectKey::new("ns".to_string(), "a".to_string());
-        store.toggle_mark(&key);
-
-        let t = target("a", "ns");
-        let mut tr = BatchTracker::new(
-            "Deleted", "pod".to_string(), pod_rid(), std::slice::from_ref(&t), 0,
-            std::sync::Arc::downgrade(&store), crate::kube::protocol::OperationKind::Delete,
-        );
-        assert!(tr.consume(&crate::kube::protocol::OperationKind::Delete, &t, &Err("RBAC".into())));
-        assert!(store.has_marks(), "failure keeps the mark for retry");
-        let summary = tr.summary();
-        assert!(summary.message.contains("Deleted 0 pods"), "{}", summary.message);
-        assert!(summary.message.contains("RBAC"), "{}", summary.message);
-    }
-
-    #[test]
-    fn fail_send_counts_as_a_result() {
-        let t = target("a", "ns");
-        let mut tr = BatchTracker::new(
-            "Deleted", "pod".to_string(), pod_rid(), std::slice::from_ref(&t), 0, std::sync::Weak::new(),
-            crate::kube::protocol::OperationKind::Delete,
-        );
-        tr.fail_send(&t, "send failed: broken pipe".into());
-        assert!(tr.is_done());
-        assert!(tr.summary().message.contains("broken pipe"));
-    }
 }
 
 #[cfg(test)]
@@ -1591,444 +1431,6 @@ mod key_combo_tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Form dialog
-// ---------------------------------------------------------------------------
-//
-// One generic dialog that handles every operation needing user input. The
-// shape is built client-side per-operation in `session_handlers::build_*_form`
-// from row context — for PortForward we read the pod's `containerPorts`
-// off the selected `ResourceRow`; for Scale we read the current replica
-// count.
-//
-// Submit dispatch is centralized: a single function pattern-matches on
-// `FormDialog::kind` to build the typed `SessionCommand` from the collected
-// field values. The widget never sees a wire command.
-
-/// One field's live state inside an open `FormDialog`. `kind` decides what
-/// input control the widget draws and what keystrokes the input handler
-/// accepts; `value` is the user's current input — text-typed for every
-/// kind so partial input (e.g. mid-typed numbers) parses cleanly.
-#[derive(Debug, Clone)]
-pub struct FormFieldState {
-    /// Stable identifier — used by the per-OperationKind dispatcher to look
-    /// the value up at submit time. Names come from the
-    /// [`crate::kube::protocol::form_field_name`] constants module so the
-    /// builder and dispatcher share a single source of truth.
-    pub name: String,
-    /// User-facing label rendered to the left of the input.
-    pub label: String,
-    /// Discriminator that decides which input control the widget renders
-    /// and what keystrokes the input handler accepts.
-    pub kind: FormFieldKind,
-    /// Current text input — the characters the user has typed. Used by the
-    /// text-like kinds (Text/Number/Port). For `Select` the chosen option is
-    /// the typed `selected` index carried on the kind itself, and this field
-    /// stays empty.
-    pub value: String,
-}
-
-/// Field type discriminator. Owned client-side — there is no wire-level
-/// equivalent (the daemon only sends a list of [`OperationKind`] and the
-/// client builds the form shape from row context).
-#[derive(Debug, Clone)]
-pub enum FormFieldKind {
-    /// Free-form text. `max_len` is advisory.
-    Text { max_len: Option<usize> },
-    /// Integer with explicit bounds. Input is digits-only.
-    Number { min: i64, max: i64 },
-    /// Network port (1..=65535). Input is digits-only.
-    Port,
-    /// One of a fixed set of choices, cycled with Left/Right. `selected`
-    /// indexes `options` — typed, so the chosen option can't desync from a
-    /// parallel digit-string the way the old `value`-encoded index could.
-    Select { options: Vec<SelectOption>, selected: usize },
-}
-
-/// A single entry in a [`FormFieldKind::Select`]. `value` is what the
-/// form submits; `label` is what the user sees. Named instead of the
-/// prior `(String, String)` so call sites can't swap the positions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectOption {
-    pub value: String,
-    pub label: String,
-}
-
-impl SelectOption {
-    pub fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
-        Self { value: value.into(), label: label.into() }
-    }
-}
-
-/// What happens when a form dialog is submitted. Each variant knows how
-/// to extract field values and produce a wire command. The generic dialog
-/// framework just collects input — it never knows what operation it's for.
-///
-/// Adding a new form-driven operation: add a variant here, implement its
-/// `submit` arm in `dispatch_form_submit`, and write a builder function.
-#[derive(Debug, Clone)]
-pub enum FormSubmit {
-    /// Scale a workload: reads the REPLICAS field → SessionCommand::Scale.
-    Scale,
-    /// Create a port-forward: reads CONTAINER_PORT + LOCAL_PORT fields
-    /// → SessionCommand::PortForward.
-    PortForward,
-}
-
-impl FormSubmit {
-    /// Map an `OperationKind` to the corresponding `FormSubmit` variant.
-    pub fn from_operation(op: crate::kube::protocol::OperationKind) -> Option<Self> {
-        match op {
-            crate::kube::protocol::OperationKind::Scale => Some(FormSubmit::Scale),
-            crate::kube::protocol::OperationKind::PortForward => Some(FormSubmit::PortForward),
-            _ => None,
-        }
-    }
-
-    /// Human-readable label for flash messages.
-    pub fn from_operation_label(&self) -> &'static str {
-        match self {
-            FormSubmit::Scale => "Scaling",
-            FormSubmit::PortForward => "Port-forwarding",
-        }
-    }
-
-    /// Build the wire command from form field values. Each variant knows
-    /// which fields to extract and how to parse them. Returns the command
-    /// to send to the daemon, or an error message for the user.
-    pub fn build_command(
-        &self,
-        target: &crate::kube::protocol::ObjectRef,
-        fields: &[FormFieldState],
-    ) -> Result<crate::kube::protocol::SessionCommand, String> {
-        use crate::kube::protocol::{SessionCommand, form_field_name};
-        match self {
-            FormSubmit::Scale => {
-                let val = find_field_value(fields, form_field_name::REPLICAS)?;
-                let replicas = val.parse::<u32>()
-                    .map_err(|_| format!("Invalid replica count: {}", val))?;
-                Ok(SessionCommand::Scale { target: target.clone(), replicas })
-            }
-            FormSubmit::PortForward => {
-                let cp = parse_port_field(fields, form_field_name::CONTAINER_PORT)?;
-                let lp = parse_port_field(fields, form_field_name::LOCAL_PORT)?;
-                Ok(SessionCommand::PortForward {
-                    target: target.clone(),
-                    local_port: lp,
-                    container_port: cp,
-                })
-            }
-        }
-    }
-}
-
-/// Extract a field's trimmed value by name.
-fn find_field_value(fields: &[FormFieldState], name: &str) -> Result<String, String> {
-    fields.iter()
-        .find(|f| f.name == name)
-        .map(|f| f.value.trim().to_string())
-        .ok_or_else(|| format!("Missing field: {}", name))
-}
-
-/// Parse a port field — handles both Select (value is option index) and
-/// direct Port input (value is the port number string).
-fn parse_port_field(fields: &[FormFieldState], name: &str) -> Result<u16, String> {
-    let field = fields.iter()
-        .find(|f| f.name == name)
-        .ok_or_else(|| format!("Missing field: {}", name))?;
-    match &field.kind {
-        FormFieldKind::Select { options, selected } => {
-            options.get(*selected)
-                .and_then(|opt| opt.value.parse::<u16>().ok())
-                .ok_or_else(|| "Invalid port selection".to_string())
-        }
-        _ => field.value.trim().parse::<u16>()
-            .map_err(|_| format!("Invalid port: {}", field.value.trim())),
-    }
-}
-
-/// A modal form dialog gathering input for a single operation.
-#[derive(Debug, Clone)]
-pub struct FormDialog {
-    /// What to do on submit.
-    pub submit: FormSubmit,
-    /// Title shown in the dialog border (e.g. "Scale: deploy/nginx").
-    pub title: String,
-    /// Optional context line under the title (e.g. "namespace: default").
-    pub subtitle: String,
-    /// The object the operation will run on. Carried through to dispatch.
-    pub target: ObjectRef,
-    /// Schema fields, in display order.
-    pub fields: Vec<FormFieldState>,
-    /// Currently focused position. `0..fields.len()` are field indices;
-    /// `fields.len()` is the OK button. Esc cancels regardless of focus.
-    pub focused: usize,
-}
-
-impl FormDialog {
-    /// Number of focusable positions (one per field, plus the OK button).
-    pub fn focus_count(&self) -> usize {
-        self.fields.len() + 1
-    }
-
-    /// Move focus to the next position, wrapping around.
-    pub fn focus_next(&mut self) {
-        self.focused = (self.focused + 1) % self.focus_count();
-    }
-
-    /// Move focus to the previous position, wrapping around.
-    pub fn focus_prev(&mut self) {
-        let n = self.focus_count();
-        self.focused = (self.focused + n - 1) % n;
-    }
-
-    /// True if the OK button is currently focused.
-    pub fn ok_focused(&self) -> bool {
-        self.focused == self.fields.len()
-    }
-
-    /// Mutably borrow the currently focused field, if any.
-    pub fn current_field_mut(&mut self) -> Option<&mut FormFieldState> {
-        self.fields.get_mut(self.focused)
-    }
-
-}
-
-impl FormFieldState {
-    /// True if this field accepts text/digit input (i.e. the cursor sits
-    /// inside an edit box, not on a Select picker or button).
-    pub fn is_text_input(&self) -> bool {
-        matches!(self.kind, FormFieldKind::Text { .. } | FormFieldKind::Number { .. } | FormFieldKind::Port)
-    }
-}
-
-/// Shared state for YAML and Describe content views (previously duplicated as
-/// `YamlState` and `DescribeState`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ContentViewState {
-    pub content: String,
-    /// Typed describe lines when this view is a structured *describe* (empty
-    /// for YAML, aliases, and kubectl-fallback text). When non-empty the
-    /// renderer styles by the producer's role tags instead of re-inferring
-    /// structure from `content`.
-    pub describe_lines: Vec<crate::kube::protocol::DescribeLine>,
-    /// Vertical scroll relationship — content views never wrap, so one line is
-    /// one row; the render publishes the extent back via `set_metrics`.
-    pub viewport: crate::app::viewport::Viewport,
-    pub search: Option<String>,
-    pub search_matches: Vec<usize>,
-    pub current_match: usize,
-    pub search_input_active: bool,
-    pub search_input: String,
-    /// Cached line count — updated when content changes.
-    line_count: usize,
-}
-
-impl ContentViewState {
-    /// Set plain-text content (YAML, aliases, error text) and update the cached
-    /// line count. Clears any typed describe lines so the renderer falls back
-    /// to text inference for these genuinely-opaque views.
-    pub fn set_content(&mut self, content: String) {
-        self.line_count = content.lines().count();
-        self.content = content;
-        self.describe_lines.clear();
-    }
-
-    /// Set typed describe lines (a structured describe). Derives the flat
-    /// `content` (line texts joined) so search / scroll / clipboard keep
-    /// operating on a `String` unchanged.
-    pub fn set_describe_lines(&mut self, lines: Vec<crate::kube::protocol::DescribeLine>) {
-        self.content = crate::kube::protocol::describe_lines_text(&lines);
-        self.line_count = lines.len();
-        self.describe_lines = lines;
-    }
-
-    /// Get the cached line count (O(1) instead of O(n)).
-    pub fn line_count(&self) -> usize {
-        self.line_count
-    }
-}
-
-impl ContentViewState {
-    /// Recompute search matches from current content (smartcase regex).
-    pub fn update_search(&mut self) {
-        self.search_matches.clear();
-        self.current_match = 0;
-        if let Some(ref term) = self.search {
-            if term.is_empty() { return; }
-            let pat = crate::util::SearchPattern::new(term);
-            for (i, line) in self.content.lines().enumerate() {
-                if pat.is_match(line) {
-                    self.search_matches.push(i);
-                }
-            }
-        }
-    }
-
-    pub fn next_match(&mut self) {
-        if self.search_matches.is_empty() {
-            return;
-        }
-        self.current_match = (self.current_match + 1) % self.search_matches.len();
-        self.viewport.center_on(self.search_matches[self.current_match]);
-    }
-
-    pub fn prev_match(&mut self) {
-        if self.search_matches.is_empty() {
-            return;
-        }
-        self.current_match = if self.current_match == 0 {
-            self.search_matches.len() - 1
-        } else {
-            self.current_match - 1
-        };
-        self.viewport.center_on(self.search_matches[self.current_match]);
-    }
-
-    /// Clear search state.
-    pub fn clear_search(&mut self) {
-        self.search = None;
-        self.search_matches.clear();
-        self.current_match = 0;
-        self.search_input_active = false;
-        self.search_input.clear();
-    }
-}
-
-/// Type alias for backward compatibility.
-pub type YamlState = ContentViewState;
-/// Type alias for backward compatibility.
-pub type DescribeState = ContentViewState;
-
-// ---------------------------------------------------------------------------
-// KubectlCache — TTL cache for describe/yaml kubectl output
-// ---------------------------------------------------------------------------
-
-/// What kind of content is cached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ContentKind {
-    Yaml,
-    Describe,
-}
-
-/// Key for the kubectl output cache. Typed end-to-end: keyed on the full
-/// `ObjectRef` so two CRDs sharing a Kind name across groups never collide.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CacheKey {
-    pub target: ObjectRef,
-    pub kind: ContentKind,
-}
-
-impl CacheKey {
-    pub fn new(target: ObjectRef, kind: ContentKind) -> Self {
-        Self { target, kind }
-    }
-}
-
-/// A cached content entry with its timestamp.
-pub(crate) struct CacheEntry {
-    pub(crate) content: String,
-    /// Typed describe lines for `ContentKind::Describe` entries; empty for
-    /// YAML. Lets a cached describe re-open render by role tags exactly like a
-    /// fresh one, with no inference-on-cache-hit inconsistency.
-    pub(crate) describe_lines: Vec<crate::kube::protocol::DescribeLine>,
-    pub(crate) cached_at: Instant,
-}
-
-pub struct KubectlCache {
-    entries: HashMap<CacheKey, CacheEntry>,
-    insertion_order: Vec<CacheKey>,
-    ttl: Duration,
-    max_capacity: usize,
-}
-
-impl KubectlCache {
-    pub fn new(ttl: Duration, capacity: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            insertion_order: Vec::new(),
-            ttl,
-            max_capacity: capacity,
-        }
-    }
-
-    pub fn get(&self, target: &ObjectRef, kind: ContentKind) -> Option<&str> {
-        let key = CacheKey::new(target.clone(), kind);
-        self.entries
-            .get(&key)
-            .and_then(|entry| {
-                if entry.cached_at.elapsed() < self.ttl {
-                    Some(entry.content.as_str())
-                } else {
-                    None
-                }
-            })
-    }
-
-    pub fn insert(&mut self, target: ObjectRef, kind: ContentKind, content: String) {
-        self.insert_entry(
-            CacheKey::new(target, kind),
-            CacheEntry { content, describe_lines: Vec::new(), cached_at: Instant::now() },
-        );
-    }
-
-    /// Cache a structured describe by its typed lines. The flat `content` is
-    /// derived so the text-keyed `get` keeps working for this entry too.
-    pub fn insert_describe(
-        &mut self,
-        target: ObjectRef,
-        lines: Vec<crate::kube::protocol::DescribeLine>,
-    ) {
-        let content = crate::kube::protocol::describe_lines_text(&lines);
-        self.insert_entry(
-            CacheKey::new(target, ContentKind::Describe),
-            CacheEntry { content, describe_lines: lines, cached_at: Instant::now() },
-        );
-    }
-
-    /// Shared insert: update in place if the key exists (preserving insertion
-    /// order), else append and, once at capacity, evict the oldest entry —
-    /// FIFO by insertion order, not LRU (an in-place update does not refresh
-    /// recency, so a frequently-read entry is still evicted on schedule).
-    fn insert_entry(&mut self, key: CacheKey, entry: CacheEntry) {
-        if let std::collections::hash_map::Entry::Occupied(mut e) = self.entries.entry(key.clone()) {
-            e.insert(entry);
-            return;
-        }
-        if self.entries.len() >= self.max_capacity {
-            if let Some(oldest_key) = self.insertion_order.first().cloned() {
-                self.entries.remove(&oldest_key);
-                self.insertion_order.remove(0);
-            }
-        }
-        self.insertion_order.push(key.clone());
-        self.entries.insert(key, entry);
-    }
-
-    /// Fresh typed describe lines for `target`, if cached and unexpired. Used by
-    /// the describe cache-hit path so a re-open renders identically to a fresh
-    /// describe instead of falling back to text inference.
-    pub fn get_describe_lines(
-        &self,
-        target: &ObjectRef,
-    ) -> Option<Vec<crate::kube::protocol::DescribeLine>> {
-        let key = CacheKey::new(target.clone(), ContentKind::Describe);
-        self.entries.get(&key).and_then(|entry| {
-            // Empty lines count as a miss, not a hit: a describe view fed empty
-            // lines would derive empty `content` and wedge on "Loading…". A real
-            // describe always has lines, so this only rejects a degenerate
-            // entry and re-fetches.
-            let usable = entry.cached_at.elapsed() < self.ttl && !entry.describe_lines.is_empty();
-            usable.then(|| entry.describe_lines.clone())
-        })
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.insertion_order.clear();
-    }
-}
-
 #[cfg(test)]
 mod context_switch_tests {
     use super::*;
@@ -2124,116 +1526,6 @@ mod context_switch_tests {
         assert!(s.is_stable());
     }
 }
-
-#[cfg(test)]
-mod form_submit_tests {
-    use super::*;
-    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
-    use crate::kube::resource_def::BuiltInKind;
-
-    fn pod_target() -> ObjectRef {
-        ObjectRef::new(
-            ResourceId::BuiltIn(BuiltInKind::Pod),
-            "test-pod",
-            Namespace::from_user_command("default"),
-        )
-    }
-
-    #[test]
-    fn scale_build_command_valid() {
-        let target = pod_target();
-        let fields = vec![FormFieldState {
-            name: "replicas".into(),
-            label: "Replicas".into(),
-            kind: FormFieldKind::Number { min: 0, max: 100 },
-            value: "3".into(),
-        }];
-        let cmd = FormSubmit::Scale.build_command(&target, &fields).unwrap();
-        match cmd {
-            crate::kube::protocol::SessionCommand::Scale { replicas, .. } => {
-                assert_eq!(replicas, 3);
-            }
-            _ => panic!("expected Scale command"),
-        }
-    }
-
-    #[test]
-    fn scale_build_command_invalid() {
-        let target = pod_target();
-        let fields = vec![FormFieldState {
-            name: "replicas".into(),
-            label: "Replicas".into(),
-            kind: FormFieldKind::Number { min: 0, max: 100 },
-            value: "abc".into(),
-        }];
-        assert!(FormSubmit::Scale.build_command(&target, &fields).is_err());
-    }
-
-    #[test]
-    fn port_forward_build_command_valid() {
-        let target = pod_target();
-        let fields = vec![
-            FormFieldState {
-                name: "container_port".into(),
-                label: "".into(),
-                kind: FormFieldKind::Port,
-                value: "8080".into(),
-            },
-            FormFieldState {
-                name: "local_port".into(),
-                label: "".into(),
-                kind: FormFieldKind::Port,
-                value: "9090".into(),
-            },
-        ];
-        let cmd = FormSubmit::PortForward.build_command(&target, &fields).unwrap();
-        match cmd {
-            crate::kube::protocol::SessionCommand::PortForward { local_port, container_port, .. } => {
-                assert_eq!(container_port, 8080);
-                assert_eq!(local_port, 9090);
-            }
-            _ => panic!("expected PortForward command"),
-        }
-    }
-
-    #[test]
-    fn port_forward_build_command_select_uses_typed_index() {
-        let target = pod_target();
-        // The pf_ports path builds a Select container_port. The chosen option is
-        // the typed `selected` index — no digit-string round-trip — so selected=1
-        // resolves to the second option ("8443").
-        let fields = vec![
-            FormFieldState {
-                name: "container_port".into(),
-                label: "".into(),
-                kind: FormFieldKind::Select {
-                    options: vec![
-                        SelectOption::new("8080", "8080"),
-                        SelectOption::new("8443", "8443"),
-                    ],
-                    selected: 1,
-                },
-                value: String::new(),
-            },
-            FormFieldState {
-                name: "local_port".into(),
-                label: "".into(),
-                kind: FormFieldKind::Port,
-                value: "9090".into(),
-            },
-        ];
-        let cmd = FormSubmit::PortForward.build_command(&target, &fields).unwrap();
-        match cmd {
-            crate::kube::protocol::SessionCommand::PortForward { container_port, local_port, .. } => {
-                assert_eq!(container_port, 8443);
-                assert_eq!(local_port, 9090);
-            }
-            _ => panic!("expected PortForward command"),
-        }
-    }
-}
-
-
 
 #[cfg(test)]
 #[path = "../tests/app/types.rs"]

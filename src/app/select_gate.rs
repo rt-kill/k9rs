@@ -91,6 +91,26 @@ pub fn gate_action(app: &App, action: Action) -> Gated {
         Action::Restart => Gated::Pass(Action::BatchRestart),
         Action::ForceKill => Gated::Pass(Action::BatchForceKill),
 
+        // Esc: leave the MODE before leaving the scope.
+        //
+        // Select mode is the vim-like mutually-exclusive mode the user asked
+        // for, and in vim Esc is how you leave visual mode. It transforms
+        // here rather than being special-cased in the key handler for the
+        // same reason `Delete` does: this is the ONE place that knows the
+        // mode, so the shadowing can't drift from the mode's own definition.
+        //
+        // Only the FIRST Esc is consumed — clearing the marks ends select
+        // mode, so the next Esc arrives in normal mode and pops the stack as
+        // it always has. The ownership-based exits (Tab, `-`, `0`, `:` cmds,
+        // namespace/context switches) are untouched: they still drop the
+        // store and take the marks with it, which is why this is a shadow
+        // and not a new policy.
+        //
+        // (Reverses a 2026-07-08 "won't do" — that call predated select mode
+        // by six days, when marks were highlights and an un-cleared one cost
+        // a stale colour rather than seventeen dead keys.)
+        Action::ClearFilter => Gated::Pass(Action::ClearMarks),
+
         // Single-target actions: dead in select mode.
         Action::Enter
         | Action::Describe
@@ -126,7 +146,6 @@ pub fn gate_action(app: &App, action: Action) -> Gated {
         | Action::Home
         | Action::End
         | Action::Filter(_)
-        | Action::ClearFilter
         | Action::ToggleLogFollow
         | Action::ToggleLogWrap
         | Action::ToggleLogTimestamps

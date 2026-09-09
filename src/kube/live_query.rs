@@ -527,8 +527,12 @@ impl WatcherCache {
     }
 
     /// Force-subscribe: removes any existing Weak entry for the key and creates
-    /// a new watcher unconditionally. The old watcher's grace task still holds
-    /// its Arc, so it will live out its grace period — that's fine. The cache
+    /// a new watcher unconditionally. The displaced watcher lives as long as
+    /// any OTHER session's `Subscription` holds it — grace only starts once
+    /// the last one drops — so on a shared daemon one client's Ctrl-R can
+    /// leave two watchers (two apiserver watches, two row stores) for one key
+    /// until those subscribers go away. Bounded and self-resolving, but not
+    /// the 60s the word "grace" suggests. The cache
     /// now points to the new watcher.
     pub fn subscribe_force(
         &self,
@@ -700,6 +704,15 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
 
     let mut backoff_ms: u64 = initial_backoff_ms();
     let mut backoff_start = std::time::Instant::now();
+    // When the watch may be polled again after an error. A DEADLINE rather
+    // than an inline sleep: `select!` only cancels branch *futures*, so a
+    // `sleep().await` inside a branch HANDLER suspends the whole loop —
+    // which meant a backed-off watcher (up to 30s) stopped answering
+    // baseline asks and stopped flushing. A client attaching in that window
+    // got a spinner over perfectly good rows, with no diagnostic, until the
+    // sleep ended. Gating only the stream branch keeps `ask_rx` and the
+    // flush timer live throughout.
+    let mut retry_at: Option<tokio::time::Instant> = None;
 
     let mut flush_timer = tokio::time::interval(std::time::Duration::from_millis(INIT_FLUSH_INTERVAL_MS));
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -726,7 +739,8 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
 
     loop {
         tokio::select! {
-            event_result = stream.try_next() => {
+            // Not polled while backing off (see `retry_at`).
+            event_result = stream.try_next(), if retry_at.is_none() => {
                 match event_result {
                     Ok(Some(event)) => {
                         match event {
@@ -741,7 +755,7 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                                     ListPhase::Listing { seen, .. } => seen.clear(),
                                 }
                                 backoff_start = std::time::Instant::now();
-                                info!("live_query: starting list for {}({})", rt, ns_label);
+                                debug!(resource = %rt, namespace = %ns_label, "listing");
                             }
                             WatcherEvent::InitApply(obj) => {
                                 let key = obj_key(&obj);
@@ -781,7 +795,7 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                                     }
                                 }
                                 phase = ListPhase::Steady;
-                                info!("live_query: list complete for {}({}), {} items", rt, ns_label, store.len());
+                                info!(resource = %rt, namespace = %ns_label, items = store.len(), "watch established");
                                 // Flush accumulated changes immediately —
                                 // the user is waiting.
                                 if !pending.is_empty() {
@@ -815,7 +829,7 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                         }
                     }
                     Ok(None) => {
-                        debug!("live_query: stream ended for {}", rt);
+                        debug!(resource = %rt, "watch stream ended");
                         if !pending.is_empty() {
                             let _ = delta_tx.send(Arc::new(WatcherMsg::Delta(pending.drain(&store))));
                         }
@@ -825,12 +839,12 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                         // Fail-fast iff the FIRST list never completed:
                         // almost certainly permanent (RBAC, unknown type).
                         if matches!(phase, ListPhase::Listing { first: true, .. }) {
-                            warn!("live_query: initial load failed for {}: {}", rt, e);
+                            warn!(resource = %rt, "initial load failed: {e}");
                             exit_reason = Some(format!("{}", e));
                             break;
                         }
                         if backoff_start.elapsed().as_millis() as u64 > max_elapsed_ms() {
-                            warn!("live_query: watcher for {} failed for over 2 minutes, giving up: {}", rt, e);
+                            warn!(resource = %rt, "giving up after 2 minutes of failures: {e}");
                             exit_reason = Some(format!("{}", e));
                             break;
                         }
@@ -838,15 +852,34 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                         // (Init / InitDone / Apply / Delete), so it measures
                         // exactly what the rule wants: how long the store has
                         // been frozen. See `WatchHealth::after_error`.
-                        if let Some(next) = health.after_error(backoff_start.elapsed(), &format!("{}", e)) {
-                            health = next;
-                            let _ = delta_tx.send(Arc::new(WatcherMsg::Health(health.clone())));
+                        // The log level follows the SAME threshold as the
+                        // staleness decision, for the same reason: kube-rs
+                        // surfaces routine watch restarts as errors, so a
+                        // warn per retry is noise on a healthy cluster. Warn
+                        // ONCE, when the failure has outlived a restart and
+                        // we start telling clients their rows are frozen;
+                        // every retry before and after that stays at debug.
+                        match health.after_error(backoff_start.elapsed(), &format!("{}", e)) {
+                            Some(next) => {
+                                warn!(resource = %rt, "watch stalled, rows are frozen: {e}");
+                                health = next;
+                                let _ = delta_tx.send(Arc::new(WatcherMsg::Health(health.clone())));
+                            }
+                            None => debug!(resource = %rt, "watch retry in {backoff_ms}ms: {e}"),
                         }
-                        warn!("live_query: watcher error for {}: {}, retrying in {}ms", rt, e, backoff_ms);
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        retry_at = Some(
+                            tokio::time::Instant::now()
+                                + std::time::Duration::from_millis(backoff_ms),
+                        );
                         backoff_ms = (backoff_ms * 2).min(max_backoff_ms());
                     }
                 }
+            }
+            // Backoff expiry — re-enables the stream branch above.
+            _ = async { if let Some(at) = retry_at { tokio::time::sleep_until(at).await } },
+                if retry_at.is_some() =>
+            {
+                retry_at = None;
             }
             _ = flush_timer.tick() => {
                 if !pending.is_empty() {
@@ -966,6 +999,13 @@ mod watcher_tests {
     impl Harness {
         fn send(&self, ev: WatcherEvent<ConfigMap>) {
             self.events.send(Ok(ev)).expect("watcher task alive");
+        }
+
+        /// Push a watch error, driving the loop into its retry backoff.
+        fn fail_stream(&self) {
+            self.events
+                .send(Err(watcher::Error::NoResourceVersion))
+                .expect("watcher task alive");
         }
 
         async fn next_delta(&mut self) -> TableDelta {
@@ -1196,6 +1236,35 @@ mod watcher_tests {
         let reply = h.ask(false).await.expect("baseline");
         assert_eq!(reply.health, WatchHealth::Feeding);
         assert_eq!(reply.baseline.rows.len(), 1);
+    }
+
+    /// A backed-off watcher must still answer baseline asks.
+    ///
+    /// From the 2026-09-09 audit: the retry `sleep` ran inside a `select!`
+    /// branch HANDLER, which suspends the whole loop — so for up to 30s the
+    /// watcher stopped answering `ask_rx` and stopped flushing. A client
+    /// attaching in that window sat on a spinner over rows the watcher
+    /// already had.
+    #[tokio::test]
+    async fn a_backed_off_watcher_still_answers_baseline_asks() {
+        let mut h = spawn_harness();
+        h.init_steady(vec![cm("ns", "a", "1")]).await;
+        // Drive the watch into its error/backoff path.
+        h.fail_stream();
+        // Let the loop actually CONSUME the error and enter its backoff —
+        // otherwise the ask and the error race in the `select!` and the ask
+        // can simply win, which would make this test prove nothing.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        // The ask must be answered from the store, not queued behind the
+        // backoff. The window is deliberately SHORTER than `initial_ms`
+        // (300ms) — with the sleep inside the branch handler the loop cannot
+        // reach `ask_rx` until it expires, so this is what distinguishes the
+        // two implementations.
+        let reply = tokio::time::timeout(Duration::from_millis(120), h.ask(false))
+            .await
+            .expect("ask answered while backing off")
+            .expect("watcher alive");
+        assert_eq!(reply.baseline.rows.len(), 1, "served from the resident store");
     }
 
     /// The two subtleties of the degrade rule, without a cluster or a clock:

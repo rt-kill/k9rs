@@ -71,7 +71,7 @@ fn a_full_frame_overlay_erases_the_view_beneath() {
     let before = paint(&mut t, &mut app);
     assert!(before.contains("canary-row-marker"), "table paints its rows normally");
 
-    app.ui.overlay = Some(shell_overlay());
+    app.ui.open(crate::app::Modal::Overlay(shell_overlay()));
     let during = paint(&mut t, &mut app);
     assert!(
         !during.contains("canary-row-marker"),
@@ -89,9 +89,9 @@ fn a_dialog_overlay_keeps_the_live_view_around_it() {
     app.conn.established();
     seed_row(&app, "canary-row-marker");
     let mut t = term();
-    app.ui.overlay = Some(Overlay::Help {
+    app.ui.open(crate::app::Modal::Overlay(Overlay::Help {
         viewport: crate::app::viewport::Viewport::default(),
-    });
+    }));
 
     let painted = paint(&mut t, &mut app);
     assert!(
@@ -329,4 +329,68 @@ fn horizontal_scroll_never_lands_inside_a_column() {
             "step {step}: col_offset {offset} is inside a column (starts: {starts:?})",
         );
     }
+}
+
+#[test]
+fn hostile_apiserver_text_cannot_reach_the_terminal() {
+    // SEV-1 from the 2026-09-09 audit. The apiserver's `Status.message`
+    // rides `StreamEvent::Error`/`Stale` into `Liveness`, which renders it
+    // through a `Block` TITLE and a centred `Span` — and ratatui writes
+    // title/Span symbols VERBATIM. Only `Buffer::set_string`/`set_line`
+    // filter, which is why the flash path was never exposed and these two
+    // were. A compromised apiserver, or an admission webhook whose denial
+    // message an attacker controls, could smuggle OSC-52 (clipboard write)
+    // or ESC[6n (cursor report → stdin injection while in raw mode).
+    const HOSTILE: &str = "\u{1b}]52;c;aGF4\u{7}denied\u{1b}[6n";
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "canary-row-marker");
+    let store = app.nav.top().data_store().expect("root is a table").clone();
+
+    // The banner path: rows resident, so the message rides the title.
+    store.apply(1, StorePayload::Stale(HOSTILE.to_string()));
+    let mut t = term();
+    let painted = paint(&mut t, &mut app);
+    assert!(!painted.contains('\u{1b}'), "no ESC may reach the buffer");
+    assert!(!painted.contains('\u{7}'), "no BEL may reach the buffer");
+    assert!(painted.contains("denied"), "the human-readable part survives");
+
+    // The status-line path: no rows, so the message is centred instead.
+    store.clear();
+    store.apply(2, StorePayload::Failed(HOSTILE.to_string()));
+    let painted = paint(&mut t, &mut app);
+    assert!(!painted.contains('\u{1b}'));
+    assert!(!painted.contains('\u{7}'));
+}
+
+#[test]
+fn cached_overview_counters_say_they_are_from_a_previous_visit() {
+    // Found independently by three audit agents: `switch_context` marked the
+    // restored core stores `Stale`, and NOTHING read that field — the
+    // Overview's counters come from `i.rows` and gate on the LINK alone. So
+    // A→B→A painted the previous visit's node/namespace counts exactly like
+    // live ones. The unit test passed; the screen still lied.
+    use crate::kube::protocol::ContextName;
+    use crate::kube::resource_def::BuiltInKind;
+    let mut app = App::new_for_test();
+    app.conn.established();
+    app.core.seed(BuiltInKind::Namespace, vec![ResourceRow {
+        name: "kube-system".into(),
+        ..Default::default()
+    }]);
+
+    // Leave for another context and come back.
+    let a = ContextName::new("ctx-a").unwrap();
+    let b = ContextName::new("ctx-b").unwrap();
+    app.core.switch_context(Some(a.clone()), &b);
+    app.core.switch_context(Some(b), &a);
+
+    // The counters live on the Overview, which is where every switch lands.
+    app.nav.reset(Element::Overview(crate::app::element::Overview));
+    let mut t = term();
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        painted.contains("STALE"),
+        "restored counters must say they're from a previous visit:\n{painted}"
+    );
 }

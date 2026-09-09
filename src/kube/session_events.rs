@@ -88,7 +88,7 @@ pub(crate) fn apply_event(
             }
         }
         AppEvent::ExecData(bytes) => {
-            if let Some(crate::app::Overlay::Shell(ref mut shell)) = app.ui.overlay {
+            if let Some(crate::app::Overlay::Shell(shell)) = app.ui.overlay_mut() {
                 shell.connect_state = crate::app::ShellConnectState::Connected;
                 // Buffer output until the main loop enters bridge mode.
                 // These bytes (typically the initial shell prompt) will be
@@ -105,7 +105,7 @@ pub(crate) fn apply_event(
             // (error flash); already `Connected` = the shell came up and
             // exited immediately (fast command / instant exit — a normal end,
             // not a failure).
-            if let Some(crate::app::Overlay::Shell(ref shell)) = app.ui.overlay {
+            if let Some(crate::app::Overlay::Shell(ref shell)) = app.ui.overlay() {
                 app.ui.flash = Some(match shell.connect_state {
                     crate::app::ShellConnectState::Connecting => {
                         crate::app::FlashMessage::error("Shell connection failed".to_string())
@@ -114,7 +114,7 @@ pub(crate) fn apply_event(
                         crate::app::FlashMessage::info("Shell session ended".to_string())
                     }
                 });
-                app.ui.overlay = None;
+                app.ui.close_modal();
             }
         }
         AppEvent::DaemonDisconnected => {
@@ -141,6 +141,8 @@ pub(crate) fn apply_event(
             // KubeconfigLoaded stage put there.
             app.kube.context = Some(context);
             app.kube.identity = identity;
+            // Confirmed — the candidate has served its purpose.
+            app.kube.connecting = None;
             if !namespaces.is_empty() {
                 let ns_rows = crate::kube::cache::cached_namespaces_to_rows(&namespaces);
                 app.core.seed(crate::kube::resource_def::BuiltInKind::Namespace, ns_rows);
@@ -200,14 +202,11 @@ pub(crate) fn apply_event(
         AppEvent::KubeconfigLoaded {
             contexts, current_context, current_identity,
         } => {
-            // Adopt the kubeconfig's view only if the daemon hasn't already
-            // published its own (authoritative) values via ConnectionEstablished.
-            // In the normal startup order KubeconfigLoaded arrives first and
-            // ConnectionEstablished arrives later, so this branch is taken.
-            if app.kube.context.is_none() {
-                app.kube.context = current_context;
-                app.kube.identity = current_identity;
-            }
+            // A CANDIDATE, not a confirmation: this fires before the
+            // handshake and names the context this session is aiming at. It
+            // must never touch `context`/`identity`, which mean "last
+            // CONFIRMED" and are what a failed switch falls back to.
+            app.kube.connecting = current_context.map(|c| (c, current_identity));
             // One store, re-seeded in place: a contexts view that is already
             // open sees the new rows on its next derive, exactly as a
             // resource table sees a fresh baseline. No second copy to sync.
@@ -255,7 +254,7 @@ fn apply_op_result(
     // if this result IS an apply for the edited object.
     let is_applying_this = op == crate::kube::protocol::OperationKind::Apply
         && matches!(
-            app.ui.overlay,
+            app.ui.overlay(),
             Some(crate::app::Overlay::Edit {
                 target: ref t,
                 state: crate::app::EditState::Applying { .. },
@@ -266,7 +265,7 @@ fn apply_op_result(
         if let Some(crate::app::Overlay::Edit {
             target: edit_target,
             state: crate::app::EditState::Applying { temp_file, original },
-        }) = app.ui.overlay.take() {
+        }) = app.ui.take_modal().into_overlay() {
             match &result {
                 Ok(_) => {
                     drop(temp_file);
@@ -279,10 +278,10 @@ fn apply_op_result(
                         msg, current,
                     );
                     let _ = std::fs::write(temp_file.path(), &with_error);
-                    app.ui.overlay = Some(crate::app::Overlay::Edit {
+                    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Edit {
                         target: edit_target,
                         state: crate::app::EditState::EditorReady { temp_file, original },
-                    });
+                    }));
                 }
             }
         }
@@ -349,7 +348,7 @@ fn apply_resource_update(
             if view_took_it {
                 return;
             }
-            if let Some(crate::app::Overlay::Edit { ref target, ref mut state }) = app.ui.overlay {
+            if let Some(crate::app::Overlay::Edit { target, state }) = app.ui.overlay_mut() {
                 if *target != response_target { return; }
                 if matches!(state, crate::app::EditState::AwaitingYaml) {
                     match write_edit_temp_file(target, &content) {
@@ -364,7 +363,7 @@ fn apply_resource_update(
                             app.ui.flash = Some(crate::app::FlashMessage::error(
                                 format!("Edit failed: {}", e)
                             ));
-                            app.ui.overlay = None;
+                            app.ui.close_modal();
                         }
                     }
                 }

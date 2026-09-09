@@ -63,7 +63,7 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     // -----------------------------------------------------------------------
     // Confirmation dialog: only y/n/Enter/Esc.
     // -----------------------------------------------------------------------
-    if app.ui.confirm_dialog.is_some() {
+    if app.ui.confirm_dialog().is_some() {
         return handle_confirm_dialog(app, key);
     }
 
@@ -71,7 +71,7 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     // Overlays first. Checked BEFORE global keys so `:q`, Ctrl-C, etc.
     // can't leak through during the edit flow or a shell connect.
     // -----------------------------------------------------------------------
-    match &app.ui.overlay {
+    match &app.ui.overlay() {
         Some(Overlay::Edit { .. }) | Some(Overlay::Shell(_)) => {
             // Modal operations block ALL keys except Esc. (Shell during
             // Connecting: Esc cancels; during bridge mode the TUI is
@@ -128,7 +128,7 @@ fn handle_confirm_dialog(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Enter => {
             // Confirm or cancel based on which button is selected
-            if app.ui.confirm_dialog.as_ref().is_some_and(|d| d.action_focused) {
+            if app.ui.confirm_dialog().as_ref().is_some_and(|d| d.action_focused) {
                 Some(Action::Confirm)
             } else {
                 Some(Action::Cancel)
@@ -218,8 +218,15 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
 // ---------------------------------------------------------------------------
 
 fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
-    // Ctrl-D: delete with confirmation.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+    // Ctrl-D: delete with confirmation — only if the resource declares it,
+    // exactly like Ctrl-K below. Unconditional, it offered "Delete
+    // Context/prod?" on the contexts view, whose `operations()` is
+    // deliberately empty because a kubeconfig context is switched to, not
+    // deleted.
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('d')
+        && app.current_capabilities().supports(OperationKind::Delete)
+    {
         return Some(Action::Delete);
     }
 
@@ -282,15 +289,14 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
             }
         }
 
-        // Esc in resource view: pop one nav level if drilled, otherwise no-op.
+        // Esc in a resource view. Emitted UNCONDITIONALLY: whether it does
+        // anything is the action layer's call, not this one's. It used to
+        // ask `is_drilled()` first and return `None` at the root — a copy of
+        // the "nothing to pop at the root" rule that `ClearFilter` already
+        // enforces, and one that swallowed the key before
+        // `select_gate::gate_action` could shadow it into `ClearMarks`.
         // Overview is only a startup page — `:overview` or `:home` to return.
-        KeyCode::Esc => {
-            if app.nav.is_drilled() {
-                Some(Action::ClearFilter)
-            } else {
-                None
-            }
-        }
+        KeyCode::Esc => Some(Action::ClearFilter),
 
         // Navigation. Column-cursor movement is arrow-keys-only by
         // default (`l` is logs, k9s-style); `keys.colLeft`/`colRight`
