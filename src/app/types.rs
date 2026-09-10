@@ -669,6 +669,10 @@ pub struct UiConfig {
     /// Skin name (loaded by theme.rs separately).
     #[serde(default)]
     pub skin: Option<String>,
+    /// Base palette: `auto` (detect the terminal background), `dark` or
+    /// `light`. A skin, if any, layers on top of whichever is chosen.
+    #[serde(default)]
+    pub theme: crate::ui::theme::ThemeMode,
     pub max_column_width: u16,
     pub search_context_lines: usize,
     pub command_history_size: usize,
@@ -682,6 +686,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             skin: None,
+            theme: crate::ui::theme::ThemeMode::default(),
             max_column_width: 64,
             search_context_lines: 10,
             command_history_size: 50,

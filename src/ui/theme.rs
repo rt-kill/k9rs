@@ -1,41 +1,141 @@
 use std::path::Path;
 
+use crate::ui::term_bg::Appearance;
+
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
-// Default color palette — Nord theme (matches k9s "foot" skin)
+// Palettes
+// ---------------------------------------------------------------------------
+//
+// Every style in [`Theme`] is derived from a [`Palette`], so a color scheme is
+// a palette and nothing else — the style construction lives once, in
+// [`Theme::from_palette`]. Two ship in-tree: [`DARK`] (Nord, matching the k9s
+// "foot" skin) and [`LIGHT`], its counterpart for light terminals. Skin files
+// override individual styles on top of whichever palette was picked.
+
+/// The color slots a [`Theme`] is built from.
+struct Palette {
+    /// Body text: titles, log lines, info values, command prompt.
+    text: Color,
+    /// Brighter than `text` — table headers.
+    text_bright: Color,
+    /// Low-contrast text: borders, timestamps, line numbers, "n/a".
+    muted: Color,
+    /// Accent: focused borders, YAML keys, filter prompt, info labels.
+    blue: Color,
+    /// Default row color for healthy resources (k9s `StdColor`).
+    teal: Color,
+    /// Healthy / running / completed.
+    green: Color,
+    /// Warning, pending, marked rows, changed rows.
+    yellow: Color,
+    /// Error, failed.
+    red: Color,
+    /// Logo, counters, key hints.
+    mauve: Color,
+    /// Row cursor bar, and the text drawn on top of it.
+    cursor_bg: Color,
+    cursor_fg: Color,
+    /// Breadcrumb pills — the trailing (active) crumb and the rest.
+    crumb_bg: Color,
+    crumb_fg: Color,
+    crumb_active_bg: Color,
+    crumb_active_fg: Color,
+    /// Search hit highlight.
+    match_bg: Color,
+    match_fg: Color,
+    /// Dialog interior fill. Painted unconditionally, so it has to stay
+    /// legible against ANY terminal background.
+    dialog_bg: Color,
+    /// Column cursor tint: a background wash laid under whatever foreground
+    /// the cell already has (red/yellow/green health), so it must be subtle.
+    col_highlight: Color,
+}
+
+/// Nord — the default dark palette (matches the k9s "foot" skin).
+const DARK: Palette = Palette {
+    // Snow Storm (text)
+    text: Color::Rgb(216, 222, 232),            // #d8dee8
+    text_bright: Color::Rgb(229, 233, 240),     // #e5e9f0
+    // Polar Night (muted)
+    muted: Color::Rgb(75, 82, 98),              // #4b5262
+    // Frost + Aurora
+    blue: Color::Rgb(129, 161, 193),            // #81a1c1
+    teal: Color::Rgb(137, 208, 186),            // #89d0ba
+    green: Color::Rgb(163, 190, 140),           // #a3be8c
+    yellow: Color::Rgb(235, 203, 139),          // #ebcb8b
+    red: Color::Rgb(191, 97, 106),              // #bf616a
+    mauve: Color::Rgb(180, 142, 173),           // #b48ead
+    // Filled bars: dark Polar Night text on a bright accent.
+    cursor_bg: Color::Rgb(129, 161, 193),
+    cursor_fg: Color::Rgb(47, 52, 63),          // #2f343f
+    crumb_bg: Color::Rgb(129, 161, 193),
+    crumb_fg: Color::Rgb(47, 52, 63),
+    crumb_active_bg: Color::Rgb(180, 142, 173),
+    crumb_active_fg: Color::Rgb(47, 52, 63),
+    match_bg: Color::Rgb(235, 203, 139),
+    match_fg: Color::Rgb(47, 52, 63),
+    dialog_bg: Color::Rgb(25, 28, 38),
+    col_highlight: Color::Rgb(40, 44, 55),
+};
+
+/// Light counterpart to [`DARK`]. Same hues, darkened until every foreground
+/// clears 4.5:1 against a white background (pure Aurora yellow/teal on white
+/// is unreadable), and the filled bars flip: dark text on a pale accent wash
+/// instead of Nord's dark-on-bright.
+const LIGHT: Palette = Palette {
+    text: Color::Rgb(46, 52, 64),               // #2e3440
+    text_bright: Color::Rgb(28, 32, 40),        // #1c2028
+    muted: Color::Rgb(98, 107, 120),            // #626b78
+    blue: Color::Rgb(43, 108, 176),             // #2b6cb0
+    teal: Color::Rgb(15, 118, 110),             // #0f766e
+    green: Color::Rgb(21, 128, 61),             // #15803d
+    yellow: Color::Rgb(180, 83, 9),             // #b45309 — amber, not yellow
+    red: Color::Rgb(185, 28, 28),               // #b91c1c
+    mauve: Color::Rgb(126, 34, 206),            // #7e22ce
+    cursor_bg: Color::Rgb(203, 224, 245),       // #cbe0f5
+    cursor_fg: Color::Rgb(28, 32, 40),
+    crumb_bg: Color::Rgb(219, 230, 244),        // #dbe6f4
+    crumb_fg: Color::Rgb(28, 32, 40),
+    crumb_active_bg: Color::Rgb(230, 214, 245), // #e6d6f5
+    crumb_active_fg: Color::Rgb(28, 32, 40),
+    match_bg: Color::Rgb(255, 224, 138),        // #ffe08a
+    match_fg: Color::Rgb(28, 32, 40),
+    dialog_bg: Color::Rgb(242, 244, 248),       // #f2f4f8
+    col_highlight: Color::Rgb(232, 236, 243),   // #e8ecf3
+};
+
+// ---------------------------------------------------------------------------
+// Theme mode
 // ---------------------------------------------------------------------------
 
-// Nord Polar Night (backgrounds/dark accents)
-/// Dark background accent: #2f343f
-const POLAR_DARK: Color = Color::Rgb(47, 52, 63);
-/// Muted border/separator: #4b5262
-const POLAR_MUTED: Color = Color::Rgb(75, 82, 98);
+/// Which palette to build the theme from (`ui.theme` in config, `--theme` on
+/// the command line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    /// Ask the terminal for its background color and pick to match; falls
+    /// back to `Dark` when it doesn't answer. See [`crate::ui::term_bg`].
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
 
-// Nord Snow Storm (text)
-/// Primary text: #d8dee8
-const SNOW_PRIMARY: Color = Color::Rgb(216, 222, 232);
-/// Bright text (headers): #e5e9f0
-const SNOW_BRIGHT: Color = Color::Rgb(229, 233, 240);
-
-// Nord Frost (blues)
-/// Frost blue (accent, selection, links): #81a1c1
-const FROST_BLUE: Color = Color::Rgb(129, 161, 193);
-/// Suggestion/muted blue: #81a1c1
-const FROST_SUGGEST: Color = Color::Rgb(129, 161, 193);
-
-// Nord Aurora (semantic colors)
-/// Aurora green (success, running): #a3be8c
-const AURORA_GREEN: Color = Color::Rgb(163, 190, 140);
-/// Aurora teal (new, sort indicator): #89d0ba
-const AURORA_TEAL: Color = Color::Rgb(137, 208, 186);
-/// Aurora yellow (warning, modify): #ebcb8b
-const AURORA_YELLOW: Color = Color::Rgb(235, 203, 139);
-/// Aurora red (error, failed): #bf616a
-const AURORA_RED: Color = Color::Rgb(191, 97, 106);
-/// Aurora mauve (logo, active breadcrumb): #b48ead
-const AURORA_MAUVE: Color = Color::Rgb(180, 142, 173);
+impl ThemeMode {
+    /// Resolve to a concrete [`Appearance`]. THE only place that may query
+    /// the terminal, and it must be called at the edge — before raw mode and
+    /// the alternate screen, and outside anything a test constructs.
+    pub fn resolve(self) -> Appearance {
+        match self {
+            ThemeMode::Dark => Appearance::Dark,
+            ThemeMode::Light => Appearance::Light,
+            ThemeMode::Auto => crate::ui::term_bg::detect(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers to parse colors from skin YAML
@@ -474,6 +574,11 @@ pub struct Theme {
     // Dialog
     pub dialog_border: Style,
     pub dialog_bg: Style,
+    /// Opaque fill for dialog interiors. Not a `Style` and not
+    /// skin-overridable on purpose: dialogs paint it under everything so a
+    /// skin's `dialog.bgColor: default` can't render them invisible against
+    /// the terminal background. See [`crate::ui::fill_dialog_bg`].
+    pub dialog_fill: Color,
     pub dialog_button_active: Style,
     pub dialog_button_inactive: Style,
 
@@ -501,214 +606,253 @@ pub struct Theme {
 }
 
 impl Default for Theme {
+    /// The stock dark (Nord) theme — the historical default, and what every
+    /// non-rendering caller (line counting, tests) wants.
     fn default() -> Self {
-        Self {
-            // Table header: bright snow, bold
-            header: Style::default()
-                .fg(SNOW_BRIGHT)
-                .add_modifier(Modifier::BOLD),
-            // Selected row: dark text on frost blue, bold
-            selected: Style::default()
-                .fg(POLAR_DARK)
-                .bg(FROST_BLUE)
-                .add_modifier(Modifier::BOLD),
-            // Normal row text: aurora teal (k9s uses frame.status.newColor
-            // as StdColor — the default row color for healthy resources).
-            row_normal: Style::default()
-                .fg(AURORA_TEAL),
-
-            // Status colors (Aurora palette)
-            status_running: Style::default()
-                .fg(AURORA_GREEN),
-            status_pending: Style::default()
-                .fg(AURORA_YELLOW),
-            status_failed: Style::default()
-                .fg(AURORA_RED),
-            status_succeeded: Style::default()
-                .fg(AURORA_GREEN)
-                .add_modifier(Modifier::DIM),
-
-            // Borders: muted polar, focused = frost blue
-            border: Style::default()
-                .fg(POLAR_MUTED),
-            border_focused: Style::default()
-                .fg(FROST_BLUE),
-
-            // Table title: snow primary
-            title: Style::default()
-                .fg(SNOW_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-            // Namespace highlight in title: aurora yellow
-            title_namespace: Style::default()
-                .fg(AURORA_YELLOW)
-                .add_modifier(Modifier::BOLD),
-            // Counter in title: aurora mauve
-            title_counter: Style::default()
-                .fg(AURORA_MAUVE),
-            // Filter indicator in title: aurora green
-            title_filter_indicator: Style::default()
-                .fg(AURORA_GREEN),
-            // Sort indicator: aurora teal
-            sort_indicator: Style::default()
-                .fg(AURORA_TEAL)
-                .add_modifier(Modifier::BOLD),
-
-            // Filter prompt: frost blue
-            filter: Style::default()
-                .fg(FROST_BLUE),
-
-            // Flash messages
-            flash_info: Style::default()
-                .fg(AURORA_TEAL)
-                .add_modifier(Modifier::BOLD),
-            flash_warn: Style::default()
-                .fg(AURORA_YELLOW)
-                .add_modifier(Modifier::BOLD),
-            flash_error: Style::default()
-                .fg(AURORA_RED)
-                .add_modifier(Modifier::BOLD),
-
-            // Breadcrumbs: dark text on frost blue / active on mauve
-            breadcrumb_active: Style::default()
-                .fg(POLAR_DARK)
-                .bg(AURORA_MAUVE),
-            breadcrumb_inactive: Style::default()
-                .fg(POLAR_DARK)
-                .bg(FROST_BLUE),
-
-            // YAML syntax (frost + aurora)
-            yaml_key: Style::default()
-                .fg(FROST_BLUE),
-            yaml_string: Style::default()
-                .fg(AURORA_GREEN),
-            yaml_number: Style::default()
-                .fg(AURORA_MAUVE),
-
-            // Command prompt
-            command: Style::default()
-                .fg(SNOW_PRIMARY),
-            command_suggestion: Style::default()
-                .fg(FROST_SUGGEST),
-
-            // Status bar
-            status_bar: Style::default()
-                .fg(SNOW_PRIMARY),
-            status_bar_key: Style::default()
-                .fg(AURORA_MAUVE)
-                .add_modifier(Modifier::BOLD),
-
-            // Header panel (cluster info)
-            info_label: Style::default()
-                .fg(FROST_BLUE)
-                .add_modifier(Modifier::BOLD),
-            info_value: Style::default()
-                .fg(SNOW_PRIMARY),
-            logo: Style::default()
-                .fg(AURORA_MAUVE)
-                .add_modifier(Modifier::BOLD),
-
-            // Namespace/context labels
-            namespace_label: Style::default()
-                .fg(AURORA_YELLOW)
-                .add_modifier(Modifier::BOLD),
-            context_label: Style::default()
-                .fg(FROST_BLUE)
-                .add_modifier(Modifier::BOLD),
-
-            // Help overlay
-            help_key: Style::default()
-                .fg(AURORA_MAUVE)
-                .add_modifier(Modifier::BOLD),
-            help_desc: Style::default()
-                .fg(SNOW_PRIMARY),
-
-            // Dialog
-            dialog_border: Style::default()
-                .fg(FROST_BLUE),
-            dialog_bg: Style::default()
-                .bg(POLAR_DARK),
-            dialog_button_active: Style::default()
-                .fg(POLAR_DARK)
-                .bg(FROST_BLUE)
-                .add_modifier(Modifier::BOLD),
-            dialog_button_inactive: Style::default()
-                .fg(POLAR_MUTED),
-
-            // Log viewer
-            log_timestamp: Style::default()
-                .fg(POLAR_MUTED),
-            log_text: Style::default()
-                .fg(SNOW_PRIMARY),
-            line_number: Style::default()
-                .fg(POLAR_MUTED),
-            search_match: Style::default()
-                .fg(POLAR_DARK)
-                .bg(AURORA_YELLOW),
-
-            // Info "n/a" values
-            info_na: Style::default()
-                .fg(POLAR_MUTED),
-
-            // Marked/selected rows: aurora yellow bold
-            marked_row: Style::default()
-                .fg(AURORA_YELLOW)
-                .add_modifier(Modifier::BOLD),
-            selected_marked: Style::default()
-                .fg(AURORA_YELLOW)
-                .add_modifier(Modifier::BOLD),
-
-            // Delta changed rows: aurora yellow highlight
-            delta_changed: Style::default()
-                .fg(AURORA_YELLOW),
-
-            // Column cursor: subtle polar background tint
-            col_highlight: Style::default()
-                .bg(Color::Rgb(40, 44, 55)),
-        }
+        Self::from_palette(&DARK)
     }
 }
 
 impl Theme {
-    /// Try to load the user's skin, falling back to the stock theme.
+    /// The stock dark (Nord) theme.
+    pub fn dark() -> Self {
+        Self::from_palette(&DARK)
+    }
+
+    /// The stock light theme.
+    pub fn light() -> Self {
+        Self::from_palette(&LIGHT)
+    }
+
+    /// The theme for an already-RESOLVED appearance.
     ///
-    /// 1. Read `~/.config/k9rs/config.yaml` to find the skin name under `k9rs.ui.skin`.
-    /// 2. Look for `~/.config/k9rs/skins/<name>.yaml`.
-    /// 3. If found, parse it and override colors.
-    /// 4. Fall back to `Theme::default()`.
+    /// Takes [`Appearance`], not [`ThemeMode`], so `Auto` cannot reach here:
+    /// resolving it queries the terminal, and this runs inside `App::new`,
+    /// which is deliberately free of I/O (`App::new_for_test` would otherwise
+    /// open `/dev/tty` in the test suite). Resolution happens once, at the
+    /// edge — see [`ThemeMode::resolve`].
+    pub fn for_appearance(appearance: Appearance) -> Self {
+        match appearance {
+            Appearance::Light => Self::light(),
+            Appearance::Dark => Self::dark(),
+        }
+    }
+
+    /// Build the full style set from a palette. Every color a widget can
+    /// reach comes from here, so a palette swap recolors the whole TUI.
+    fn from_palette(p: &Palette) -> Self {
+        Self {
+            // Table header: brightest text, bold
+            header: Style::default()
+                .fg(p.text_bright)
+                .add_modifier(Modifier::BOLD),
+            // Selected row: cursor bar
+            selected: Style::default()
+                .fg(p.cursor_fg)
+                .bg(p.cursor_bg)
+                .add_modifier(Modifier::BOLD),
+            // Normal row text: teal (k9s uses frame.status.newColor
+            // as StdColor — the default row color for healthy resources).
+            row_normal: Style::default()
+                .fg(p.teal),
+
+            // Status colors
+            status_running: Style::default()
+                .fg(p.green),
+            status_pending: Style::default()
+                .fg(p.yellow),
+            status_failed: Style::default()
+                .fg(p.red),
+            status_succeeded: Style::default()
+                .fg(p.green)
+                .add_modifier(Modifier::DIM),
+
+            // Borders: muted, focused = accent blue
+            border: Style::default()
+                .fg(p.muted),
+            border_focused: Style::default()
+                .fg(p.blue),
+
+            // Table title: body text
+            title: Style::default()
+                .fg(p.text)
+                .add_modifier(Modifier::BOLD),
+            // Namespace highlight in title
+            title_namespace: Style::default()
+                .fg(p.yellow)
+                .add_modifier(Modifier::BOLD),
+            // Counter in title
+            title_counter: Style::default()
+                .fg(p.mauve),
+            // Filter indicator in title
+            title_filter_indicator: Style::default()
+                .fg(p.green),
+            // Sort indicator
+            sort_indicator: Style::default()
+                .fg(p.teal)
+                .add_modifier(Modifier::BOLD),
+
+            // Filter prompt
+            filter: Style::default()
+                .fg(p.blue),
+
+            // Flash messages
+            flash_info: Style::default()
+                .fg(p.teal)
+                .add_modifier(Modifier::BOLD),
+            flash_warn: Style::default()
+                .fg(p.yellow)
+                .add_modifier(Modifier::BOLD),
+            flash_error: Style::default()
+                .fg(p.red)
+                .add_modifier(Modifier::BOLD),
+
+            // Breadcrumbs: pills, active one in the accent hue
+            breadcrumb_active: Style::default()
+                .fg(p.crumb_active_fg)
+                .bg(p.crumb_active_bg),
+            breadcrumb_inactive: Style::default()
+                .fg(p.crumb_fg)
+                .bg(p.crumb_bg),
+
+            // YAML syntax
+            yaml_key: Style::default()
+                .fg(p.blue),
+            yaml_string: Style::default()
+                .fg(p.green),
+            yaml_number: Style::default()
+                .fg(p.mauve),
+
+            // Command prompt
+            command: Style::default()
+                .fg(p.text),
+            command_suggestion: Style::default()
+                .fg(p.blue),
+
+            // Status bar
+            status_bar: Style::default()
+                .fg(p.text),
+            status_bar_key: Style::default()
+                .fg(p.mauve)
+                .add_modifier(Modifier::BOLD),
+
+            // Header panel (cluster info)
+            info_label: Style::default()
+                .fg(p.blue)
+                .add_modifier(Modifier::BOLD),
+            info_value: Style::default()
+                .fg(p.text),
+            logo: Style::default()
+                .fg(p.mauve)
+                .add_modifier(Modifier::BOLD),
+
+            // Namespace/context labels
+            namespace_label: Style::default()
+                .fg(p.yellow)
+                .add_modifier(Modifier::BOLD),
+            context_label: Style::default()
+                .fg(p.blue)
+                .add_modifier(Modifier::BOLD),
+
+            // Help overlay
+            help_key: Style::default()
+                .fg(p.mauve)
+                .add_modifier(Modifier::BOLD),
+            help_desc: Style::default()
+                .fg(p.text),
+
+            // Dialog
+            dialog_border: Style::default()
+                .fg(p.blue),
+            dialog_bg: Style::default()
+                .bg(p.dialog_bg),
+            dialog_fill: p.dialog_bg,
+            dialog_button_active: Style::default()
+                .fg(p.cursor_fg)
+                .bg(p.cursor_bg)
+                .add_modifier(Modifier::BOLD),
+            dialog_button_inactive: Style::default()
+                .fg(p.muted),
+
+            // Log viewer
+            log_timestamp: Style::default()
+                .fg(p.muted),
+            log_text: Style::default()
+                .fg(p.text),
+            line_number: Style::default()
+                .fg(p.muted),
+            search_match: Style::default()
+                .fg(p.match_fg)
+                .bg(p.match_bg),
+
+            // Info "n/a" values
+            info_na: Style::default()
+                .fg(p.muted),
+
+            // Marked/selected rows
+            marked_row: Style::default()
+                .fg(p.yellow)
+                .add_modifier(Modifier::BOLD),
+            selected_marked: Style::default()
+                .fg(p.yellow)
+                .add_modifier(Modifier::BOLD),
+
+            // Delta changed rows
+            delta_changed: Style::default()
+                .fg(p.yellow),
+
+            // Column cursor: subtle background tint
+            col_highlight: Style::default()
+                .bg(p.col_highlight),
+        }
+    }
+
+    /// Load the theme: the palette picked by `mode`, with the user's skin
+    /// (if any) overriding colors on top of it.
     ///
-    /// Load the theme. The skin name comes from AppConfig (already
-    /// deserialized via serde). Searches k9rs then k9s skins dirs.
-    pub fn load(skin_name: Option<&str>) -> Self {
+    /// 1. `mode` selects the base palette — dark, light, or auto-detected
+    ///    from the terminal background.
+    /// 2. The skin name comes from AppConfig (already deserialized via
+    ///    serde); an empty/absent name means "stock palette, no overrides".
+    /// 3. `~/.config/k9rs/skins/<name>.yaml` is searched first, then
+    ///    `~/.config/k9s/skins/<name>.yaml`.
+    /// 4. A missing or unparsable skin falls back to the bare palette.
+    pub fn load(skin_name: Option<&str>, appearance: Appearance) -> Self {
         let Some(name) = skin_name.filter(|s| !s.is_empty()) else {
-            return Self::default();
+            return Self::for_appearance(appearance);
         };
         let home = match std::env::var("HOME") {
             Ok(h) => h,
-            Err(_) => return Self::default(),
+            Err(_) => return Self::for_appearance(appearance),
         };
         // Try k9rs skins dir first, fall back to k9s.
         let skin_file = format!("{}.yaml", name);
         let k9rs_path = Path::new(&home).join(".config/k9rs/skins").join(&skin_file);
         if k9rs_path.exists() {
-            return Self::from_skin_file(&k9rs_path).unwrap_or_default();
+            return Self::from_skin_file(&k9rs_path, appearance).unwrap_or_else(|| Self::for_appearance(appearance));
         }
         let k9s_path = Path::new(&home).join(".config/k9s/skins").join(&skin_file);
         if k9s_path.exists() {
-            return Self::from_skin_file(&k9s_path).unwrap_or_default();
+            return Self::from_skin_file(&k9s_path, appearance).unwrap_or_else(|| Self::for_appearance(appearance));
         }
-        Self::default()
+        Self::for_appearance(appearance)
     }
 
-    /// Load a skin YAML file (compatible with k9s skin format) and produce a Theme
-    /// with overridden colors. Returns `None` if the file cannot be read or parsed.
-    pub fn from_skin_file(path: &Path) -> Option<Self> {
+    /// Load a skin YAML file (compatible with k9s skin format) and produce a
+    /// Theme with overridden colors, layered over `mode`'s palette. Returns
+    /// `None` if the file cannot be read or parsed.
+    pub fn from_skin_file(path: &Path, appearance: Appearance) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
         let yaml: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
         let k9s_val = yaml.get("k9s")?.clone();
         let skin: SkinSchema = serde_yaml::from_value(k9s_val).ok()?;
 
-        let mut theme = Self::default();
+        let mut theme = Self::for_appearance(appearance);
         skin.apply_to(&mut theme);
         Some(theme)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/ui/theme.rs"]
+mod mirror_tests;

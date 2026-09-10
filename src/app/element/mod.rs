@@ -1233,11 +1233,16 @@ impl Element {
         }
     }
 
-    /// How many committed log greps are active on this element.
-    pub fn log_committed_count(&self) -> usize {
+    /// The COMMITTED log greps on this element, oldest first — what the grep
+    /// bar labels itself with. [`Self::log_patterns`] is the highlight set and
+    /// additionally carries the uncommitted draft, so the two are not
+    /// interchangeable.
+    pub fn log_committed_patterns(&self) -> Vec<String> {
         match self {
-            Element::LogFilter(e) => e.source.patterns.len(),
-            _ => 0,
+            Element::LogFilter(e) => {
+                e.source.patterns.iter().map(|p| p.source().to_string()).collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -1284,10 +1289,7 @@ impl Element {
     /// The committed log-grep patterns active on this element (labels for
     /// highlight + the filter bar).
     pub fn log_patterns(&self) -> Vec<String> {
-        let mut pats: Vec<String> = match self {
-            Element::LogFilter(e) => e.source.patterns.iter().map(|p| p.source().to_string()).collect(),
-            _ => Vec::new(),
-        };
+        let mut pats = self.log_committed_patterns();
         if let Some(view) = self.log_view() {
             if let Some(d) = &view.draft {
                 if !d.is_empty() {

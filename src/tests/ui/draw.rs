@@ -394,3 +394,135 @@ fn cached_overview_counters_say_they_are_from_a_previous_visit() {
         "restored counters must say they're from a previous visit:\n{painted}"
     );
 }
+
+#[test]
+fn the_light_palette_actually_reaches_the_screen() {
+    // The palette is only worth having if it survives the whole render path.
+    // The dialog fill is the sharpest probe: it used to be a hardcoded
+    // near-black const applied over Clear, so on a light terminal every
+    // dialog was a black hole regardless of theme.
+    use ratatui::style::Color;
+    let mut app = App::new_for_test();
+    app.conn.established();
+    app.ui.theme = crate::ui::theme::Theme::light();
+    app.ui.open(crate::app::Modal::Overlay(Overlay::Help {
+        viewport: crate::app::viewport::Viewport::default(),
+    }));
+
+    let mut t = term();
+    paint(&mut t, &mut app);
+    let fill = crate::ui::theme::Theme::light().dialog_fill;
+    let painted_fill = t
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .any(|c| c.style().bg == Some(fill));
+    assert!(painted_fill, "the light dialog fill must reach the buffer");
+
+    // And it is genuinely light — the old const was Rgb(25, 28, 38).
+    let Color::Rgb(r, g, b) = fill else { panic!("dialog fill should be rgb") };
+    let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    assert!(luma > 127.5, "a light theme's dialog must not be dark: {fill:?}");
+}
+
+// ---------------------------------------------------------------------------
+// "Chrome that explains the content cannot be owned by the content." The log
+// grep bar was painted inside `LogViewer`, which the view only instantiates
+// when there are lines to draw — so it vanished in exactly the states that
+// needed explaining, and covered the last row in the states that didn't.
+// ---------------------------------------------------------------------------
+
+/// A log element with `lines` already in its store, ready to push.
+fn log_session_with(lines: &[&str]) -> Element {
+    let session = LogSession::for_test(ContainerRef::new(
+        "canarypod",
+        "default",
+        LogContainer::Named("app".to_string()),
+    ));
+    for content in lines {
+        session
+            .store()
+            .push(0, LogLine { container: None, content: (*content).to_string() });
+    }
+    Element::LogSession(Box::new(session))
+}
+
+#[test]
+fn a_grep_that_matches_nothing_still_shows_its_pattern() {
+    // THE reported bug. Type a grep that matches nothing and the screen said
+    // "No matching lines." with no sign of the pattern that emptied it —
+    // nothing to read, nothing to correct, and no way to tell a typo from a
+    // genuinely absent line.
+    let mut app = App::new_for_test();
+    app.conn.established();
+    app.nav.push(log_session_with(&["hello world"]));
+    app.nav.top_mut().log_view_mut().expect("log view").draft =
+        Some("zzz-no-such-line".to_string());
+
+    let mut t = term();
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        painted.contains("No matching lines."),
+        "the grep really did empty the view:\n{painted}"
+    );
+    assert!(
+        painted.contains("zzz-no-such-line"),
+        "the pattern that emptied the view must stay on screen to be edited:\n{painted}"
+    );
+}
+
+#[test]
+fn a_committed_grep_that_matches_nothing_still_shows_its_chain() {
+    // Same hole one level up: a COMMITTED grep (a `LogFilter` element) that
+    // narrows to zero also lost its label, so the only way to learn what was
+    // filtering the view was to pop it.
+    let mut app = App::new_for_test();
+    app.conn.established();
+    let session = log_session_with(&["hello world"]);
+    let filter = Element::derive_log_filter(
+        &session,
+        crate::app::nav::CompiledGrep::new("zzz-no-such-line"),
+    )
+    .expect("log session yields a line output");
+    app.nav.push(session);
+    app.nav.push(filter);
+
+    let mut t = term();
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        painted.contains("No matching lines."),
+        "the grep really did empty the view:\n{painted}"
+    );
+    assert!(
+        painted.contains("zzz-no-such-line"),
+        "a committed grep must keep naming itself when it matches nothing:\n{painted}"
+    );
+}
+
+#[test]
+fn the_grep_bar_does_not_cover_the_last_log_line() {
+    // The other half of the same structural fault: the bar was painted over
+    // the last content row while the Viewport still counted that row as
+    // visible. With a grep active the tail line was drawn and then erased, and
+    // no amount of scrolling could bring it back — `end()` was already at the
+    // bottom. Now the bar claims its own layout row, so the content area is
+    // genuinely one shorter and every measured row is a row you can see.
+    let mut app = App::new_for_test();
+    app.conn.established();
+    let lines: Vec<String> = (0..200).map(|i| format!("line-{i} keep")).collect();
+    let session = log_session_with(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+    let filter =
+        Element::derive_log_filter(&session, crate::app::nav::CompiledGrep::new("keep"))
+            .expect("log session yields a line output");
+    app.nav.push(session);
+    app.nav.push(filter);
+
+    let mut t = term();
+    paint(&mut t, &mut app); // first frame publishes the measured extent
+    let painted = paint(&mut t, &mut app); // second tails to the true bottom
+    assert!(
+        painted.contains("line-199"),
+        "the tail line must survive the grep bar that sits below it:\n{painted}"
+    );
+}

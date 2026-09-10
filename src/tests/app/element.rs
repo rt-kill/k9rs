@@ -210,7 +210,7 @@ fn log_filters_chain_and_scroll_heals_on_eviction() {
     let mut filter =
         Element::derive_log_filter(&session, CompiledGrep::new("err")).unwrap();
     assert_eq!(filter.label(), "/err");
-    assert_eq!(filter.log_committed_count(), 1);
+    assert_eq!(filter.log_committed_patterns(), vec!["err".to_string()]);
     assert_eq!(filter.log_visible().unwrap().len(), 5);
     // Draft narrows further (a derive input — no rebuild call).
     filter.log_view_mut().unwrap().draft = Some("line-2".to_string());

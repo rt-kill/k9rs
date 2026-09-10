@@ -88,7 +88,12 @@ k9rs:
 
   # TUI preferences
   ui:
-    skin: dracula              # skin name (loads from skins/ directory)
+    theme: auto                # auto | dark | light — `auto` asks the
+                               #   terminal for its background colour and
+                               #   falls back to dark. `--theme <mode>`
+                               #   overrides this for one run.
+    skin: dracula              # skin name (loads from skins/ directory);
+                               #   layers on top of the chosen theme
     pageScrollLines: 40        # lines per PageUp/PageDown
     maxColumnWidth: 64         # max column width before truncation
     commandHistorySize: 50     # max : command history entries

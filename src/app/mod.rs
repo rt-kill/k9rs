@@ -411,6 +411,7 @@ impl App {
     /// itself, so tests are hermetic by construction and a config error
     /// is a visible startup failure, not a silent default fallback.
     pub fn new(
+        appearance: crate::ui::term_bg::Appearance,
         context: Option<crate::kube::protocol::ContextName>,
         namespace: crate::kube::protocol::Namespace,
         session: &crate::kube::client_session::ClientSession,
@@ -422,7 +423,7 @@ impl App {
         // watch opens until the user navigates to one (startup args or
         // `:cmd` reset to a resource root).
         let root = element::Element::Overview(element::Overview);
-        Self::new_with_root(context, namespace, metrics, root, config)
+        Self::new_with_root(context, namespace, metrics, root, config, appearance)
     }
 
     /// Test-only: an App whose root element rides a parked stream — no
@@ -444,7 +445,15 @@ impl App {
             &metrics,
             "pods".to_string(),
         ));
-        Self::new_with_root(None, namespace, metrics, root, AppConfig::default())
+        // Pinned dark: a test must not depend on the developer's terminal.
+        Self::new_with_root(
+            None,
+            namespace,
+            metrics,
+            root,
+            AppConfig::default(),
+            crate::ui::term_bg::Appearance::Dark,
+        )
     }
 
     fn new_with_root(
@@ -453,6 +462,10 @@ impl App {
         metrics: std::sync::Arc<store::MetricsHub>,
         root: element::Element,
         config: AppConfig,
+        // RESOLVED, never `ThemeMode::Auto`: resolving queries the terminal,
+        // and this constructor must stay free of I/O — `new_for_test` would
+        // otherwise open `/dev/tty` from the test suite.
+        appearance: crate::ui::term_bg::Appearance,
     ) -> Self {
         let cache_capacity = config.ui.cache_capacity;
         let skin_name = config.ui.skin.clone();
@@ -468,7 +481,7 @@ impl App {
             conn: Connection::new(),
             pending_batch: None,
             config,
-            ui: UiState::new(crate::ui::theme::Theme::load(skin_name.as_deref())),
+            ui: UiState::new(crate::ui::theme::Theme::load(skin_name.as_deref(), appearance)),
             kube: KubeState {
                 context,
                 connecting: None,

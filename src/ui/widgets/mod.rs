@@ -10,7 +10,7 @@ pub mod yaml_view;
 
 pub use dialog::{ConfirmDialogWidget, FormDialogWidget};
 pub use modal::{ModalOverlay, DialogSize};
-pub use filter::FilterBar;
+pub use filter::{FilterBar, LogFilterBar};
 pub use flash::FlashWidget;
 pub use help::HelpOverlay;
 pub use log_view::{LogViewer, LogViewState};

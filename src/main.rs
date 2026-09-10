@@ -27,6 +27,11 @@ use crate::event::AppEvent;
 #[command(name = "k9rs", version, about = "A fast Kubernetes TUI")]
 #[command(args_conflicts_with_subcommands = true)]
 struct Cli {
+    /// Color scheme: auto (detect the terminal background), dark, or light.
+    /// Overrides `ui.theme` from the config file for this run.
+    #[arg(long, value_name = "MODE")]
+    theme: Option<crate::ui::theme::ThemeMode>,
+
     /// Kubernetes context to use
     #[arg(long)]
     context: Option<String>,
@@ -153,13 +158,23 @@ async fn main() -> Result<()> {
     // validation (unknown fields, malformed/reserved key chords) is
     // only worth anything if its rejection reaches the user — a silent
     // fallback to defaults would quietly drop settings like readOnly.
-    let config = match App::load_config() {
+    let mut config = match App::load_config() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("k9rs: config error: {e}");
             std::process::exit(2);
         }
     };
+    // `--theme` wins over `ui.theme` for this run.
+    if let Some(mode) = cli.theme {
+        config.ui.theme = mode;
+    }
+    // Resolve to a concrete palette HERE, at the edge. `auto` asks the
+    // terminal for its background colour over `/dev/tty`, which must happen
+    // before raw mode and the alternate screen (both below) so the reply
+    // can't surface as a phantom keypress — and outside `App::new`, which
+    // stays free of I/O so the test constructor doesn't touch a terminal.
+    let appearance = config.ui.theme.resolve();
 
     // Construct the data source FIRST — `ClientSession::new` is
     // non-blocking (it spawns a background manager that does the
@@ -179,7 +194,7 @@ async fn main() -> Result<()> {
 
     // `None`: no context is confirmed until the daemon says so (or, with
     // nothing to connect to, until the user picks one in the contexts view).
-    let mut app = App::new(None, namespace, &data_source, config);
+    let mut app = App::new(appearance, None, namespace, &data_source, config);
     if cli.readonly {
         app.read_only = true;
     }

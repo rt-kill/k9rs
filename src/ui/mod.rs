@@ -1,4 +1,5 @@
 pub mod header;
+pub mod term_bg;
 pub mod theme;
 pub mod views;
 pub mod widgets;
@@ -6,14 +7,19 @@ pub mod widgets;
 /// Header panel height in rows (context/cluster/user + logo).
 pub const HEADER_HEIGHT: u16 = 5;
 
-/// Guaranteed-visible dark background for dialog interiors. Applied after
-/// Clear + Block to prevent skin-overridable `dialog_bg: default` from
-/// making dialogs invisible against the terminal background.
-pub const DIALOG_BG: ratatui::style::Color = ratatui::style::Color::Rgb(25, 28, 38);
 
-/// Fill a rectangular area with the dialog background color.
-pub fn fill_dialog_bg(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
-    let style = ratatui::style::Style::default().bg(DIALOG_BG);
+/// Fill a rectangular area with the theme's dialog background
+/// ([`theme::Theme::dialog_fill`]). Applied after Clear + Block: the fill is
+/// opaque and deliberately NOT skin-overridable, so a skin setting
+/// `dialog_bg: default` can't render dialogs invisible against the terminal.
+/// It follows the palette rather than being a const, so a light theme gets a
+/// light dialog instead of a near-black hole.
+pub fn fill_dialog_bg(
+    buf: &mut ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    theme: &theme::Theme,
+) {
+    let style = ratatui::style::Style::default().bg(theme.dialog_fill);
     for row in area.y..area.y + area.height {
         for col in area.x..area.x + area.width {
             buf[(col, row)].set_style(style);
@@ -314,7 +320,7 @@ fn draw_container_select(
         return;
     }
 
-    fill_dialog_bg(f.buffer_mut(), inner);
+    fill_dialog_bg(f.buffer_mut(), inner, theme);
 
     // Render container list
     for (i, container) in containers.iter().enumerate() {

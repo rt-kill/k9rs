@@ -3,7 +3,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, StatefulWidget, Widget},
+    widgets::StatefulWidget,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -119,12 +119,13 @@ fn container_color(name: &str) -> Color {
 }
 
 /// State for the log viewer widget. Pure data, snapshotted each draw.
+///
+/// It carries only what CONTENT rendering needs. Chrome — the bordered block,
+/// the title indicators, the grep bar — belongs to the view, which draws it in
+/// every state including the ones where there is no content at all.
 pub struct LogViewState {
     /// Physical (wrap-expanded) row offset — from the element's Viewport.
     pub offset: usize,
-    /// Autoscroll flag — for the title indicator only; the snap itself lives
-    /// in the Viewport.
-    pub follow: bool,
     pub wrap: bool,
     pub show_timestamps: bool,
     /// WRITTEN BACK by the widget: total physical (wrap-expanded) row count,
@@ -132,14 +133,6 @@ pub struct LogViewState {
     pub content_rows: usize,
     /// All active filter patterns (committed + draft) for highlighting.
     pub active_patterns: Vec<String>,
-    /// Whether the filter input bar is active (draft being typed).
-    pub filter_input_active: bool,
-    /// Text being typed in the filter input bar.
-    pub filter_input: String,
-    /// Total number of visible lines after filtering.
-    pub visible_count: usize,
-    /// Number of committed (stacked) filters.
-    pub committed_filter_count: usize,
 }
 
 // `LogViewState` is pure data — the authoritative state lives in
@@ -147,42 +140,24 @@ pub struct LogViewState {
 // snapshots into a `LogViewState` via struct literal each draw, so impl
 // methods on this type would never be called.
 
-/// Log viewer widget.
+/// Log CONTENT widget: the scrollable, wrappable, filter-highlighted line
+/// body and its scrollbar, drawn into the area the view hands it.
 ///
-/// Displays scrollable log output with follow mode, line wrapping,
-/// and timestamp display toggle. Renders from a ring buffer of log lines.
-///
-/// Accepts `&[&str]` so it works with both `Vec<String>` and `VecDeque<String>`
-/// (the caller converts to a slice of borrowed strings).
+/// It owns no chrome. The view draws the bordered block and the grep bar
+/// around it, because those must also appear in the states this widget is
+/// never constructed for — connecting, no logs yet, nothing matched the grep.
 pub struct LogViewer<'a> {
     /// Visible window of typed log lines. Each carries `content` plus an
     /// optional source `container` (daemon-tagged for `--all-containers`
     /// streams); the renderer colors that container as a prefix directly,
     /// with no per-line string parsing.
     lines: &'a [&'a LogLine],
-    pod_name: &'a str,
-    /// User-facing label for the header bar — derived from the typed
-    /// [`crate::kube::protocol::LogContainer`] via `ContainerRef::container_label`.
-    container_label: &'a str,
-    since_label: &'a str,
     theme: &'a Theme,
 }
 
 impl<'a> LogViewer<'a> {
-    pub fn new(
-        lines: &'a [&'a LogLine],
-        pod_name: &'a str,
-        container_label: &'a str,
-        since_label: &'a str,
-        theme: &'a Theme,
-    ) -> Self {
-        Self {
-            lines,
-            pod_name,
-            container_label,
-            since_label,
-            theme,
-        }
+    pub fn new(lines: &'a [&'a LogLine], theme: &'a Theme) -> Self {
+        Self { lines, theme }
     }
 
     /// Parse a log line to separate timestamp from content.
@@ -217,23 +192,7 @@ impl StatefulWidget for LogViewer<'_> {
     type State = LogViewState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        // Build title with follow/wrap/since indicators
-        let follow_indicator = if state.follow { " \u{25cf}" } else { " \u{25cb}" }; // ● / ○
-        let wrap_indicator = if state.wrap { " [WRAP]" } else { "" };
-        let since_indicator = format!(" [{}]", self.since_label);
-        let title = format!(
-            " Logs: {}/{}{}{}{} ",
-            self.pod_name, self.container_label, follow_indicator, wrap_indicator, since_indicator
-        );
-
-        let block = Block::bordered()
-            .title(title)
-            .title_style(self.theme.title)
-            .border_style(self.theme.border);
-
-        let inner = block.inner(area);
-        block.render(area, buf);
-
+        let inner = area;
         if inner.height == 0 || inner.width == 0 {
             return;
         }
@@ -427,37 +386,6 @@ impl StatefulWidget for LogViewer<'_> {
                     buf.set_string(scrollbar_x, y, "\u{2591}", self.theme.border);
                 }
             }
-        }
-
-        // Filter bar at the bottom of the log area.
-        if state.filter_input_active || state.committed_filter_count > 0 {
-            let bar_y = inner.y + inner.height.saturating_sub(1);
-            // Clear the line.
-            for x in inner.x..inner.x + inner.width {
-                buf.set_string(x, bar_y, " ", self.theme.status_bar);
-            }
-            let mut spans = vec![Span::styled(" /", self.theme.status_bar_key)];
-            if state.filter_input_active {
-                spans.push(Span::styled(&state.filter_input, self.theme.filter));
-                spans.push(Span::styled("\u{2588}", self.theme.filter));
-                // Show live visible count while typing
-                spans.push(Span::styled(
-                    format!("  [{} visible]", state.visible_count),
-                    self.theme.title_counter,
-                ));
-            } else {
-                // Show committed filter stack summary
-                let label = state.active_patterns.join(" | ");
-                spans.push(Span::styled(label, self.theme.filter));
-                spans.push(Span::styled(
-                    format!("  [{} filter{}, {} visible]",
-                        state.committed_filter_count,
-                        if state.committed_filter_count == 1 { "" } else { "s" },
-                        state.visible_count),
-                    self.theme.title_counter,
-                ));
-            }
-            buf.set_line(inner.x, bar_y, &Line::from(spans), inner.width);
         }
     }
 }
