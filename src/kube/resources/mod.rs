@@ -12,6 +12,13 @@ pub(crate) mod k8s_const {
     pub const STATUS_TRUE: &str = "True";
 
     // -- Pod / namespace phases & reasons --
+        /// Event `type` — a two-valued field, both values named.
+    pub const EVENT_TYPE_NORMAL: &str = "Normal";
+    pub const EVENT_TYPE_WARNING: &str = "Warning";
+    /// ConditionStatus. `STATUS_TRUE` already lived here; its counterpart
+    /// was re-spelled raw in `hpa.rs`.
+    pub const STATUS_FALSE: &str = "False";
+
     pub const PHASE_RUNNING: &str = "Running";
     pub const PHASE_PENDING: &str = "Pending";
     pub const PHASE_SUCCEEDED: &str = "Succeeded";

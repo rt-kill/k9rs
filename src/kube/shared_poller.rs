@@ -14,7 +14,6 @@
 //! concrete mirror that the two pollers — both born here, both
 //! latest-snapshot producers — share via the snapshot type parameter `S`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use dashmap::DashMap;
@@ -32,9 +31,9 @@ pub struct SharedPoller<S: Clone + Send + Sync + 'static> {
     /// task publishes through a clone of this.
     snapshot_tx: watch::Sender<S>,
     task: JoinHandle<()>,
-    /// Coalesces grace tasks to at most one in flight — same discipline as
-    /// [`crate::kube::live_query::LiveQuery`].
-    grace_in_flight: AtomicBool,
+    /// Keep-warm window after the last `PollerSub` drops — same discipline
+    /// as [`crate::kube::live_query::LiveQuery`].
+    grace: crate::kube::GraceGate,
 }
 
 impl<S: Clone + Send + Sync + 'static> Drop for SharedPoller<S> {
@@ -76,12 +75,7 @@ impl<S: Clone + Send + Sync + 'static> Drop for PollerSub<S> {
         crate::kube::spawn_grace(
             self._keepalive.clone(),
             |p| p.task.is_finished(),
-            |p| {
-                p.grace_in_flight
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            },
-            |p| p.grace_in_flight.store(false, Ordering::Release),
+            |p| Some(&p.grace),
         );
     }
 }
@@ -168,9 +162,15 @@ impl<S: Clone + Send + Sync + 'static> PollerCache<S> {
         let poller = Arc::new(SharedPoller {
             snapshot_tx,
             task,
-            grace_in_flight: AtomicBool::new(false),
+            grace: crate::kube::GraceGate::new(crate::kube::watcher_grace()),
         });
         (poller, snapshot_rx)
+    }
+
+    /// Live pollers, for `ctl status`. Skips dead `Weak`s without reaping —
+    /// reporting must not mutate what it reports on.
+    pub fn live_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.value().strong_count() > 0).count()
     }
 
     /// Drop `Weak` slots whose poller is gone, so a long-lived daemon churning

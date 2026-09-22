@@ -52,8 +52,11 @@ fn cellvalue_wire_layout_golden() {
 
 #[test]
 fn resourcerow_wire_layout_golden() {
-    // Pins ResourceRow field order/presence (incl. the metrics tail that
-    // has `#[serde(default)]` but is always positionally on the wire).
+    // Pins ResourceRow field order/presence (incl. the `#[serde(default)]`
+    // fields, which are always positionally on the wire). `references` sits
+    // between `owner_refs` and `pf_ports` — v15 inserted it there, which is a
+    // layout change and therefore a version break, which is the whole reason
+    // this test exists.
     let row = ResourceRow {
         cells: vec![CellValue::Text("c".into()), CellValue::Count(9)],
         name: "row".into(),
@@ -61,6 +64,10 @@ fn resourcerow_wire_layout_golden() {
         drill_target: None,
         containers: Vec::new(),
         owner_refs: Vec::new(),
+        references: vec![crate::kube::resources::row::ResourceRefInfo {
+            kind: crate::kube::resource_def::BuiltInKind::Secret,
+            name: "db".into(),
+        }],
         pf_ports: vec![80, 443],
         crd_info: None,
         node: None,
@@ -72,7 +79,7 @@ fn resourcerow_wire_layout_golden() {
     };
     assert_eq!(
         hex(&bincode::serialize(&row).unwrap()),
-        "0200000000000000000000000100000000000000630400000009000000000000000300000000000000726f770102000000000000006e73000000000000000000000000000000000002000000000000005000bb01000001000000010700000000000000000000",
+        "0200000000000000000000000100000000000000630400000009000000000000000300000000000000726f770102000000000000006e7300000000000000000000000000000000000100000000000000090000000200000000000000646202000000000000005000bb01000001000000010700000000000000000000",
     );
 }
 
@@ -93,28 +100,44 @@ fn describeline_wire_layout_golden() {
 #[test]
 fn logline_wire_layout_golden() {
     // The log-stream wire type added in PROTOCOL_VERSION 7. Field order is
-    // `container` (Option — 1-byte bincode tag, then the String if Some)
-    // then `content`. The All-containers path rides the tagged shape; every
-    // single-source line rides the untagged (None) shape.
-    let tagged = LogLine { container: Some("c".into()), content: "hi".into() };
+    // `source` (Option — 1-byte bincode tag, then the String if Some), then
+    // `timestamp` (same shape, added v16), then `content`. A multi-source
+    // stream rides the tagged shape; every single-source line rides the
+    // untagged (None) shape.
+    let tagged = LogLine { timestamp: None, source: Some("c".into()), content: "hi".into() };
     assert_eq!(
         hex(&bincode::serialize(&tagged).unwrap()),
-        "0101000000000000006302000000000000006869",
+        "010100000000000000630002000000000000006869",
     );
+    // Both Options None: two tag bytes, then the content.
     let untagged = LogLine::untagged("hi");
     assert_eq!(
         hex(&bincode::serialize(&untagged).unwrap()),
-        "0002000000000000006869",
+        "000002000000000000006869",
     );
 }
 
 #[test]
 fn logline_flat_text() {
-    // Untagged: bare content (borrowed, no prefix). Tagged: the source
-    // container regains a `[container] ` prefix for clipboard / file export.
+    // Export carries the line's SUBSTANCE, not a transcript of the drawn
+    // cells: both pieces of provenance ride along whatever `t` and `p` are
+    // set to. All FOUR shapes are pinned, because the one the daemon
+    // actually produces — timestamped — is the one the old test left out,
+    // and it was the one being silently dropped.
     assert_eq!(LogLine::untagged("hi").flat_text().as_ref(), "hi");
     assert_eq!(
-        LogLine { container: Some("web".into()), content: "msg".into() }.flat_text().as_ref(),
+        LogLine { timestamp: None, source: Some("web".into()), content: "msg".into() }.flat_text().as_ref(),
         "[web] msg",
+    );
+    let ts = "2026-09-18T20:29:40.6Z";
+    assert_eq!(
+        LogLine { timestamp: Some(ts.into()), source: None, content: "msg".into() }.flat_text().as_ref(),
+        format!("{ts} msg"),
+    );
+    assert_eq!(
+        LogLine { timestamp: Some(ts.into()), source: Some("web".into()), content: "msg".into() }
+            .flat_text()
+            .as_ref(),
+        format!("{ts} [web] msg"),
     );
 }

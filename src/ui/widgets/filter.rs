@@ -15,6 +15,10 @@ pub struct FilterBar<'a> {
     text: &'a str,
     match_count: usize,
     total_count: usize,
+    /// Why the pattern isn't running as a regex, if it isn't
+    /// ([`crate::app::element::Element::grep_fallback`]). Rendered because
+    /// the alternative is a `[0/47]` the user has no way to explain.
+    fallback: Option<&'a str>,
     theme: &'a Theme,
 }
 
@@ -31,7 +35,25 @@ impl<'a> FilterBar<'a> {
             text,
             match_count,
             total_count,
+            fallback: None,
             theme,
+        }
+    }
+
+    pub fn fallback(mut self, why: Option<&'a str>) -> Self {
+        self.fallback = why;
+        self
+    }
+
+    /// The trailing `[n/total]`, or the reason the pattern degraded — the
+    /// count is meaningless while the pattern isn't the one you wrote.
+    fn counter(&self) -> (String, ratatui::style::Style) {
+        match self.fallback {
+            Some(why) => (format!("  [literal: {why}]"), self.theme.filter_degraded),
+            None => (
+                format!("  [{}/{}]", self.match_count, self.total_count),
+                self.theme.title_counter,
+            ),
         }
     }
 }
@@ -59,6 +81,8 @@ pub struct LogFilterBar<'a> {
     committed: &'a [String],
     /// Lines visible through the whole chain, draft included.
     visible_count: usize,
+    /// Why a grep in the chain isn't running as a regex, if one isn't.
+    fallback: Option<&'a str>,
     theme: &'a Theme,
 }
 
@@ -70,7 +94,12 @@ impl<'a> LogFilterBar<'a> {
         visible_count: usize,
         theme: &'a Theme,
     ) -> Self {
-        Self { active, draft, committed, visible_count, theme }
+        Self { active, draft, committed, visible_count, fallback: None, theme }
+    }
+
+    pub fn fallback(mut self, why: Option<&'a str>) -> Self {
+        self.fallback = why;
+        self
     }
 
     /// Whether this bar has anything to say. The view asks BEFORE laying out,
@@ -105,6 +134,16 @@ impl Widget for LogFilterBar<'_> {
             }
             spans.push(Span::styled(self.draft.to_string(), self.theme.filter));
             spans.push(Span::styled("\u{2588}", self.theme.filter));
+        }
+        // A visible-line count is meaningless while the pattern isn't the one
+        // you wrote, so the reason takes its place rather than sitting beside
+        // it.
+        if let Some(why) = self.fallback {
+            spans.push(Span::styled(
+                format!("  [literal: {why}]"),
+                self.theme.filter_degraded,
+            ));
+        } else if self.active {
             spans.push(Span::styled(
                 format!("  [{} visible]", self.visible_count),
                 self.theme.title_counter,
@@ -165,10 +204,8 @@ impl Widget for FilterBar<'_> {
             }
             // Match count
             if !self.text.is_empty() {
-                spans.push(Span::styled(
-                    format!("  [{}/{}]", self.match_count, self.total_count),
-                    self.theme.title_counter,
-                ));
+                let (text, style) = self.counter();
+                spans.push(Span::styled(text, style));
             }
             let line = Line::from(spans);
             buf.set_line(inner.x, inner.y, &line, inner.width);
@@ -181,10 +218,8 @@ impl Widget for FilterBar<'_> {
                 spans.push(Span::styled("\u{2588}", self.theme.filter));
             }
             if !self.text.is_empty() {
-                spans.push(Span::styled(
-                    format!("  [{}/{}]", self.match_count, self.total_count),
-                    self.theme.title_counter,
-                ));
+                let (text, style) = self.counter();
+                spans.push(Span::styled(text, style));
             }
             let line = Line::from(spans);
             buf.set_line(area.x, area.y, &line, area.width);

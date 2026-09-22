@@ -49,7 +49,34 @@ pub enum CellValue {
     Placeholder,
 }
 
+/// Utilization percentages at or above which a cell colours itself.
+///
+/// A default, not a policy: a per-column `coloring` overlay rule still wins
+/// (see `app::store::derive_view`). What this removes is the state where a
+/// utilization column is born INVISIBLE — colouring used to exist only in
+/// hand-written overlay YAML keyed by header STRING, so `CPU%` instead of
+/// `%CPU` silently coloured nothing, and every new percent column started
+/// out the same way.
+pub const UTILIZATION_WARN_PCT: u64 = 75;
+pub const UTILIZATION_CRIT_PCT: u64 = 90;
+
 impl CellValue {
+    /// Threshold health for a utilization percentage, or `None` for any
+    /// other cell (and for a percentage with nothing to report).
+    ///
+    /// Lives on the TYPE rather than in a table of header names, for the
+    /// same reason [`crate::kube::protocol::LogContainer::label`] does: the
+    /// cell already knows it is a percentage and already holds the number.
+    /// The old path stringified that number, matched a header to decide
+    /// whether to care, then parsed it back out of the rendered `"85%"`.
+    pub fn utilization_health(&self) -> Option<RowHealth> {
+        match self {
+            CellValue::Percentage(Some(v)) if *v >= UTILIZATION_CRIT_PCT => Some(RowHealth::Failed),
+            CellValue::Percentage(Some(v)) if *v >= UTILIZATION_WARN_PCT => Some(RowHealth::Pending),
+            _ => None,
+        }
+    }
+
     /// Build a `List` from a pre-joined comma-separated string.
     /// Returns an empty list if the input is empty.
     pub fn from_comma_str(s: &str) -> Self {
@@ -205,6 +232,12 @@ pub struct ResourceRow {
     pub containers: Vec<ContainerInfo>,
     /// Owner references (server-side for OwnerUid post-filtering).
     pub owner_refs: Vec<OwnerRefInfo>,
+    /// Objects this row NAMES (see [`ResourceRefInfo`]) — populated by the
+    /// pods converter from the spec, empty for every other kind. Feeds the
+    /// `U` reverse lookup as a server-side post-filter, the same shape
+    /// `SubscriptionFilter::OwnerUid` already uses.
+    #[serde(default)]
+    pub references: Vec<ResourceRefInfo>,
     /// Port-forward metadata: suggested local/remote ports for this resource.
     /// Used by the client to populate the port-forward dialog.
     pub pf_ports: Vec<u16>,
@@ -285,6 +318,17 @@ pub struct ContainerInfo {
     /// Cumulative restart count.
     #[serde(default)]
     pub restart_count: i32,
+    /// The DAEMON's verdict, from the same `classify_pod_reason` that decides
+    /// the pod row — so the container row and its pod can no longer disagree.
+    ///
+    /// The client used to re-derive this from `ready`/`state`/`restart_count`,
+    /// ignoring `reason`. An `ImagePullBackOff` with zero restarts came out
+    /// Failed (red) on the pod row and Pending (yellow) on the container row
+    /// one Enter down, with the cell TEXT reading "ImagePullBackOff" in both —
+    /// text and colour contradicting each other, which is exactly what the
+    /// typed classifier was introduced to end.
+    #[serde(default)]
+    pub health: RowHealth,
 }
 
 impl ContainerInfo {
@@ -353,6 +397,25 @@ pub struct OwnerRefInfo {
     pub uid: String,
 }
 
+/// An object this row REFERENCES — a volume's claim, a mounted secret, a
+/// service account. The outward edges, where [`OwnerRefInfo`] is the upward
+/// one.
+///
+/// Extracted by the converter at the API boundary, like every other typed
+/// field on a row, so the reverse lookup ("what uses this PVC") is a filter
+/// over data rather than a guess. It used to be a grep of the pod list for
+/// the resource's NAME, which found `data-postgres-0` → `postgres-0` by
+/// luck of naming convention and missed a secret mounted by `api-7d9f`
+/// entirely — with no indication, because "no pods" looks like an answer.
+///
+/// `kind` is typed: only the kinds a pod can actually name are extractable,
+/// so a reference to something unrepresentable can't be constructed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ResourceRefInfo {
+    pub kind: crate::kube::resource_def::BuiltInKind,
+    pub name: String,
+}
+
 /// Typed K8s field selector. Each variant corresponds to a specific K8s
 /// field selector path; the variant data is the value to match against.
 /// New field paths get new variants — the wire-format string and
@@ -370,16 +433,34 @@ pub enum K8sFieldSelector {
     SpecNodeName(String),
     /// `status.phase=<phase>` — pods in a specific lifecycle phase.
     StatusPhase(String),
+    /// `involvedObject.{kind,name,namespace}` — the events ABOUT one object.
+    ///
+    /// All three parts, because a Service and a Deployment can share a name
+    /// and so can two objects in different namespaces; the whole point of
+    /// this drill is that it answers for one object and not something that
+    /// resembles it. `namespace` is empty for cluster-scoped subjects, whose
+    /// events land in whatever namespace the reporting component chose — so
+    /// the drill scopes the LIST to all namespaces and lets the selector do
+    /// the narrowing.
+    InvolvedObject { kind: String, name: String, namespace: String },
 }
 
 impl K8sFieldSelector {
     /// Render the selector in the format K8s expects on the wire
-    /// (`field.path=value`), suitable for `SubscriptionFilter::Field`.
+    /// (`field.path=value`, comma-separated for AND), suitable for
+    /// `SubscriptionFilter::Field`.
     pub fn to_wire(&self) -> String {
         match self {
             Self::MetadataName(v) => format!("metadata.name={}", v),
             Self::SpecNodeName(v) => format!("spec.nodeName={}", v),
             Self::StatusPhase(v) => format!("status.phase={}", v),
+            Self::InvolvedObject { kind, name, namespace } => {
+                let mut s = format!("involvedObject.kind={kind},involvedObject.name={name}");
+                if !namespace.is_empty() {
+                    s.push_str(&format!(",involvedObject.namespace={namespace}"));
+                }
+                s
+            }
         }
     }
 
@@ -389,6 +470,9 @@ impl K8sFieldSelector {
             Self::MetadataName(v) => format!("name={}", v),
             Self::SpecNodeName(v) => format!("node={}", v),
             Self::StatusPhase(v) => format!("phase={}", v),
+            Self::InvolvedObject { kind, name, .. } => {
+                format!("{}/{}", kind.to_lowercase(), name)
+            }
         }
     }
 }

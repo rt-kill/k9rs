@@ -43,6 +43,15 @@ pub struct DaemonConfig {
     /// cut daemon memory on big quiet resources; raise it if slow (SSH)
     /// clients re-baseline too often.
     pub fanout_ring: usize,
+    /// How long a watcher stays warm after its last subscriber leaves. Bounds
+    /// a row store plus an apiserver watch; see
+    /// [`crate::kube::DEFAULT_WATCHER_GRACE_SECS`].
+    pub watcher_grace_secs: u64,
+    /// How long a context's port-forwards survive after its last session
+    /// detaches. A separate knob from `watcherGraceSecs` because it bounds a
+    /// user-created side effect rather than a cache; see
+    /// [`crate::kube::DEFAULT_LOCALS_GRACE_SECS`].
+    pub locals_grace_secs: u64,
     pub backoff: BackoffConfig,
     /// Exec-backed local resource sources. Each entry defines a command
     /// that is periodically run; its JSON stdout is parsed into table rows.
@@ -56,6 +65,8 @@ impl Default for DaemonConfig {
             watcher_page_size: 1000,
             discovery_refresh_secs: 300,
             fanout_ring: 64,
+            watcher_grace_secs: crate::kube::DEFAULT_WATCHER_GRACE_SECS,
+            locals_grace_secs: crate::kube::DEFAULT_LOCALS_GRACE_SECS,
             backoff: BackoffConfig::default(),
             exec_resources: Vec::new(),
         }

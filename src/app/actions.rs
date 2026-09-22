@@ -4,13 +4,35 @@
 /// integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortTarget {
-    /// Sort by the column at the given data index.
+    /// Sort by the column at the given DATA index.
     Column(usize),
-    /// Sort by the last column of the current table (e.g. AGE). Resolved
-    /// at apply time using the actual table width — `usize::MAX` no
-    /// longer leaks into the action layer.
-    Last,
+    /// Sort by whatever column the cursor is on, resolved at DISPATCH time.
+    ///
+    /// The key handler used to do the visible→data conversion itself, which
+    /// meant reading the last painted view from the key layer — cold on a
+    /// fresh element, so `S` right after a drill produced no action at all.
+    /// Naming the intent instead of computing an index also removes the one
+    /// caller that had to know which of the two column index spaces
+    /// `Column(usize)` is in.
+    CursorColumn,
+    /// Sort by the column carrying this header, resolved against the LIVE
+    /// headers at apply time. `None` if the table has no such column.
+    ///
+    /// The key handler used to compute a data index for `N` (sort by name)
+    /// from a single boolean — `if is_cluster_scoped { 0 } else { 1 }` — on
+    /// the assumption that a namespaced table's second column is NAME. Events
+    /// is namespaced and its headers are `[NAMESPACE, TYPE, REASON, …]`, so
+    /// `N` sorted by event TYPE; the table has no NAME column at all. `A`
+    /// (sort by age) had the same shape one line down, taking the LAST column
+    /// — which is ACTIVE on the contexts table and RESTARTS on containers.
+    ///
+    /// A name is what the user means, so a name is what travels.
+    Named(&'static str),
 }
+
+/// Canonical header names the semantic sort keys resolve against.
+pub const COL_NAME: &str = "NAME";
+pub const COL_AGE: &str = "AGE";
 
 /// Represents every discrete user action that the application can handle.
 /// Actions are produced by the event handler (keystroke → Action mapping;
@@ -64,6 +86,9 @@ pub enum Action {
     /// Toggle log line wrapping.
     ToggleLogWrap,
     /// Toggle log timestamps display.
+    /// Cycle how much per-line chrome the log view shows (`t`) — see
+    /// `ui::widgets::Role::SHED_ORDER`. One action for the whole cycle, so a
+    /// new role joins it without a new binding.
     ToggleLogTimestamps,
     /// Clear the log buffer.
     ClearLogs,
@@ -127,14 +152,21 @@ pub enum Action {
     ShowAliases,
     /// Change the log time range (--since flag). None = tail all logs.
     LogSince(Option<String>),
-    /// Move the column cursor left.
+    /// Move left in this view: the column cursor on a table, a horizontal
+    /// pan on a log. One action because it is one intent — each element kind
+    /// answers it in its own units, which is why the log view did not need a
+    /// second pair of keys or a second config binding.
     ColLeft,
-    /// Move the column cursor right.
+    /// Move right in this view. See [`Action::ColLeft`].
     ColRight,
     /// Move the column cursor to the first (leftmost) column.
     ColFirst,
     /// Move the column cursor to the last (rightmost) column.
     ColLast,
+    /// Pan a stride left / right (logs). The stride is screen-derived and
+    /// published by the render — see `viewport::Pan`.
+    PageLeft,
+    PageRight,
     /// Open the filter input restricted to the currently hovered column.
     ColumnFilter,
     /// Toggle wide column mode.
@@ -159,6 +191,8 @@ pub enum Action {
     SaveLogs,
     /// Show which resources reference the selected row (reverse lookup).
     UsedBy,
+    /// Show the events ABOUT the selected row — "why is this Pending".
+    ShowEvents,
     /// Overlay-defined capability. Carries only the capability name; the
     /// handler resolves implementation details from the overlay config.
     /// Currently only Drill (read-only navigation) is supported. If
@@ -174,6 +208,16 @@ pub enum Action {
     BatchRestart,
     /// Force-kill every marked row (select mode).
     BatchForceKill,
+    /// Copy ONLY the marked rows (select mode's `c`). Distinct from
+    /// [`Action::Copy`], which dumps the whole visible table, for the
+    /// same reason `BatchDelete` is distinct from `Delete`: single and
+    /// batch must never be the same action wearing different data.
+    BatchCopy,
+    /// Stream the marked rows' logs as ONE merged view (select mode's
+    /// log key). The only `Aggregate` action: where `BatchDelete` fans
+    /// out to N independent commands, this collapses to a single
+    /// substream the daemon merges — see [`crate::kube::protocol::LogTarget`].
+    BatchLogs,
 }
 
 /// Operation-manifest → key-dispatch bridge. Lives HERE (client side), not

@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::kube::protocol::{ContextId, ContextName};
 
 fn ctx(n: u64) -> ContextId {

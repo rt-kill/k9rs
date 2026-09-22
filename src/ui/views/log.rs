@@ -40,15 +40,44 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     // conflict with anything.
     let Some(indices) = app.nav.top_mut().log_visible() else { return };
     let element = app.nav.top();
-    let Some((pod_name, container_label, since_label)) = element.log_header() else { return };
+    // `target` is whatever the stream is over: a pod, "3 pods", or
+    // "deploy/api" — see `LogTarget::display`.
+    let Some((target, container_label, since_label)) = element.log_header() else { return };
     let active_patterns = element.log_patterns();
+    let grep_fallback = element.grep_fallback();
+    // A pattern that couldn't compile and a history we couldn't collect are
+    // both "what you see is not what you asked for"; the bar has one slot and
+    // the broken pattern is the more urgent of the two.
+    // ONE slot, three things that can make the result not what you asked
+    // for, most urgent first: a pattern that could not compile, matches that
+    // were dropped before this filter saw them, and smartcase having flipped
+    // the search to case-sensitive. The last is the quietest — nothing else
+    // on screen distinguishes "no such line" from "no such line WITH THAT
+    // CAPITALISATION".
+    let case_sensitive = active_patterns
+        .iter()
+        .any(|p| !p.is_empty() && crate::util::SearchPattern::new(p).is_case_sensitive());
+    let grep_note = grep_fallback
+        .clone()
+        .or_else(|| {
+            element
+                .log_lost_history()
+                .then(|| "older matches were dropped before this filter saw them".to_string())
+        })
+        .or_else(|| {
+            case_sensitive.then(|| {
+                "case-sensitive: a capital in the pattern turns smartcase off".to_string()
+            })
+        });
     let committed = element.log_committed_patterns();
     let Some(view) = element.log_view() else { return };
-    let (offset, follow, wrap, show_timestamps, initial_load) = (
+    let (offset, anchor, follow, wrap, shed, pan, initial_load) = (
         view.viewport.offset(),
+        view.viewport.anchor(),
         view.viewport.following(),
         view.wrap,
-        view.show_timestamps,
+        view.shed,
+        view.pan.offset(),
         view.initial_load,
     );
     let (filter_input_active, filter_input) = (
@@ -56,6 +85,11 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
         view.draft.clone().unwrap_or_default(),
     );
     let Some(store) = element.log_store().cloned() else { return };
+    // Colours come from the SESSION's source list, not this element's. A grep
+    // over a fan-out retains a SUBSET of the lines, so building the ordering
+    // from its own store would renumber the pods that survived the filter and
+    // recolour them the moment you typed a pattern.
+    let sources = element.log_root_store().map(|s| s.sources()).unwrap_or_default();
     let theme = &app.ui.theme;
     let anim = &app.ui.anim;
 
@@ -64,7 +98,8 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     // below, including the ones with no content at all.
     let visible_count = indices.len();
     let grep_bar =
-        LogFilterBar::new(filter_input_active, &filter_input, &committed, visible_count, theme);
+        LogFilterBar::new(filter_input_active, &filter_input, &committed, visible_count, theme)
+            .fallback(grep_note.as_deref());
     let grep_height: u16 = if grep_bar.wants_row() { 1 } else { 0 };
 
     let chunks = Layout::vertical([
@@ -89,7 +124,7 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     let block = ratatui::widgets::Block::bordered()
         .title(format!(
             " Logs: {}/{}{}{} [{}] ",
-            pod_name, container_label, follow_indicator, wrap_indicator, since_label
+            target, container_label, follow_indicator, wrap_indicator, since_label
         ))
         .title_style(theme.title)
         .border_style(theme.border);
@@ -99,7 +134,18 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(block, log_area);
     let inner_height = content_area.height as usize;
 
-    let mut content_rows = 0usize;
+    // What this frame MEASURED: the offset the widget actually windowed from
+    // and the extent it measured, or `None` if no content was drawn at all.
+    //
+    // An Option, not a pair of zeroed locals, because only a real measurement
+    // may be published. Every status screen — connecting, waiting, no logs, no
+    // matching lines — measures nothing, and publishing its zero extent
+    // clamps the persisted offset to 0: type one character of a grep that
+    // matches nothing, backspace it, and you are at the top of a 5000-line
+    // log. The connecting path was guarded against exactly this by hand; the
+    // other three were not, and a bool would have let the next one be missed
+    // too.
+    let mut measured: Option<(usize, usize, usize, crate::app::viewport::LineAnchor)> = None;
     if link_connecting {
         crate::ui::draw_centered_loading(f, content_area, "Connecting...", theme.status_pending, anim);
     } else {
@@ -112,17 +158,62 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
                 let log_viewer = LogViewer::new(&all_lines, theme);
                 let mut view_state = crate::ui::widgets::LogViewState {
                     offset,
+                    // Store-absolute line sequence -> index into the VISIBLE
+                    // slice. `indices` is ascending, so the partition point is
+                    // "the first visible line at or after the anchor" — total
+                    // for every way the anchor can go stale: the line was
+                    // evicted (lands on the new front), a grep dropped it
+                    // (lands on the next match), a grep dropped everything
+                    // below it (lands past the end, which the widget parks at
+                    // the bottom).
+                    anchor: anchor.map(|a| {
+                        let li = indices
+                            .partition_point(|&i| inner.evicted + (i as u64) < a.seq);
+                        (li, a.skip)
+                    }),
+                    top: None,
+                    // Suppressed during the initial tail fetch so the view
+                    // doesn't race while the batch streams in; the event loop
+                    // clears `initial_load` once delivery gaps.
+                    follow: follow && !initial_load,
                     wrap,
-                    show_timestamps,
+                    shed,
+                    pan,
                     content_rows: 0,
+                    widest: 0,
                     active_patterns: active_patterns.clone(),
+                    sources: sources.clone(),
                 };
                 f.render_stateful_widget(log_viewer, content_area, &mut view_state);
-                content_rows = view_state.content_rows;
-            } else if inner.live && inner.lines.is_empty() {
+                // ...and back: the slice index the widget actually drew from,
+                // re-expressed as the line's own sequence so it survives
+                // everything that renumbers the slice.
+                let Some((top_line, top_skip)) = view_state.top else { return };
+                if let Some(&i) = indices.get(top_line) {
+                    measured = Some((
+                        view_state.offset,
+                        view_state.content_rows,
+                        view_state.widest,
+                        crate::app::viewport::LineAnchor {
+                            seq: inner.evicted + i as u64,
+                            skip: top_skip,
+                        },
+                    ));
+                }
+            } else if inner.live && inner.lines.is_empty() && committed.is_empty() {
+                // "Waiting" only where waiting is the truth. A FILTER with an
+                // empty store has drained its parent and found nothing —
+                // which is "no matching lines", not "no data yet". Before the
+                // filter owned a store it read the parent's, so an empty
+                // result still saw the parent's lines and fell through
+                // correctly; now the emptiness is its own.
                 crate::ui::draw_centered_loading(f, content_area, "Waiting for logs...", theme.status_pending, anim);
             } else if content_area.height > 0 && content_area.width > 0 {
-                let msg = if inner.lines.is_empty() { "No logs." } else { "No matching lines." };
+                let msg = if inner.lines.is_empty() && committed.is_empty() {
+                    "No logs."
+                } else {
+                    "No matching lines."
+                };
                 let line = ratatui::text::Line::from(Span::styled(msg, theme.status_pending));
                 let cx = content_area.x + content_area.width.saturating_sub(msg.len() as u16) / 2;
                 let cy = content_area.y + content_area.height / 2;
@@ -135,54 +226,87 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     // can't correct, and "no lines matched" is exactly when you need to.
     f.render_widget(grep_bar, grep_area);
 
-    // Publish the physical extent the render measured back into the Viewport —
-    // the single write-back site; autoscroll is gated on the initial tail load.
-    // Skipped while the connecting screen is up: that frame measured no
-    // content, and publishing a zero extent would clamp the offset to 0 and
-    // lose the user's scroll position across the gap.
-    if !link_connecting {
+    // Publish what the render measured — the single write-back site, and it
+    // runs only when there WAS a measurement (see `measured`).
+    //
+    // `apply_render_anchored`, not `set_metrics`: the widget resolved the
+    // follow-window itself (it is the only thing that knows the wrap-expanded
+    // extent), so this persists the offset it used alongside the extent it
+    // measured. `set_metrics` would have snapped the offset AFTER the frame was
+    // already drawn, leaving a following view one screen behind the tail — and
+    // with no further data there is no next frame to catch up on.
+    //
+    // The `_anchored` half is what makes the position survive its own content:
+    // the offset is only good for the extent it was measured against, and the
+    // ring evicts under the window between frames.
+    if let Some((rendered_offset, content_rows, widest, anchor)) = measured {
         if let Some(view) = app.nav.top_mut().log_view_mut() {
-            view.viewport.set_metrics(content_rows, inner_height, follow && !initial_load);
+            view.viewport.apply_render_anchored(
+                rendered_offset,
+                anchor,
+                content_rows,
+                inner_height,
+            );
+            // Same contract on the other axis: the render measured it, the
+            // action layer never guesses it.
+            // `width - 1`: the widget reserves the last column for the
+            // scrollbar and draws into the rest, so publishing the full
+            // width put `max` one short and made the final column of the
+            // widest line unreachable at every pan offset.
+            view.pan.set_extent(widest, (content_area.width as usize).saturating_sub(1));
         }
     }
 
     // Indicator bar: element-owned toggle states.
     let follow_state = if follow { "On" } else { "Off" };
     let wrap_state = if wrap { "On" } else { "Off" };
-    let ts_state = if show_timestamps { "On" } else { "Off" };
+    // ONE indicator for the whole cycle, naming what is showing rather than
+    // one On/Off per role — which is the same collapse the key went through.
+    let fields: Vec<&str> = crate::kube::protocol::Role::SHED_ORDER
+        .iter()
+        .filter(|r| r.shown(shed))
+        .map(|r| match r {
+            crate::kube::protocol::Role::Timestamp => "time",
+            crate::kube::protocol::Role::Source => "source",
+            crate::kube::protocol::Role::Body => "message",
+        })
+        .collect();
+    let fields_state =
+        if fields.is_empty() { "message".to_string() } else { format!("{}+message", fields.join("+")) };
 
-    let indicator_spans = vec![
+    let mut indicator_spans = vec![
         Span::styled(" AutoScroll:", theme.status_bar_key),
         Span::styled(follow_state, theme.status_bar),
         Span::styled(" \u{2502} ", theme.status_bar),
         Span::styled("Wrap:", theme.status_bar_key),
         Span::styled(wrap_state, theme.status_bar),
         Span::styled(" \u{2502} ", theme.status_bar),
-        Span::styled("Timestamps:", theme.status_bar_key),
-        Span::styled(ts_state, theme.status_bar),
+        Span::styled("Fields:", theme.status_bar_key),
+        Span::styled(fields_state.as_str(), theme.status_bar),
         Span::styled(" \u{2502} ", theme.status_bar),
         Span::styled("Since:", theme.status_bar_key),
         Span::styled(since_label.as_str(), theme.status_bar),
     ];
+    // A horizontally panned view is missing its left edge, which looks like
+    // corruption rather than a setting unless the bar says so. Shown only
+    // when it is non-zero — it is the only one of these that is a position
+    // rather than a mode, and a permanent "Pan:0" is noise. And not under
+    // wrap, where the widget ignores the pan entirely: advertising a shift
+    // the content did not take is worse than saying nothing.
+
+    if pan > 0 && !wrap {
+        indicator_spans.push(Span::styled(" \u{2502} ", theme.status_bar));
+        indicator_spans.push(Span::styled("Pan:", theme.status_bar_key));
+        indicator_spans.push(Span::styled(format!("+{pan}"), theme.status_bar));
+    }
 
     crate::ui::fill_line_bg(f, indicator_area, theme.status_bar);
     let indicator_line = Line::from(indicator_spans);
     f.render_widget(indicator_line, indicator_area);
 
     // Keybinding bar
-    let hints = vec![
-        ("s", "follow"),
-        ("w", "wrap"),
-        ("t", "timestamps"),
-        ("0", "tail"),
-        ("1", "1m"),
-        ("2", "5m"),
-        ("3", "15m"),
-        ("4", "30m"),
-        ("5", "1h"),
-        ("6", "24h"),
-        ("q", "back"),
-    ];
+    // Projected from the ONE keymap declaration — see `event::keymap`.
+    let hints = crate::event::keymap::bar_hints(crate::event::keymap::ViewClass::Log);
 
     crate::ui::fill_line_bg(f, bar_area, theme.status_bar);
 

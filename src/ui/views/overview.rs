@@ -85,9 +85,9 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let id = header::display_identity(app);
     let info_fields: &[(&str, &str)] = &[
         ("Context: ", ctx_label.as_str()),
-        ("Cluster: ", if id.cluster.is_empty() { "n/a" } else { &id.cluster }),
-        ("User: ", if id.user.is_empty() { "n/a" } else { &id.user }),
-        ("K8s: ", if id.k8s_version.is_empty() { "n/a" } else { &id.k8s_version }),
+        ("Cluster: ", id.cluster().unwrap_or(header::UNKNOWN_FIELD)),
+        ("User: ", id.user().unwrap_or(header::UNKNOWN_FIELD)),
+        ("K8s: ", id.k8s_version().unwrap_or(header::UNKNOWN_FIELD)),
     ];
     for (label, value) in info_fields {
         lines.push(Line::from(vec![

@@ -522,17 +522,62 @@ impl std::fmt::Display for Namespace {
 /// identity used for cache sharing. Bundling the pair here DRYs up ~8 structs that used
 /// to carry `cluster: String, user: String` as adjacent fields — and
 /// prevents accidental positional swaps when they ride together.
+/// Every field is INDEPENDENTLY unknown, and unknown is `None` — never a
+/// string that happens to be blank. Same rule as [`ContextName`], for the
+/// same reason: all three arrive from outside as possibly-empty strings
+/// (kube-rs types `Context::user` as `Option<String>`, a context missing from
+/// the kubeconfig yields nothing at all, and `k8s_version` is not known until
+/// the daemon has asked the apiserver), and a blank that survives the
+/// boundary makes every reader responsible for re-checking it. Six readers
+/// did; the contexts table forgot, and rendered an empty cell where the
+/// header showed `n/a`.
+///
+/// Fields are private so the only way to read one is through an accessor
+/// that hands back `Option<&str>` — there is no blank string to mistake for
+/// a value. `Default` is all-unknown, which is a real state (before the
+/// handshake lands) rather than a placeholder.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterIdentity {
-    pub cluster: String,
-    pub user: String,
-    pub k8s_version: String,
+    cluster: Option<String>,
+    user: Option<String>,
+    k8s_version: Option<String>,
 }
 
 impl ClusterIdentity {
+    /// The kubeconfig `(cluster, user)` labels for a context. Blank collapses
+    /// to unknown HERE — the one boundary where these enter the process.
     pub fn new(cluster: String, user: String) -> Self {
-        Self { cluster, user, k8s_version: String::new() }
+        Self {
+            cluster: non_empty(cluster),
+            user: non_empty(user),
+            k8s_version: None,
+        }
     }
+
+    pub fn cluster(&self) -> Option<&str> {
+        self.cluster.as_deref()
+    }
+
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+
+    pub fn k8s_version(&self) -> Option<&str> {
+        self.k8s_version.as_deref()
+    }
+
+    /// Record the apiserver version, once the daemon has one. Blank collapses
+    /// to unknown for the same reason as the constructor: a version string the
+    /// apiserver didn't give us is not a version.
+    pub fn set_k8s_version(&mut self, version: String) {
+        self.k8s_version = non_empty(version);
+    }
+}
+
+/// `Some(s)` unless `s` is empty. The one-line rule behind every
+/// blank-is-absence collapse in this module.
+fn non_empty(s: String) -> Option<String> {
+    (!s.is_empty()).then_some(s)
 }
 
 /// Identity (Hash/Eq) is `(server_url, cred_fingerprint)` — the context name
@@ -935,7 +980,80 @@ impl OperationKind {
         match self {
             OperationKind::Shell => Some(&SHELL_TEMPLATE),
             OperationKind::NodeShell => Some(&NODE_SHELL_TEMPLATE),
-            _ => None,
+            // EXHAUSTIVE, like its sibling manifests. `form_schema` eighty
+            // lines above argues this case verbatim — "a `_ => None` arm
+            // meant a new operation silently got no form dialog instead of
+            // forcing the author to decide" — and then this one kept the
+            // wildcard it was arguing against.
+            OperationKind::Describe
+            | OperationKind::Yaml
+            | OperationKind::Delete
+            | OperationKind::Restart
+            | OperationKind::Scale
+            | OperationKind::StreamLogs
+            | OperationKind::PreviousLogs
+            | OperationKind::PortForward
+            | OperationKind::ShowNode
+            | OperationKind::ForceKill
+            | OperationKind::DecodeSecret
+            | OperationKind::TriggerCronJob
+            | OperationKind::ToggleSuspendCronJob
+            | OperationKind::Custom(_)
+            | OperationKind::Apply => None,
+        }
+    }
+
+    /// Every operation the app itself defines. `Custom` is excluded: it is
+    /// overlay-declared and unbounded, so there is no list to put it in.
+    ///
+    /// ONE list, so the four hand-written copies that used to appear in the
+    /// agreement tests and in `KeysConfig::entries` cannot disagree about
+    /// which operations exist.
+    pub const BUILT_IN: &'static [OperationKind] = &[
+        OperationKind::Describe,
+        OperationKind::Yaml,
+        OperationKind::Delete,
+        OperationKind::Restart,
+        OperationKind::Scale,
+        OperationKind::StreamLogs,
+        OperationKind::PreviousLogs,
+        OperationKind::PortForward,
+        OperationKind::Shell,
+        OperationKind::ShowNode,
+        OperationKind::ForceKill,
+        OperationKind::NodeShell,
+        OperationKind::DecodeSecret,
+        OperationKind::TriggerCronJob,
+        OperationKind::ToggleSuspendCronJob,
+        OperationKind::Apply,
+    ];
+
+    /// The `keys.*` config field name that overrides this operation's chord,
+    /// or `None` for the ones that aren't user-bindable.
+    ///
+    /// Exhaustive, and the source of `KeysConfig::entries` — which was a
+    /// hand-written array parallel to both the struct fields and
+    /// `op_override`, so a binding added to those two and missed here
+    /// escaped the reserved-chord check AND the duplicate check, in the one
+    /// function whose stated purpose is "a startup error, not a mystery".
+    pub fn config_key(&self) -> Option<&'static str> {
+        match self {
+            OperationKind::Describe => Some("describe"),
+            OperationKind::Yaml => Some("yaml"),
+            OperationKind::StreamLogs => Some("logs"),
+            OperationKind::PreviousLogs => Some("previousLogs"),
+            OperationKind::Shell => Some("shell"),
+            OperationKind::Restart => Some("restart"),
+            OperationKind::Scale => Some("scale"),
+            OperationKind::Delete => Some("delete"),
+            OperationKind::ForceKill => Some("forceKill"),
+            OperationKind::PortForward => Some("portForward"),
+            OperationKind::ShowNode => Some("showNode"),
+            OperationKind::NodeShell => Some("nodeShell"),
+            OperationKind::DecodeSecret => Some("decodeSecret"),
+            OperationKind::TriggerCronJob => Some("triggerCronJob"),
+            OperationKind::ToggleSuspendCronJob => Some("toggleSuspendCronJob"),
+            OperationKind::Custom(_) | OperationKind::Apply => None,
         }
     }
 }
@@ -990,10 +1108,14 @@ impl OperationKind {
             OperationKind::Delete | OperationKind::Restart | OperationKind::ForceKill => {
                 BatchSupport::PerItem
             }
+            // One stream over the whole marked set, merged by the daemon —
+            // NOT one log view per pod. `PreviousLogs` stays single-only:
+            // the crashed-container-before-this-one question is about one
+            // container, and merging N of them answers nothing.
+            OperationKind::StreamLogs => BatchSupport::Aggregate,
             OperationKind::Describe
             | OperationKind::Yaml
             | OperationKind::Scale
-            | OperationKind::StreamLogs
             | OperationKind::PreviousLogs
             | OperationKind::PortForward
             | OperationKind::Shell
@@ -1009,15 +1131,15 @@ impl OperationKind {
 }
 
 /// Batch stance of an operation (see [`OperationKind::batch_support`]).
-/// `PerItem` = the operation is dispatched once per marked row (each item
-/// is an independent server command); everything else is single-target
-/// and its keybinding is dead in select mode. An `Aggregate` stance
-/// (one operation consuming the whole set, e.g. merged multi-pod logs)
-/// is deliberately absent until a real consumer exists — adding it later
-/// is free precisely because this is not a wire type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchSupport {
+    /// Dispatched once per marked row — each item is an independent server
+    /// command with its own `OpResult`.
     PerItem,
+    /// ONE operation consuming the whole set: merged multi-pod logs, where
+    /// N streams into N views would defeat the point of asking.
+    Aggregate,
+    /// Inherently single-target; the keybinding is dead in select mode.
     SingleOnly,
 }
 
@@ -1153,6 +1275,57 @@ pub struct DaemonStatus {
     pub pid: u32,
     pub uptime_secs: u64,
     pub socket_path: String,
+    /// What the daemon is actually holding open on the user's behalf.
+    ///
+    /// `ctl status` used to answer only "is it up, and since when" — which
+    /// says nothing about the two things that go wrong in a long-lived
+    /// daemon: watchers that should have been reclaimed and aren't, and
+    /// port-forwards the user has lost track of. Both are `Weak`-cached, so
+    /// the counts below are also the shape of a leak if one exists.
+    pub caches: CacheStats,
+}
+
+/// A snapshot of the daemon's `Weak`-keyed caches.
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct CacheStats {
+    /// One per live watcher — i.e. per distinct
+    /// `(context, namespace, resource, filter)`.
+    pub watchers: Vec<WatcherStat>,
+    /// One per context with a live local slice.
+    pub contexts: Vec<ContextStat>,
+    /// Contexts with cached discovery (namespaces + CRD definitions).
+    pub discovery_entries: usize,
+    pub metrics_pollers: usize,
+    pub discovery_pollers: usize,
+}
+
+/// One live watcher, as `ctl status` reports it.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WatcherStat {
+    /// The context name that created the watcher's cache key. Watchers are
+    /// keyed by `ContextId`, whose identity excludes this name, so it is a
+    /// label for humans — not the sharing key.
+    pub context: ContextName,
+    pub namespace: String,
+    pub resource: String,
+    pub filter: Option<String>,
+    /// Strong refs to the watcher: live `Subscription`s plus, if the last one
+    /// has left, the in-flight grace task. A watcher lingering at `1` with no
+    /// open view is the grace window doing its job — at `1` for minutes is
+    /// not.
+    pub holders: usize,
+}
+
+/// One context's local slice.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ContextStat {
+    pub context: ContextName,
+    pub server_url: String,
+    /// Forwards currently running for this context. These outlive any view
+    /// of them, so this is the only place they are countable.
+    pub port_forwards: usize,
+    /// Sessions attached, plus an in-flight grace task if the last one left.
+    pub holders: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1171,6 +1344,11 @@ pub enum SubscriptionFilter {
     Field(String),
     /// Owner UID: only return resources owned by this UID (post-filtered server-side).
     OwnerUid(String),
+    /// Only rows that NAME this object — the reverse lookup behind `U`.
+    /// Post-filtered server-side for the same reason as `OwnerUid`: the K8s
+    /// API cannot select on a spec's references, so the filter runs against
+    /// the converted row's [`crate::kube::resources::row::ResourceRow::references`].
+    References { kind: crate::kube::resource_def::BuiltInKind, name: String },
 }
 
 impl SubscriptionFilter {
@@ -1297,6 +1475,28 @@ pub enum LogContainer {
     Named(String),
     /// Let kubectl pick the default container (omit `-c`).
     Default,
+    /// Stream exactly these containers — a marked selection inside a
+    /// container view. Distinct from [`Self::All`]: `--all-containers` is one
+    /// kubectl invocation that names its own sources, while this is one
+    /// stream PER container, merged like a pod fan-out.
+    ///
+    /// APPENDED (v14), not inserted, so the three older tags keep their
+    /// wire values.
+    Set(Vec<String>),
+}
+
+impl LogContainer {
+    /// Short user-facing label for headers and filenames. Lives here, next
+    /// to the variants, so the UI never re-derives a name for the sentinel
+    /// cases from a magic string.
+    pub fn label(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            LogContainer::All => "all".into(),
+            LogContainer::Named(n) => n.as_str().into(),
+            LogContainer::Set(names) => format!("{} containers", names.len()).into(),
+            LogContainer::Default => "(default)".into(),
+        }
+    }
 }
 
 /// Handshake for an exec substream. The daemon spawns `kubectl` with the
@@ -1325,7 +1525,7 @@ pub enum ExecFrame {
 /// bincode-framed). EOF from the daemon = log stream ended.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogInit {
-    pub pod: String,
+    pub target: LogTarget,
     pub namespace: Namespace,
     pub container: LogContainer,
     pub follow: bool,
@@ -1363,7 +1563,48 @@ pub struct LogInit {
 /// baseline; a watch that broke after delivering data was silently retried
 /// (2 minutes inside the watcher, then forever in the bridge) while the TUI
 /// painted the frozen rows as live.
-pub const PROTOCOL_VERSION: u32 = 11;
+///
+/// v12: two changes, one break.
+/// - `ClusterIdentity`'s three fields become `Option<String>` — blank was
+///   doing double duty as "the apiserver/kubeconfig didn't tell us", the same
+///   shape that let `current-context: ""` reach the daemon as a real name
+///   (see [`ContextName`]). `Option` is a discriminant byte on the wire, so
+///   this alone is a break even though nothing was added or reordered.
+/// - `DaemonStatus` gains [`CacheStats`], so `ctl status` can report what the
+///   daemon is actually holding open (watchers, contexts, port-forwards)
+///   rather than just pid and uptime.
+///
+/// v13: `LogInit.pod: String` becomes [`LogTarget`] — one pod, an explicit
+/// list, or a label selector the DAEMON resolves. The old field was a
+/// `kubectl`-shaped string that happened to accept `deployments/foo`, which
+/// kubectl then resolved to a single arbitrary pod; a workload's logs are
+/// every replica's logs, and that can't be said in one `String`.
+///
+/// v14: both of a log stream's axes become sets, so that a MARKED SELECTION
+/// of anything can be one merged stream.
+/// - `LogTarget::Many(Vec<String>)` → recursive `Union { targets, label }`.
+///   A selection is heterogeneous — two deployments and a bare pod are two
+///   `Selector`s and a `One` — which a flat list of pod names could not say,
+///   so batch logs refused every non-pod row.
+/// - `LogContainer` gains `Set(Vec<String>)`: the marked containers of one
+///   pod, streamed one apiece and merged.
+///
+/// v16: `LogLine` gains `timestamp: Option<String>`. The daemon now passes
+/// `--timestamps` / `timestamps: true` and splits the kubelet's stamp off
+/// itself, because the renderer's heuristic was scoring application text and
+/// deleting it from the body when timestamps were toggled off.
+///
+/// v15: the reverse lookup stops being a guess.
+/// - `ResourceRow` gains `references: Vec<ResourceRefInfo>` — the objects a
+///   pod's spec NAMES (claims, secrets, configmaps, its service account),
+///   extracted at conversion like every other typed field.
+/// - `SubscriptionFilter::References { kind, name }` filters on them,
+///   post-applied server-side for the same reason `OwnerUid` is: no field
+///   selector can select on a spec. `U` used to grep the pod list for the
+///   resource's NAME and call the result "pods referencing X".
+/// - `K8sFieldSelector::InvolvedObject` (appended) carries the `E` drill —
+///   the events ABOUT one object.
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Handshake magic — "K9RS" as a big-endian u32. Doubles as a poison
 /// length: a pre-8 daemon reads these 4 bytes as a frame-length prefix of
@@ -1536,6 +1777,36 @@ pub enum SessionCommand {
 }
 
 impl SessionCommand {
+    /// The variant's NAME, with nothing from its payload.
+    ///
+    /// Exists so an error path can say which command arrived without
+    /// `{:?}`-ing the value: `Init` carries `kubeconfig_yaml` (inline
+    /// `client-key-data` and all) plus every forwarded env var, and the
+    /// management door used to Debug-format whatever it got straight back to
+    /// the peer. Exhaustive, so a new command cannot be reported as some
+    /// other command's name.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            SessionCommand::Init { .. } => "Init",
+            SessionCommand::Describe(_) => "Describe",
+            SessionCommand::Yaml(_) => "Yaml",
+            SessionCommand::Delete(_) => "Delete",
+            SessionCommand::ForceKill(_) => "ForceKill",
+            SessionCommand::Scale { .. } => "Scale",
+            SessionCommand::Restart(_) => "Restart",
+            SessionCommand::GetDiscovery => "GetDiscovery",
+            SessionCommand::Apply { .. } => "Apply",
+            SessionCommand::DecodeSecret(_) => "DecodeSecret",
+            SessionCommand::TriggerCronJob(_) => "TriggerCronJob",
+            SessionCommand::ToggleSuspendCronJob(_) => "ToggleSuspendCronJob",
+            SessionCommand::PortForward { .. } => "PortForward",
+            SessionCommand::Ping => "Ping",
+            SessionCommand::Status => "Status",
+            SessionCommand::Shutdown => "Shutdown",
+            SessionCommand::Clear { .. } => "Clear",
+        }
+    }
+
     /// True if this command mutates cluster or daemon state and must be
     /// refused when the session is read-only. Exhaustive match so that
     /// adding a new command variant is a compile error in this method —
@@ -1633,10 +1904,16 @@ pub fn describe_lines_text(lines: &[DescribeLine]) -> String {
 }
 
 /// A single streamed log line, split at the daemon. `content` is the log text;
-/// `container` names the source container *only* when the line came from a
-/// multiplexed `--all-containers` stream — there the daemon strips kubectl's
-/// `[pod/container]` prefix and tags it here. Single-container streams leave
-/// `container` `None`: there's one source, already named in the view header.
+/// `source` names where the line came from, and is `Some` exactly when the
+/// stream has more than one source to distinguish:
+///
+/// - `--all-containers` on one pod → the container name (the daemon strips
+///   kubectl's own `[pod/container] ` prefix and tags it here),
+/// - a [`LogTarget`] fan-out → the pod name,
+/// - both at once → `pod/container`.
+///
+/// A single-source stream leaves it `None`: there is one source and the view
+/// header already names it.
 ///
 /// Why typed: kubectl `--all-containers` auto-enables `--prefix`, emitting
 /// `[pod/container] body` on every line. The old wire shipped that raw `String`
@@ -1645,23 +1922,202 @@ pub fn describe_lines_text(lines: &[DescribeLine]) -> String {
 /// body and never colored. The daemon knows the source, so it tags it once here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogLine {
-    pub container: Option<String>,
+    pub source: Option<String>,
+    /// The RFC3339 stamp the kubelet recorded, when the daemon ASKED for it
+    /// (it always does — see `stream_logs_via_api`). Split off here for the
+    /// same reason `source` is: the renderer used to sniff one out of
+    /// `content` with a "starts with four digits and a dash" heuristic, which
+    /// scored the application's own `[2026-09-17 10:00:00] …` and then, with
+    /// timestamps toggled OFF, rendered the line without it. A field the
+    /// producer fills cannot delete the consumer's text.
+    pub timestamp: Option<String>,
     pub content: String,
 }
 
-impl LogLine {
-    /// A line from a single-source stream — no per-line container tag.
-    pub fn untagged(content: impl Into<String>) -> Self {
-        Self { container: None, content: content.into() }
+/// The parts of a log line a view can independently show, hide, search and
+/// export.
+///
+/// CLOSED on purpose. Every question that used to be asked of a line by
+/// pattern-matching on which `Option` was populated — is this shown, is this
+/// searchable, how is it coloured — is asked of a role instead, once. Those
+/// answers used to be spelled out separately in the measurer and the
+/// renderer, which is why `show_source` appears as the identical
+/// `then_some(..).flatten()` in both, with a test pinning that the two copies
+/// agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The daemon's tag for where the line came from. Only present when more
+    /// than one source feeds the stream.
+    Source,
+    /// The kubelet's ingestion stamp, split into a typed field by the daemon.
+    Timestamp,
+    /// What the workload actually wrote — the only part carrying its own ANSI.
+    Body,
+}
+
+impl Role {
+    /// Whether a grep runs over this part. The body and the source tag are
+    /// content; the timestamp is chrome, and matching it would make `/2026`
+    /// select every line. Previously an unstated choice duplicated in
+    /// `LogFilter::drain_from_parent` and the draft derive.
+    pub fn searchable(self) -> bool {
+        matches!(self, Role::Source | Role::Body)
     }
 
-    /// Flat text form for clipboard / file export: a tagged line regains a
-    /// `[container] ` prefix so its source stays visible outside the colored
-    /// UI; an untagged line is just its content, borrowed (no allocation).
+    /// The hideable roles, in SHED ORDER — first to go is the one whose
+    /// columns buy the least.
+    ///
+    /// The timestamp leads because it is 31 columns duplicating a stamp the
+    /// service almost always prints itself; the source tag is 22 columns of
+    /// information nothing else carries, and only exists when more than one
+    /// pod is feeding the stream. `Body` is absent because it is never
+    /// hidden: shedding chrome trades width for context, it does not remove
+    /// what the workload said.
+    pub const SHED_ORDER: [Role; 2] = [Role::Timestamp, Role::Source];
+
+    /// Visible at this shed level. One key cycles the level, so adding a
+    /// role to `SHED_ORDER` extends the cycle — no new binding, no new
+    /// boolean, and no unreachable combination of them.
+    pub fn shown(self, shed: usize) -> bool {
+        match Self::SHED_ORDER.iter().position(|r| *r == self) {
+            Some(i) => i >= shed,
+            None => true,
+        }
+    }
+
+    /// How many levels the cycle has: every role shed one at a time, plus
+    /// the state where all of them are showing.
+    pub const fn levels() -> usize {
+        Self::SHED_ORDER.len() + 1
+    }
+}
+
+/// One line's parts, in render order, with the separator each carries.
+///
+/// Borrowed from the line — this is a projection, not a second copy. It is
+/// the seam the eventual materialize-on-arrival slots into: the roles and
+/// their order stay exactly as they are, only `text` stops being derived per
+/// frame.
+pub fn segments(line: &LogLine) -> impl Iterator<Item = (Role, &str, &'static str)> {
+    [
+        line.source.as_deref().map(|t| (Role::Source, t, " ")),
+        line.timestamp.as_deref().map(|t| (Role::Timestamp, t, " ")),
+        Some((Role::Body, line.content.as_str(), "")),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+impl LogLine {
+    /// A line from a single-source stream — no per-line tag, and no stamp
+    /// (this is k9rs speaking, not the workload).
+    pub fn untagged(content: impl Into<String>) -> Self {
+        Self { source: None, timestamp: None, content: content.into() }
+    }
+
+    /// Split kubelet's `--timestamps` prefix off a raw line. Safe only
+    /// because we request it; see [`Self::timestamp`].
+    pub fn split_timestamp(line: &str) -> (Option<String>, &str) {
+        // `2026-09-17T10:00:00.123456789Z rest…` — one token, then a space.
+        let Some(sp) = line.find(' ') else { return (None, line) };
+        let (head, rest) = line.split_at(sp);
+        let plausible = head.len() >= 20
+            && head.ends_with('Z')
+            && head.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+            && head.as_bytes()[4] == b'-';
+        if plausible {
+            (Some(head.to_string()), &rest[1..])
+        } else {
+            (None, line)
+        }
+    }
+
+    /// Flat text form for clipboard / file export.
+    ///
+    /// Export carries the SUBSTANCE of a line, not a transcript of the cells
+    /// it was drawn in: both pieces of provenance ride along regardless of
+    /// what the display toggles are showing, because `t` and `p` govern how
+    /// much of a 97-column terminal the chrome may eat — a question that has
+    /// no meaning in a file. The same rule that keeps the export from being
+    /// truncated to the visible window keeps it from being thinned to the
+    /// visible fields.
+    ///
+    /// It used to include the source and drop the timestamp, which was not a
+    /// decision — `flat_text` predates `timestamp` being a typed field at
+    /// all, so it carried one half of the provenance and silently lost the
+    /// other.
     pub fn flat_text(&self) -> std::borrow::Cow<'_, str> {
-        match &self.container {
-            Some(c) => std::borrow::Cow::Owned(format!("[{}] {}", c, self.content)),
-            None => std::borrow::Cow::Borrowed(&self.content),
+        match (&self.timestamp, &self.source) {
+            (Some(ts), Some(c)) => std::borrow::Cow::Owned(format!("{} [{}] {}", ts, c, self.content)),
+            (Some(ts), None) => std::borrow::Cow::Owned(format!("{} {}", ts, self.content)),
+            (None, Some(c)) => std::borrow::Cow::Owned(format!("[{}] {}", c, self.content)),
+            (None, None) => std::borrow::Cow::Borrowed(&self.content),
+        }
+    }
+}
+
+/// What a log stream is OVER.
+///
+/// Replaces a bare `pod: String`. That field was always a kubectl-style ref
+/// rather than strictly a pod name — a deployment sent `deployments/my-app`,
+/// which kubectl resolves to ONE of its pods — so "show me this workload's
+/// logs" silently meant "show me one arbitrary replica's logs".
+///
+/// Fan-out lives on the DAEMON side and merges into the single existing
+/// substream, so the client keeps one `LogStream` over one `LineStore` under
+/// one epoch. That matters: the epoch floor is what rejects a superseded
+/// stream's stragglers, and it assumes one writer per store — N client-side
+/// substreams sharing a store would floor each other out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogTarget {
+    /// One pod, or a kubectl-style ref that resolves to one. Lines are
+    /// untagged, exactly as before.
+    One(String),
+    /// Everything these targets resolve to, merged — a marked selection.
+    ///
+    /// Recursive because a selection is heterogeneous: marking two
+    /// deployments and a bare pod is a `Selector`, a `Selector` and a `One`,
+    /// and the daemon resolving each in turn is the only place that can be
+    /// decided (the client may never have loaded any of their pods). The
+    /// daemon dedupes, so marking a deployment AND one of its pods streams
+    /// that pod once.
+    Union { targets: Vec<LogTarget>, label: String },
+    /// Every pod matching this label selector — a workload. Resolved by the
+    /// daemon at stream time, so a replica that appears later is included on
+    /// the next restart rather than being invisible forever.
+    Selector { labels: BTreeMap<String, String>, label: String },
+    /// Every pod owned by this object UID — a job or replicaset, which
+    /// identify their pods by `ownerReference` rather than by a selector
+    /// (a job's `controller-uid` label is an implementation detail, and a
+    /// replicaset shares its deployment's labels with its siblings).
+    Owner { uid: String, label: String },
+}
+
+impl LogTarget {
+    /// A short human label for the view header ("3 pods", "deploy/api").
+    /// The indirect targets carry their own — a header reading
+    /// `app=api,tier=web` is the selector, not the thing you drilled into.
+    pub fn display(&self) -> String {
+        match self {
+            LogTarget::One(name) => name.clone(),
+            LogTarget::Union { label, .. }
+            | LogTarget::Selector { label, .. }
+            | LogTarget::Owner { label, .. } => label.clone(),
+        }
+    }
+
+    /// Whether this target can produce lines from more than one pod.
+    ///
+    /// A *claim about the target*, not the tagging rule — the daemon tags by
+    /// how many streams it actually opened, because a selector matching one
+    /// replica has one source no matter what its shape promised.
+    pub fn is_fanout(&self) -> bool {
+        match self {
+            LogTarget::One(_) => false,
+            LogTarget::Union { targets, .. } => {
+                targets.len() > 1 || targets.first().is_some_and(LogTarget::is_fanout)
+            }
+            LogTarget::Selector { .. } | LogTarget::Owner { .. } => true,
         }
     }
 }

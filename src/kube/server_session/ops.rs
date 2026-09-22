@@ -405,11 +405,38 @@ impl ServerSession {
             };
             let result = match api.get_scale(&n).await {
                 Ok(mut scale) => {
-                    if let Some(s) = scale.spec.as_mut() { s.replicas = Some(replicas as i32); }
-                    let body = serde_json::to_vec(&scale).unwrap_or_default();
-                    match api.replace_scale(&n, &kube::api::PostParams::default(), body).await {
-                        Ok(_) => Ok(format!("Scaled {}/{} to {} replicas", display, n, replicas)),
-                        Err(e) => Err(format!("Scale failed: {}", e)),
+                    // The write must HAPPEN before it is reported. With an
+                    // `if let` here, a Scale whose `spec` the apiserver did
+                    // not populate skipped the assignment, PUT the object
+                    // back unchanged, succeeded, and reported "Scaled …/… to
+                    // N replicas" — a green flash naming a number that was
+                    // never written. Likewise `unwrap_or_default()` on the
+                    // serialize turned a failure into a PUT with an EMPTY
+                    // body.
+                    let prepared = match scale.spec.as_mut() {
+                        Some(s) => {
+                            s.replicas = Some(replicas as i32);
+                            serde_json::to_vec(&scale)
+                                .map_err(|e| format!("Scale failed: {e}"))
+                        }
+                        None => Err(
+                            "Scale failed: the server returned no scale spec".to_string()
+                        ),
+                    };
+                    match prepared {
+                        Ok(body) => {
+                            match api
+                                .replace_scale(&n, &kube::api::PostParams::default(), body)
+                                .await
+                            {
+                                Ok(_) => Ok(format!(
+                                    "Scaled {}/{} to {} replicas",
+                                    display, n, replicas
+                                )),
+                                Err(e) => Err(format!("Scale failed: {}", e)),
+                            }
+                        }
+                        Err(e) => Err(e),
                     }
                 }
                 Err(e) => Err(format!("Scale failed: {}", e)),
@@ -627,6 +654,9 @@ impl ServerSession {
         let _pf_id = source.create(
             crate::kube::local::port_forward::PortForwardRequest {
                 target: target.clone(),
+                // THIS session's context name, not the shared source's — a
+                // source is per `ContextId`, which excludes the name.
+                context: self.context.name.clone(),
                 kubectl_target,
                 namespace: target.namespace.clone(),
                 local_port,

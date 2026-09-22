@@ -199,6 +199,21 @@ async fn main() -> Result<()> {
         app.read_only = true;
     }
 
+    // Overlays are the one user-facing extension point, and until now every
+    // complaint they had went to `warn!` — i.e. to `io::sink` unless the user
+    // passed `--log-file`. A typo'd column, an unknown capability, a bad
+    // jsonpath and a YAML parse error all looked identical to "working". Say
+    // the first one out loud; the count tells them there are more to fix.
+    let overlay_problems = crate::kube::overlay::overlay_diagnostics();
+    if let Some(first) = overlay_problems.first() {
+        let more = overlay_problems.len() - 1;
+        app.ui.flash = Some(crate::app::FlashMessage::warn(if more == 0 {
+            first.clone()
+        } else {
+            format!("{first} (+{more} more overlay problem{})", if more == 1 { "" } else { "s" })
+        }));
+    }
+
     // -----------------------------------------------------------------------
     // Enter the TUI immediately. NO blocking I/O happens before this point.
     // Kubeconfig read, daemon check, and connection all run in background
@@ -215,6 +230,10 @@ async fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let _terminal_guard = TerminalGuard::new();
+    // Reclaims `/tmp/k9rs-<pid>/` on the way out, including the `?` paths —
+    // the same reason `TerminalGuard` exists one line up. Removes the
+    // directory only when empty, so anything the user asked us to save stays.
+    let _temp_dir_guard = crate::util::TempDirGuard;
 
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
@@ -238,40 +257,72 @@ async fn main() -> Result<()> {
     let (suspend_tx, mut suspend_rx) = tokio::sync::watch::channel(false);
     let (suspend_ack_tx, suspend_ack_rx) = tokio::sync::mpsc::channel::<()>(1);
     let input_bridge = tokio::spawn(async move {
-        let mut event_stream = EventStream::new();
-        let mut suspended = false;
+        /// Why the stream is DROPPED on suspend rather than merely unpolled.
+        ///
+        /// crossterm's `EventStream` arms a helper thread that sits in
+        /// `poll_internal(None, ..)` — an indefinite blocking read of fd 0 —
+        /// and that thread is shut down ONLY by `EventStream::drop`. Dropping
+        /// the `Next` future does nothing to it. So an "unpolled" stream is
+        /// still an active reader of stdin, and while `$EDITOR` or a shell
+        /// owns the terminal, the first keystroke aimed at them could be
+        /// swallowed by crossterm instead — then buffered, then replayed into
+        /// the TUI as type-ahead once the bridge resumed. A `:` typed in vim
+        /// could open the command bar after the editor exited.
+        ///
+        /// `Drop` is the supported release: crossterm's own note explains that
+        /// it both sets the shutdown flag AND wakes the blocked
+        /// `poll_internal`, so the thread returns without consuming a byte.
+        ///
+        /// Recreating on resume loses nothing. The internal event reader is
+        /// global (`lock_internal_event_reader`), so anything already parsed
+        /// survives the handover, and anything typed during the window is
+        /// still sitting unread in the kernel's tty buffer — which is exactly
+        /// where input for a suspended TUI belongs.
+        enum Wake {
+            Suspend(Result<(), tokio::sync::watch::error::RecvError>),
+            Input(Option<Result<crossterm::event::Event, std::io::Error>>),
+        }
+
+        let mut event_stream = Some(EventStream::new());
         loop {
-            if suspended {
-                if suspend_rx.changed().await.is_err() { break; }
+            let Some(stream) = event_stream.as_mut() else {
+                // Suspended: no stream, so nothing is reading stdin. Wait for
+                // the resume edge and build a fresh one.
+                if suspend_rx.changed().await.is_err() {
+                    break;
+                }
                 if !*suspend_rx.borrow() {
-                    // Resume by simply polling the SAME stream again — it was
-                    // never dropped, only unpolled. Rebuilding it here used to
-                    // race the old stream's teardown against the new one's
-                    // registration and could eat the first real keypress after
-                    // an editor/shell returned.
-                    suspended = false;
+                    event_stream = Some(EventStream::new());
                 }
                 continue;
-            }
-            tokio::select! {
+            };
+
+            let wake = tokio::select! {
                 biased;
-                _ = suspend_rx.changed() => {
+                res = suspend_rx.changed() => Wake::Suspend(res),
+                ev = stream.next() => Wake::Input(ev),
+            };
+
+            match wake {
+                // A closed watch resolves Ready(Err) forever. Ignoring it
+                // meant `biased` re-polled the same always-ready branch and
+                // the bridge span on CPU for as long as it lived.
+                Wake::Suspend(Err(_)) => break,
+                Wake::Suspend(Ok(())) => {
                     if *suspend_rx.borrow() {
-                        suspended = true;
+                        // Release stdin BEFORE acking: the ack is what the
+                        // suspend guard takes as "the terminal is yours".
+                        event_stream = None;
                         let _ = suspend_ack_tx.send(()).await;
                     }
                 }
-                event = event_stream.next() => {
-                    match event {
-                        Some(Ok(ev)) => {
-                            if input_tx.send(ev).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Err(_)) => continue,
-                        None => break,
+                Wake::Input(Some(Ok(ev))) => {
+                    if input_tx.send(ev).await.is_err() {
+                        break;
                     }
                 }
+                Wake::Input(Some(Err(_))) => continue,
+                Wake::Input(None) => break,
             }
         }
     });

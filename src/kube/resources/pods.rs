@@ -340,6 +340,7 @@ impl ConvertToRow<Pod> for PodDef {
         .iter()
         .map(|cs| {
             let (state, reason, ready) = container_status_and_ready(cs);
+            let health = container_health(ready, &reason);
             ContainerInfo {
                 name: cs.name.clone(),
                 kind: crate::kube::resources::row::ContainerKind::Init,
@@ -348,6 +349,7 @@ impl ConvertToRow<Pod> for PodDef {
                 reason,
                 ready,
                 restart_count: cs.restart_count,
+                health,
             }
         })
         .collect();
@@ -356,6 +358,7 @@ impl ConvertToRow<Pod> for PodDef {
         .iter()
         .map(|cs| {
             let (state, reason, ready) = container_status_and_ready(cs);
+            let health = container_health(ready, &reason);
             ContainerInfo {
                 name: cs.name.clone(),
                 kind: crate::kube::resources::row::ContainerKind::Regular,
@@ -364,6 +367,7 @@ impl ConvertToRow<Pod> for PodDef {
                 reason,
                 ready,
                 restart_count: cs.restart_count,
+                health,
             }
         })
         .collect();
@@ -388,6 +392,9 @@ impl ConvertToRow<Pod> for PodDef {
         Some("BestEffort") | None => "BE",
         Some(_) => "?",
     };
+
+    // Outward edges, read BEFORE the spec is picked apart below.
+    let references = pod_references(&spec);
 
     // Service account
     let service_account = spec.service_account_name.unwrap_or_default();
@@ -514,6 +521,7 @@ impl ConvertToRow<Pod> for PodDef {
         namespace: Some(namespace),
         containers: containers_vec,
         owner_refs: owner_references,
+        references,
         pf_ports,
         node,
         health,
@@ -526,6 +534,105 @@ impl ConvertToRow<Pod> for PodDef {
         mem_limit: if has_mem_lim { Some(mem_lim_bytes) } else { None },
         ..Default::default()
     }
+    }
+}
+
+/// Every object this pod's spec NAMES, deduped.
+///
+/// The outward edges of a pod, read once at conversion so "what uses this
+/// PVC" is a filter over data rather than a grep of pod names. Covers the
+/// places a pod can name another object: volumes (including projected
+/// sources), env (`envFrom` and `valueFrom`), the service account, and image
+/// pull secrets. Anything not on that list is not extractable and therefore
+/// not claimable — `U` says what it can see.
+pub fn referenceable_kinds() -> &'static [crate::kube::resource_def::BuiltInKind] {
+    use crate::kube::resource_def::BuiltInKind;
+    // The closed set `pod_references` can emit, declared NEXT to it so the
+    // two cannot drift. `U` gates on this: without it, `U` on a Deployment,
+    // Node, Service or Namespace opened a view titled "Pods that reference
+    // deployments/api" containing nothing — reporting a miss as an answer,
+    // which is the exact failure the reverse lookup replaced.
+    &[
+        BuiltInKind::PersistentVolumeClaim,
+        BuiltInKind::Secret,
+        BuiltInKind::ConfigMap,
+        BuiltInKind::ServiceAccount,
+    ]
+}
+
+fn pod_references(
+    spec: &k8s_openapi::api::core::v1::PodSpec,
+) -> Vec<crate::kube::resources::row::ResourceRefInfo> {
+    use crate::kube::resource_def::BuiltInKind;
+    use crate::kube::resources::row::ResourceRefInfo;
+
+    let mut out: Vec<ResourceRefInfo> = Vec::new();
+    let mut push = |kind: BuiltInKind, name: Option<&String>| {
+        let Some(name) = name.filter(|n| !n.is_empty()) else { return };
+        let item = ResourceRefInfo { kind, name: name.clone() };
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    };
+
+    for v in spec.volumes.iter().flatten() {
+        push(
+            BuiltInKind::PersistentVolumeClaim,
+            v.persistent_volume_claim.as_ref().map(|p| &p.claim_name),
+        );
+        push(BuiltInKind::Secret, v.secret.as_ref().and_then(|s| s.secret_name.as_ref()));
+        push(BuiltInKind::ConfigMap, v.config_map.as_ref().map(|c| &c.name));
+        // A projected volume is several sources wearing one mount.
+        for src in v.projected.iter().flat_map(|p| p.sources.iter().flatten()) {
+            push(BuiltInKind::Secret, src.secret.as_ref().map(|s| &s.name));
+            push(BuiltInKind::ConfigMap, src.config_map.as_ref().map(|c| &c.name));
+        }
+    }
+
+    let all_containers = spec
+        .containers
+        .iter()
+        .chain(spec.init_containers.iter().flatten());
+    for c in all_containers {
+        for ef in c.env_from.iter().flatten() {
+            push(BuiltInKind::Secret, ef.secret_ref.as_ref().map(|s| &s.name));
+            push(BuiltInKind::ConfigMap, ef.config_map_ref.as_ref().map(|c| &c.name));
+        }
+        for e in c.env.iter().flatten() {
+            let Some(from) = e.value_from.as_ref() else { continue };
+            push(
+                BuiltInKind::Secret,
+                from.secret_key_ref.as_ref().map(|s| &s.name),
+            );
+            push(
+                BuiltInKind::ConfigMap,
+                from.config_map_key_ref.as_ref().map(|c| &c.name),
+            );
+        }
+    }
+
+    push(BuiltInKind::ServiceAccount, spec.service_account_name.as_ref());
+    for s in spec.image_pull_secrets.iter().flatten() {
+        push(BuiltInKind::Secret, Some(&s.name));
+    }
+    out
+}
+
+/// One container's health, from the SAME classifier that decides its pod's.
+///
+/// The client used to re-derive this in `app::derived`, keying off
+/// `restart_count` and ignoring `reason` — so an `ImagePullBackOff` with zero
+/// restarts was Failed on the pod row and Pending on the container row one
+/// Enter down, while the cell text said "ImagePullBackOff" in both places.
+fn container_health(ready: bool, reason: &Option<String>) -> RowHealth {
+    if ready {
+        return RowHealth::Normal;
+    }
+    match reason.as_deref() {
+        Some(r) => classify_pod_reason(r),
+        // Not ready and the kubelet gave no reason: starting, or terminated
+        // cleanly. Pending either way — visible, not flagged.
+        None => RowHealth::Pending,
     }
 }
 

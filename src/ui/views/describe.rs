@@ -47,15 +47,15 @@ pub fn draw_describe(f: &mut Frame, app: &mut App, area: Rect) {
         }
     };
 
-    if !describe.content.is_empty() {
+    if !describe.content().is_empty() {
         // Render from the producer's typed lines when present (a structured
         // describe); fall back to text inference for genuinely-opaque content
         // (YAML, aliases, kubectl-fallback text) where no structure is known.
-        let typed = !describe.describe_lines.is_empty();
+        let typed = !describe.describe_lines().is_empty();
         let total_lines = if typed {
-            describe.describe_lines.len()
+            describe.describe_lines().len()
         } else {
-            describe.content.lines().count()
+            describe.content().lines().count()
         };
 
         // Build title with optional search info
@@ -113,7 +113,7 @@ pub fn draw_describe(f: &mut Frame, app: &mut App, area: Rect) {
             };
 
             let visible_lines: Vec<Line> = if typed {
-                describe.describe_lines[start..end]
+                describe.describe_lines()[start..end]
                     .iter()
                     .enumerate()
                     .map(|(vi, dl)| match highlight(start + vi) {
@@ -133,7 +133,7 @@ pub fn draw_describe(f: &mut Frame, app: &mut App, area: Rect) {
                     .collect()
             } else {
                 describe
-                    .content
+                    .content()
                     .lines()
                     .skip(start)
                     .take(end.saturating_sub(start))
@@ -203,15 +203,11 @@ pub fn draw_describe(f: &mut Frame, app: &mut App, area: Rect) {
         }
     } else {
         // Keybinding bar
-        let hints = vec![
-            ("j/k", "scroll"),
-            ("g/G", "top/bottom"),
-            ("Ctrl-d/u", "page"),
-            ("/", "search"),
-            ("n/N", "next/prev"),
-            ("Esc", "back"),
-        ];
-
+        // Projected from the ONE keymap declaration, so this bar cannot
+        // advertise a key the dispatcher doesn't have (or miss one it does).
+        let hints = crate::event::keymap::bar_hints(
+            crate::event::keymap::ViewClass::Detail,
+        );
         let line = crate::ui::header::render_keybinding_bar(&hints, theme);
         f.render_widget(line, bar_area);
     }

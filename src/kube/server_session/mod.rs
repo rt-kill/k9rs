@@ -113,10 +113,20 @@ impl Default for SessionSharedState {
 }
 
 impl SessionSharedState {
+    /// A snapshot of every `Weak`-keyed cache, for `ctl status`. Read-only:
+    /// nothing here reaps, so asking what the daemon holds cannot change it.
+    pub fn cache_stats(&self) -> protocol::CacheStats {
+        protocol::CacheStats {
+            watchers: self.watcher_cache.stats(),
+            contexts: self.local_registry.stats(),
+            discovery_entries: self.discovery_cache.len(),
+            metrics_pollers: self.metrics_pollers.live_count(),
+            discovery_pollers: self.discovery_pollers.live_count(),
+        }
+    }
+
     pub fn new() -> Self {
-        Self::with_local_grace(Some(std::time::Duration::from_secs(
-            crate::kube::GRACE_PERIOD_SECS,
-        )))
+        Self::with_local_grace(Some(crate::kube::locals_grace()))
     }
 
     /// For `--no-daemon`: this state lives inside a single connection, so a
@@ -189,6 +199,42 @@ pub(crate) struct SessionContext {
     pub locals: crate::kube::local::ContextKeepalive,
 }
 
+#[cfg(test)]
+impl SessionContext {
+    /// TEST SEAM: a session context with no cluster behind it.
+    ///
+    /// The `kube::Client` is real but points at a port nothing listens on. It
+    /// is deliberately never exercised: the paths under test get their
+    /// `Subscription` from a watcher seeded via
+    /// [`crate::kube::live_query::WatcherCache::seed_driven`], which takes the
+    /// cache's reuse branch and so never invokes the client factory. A test
+    /// that DOES reach the client will fail by connection-refused rather than
+    /// by silently talking to whatever cluster the developer happens to have
+    /// configured — the property that matters is that tests never touch a real
+    /// daemon or cluster.
+    pub(crate) fn for_test(shared: Arc<SessionSharedState>) -> Arc<Self> {
+        let context = protocol::ContextId {
+            name: protocol::ContextName::new("test-ctx").expect("non-empty"),
+            server_url: "http://127.0.0.1:1".to_string(),
+            cred_fingerprint: 0,
+        };
+        let config = kube::Config::new(
+            "http://127.0.0.1:1".parse().expect("a valid uri"),
+        );
+        let locals = shared.local_registry.attach(&context);
+        Arc::new(Self {
+            client: kube::Client::try_from(config).expect("offline client build"),
+            session_env: crate::kube::session_env::SessionEnv::new(HashMap::new()),
+            context,
+            session_id: 1,
+            streaming_lists: false,
+            readonly: false,
+            locals,
+            shared,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ServerSession
 // ---------------------------------------------------------------------------
@@ -197,7 +243,6 @@ pub struct ServerSession {
     writer: BufWriter<Box<dyn AsyncWrite + Unpin + Send>>,
     shared: Arc<SessionSharedState>,
     client: kube::Client,
-    client_config: Option<kube::Config>,
     /// The session's process env, applied to every `kubectl` subprocess the
     /// handlers spawn (describe/yaml/delete fallbacks, port-forward).
     session_env: SessionEnv,
@@ -245,7 +290,6 @@ impl ServerSession {
             writer,
             shared,
             client,
-            client_config: None,
             session_env,
             context,
             readonly,
@@ -457,7 +501,7 @@ impl ServerSession {
             // The API server's version string is attacker-influenceable
             // (compromised/hostile apiserver) and renders in the header
             // through the Paragraph path — sanitize control chars.
-            identity.k8s_version = crate::util::sanitize_terminal(&info.git_version);
+            identity.set_k8s_version(crate::util::sanitize_terminal(&info.git_version));
             parse_k8s_minor(&info.git_version).is_some_and(|minor| minor >= 32)
         } else {
             false
@@ -490,7 +534,6 @@ impl ServerSession {
             session_env.clone(),
             locals.clone(),
         );
-        session.client_config = Some(client_config.clone());
 
         // Publish the SessionContext so muxed subscription substream tasks
         // can access the kube client + context without needing a reference
@@ -933,7 +976,7 @@ async fn handle_data_substream(
             }
         }
         protocol::SubstreamInit::Log(log_init) => {
-            tracing::debug!(session = sid, sub = sub_id, "log: pod={} container={:?}", log_init.pod, log_init.container);
+            tracing::debug!(session = sid, sub = sub_id, "log: target={} container={:?}", log_init.target.display(), log_init.container);
             let bridge = handle_log_substream(log_init, writer, ctx);
             tokio::pin!(bridge);
             tokio::select! {
@@ -1046,14 +1089,13 @@ async fn handle_subscription_substream_inner(
     } else {
         init.namespace.clone()
     };
-    // OwnerUid is a post-filter applied in the bridge (apply_owner_filter_inline),
-    // NOT a K8s API-level filter. Exclude it from the QueryKey so that
-    // OwnerUid-filtered subscriptions reuse the same watcher as unfiltered ones,
-    // avoiding duplicate API server watches for the same data.
-    let cache_filter = match &filter {
-        Some(protocol::SubscriptionFilter::OwnerUid(_)) => None,
-        other => other.clone(),
-    };
+    // A POST-filter is applied in the bridge (`row_passes`), not by the
+    // apiserver. Exclude it from the QueryKey so those subscriptions reuse
+    // the same watcher as unfiltered ones instead of opening a duplicate
+    // watch over identical data. Asked through `is_post_filter` rather than
+    // matched here, so the two places that decide "does the apiserver do
+    // this one?" cannot answer differently.
+    let cache_filter = if is_post_filter(&filter) { None } else { filter.clone() };
     let key = QueryKey {
         context: ctx.context.clone(),
         namespace: effective_ns,
@@ -1265,6 +1307,16 @@ async fn handle_subscription_substream_inner(
                     let _ = writer.flush().await;
                     return;
                 }
+                // Drop the DEAD subscription before `resubscribe` sleeps
+                // out the backoff (up to 60s). `Subscription::drop` is built
+                // so a self-terminated watcher skips grace and reclaims at
+                // once; holding `sub` across the sleep defeated that, pinning
+                // the dead watcher's 64-batch fanout ring — a full row set on
+                // a quiet resource — while its successor built a second one.
+                // A control-plane upgrade that kills every watch at once made
+                // that 2x row memory daemon-wide, in the process hosting
+                // every session.
+                drop(sub);
                 let Some(next) = resubscribe(
                     &ctx, &resub, make_client, &mut retry_backoff, &detail, session_id,
                     &mut writer,
@@ -1328,6 +1380,8 @@ async fn handle_subscription_substream_inner(
                     }
                     crate::kube::live_query::WatcherMsg::Dead(reason) => {
                         let detail = reason.clone();
+                        drop(msg); // ends the borrow of the frame we just read
+                        drop(sub); // see the note at the first `resubscribe`
                         let Some(next) = resubscribe(
                             &ctx, &resub, make_client, &mut retry_backoff, &detail, session_id,
                             &mut writer,
@@ -1349,6 +1403,7 @@ async fn handle_subscription_substream_inner(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     let detail = String::new();
+                    drop(sub); // see the note at the first `resubscribe`
                     let Some(next) = resubscribe(
                         &ctx, &resub, make_client, &mut retry_backoff, &detail, session_id,
                         &mut writer,
@@ -1512,44 +1567,83 @@ async fn resubscribe(
     })
 }
 
-/// Owner-uid post-filter, baseline flavor. OwnerUid is the one
-/// `SubscriptionFilter` variant K8s can't apply server-side, so the bridge
-/// filters each frame. Exhaustive over frame kinds by construction — one
-/// function per frame type, no wildcard arm a future variant can slip past.
+/// Does this row survive a post-filter?
+///
+/// The EXHAUSTIVE match is the point: `Labels`/`Field` push down to the API
+/// and never reach here, and the two that can't push down must each say so
+/// by name. The callers below used to ask `let Some(OwnerUid(uid)) = filter
+/// else { return unchanged }`, which is a wildcard wearing a pattern — a new
+/// post-filtered variant would have been silently ignored, and an ignored
+/// filter shows MORE rows than asked for.
+fn row_passes(
+    row: &crate::kube::resources::row::ResourceRow,
+    filter: &protocol::SubscriptionFilter,
+) -> bool {
+    match filter {
+        protocol::SubscriptionFilter::OwnerUid(uid) => {
+            row.owner_refs.iter().any(|r| r.uid == *uid)
+        }
+        protocol::SubscriptionFilter::References { kind, name } => row
+            .references
+            .iter()
+            .any(|r| r.kind == *kind && r.name == *name),
+        // Pushed down to the apiserver; the rows never needed filtering.
+        protocol::SubscriptionFilter::Labels(_) | protocol::SubscriptionFilter::Field(_) => true,
+    }
+}
+
+/// Whether a filter is applied HERE rather than by the apiserver.
+fn is_post_filter(filter: &Option<protocol::SubscriptionFilter>) -> bool {
+    matches!(
+        filter,
+        Some(
+            protocol::SubscriptionFilter::OwnerUid(_)
+                | protocol::SubscriptionFilter::References { .. }
+        )
+    )
+}
+
+/// Post-filter, baseline flavor. Some `SubscriptionFilter` variants can't be
+/// applied by K8s (no field selector exists for an ownerReference or for a
+/// spec's references), so the bridge filters each frame. Exhaustive over
+/// frame kinds by construction — one function per frame type, no wildcard
+/// arm a future variant can slip past.
 fn filter_baseline(
     mut baseline: protocol::TableBaseline,
     filter: &Option<protocol::SubscriptionFilter>,
 ) -> protocol::TableBaseline {
-    let Some(protocol::SubscriptionFilter::OwnerUid(ref uid)) = filter else {
+    let Some(filter) = filter.as_ref().filter(|_| is_post_filter(filter)) else {
         return baseline;
     };
-    baseline.rows.retain(|row| row.owner_refs.iter().any(|r| r.uid == *uid));
+    baseline.rows.retain(|row| row_passes(row, filter));
     baseline
 }
 
-/// Owner-uid post-filter, delta flavor. Stateless: an upsert that fails
-/// the filter becomes a Remove — the row may never have been shown, but
-/// client removes are idempotent (remove-of-absent is a no-op), so a pod
-/// whose ownerRef mutates away from the drill correctly disappears.
+/// Post-filter, delta flavor. Stateless: an upsert that fails the filter
+/// becomes a Remove — the row may never have been shown, but client removes
+/// are idempotent (remove-of-absent is a no-op), so a pod whose ownerRef (or
+/// mounted secret) mutates away from the drill correctly disappears.
 fn filter_delta<'a>(
     delta: &'a protocol::TableDelta,
     filter: &Option<protocol::SubscriptionFilter>,
 ) -> std::borrow::Cow<'a, protocol::TableDelta> {
-    // No owner filter → BORROW the delta unchanged (the common case: no
-    // clone, no rewrite). Only an OwnerUid filter rewrites, and only that
-    // path pays for an owned copy.
-    let Some(protocol::SubscriptionFilter::OwnerUid(ref uid)) = filter else {
+    // Nothing post-filtered → BORROW the delta unchanged (the common case:
+    // no clone, no rewrite). Only a post-filter pays for an owned copy.
+    let Some(filter) = filter.as_ref().filter(|_| is_post_filter(filter)) else {
         return std::borrow::Cow::Borrowed(delta);
     };
     let changes = delta.changes.iter().map(|change| match change {
         protocol::RowChange::Upsert(row) => {
-            if row.owner_refs.iter().any(|r| r.uid == *uid) {
+            if row_passes(row, filter) {
                 protocol::RowChange::Upsert(row.clone())
             } else {
-                protocol::RowChange::Remove(protocol::ObjectKey::new(
-                    row.namespace.clone().unwrap_or_default(),
-                    row.name.clone(),
-                ))
+                // `change.key()` — the canonical derivation, not a second
+                // copy of it. If the two ever diverged, a synthesized
+                // `Remove` would stop matching the client's `Upsert` keys,
+                // and a non-matching Remove is DEFINED as a no-op — so the
+                // filtered-out rows would stay on screen forever with no
+                // error anywhere.
+                protocol::RowChange::Remove(change.key())
             }
         }
         protocol::RowChange::Remove(key) => protocol::RowChange::Remove(key.clone()),
@@ -1569,21 +1663,395 @@ fn filter_delta<'a>(
 /// back to `kubectl logs` if the API path fails (e.g., exec credentials
 /// that kube-rs can't use). When the substream closes (TUI dropped it),
 /// the stream is cancelled naturally.
+/// Most pods one log view will stream at once.
+///
+/// A selector can match hundreds; each match is an open watch against the
+/// apiserver. kubectl's own `--max-log-requests` defaults to 5, which is
+/// stingy for a TUI where "show me this deployment" is the normal case, but
+/// unbounded is a way to hold a cluster open by accident. Truncation is
+/// REPORTED in-band (see below) rather than silently applied.
+const MAX_LOG_FANOUT: usize = 20;
+
+/// How many merged lines one drain pass may take. Only a cap — the drain
+/// never waits to fill it.
+const LOG_DRAIN_BATCH: usize = 256;
+
+/// Sort key for a kubelet RFC3339 stamp: `(seconds-part, nanoseconds)`.
+///
+/// The seconds part is fixed-width and zero-padded, so comparing it as text
+/// IS chronological. The FRACTION is not: Go's `RFC3339Nano` trims trailing
+/// zeros, so it is variable-width, and text comparison then inverts every
+/// pair where one fraction is a prefix of the other — `.6Z` vs `.61Z`
+/// compares `Z`(0x5A) against `1`(0x31) and puts the EARLIER line second.
+/// A stamp with no fraction at all (which `split_timestamp` accepts, at
+/// exactly its 20-byte floor) loses to every sub-second stamp in its own
+/// second the same way, by up to 999 ms.
+///
+/// So the fraction is read as a number, padded to nanoseconds. Short is
+/// padded with zeros (`.6` is 600 ms, not 6 ns) and anything past nine
+/// digits is dropped.
+fn time_key(ts: &str) -> (&str, u64) {
+    let body = ts.strip_suffix('Z').unwrap_or(ts);
+    let (secs, frac) = match body.split_once('.') {
+        Some((secs, frac)) => (secs, frac),
+        None => (body, ""),
+    };
+    let mut nanos = 0u64;
+    for i in 0..9 {
+        let d = frac.as_bytes().get(i).and_then(|b| (*b as char).to_digit(10)).unwrap_or(0);
+        nanos = nanos * 10 + d as u64;
+    }
+    (secs, nanos)
+}
+
+/// Put one ready-batch of merged fan-out lines into timestamp order.
+///
+/// A fan-out merges N independent readers into one channel, so arrival order
+/// across sources is scheduling noise: the bottom line of a twenty-replica
+/// view is the last line to be *scheduled*, not the newest. This reorders
+/// only lines that were ALREADY QUEUED TOGETHER, so nothing is ever held back
+/// and no latency is added.
+///
+/// **It refuses to touch a batch that came from ONE source**, and that is the
+/// most important thing it does. A single stream is already in true order —
+/// one reader, one FIFO channel — so there is nothing to gain there and a
+/// whole line ordering to lose. The test on the batch's actual contents
+/// rather than on the stream's shape is deliberate: a fan-out batch in which
+/// only one pod happened to speak is also authoritative, and is also left
+/// alone.
+///
+/// It does NOT promise a globally correct ordering and could not: kubelet
+/// stamps come from different nodes, so across pods they order by clock skew
+/// as much as by time. A batch containing any untimestamped line is left
+/// exactly as it arrived — there is no defensible place to sort a line that
+/// does not say when it happened.
+fn order_batch(batch: &mut [protocol::LogLine]) {
+    if batch.len() < 2 || !batch.iter().all(|l| l.timestamp.is_some()) {
+        return;
+    }
+    // One source in this batch ⇒ arrival order IS true order. Never reorder it.
+    if batch.iter().all(|l| l.source == batch[0].source) {
+        return;
+    }
+    // Stable, so an exact tie keeps arrival order.
+    batch.sort_by(|a, b| {
+        time_key(a.timestamp.as_deref().unwrap_or(""))
+            .cmp(&time_key(b.timestamp.as_deref().unwrap_or("")))
+    });
+}
+
 async fn handle_log_substream(
     init: protocol::LogInit,
     mut writer: tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
     ctx: Arc<SessionContext>,
 ) {
-    // Try the kube-rs API first — reuses the session's authenticated
-    // client, no subprocess spawn, no re-authentication overhead.
-    if let Ok(()) = stream_logs_via_api(&init, &mut writer, &ctx).await {
-        tracing::debug!("log substream ended (API) for pod={}", init.pod);
+    let pods = match resolve_log_pods(&init, &ctx).await {
+        Ok(p) => p,
+        Err(msg) => {
+            let _ = protocol::write_bincode(&mut writer, &protocol::LogLine::untagged(msg)).await;
+            let _ = writer.flush().await;
+            return;
+        }
+    };
+    if pods.is_empty() {
+        let msg = format!("No pods match {}", init.target.display());
+        let _ = protocol::write_bincode(&mut writer, &protocol::LogLine::untagged(msg)).await;
+        let _ = writer.flush().await;
         return;
     }
 
-    // Fallback: kubectl logs. Spawns a subprocess with its own auth.
-    stream_logs_via_kubectl(&init, &mut writer, &ctx).await;
-    tracing::debug!("log substream ended (kubectl) for pod={}", init.pod);
+    let mut work = plan_log_work(&pods, &init.container);
+    // The pod guard above doesn't cover this: a `LogContainer::Set(vec![])`
+    // has pods and no streams, which would otherwise close the substream with
+    // no lines and no reason — the shape this whole function exists to avoid.
+    if work.is_empty() {
+        let msg = format!("No containers selected for {}", init.target.display());
+        let _ = protocol::write_bincode(&mut writer, &protocol::LogLine::untagged(msg)).await;
+        let _ = writer.flush().await;
+        return;
+    }
+    let mut notice = None;
+    if work.len() > MAX_LOG_FANOUT {
+        notice = Some(format!(
+            "…streaming the first {} of {} sources (k9rs caps concurrent log streams)",
+            MAX_LOG_FANOUT,
+            work.len(),
+        ));
+        work.truncate(MAX_LOG_FANOUT);
+    }
+
+    // One task per stream, all feeding ONE channel that this task drains into
+    // the single substream. The client therefore still sees one stream over
+    // one store under one epoch; nothing about its element model changes.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<protocol::LogLine>(256);
+    let mut readers = tokio::task::JoinSet::new();
+    for item in work {
+        let init = init.clone();
+        let ctx = Arc::clone(&ctx);
+        let tx = tx.clone();
+        readers.spawn(async move {
+            let LogWork { pod, container, source } = item;
+            // API first (reuses the session's client, no subprocess); kubectl
+            // only when the API can't serve this shape (`--all-containers`).
+            let args = (pod.as_str(), &container, source.as_deref());
+            if stream_logs_via_api(&init, args, &tx, &ctx).await.is_err() {
+                stream_logs_via_kubectl(&init, args, &tx, &ctx).await;
+            }
+        });
+    }
+    drop(tx); // so the drain below ends when every reader is done
+
+    if let Some(notice) = notice {
+        let _ = protocol::write_bincode(&mut writer, &protocol::LogLine::untagged(notice)).await;
+    }
+    // Drain in READY batches. `recv_many` blocks only when the channel is
+    // EMPTY — given anything queued it returns it immediately — so this adds
+    // no latency by construction. That is the whole design constraint: a
+    // reorder buffer would have to WAIT to know whether an older line is
+    // still coming, and paying deliberate lag on a live tail to tidy an
+    // ordering nobody can verify is a bad trade.
+    //
+    // It also collapses the per-line write+flush into one flush per batch
+    // (see `write_bincode_no_flush` below), which at twenty pods under load
+    // is the dominant cost here.
+    let mut batch: Vec<protocol::LogLine> = Vec::with_capacity(LOG_DRAIN_BATCH);
+    loop {
+        // MUST come first: `recv_many` APPENDS to the buffer, and tokio
+        // additionally asserts the buffer is empty when it observes the
+        // channel closed-and-empty. Clearing after the writes below would
+        // both re-send the previous batch and panic the daemon on shutdown.
+        batch.clear();
+        if rx.recv_many(&mut batch, LOG_DRAIN_BATCH).await == 0 {
+            break; // every reader is done
+        }
+        order_batch(&mut batch);
+        let mut broken = false;
+        for line in &batch {
+            // `_no_flush`: `write_bincode` flushes the 256 KiB BufWriter on
+            // EVERY message, so using it here would have been one flush per
+            // line plus a trailing no-op — one more than before, not one
+            // total. This is where the batching actually pays.
+            if protocol::write_bincode_no_flush(&mut writer, line).await.is_err() {
+                broken = true;
+                break;
+            }
+        }
+        // Flushed unconditionally: with the writes buffered, short-circuiting
+        // past this on `broken` would discard every line that serialized
+        // fine ahead of the one that failed.
+        let flushed = writer.flush().await.is_ok();
+        if broken || !flushed {
+            break;
+        }
+    }
+    // `readers` drops here: every still-running per-pod task is aborted, and
+    // each kubectl child goes with it (`kill_on_drop`).
+    tracing::debug!("log substream ended for {}", init.target.display());
+}
+
+/// One stream the daemon opens, and the tag its lines carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogWork {
+    pod: String,
+    container: protocol::LogContainer,
+    /// `None` when there is exactly one source, so a single-pod,
+    /// single-container view is byte-identical to the pre-fan-out one.
+    source: Option<String>,
+}
+
+/// Expand a resolved pod list and a container selector into the streams to
+/// open, and decide what each line will be tagged with.
+///
+/// Both axes can be sets now, so the CROSS PRODUCT is the unit of work —
+/// and it's also the thing worth capping, since three marked containers on
+/// eight pods is twenty-four apiserver streams, not eight.
+///
+/// The tag is derived from what actually varies. Naming a pod on every line
+/// of a single-pod view is noise, and naming only the container when several
+/// pods are in play is ambiguous in a way that's invisible in the output —
+/// it just looks like interleaving.
+fn plan_log_work(pods: &[String], container: &protocol::LogContainer) -> Vec<LogWork> {
+    let multi_pod = pods.len() > 1;
+    match container {
+        protocol::LogContainer::Set(names) => pods
+            .iter()
+            .flat_map(|pod| {
+                names.iter().map(move |name| LogWork {
+                    pod: pod.clone(),
+                    container: protocol::LogContainer::Named(name.clone()),
+                    source: Some(if multi_pod {
+                        format!("{pod}/{name}")
+                    } else {
+                        name.clone()
+                    }),
+                })
+            })
+            .collect(),
+        // `All` needs no tag of its own: it runs through kubectl, which
+        // prefixes every line with the container it came from, and
+        // `tag_kubectl_line` folds the pod into that.
+        one => pods
+            .iter()
+            .map(|pod| LogWork {
+                pod: pod.clone(),
+                container: one.clone(),
+                source: multi_pod.then(|| pod.clone()),
+            })
+            .collect(),
+    }
+}
+
+/// Resolve a [`protocol::LogTarget`] to the pods to stream.
+///
+/// `Selector` is resolved HERE, at stream time, rather than by the client
+/// sending a pod list: the client's pod table may be filtered, stale, or
+/// absent entirely (you can `:deploy` without ever opening pods), and the
+/// daemon is the side holding an authenticated client anyway.
+async fn resolve_log_pods(
+    init: &protocol::LogInit,
+    ctx: &SessionContext,
+) -> Result<Vec<String>, String> {
+    resolve_target(&init.target, init, ctx).await
+}
+
+/// `resolve_log_pods`, recursing through [`protocol::LogTarget::Union`].
+/// Boxed because a union resolves its members with the same function.
+fn resolve_target<'a>(
+    target: &'a protocol::LogTarget,
+    init: &'a protocol::LogInit,
+    ctx: &'a SessionContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
+    Box::pin(async move {
+    match target {
+        protocol::LogTarget::One(name) => Ok(vec![name.clone()]),
+        protocol::LogTarget::Union { targets, .. } => {
+            // Every `Owner` member wants the SAME namespace-wide pod list —
+            // ownerReferences have no field selector, so each one lists the
+            // whole namespace and filters locally. Resolving them one at a
+            // time meant thirty marked Jobs issued thirty sequential LISTs
+            // before the first log line. One list serves all of them.
+            let owners = owner_pods(targets, init, ctx).await;
+
+            let mut pods = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            let mut last_err = None;
+            // Walked in TARGET order regardless, because the fan-out cap
+            // truncates, and which sources survive that truncation should
+            // follow the selection rather than the resolution strategy.
+            for t in targets {
+                let resolved = match (t, &owners) {
+                    (protocol::LogTarget::Owner { uid, .. }, Ok(by_uid)) => {
+                        Ok(by_uid.get(uid).cloned().unwrap_or_default())
+                    }
+                    (protocol::LogTarget::Owner { .. }, Err(e)) => Err(e.clone()),
+                    _ => resolve_target(t, init, ctx).await,
+                };
+                match resolved {
+                    // Dedupe: marking a deployment AND one of its pods is a
+                    // selection of two things over one pod, and streaming it
+                    // twice would double every line.
+                    Ok(names) => pods.extend(names.into_iter().filter(|n| seen.insert(n.clone()))),
+                    // One unresolvable member must not sink the rest — you
+                    // marked five workloads and one was deleted underneath
+                    // you. The error is kept only if NOTHING resolved.
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            match (pods.is_empty(), last_err) {
+                (true, Some(e)) => Err(e),
+                _ => Ok(pods),
+            }
+        }
+        protocol::LogTarget::Selector { labels, label } => {
+            let selector = protocol::SubscriptionFilter::labels_to_selector(labels);
+            let params = kube::api::ListParams::default().labels(&selector);
+            list_pod_names(init, ctx, params, |_| true)
+                .await
+                .map_err(|e| format!("Could not list pods for {label}: {e}"))
+        }
+        protocol::LogTarget::Owner { uid, label } => {
+            // No field selector exists for ownerReferences, so this lists
+            // the namespace's pod METADATA (names + owners, no spec/status)
+            // and filters client-side. Same cost shape as the selector path.
+            list_pod_names(init, ctx, kube::api::ListParams::default(), |meta| {
+                meta.owner_references.iter().flatten().any(|o| &o.uid == uid)
+            })
+            .await
+            .map_err(|e| format!("Could not list pods for {label}: {e}"))
+        }
+    }
+    })
+}
+
+/// Resolve every `Owner` member of a union with ONE namespace pod list,
+/// returning uid → pod names. Empty (and cheap) when the union has no owner
+/// members at all.
+async fn owner_pods(
+    targets: &[protocol::LogTarget],
+    init: &protocol::LogInit,
+    ctx: &SessionContext,
+) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
+    let uids: std::collections::HashSet<&str> = targets
+        .iter()
+        .filter_map(|t| match t {
+            protocol::LogTarget::Owner { uid, .. } => Some(uid.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut by_uid: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    if uids.is_empty() {
+        return Ok(by_uid);
+    }
+    let ns = init.namespace.as_option().unwrap_or_default();
+    let api: kube::Api<k8s_openapi::api::core::v1::Pod> = namespaced_or_all(ctx, ns);
+    let list = api
+        .list_metadata(&kube::api::ListParams::default())
+        .await
+        .map_err(|e| format!("Could not list pods: {e}"))?;
+    for p in list.items {
+        let Some(name) = p.metadata.name else { continue };
+        for owner in p.metadata.owner_references.iter().flatten() {
+            if let Some(uid) = uids.get(owner.uid.as_str()) {
+                by_uid.entry((*uid).to_string()).or_default().push(name.clone());
+            }
+        }
+    }
+    Ok(by_uid)
+}
+
+/// The pod API for a log request's namespace. An absent namespace means
+/// every namespace — NOT the literal string `"default"`, which is what the
+/// two API paths used to substitute while the kubectl path omitted `-n` and
+/// got the kubeconfig's current namespace instead. One `LogInit` streaming
+/// from two different namespaces depending on which backend served it is not
+/// something the wire type should be able to express.
+fn namespaced_or_all(
+    ctx: &SessionContext,
+    ns: &str,
+) -> kube::Api<k8s_openapi::api::core::v1::Pod> {
+    if ns.is_empty() {
+        kube::Api::all(ctx.client.clone())
+    } else {
+        kube::Api::namespaced(ctx.client.clone(), ns)
+    }
+}
+
+/// List pod names in the init's namespace, keeping those whose metadata
+/// passes `keep`.
+async fn list_pod_names(
+    init: &protocol::LogInit,
+    ctx: &SessionContext,
+    params: kube::api::ListParams,
+    keep: impl Fn(&kube::core::ObjectMeta) -> bool,
+) -> Result<Vec<String>, kube::Error> {
+    let api = namespaced_or_all(ctx, init.namespace.as_option().unwrap_or_default());
+    let list = api.list_metadata(&params).await?;
+    Ok(list
+        .items
+        .into_iter()
+        .filter(|p| keep(&p.metadata))
+        .filter_map(|p| p.metadata.name)
+        .collect())
 }
 
 /// Cap on a single log line's length. A hostile/broken workload can emit a
@@ -1679,18 +2147,25 @@ fn finish_capped_line(bytes: Vec<u8>, truncated: bool) -> String {
 }
 
 /// Stream logs via the kube-rs `Api::log_stream` API.
+///
+/// `work` is one [`LogWork`] item flattened to `(pod, container, source)` —
+/// which pod, which of its containers, and the tag its lines carry (`None`
+/// when there is only one source, so a single-pod single-container view is
+/// byte-identical to the pre-fan-out one).
 async fn stream_logs_via_api(
     init: &protocol::LogInit,
-    writer: &mut tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
+    work: (&str, &protocol::LogContainer, Option<&str>),
+    out: &tokio::sync::mpsc::Sender<protocol::LogLine>,
     ctx: &SessionContext,
 ) -> Result<(), ()> {
-    let ns = init.namespace.as_option().unwrap_or("default");
-    let api: kube::Api<k8s_openapi::api::core::v1::Pod> =
-        kube::Api::namespaced(ctx.client.clone(), ns);
+    let (pod, container, source) = work;
+    let api = namespaced_or_all(ctx, init.namespace.as_option().unwrap_or_default());
 
     let mut params = kube::api::LogParams {
         follow: init.follow,
         previous: init.previous,
+        // Asked for, so the split below is a contract rather than a guess.
+        timestamps: true,
         ..Default::default()
     };
     if let Some(tail) = init.tail {
@@ -1701,22 +2176,21 @@ async fn stream_logs_via_api(
             params.since_seconds = Some(secs);
         }
     }
-    match &init.container {
+    match container {
         protocol::LogContainer::Named(name) => {
             params.container = Some(name.clone());
         }
-        protocol::LogContainer::All => {
-            // kube-rs LogParams doesn't support --all-containers.
-            // Fall back to kubectl for this case.
-            return Err(());
-        }
+        // kube-rs `LogParams` has no `--all-containers`, so that shape falls
+        // back to kubectl. (`Set` never reaches here — `plan_log_work` has
+        // already split it into one `Named` stream per container.)
+        protocol::LogContainer::All | protocol::LogContainer::Set(_) => return Err(()),
         protocol::LogContainer::Default => {}
     }
 
-    let reader = match api.log_stream(&init.pod, &params).await {
+    let reader = match api.log_stream(pod, &params).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::debug!("log API failed for pod={}: {}, falling back to kubectl", init.pod, e);
+            tracing::debug!("log API failed for pod={}: {}, falling back to kubectl", pod, e);
             return Err(());
         }
     };
@@ -1725,14 +2199,52 @@ async fn stream_logs_via_api(
     // length-capped lines so a workload emitting a giant newline-free line
     // can't OOM the daemon.
     let mut reader = reader;
-    while let Ok(Some(line)) = read_capped_line_futures(&mut reader, MAX_LOG_LINE_BYTES).await {
-        // API path only serves Named/Default (All falls back to
-        // kubectl), so every line is single-source → untagged.
-        let log_line = protocol::LogLine::untagged(line);
-        if protocol::write_bincode(writer, &log_line).await.is_err() { return Ok(()); }
-        if writer.flush().await.is_err() { return Ok(()); }
+    let mut wrote_any = false;
+    loop {
+        // NOT `while let Ok(Some(..))`. That swallowed every mid-stream
+        // failure — a reset connection, a TLS error, the 300 s idle timeout
+        // — into the same shape as EOF, and the caller reads `Ok(())` as
+        // success. So a follow whose connection dropped an hour ago looked
+        // exactly like a pod that had gone quiet: no fallback, no message,
+        // no indication at all. (The failure reporting added alongside the
+        // fan-out covers the SPAWN failure and kubectl's stderr; this path
+        // had neither.)
+        match read_capped_line_futures(&mut reader, MAX_LOG_LINE_BYTES).await {
+            Ok(Some(line)) => {
+                // The API path only serves Named/Default (All falls back to
+                // kubectl), so within one pod every line has a single
+                // source: the tag is the pod, or nothing at all when there
+                // is only one pod.
+                let (timestamp, body) = protocol::LogLine::split_timestamp(&line);
+                let log_line = protocol::LogLine {
+                    source: source.map(ToOwned::to_owned),
+                    timestamp,
+                    content: body.to_owned(),
+                };
+                // A send error means the drain side is gone (client closed
+                // the substream), which is the normal end of a follow.
+                if out.send(log_line).await.is_err() {
+                    return Ok(());
+                }
+                wrote_any = true;
+            }
+            // Clean end of stream.
+            Ok(None) => return Ok(()),
+            // Failed before producing anything: let the caller try kubectl,
+            // which is the whole point of this function's `Result`.
+            Err(e) if !wrote_any => {
+                tracing::debug!("log API failed for pod={} before any line: {}", pod, e);
+                return Err(());
+            }
+            // Failed PART WAY THROUGH. Falling back now would replay the
+            // lines already delivered, so say what happened instead — on the
+            // stream, where the reader is looking.
+            Err(e) => {
+                report_log_failure(out, pod, &format!("log stream ended: {e}")).await;
+                return Ok(());
+            }
+        }
     }
-    Ok(())
 }
 
 /// Parse a kubectl-style duration string ("5m", "1h", "30s") into seconds.
@@ -1753,11 +2265,20 @@ fn parse_since_to_seconds(s: &str) -> Option<i64> {
     s.parse().ok()
 }
 
-/// Split a kubectl `--all-containers` line into `(container, body)`. kubectl
-/// auto-enables `--prefix` for `--all-containers`, prepending `[source] ` to
-/// EVERY streamed line — so the first `[...] ` group is always kubectl's prefix,
-/// and the container's own line (brackets and all) follows it. That property is
-/// what makes this safe: we strip exactly the first prefix, never log content.
+/// Split a kubectl `--prefix` line into `(container, body)`.
+///
+/// This is only safe because WE pass `--prefix` (see `stream_logs_via_kubectl`),
+/// so the first `[...] ` group is always kubectl's and the line's own content —
+/// brackets and all — follows it.
+///
+/// It previously ran on the premise that `--all-containers` enables `--prefix`
+/// by itself. It does not; only `--all-pods` does. So no prefix was ever
+/// present, and this stripped the first bracketed group of whatever the
+/// application actually logged: `[2026-09-17 10:00:00] WARN …` became source
+/// `2026-09-17 10:00:00` (coloured by a hash, so a different colour every line)
+/// with the timestamp gone from the body, and the container name — the entire
+/// point — was never recovered.
+///
 /// `source` is `pod/container` (or just `container`); the container is its final
 /// `/`-separated component. Returns `None` for a line that doesn't open with a
 /// recognizable prefix — it then rides the wire untagged rather than guessing.
@@ -1769,18 +2290,77 @@ fn split_all_containers_prefix(line: &str) -> Option<(&str, &str)> {
     Some((container, &rest[close + 2..]))
 }
 
+/// Put one source's failure ON the stream, tagged with the pod it belongs to.
+///
+/// In a fan-out this is the only place a per-pod failure can surface: the
+/// substream is shared, so there is no per-source error channel and a silent
+/// reader is indistinguishable from a quiet one.
+async fn report_log_failure(
+    out: &tokio::sync::mpsc::Sender<protocol::LogLine>,
+    pod: &str,
+    message: &str,
+) {
+    let _ = out
+        .send(protocol::LogLine {
+            source: Some(pod.to_string()),
+            timestamp: None,
+            content: format!("k9rs: {message}"),
+        })
+        .await;
+}
+
+/// Attach the `source` tag to one raw `kubectl logs` line.
+///
+/// Two independent tag axes meet here and both can be live at once:
+/// `--all-containers` makes kubectl prefix every line with `[pod/container] `,
+/// and a fan-out gives the line a pod. When both apply the tag must be
+/// `pod/container` — with several multi-container pods in one view, a bare
+/// container name doesn't say which pod emitted it, and that ambiguity is
+/// invisible in the rendered output (it just looks like interleaving).
+fn tag_kubectl_line(line: String, all_containers: bool, source: Option<&str>) -> protocol::LogLine {
+    // Only `--all-containers` carries the prefix; anything else rides through
+    // with the fan-out tag, or none.
+    // kubectl emits `[prefix] <stamp> body`, so the prefix comes off first.
+    let (tag, rest) = match all_containers.then(|| split_all_containers_prefix(&line)).flatten() {
+        Some((container, body)) => {
+            let tag = Some(match source {
+                Some(pod) => format!("{pod}/{container}"),
+                None => container.to_owned(),
+            });
+            (tag, body)
+        }
+        None => (source.map(ToOwned::to_owned), line.as_str()),
+    };
+    let (timestamp, content) = protocol::LogLine::split_timestamp(rest);
+    protocol::LogLine { source: tag, timestamp, content: content.to_owned() }
+}
+
 /// Fallback: stream logs via `kubectl logs` subprocess.
+///
+/// See [`stream_logs_via_api`] for `work`. When both a fan-out source and
+/// kubectl's own per-container prefix are present the tag is `pod/container`,
+/// because with several multi-container pods in one view the container name
+/// alone doesn't say which pod it came from.
 async fn stream_logs_via_kubectl(
     init: &protocol::LogInit,
-    writer: &mut tokio::io::BufWriter<tokio::io::WriteHalf<crate::kube::mux::MuxedStream>>,
+    work: (&str, &protocol::LogContainer, Option<&str>),
+    out: &tokio::sync::mpsc::Sender<protocol::LogLine>,
     ctx: &SessionContext,
 ) {
+    let (pod, container, source) = work;
     let mut cmd = ctx.session_env.kubectl();
-    cmd.arg("logs").arg(&init.pod);
-    match &init.container {
-        protocol::LogContainer::All => { cmd.arg("--all-containers"); }
+    cmd.arg("logs").arg(pod);
+    match container {
+        protocol::LogContainer::All => {
+            // `--prefix` is NOT implied by `--all-containers` — only
+            // `--all-pods` sets it. Without it every line arrives bare and
+            // `split_all_containers_prefix` strips the application's own
+            // leading `[...]` group instead of kubectl's.
+            cmd.arg("--all-containers").arg("--prefix");
+        }
         protocol::LogContainer::Named(name) => { cmd.arg("-c").arg(name); }
-        protocol::LogContainer::Default => {}
+        // Split upstream by `plan_log_work`; a `Set` never reaches a command.
+        protocol::LogContainer::Set(_) | protocol::LogContainer::Default => {}
     }
     if let Some(ns) = init.namespace.as_option() {
         cmd.arg("-n").arg(ns);
@@ -1794,14 +2374,20 @@ async fn stream_logs_via_kubectl(
         cmd.arg("--since").arg(since);
     }
     if init.previous { cmd.arg("--previous"); }
+    // Matches the API path, so both backends deliver the same typed line.
+    cmd.arg("--timestamps");
     cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null());
+    // Captured, not discarded: kubectl's refusal IS the answer when a pod has
+    // no previous container or was deleted mid-fan-out, and it used to go to
+    // /dev/null — leaving the view to print "No logs.", an affirmative false
+    // statement about a fetch that failed.
+    cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("log substream: failed to spawn kubectl: {}", e);
+            report_log_failure(out, pod, &format!("could not run kubectl: {e}")).await;
             return;
         }
     };
@@ -1810,23 +2396,28 @@ async fn stream_logs_via_kubectl(
         Some(s) => s,
         None => return,
     };
+    let stderr = child.stderr.take();
     let mut reader = tokio::io::BufReader::new(stdout);
 
-    // Only `--all-containers` carries kubectl's `[source] ` prefix; tag those
-    // lines with the source container and strip the prefix. Single-container
-    // streams have no prefix and ride the wire untagged.
-    let all_containers = matches!(init.container, protocol::LogContainer::All);
+    let all_containers = matches!(container, protocol::LogContainer::All);
+    let mut wrote_any = false;
     while let Ok(Some(line)) = read_capped_line_tokio(&mut reader, MAX_LOG_LINE_BYTES).await {
-        let parsed = if all_containers { split_all_containers_prefix(&line) } else { None };
-        let log_line = match parsed {
-            Some((container, body)) => protocol::LogLine {
-                container: Some(container.to_owned()),
-                content: body.to_owned(),
-            },
-            None => protocol::LogLine::untagged(line),
-        };
-        if protocol::write_bincode(writer, &log_line).await.is_err() { break; }
-        if writer.flush().await.is_err() { break; }
+        wrote_any = true;
+        if out.send(tag_kubectl_line(line, all_containers, source)).await.is_err() {
+            return;
+        }
+    }
+
+    // Only if the stream produced nothing: a successful follow that is simply
+    // quiet must stay silent, and a stream that ended after real output has
+    // already said what it had to say.
+    if !wrote_any {
+        if let Some(stderr) = stderr {
+            let mut err = tokio::io::BufReader::new(stderr);
+            if let Ok(Some(first)) = read_capped_line_tokio(&mut err, MAX_LOG_LINE_BYTES).await {
+                report_log_failure(out, pod, first.trim()).await;
+            }
+        }
     }
 }
 
@@ -1888,9 +2479,10 @@ async fn handle_exec_substream(
         }
     };
 
-    // RAII guard: kills and reaps the child on drop. Ensures cleanup
-    // even if the tokio task is aborted (daemon shutdown).
-    let _child_guard = ChildGuard(Some(child));
+    // Held for its Drop: `kill_on_drop` signals the child and tokio reaps it
+    // in the background. Cleanup still happens when the task is aborted
+    // (daemon shutdown) — without a blocking `waitpid` on the way out.
+    let _child = child;
 
     // Transfer master ownership from the PTY into a File — a plain typed
     // move (`OwnedFd` → `File`), no raw-fd unsafe. Consumes the Pty; the
@@ -1976,28 +2568,13 @@ async fn handle_exec_substream(
         _ = pty_to_yamux => {}
     }
 
-    // ChildGuard's Drop kills + reaps the child. Whether we get here
-    // normally, or the task is aborted (daemon shutdown), or the daemon
-    // is killed with SIGTERM (Drop runs during unwind), the child dies.
-    // Only SIGKILL bypasses this — nothing survives SIGKILL on any platform.
+    // `kill_on_drop` kills the child and hands the reap to tokio. Whether we
+    // get here normally, or the task is aborted (daemon shutdown), or the
+    // daemon takes SIGTERM (Drop runs during unwind), the child dies. Only
+    // SIGKILL bypasses this — nothing survives SIGKILL on any platform.
     drop(master);
-    drop(_child_guard);
+    drop(_child);
     tracing::debug!("exec substream ended");
-}
-
-/// RAII guard for a child process. Kills and reaps on drop — ensures
-/// cleanup even when a tokio task is aborted (daemon shutdown). Same
-/// pattern as `AbortOnDrop`, `SuspendGuard`, `TempFile`. Works on
-/// Linux and macOS (uses `kill` + `wait`, no platform-specific APIs).
-struct ChildGuard(Option<std::process::Child>);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(ref mut child) = self.0 {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
 }
 
 /// Minimal PTY wrapper using raw libc. Fd lifetimes are [`OwnedFd`]s — a
@@ -2038,6 +2615,28 @@ impl Pty {
         // error path below closes them by drop.
         let master = unsafe { OwnedFd::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        // CLOSE-ON-EXEC on BOTH, immediately.
+        //
+        // `openpty` does not set it, and the daemon forks other children all
+        // the time — `kubectl logs -f`, describe, another exec, the auth
+        // credential plugin. Every one of them inherited these fds, and an
+        // inherited copy is not released when ours is: open a shell, then
+        // follow a log, exit the shell, and that pty pair stays allocated for
+        // as long as the log runs. `Drop` cannot reach an fd that has already
+        // been copied into another process's table — CLOEXEC is how you stop
+        // the copy from happening.
+        //
+        // Safe for OUR child: `pre_exec` below installs the slave via `dup2`,
+        // which clears CLOEXEC on the new descriptor, and closes both
+        // originals explicitly.
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags == -1
+                || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
         // Set master to non-blocking for async I/O.
         let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
         if flags == -1
@@ -2049,6 +2648,18 @@ impl Pty {
         Ok(Pty { master, slave: Some(slave) })
     }
 
+    /// Raw fds for the CLOEXEC pin. Test-only: production code never needs
+    /// the numbers, only the `OwnedFd`s.
+    #[cfg(test)]
+    fn master_fd_for_test(&self) -> std::os::fd::RawFd {
+        self.master.as_raw_fd()
+    }
+
+    #[cfg(test)]
+    fn slave_fd_for_test(&self) -> std::os::fd::RawFd {
+        self.slave.as_ref().expect("slave not yet consumed").as_raw_fd()
+    }
+
     /// Hand the master to the caller (typically wrapped into a `File` /
     /// `AsyncFd`), consuming the PTY. By now `spawn` has taken the slave,
     /// so the move IS the complete ownership transfer — nothing is left
@@ -2058,8 +2669,21 @@ impl Pty {
     }
 
     /// Spawn a process with the slave PTY as its controlling terminal.
-    fn spawn(&mut self, cmd: &str, args: &[String], env: &SessionEnv) -> std::io::Result<std::process::Child> {
-        use std::os::unix::process::CommandExt;
+    /// Spawn on TOKIO's process driver with `kill_on_drop`.
+    ///
+    /// Not `std::process`: the guard that used to own this child killed AND
+    /// `wait()`ed in its `Drop`, which is a blocking `waitpid` running on a
+    /// runtime worker during task teardown — and two shutdown paths `await`
+    /// that teardown. A `kubectl` wedged in uninterruptible sleep therefore
+    /// defers its own SIGKILL, `wait()` never returns, the session task never
+    /// completes, and `ctl shutdown` hangs forever. It also contradicted the
+    /// contract its sibling guard states outright: abort-only, never join,
+    /// because a blocking join in `Drop` would deadlock.
+    ///
+    /// `kill_on_drop(true)` gives the same guarantee without the blocking:
+    /// dropping the child signals it and hands the reaping to tokio's orphan
+    /// queue.
+    fn spawn(&mut self, cmd: &str, args: &[String], env: &SessionEnv) -> std::io::Result<tokio::process::Child> {
         let Some(slave) = self.slave.take() else {
             return Err(std::io::Error::other("PTY slave already consumed"));
         };
@@ -2067,8 +2691,9 @@ impl Pty {
         // child, where the parent's OwnedFds don't exist as owners).
         let slave_fd = slave.as_raw_fd();
         let master_fd = self.master.as_raw_fd();
-        let mut command = std::process::Command::new(cmd);
+        let mut command = tokio::process::Command::new(cmd);
         command.args(args);
+        command.kill_on_drop(true);
         // Authenticate as this session, not the daemon's startup env. Applied
         // before TERM below so our forced TERM always wins.
         env.apply_to(&mut command);

@@ -162,7 +162,14 @@ pub(crate) fn apply_event(
                 // arms and leave the queued switch to proceed. (`target()`
                 // deliberately spans both states; this edge needs the
                 // narrower question.)
-                _ => None,
+                // NAMED, not `_`. A future `Cancelling`/`Retrying` variant
+                // falling in here would take the reconnect-backoff branch
+                // instead of settling the switch: `is_stable()` would stay
+                // false and every later `:context` would be refused forever.
+                // That is the 2026-07-30 context-lock bug, and `types.rs`
+                // already warns that outcome edges must match `InFlight`.
+                crate::app::ContextSwitchState::Stable
+                | crate::app::ContextSwitchState::Requested(_) => None,
             };
             if let Some(target) = in_flight_target {
                 // A context SWITCH failed: the target we asked for is
@@ -393,20 +400,37 @@ fn apply_resource_update(
             use crate::app::element::{ContentPhase, ContentSpec};
             let nav = &mut app.nav;
             let cache = &mut app.kube.kubectl_cache;
+            // Kind axis EXHAUSTIVE; the target comparison is the only guard.
+            //
+            // Both arms used to carry the `if *target == …` in the PATTERN,
+            // which forced a trailing wildcard — and that wildcard was doing
+            // two jobs. Absorbing "same kind, wrong target" is right;
+            // absorbing "a kind this walk has never heard of" is how a future
+            // `ContentSpec` delivered over this same event would sit at
+            // `Fetching` forever, animating "Loading…" with no request behind
+            // it. That is precisely the state `ContentPhase` replaced an
+            // `awaiting_response: bool` to make unrepresentable.
             nav.for_each_content_view(|cv| {
                 match cv.kind {
-                    ContentSpec::Describe(ref target) if *target == response_target => {
+                    ContentSpec::Describe(ref target) => {
+                        if *target != response_target {
+                            return;
+                        }
                         if cv.phase == ContentPhase::Fetching {
                             cache.insert_describe(target.clone(), lines.clone());
                         }
                         cv.phase = ContentPhase::Ready;
                         cv.state.set_describe_lines(lines.clone());
                     }
-                    ContentSpec::DecodedSecret(ref target) if *target == response_target => {
+                    ContentSpec::DecodedSecret(ref target) => {
+                        if *target != response_target {
+                            return;
+                        }
                         cv.phase = ContentPhase::Ready;
                         cv.state.set_describe_lines(lines.clone());
                     }
-                    _ => {}
+                    // Delivered over their own events, not this one.
+                    ContentSpec::Yaml(_) | ContentSpec::Aliases => {}
                 }
             });
         }

@@ -130,24 +130,17 @@ pub trait LocalResourceSource: Send + Sync + 'static {
     /// user-facing message on success, or an error string on failure.
     fn apply_yaml(&self, name: &str, yaml: &str) -> Result<String, String>;
 
-    /// Try to claim the "grace task in flight" slot. Returns `true` if the
-    /// caller won the race and SHOULD spawn a fresh grace task; `false`
-    /// if a grace task is already running for this source and the caller
-    /// should just drop its Arc immediately. Implementations typically
-    /// CAS-flip an `AtomicBool`.
+    /// This source's keep-warm gate, or `None` if subscription-level grace
+    /// doesn't apply to it — a port-forward is owned by its `ContextLocals`
+    /// and outlives any view of it, so gracing it here would be meaningless.
     ///
-    /// Paired with [`Self::end_grace`]: together they are the `claim`/`reset`
-    /// closures driving [`crate::kube::spawn_grace`]. The pair MUST target the
-    /// exact same slot — the type system can't verify it, so an implementation
-    /// that claims one flag and resets another would silently wedge the grace
-    /// coalescing (a permanently-set flag means no future grace task spawns).
-    fn try_begin_grace(&self) -> bool;
-
-    /// Reset the "grace task in flight" slot claimed by
-    /// [`Self::try_begin_grace`] — the *same* slot (see its note). Called by
-    /// the grace task just before it drops its Arc, so that a subsequent
-    /// subscribe/drop cycle can spawn a fresh grace task.
-    fn end_grace(&self);
+    /// ONE accessor rather than the `try_begin_grace`/`end_grace` pair it
+    /// replaced. That pair carried a warning that both halves "MUST target the
+    /// exact same slot — the type system can't verify it", and an
+    /// implementation that claimed one flag and reset another would wedge the
+    /// coalescing permanently. Handing back the gate itself makes the mismatch
+    /// unwritable.
+    fn grace_gate(&self) -> Option<&crate::kube::GraceGate>;
 }
 
 /// Convenience: downcast-free typed handle to the daemon's PortForwardSource.

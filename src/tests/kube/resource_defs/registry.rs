@@ -67,3 +67,36 @@ fn default_cells_align_with_headers() {
         );
     }
 }
+
+/// Every alias of every registered resource resolves to THAT resource, in
+/// either case, deterministically.
+///
+/// `by_alias` used to scan `by_kind.values()` — a `HashMap` with the default
+/// randomized hasher — so the first alias collision anyone introduced would
+/// have resolved to a different resource on different launches of the same
+/// binary, with no panic, no test failure and no way to reproduce the report.
+/// It is an index now and `insert` rejects a collision at registration, so
+/// this walks the live registry to prove the index is total and faithful.
+#[test]
+fn every_alias_resolves_to_its_own_resource() {
+    for def in REGISTRY.all() {
+        for alias in def.aliases() {
+            let found = REGISTRY
+                .by_alias(alias)
+                .unwrap_or_else(|| panic!("alias {alias:?} of {:?} resolves to nothing", def.kind()));
+            assert_eq!(
+                found.kind(),
+                def.kind(),
+                "alias {alias:?} belongs to {:?} but resolved to {:?}",
+                def.kind(),
+                found.kind(),
+            );
+            let shouty = alias.to_uppercase();
+            assert_eq!(
+                REGISTRY.by_alias(&shouty).map(|d| d.kind()),
+                Some(def.kind()),
+                "alias lookup is case-insensitive ({shouty})",
+            );
+        }
+    }
+}

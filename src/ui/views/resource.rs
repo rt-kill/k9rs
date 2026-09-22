@@ -110,8 +110,19 @@ fn draw_resource_table(
 pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.ui.theme;
 
+    // A FLOATING element renders its content only: the cluster header, the
+    // breadcrumb and the flash line are the FRAME's chrome, and drawing them
+    // again inside an 80%-wide box gave two header panels, two breadcrumbs,
+    // two `? help` hints, and a flash row that blanked the parent's border
+    // across the width of the box.
+    let floating = !matches!(
+        app.nav.top().extent(),
+        crate::app::element::ViewExtent::Full
+    );
+
     // Determine dynamic section heights
-    let header_height: u16 = if app.ui.show_header { crate::ui::HEADER_HEIGHT } else { 0 };
+    let header_height: u16 =
+        if app.ui.show_header && !floating { crate::ui::HEADER_HEIGHT } else { 0 };
     let command_height: u16 = if app.ui.command_input().is_some() { 3 } else { 0 };
     // Only show the filter bar box while actively typing; when committed
     // (inactive but text non-empty), the table title shows `</:filter_text>`.
@@ -123,8 +134,8 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(command_height),     // command prompt
         Constraint::Length(filter_height),      // filter
         Constraint::Fill(1),                   // table
-        Constraint::Length(1),                 // breadcrumbs
-        Constraint::Length(1),                 // flash
+        Constraint::Length(u16::from(!floating)), // breadcrumbs
+        Constraint::Length(u16::from(!floating)), // flash
     ])
     .split(area);
 
@@ -172,12 +183,14 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         let filtered = view.keys.len();
         let total = view.total_rows;
         let fi = app.nav.top().filter_input();
+        let fallback = app.nav.top().grep_fallback();
         let match_count = if fi.text().is_empty() && !app.nav.is_drilled() {
             total
         } else {
             filtered
         };
-        let filter_bar = FilterBar::new(fi.active(), fi.text(), match_count, total, theme);
+        let filter_bar = FilterBar::new(fi.active(), fi.text(), match_count, total, theme)
+            .fallback(fallback.as_deref());
         f.render_widget(filter_bar, filter_area);
     }
 

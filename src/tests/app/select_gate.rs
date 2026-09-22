@@ -55,7 +55,8 @@ fn gate_kills_single_target_actions_in_select_mode() {
         Action::Enter,
         Action::Describe,
         Action::Yaml,
-        Action::Logs,
+        // (`Logs` is NOT here — it is the one Aggregate action and
+        // retargets to `BatchLogs`; see `logs_aggregate_and_previous_logs_does_not`.)
         Action::Shell,
         Action::Edit,
         Action::Scale,
@@ -91,9 +92,8 @@ fn gate_passes_navigation_marking_and_view_ops_in_select_mode() {
         Action::ClearMarks,
         Action::Filter(String::new()),
         Action::Refresh,
-        Action::Copy,
         Action::SaveTable,
-        Action::Sort(crate::app::SortTarget::Last),
+        Action::Sort(crate::app::SortTarget::Named(crate::app::actions::COL_AGE)),
         Action::NextTab,
         Action::CommandMode,
         Action::Quit,
@@ -101,6 +101,30 @@ fn gate_passes_navigation_marking_and_view_ops_in_select_mode() {
     ] {
         assert_eq!(gate_action(&app, action.clone()), Gated::Pass(action));
     }
+}
+
+/// `c` copies the SELECTION, not the table.
+///
+/// It used to pass through unchanged, so with rows marked `Copy` still dumped
+/// every visible row — mark three pods, press `c`, get all forty-seven. That
+/// is the single-vs-batch conflation the whole mode exists to kill, and it
+/// retargets here for the same reason `Delete` does: the gate is the one place
+/// that knows the mode. Unlike the other batch actions it mutates nothing, so
+/// it stays available under `--read-only`.
+#[test]
+fn copy_takes_the_selection_in_select_mode() {
+    let app = seeded_app(&["a"]);
+    assert_eq!(gate_action(&app, Action::Copy), Gated::Pass(Action::BatchCopy));
+
+    // With nothing marked there is no mode and no retarget: `c` is the
+    // ordinary whole-table copy.
+    let app = seeded_app(&[]);
+    assert_eq!(gate_action(&app, Action::Copy), Gated::Pass(Action::Copy));
+
+    assert!(
+        !Action::BatchCopy.is_mutating(),
+        "copying is not a mutation — read-only sessions must keep it",
+    );
 }
 
 /// Esc is the mode's exit, not the scope's, while marks exist. Vim-like:
@@ -148,28 +172,24 @@ fn gate_is_inert_in_normal_mode() {
 }
 
 /// The stale-frame guard list is derived by hand (`Delete | Restart |
-/// ForceKill` in `gate_action`) — this pins it to the manifest: every
-/// `PerItem` operation's action must be swallowed when the last
+/// ForceKill | Logs` in `gate_action`) — this pins it to the manifest:
+/// every BATCH-CAPABLE operation's action must be swallowed when the last
 /// painted frame showed select mode but the marks are gone. A future
-/// PerItem op that transforms in select mode but lacks the stale
-/// guard would re-open the exact race the guard exists to kill.
+/// batch op that transforms in select mode but lacks the stale guard
+/// would re-open the exact race the guard exists to kill: the key lands
+/// on the hovered row instead of the set the user was looking at.
 #[test]
-fn stale_guard_covers_every_per_item_operation() {
+fn stale_guard_covers_every_batch_capable_operation() {
     use crate::kube::protocol::{BatchSupport, OperationKind as Op};
     let mut app = seeded_app(&[]);
     app.nav.top_mut().table_interaction_mut().unwrap().rendered_select_mode = true;
-    let all = [
-        Op::Describe, Op::Yaml, Op::Delete, Op::Restart, Op::Scale,
-        Op::StreamLogs, Op::PreviousLogs, Op::PortForward, Op::Shell,
-        Op::ShowNode, Op::ForceKill, Op::NodeShell, Op::DecodeSecret,
-        Op::TriggerCronJob, Op::ToggleSuspendCronJob,
-        Op::Custom("x".to_string()),
-    ];
-    for op in all {
-        if op.batch_support() == BatchSupport::PerItem {
+    // ONE list, `OperationKind::BUILT_IN`, so the manifest and the tests
+    // that check it cannot disagree about which operations exist.
+    for op in Op::BUILT_IN {
+        if op.batch_support() != BatchSupport::SingleOnly {
             assert!(
-                matches!(gate_action(&app, crate::app::actions::Action::from(&op)), Gated::Blocked(_)),
-                "{op:?} is PerItem but its action survives a stale select frame",
+                matches!(gate_action(&app, crate::app::actions::Action::from(op)), Gated::Blocked(_)),
+                "{op:?} is batch-capable but its action survives a stale select frame",
             );
         }
     }
@@ -211,26 +231,13 @@ fn stale_rendered_select_mode_swallows_batch_keys() {
 fn gate_agrees_with_batch_support_manifest() {
     use OperationKind as Op;
     let app = seeded_app(&["a"]);
-    let all = [
-        Op::Describe,
-        Op::Yaml,
-        Op::Delete,
-        Op::Restart,
-        Op::Scale,
-        Op::StreamLogs,
-        Op::PreviousLogs,
-        Op::PortForward,
-        Op::Shell,
-        Op::ShowNode,
-        Op::ForceKill,
-        Op::NodeShell,
-        Op::DecodeSecret,
-        Op::TriggerCronJob,
-        Op::ToggleSuspendCronJob,
-        Op::Custom("x".to_string()),
-    ];
-    for op in all {
-        let gated = gate_action(&app, crate::app::actions::Action::from(&op));
+    // ONE list, `OperationKind::BUILT_IN`, so the manifest and the tests
+    // that check it cannot disagree about which operations exist.
+    // `Custom` is not in BUILT_IN (it is overlay-declared and unbounded), so
+    // it is checked explicitly — it is the variant most likely to drift.
+    let custom = Op::Custom("x".to_string());
+    for op in Op::BUILT_IN.iter().chain(std::iter::once(&custom)) {
+        let gated = gate_action(&app, crate::app::actions::Action::from(op));
         match op.batch_support() {
             BatchSupport::PerItem => assert!(
                 matches!(
@@ -241,10 +248,35 @@ fn gate_agrees_with_batch_support_manifest() {
                 ),
                 "{op:?} is PerItem but the gate didn't transform it",
             ),
+            BatchSupport::Aggregate => assert!(
+                matches!(gated, Gated::Pass(Action::BatchLogs)),
+                "{op:?} is Aggregate but the gate didn't transform it",
+            ),
             BatchSupport::SingleOnly => assert!(
                 matches!(gated, Gated::Blocked(_)),
                 "{op:?} is SingleOnly but the gate let it through",
             ),
         }
     }
+}
+
+/// Aggregate is a DISTINCT stance, not a second name for PerItem: it must
+/// collapse to ONE action, never fan out. `StreamLogs` is the whole reason
+/// the variant exists (its sibling `PreviousLogs` stays single-only — the
+/// crashed-container question is about one container).
+#[test]
+fn logs_aggregate_and_previous_logs_does_not() {
+    use crate::kube::protocol::{BatchSupport, OperationKind as Op};
+    assert_eq!(Op::StreamLogs.batch_support(), BatchSupport::Aggregate);
+    assert_eq!(Op::PreviousLogs.batch_support(), BatchSupport::SingleOnly);
+
+    let app = seeded_app(&["a"]);
+    assert_eq!(gate_action(&app, Action::Logs), Gated::Pass(Action::BatchLogs));
+    assert!(matches!(gate_action(&app, Action::PreviousLogs), Gated::Blocked(_)));
+    // And the keymap can't produce the batch action itself — only this gate.
+    assert_eq!(
+        gate_action(&app, Action::BatchLogs),
+        Gated::Pass(Action::BatchLogs),
+        "BatchLogs must survive the gate unchanged (no double transform)",
+    );
 }

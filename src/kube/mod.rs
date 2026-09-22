@@ -1,73 +1,191 @@
 pub mod cache;
 pub mod client_session;
 
-/// How long a watcher (or local resource source) stays alive after the last
-/// subscriber drops. Shared between the K8s `LiveQuery` grace-period task and
-/// the `LocalSubscription` grace-period task (both via [`spawn_grace`]) so the
-/// two systems use the same window and can't silently drift.
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+// `tokio::time::Instant`, not `std::time::Instant`: identical monotonic clock
+// in production, but it moves with `tokio::time::pause()`, so a test can walk
+// a 30-minute window without waiting 30 minutes. A `std::time::Instant` here
+// would leave the deadline pinned to real time while the sleeps jumped ahead,
+// and the gate would never open.
+use tokio::time::Instant;
+
+/// How long a *watcher* (or exec-backed local source) stays warm after its
+/// last subscriber drops.
 ///
 /// 60s: long enough that quick nav-away/back (Esc then re-enter, tab cycling)
 /// reuses the warm watcher; short enough that a linear sweep through many
 /// resource types doesn't pin a *union* of watchers — each holding its full
 /// store and an open apiserver watch — for minutes. Most reuse value decays
 /// under a minute.
-pub(crate) const GRACE_PERIOD_SECS: u64 = 60;
-
-/// The shared "last subscriber dropped" grace dance, used by both the K8s
-/// `live_query::Subscription` and the local `LocalSubscription` `Drop` impls.
-/// Their grace logic is structurally identical — keep the kept-alive `arc`
-/// around for [`GRACE_PERIOD_SECS`], then release a single-owner claim flag and
-/// drop it — but the *mechanism* of that flag differs (a concrete `AtomicBool`
-/// on the `LiveQuery` vs. the dyn-dispatched `try_begin_grace`/`end_grace` hook
-/// on the `LocalResourceSource` trait). Parameterizing the variance as closures
-/// keeps the one control-flow skeleton here instead of copy-pasted into two
-/// `Drop`s that could silently drift.
 ///
-/// All four behaviors of the original hand-rolled Drops are preserved:
+/// Deliberately NOT the window for a context's local slice: see
+/// [`DEFAULT_LOCALS_GRACE_SECS`].
+pub(crate) const DEFAULT_WATCHER_GRACE_SECS: u64 = 60;
+
+/// How long a context's LOCAL slice — its running port-forwards — survives
+/// after the last session for that context detaches.
+///
+/// A different number from [`DEFAULT_WATCHER_GRACE_SECS`] because it bounds a
+/// completely different cost. A warm watcher costs a full row store plus an
+/// open apiserver watch, and buys back only a re-LIST; 60s is a fair trade. A
+/// port-forward costs one `kubectl` child, was created by an explicit user
+/// action, and buying it back means the user noticing it died and recreating
+/// it. Sharing one constant meant `:ctx` away for two minutes and back silently
+/// killed forwards the user was still using.
+///
+/// 30 minutes: survives context-hopping, a meeting, lunch — while still
+/// bounding a long-lived daemon so forwards for abandoned contexts don't
+/// accumulate forever. Override with `daemon.localsGraceSecs`.
+pub(crate) const DEFAULT_LOCALS_GRACE_SECS: u64 = 1800;
+
+/// The configured watcher grace window.
+pub(crate) fn watcher_grace() -> Duration {
+    Duration::from_secs(daemon_config::daemon_config().watcher_grace_secs)
+}
+
+/// The configured window for a context's local slice.
+pub(crate) fn locals_grace() -> Duration {
+    Duration::from_secs(daemon_config::daemon_config().locals_grace_secs)
+}
+
+/// The "last holder just left" gate: a movable deadline and a single-owner
+/// claim, as ONE value.
+///
+/// Both halves used to be spelled out per call site — an `AtomicBool` here, a
+/// pair of dyn-dispatched trait hooks there, a hand-rolled deadline loop in
+/// `ContextLocals` — and the two halves could drift apart because nothing tied
+/// them together. The trait even carried a doc warning that its `claim`/`reset`
+/// pair "MUST target the exact same slot — the type system can't verify it".
+/// Now they are one field with one method each, so it can.
+///
+/// # Why a deadline rather than a claim flag alone
+///
+/// The claim flag exists to coalesce: at most one grace task per object, so
+/// context-switch churn can't stack detached timers. But claim-only measured
+/// the window from the FIRST dropper, so with two sessions the second one out
+/// could get ~0s of grace — it lost the claim, and the winner's timer was
+/// already most of the way through. Every drop now bumps `deadline = now +
+/// window` and the single task sleeps until the deadline stops moving, so the
+/// window is always measured from the LAST holder out.
+pub struct GraceGate {
+    window: Duration,
+    /// Anchors the deadline arithmetic so a monotonic `Instant` fits in an
+    /// `AtomicU64` of elapsed millis.
+    created: Instant,
+    deadline_ms: AtomicU64,
+    claimed: AtomicBool,
+}
+
+impl GraceGate {
+    pub(crate) fn new(window: Duration) -> Self {
+        Self {
+            window,
+            created: Instant::now(),
+            deadline_ms: AtomicU64::new(0),
+            claimed: AtomicBool::new(false),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.created.elapsed().as_millis() as u64
+    }
+
+    /// Push the deadline out to `now + window` and try to become the one
+    /// waiter. `true` = you own the grace task.
+    fn bump_and_claim(&self) -> bool {
+        let deadline = self.now_ms().saturating_add(self.window.as_millis() as u64);
+        // `fetch_max`, not `store`: a racing earlier drop must not pull an
+        // already-later deadline back in.
+        self.deadline_ms.fetch_max(deadline, Ordering::AcqRel);
+        self.claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn release(&self) {
+        self.claimed.store(false, Ordering::Release);
+    }
+
+    /// Sleep until the deadline stops moving.
+    async fn wait_out(&self) {
+        loop {
+            loop {
+                let now = self.now_ms();
+                let deadline = self.deadline_ms.load(Ordering::Acquire);
+                if now >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(deadline - now)).await;
+            }
+            self.release();
+            // Release-recheck: a holder may have bumped the deadline between
+            // our last load and the release above — its claim lost against our
+            // still-set flag, so that bump is ours to serve. Re-claim and keep
+            // waiting; if someone else claimed in the gap, the bump is theirs.
+            if self.now_ms() >= self.deadline_ms.load(Ordering::Acquire) {
+                return;
+            }
+            if self
+                .claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+
+/// The shared "last subscriber dropped" grace dance, driving every kept-alive
+/// object in the daemon: K8s watchers (`live_query::Subscription`), shared
+/// pollers (`PollerSub`), local sources (`LocalSubscription`) and a context's
+/// local slice (`ContextKeepalive`).
+///
+/// Behaviors, all preserved from the four hand-rolled `Drop`s this replaced:
 /// 1. `finished(&arc)` → already dead (a self-terminated watcher); drop `arc`
 ///    now with no grace, so its cache slot is reclaimed and the next subscribe
-///    builds fresh. Infallible local sources pass `|_| false`.
-/// 2. `claim(&arc)` lost → another drop already owns the in-flight grace task;
-///    just drop our `arc`. The coalescing CAS means at most one grace task
-///    exists per kept-alive object, so context-switch churn can't stack
-///    detached timers.
-/// 3. No tokio runtime (dropping during process shutdown) → `reset(&arc)` to
-///    release the claim, then drop `arc` immediately; dying now is correct.
-/// 4. Otherwise spawn a task that sleeps the grace window, calls `reset(&arc)`
-///    to release the claim *before* dropping `arc` (so a later subscribe/drop
-///    cycle can grace again), then drops it.
-///
-/// `claim` performs the winning side of the coalescing CAS and returns whether
-/// it won; `reset` undoes it. Only `reset` and `arc` cross into the spawned
-/// task, so only they carry `Send + 'static`.
+///    builds fresh. Objects that can't self-terminate pass `|_| false`.
+/// 2. `gate(&arc)` is `None` → this object is not graced at THIS level at all
+///    (a port-forward source is owned by its `ContextLocals`, so subscription
+///    grace would be meaningless). Drop now.
+/// 3. Claim lost → another drop already owns the in-flight grace task, and our
+///    `bump_and_claim` has already pushed the deadline out for it to serve.
+/// 4. No tokio runtime (dropping during process shutdown) → release the claim
+///    and drop immediately; dying now is correct.
+/// 5. Otherwise spawn the one task, which waits out the (movable) deadline,
+///    releases the claim, and drops.
 pub(crate) fn spawn_grace<A>(
     arc: A,
     finished: impl FnOnce(&A) -> bool,
-    claim: impl FnOnce(&A) -> bool,
-    reset: impl FnOnce(&A) + Send + 'static,
+    gate: impl Fn(&A) -> Option<&GraceGate> + Send + 'static,
 ) where
     A: Send + 'static,
 {
     if finished(&arc) {
         return;
     }
-    if !claim(&arc) {
+    let Some(g) = gate(&arc) else {
+        return;
+    };
+    if !g.bump_and_claim() {
         return;
     }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        // `reset` is `FnOnce`; consuming it here is sound only because this
-        // arm diverges (`return`) — so the spawn path below never also moves
-        // it. A future edit that drops the `return` would fail to compile,
-        // which is the intended tripwire, not a silent hazard.
-        reset(&arc);
+        g.release();
         return;
     };
     handle.spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(GRACE_PERIOD_SECS)).await;
-        reset(&arc);
+        if let Some(g) = gate(&arc) {
+            g.wait_out().await;
+        }
         drop(arc);
     });
 }
+
+#[cfg(test)]
+#[path = "../tests/kube/grace.rs"]
+mod grace_tests;
 
 pub mod mux;
 pub mod daemon;

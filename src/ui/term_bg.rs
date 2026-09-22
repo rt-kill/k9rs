@@ -67,7 +67,10 @@ fn query_osc11() -> Option<Appearance> {
 
     // OSC 11 query, then a DA1 (`ESC [ c`) chaser: every terminal answers
     // DA1, and always after the OSC reply if one is coming, so a DA1 answer
-    // with no color in front of it is a definitive "unsupported".
+    // with no color in front of it is a definitive "unsupported" — AND its
+    // arrival is what tells us the tty is drained of everything we provoked.
+    // A terminal that answers the color but not DA1 costs the full
+    // `REPLY_TIMEOUT` here; leaving its reply behind costs stray keystrokes.
     tty.write_all(b"\x1b]11;?\x1b\\\x1b[c").ok()?;
     tty.flush().ok()?;
 
@@ -84,8 +87,7 @@ fn query_osc11() -> Option<Appearance> {
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
         match classify_reply(&buf) {
-            ReplyState::Color(rgb) => return Some(appearance_of(rgb)),
-            ReplyState::Unsupported => return None,
+            ReplyState::Done(color) => return color.map(appearance_of),
             ReplyState::NeedMore => continue,
         }
     }
@@ -94,25 +96,28 @@ fn query_osc11() -> Option<Appearance> {
 /// What the bytes received so far amount to.
 #[derive(Debug, PartialEq, Eq)]
 enum ReplyState {
-    /// The terminal answered OSC 11 with this background color.
-    Color((u8, u8, u8)),
-    /// The terminal finished answering DA1 without sending a color: it
-    /// doesn't support the query, and waiting longer is pointless.
-    Unsupported,
+    /// The terminal has finished answering BOTH queries. Carries the
+    /// background color if OSC 11 supplied one, `None` if it didn't.
+    Done(Option<(u8, u8, u8)>),
     /// Still mid-reply — read more.
     NeedMore,
 }
 
 /// Decide whether the bytes read so far settle the question. Called after
 /// every read, so it must tolerate a reply split across arbitrary chunks.
+///
+/// The DA1 terminator is the ONLY stopping point, even once a color has
+/// parsed. DA1 is the chaser: it can only arrive after whatever OSC 11 answer
+/// was coming, so its arrival means the terminal has said everything it is
+/// going to say. Returning early on the color — which is what this used to do
+/// — left DA1's own reply sitting unread in `/dev/tty`, and the TUI starts
+/// reading that same tty moments later. `ESC [ ? 6 4 ; 1 ; 2 c` shredded into
+/// keystrokes is a `?` (help) and a trailing `c` (copy) arriving from nowhere
+/// during the first frames. The resume sieve can't help: it runs on
+/// suspend/resume, and this is startup.
 fn classify_reply(buf: &[u8]) -> ReplyState {
-    if let Some(rgb) = parse_osc11(buf) {
-        return ReplyState::Color(rgb);
-    }
-    // DA1 reply: `ESC [ ? … c`. The terminating 'c' is the signal — it can
-    // only arrive after any OSC 11 answer the terminal was going to send.
     if buf.last() == Some(&b'c') && buf.windows(3).any(|w| w == b"\x1b[?") {
-        return ReplyState::Unsupported;
+        return ReplyState::Done(parse_osc11(buf));
     }
     ReplyState::NeedMore
 }
@@ -318,19 +323,29 @@ mod tests {
     }
 
     #[test]
-    fn a_color_reply_settles_the_query() {
-        // xterm answers the color, then DA1. We stop at the color and never
-        // look at the DA1 bytes behind it.
-        let (state, consumed) = drive(b"\x1b]11;rgb:2e2e/3434/4040\x1b\\\x1b[?62;1;6c");
-        assert_eq!(state, ReplyState::Color((46, 52, 64)));
-        assert_eq!(consumed, 24, "should settle on the OSC terminator, not read past it");
+    fn a_color_reply_is_read_through_to_the_chaser() {
+        // xterm answers the color, then DA1.
+        //
+        // This test used to assert the opposite — "we stop at the color and
+        // never look at the DA1 bytes behind it" — which pinned a bug as if it
+        // were a feature. Those unread bytes stay in `/dev/tty`, which is the
+        // tty the TUI begins reading milliseconds later, where
+        // `ESC [ ? 6 2 ; 1 ; 6 c` shreds into a stray `?` and `c`.
+        let reply = b"\x1b]11;rgb:2e2e/3434/4040\x1b\\\x1b[?62;1;6c";
+        let (state, consumed) = drive(reply);
+        assert_eq!(state, ReplyState::Done(Some((46, 52, 64))));
+        assert_eq!(
+            consumed,
+            reply.len(),
+            "every byte we provoked is consumed, not just the ones we wanted",
+        );
     }
 
     #[test]
     fn da1_alone_means_the_terminal_cannot_answer() {
         // A terminal that ignores OSC 11 still answers DA1 — that's what
         // keeps startup from burning the whole timeout.
-        assert_eq!(drive(b"\x1b[?62;1;6c").0, ReplyState::Unsupported);
+        assert_eq!(drive(b"\x1b[?62;1;6c").0, ReplyState::Done(None));
         // ... but only once its reply is complete.
         assert_eq!(drive(b"\x1b[?62;1;6").0, ReplyState::NeedMore);
     }

@@ -6,11 +6,10 @@
 //! schedule-shaped one: re-running after the interval is the *normal* path,
 //! so no failure-flavored lifecycle events are emitted (a failed poll warns
 //! and keeps the last-known rows, exactly as before). Demand-driven
-//! lifetime: subscribers hold the strong refs (`try_begin_grace`/`end_grace`
-//! grace on the last drop), and the source's drop aborts the poll via its
-//! [`OperatorGuard`].
+//! lifetime: subscribers hold the strong refs (its
+//! [`GraceGate`](crate::kube::GraceGate) keeps it warm past the last drop),
+//! and the source's drop aborts the poll via its [`OperatorGuard`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -43,8 +42,17 @@ pub struct ExecSourceConfig {
     #[serde(default)]
     pub args: Vec<String>,
     /// How often (in seconds) the command is re-run.
+    ///
+    /// `NonZeroU64`, so `pollIntervalSecs: 0` is rejected by the config
+    /// deserializer rather than by a guard someone has to remember to write.
+    /// Zero was catastrophic and silent: it makes `RunDelay::Schedule(ZERO)`
+    /// re-run with no delay AND makes the per-poll `timeout(interval, child)`
+    /// fire before the child can emit a byte — so every poll `kill_on_drop`s
+    /// its own subprocess, at CPU speed, forever, publishing no rows. With the
+    /// exec sink deliberately `|_| {}`, a poller in that state is
+    /// indistinguishable from a healthy one returning nothing.
     #[serde(default = "default_poll_interval")]
-    pub poll_interval_secs: u64,
+    pub poll_interval_secs: std::num::NonZeroU64,
     /// Column headers for the resulting table. Must match `json_field_keys`
     /// in length and order.
     pub headers: Vec<String>,
@@ -53,8 +61,8 @@ pub struct ExecSourceConfig {
     pub json_field_keys: Vec<String>,
 }
 
-fn default_poll_interval() -> u64 {
-    30
+fn default_poll_interval() -> std::num::NonZeroU64 {
+    std::num::NonZeroU64::new(30).expect("30 is not zero")
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +92,7 @@ pub struct ExecSource {
     entries: Mutex<Vec<ExecEntry>>,
     tx: watch::Sender<crate::kube::protocol::TableBaseline>,
     _keep_rx: watch::Receiver<crate::kube::protocol::TableBaseline>,
-    grace_in_flight: AtomicBool,
+    grace: crate::kube::GraceGate,
     /// RAII handle to the supervised poll loop, set once right after
     /// construction (`OnceLock` because `Arc::new_cyclic` runs before the
     /// task can exist). Source drop → guard drop → poll aborted — the old
@@ -105,14 +113,14 @@ impl ExecSource {
             rows: Vec::new(),
         };
         let (tx, rx) = watch::channel(empty);
-        let interval = Duration::from_secs(config.poll_interval_secs);
+        let interval = Duration::from_secs(config.poll_interval_secs.get());
         let arc = Arc::new_cyclic(|_weak: &Weak<Self>| Self {
             rid,
             config,
             entries: Mutex::new(Vec::new()),
             tx,
             _keep_rx: rx,
-            grace_in_flight: AtomicBool::new(false),
+            grace: crate::kube::GraceGate::new(crate::kube::watcher_grace()),
             poll_guard: OnceLock::new(),
         });
         let (guard, gate) = supervise(
@@ -265,7 +273,7 @@ impl LocalOperator for ExecPollOp {
             (
                 t.config.command.clone(),
                 t.config.args.clone(),
-                Duration::from_secs(t.config.poll_interval_secs),
+                Duration::from_secs(t.config.poll_interval_secs.get()),
             )
         }) else {
             return OperatorExit::Gone;
@@ -310,30 +318,23 @@ impl LocalResourceSource for ExecSource {
         self.config.headers.clone()
     }
 
-    fn try_begin_grace(&self) -> bool {
-        self.grace_in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    fn end_grace(&self) {
-        self.grace_in_flight.store(false, Ordering::Release);
+    fn grace_gate(&self) -> Option<&crate::kube::GraceGate> {
+        Some(&self.grace)
     }
 
     fn subscribe(&self) -> watch::Receiver<crate::kube::protocol::TableBaseline> {
         self.tx.subscribe()
     }
 
-    fn delete(&self, name: &str) -> Result<(), String> {
-        let mut locked = self.entries.lock().expect("exec entries mutex poisoned");
-        let before = locked.len();
-        locked.retain(|e| e.name != name);
-        if locked.len() == before {
-            return Err(format!("no exec entry named '{name}'"));
-        }
-        drop(locked);
-        self.publish();
-        Ok(())
+    fn delete(&self, _name: &str) -> Result<(), String> {
+        // Read-only, exactly as `apply_yaml` below already says.
+        //
+        // This used to remove the entry and report success — and then
+        // `ingest` replaced the whole entry vector on the next poll and the
+        // row came back. The rows ARE the command's output; there is nothing
+        // here to delete. Reporting a success the next tick undoes is worse
+        // than refusing.
+        Err("exec resources are read-only (rows come from the command's output)".to_string())
     }
 
     fn describe(&self, name: &str) -> Option<Result<String, String>> {

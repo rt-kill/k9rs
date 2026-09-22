@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-use crate::app::{App, ContainerRef};
+use crate::app::App;
 use crate::app::nav::rid;
 use crate::event::AppEvent;
 use crate::kube::client_session::ClientSession;
@@ -49,10 +49,29 @@ pub(crate) fn handle_action(
             }
         }
         Action::Help => {
-            if matches!(app.ui.overlay(), Some(crate::app::Overlay::Help { .. })) {
-                app.ui.close_modal();
+            // `?` pushes an ELEMENT, so help gets grep, scroll, sort, column
+            // movement and copy for free, and Esc is the ordinary nav pop —
+            // no bespoke key path to remember, which is what let every modal
+            // lose its Esc when a routing guard was added upstream of them.
+            if app.nav.top().is_keybindings_view() {
+                app.nav.pop();
             } else {
-                app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() }));
+                let class = crate::event::keymap::ViewClass::of(app.nav.top());
+                let caps = Some(app.current_capabilities());
+                let store = app.core.seed_keybindings(caps, app.config.keys, class);
+                let rid = crate::kube::local::LocalResourceKind::Keybinding.to_resource_id();
+                app.nav.push(crate::app::element::Element::ResourceList(
+                    crate::app::element::ResourceList::client(
+                        crate::app::element::QuerySpec {
+                            rid,
+                            namespace: crate::kube::protocol::Namespace::All,
+                            filter: None,
+                        },
+                        store,
+                        &app.kube.metrics,
+                        "keys".to_string(),
+                    ),
+                ));
             }
         }
 
@@ -93,7 +112,7 @@ pub(crate) fn handle_action(
         // --- Scroll / in-view navigation ---
         a @ (Action::NextItem | Action::PrevItem | Action::PageUp | Action::PageDown
             | Action::Home | Action::End | Action::ScrollUp(_) | Action::ScrollDown(_)
-            | Action::ColLeft | Action::ColRight
+            | Action::ColLeft | Action::ColRight | Action::PageLeft | Action::PageRight
             | Action::ColFirst | Action::ColLast) => {
             handle_scroll(app, a);
         }
@@ -116,6 +135,7 @@ pub(crate) fn handle_action(
         a @ (Action::BatchDelete | Action::BatchRestart | Action::BatchForceKill) => {
             handle_batch_op(app, a);
         }
+        Action::BatchLogs => handle_batch_logs(app, data_source),
 
         // --- Confirmation dialog ---
         Action::Confirm => return handle_confirm_action(app, data_source),
@@ -135,18 +155,19 @@ pub(crate) fn handle_action(
 
         // --- Log view actions ---
         a @ (Action::ToggleLogFollow | Action::ToggleLogWrap | Action::ToggleLogTimestamps
-            | Action::ClearLogs | Action::LogSince(_) | Action::SaveLogs) => {
+            | Action::ClearLogs | Action::LogSince(_)
+            | Action::SaveLogs) => {
             handle_log_action(app, a, data_source);
         }
 
         // --- Drill-down navigation ---
         a @ (Action::ShowNode | Action::UsedBy | Action::JumpToOwner | Action::NodeShell
-            | Action::OverlayCapability(_)) => {
+            | Action::ShowEvents | Action::OverlayCapability(_)) => {
             return handle_drill(app, a, data_source);
         }
 
         // --- Clipboard / file I/O ---
-        a @ (Action::Copy | Action::SaveTable) => {
+        a @ (Action::Copy | Action::BatchCopy | Action::SaveTable) => {
             handle_io(app, a, event_tx, data_source);
         }
 
@@ -248,33 +269,22 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
     use crate::app::Overlay;
 
     // Overlays capture scroll keys first (help sheet, container picker).
-    match (app.ui.overlay_mut(), &action) {
-        (Some(Overlay::Help { viewport }), a) => {
-            match a {
-                Action::NextItem => viewport.line_down(1),
-                Action::PrevItem => viewport.line_up(1),
-                Action::PageUp => viewport.page_up(),
-                Action::PageDown => viewport.page_down(),
-                Action::Home => viewport.home(),
-                Action::End => viewport.end(),
-                _ => {}
-            }
-            return;
-        }
-        (Some(Overlay::ContainerSelect { containers, selected, .. }), a) => {
-            match a {
-                Action::NextItem => {
-                    if !containers.is_empty() && *selected + 1 < containers.len() {
-                        *selected += 1;
-                    }
+    // The one overlay that still takes scroll keys. `if let` rather than a
+    // `match` with a `_ => {}`: after help became a nav element there is only
+    // one arm left, and a wildcard would hide the next one that needs adding.
+    if let Some(Overlay::ContainerSelect { choices, selected, .. }) = app.ui.overlay_mut() {
+        match action {
+            Action::NextItem => {
+                if !choices.is_empty() && *selected + 1 < choices.len() {
+                    *selected += 1;
                 }
-                Action::PrevItem => *selected = selected.saturating_sub(1),
-                _ => {}
             }
-            return;
+            Action::PrevItem => *selected = selected.saturating_sub(1),
+            _ => {}
         }
-        _ => {}
+        return;
     }
+
 
     match app.nav.top_mut() {
         // Log views: scroll over the derived visible-line set.
@@ -290,6 +300,14 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
                 Action::End => view.viewport.end(),
                 Action::ScrollUp(n) => view.viewport.line_up(n),
                 Action::ScrollDown(n) => view.viewport.line_down(n),
+                // The other axis, same rule: intent only. `Pan` holds the
+                // step and the bound, both published by the last render.
+                Action::ColLeft => view.pan.left(),
+                Action::ColRight => view.pan.right(),
+                Action::ColFirst => view.pan.home(),
+                Action::ColLast => view.pan.end(),
+                Action::PageLeft => view.pan.page_left(),
+                Action::PageRight => view.pan.page_right(),
                 _ => {}
             }
         }
@@ -392,11 +410,12 @@ fn handle_resource_op(
                     if containers.len() > 1 {
                         app.ui.close_modal();
                         app.ui.close_modal();
+                        let action = crate::app::ContainerAction::Shell;
                         app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::ContainerSelect {
                             target,
-                            containers: containers.clone(),
+                            choices: crate::app::ContainerChoice::list(action, containers),
                             selected: 0,
-                            action: crate::app::ContainerAction::Shell,
+                            action,
                         }));
                     } else {
                         let container = containers.first().map(|c| c.name.clone()).unwrap_or_default();
@@ -581,6 +600,151 @@ fn batch_confirm_message(verb: &str, targets: &[crate::kube::protocol::ObjectRef
         msg.push_str(&format!(" …and {} more", targets.len() - LISTED));
     }
     msg
+}
+
+/// Select mode's log key: ONE merged log view over every marked pod.
+///
+/// The only `BatchSupport::Aggregate` action, and the reason that stance
+/// exists — `BatchDelete` fans out to N independent commands with N results,
+/// while this collapses to a single `LogInit` the daemon fans out and merges
+/// back. N log views would answer a question nobody asked.
+///
+/// Two things it refuses rather than guesses:
+/// Each marked row resolves through the SAME `row_log_target` a single
+/// `Ctrl-L` uses, so a hovered deployment and a marked one can't disagree
+/// about which pods they mean; the union is what lets a mixed selection —
+/// two deployments, a job and a bare pod — be one stream. Inside a
+/// container projection the selection lands on the other axis instead
+/// (see [`batch_container_log_spec`]).
+///
+/// Two things it still refuses rather than guesses:
+/// - **A selection spanning namespaces.** One stream carries one namespace
+///   (`LogInit.namespace`), which is the same constraint `kubectl logs` has.
+/// - **Rows with no logs at all** — a namespace, a configmap. A row earns a
+///   place in the union by knowing where its pods are, not by being a pod.
+fn handle_batch_logs(app: &mut App, data_source: &mut ClientSession) {
+    match batch_log_spec(app, app.config.ui.logs.tail_lines) {
+        Ok(spec) => push_log_session(app, data_source, spec),
+        Err(why) => app.ui.flash = Some(crate::app::FlashMessage::warn(why)),
+    }
+}
+
+/// The merged log stream a marked selection defines — or, as `Err`, the
+/// reason there isn't one. Separated from the handler so the decision is
+/// testable without a live session; the handler only pushes or flashes.
+pub(crate) fn batch_log_spec(app: &App, tail: u64) -> Result<protocol::LogInit, String> {
+    // A projection's marked rows aren't resources in a store, so the store
+    // path below cannot read them — and the match is exhaustive, so a new
+    // projection kind has to decide what its marked rows mean rather than
+    // silently inheriting the parent store's marks.
+    if let Some(kind) = app.nav.top().derived_kind() {
+        return match kind {
+            crate::app::view::DerivedViewKind::Containers => {
+                batch_container_log_spec(app, tail)
+            }
+        };
+    }
+
+    let Some(store) = app.nav.top().data_store() else {
+        return Err("Nothing here to log".to_string());
+    };
+    let Some(rid) = app.nav.top().rid().cloned() else {
+        return Err("Nothing here to log".to_string());
+    };
+
+    // Marks ∩ present rows, read once — same honesty as `handle_batch_op`:
+    // during the Ctrl-R window marks survive but rows don't, so this is
+    // empty rather than acting on identities the store can't vouch for.
+    let marked: Vec<crate::kube::resources::row::ResourceRow> = store.with_read(|inner| {
+        inner
+            .rows
+            .iter()
+            .filter(|row| inner.marked().contains(&crate::app::store::row_key(row)))
+            .cloned()
+            .collect()
+    });
+
+    if marked.is_empty() {
+        return Err("No marked rows present (still refreshing?)".to_string());
+    }
+    let ns = marked[0].namespace.clone().unwrap_or_default();
+    if marked.iter().any(|r| r.namespace.clone().unwrap_or_default() != ns) {
+        return Err(
+            "Marked rows span namespaces — one log stream covers one namespace".to_string()
+        );
+    }
+
+    // Each row says where ITS logs are, through the same resolution a single
+    // `Ctrl-L` uses — so a marked deployment and a hovered one can't disagree
+    // about which pods that is. The union is what makes a MIXED selection
+    // expressible: two deployments, a job and a bare pod is four targets of
+    // three different shapes.
+    let mut targets = Vec::with_capacity(marked.len());
+    for row in &marked {
+        match row_log_target(row, &rid) {
+            Some(t) => targets.push(t),
+            None => {
+                return Err(format!(
+                    "{} has no logs — it names neither containers nor pods",
+                    row.name,
+                ))
+            }
+        }
+    }
+
+    // `Default` keeps single-container pods on the daemon's API path (no
+    // subprocess each). Anything else in the set — a sidecar, or a workload
+    // whose replicas we haven't seen — forces `--all-containers`, the only
+    // shape that names every container it finds.
+    let container = if marked.iter().all(|r| r.containers.len() == 1) {
+        protocol::LogContainer::Default
+    } else {
+        protocol::LogContainer::All
+    };
+
+    // A one-row selection is just that row, so it says so; `plural()` is
+    // already plural and must not be pluralized again.
+    let label = match targets.as_slice() {
+        [only] => only.display(),
+        many => format!("{} {}", many.len(), rid.plural()),
+    };
+    Ok(protocol::LogInit {
+        target: protocol::LogTarget::Union { label, targets },
+        namespace: protocol::Namespace::from_row(&ns),
+        container,
+        follow: true,
+        tail: Some(tail),
+        since: None,
+        previous: false,
+    })
+}
+
+/// Batch logs inside a container projection: ONE pod (the projection's
+/// origin), the marked containers of it.
+///
+/// The other axis of the same idea — and the reason [`protocol::LogContainer`]
+/// grew a `Set`. `All` would not do: it is `--all-containers`, every
+/// container of the pod, which is precisely what you said no to by marking
+/// three of the eight.
+fn batch_container_log_spec(app: &App, tail: u64) -> Result<protocol::LogInit, String> {
+    let Some(origin) = app.nav.top().origin().cloned() else {
+        return Err("Nothing here to log".to_string());
+    };
+    // `marked_keys` is already intersected with the live projection, and
+    // returns them in VIEW order so the header reads the way the table did.
+    let names: Vec<String> = app.nav.top().marked_keys().into_iter().map(|k| k.name).collect();
+    if names.is_empty() {
+        return Err("No marked containers present".to_string());
+    }
+    Ok(protocol::LogInit {
+        target: protocol::LogTarget::One(origin.name.clone()),
+        namespace: origin.namespace.clone(),
+        container: protocol::LogContainer::Set(names),
+        follow: true,
+        tail: Some(tail),
+        since: None,
+        previous: false,
+    })
 }
 
 /// Dispatch a confirmed batch: re-anchor on the CURRENT marked set, send
@@ -829,33 +993,61 @@ fn handle_log_action(
                 view.wrap = !view.wrap;
             }
         }
+
         Action::ToggleLogTimestamps => {
+            // ONE key cycles how much chrome is shed, in `Role::SHED_ORDER`:
+            // everything, then without the timestamp, then without the
+            // source tag either. A key per role meant two bindings for three
+            // meaningful states, a fourth that nothing could produce, and a
+            // new binding for every role added later.
             if let Some(view) = app.nav.top_mut().log_view_mut() {
-                view.show_timestamps = !view.show_timestamps;
-                let on = view.show_timestamps;
-                app.ui.flash = Some(crate::app::FlashMessage::info(
-                    if on { "Timestamps: on" } else { "Timestamps: off" }
-                ));
+                use crate::kube::protocol::Role;
+                view.shed = (view.shed + 1) % Role::levels();
+                let showing: Vec<&str> = Role::SHED_ORDER
+                    .iter()
+                    .filter(|r: &&Role| r.shown(view.shed))
+                    .map(|r| match r {
+                        Role::Timestamp => "time",
+                        Role::Source => "source",
+                        Role::Body => "body",
+                    })
+                    .collect();
+                let msg = if showing.is_empty() {
+                    "Fields: message only".to_string()
+                } else {
+                    format!("Fields: {} + message", showing.join(" + "))
+                };
+                app.ui.flash = Some(crate::app::FlashMessage::info(msg));
             }
         }
+
         Action::ClearLogs => {
-            // Clears the DATA (the session's line store) — every filter
-            // element over it empties with it, honestly.
-            if let Some(store) = app.nav.top().log_store() {
+            // Clears the SESSION's store, then resets the greps derived from
+            // it. The filters own their lines now, so emptying the parent
+            // does nothing to them on its own — this comment used to claim
+            // "every filter over it empties with it, honestly", which
+            // stopped being true the moment `retained` was introduced and
+            // left `Shift-C` flashing "Logs cleared" over an unchanged view.
+            if let Some(store) = app.nav.top().log_root_store().cloned() {
                 store.clear();
-                app.ui.flash = Some(crate::app::FlashMessage::info("Logs cleared"));
+                app.nav.reset_log_filters_of(&store);
+                app.ui.flash = Some(crate::app::FlashMessage::info("Logs cleared".to_string()));
             }
         }
+
         Action::LogSince(ref since) => {
             // Range keys re-run the OWNING session's spec. Under a filter,
             // the owner is found by store pointer identity — the same
             // named-walk discipline as subscription revival.
-            let Some(store) = app.nav.top().log_store().cloned() else { return };
+            let Some(store) = app.nav.top().log_root_store().cloned() else { return };
             let since_label = since.as_deref().unwrap_or("tail");
             app.ui.flash = Some(crate::app::FlashMessage::info(format!("Log range: {}", since_label)));
             app.nav.with_log_session_of(&store, |session_el| {
                 session_el.restart_range(data_source, since.clone());
             });
+            // The session store was just emptied and refilled from a new
+            // range; a grep over it is still holding the OLD range's matches.
+            app.nav.reset_log_filters_of(&store);
         }
         Action::SaveLogs => {
             let Element::LogSession(ref s) = app.nav.top() else {
@@ -864,11 +1056,11 @@ fn handle_log_action(
                 save_visible_logs(app);
                 return;
             };
-            let target = &s.target;
+            let (what, container, _) = s.header();
             let safe = |x: &str| x.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
             let filename = format!(
                 "logs-{}-{}-{}.log",
-                safe(&target.pod), safe(target.container_label()),
+                safe(&what), safe(&container),
                 chrono::Utc::now().format("%Y%m%d-%H%M%S"),
             );
             let content: String = s.store().with_read(|i| {
@@ -947,28 +1139,79 @@ fn handle_drill(
                 }
             }
         }
+        // The events ABOUT this object — "why is this Pending", which is the
+        // question `:events` exists to answer and could not, because it
+        // showed the whole cluster's events and left you grepping a name by
+        // eye.
+        //
+        // A global Table binding rather than an `OperationKind`: every
+        // namespaced object has events, so declaring the capability in
+        // thirty `operations()` lists would carve an exception where the
+        // framework already has a shape for this (`J`, `U`).
+        Action::ShowEvents => {
+            if let Some(info) = require_selected(app) {
+                let selector = crate::kube::resources::row::K8sFieldSelector::InvolvedObject {
+                    kind: info.resource.kind_str().to_string(),
+                    name: info.name.clone(),
+                    namespace: info.namespace.as_option().unwrap_or_default().to_string(),
+                };
+                let breadcrumb = selector.breadcrumb();
+                // Scoped to ALL namespaces on purpose: a cluster-scoped
+                // object's events land in whatever namespace the reporting
+                // component chose, and the selector above already pins the
+                // subject exactly. Narrowing twice would only lose events.
+                let el = app.list_element_from_top(
+                    data_source,
+                    rid(BuiltInKind::Event),
+                    protocol::Namespace::All,
+                    Some(protocol::SubscriptionFilter::Field(selector.to_wire())),
+                    format!("events({breadcrumb})"),
+                );
+                app.nav.push(el);
+                app.ui.flash = Some(crate::app::FlashMessage::info(
+                    format!("Events for {breadcrumb}"),
+                ));
+            }
+        }
+        // The pods that actually NAME this object.
+        //
+        // This used to grep the pod list for the resource's name, which found
+        // `data-postgres-0` → `postgres-0` by luck of naming convention and
+        // missed a secret mounted by `api-7d9f` entirely — reporting the miss
+        // as an empty table, which reads like an answer. The references are
+        // now extracted from the pod spec at conversion
+        // (`ResourceRow::references`) and the drill is a filter over them.
         Action::UsedBy => {
             if let Some(info) = require_selected(app) {
-                let name = info.name.clone();
-                let kind = info.resource.display_label().to_string();
-                // A pods list (scoped by the selector at construction) plus
-                // a grep refinement over it — two honest elements.
+                // Gated on the CLOSED set a pod spec can actually name (see
+                // `referenceable_kinds`). Accepting every built-in meant `U`
+                // on a Deployment, Node or Service opened a confidently empty
+                // table — a miss dressed as an answer, which is what this
+                // lookup exists to stop doing.
+                let kind = info.resource.built_in_kind().filter(|k| {
+                    crate::kube::resources::pods::referenceable_kinds().contains(k)
+                });
+                let Some(kind) = kind else {
+                    app.ui.flash = Some(crate::app::FlashMessage::warn(format!(
+                        "Nothing references a {} — pods name claims, secrets, configmaps and service accounts",
+                        info.resource.display_label(),
+                    )));
+                    return ActionResult::None;
+                };
+                let label = format!("{}/{}", info.resource.plural(), info.name);
                 let el = app.list_element_from_top(
                     data_source,
                     rid(BuiltInKind::Pod),
-                    app.kube.selected_ns.clone(),
-                    None,
-                    "pods".to_string(),
+                    info.namespace.clone(),
+                    Some(protocol::SubscriptionFilter::References {
+                        kind,
+                        name: info.name.clone(),
+                    }),
+                    format!("uses({label})"),
                 );
                 app.nav.push(el);
-                let predicate = RowPredicate::Grep(crate::app::nav::CompiledGrep::new(
-                    regex::escape(&name),
-                ));
-                if let Ok(el) = Element::derive_filter(app.nav.top(), predicate) {
-                    app.nav.push(el);
-                }
                 app.ui.flash = Some(crate::app::FlashMessage::info(
-                    format!("Pods referencing {}/{}", kind.to_lowercase(), name)
+                    format!("Pods that reference {label}"),
                 ));
             }
         }
@@ -1070,11 +1313,11 @@ fn handle_io(
             use crate::app::element::Element;
             let (text, label) = match app.nav.top_mut() {
                 Element::ContentView(cv) => {
-                    if cv.state.content.is_empty() {
+                    if cv.state.content().is_empty() {
                         (String::new(), String::new())
                     } else {
                         let lines = cv.state.line_count();
-                        (cv.state.content.clone(), format!("Copied {} lines to clipboard", lines))
+                        (cv.state.content().to_string(), format!("Copied {} lines to clipboard", lines))
                     }
                 }
                 el @ (Element::LogSession(_) | Element::LogFilter(_)) => {
@@ -1106,21 +1349,20 @@ fn handle_io(
                     }
                 }
             };
-            if !text.is_empty() {
-                let tx = event_tx.clone();
-                data_source.track_task(async move {
-                    let ok = tokio::task::spawn_blocking(move || {
-                        crate::util::try_copy_to_clipboard(&text)
-                    }).await.unwrap_or(false);
-                    if ok {
-                        let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(label))).await;
-                    } else {
-                        let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::warn(
-                            "No clipboard tool found (install xclip, xsel, wl-copy, or pbcopy)"
-                        ))).await;
-                    }
-                });
-            }
+            send_to_clipboard(data_source, event_tx, text, label);
+        }
+
+        // Select mode's `c`. Distinct from `Copy` because the whole point of
+        // the mode is that single and batch are never the same action: with
+        // rows marked, `Copy` used to fall through and dump the ENTIRE visible
+        // table, so marking three pods and copying gave you all forty-seven.
+        Action::BatchCopy => {
+            let marked = app.nav.top().marked_snapshot();
+            let text = table_dump(app, Some(&marked));
+            let count = text.lines().count().saturating_sub(1); // exclude header
+            let label = format!("Copied {} marked row{} to clipboard",
+                count, if count == 1 { "" } else { "s" });
+            send_to_clipboard(data_source, event_tx, text, label);
         }
         Action::SaveTable => {
             let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
@@ -1274,9 +1516,9 @@ pub(crate) fn handle_enter(
     // Copy what we need OUT of the overlay before touching `app.ui` again —
     // the borrow would otherwise still be live across the flash and the close.
     let pick = match app.ui.overlay() {
-        Some(crate::app::Overlay::ContainerSelect { target, containers, selected, action }) => Some((
+        Some(crate::app::Overlay::ContainerSelect { target, choices, selected, action }) => Some((
             target.clone(),
-            containers.get(*selected).map(|ci| ci.name.clone()),
+            choices.get(*selected).cloned(),
             *selected,
             *action,
         )),
@@ -1284,24 +1526,30 @@ pub(crate) fn handle_enter(
     };
     if let Some((target, picked, selected, action)) = pick {
         let pod_ns_str = target.namespace.display().to_string();
-        // The dialog captured its container list at construction.
-        let container_name = match picked {
-            Some(n) => n,
-            None => {
-                app.ui.flash = Some(crate::app::FlashMessage::error(
-                    format!("Pod {}/{} no longer has a container at index {}", pod_ns_str, target.name, selected)
-                ));
-                app.ui.close_modal();
-                return ActionResult::None;
-            }
+        // The dialog captured its choices at construction.
+        let Some(picked) = picked else {
+            app.ui.flash = Some(crate::app::FlashMessage::error(
+                format!("Pod {}/{} no longer has a container at index {}", pod_ns_str, target.name, selected)
+            ));
+            app.ui.close_modal();
+            return ActionResult::None;
         };
         app.ui.close_modal();
 
         if matches!(action, crate::app::ContainerAction::Shell) {
+            let protocol::LogContainer::Named(container) = picked.container else {
+                // A shell picker contains only `Named` rows — `ContainerChoice::list`
+                // offers "all containers" for the log actions alone, because there
+                // is no exec into every container at once.
+                app.ui.flash = Some(crate::app::FlashMessage::error(
+                    "Pick one container to shell into".to_string(),
+                ));
+                return ActionResult::None;
+            };
             return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget::Pod {
                 pod: target.name,
                 namespace: pod_ns_str,
-                container: container_name,
+                container,
             } };
         }
 
@@ -1309,15 +1557,10 @@ pub(crate) fn handle_enter(
         push_log_session(
             app,
             data_source,
-            ContainerRef::new(
-                target.name.clone(),
-                pod_ns_str,
-                log_container_from_str(&container_name),
-            ),
             crate::kube::protocol::LogInit {
-                pod: target.name.clone(),
+                target: crate::kube::protocol::LogTarget::One(target.name.clone()),
                 namespace: target.namespace.clone(),
-                container: log_container_from_str(&container_name),
+                container: picked.container,
                 follow: !previous,
                 tail: Some(app.config.ui.logs.tail_lines),
                 since: None,
@@ -1495,11 +1738,10 @@ pub(crate) fn handle_previous_logs(
 fn push_log_session(
     app: &mut App,
     data_source: &mut ClientSession,
-    target: ContainerRef,
     spec: protocol::LogInit,
 ) {
     let el = crate::app::element::Element::LogSession(Box::new(
-        crate::app::element::LogSession::open(data_source, target, spec, &app.config.ui.logs),
+        crate::app::element::LogSession::open(data_source, spec, &app.config.ui.logs),
     ));
     app.nav.push(el);
 }
@@ -1520,50 +1762,105 @@ fn open_logs(
     let Some(info) = require_selected(app) else { return; };
     let name = info.name.clone();
     let namespace_typed = info.namespace.clone();
-    let namespace_display = namespace_typed.display().to_string();
 
     let containers = app.nav.top().selected_row()
         .map(|row| row.containers.clone())
         .unwrap_or_default();
 
     if containers.len() > 1 {
+        let action = if previous {
+            crate::app::ContainerAction::PreviousLogs
+        } else {
+            crate::app::ContainerAction::Logs
+        };
         app.ui.close_modal();
         app.ui.close_modal();
         app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::ContainerSelect {
             target: info.clone(),
-            containers: containers.clone(),
+            choices: crate::app::ContainerChoice::list(action, &containers),
             selected: 0,
-            action: if previous {
-                crate::app::ContainerAction::PreviousLogs
-            } else {
-                crate::app::ContainerAction::Logs
-            },
+            action,
         }));
         return;
     }
 
-    let (log_target, route_pod, route_container) = if !containers.is_empty() {
+    let (target, container) = if !containers.is_empty() {
+        // The row IS a pod (it lists containers), with exactly one of them
+        // after the multi-container branch above.
         let container = containers.first().map(|ci| ci.name.clone()).unwrap_or_default();
-        (name.clone(), name.clone(), log_container_from_str(&container))
+        (protocol::LogTarget::One(name.clone()), log_container_from_str(&container))
     } else {
-        let target = info.kubectl_target();
-        (target.clone(), target, protocol::LogContainer::All)
+        // Not a pod — a workload. Its logs are every pod it owns, found via
+        // the SAME drill target Enter uses, so "logs of this deployment" and
+        // "pods of this deployment" can never disagree about which pods those
+        // are. `--all-containers` because a replica set's pods routinely carry
+        // sidecars and there is no one container to pick across N of them.
+        (workload_log_target(app, &info), protocol::LogContainer::All)
     };
 
     push_log_session(
         app,
         data_source,
-        ContainerRef::new(route_pod, namespace_display, route_container.clone()),
         protocol::LogInit {
-            pod: log_target,
+            target,
             namespace: namespace_typed,
-            container: route_container,
+            container,
             follow: !previous,
             tail: Some(app.config.ui.logs.tail_lines),
             since: None,
             previous,
         },
     );
+}
+
+/// The log target for a non-pod row, read off its drill target.
+///
+/// The fallback — the row's `kubectl`-style ref as a single target — is the
+/// pre-fan-out behaviour, kept for the shapes nothing can resolve (a cronjob
+/// owns jobs, not pods; a name-grep isn't a selector): `kubectl logs` accepts
+/// `cronjobs/foo` and picks a pod, or fails with its own message, exactly as
+/// it did before.
+pub(crate) fn workload_log_target(app: &App, info: &ObjectRef) -> protocol::LogTarget {
+    let rid = info.resource.clone();
+    app.nav
+        .top()
+        .selected_row()
+        .and_then(|row| row_log_target(&row, &rid))
+        .unwrap_or_else(|| protocol::LogTarget::One(info.kubectl_target()))
+}
+
+/// What ONE row's logs are: itself if it is a pod, otherwise the pods its
+/// drill target names.
+///
+/// The single resolution behind both `Ctrl-L` on a row and `Ctrl-L` over a
+/// marked set, so the hovered deployment and the marked one can't disagree
+/// about which pods they mean. `None` = this row has no logs at all
+/// (a namespace, a configmap): it names neither containers nor pods.
+pub(crate) fn row_log_target(
+    row: &crate::kube::resources::row::ResourceRow,
+    rid: &crate::kube::protocol::ResourceId,
+) -> Option<protocol::LogTarget> {
+    use crate::kube::resources::row::DrillTarget;
+    let label = format!("{}/{}", rid.plural(), row.name);
+    // Listing containers is what makes a row a pod.
+    if !row.containers.is_empty() {
+        return Some(protocol::LogTarget::One(row.name.clone()));
+    }
+    match row.drill_target.clone() {
+        Some(DrillTarget::PodsByLabels { labels, .. }) => {
+            Some(protocol::LogTarget::Selector { labels, label })
+        }
+        Some(DrillTarget::PodsByOwner { uid, .. }) => {
+            Some(protocol::LogTarget::Owner { uid, label })
+        }
+        // Nothing here resolves to a pod set, but the resource still
+        // declares logs (a cronjob does) — hand the ref to kubectl, which is
+        // exactly what happened before any of this existed.
+        _ if rid.capabilities().supports(protocol::OperationKind::StreamLogs) => {
+            Some(protocol::LogTarget::One(label))
+        }
+        _ => None,
+    }
 }
 
 /// Open logs from a derived view (e.g., container table). The selected
@@ -1579,15 +1876,13 @@ fn open_logs_from_derived(
     let container_name = item.name.clone();
     let pod_name = origin.name.clone();
     let namespace = origin.namespace.clone();
-    let ns_display = namespace.display().to_string();
     let container = protocol::LogContainer::Named(container_name.clone());
 
     push_log_session(
         app,
         data_source,
-        ContainerRef::new(pod_name.clone(), ns_display, container.clone()),
         protocol::LogInit {
-            pod: pod_name,
+            target: protocol::LogTarget::One(pod_name),
             namespace,
             container,
             follow: !previous,
@@ -1603,14 +1898,69 @@ fn open_logs_from_derived(
 /// element's OWN NAMESPACE decision — not the ambient selector), same
 /// filter and sort, same effective (metrics-overlaid) cell strings the
 /// user is looking at. What you copy is exactly what you see.
+/// Put `text` on the clipboard in the background, flashing `label` on success
+/// and a single install hint on failure. Shared by `Copy` and `BatchCopy` so
+/// the two can't drift on the failure message.
+fn send_to_clipboard(
+    data_source: &mut ClientSession,
+    event_tx: &mpsc::Sender<AppEvent>,
+    text: String,
+    label: String,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let tx = event_tx.clone();
+    data_source.track_task(async move {
+        let ok = tokio::task::spawn_blocking(move || {
+            crate::util::try_copy_to_clipboard(&text)
+        })
+        .await
+        .unwrap_or(false);
+        if ok {
+            let _ = tx.send(AppEvent::Flash(crate::app::FlashMessage::info(label))).await;
+        } else {
+            let _ = tx
+                .send(AppEvent::Flash(crate::app::FlashMessage::warn(
+                    "No clipboard tool found (install xclip, xsel, wl-copy, or pbcopy)",
+                )))
+                .await;
+        }
+    });
+}
+
 pub(crate) fn build_table_dump(app: &App) -> String {
+    table_dump(app, None)
+}
+
+/// The table as text, optionally restricted to a set of row identities.
+///
+/// `only` is `Some` for select mode's copy: `PreparedView.keys` runs parallel
+/// to `rows`, so the marked set filters by identity rather than by screen
+/// position — a delta reordering the table between the mark and the copy
+/// cannot hand back a different row. The header line is kept either way; a
+/// bare column of values is not something you can paste anywhere useful.
+fn table_dump(app: &App, only: Option<&std::collections::HashSet<crate::kube::protocol::ObjectKey>>) -> String {
     let Some(view) = app.nav.top().last_view() else { return String::new() };
     if view.rows.is_empty() && view.total_rows == 0 {
         return String::new();
     }
     let mut lines = vec![view.headers.join("\t")];
-    for row in &view.rows {
+    for (i, row) in view.rows.iter().enumerate() {
+        if let Some(keys) = only {
+            // A row with no identity at this index can't be matched against
+            // the marks, so it is not one of them.
+            match view.keys.get(i) {
+                Some(key) if keys.contains(key) => {}
+                _ => continue,
+            }
+        }
         lines.push(row.join("\t"));
+    }
+    // Header only = nothing matched; report that as empty rather than
+    // putting a lone header row on the clipboard.
+    if lines.len() == 1 {
+        return String::new();
     }
     lines.join("\n")
 }
@@ -1723,6 +2073,20 @@ pub(crate) fn build_form_from_schema(
 /// keypress that names a single target routes here — a miss must say so,
 /// not silently swallow the key.
 pub(crate) fn require_selected(app: &mut App) -> Option<ObjectRef> {
+    // A view whose resource declares NO operations is documentation, not a
+    // list of things to act on — help and the contexts table both. Most
+    // single-target keys are gated on a specific capability, but `e` (Edit)
+    // and `E` (Events) are STRUCTURAL and were gated on nothing: pressing `e`
+    // on a help row sent the daemon a yaml request for `Local(Keybinding)`,
+    // got back the string "Unknown local resource type", wrote it to a temp
+    // file and opened `$EDITOR` on it. Gating here rather than at each key is
+    // what makes that true of the next structural key too.
+    if app.nav.top().capabilities().operations.is_empty() {
+        app.ui.flash = Some(crate::app::FlashMessage::info(
+            "Nothing to act on here — this view is a reference, not a resource".to_string(),
+        ));
+        return None;
+    }
     let info = get_selected_resource_info(app);
     if info.is_none() {
         app.ui.flash =
@@ -1984,3 +2348,7 @@ pub(crate) fn do_switch_namespace(
         ns.display()
     )));
 }
+
+#[cfg(test)]
+#[path = "../tests/kube/session_actions.rs"]
+mod dump_tests;

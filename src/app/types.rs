@@ -4,7 +4,7 @@ use crate::app::kubectl_cache::KubectlCache;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::kube::protocol::{LogContainer, ObjectRef};
+use crate::kube::protocol::ObjectRef;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -240,10 +240,50 @@ impl UiState {
         }
     }
 
-    /// Whether ANY modal is capturing input — the old
+    /// Whether ANY modal is up — the old
     /// `input_mode.is_active() || dialog.is_some() || …` chain.
+    ///
+    /// A question about DISPLAY, not about key routing. It was briefly wired
+    /// as the fall-through guard in `try_handle_input_mode` and that was
+    /// wrong in the most direct way possible: it is true for modals that
+    /// already HAVE handlers, so it swallowed their keys before they could
+    /// run and left every overlay — help, the container picker, a delete
+    /// confirmation, a hanging shell connect — with no working Esc. Use
+    /// [`Self::modal_without_key_handler`] for routing.
     pub fn is_modal(&self) -> bool {
         !matches!(self.modal, Modal::None)
+    }
+
+    /// Whether a modal is up whose keys NOTHING downstream will handle.
+    ///
+    /// This is the backstop the routing pass needs: a modal nobody handles
+    /// must swallow input (visibly stuck) rather than leak it to the view
+    /// underneath (invisibly wrong — keys keep driving the table, and Esc
+    /// pops the nav stack out from under whatever is on screen).
+    ///
+    /// EXHAUSTIVE over `Modal` on purpose, and every arm is `false` today.
+    /// That is the point: the value is not the answer, it is that adding a
+    /// modal kind will not compile until someone states who handles its
+    /// keys. A blanket `is_modal()` here answered a question nobody asked
+    /// and broke every modal that was already correct.
+    pub fn modal_without_key_handler(&self) -> bool {
+        match &self.modal {
+            Modal::None => false,
+            // `Command` genuinely consumes every key it is handed.
+            Modal::Command { .. } => false,
+            // `Form` does NOT: `handle_form_dialog_key` ends in
+            // `_ => return false`, so PageUp/PageDown/Home/End fell through
+            // to the table underneath and moved its cursor under an open
+            // dialog. The comment that used to sit here said the sinks
+            // "consume unconditionally", and justified the leak by wanting
+            // Ctrl-C to reach the global handler — which it never could,
+            // since `TextKey::new` rejects chords two frames earlier.
+            Modal::Form(_) => true,
+            // Owned by `handler::handle_key_event`, whose `Overlay` match is
+            // wildcard-free — a new overlay variant is a compile error
+            // there, which is the guard that actually holds.
+            Modal::Confirm(_) | Modal::Overlay(_) => false,
+        }
     }
 }
 
@@ -585,32 +625,30 @@ impl KeysConfig {
     }
 
     /// Every configured binding as `(config name, chord)`.
+    ///
+    /// The operation half is DERIVED from `op_override` + `config_key`, both
+    /// of which are compiler-exhaustive. It used to be a third hand-written
+    /// array parallel to the struct fields and to `op_override`, so a binding
+    /// added to those two and missed here slipped past both `validate`
+    /// checks — in the function whose doc says the whole point is "a startup
+    /// error, not a mystery".
     fn entries(&self) -> Vec<(&'static str, KeyCombo)> {
-        [
+        let mut out: Vec<(&'static str, KeyCombo)> = [
             ("colLeft", self.col_left),
             ("colRight", self.col_right),
             ("colFirst", self.col_first),
             ("colLast", self.col_last),
             ("namespaceAll", self.namespace_all),
-            ("describe", self.describe),
-            ("yaml", self.yaml),
-            ("logs", self.logs),
-            ("previousLogs", self.previous_logs),
-            ("shell", self.shell),
-            ("restart", self.restart),
-            ("scale", self.scale),
-            ("delete", self.delete),
-            ("forceKill", self.force_kill),
-            ("portForward", self.port_forward),
-            ("showNode", self.show_node),
-            ("nodeShell", self.node_shell),
-            ("decodeSecret", self.decode_secret),
-            ("triggerCronJob", self.trigger_cron_job),
-            ("toggleSuspendCronJob", self.toggle_suspend_cron_job),
         ]
         .into_iter()
         .filter_map(|(name, combo)| combo.map(|c| (name, c)))
-        .collect()
+        .collect();
+        for op in crate::kube::protocol::OperationKind::BUILT_IN {
+            if let (Some(name), Some(combo)) = (op.config_key(), self.op_override(op)) {
+                out.push((name, combo));
+            }
+        }
+        out
     }
 
     /// Reject bindings that could never fire: chords consumed by earlier
@@ -720,8 +758,56 @@ pub struct LogConfig {
     pub max_lines: usize,
     pub tail_lines: u64,
     pub default_follow: bool,
-    pub default_timestamps: bool,
     pub default_wrap: bool,
+    /// Which per-line fields the view starts on. ONE key (`t`) cycles this at
+    /// runtime, so the config names a point on that cycle rather than a flag
+    /// per field — two flags were four combinations for three reachable
+    /// states, and a config could ask for the unreachable one.
+    pub default_fields: LogFields,
+}
+
+/// A point on the field cycle — see `ui::widgets::Role::SHED_ORDER`, which
+/// defines the order fields are shed in.
+///
+/// One variant per level, and `log_fields_covers_every_shed_level` pins that,
+/// so adding a role to `SHED_ORDER` fails the build here until someone names
+/// the state it creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LogFields {
+    /// Timestamp, source tag and message.
+    All,
+    /// Source tag and message. The kubelet's stamp is 31 columns duplicating
+    /// one the service almost always prints itself.
+    Source,
+    /// Message only. The source tag exists solely on multi-source streams,
+    /// where it is the one thing saying which replica spoke — so this is a
+    /// deliberate choice, not a default.
+    Message,
+}
+
+impl LogFields {
+    /// How many roles this level hides.
+    pub fn shed(self) -> usize {
+        match self {
+            LogFields::All => 0,
+            LogFields::Source => 1,
+            LogFields::Message => 2,
+        }
+    }
+}
+
+impl LogConfig {
+    /// The shed level the configured defaults describe.
+    ///
+    /// The config keeps a flag per role because that is what a user writes;
+    /// the VIEW keeps a level because that is what one key cycles. A config
+    /// asking for the one combination the cycle cannot express — a timestamp
+    /// without a source tag — resolves to showing both, since the cycle's
+    /// next press takes the timestamp away anyway.
+    pub fn initial_shed(&self) -> usize {
+        self.default_fields.shed()
+    }
 }
 
 impl Default for LogConfig {
@@ -730,8 +816,17 @@ impl Default for LogConfig {
             max_lines: 50_000,
             tail_lines: 100,
             default_follow: true,
-            default_timestamps: true,
             default_wrap: false,
+            // Source tag and message: one shed level in.
+            //
+            // The daemon still asks the kubelet for timestamps and the typed
+            // field is still on the wire — `t` cycles a DISPLAY choice over
+            // data we always have, and the fan-out needs the stamps to merge
+            // replicas in time order. But that stamp is 31 columns of a ~97
+            // column line spent duplicating the 27 the service prints next
+            // to it, whereas the source tag only exists when more than one
+            // pod is talking and is then the only thing saying which.
+            default_fields: LogFields::Source,
         }
     }
 }
@@ -998,11 +1093,53 @@ pub enum SearchInputResult {
 /// Process a keystroke against a search input buffer.
 /// Returns what happened so the caller can apply view-specific logic.
 /// Callers gate on their own "search active" state before dispatching.
-pub fn handle_search_key(
-    input: &mut String,
-    key: crossterm::event::KeyCode,
-) -> SearchInputResult {
-    match key {
+/// A keystroke that is TEXT.
+///
+/// Every text sink — the `:` command bar, form fields, the resource filter,
+/// the log grep draft, the yaml/describe search — matched on `key.code` alone,
+/// so a Ctrl chord typed its bare character instead of falling through to the
+/// global handler. Three of the five were fixed one at a time across two
+/// separate bug reports; `handle_search_key` could not be fixed at its call
+/// site at all, because it took a `KeyCode` and the modifier was already gone.
+///
+/// So the guard became a TYPE. A sink takes a `TextKey`, which can only be
+/// built by [`TextKey::new`], which refuses Ctrl chords — "forgot the guard"
+/// is no longer something you can write.
+///
+/// Concretely this is not hypothetical: `BEL` terminates an OSC reply and
+/// crossterm delivers `0x07` as Ctrl-G, so a terminal colour response leaking
+/// into a resume window typed a stray `g` into whichever text box was open.
+#[derive(Debug, Clone, Copy)]
+pub struct TextKey(crossterm::event::KeyEvent);
+
+impl TextKey {
+    /// `None` for a Ctrl chord — that is a command, not text, and belongs to
+    /// the global handler. Alt chords are likewise not text (an Alt-modified
+    /// key is a different chord, not its bare character — the same rule
+    /// `combo_of` follows).
+    pub fn new(key: crossterm::event::KeyEvent) -> Option<Self> {
+        use crossterm::event::KeyModifiers;
+        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            return None;
+        }
+        Some(Self(key))
+    }
+
+    pub fn code(&self) -> crossterm::event::KeyCode {
+        self.0.code
+    }
+
+    /// The character this key types, if it types one.
+    pub fn char(&self) -> Option<char> {
+        match self.0.code {
+            crossterm::event::KeyCode::Char(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+pub fn handle_search_key(input: &mut String, key: TextKey) -> SearchInputResult {
+    match key.code() {
         crossterm::event::KeyCode::Esc => {
             input.clear();
             SearchInputResult::Cancelled
@@ -1034,42 +1171,12 @@ pub fn handle_search_key(
 /// CrdRef directly instead of re-cloning fields.
 pub type CrdInfo = crate::kube::protocol::CrdRef;
 
-// ---------------------------------------------------------------------------
-// ContainerRef
-// ---------------------------------------------------------------------------
-
-/// Reference to a specific container within a pod. The `container` field
-/// is the typed [`LogContainer`] selector — never a magic string. The
-/// log-view widget reads it directly to decide whether to show a
-/// per-container prefix; the relaunch-with-since path passes it back to
-/// `stream_log_substream` without any string round-trip.
-///
-/// `namespace: String` is deliberate — it's a *location* (which namespace
-/// the pod actually lives in), not a *selection* (the all-vs-named
-/// semantic encoded by `Namespace`). Same distinction as
-/// [`crate::kube::protocol::ObjectKey`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContainerRef {
-    pub pod: String,
-    pub namespace: String,
-    pub container: LogContainer,
-}
-
-impl ContainerRef {
-    pub fn new(pod: impl Into<String>, namespace: impl Into<String>, container: LogContainer) -> Self {
-        Self { pod: pod.into(), namespace: namespace.into(), container }
-    }
-
-    /// Short user-facing label for the route header / breadcrumbs. Wraps
-    /// the typed enum so the UI never sees a magic sentinel.
-    pub fn container_label(&self) -> &str {
-        match &self.container {
-            LogContainer::All => "all",
-            LogContainer::Named(n) => n.as_str(),
-            LogContainer::Default => "(default)",
-        }
-    }
-}
+// (`ContainerRef` lived here: pod + namespace + `LogContainer`, carried
+// beside a `LogSession`'s `LogInit` as its display identity. It was a
+// second copy of what the spec already said, and a fan-out target —
+// "3 pods", "deploy/api" — is precisely where the copy would have had to
+// lie. The element now derives its header from the spec, and the
+// container label lives on `LogContainer::label` next to the variants.)
 
 // ---------------------------------------------------------------------------
 // Overlay — the single modal slot
@@ -1081,14 +1188,19 @@ impl ContainerRef {
 /// closes it (dropping its RAII: [`crate::kube::client_session::ExecStream`],
 /// [`TempFile`]) and the view underneath was never displaced.
 pub enum Overlay {
-    /// The `?` help sheet.
-    Help { viewport: crate::app::viewport::Viewport },
+    // The `?` help sheet used to live here. It is a nav ELEMENT now
+    // (`LocalResourceKind::Keybinding`), which is what gives it grep,
+    // scroll, sort and copy for free and makes Esc the ordinary pop —
+    // see `Element::extent` for how it still floats.
     /// "Which container?" picker for multi-container pods. Captures its
     /// container list at construction — self-contained (no table lookups
     /// under a dialog that may outlive the row).
     ContainerSelect {
         target: crate::kube::protocol::ObjectRef,
-        containers: Vec<crate::kube::resources::row::ContainerInfo>,
+        /// The rows to pick from, already resolved for `action` — see
+        /// [`ContainerChoice::list`]. `selected` indexes THIS, so there is
+        /// one index space and no "row 0 means something else" offset.
+        choices: Vec<ContainerChoice>,
         selected: usize,
         action: ContainerAction,
     },
@@ -1138,7 +1250,6 @@ impl Overlay {
         match self {
             // All three clear their own rect (Clear + dialog chrome) and
             // sit over a view that is still live and worth seeing.
-            Overlay::Help { .. } => OverlayExtent::Dialog,
             Overlay::ContainerSelect { .. } => OverlayExtent::Dialog,
             Overlay::Edit { .. } => OverlayExtent::Dialog,
             // The connect screen is a full-screen titled frame: the view
@@ -1153,7 +1264,6 @@ impl Overlay {
 impl std::fmt::Debug for Overlay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Overlay::Help { viewport } => f.debug_struct("Help").field("offset", &viewport.offset()).finish(),
             Overlay::ContainerSelect { target, .. } => {
                 f.debug_struct("ContainerSelect").field("target", target).finish_non_exhaustive()
             }
@@ -1212,6 +1322,44 @@ pub enum ContainerAction {
     PreviousLogs,
     /// Open a `kubectl exec -it` shell into the chosen container.
     Shell,
+}
+
+/// One row of the container picker: what it shows, and what picking it
+/// means. Keeping the two together is what lets "all containers" be an
+/// ordinary row instead of a magic index the renderer and the handler both
+/// have to remember to offset around.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerChoice {
+    /// The rendered label (`"all containers"`, `"web"`, `"init:setup"`).
+    pub label: String,
+    /// The log selector this row means. `All` appears only in a LOG
+    /// picker — there is no shell into every container at once, and
+    /// [`ContainerChoice::list`] is the single place that upholds it.
+    pub container: crate::kube::protocol::LogContainer,
+}
+
+impl ContainerChoice {
+    /// The picker's rows for `action`.
+    ///
+    /// A multi-container pod's logs used to be unreachable as a WHOLE:
+    /// `LogContainer::All` existed on the wire but no UI path produced it
+    /// for a pod, so "show me this pod's logs" always meant one container.
+    /// The log pickers therefore lead with it.
+    pub fn list(
+        action: ContainerAction,
+        containers: &[crate::kube::resources::row::ContainerInfo],
+    ) -> Vec<Self> {
+        use crate::kube::protocol::LogContainer;
+        let mut out = Vec::with_capacity(containers.len() + 1);
+        if !matches!(action, ContainerAction::Shell) {
+            out.push(Self { label: "all containers".to_string(), container: LogContainer::All });
+        }
+        out.extend(containers.iter().map(|ci| Self {
+            label: ci.display_name(),
+            container: LogContainer::Named(ci.name.clone()),
+        }));
+        out
+    }
 }
 
 /// Where we are in the unified edit flow. See `Route::EditingResource`.

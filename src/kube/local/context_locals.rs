@@ -7,9 +7,9 @@
 //! - Every session attached to the context holds a [`ContextKeepalive`]
 //!   (a strong `Arc`); the registry holds only a `Weak`.
 //! - When the **last** keepalive drops, a grace task keeps the whole slice
-//!   alive for [`GRACE_PERIOD_SECS`](crate::kube::GRACE_PERIOD_SECS) —
-//!   a session reconnecting within the window upgrades the `Weak` and
-//!   recovers everything (running port-forwards included).
+//!   alive for [`locals_grace`](crate::kube::locals_grace) — a session
+//!   reconnecting within the window upgrades the `Weak` and recovers
+//!   everything (running port-forwards included).
 //! - When the grace expires, the `Arc` drops and teardown cascades:
 //!   port-forward entries drop their
 //!   [`OperatorGuard`](super::supervise::OperatorGuard)s, aborting each
@@ -28,19 +28,21 @@
 //!   strongly here would mean running user-configured commands forever
 //!   for a context nobody is looking at.
 //!
-//! # Grace is deadline-based, not first-drop-based
+//! # A longer window than a watcher's, for a different reason
 //!
-//! The shared [`spawn_grace`](crate::kube::spawn_grace) coalesces on a
-//! claim flag, which measures the window from the FIRST dropper — with two
-//! sessions, the second to leave could get ~0s of grace. Contexts carry
-//! live subprocesses, so this slice uses a movable deadline instead: every
-//! keepalive drop bumps `deadline = now + grace`, and the single coalesced
-//! task sleeps until the deadline stops moving. The window is always
-//! measured from the *last* session out.
+//! This slice does NOT share the watcher grace window. A warm watcher costs
+//! a row store plus an apiserver watch and buys back a re-LIST; a port-forward
+//! costs one `kubectl` child, was created by an explicit user action, and
+//! buying it back means the user noticing it died. See
+//! [`DEFAULT_LOCALS_GRACE_SECS`](crate::kube::DEFAULT_LOCALS_GRACE_SECS).
+//!
+//! The deadline-based grace this module used to implement by hand — so the
+//! second session out doesn't inherit the first one's nearly-expired timer —
+//! now lives in [`GraceGate`](crate::kube::GraceGate) and is shared by every
+//! kept-alive object in the daemon.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dashmap::DashMap;
 
@@ -62,16 +64,14 @@ pub struct ContextLocals {
     /// Same shape the registry itself used before this type existed.
     exec_resources: DashMap<String, Weak<ExecSource>>,
     exec_configs: Arc<Vec<ExecSourceConfig>>,
-    /// Grace bookkeeping. `created` anchors the deadline arithmetic so a
-    /// monotonic `Instant` fits in an `AtomicU64` of elapsed millis.
-    created: Instant,
-    grace_deadline_ms: AtomicU64,
-    grace_claimed: AtomicBool,
-    /// `None` = drop immediately on last detach (`--no-daemon`: the
-    /// registry lives inside a single connection, so a post-session grace
-    /// window could never be recovered — it would only keep kubectl
-    /// children alive pointlessly).
-    grace: Option<Duration>,
+    /// Keep-alive window after the last session detaches. `None` = drop
+    /// immediately (`--no-daemon`: the registry lives inside a single
+    /// connection, so a post-session grace window could never be recovered
+    /// — it would only keep kubectl children alive pointlessly).
+    ///
+    /// The deadline-based behaviour this slice used to spell out by hand now
+    /// lives in [`GraceGate`] and is shared by every kept-alive object.
+    grace: Option<crate::kube::GraceGate>,
 }
 
 impl ContextLocals {
@@ -80,16 +80,13 @@ impl ContextLocals {
         exec_configs: Arc<Vec<ExecSourceConfig>>,
         grace: Option<Duration>,
     ) -> Arc<Self> {
-        let port_forwards = PortForwardSource::for_context(context.name.clone());
+        let port_forwards = PortForwardSource::for_context();
         Arc::new(Self {
             context,
             port_forwards,
             exec_resources: DashMap::new(),
             exec_configs,
-            created: Instant::now(),
-            grace_deadline_ms: AtomicU64::new(0),
-            grace_claimed: AtomicBool::new(false),
-            grace,
+            grace: grace.map(crate::kube::GraceGate::new),
         })
     }
 
@@ -123,7 +120,10 @@ impl ContextLocals {
             // reach for it precisely when you have no usable context. A
             // subscribe request for one is a client bug, and `None` here
             // makes the daemon say so instead of inventing an answer.
-            LocalResourceKind::Context => None,
+            // Same rule, same reason: keybindings are a fact about the
+            // CLIENT's keymap and its config file. The daemon has never seen
+            // either.
+            LocalResourceKind::Context | LocalResourceKind::Keybinding => None,
             LocalResourceKind::Custom(ref name) => {
                 self.exec_source_for(name).map(|arc| arc as SharedLocalSource)
             }
@@ -161,9 +161,6 @@ impl ContextLocals {
         }
     }
 
-    fn now_ms(&self) -> u64 {
-        self.created.elapsed().as_millis() as u64
-    }
 }
 
 /// A session's strong hold on a context's local resources. Clone freely —
@@ -186,67 +183,16 @@ impl std::ops::Deref for ContextKeepalive {
 
 impl Drop for ContextKeepalive {
     fn drop(&mut self) {
-        let locals = &self.0;
-        let Some(grace) = locals.grace else {
-            // --no-daemon: die with the attachment, exactly like today.
-            return;
-        };
-        // Move the deadline out to now + grace. fetch_max (not store) so a
-        // racing earlier drop can't pull an already-later deadline back in.
-        let deadline = locals.now_ms().saturating_add(grace.as_millis() as u64);
-        locals.grace_deadline_ms.fetch_max(deadline, Ordering::AcqRel);
-
-        // Coalesce: at most one grace task per slice. Losers just drop
-        // their Arc — the winner's task already watches the (bumped)
-        // deadline.
-        if locals
-            .grace_claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            // Process shutdown — no runtime to grace on; release the claim
-            // and die now (mirrors `spawn_grace`'s fallback arm).
-            locals.grace_claimed.store(false, Ordering::Release);
-            return;
-        };
-        let arc = Arc::clone(&self.0);
-        handle.spawn(async move {
-            loop {
-                // Sleep until the deadline stops moving.
-                loop {
-                    let now = arc.now_ms();
-                    let dl = arc.grace_deadline_ms.load(Ordering::Acquire);
-                    if now >= dl {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(dl - now)).await;
-                }
-                arc.grace_claimed.store(false, Ordering::Release);
-                // Release-recheck: a keepalive may have bumped the deadline
-                // between our last load and the reset above — its claim
-                // lost against our still-set flag, so the bump is ours to
-                // serve. Re-claim and keep waiting; if someone else claimed
-                // in the gap, the bump is theirs.
-                let now = arc.now_ms();
-                if now >= arc.grace_deadline_ms.load(Ordering::Acquire) {
-                    break;
-                }
-                if arc
-                    .grace_claimed
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            // Task's Arc drops here — if it was the last strong ref, the
-            // whole slice tears down (port-forward guards abort, children
-            // reaped).
-            drop(arc);
-        });
+        // The whole deadline dance now lives in `GraceGate`, shared with
+        // watchers, pollers and local sources. `None` (`--no-daemon`) means
+        // die with the attachment. When the task's Arc finally drops, if it
+        // was the last strong ref the slice tears down: port-forward guards
+        // abort, kubectl children are reaped.
+        crate::kube::spawn_grace(
+            Arc::clone(&self.0),
+            |_locals| false,
+            |locals| locals.grace.as_ref(),
+        );
     }
 }
 

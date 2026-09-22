@@ -41,6 +41,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 unicode-width = "0.2"
+# Same segmentation ratatui uses to decide what occupies a cell — see
+# `ui::widgets::log_view::cluster_width`.
+unicode-segmentation = "1"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 libc = "0.2"
 dashmap = "6"
@@ -50,6 +53,15 @@ dashmap = "6"
 # implementations later (libp2p/yamux, hand-rolled, etc.) touches only that
 # module — the rest of the codebase only sees `MuxedConnection`/`MuxedStream`.
 tokio-yamux = "0.3"
+
+[dev-dependencies]
+# `test-util` is deliberately NOT part of tokio's `full`, and it is what
+# provides `#[tokio::test(start_paused = true)]`. One test asserts a path
+# whose backstop IS a two-second timeout; without a pausable clock, waiting
+# that out puts a two-second floor under the entire suite. Dev-only, so
+# `cargo build` never sees it, and enabling it changes nothing unless a test
+# actually pauses the clock.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [profile.release]
 opt-level = 3

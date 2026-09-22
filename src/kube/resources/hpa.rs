@@ -3,7 +3,7 @@ use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::{CellValue, ResourceRow};
+use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
 // ---------------------------------------------------------------------------
 // HpaDef
@@ -37,18 +37,38 @@ impl ConvertToRow<HorizontalPodAutoscaler> for HpaDef {
         let _max_replicas = spec.max_replicas.to_string();
         let status = hpa.status.unwrap_or_default();
         let current_replicas = status.current_replicas.unwrap_or(0);
+
+        // An autoscaler that cannot scale is the interesting state, and the
+        // API says so in its conditions — `ScalingActive=False` means it
+        // isn't computing a target at all (no metrics, usually). Pinned at
+        // MAX is the milder one: it is working, and it has run out of room.
+        let cannot_scale = status.conditions.iter().flatten().any(|c| {
+            (c.type_ == "ScalingActive" || c.type_ == "AbleToScale") && c.status == crate::kube::resources::k8s_const::STATUS_FALSE
+        });
+        let health = if cannot_scale {
+            RowHealth::Failed
+        } else if current_replicas >= spec.max_replicas && spec.max_replicas > 0 {
+            RowHealth::Pending
+        } else {
+            RowHealth::Normal
+        };
+
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.namespace.clone()),
             CellValue::Text(meta.name.clone()),
             CellValue::Text(reference),
             CellValue::Text(min_replicas),
             CellValue::Count(spec.max_replicas as i64),
+            // `Count`, not `Status`: `Status` sorts as text (see `row.rs`),
+            // which turned `O` on this column into 9, 8, 7, 3, 20, 12, 10, 1.
+            // The row health carries the verdict.
             CellValue::Count(current_replicas as i64),
             CellValue::Age(meta.age.map(|t| t.timestamp())),
         ];        ResourceRow {
             name: meta.name,
             namespace: Some(meta.namespace),
             cells,
+            health,
             ..Default::default()
         }
     }

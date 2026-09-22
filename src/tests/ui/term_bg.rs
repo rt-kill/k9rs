@@ -27,10 +27,26 @@ fn a_half_read_reply_is_never_mistaken_for_a_colour() {
     assert_eq!(parse_osc11(b"\x1b]11;rgb:2e2e"), None);
     assert_eq!(parse_osc11(b"\x1b]11;rgb:2e2e/3434"), None);
     assert_eq!(classify_reply(b"\x1b]11;rgb:2e2e/3434"), ReplyState::NeedMore);
-    // …and once it completes, it resolves.
+}
+
+#[test]
+fn reading_stops_at_the_da1_chaser_not_at_the_colour() {
+    // A COMPLETE colour is still not a stopping point. DA1 is the chaser and
+    // always arrives last, so its reply is still in flight here — and
+    // `/dev/tty` is the same tty the TUI starts reading from moments later.
+    // Stopping on the colour left `ESC [ ? 6 4 ; 1 ; 2 c` behind, which
+    // shreds into a `?` (help) and a trailing `c` (copy) from nowhere. The
+    // resume sieve cannot cover it: that runs on suspend/resume, this is
+    // startup.
     assert_eq!(
         classify_reply(b"\x1b]11;rgb:ffff/ffff/ffff\x07"),
-        ReplyState::Color((255, 255, 255)),
+        ReplyState::NeedMore,
+        "the colour parsed, but the chaser we sent has not answered yet",
+    );
+    assert_eq!(
+        classify_reply(b"\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[?62;c"),
+        ReplyState::Done(Some((255, 255, 255))),
+        "both answers in hand: the tty is drained and the colour stands",
     );
 }
 
@@ -38,11 +54,11 @@ fn a_half_read_reply_is_never_mistaken_for_a_colour() {
 fn a_da1_answer_with_no_colour_means_unsupported() {
     // THE bound on startup: a terminal that ignores OSC 11 still answers
     // DA1, so we stop waiting immediately instead of burning the timeout.
-    assert_eq!(classify_reply(b"\x1b[?62;c"), ReplyState::Unsupported);
+    assert_eq!(classify_reply(b"\x1b[?62;c"), ReplyState::Done(None));
     // A DA1 arriving BEHIND a colour must not mask it — the colour wins.
     assert_eq!(
         classify_reply(b"\x1b]11;rgb:0000/0000/0000\x07\x1b[?62;c"),
-        ReplyState::Color((0, 0, 0)),
+        ReplyState::Done(Some((0, 0, 0))),
     );
 }
 

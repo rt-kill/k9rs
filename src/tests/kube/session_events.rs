@@ -43,7 +43,7 @@ fn content_delivery_reaches_covered_views() {
     app.nav.pop();
     let Element::ContentView(cv) = app.nav.top() else { panic!("content view expected") };
     assert_eq!(cv.phase, ContentPhase::Ready);
-    assert_eq!(cv.state.content, "kind: Pod");
+    assert_eq!(cv.state.content(), "kind: Pod");
     // The in-flight fetch cache-writes exactly as a top delivery would.
     assert!(app.kube.kubectl_cache.get(&target, crate::app::ContentKind::Yaml).is_some());
 }
@@ -462,34 +462,75 @@ fn the_identity_never_describes_the_context_being_left() {
     let label = crate::ui::header::context_label(&app);
     let id = crate::ui::header::display_identity(&app);
     assert!(label.contains("staging"), "names what we're connecting to: {label}");
-    assert_eq!(id.cluster, "staging-eks", "…and the cluster line agrees with it");
-    assert_eq!(id.user, "staging-admin");
+    assert_eq!(id.cluster(), Some("staging-eks"), "…and the cluster line agrees with it");
+    assert_eq!(id.user(), Some("staging-admin"));
 }
 
+/// A Ctrl or Alt chord is never text — enforced by a TYPE, not by five `if`s.
+///
+/// There are five text sinks: the `:` command bar, form fields, the resource
+/// filter, the log grep draft, and the yaml/describe search. All five matched
+/// on `key.code` alone, so a Ctrl chord typed its bare character instead of
+/// reaching the global handler — Ctrl-C typed a `c` instead of quitting. Three
+/// were fixed one at a time across two bug reports, and `handle_search_key`
+/// could not be fixed at its call site at all: it took a `KeyCode`, so the
+/// modifier was already gone.
+///
+/// Now every sink takes [`TextKey`], which only [`TextKey::new`] can build and
+/// which refuses chords. The proof that this holds for all five is that the
+/// alternative does not compile.
 #[test]
-fn ctrl_chords_are_never_typed_as_text() {
-    // From the 2026-09-09 audit. The filter and form handlers matched on
-    // `key.code` alone, so every Ctrl chord was swallowed as a literal
-    // character — Ctrl-C typed a `c` instead of quitting. The comment those
-    // handlers ended with cited Ctrl-C as the example of what DID fall
-    // through, which is what made it easy to miss.
+fn a_chord_can_never_become_text() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    let mut app = App::new_for_test();
-    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    use crate::app::TextKey;
 
-    // Open the `/` filter and type into it.
-    app.nav.top_mut().filter_input_mut().expect("table takes a filter").start();
-    assert!(
-        !crate::kube::session_commands::handle_filter_key(&mut app, ctrl_c),
-        "a Ctrl chord must fall through to the global handler, not be consumed",
+    // Ctrl-C must reach the global handler (quit), not a text buffer.
+    assert!(TextKey::new(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)).is_none());
+    // Ctrl-G is the one that actually bit: `BEL` terminates an OSC reply and
+    // crossterm delivers 0x07 as Ctrl-G, so a leaked terminal colour response
+    // typed a stray `g` into whatever box was open.
+    assert!(TextKey::new(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)).is_none());
+    // An Alt chord is a different chord, not its bare character — the same
+    // rule `combo_of` follows.
+    assert!(TextKey::new(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT)).is_none());
+
+    // Ordinary keys are text, including capitals (Shift rides in the case).
+    let plain = TextKey::new(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+        .expect("a plain character is text");
+    assert_eq!(plain.char(), Some('g'));
+    let shifted = TextKey::new(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT))
+        .expect("Shift rides in the character case");
+    assert_eq!(shifted.char(), Some('G'));
+    // Non-character keys still pass through — the sinks need Esc/Enter/Backspace.
+    assert_eq!(
+        TextKey::new(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("Enter is not a chord")
+            .char(),
+        None,
     );
-    let typed = app.nav.top().filter_input().text().to_string();
-    assert!(typed.is_empty(), "Ctrl-C must not appear in the filter: {typed:?}");
+}
 
-    // A plain character still types.
-    let plain = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
-    assert!(crate::kube::session_commands::handle_filter_key(&mut app, plain));
+/// …and a `TextKey` really does type into the sinks.
+#[test]
+fn a_text_key_types_into_the_filter_and_the_command_bar() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::app::TextKey;
+    let text = |c: char| {
+        TextKey::new(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)).expect("text")
+    };
+
+    let mut app = App::new_for_test();
+    app.nav.top_mut().filter_input_mut().expect("table takes a filter").start();
+    assert!(crate::kube::session_commands::handle_filter_key(&mut app, text('c')));
     assert_eq!(app.nav.top().filter_input().text(), "c");
+
+    let mut app = App::new_for_test();
+    app.ui.open(crate::app::Modal::Command { input: String::new(), history_index: None });
+    assert!(matches!(
+        crate::kube::session_commands::edit_command_key(&mut app, text('g')),
+        crate::kube::session_commands::CommandKey::Consumed,
+    ));
+    assert_eq!(app.ui.command_input().map(|(i, _)| i.to_string()), Some("g".to_string()));
 }
 
 #[test]

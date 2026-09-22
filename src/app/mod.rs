@@ -66,8 +66,12 @@ pub fn context_rows(contexts: &[KubeContext]) -> Vec<crate::kube::resources::row
         .map(|c| ResourceRow {
             cells: vec![
                 CellValue::Text(c.name.to_string()),
-                CellValue::Text(c.identity.cluster.clone()),
-                CellValue::Text(c.identity.user.clone()),
+                // `Placeholder` renders "n/a" — the same word the header
+                // shows. These used to be raw strings, so a context whose
+                // kubeconfig entry has no `user:` rendered a BLANK cell here
+                // while the header said "n/a" for the very same field.
+                label_cell(c.identity.cluster()),
+                label_cell(c.identity.user()),
                 CellValue::Text(if c.is_current { "✓".into() } else { String::new() }),
             ],
             name: c.name.to_string(),
@@ -78,6 +82,15 @@ pub fn context_rows(contexts: &[KubeContext]) -> Vec<crate::kube::resources::row
             ..Default::default()
         })
         .collect()
+}
+
+/// A known kubeconfig label, or the table's own "no value" cell.
+fn label_cell(label: Option<&str>) -> crate::kube::resources::row::CellValue {
+    use crate::kube::resources::row::CellValue;
+    match label {
+        Some(s) => CellValue::Text(s.to_string()),
+        None => CellValue::Placeholder,
+    }
 }
 
 // `ColumnLevel` now lives in `kube::resource_def` next to `ColumnDef` — the
@@ -193,6 +206,10 @@ impl CoreData {
                 continue;
             };
             self.streams.push(session.subscribe_stream(
+                // `clear()` above already dropped every predecessor, and
+                // `SubscriptionStream::Drop` aborts — so they are retired
+                // before any epoch below is minted.
+                crate::kube::client_session::Supersedes::Nothing,
                 rid,
                 crate::kube::protocol::Namespace::All,
                 None,
@@ -265,6 +282,41 @@ impl CoreData {
                 rows: context_rows(contexts),
             }),
         );
+    }
+
+    /// Re-seed the keybindings table for the view `?` was pressed in.
+    ///
+    /// Re-seeded on every press rather than once at startup, because help is
+    /// CONTEXTUAL: the rows depend on which view you were looking at and on
+    /// that resource's declared capabilities. Same single-writer shape as
+    /// `seed_contexts` — the rows come from this process, so there is no
+    /// subscription and no epoch race.
+    pub fn seed_keybindings(
+        &self,
+        caps: Option<crate::kube::protocol::ResourceCapabilities>,
+        keys: crate::app::KeysConfig,
+        class: crate::event::keymap::ViewClass,
+    ) -> std::sync::Arc<store::RowStore> {
+        // A FRESH store per press, not one shared field.
+        //
+        // The rows are contextual — they describe the view `?` was pressed
+        // in — so a single store meant a help element already on the stack
+        // silently re-rendered with a LATER press's keymap: `?` over a pod
+        // table, drill to something else, `?` again, pop, and the first one
+        // is now showing the second one's keys under the first one's
+        // breadcrumb. Contextual content and shared storage cannot both be
+        // true.
+        let store = store::RowStore::client("keybindings");
+        let (headers, rows) = crate::ui::widgets::HelpContent::rows(caps, keys, class);
+        store.apply(
+            Self::SEED_EPOCH,
+            store::StorePayload::Baseline(crate::kube::protocol::TableBaseline {
+                resource: crate::kube::local::LocalResourceKind::Keybinding.to_resource_id(),
+                headers,
+                rows,
+            }),
+        );
+        store
     }
 
     /// Context switch: set the OUTGOING context's core stores aside and
@@ -664,7 +716,18 @@ impl App {
     /// draft text ride along by construction, so there is nothing to
     /// re-apply.
     pub fn sort_by(&mut self, target: crate::app::SortTarget) {
-        self.nav.top_mut().sort_by(target);
+        if self.nav.top_mut().sort_by(target) {
+            return;
+        }
+        // A semantic target this table doesn't have. Say so — a dead key that
+        // says nothing is how the old positional guess hid: it always found
+        // *a* column, so `N` on Events looked like it worked and sorted by
+        // event type.
+        if let crate::app::SortTarget::Named(header) = target {
+            self.ui.flash = Some(FlashMessage::warn(format!(
+                "No {header} column in this view"
+            )));
+        }
     }
 
     /// Toggle the sort direction on the top element's current column.
@@ -939,5 +1002,17 @@ pub(crate) mod test_support {
     pub(crate) fn parked_log_stream() -> crate::kube::client_session::LogStream {
         let handle = RT.handle().spawn(std::future::pending::<()>());
         crate::kube::client_session::LogStream::from_abort_handle(handle.abort_handle())
+    }
+
+    /// A log stream whose bridge task has ALREADY finished — what
+    /// `is_alive()` reports `false` for. Blocks until the task is really
+    /// done, because `AbortHandle::abort` only requests it: right after an
+    /// `abort()` the task is still unfinished, so a synchronous test that
+    /// aborts a parked stream is testing nothing.
+    pub(crate) fn finished_log_stream() -> crate::kube::client_session::LogStream {
+        let handle = RT.handle().spawn(std::future::ready(()));
+        let abort = handle.abort_handle();
+        RT.handle().block_on(handle).expect("the task completes");
+        crate::kube::client_session::LogStream::from_abort_handle(abort)
     }
 }

@@ -221,13 +221,11 @@ pub struct LiveQuery {
     task: JoinHandle<()>,
     /// What this query watches.
     pub key: QueryKey,
-    /// Coalesces grace tasks: at most ONE grace-period task is ever in
-    /// flight per `LiveQuery`. The first `Subscription::drop` that sees
-    /// `grace_in_flight` false flips it to true and spawns the task;
-    /// subsequent drops see `true` and don't spawn duplicates. The task
-    /// resets the flag right before it drops the Arc, so a new
-    /// subscribe/drop cycle later can spawn a fresh grace.
-    grace_in_flight: std::sync::atomic::AtomicBool,
+    /// Keep-warm window after the last `Subscription` drops. See
+    /// [`crate::kube::GraceGate`] — it coalesces to at most one grace task
+    /// AND measures the window from the last dropper, so a second session
+    /// leaving doesn't inherit the first one's nearly-expired timer.
+    grace: crate::kube::GraceGate,
 }
 
 impl Drop for LiveQuery {
@@ -314,21 +312,14 @@ pub(crate) fn max_elapsed_ms() -> u64 {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
         // Shared grace dance (see `crate::kube::spawn_grace`). A *dead*
         // watcher (self-terminated task) skips grace so its cache entry is
         // reclaimed and the next subscribe builds a fresh watcher; a live one
-        // is kept warm for the window. Claim/reset ride the concrete
-        // `grace_in_flight` flag, coalescing to at most one grace task.
+        // is kept warm for the window.
         crate::kube::spawn_grace(
             self._keepalive.clone(),
             |lq| lq.task.is_finished(),
-            |lq| {
-                lq.grace_in_flight
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            },
-            |lq| lq.grace_in_flight.store(false, Ordering::Release),
+            |lq| Some(&lq.grace),
         );
     }
 }
@@ -507,7 +498,7 @@ impl WatcherCache {
             ask_tx,
             task,
             key: key.clone(),
-            grace_in_flight: std::sync::atomic::AtomicBool::new(false),
+            grace: crate::kube::GraceGate::new(crate::kube::watcher_grace()),
         })
     }
 
@@ -515,6 +506,70 @@ impl WatcherCache {
     /// resources so the next `subscribe_dynamic` creates a fresh watcher.
     pub fn remove(&self, key: &QueryKey) {
         self.entries.remove(key);
+    }
+
+    /// Cache slots, live or not. Test-only: the difference between this and
+    /// `stats().len()` is exactly the dead-slot backlog, which is what pins
+    /// that reporting doesn't reap.
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Every LIVE watcher, for `ctl status`. Dead `Weak`s are skipped rather
+    /// than reaped — reporting must not mutate what it reports on.
+    pub fn stats(&self) -> Vec<crate::kube::protocol::WatcherStat> {
+        self.entries
+            .iter()
+            .filter_map(|e| {
+                let holders = e.value().strong_count();
+                if holders == 0 {
+                    return None;
+                }
+                let key = e.key();
+                Some(crate::kube::protocol::WatcherStat {
+                    context: key.context.name.clone(),
+                    namespace: key.namespace.display().to_string(),
+                    resource: key.resource.plural().to_string(),
+                    filter: key.filter.as_ref().map(|f| format!("{f:?}")),
+                    holders,
+                })
+            })
+            .collect()
+    }
+
+    /// TEST SEAM: seed the cache with a watcher the TEST drives.
+    ///
+    /// The subscription bridge obtains its `Subscription` from this cache, so
+    /// this is the one place a test can stand in for a cluster without
+    /// touching the bridge's own code: the next `subscribe` for `key` takes
+    /// the ordinary reuse path, finds this entry live, and attaches. The
+    /// client factory is never called, no watcher task is spawned, and every
+    /// line of the bridge under test is the production one.
+    ///
+    /// Returns the `Arc` keepalive alongside the driver — the cache holds only
+    /// a `Weak`, so dropping the `Arc` is how a test makes the watcher vanish.
+    #[cfg(test)]
+    pub(crate) fn seed_driven(&self, key: QueryKey) -> (Arc<LiveQuery>, DrivenWatcher) {
+        let (delta_tx, _initial_rx) = broadcast::channel(fanout_ring());
+        let (ask_tx, ask_rx) = mpsc::channel(16);
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        // A task that parks until the test ends it. `LiveQuery` needs one
+        // because `task.is_finished()` is how the rest of the system asks
+        // "is this watcher dead?" — bounding the bridge's death drain and
+        // deciding whether a dropped Subscription gets a grace window.
+        let task = tokio::spawn(async move {
+            let _ = stop_rx.await;
+        });
+        let lq = Arc::new(LiveQuery {
+            delta_tx: delta_tx.clone(),
+            ask_tx,
+            task,
+            key: key.clone(),
+            grace: crate::kube::GraceGate::new(crate::kube::watcher_grace()),
+        });
+        self.entries.insert(key, Arc::downgrade(&lq));
+        (lq, DrivenWatcher { delta_tx, ask_rx, stop: Some(stop_tx) })
     }
 
     /// Reap dead `Weak` entries from the cache. Called opportunistically
@@ -613,7 +668,7 @@ impl WatcherCache {
             ask_tx,
             task,
             key: key.clone(),
-            grace_in_flight: std::sync::atomic::AtomicBool::new(false),
+            grace: crate::kube::GraceGate::new(crate::kube::watcher_grace()),
         })
     }
 }
@@ -636,9 +691,9 @@ fn obj_key<K: Resource<DynamicType = D>, D>(obj: &K) -> ObjectKey {
 /// answered on demand from the store (see [`BaselineAsk`] for deferral
 /// semantics). Called by the type-erased `WatcherSpawner` closures.
 /// Build the kube watch stream for a watcher task: page size, semantics,
-/// and server-side filters (Labels/Field push down to the API; OwnerUid is
-/// post-filtered per-change in the bridge because the K8s API can't filter
-/// by ownerReference). Split from the loop so tests can inject a stream.
+/// and server-side filters (Labels/Field push down to the API; OwnerUid and
+/// References are post-filtered per-change in the bridge because the K8s API
+/// can filter on neither). Split from the loop so tests can inject a stream.
 pub(crate) fn watch_stream<K, D>(
     api: Api<K>,
     filter: &Option<crate::kube::protocol::SubscriptionFilter>,
@@ -668,7 +723,13 @@ where
         Some(crate::kube::protocol::SubscriptionFilter::Field(f)) => {
             watcher_config = watcher_config.fields(f);
         }
-        Some(crate::kube::protocol::SubscriptionFilter::OwnerUid(_)) | None => {}
+        // Post-filtered in the bridge (`row_passes`): neither an
+        // ownerReference nor a spec's references can be selected on.
+        Some(
+            crate::kube::protocol::SubscriptionFilter::OwnerUid(_)
+            | crate::kube::protocol::SubscriptionFilter::References { .. },
+        )
+        | None => {}
     }
     watcher::watcher(api, watcher_config).boxed()
 }
@@ -918,9 +979,54 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
 }
 
 // ---------------------------------------------------------------------------
+// Test seam: BE the watcher
+// ---------------------------------------------------------------------------
+
+/// The write ends of a [`LiveQuery`]'s two channels, so a test can play the
+/// watcher: push [`WatcherMsg`]s onto the fanout and answer baseline asks by
+/// hand. Everything downstream of it — the `Subscription`, the substream
+/// bridge, the bincode frames, the muxer — is the real thing.
+///
+/// Paired with [`WatcherCache::seed_driven`].
+#[cfg(test)]
+pub(crate) struct DrivenWatcher {
+    /// Fanout ring. `send` errors while nobody is attached, so a test should
+    /// wait for the bridge's first baseline ask before pushing.
+    pub delta_tx: broadcast::Sender<Arc<WatcherMsg>>,
+    /// Baseline asks arriving from the bridge, to answer (or deliberately
+    /// leave hanging, or drop to simulate a watcher dying mid-ask).
+    pub ask_rx: mpsc::Receiver<BaselineAsk>,
+    /// Ends the stand-in watcher task, making `watcher_finished()` true.
+    pub stop: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+impl DrivenWatcher {
+    /// Take the next baseline ask, failing the test if none arrives. Receiving
+    /// one is also the proof that the bridge has attached and pinned its
+    /// broadcast cursor — i.e. that `delta_tx.send` will now reach it.
+    pub async fn next_ask(&mut self) -> BaselineAsk {
+        tokio::time::timeout(std::time::Duration::from_secs(2), self.ask_rx.recv())
+            .await
+            .expect("the bridge should ask for a baseline")
+            .expect("ask channel open")
+    }
+
+    /// Push a message onto the fanout, failing if nobody is listening — a
+    /// silent `Err` here would make every downstream assertion vacuous.
+    pub fn push(&self, msg: WatcherMsg) {
+        self.delta_tx.send(Arc::new(msg)).expect("a bridge should be attached");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Watcher-loop tests — the injected stream lets these drive raw
 // WatcherEvents and assert the delta/baseline contract without a cluster.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "../tests/kube/live_query.rs"]
+mod cache_tests;
 
 #[cfg(test)]
 mod watcher_tests {

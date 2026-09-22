@@ -45,18 +45,87 @@ async fn cmd_status(json: bool) -> Result<()> {
     let resp = dc.request(&SessionCommand::Status).await;
     match resp {
         Some(SessionEvent::DaemonStatus(status)) => {
+            let c = &status.caches;
             if json {
+                // `serde_json` at the OUTPUT boundary only — the payload
+                // arrived typed and is serialized here because the caller
+                // asked for JSON, which is exactly what the boundary rule
+                // permits.
                 println!("{}", serde_json::json!({
                     "status": "running",
                     "pid": status.pid,
                     "socket": status.socket_path,
                     "uptime_secs": status.uptime_secs,
+                    "caches": c,
                 }));
             } else {
                 let uptime = format_duration(status.uptime_secs);
                 println!("Daemon:     running (pid {})", status.pid);
                 println!("Socket:     {}", status.socket_path);
                 println!("Uptime:     {}", uptime);
+
+                let forwards: usize = c.contexts.iter().map(|x| x.port_forwards).sum();
+                println!(
+                    "Holding:    {} watcher(s), {} context(s), {} port-forward(s)",
+                    c.watchers.len(),
+                    c.contexts.len(),
+                    forwards,
+                );
+                println!(
+                    "Caches:     {} discovery, {} metrics poller(s), {} discovery poller(s)",
+                    c.discovery_entries, c.metrics_pollers, c.discovery_pollers,
+                );
+
+                if !c.contexts.is_empty() {
+                    println!("\nContexts:");
+                    // Width from the DATA, not a guess. Fixed `{:<24}`/`{:<40}`
+                    // looked fine against short fixtures and fell apart on the
+                    // first real cluster: `unsafe-crawling-cluster-production`
+                    // is 34 characters and an EKS endpoint is 64, so every
+                    // column shifted by a different amount per row and the
+                    // table stopped being a table.
+                    let name_w = c
+                        .contexts
+                        .iter()
+                        .map(|x| x.context.as_str().len())
+                        .max()
+                        .unwrap_or(0);
+                    let url_w = c.contexts.iter().map(|x| x.server_url.len()).max().unwrap_or(0);
+                    for ctx in &c.contexts {
+                        println!(
+                            "  {:<name_w$}  {:<url_w$}  {} pf, {} holder(s)",
+                            ctx.context.as_str(),
+                            ctx.server_url,
+                            ctx.port_forwards,
+                            ctx.holders,
+                        );
+                    }
+                }
+                if !c.watchers.is_empty() {
+                    println!("\nWatchers:");
+                    // Same rule — and no truncation, because a context name
+                    // clipped to `unsafe-crawling-cluster…` is exactly the
+                    // information you came here for.
+                    let w_ctx = c
+                        .watchers
+                        .iter()
+                        .map(|w| w.context.as_str().len())
+                        .max()
+                        .unwrap_or(0);
+                    let w_res = c.watchers.iter().map(|w| w.resource.len()).max().unwrap_or(0);
+                    let w_ns = c.watchers.iter().map(|w| w.namespace.len()).max().unwrap_or(0);
+                    for w in &c.watchers {
+                        let filter = w.filter.as_deref().unwrap_or("-");
+                        println!(
+                            "  {:<w_ctx$}  {:<w_res$}  {:<w_ns$}  {:<10} {} holder(s)",
+                            w.context.as_str(),
+                            w.resource,
+                            w.namespace,
+                            filter,
+                            w.holders,
+                        );
+                    }
+                }
             }
         }
         _ => {

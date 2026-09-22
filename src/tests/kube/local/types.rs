@@ -41,3 +41,32 @@ fn local_resource_kind_wire_tags_are_stable() {
     let custom = bincode::serialize(&LocalResourceKind::Custom("x".into())).unwrap();
     assert_eq!(&custom[..4], 2u32.to_le_bytes());
 }
+
+/// `?` is not a `:cmd` resource, and must not become one by having aliases.
+///
+/// `find_by_alias` feeds `ResourceId::from_alias`, which feeds the
+/// resource-command path — and that path calls `nav.reset()`. So giving the
+/// keybindings kind the obvious aliases made `:keys` destroy the user's whole
+/// drill stack to land on a table that only `Action::Help` ever seeds (so:
+/// empty, permanently "Initializing") at depth 1, where `pop` refuses and
+/// neither `q` nor `Esc` can get out.
+///
+/// Every other alias here names a noun you browse. Help is a sheet you
+/// consult ABOUT the view you are in — which is why it floats over it.
+#[test]
+fn the_keybindings_view_is_not_reachable_as_a_command() {
+    for word in ["key", "keys", "keybindings", "help", "KEYS", "Help"] {
+        assert_eq!(
+            super::find_by_alias(word),
+            None,
+            "`:{word}` must not resolve to a resource view",
+        );
+    }
+    assert!(
+        LocalResourceKind::Keybinding.aliases().is_empty(),
+        "the aliases are what make it typeable — there must be none",
+    );
+    // The sibling client-owned kind still IS browsable, so this is a
+    // statement about help specifically, not about local kinds in general.
+    assert_eq!(super::find_by_alias("ctx"), Some(LocalResourceKind::Context));
+}

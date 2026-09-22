@@ -27,6 +27,9 @@ watcherPageSize: 2000
         let yaml = r#"
 watcherPageSize: 500
 discoveryRefreshSecs: 60
+fanoutRing: 16
+watcherGraceSecs: 30
+localsGraceSecs: 7200
 backoff:
   initialMs: 100
   maxMs: 5000
@@ -35,6 +38,11 @@ backoff:
         let cfg: DaemonConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.watcher_page_size, 500);
         assert_eq!(cfg.discovery_refresh_secs, 60);
+        assert_eq!(cfg.fanout_ring, 16);
+        // The two grace windows are SEPARATE knobs on purpose — a watcher is a
+        // cache, a port-forward is something the user asked for.
+        assert_eq!(cfg.watcher_grace_secs, 30);
+        assert_eq!(cfg.locals_grace_secs, 7200);
         assert_eq!(cfg.backoff.initial_ms, 100);
         assert_eq!(cfg.backoff.max_ms, 5000);
         assert_eq!(cfg.backoff.max_elapsed_ms, 30000);
@@ -98,4 +106,38 @@ ui:
     fn empty_yaml_uses_defaults() {
         let cfg: crate::app::AppConfig = serde_yaml::from_str("{}").unwrap();
         assert_eq!(cfg.ui.max_column_width, 64);
+    }
+
+    /// `pollIntervalSecs: 0` is rejected by the TYPE, not by a guard.
+    ///
+    /// Zero was catastrophic and silent: `RunDelay::Schedule(ZERO)` re-runs
+    /// with no delay, and `timeout(ZERO, child)` fires before the child can
+    /// emit a byte, so every poll `kill_on_drop`s its own subprocess at CPU
+    /// speed while publishing nothing. `LocalRegistry::new` ran five guards
+    /// over these configs — empty name, duplicate name, empty command, empty
+    /// headers, header/key length — and none of them looked at the interval.
+    #[test]
+    fn a_zero_poll_interval_is_not_deserializable() {
+        let yaml = r#"
+execResources:
+  - name: node-costs
+    command: kubectl
+    pollIntervalSecs: 0
+    headers: ["NAME"]
+    jsonFieldKeys: ["name"]
+"#;
+        let err = serde_yaml::from_str::<DaemonConfig>(yaml)
+            .expect_err("zero must not parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("zero") || msg.contains("NonZero") || msg.contains("nonzero"),
+            "the error should name the problem: {msg}",
+        );
+
+        // …and a sane value still parses.
+        let ok: DaemonConfig = serde_yaml::from_str(
+            &yaml.replace("pollIntervalSecs: 0", "pollIntervalSecs: 15"),
+        )
+        .expect("a non-zero interval parses");
+        assert_eq!(ok.exec_resources[0].poll_interval_secs.get(), 15);
     }

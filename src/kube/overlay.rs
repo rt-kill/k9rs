@@ -15,18 +15,66 @@ use crate::kube::resources::row::RowHealth;
 
 /// Global overlay store, loaded once at startup. Both the daemon and TUI
 /// read from the same `~/.config/k9rs/overlays/` directory.
-static OVERLAYS: std::sync::LazyLock<HashMap<String, ResourceOverlay>> =
-    std::sync::LazyLock::new(load_overlays);
+static OVERLAYS: std::sync::LazyLock<(HashMap<String, ResourceOverlay>, Vec<String>)> =
+    std::sync::LazyLock::new(|| {
+        let mut problems = Vec::new();
+        let map = load_overlays_reporting(&mut problems);
+        (map, problems)
+    });
 
 /// Look up the overlay for a resource by its plural name.
 pub fn overlay_for(plural: &str) -> Option<&'static ResourceOverlay> {
-    OVERLAYS.get(&plural.to_lowercase())
+    OVERLAYS.0.get(&plural.to_lowercase())
 }
 
-/// Get all loaded overlays (for TUI key binding display, etc.)
-pub fn all_overlays() -> &'static HashMap<String, ResourceOverlay> {
-    &OVERLAYS
+/// Everything wrong with the user's overlay files, in load order.
+///
+/// Overlays are the one user-facing extension point, and every check in this
+/// module reported through `warn!` — which goes to `io::sink` unless the user
+/// happens to pass `--log-file`. So a typo'd column, an unknown capability, a
+/// duplicate file and a YAML parse error were all *silently* discarded: the
+/// fix for "the node overlay sat dead for months" shipped into /dev/null.
+/// The TUI surfaces these at startup instead.
+pub fn overlay_diagnostics() -> &'static [String] {
+    &OVERLAYS.1
 }
+
+/// Coloring rules that name a column the resource does not have.
+///
+/// Split out so the check is testable without a filesystem. Case-insensitive,
+/// matching how `build_column_rules` resolves headers — the point is to catch
+/// a genuine typo (`CPU%` for `%CPU`), not a capitalisation difference that
+/// would have worked anyway.
+fn unknown_coloring_columns<'a>(
+    overlay: &'a ResourceOverlay,
+    known: &[&str],
+) -> Vec<&'a str> {
+    overlay
+        .coloring
+        .iter()
+        .map(|r| r.column.as_str())
+        .filter(|col| !known.iter().any(|h| h.eq_ignore_ascii_case(col)))
+        .collect()
+}
+
+/// The key an overlay is stored under: the CANONICAL plural of whatever its
+/// `resource:` field names.
+///
+/// Overlays used to be stored under the raw `resource:` string and looked up
+/// by plural, so an overlay written as `resource: po` — which the load-time
+/// validation accepts, *because that check itself resolves aliases* — was
+/// filed under `po`, never matched `pods`, and reported "loaded 1 overlay(s)"
+/// on the way to doing nothing at all. Resolving here means the two halves
+/// agree by construction.
+///
+/// An unrecognised name stays as written: CRDs are not in the registry and
+/// are looked up by their plural directly.
+fn canonical_key(resource: &str) -> String {
+    crate::kube::protocol::ResourceId::from_alias(resource)
+        .map(|rid| rid.plural().to_lowercase())
+        .unwrap_or_else(|| resource.to_lowercase())
+}
+
 
 // ---------------------------------------------------------------------------
 // Config types (deserialized from YAML)
@@ -156,6 +204,21 @@ impl From<OverlayHealth> for RowHealth {
 /// Returns a map keyed by resource plural name. Errors in individual
 /// files are logged and skipped — one bad overlay doesn't break the rest.
 pub fn load_overlays() -> HashMap<String, ResourceOverlay> {
+    load_overlays_reporting(&mut Vec::new())
+}
+
+/// `load_overlays`, also collecting every diagnostic as a user-facing string.
+/// Each `warn!` below is paired with a `report!` so the two cannot drift: the
+/// log line is for `--log-file`, the report is for the person who wrote the
+/// overlay and is looking at a TUI.
+pub fn load_overlays_reporting(problems: &mut Vec<String>) -> HashMap<String, ResourceOverlay> {
+    // One site, two destinations — a `warn!` that the user can also see.
+    macro_rules! warn {
+        ($($arg:tt)*) => {{
+            tracing::warn!($($arg)*);
+            problems.push(format!($($arg)*));
+        }};
+    }
     let mut overlays = HashMap::new();
     let home = match std::env::var("HOME") {
         Ok(h) => h,
@@ -166,8 +229,12 @@ pub fn load_overlays() -> HashMap<String, ResourceOverlay> {
         Ok(e) => e,
         Err(_) => return overlays, // directory doesn't exist — no overlays
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    // SORTED: `read_dir` yields filesystem order, so with two files claiming
+    // the same resource the winner would otherwise differ between machines —
+    // and between runs after an unrelated file was touched.
+    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
         if path.extension().and_then(|e| e.to_str()) != Some("yaml")
             && path.extension().and_then(|e| e.to_str()) != Some("yml")
         {
@@ -219,6 +286,50 @@ pub fn load_overlays() -> HashMap<String, ResourceOverlay> {
                             );
                         }
                     }
+                    // Does each coloring rule name a column this resource
+                    // actually has?
+                    //
+                    // `build_column_rules` looks columns up by header and
+                    // quietly yields empty rules for one that doesn't exist,
+                    // so a typo is a silent no-op — and the typo is easy:
+                    // node util columns are `%CPU`/`%MEM`, and `CPU%`/`MEM%`
+                    // reads just as naturally. The user's node overlay sat
+                    // dead for months because of exactly that, while the
+                    // STATUS rules in the same file worked, which made it
+                    // look like partial support rather than a mistake.
+                    //
+                    // Only checkable for BUILT-INS: a CRD's columns come from
+                    // the cluster's printer columns plus this overlay's own
+                    // `columns:`, neither of which is known here.
+                    if let Some(def) = crate::kube::resource_defs::REGISTRY
+                        .by_alias(&overlay.resource)
+                    {
+                        // `default_headers()` — the MANDATORY header list,
+                        // which all 33 built-ins implement. This read
+                        // `column_defs()`, an optional tagging hook only 4 of
+                        // them override, so the check false-positived on 30
+                        // resources: an overlay colouring `READY` on
+                        // deployments was told the column does not exist,
+                        // with an empty "Columns: " list, while the rule
+                        // worked perfectly at runtime. Its own test passed a
+                        // hand-built list and so never touched the registry.
+                        let headers = def.default_headers();
+                        let known: Vec<&str> = headers
+                            .iter()
+                            .map(String::as_str)
+                            .chain(overlay.columns.iter().map(|c| c.header.as_str()))
+                            .collect();
+                        for missing in unknown_coloring_columns(&overlay, &known) {
+                            warn!(
+                                "overlay: coloring targets column '{}', which '{}' does not \
+                                 have — the rules will never apply. Columns: {} (in {})",
+                                missing,
+                                overlay.resource,
+                                known.join(", "),
+                                path.display(),
+                            );
+                        }
+                    }
                     // Validate coloring rules at load. `build_column_rules`
                     // checks them too, but only lazily when the resource is
                     // first viewed — surfacing a malformed rule here means a
@@ -246,9 +357,19 @@ pub fn load_overlays() -> HashMap<String, ResourceOverlay> {
                             }
                         }
                     }
-                    let key = overlay.resource.to_lowercase();
-                    if overlays.contains_key(&key) {
-                        warn!("overlay: duplicate definition for '{}', using {}", key, path.display());
+                    let key = canonical_key(&overlay.resource);
+                    if let Some(prior) = overlays.get(&key) {
+                        // Same plural from two files. If their `group`s differ
+                        // this is a genuine ambiguity the lookup cannot
+                        // resolve — every caller has only a plural — so say
+                        // which one is in force rather than letting directory
+                        // order decide invisibly.
+                        warn!(
+                            "overlay: '{}' is defined twice (group {:?} and {:?}); \
+                             lookup is by plural only, so {} is IGNORED",
+                            key, prior.group, overlay.group, path.display(),
+                        );
+                        continue;
                     }
                     overlays.insert(key, overlay);
                 }

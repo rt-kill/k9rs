@@ -89,6 +89,25 @@ impl LocalRegistry {
     /// `Weak` must never build two live slices for one `ContextId` — that
     /// would mean two `PortForwardSource`s spawning duplicate kubectl
     /// children onto the same local ports.
+    /// Every context with a LIVE local slice, for `ctl status`. Skips dead
+    /// `Weak`s rather than reaping them — reporting must not mutate what it
+    /// reports on.
+    pub fn stats(&self) -> Vec<crate::kube::protocol::ContextStat> {
+        self.contexts
+            .iter()
+            .filter_map(|e| {
+                let holders = e.value().strong_count();
+                let locals = e.value().upgrade()?;
+                Some(crate::kube::protocol::ContextStat {
+                    context: e.key().name.clone(),
+                    server_url: e.key().server_url.clone(),
+                    port_forwards: locals.port_forwards().live_count(),
+                    holders,
+                })
+            })
+            .collect()
+    }
+
     pub fn attach(&self, context: &ContextId) -> ContextKeepalive {
         // Opportunistic sweep so entries for long-expired contexts don't
         // accumulate (bounded by distinct contexts ever visited either way).

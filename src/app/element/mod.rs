@@ -290,6 +290,8 @@ impl LiveQuery {
     pub fn open(session: &ClientSession, spec: QuerySpec) -> Self {
         let store = RowStore::new(spec.rid.plural());
         let stream = session.subscribe_stream(
+            // Fresh store, fresh element — nothing to retire.
+            crate::kube::client_session::Supersedes::Nothing,
             spec.rid.clone(),
             spec.namespace.clone(),
             spec.filter.clone(),
@@ -365,11 +367,11 @@ impl LiveQuery {
         // (subscribe_stream raises expect_epoch as it returns) — a
         // lingering old bridge minting a HIGHER epoch would permanently
         // out-floor the successor's baseline.
-        stream.abort();
         // Rows stay put (in-place replacement on recovery), but report
         // Initializing so the stale rows hide behind the loading screen.
         self.store.mark_reinitializing();
         self.origin = QueryOrigin::Daemon(session.subscribe_stream(
+            crate::kube::client_session::Supersedes::Stream(stream),
             self.spec.rid.clone(),
             self.spec.namespace.clone(),
             self.spec.filter.clone(),
@@ -387,10 +389,9 @@ impl LiveQuery {
     /// than clearing a store nothing will refill.
     pub fn refresh(&mut self, session: &ClientSession) {
         let QueryOrigin::Daemon(stream) = &self.origin else { return };
-        // Abort-before-mint (see resubscribe).
-        stream.abort();
         self.store.clear();
         self.origin = QueryOrigin::Daemon(session.subscribe_stream(
+            crate::kube::client_session::Supersedes::Stream(stream),
             self.spec.rid.clone(),
             self.spec.namespace.clone(),
             self.spec.filter.clone(),
@@ -491,6 +492,23 @@ impl ResourceList {
         let metrics = MetricsBinding::for_rid(&spec.rid, hub);
         let title = spec.rid.short_label().to_lowercase();
         let source = RowSource::new(Arc::clone(&store), metrics);
+        // `SortSpec` has no "unsorted" — it defaults to column 0 ascending —
+        // so for help, whose column 0 is SECTION, the alphabet decides which
+        // group you see first. Alphabetically "This view (…)" sorts LAST, so
+        // pressing `?` from the pods table opened on "Everywhere" and buried
+        // the pod keys 36 rows down: the contextual section is the entire
+        // point of the rewrite and it was off-screen. Descending puts it
+        // first. The ORDER is what matters and it is pinned by a test, so a
+        // renamed section fails loudly instead of quietly burying itself.
+        let mut interaction = TableInteraction::default();
+        if matches!(
+            spec.rid,
+            crate::kube::protocol::ResourceId::Local(
+                crate::kube::local::LocalResourceKind::Keybinding
+            )
+        ) {
+            interaction.sort = crate::app::store::SortSpec { col: 0, ascending: false };
+        }
         Self {
             query: LiveQuery::client(spec, store),
             source,
@@ -498,7 +516,7 @@ impl ResourceList {
             title,
             scope_label: String::new(),
             policy,
-            interaction: TableInteraction::default(),
+            interaction,
         }
     }
 
@@ -627,6 +645,13 @@ pub struct DerivedRows {
     rules: Vec<ColumnRenderRules>,
     label: String,
     title: String,
+    /// This projection's OWN marks. A store-backed list keys its marks on
+    /// the shared `RowStore`; projected rows have no store to key them in,
+    /// so they live here and die with the element — the same lifetime the
+    /// rows themselves have. Reads intersect with the live projection
+    /// (`Element::marked_snapshot`), which stands in for the delta-prune a
+    /// projection can never receive.
+    marked: HashSet<ObjectKey>,
     pub interaction: TableInteraction,
 }
 
@@ -637,6 +662,49 @@ pub enum DeriveError {
     NoRows,
     /// Nothing is selected (empty view).
     NoSelection,
+}
+
+/// How much of the frame an element claims when it is on top.
+///
+/// The overlay slot already answered this question for modals
+/// ([`crate::app::OverlayExtent`]); this is the same question asked of a nav
+/// ELEMENT, which is what lets a floating view be an ordinary element rather
+/// than a second kind of thing with its own key routing. A `Dialog` element
+/// is drawn in a centered box over the element beneath it — that one is
+/// rendered first, exactly as it would be if it were on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewExtent {
+    /// Claims the frame. Every element does this unless it says otherwise.
+    Full,
+    /// A centered box over the view beneath, AT MOST this big on each axis
+    /// and shrunk to whatever the content actually needs.
+    ///
+    /// A cap plus content-shrink, rather than a flat percentage, because one
+    /// rule then serves a three-row yes/no box and a sixty-row help sheet:
+    /// the confirm box asks for `Cells(60) × Cells(5)` and gets exactly that;
+    /// help asks for `Pct(80) × Pct(85)` and fills it because it has more
+    /// content than that. A percentage alone can only ever describe the
+    /// second, which is why the first was a separate mechanism.
+    Dialog { max_width: Size, max_height: Size },
+}
+
+/// One axis of a dialog's maximum size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Size {
+    /// Exactly this many cells, clamped to the frame.
+    Cells(u16),
+    /// This percentage of the frame.
+    Pct(u16),
+}
+
+impl Size {
+    /// Resolve against the frame's size on this axis.
+    pub fn resolve(self, available: u16) -> u16 {
+        match self {
+            Size::Cells(n) => n.min(available),
+            Size::Pct(p) => (u32::from(available) * u32::from(p) / 100) as u16,
+        }
+    }
 }
 
 /// Outcome of a mark keypress. The element stays UI-free — the action
@@ -675,18 +743,22 @@ pub struct LogViewState {
     /// by the render pass, which alone knows the width and wrap layout. Carries
     /// the follow/autoscroll flag too.
     pub viewport: crate::app::viewport::Viewport,
+    /// Horizontal panning, in display columns. Its own type because it is the
+    /// other axis, not another viewport — see [`crate::app::viewport::Pan`].
+    pub pan: crate::app::viewport::Pan,
     pub wrap: bool,
-    pub show_timestamps: bool,
+    /// How many chrome roles are hidden — see
+    /// [`crate::ui::widgets::Role::SHED_ORDER`]. ONE number rather than a
+    /// boolean per role: two booleans are four states for three meaningful
+    /// ones, and the unreachable fourth (time without attribution) was a
+    /// state the keys could never produce anyway.
+    pub shed: usize,
     /// True during the initial tail fetch — the render path skips
     /// follow-mode auto-scroll so the view doesn't jump as the tail
     /// streams in.
     pub initial_load: bool,
     /// Draft filter text; `Some` = the filter bar is open.
     pub draft: Option<String>,
-    /// Ring evictions last accounted for — scroll self-heals at read
-    /// time by diffing against the store's counter (the store never
-    /// reaches into elements).
-    evicted_seen: u64,
     cache: Option<(LogDeriveKey, Arc<Vec<usize>>)>,
 }
 
@@ -704,23 +776,35 @@ impl LogViewState {
             } else {
                 crate::app::viewport::Viewport::default()
             },
+            pan: crate::app::viewport::Pan::default(),
             wrap: cfg.default_wrap,
-            show_timestamps: cfg.default_timestamps,
+            shed: cfg.initial_shed(),
             initial_load: true,
             draft: None,
-            evicted_seen: 0,
             cache: None,
         }
     }
 
+    /// The view for a freshly pushed grep: the parent's display PREFERENCES,
+    /// none of its position.
+    ///
+    /// A filter owns its own store, so the parent's scroll position names
+    /// nothing here — not a row (the filtered content has a different extent)
+    /// and not a line (the child's sequence numbers are its own, since it
+    /// counts only the lines it retained). `restarted()` is the existing
+    /// answer to exactly this question, asked by the `since`-range restart:
+    /// same surface, new content, keep what the user chose.
     fn seeded_from(parent: &LogViewState) -> Self {
         Self {
-            viewport: parent.viewport,
+            viewport: parent.viewport.restarted(),
+            // The pan IS carried, unlike the vertical position: every line in
+            // the child wears the same prefix as its parent, so "I have shifted
+            // past the chrome" is still true of the narrowed view.
+            pan: parent.pan,
             wrap: parent.wrap,
-            show_timestamps: parent.show_timestamps,
+            shed: parent.shed,
             initial_load: false,
             draft: None,
-            evicted_seen: parent.evicted_seen,
             cache: None,
         }
     }
@@ -761,10 +845,12 @@ impl LineSource {
 /// A live log stream: the element's own query spec (`LogInit`), its
 /// stream + line store, and its display state.
 pub struct LogSession {
-    /// The wire-facing definition — restarts (`since` ranges) re-run THIS.
+    /// The wire-facing definition — restarts (`since` ranges) re-run THIS,
+    /// and the header/label/filename derive from it. There is deliberately
+    /// no second copy of "which pod, which container": the display identity
+    /// used to be a `ContainerRef` beside this spec, and a fan-out target
+    /// ("3 pods") is exactly the case where the two would disagree.
     spec: crate::kube::protocol::LogInit,
-    /// Display identity (pod/container labels for the header).
-    pub target: crate::app::ContainerRef,
     stream: LogStream,
     store: Arc<LineStore>,
     /// Tail size for rate restarts (from config at construction).
@@ -783,22 +869,34 @@ impl LogSession {
     /// Open a fresh log stream element.
     pub fn open(
         session: &ClientSession,
-        target: crate::app::ContainerRef,
         spec: crate::kube::protocol::LogInit,
         cfg: &crate::app::LogConfig,
     ) -> Self {
         let store = LineStore::new(cfg.max_lines);
-        let stream = session.stream_log_substream(spec.clone(), Arc::clone(&store));
-        let label = format!("logs({}/{})", target.pod, target.container_label());
+        let stream = session.stream_log_substream(
+            // A newly opened log session has no predecessor.
+            crate::kube::client_session::Supersedes::Nothing,
+            spec.clone(),
+            Arc::clone(&store),
+        );
+        let label = log_label(&spec);
         Self {
             view: LogViewState::from_config(cfg, spec.follow),
             tail_default: cfg.tail_lines,
             spec,
-            target,
             stream,
             store,
             label,
         }
+    }
+
+    /// Display identity: (what we're logging, which container(s), range).
+    pub fn header(&self) -> (String, String, String) {
+        (
+            self.spec.target.display(),
+            self.spec.container.label().to_string(),
+            self.spec.since.clone().unwrap_or_else(|| "tail".to_string()),
+        )
     }
 
     /// Restart the stream with a new time range (digits 0-6). Re-runs the
@@ -810,14 +908,52 @@ impl LogSession {
         self.spec.tail = if since.is_none() { Some(self.tail_default) } else { None };
         self.spec.follow = true;
         self.store.clear();
-        self.view.viewport = crate::app::viewport::Viewport::tailing();
+        // A RANGE request keeps its head; a plain tail keeps its tail.
+        //
+        // The apiserver streams forward from the range's start, so the old
+        // lines arrive first — and a tail-anchored ring evicted them with the
+        // newer ones behind, leaving the newest N of a range asked for
+        // precisely to see the oldest. Head retention also stops the stream
+        // once full (see `revive_if_dead`'s sibling check in the session
+        // loop), so we no longer pay to receive lines we will discard.
+        self.store.set_retain(if since.is_some() {
+            crate::app::store::Retain::Head
+        } else {
+            crate::app::store::Retain::Tail
+        });
+        // The extent is gone with the store, but AUTOSCROLL IS A USER
+        // PREFERENCE and survives. Unconditionally re-tailing here meant
+        // pressing `s` to stop the scroll and then `2` to change the range
+        // silently turned the scroll back on — a toggle undone by an
+        // unrelated key is exactly what "finicky" feels like.
+        self.view.viewport = self.view.viewport.restarted();
         self.view.initial_load = true;
-        self.stream = session.stream_log_substream(self.spec.clone(), Arc::clone(&self.store));
+        self.stream = session.stream_log_substream(
+            crate::kube::client_session::Supersedes::LogStream(&self.stream),
+            self.spec.clone(),
+            Arc::clone(&self.store),
+        );
     }
 
     /// Whether the underlying substream is still running.
     pub fn stream_alive(&self) -> bool {
         self.stream.is_alive()
+    }
+
+    /// Stop a range fetch once we have the oldest N it was asked for.
+    ///
+    /// Dropping the handle aborts the bridge, which RSTs the substream; the
+    /// daemon's drain already treats a closed reader as the normal end of a
+    /// stream (`out.send(..).is_err()`), so the kubelet read stops with no
+    /// wire change. Without this we keep receiving — and discarding — every
+    /// line behind the window, which is most of them.
+    pub fn stop_if_head_complete(&mut self) -> bool {
+        if self.store.head_is_full() && self.stream.is_alive() {
+            self.stream.abort();
+            self.store.mark_ended(u64::MAX);
+            return true;
+        }
+        false
     }
 
     /// Abort the log substream without minting a successor — the reconnect/
@@ -826,40 +962,75 @@ impl LogSession {
         self.stream.abort();
     }
 
-    /// Re-establish the stream if it died (daemon restart during a reconnect
-    /// or while covered). Without this a dead log stream renders forever as
-    /// a live, following view — the line store keeps `live = true` because
-    /// the bridge's `Ended` died in the closed channel and `mark_ended`
-    /// never ran. Reuses `restart_range` (resume from the current `since`):
-    /// re-tailing is the honest recovery — the alternative, resuming in
-    /// place, would need a "since now" the tail spec can't express.
-    pub fn revive_if_dead(&mut self, session: &ClientSession) {
-        if !self.stream.is_alive() {
-            let since = self.spec.since.clone();
-            self.restart_range(session, since);
+    /// Re-establish the stream if it DIED — and only then.
+    ///
+    /// `is_alive() == false` stands for three different things: the transport
+    /// died under us, the log legitimately ended (the container exited), or
+    /// we stopped it ourselves ([`Self::stop_if_head_complete`]). The first
+    /// wants recovery; the other two emphatically do not, and `restart_range`
+    /// begins by CLEARING the store — so reviving a finished stream threw
+    /// away a completed log and refetched a 100-line tail, and reviving a
+    /// deliberately-stopped `Retain::Head` range discarded the oldest-N
+    /// window the user had asked for and re-downloaded it, every time they
+    /// popped back into the view.
+    ///
+    /// The discriminator already exists and needs no new state: both orderly
+    /// endings run `mark_ended`, so the store reports `live = false`. A
+    /// transport death is exactly the case where it still says `live = true`,
+    /// because the bridge's `Ended` died in the closed channel — which is the
+    /// symptom this function was written for ("renders forever as a live,
+    /// following view"). Asking the store keeps the two facts from drifting.
+    /// Returns whether it actually restarted — the caller uses that to reset
+    /// the filters deriving from the store this just emptied.
+    pub fn revive_if_dead(&mut self, session: &ClientSession) -> bool {
+        if !self.needs_revival() {
+            return false;
         }
+        let since = self.spec.since.clone();
+        self.restart_range(session, since);
+        true
+    }
+
+    /// The decision behind [`Self::revive_if_dead`], named so it can be
+    /// tested without a live session: the stream is gone and it did NOT end
+    /// in an orderly way. Both orderly endings — EOF, and our own
+    /// [`Self::stop_if_head_complete`] — run `mark_ended`, which sets a
+    /// STICKY flag. It has to be sticky: `live` is re-set by every arrival,
+    /// and a stopped stream keeps delivering for a moment, so asking `live`
+    /// meant the first straggler undid the decision.
+    pub fn needs_revival(&self) -> bool {
+        !self.stream.is_alive() && !self.store.has_ended()
+    }
+
+    /// Test-only: replace the stream with one whose bridge has already
+    /// finished, i.e. the transport died under us.
+    #[cfg(test)]
+    pub(crate) fn kill_stream_for_test(&mut self) {
+        self.stream = crate::app::test_support::finished_log_stream();
     }
 
     /// Test-only: a log session over a parked stream.
     #[cfg(test)]
-    pub(crate) fn for_test(target: crate::app::ContainerRef) -> Self {
+    pub(crate) fn for_test(
+        target: crate::kube::protocol::LogTarget,
+        container: crate::kube::protocol::LogContainer,
+    ) -> Self {
         let cfg = crate::app::LogConfig::default();
         let store = LineStore::new(cfg.max_lines);
         let spec = crate::kube::protocol::LogInit {
-            pod: target.pod.clone(),
+            target,
             namespace: Namespace::Named("default".to_string()),
-            container: target.container.clone(),
+            container,
             follow: true,
             tail: Some(cfg.tail_lines),
             since: None,
             previous: false,
         };
-        let label = format!("logs({}/{})", target.pod, target.container_label());
+        let label = log_label(&spec);
         Self {
             view: LogViewState::from_config(&cfg, true),
             tail_default: cfg.tail_lines,
             spec,
-            target,
             stream: crate::app::test_support::parked_log_stream(),
             store,
             label,
@@ -875,12 +1046,125 @@ impl LogSession {
     }
 }
 
+impl LogFilter {
+    /// Pull everything new from the parent, keep what matches, advance the
+    /// cursor. Idempotent and cheap: O(lines arrived since last call), not
+    /// O(lines resident) — the derive it replaces re-scanned the whole store
+    /// with every pattern on every frame, because the memo key carries the
+    /// store's global generation and any append bumps it.
+    ///
+    /// Runs on the session task like every other store access, and never
+    /// holds two locks: the parent's read is collected into a batch first.
+    fn drain_from_parent(&mut self) {
+        let parent = self.source.store();
+        let (evicted, live, batch) = parent.with_read(|inner| {
+            let start = self.cursor.max(inner.evicted);
+            let end = inner.evicted + inner.lines.len() as u64;
+            let matched: Vec<crate::kube::protocol::LogLine> = (start..end)
+                .filter_map(|seq| inner.lines.get((seq - inner.evicted) as usize))
+                .filter(|line| {
+                    // Which PARTS a grep sees is `Role::searchable`'s to say,
+                    // not this call site's. It used to be spelled out here and
+                    // again in the draft derive — two copies of a rule that a
+                    // third place (`Role`) also stated, which is how "the
+                    // timestamp is not searchable" becomes true in one of them
+                    // and not the others.
+                    let hit = |p: &SearchPattern| {
+                        crate::kube::protocol::segments(line)
+                            .filter(|(role, ..)| role.searchable())
+                            .any(|(_, text, _)| p.is_match(text))
+                    };
+                    // The FULL committed chain, against the parent's lines.
+                    // Applying only our own pattern would rely on the parent
+                    // having retained exactly its own matches; the chain is a
+                    // conjunction and evaluating it whole keeps that true by
+                    // construction, at a cost of one extra `is_match` per
+                    // level on lines that are about to be kept anyway.
+                    self.source.patterns.iter().all(|p| hit(p.pattern()))
+                })
+                .cloned()
+                .collect();
+            (inner.evicted, inner.live, matched)
+        });
+        // The parent threw lines away before we looked at them. We cannot
+        // know how many of them matched — we never saw them — so this is a
+        // flag the bar renders, not a count.
+        if self.cursor < evicted {
+            self.lost_history = true;
+        }
+        self.cursor = evicted + parent.with_read(|i| i.lines.len() as u64);
+        self.retained.extend_derived(batch);
+        self.retained.set_live(live);
+    }
+
+    /// Whether the parent evicted matches we never got to see.
+    /// Start over against a parent whose store was just cleared.
+    ///
+    /// `restart_range` replaces the session's lines wholesale, but a filter's
+    /// `retained` is its OWN store and survives — and since `clear()` leaves
+    /// `cursor == evicted`, the next drain appended the new range's matches
+    /// onto the old range's. A reconnect under a grep therefore duplicated
+    /// every retained match, and the duplicates evicted real history to make
+    /// room for themselves.
+    pub fn restarted_from_parent(&mut self) {
+        self.retained.clear();
+        self.cursor = self.source.store().with_read(|i| i.evicted);
+        self.lost_history = false;
+    }
+
+    /// The store this filter DERIVES from (the session's), not the one it
+    /// owns — the identity a restart is announced by.
+    pub fn source_store(&self) -> &Arc<LineStore> {
+        self.source.store()
+    }
+
+    pub fn lost_history(&self) -> bool {
+        self.lost_history
+    }
+
+    /// Drain without deriving — for elements that are NOT on top.
+    ///
+    /// `log_visible` runs on `nav.top_mut()` only, so a buried filter (stack
+    /// two greps, or open a sub-view over one) would never advance its
+    /// cursor: the parent would evict past it and, on reveal, it would
+    /// report `lost_history` for lines it could have had. Draining every
+    /// frame costs O(lines arrived) per element and keeps a covered filter
+    /// exactly as complete as a visible one.
+    pub fn keep_up(&mut self) {
+        self.drain_from_parent();
+    }
+}
+
+/// The nav-stack label for a log element, derived from its spec alone.
+fn log_label(spec: &crate::kube::protocol::LogInit) -> String {
+    format!("logs({}/{})", spec.target.display(), spec.container.label())
+}
+
 /// A committed grep over the parent's line output — one element per
 /// committed filter, so Esc pops filters one at a time (the old
 /// `LogState.filters` stack, made navigation).
 #[derive(Debug)]
 pub struct LogFilter {
     source: LineSource,
+    /// This filter's OWN lines — the matches it has seen, with its own cap.
+    ///
+    /// A filter used to own nothing: it derived indices into the parent's
+    /// store on every read, so its retention WAS the parent's. Eviction there
+    /// is driven by unmatched noise, which means the rarer the pattern the
+    /// faster its matches scrolled out — a grep for `panic` was evicted by
+    /// the very traffic it was written to escape. Holding the matches makes
+    /// the cap mean "N matches" instead of "N lines, some of which matched".
+    retained: Arc<LineStore>,
+    /// Next ABSOLUTE line sequence (`evicted + index`) to consider from the
+    /// parent. Monotone, and monotone across `clear()` — which is what lets
+    /// this be a resumable cursor rather than a position that shifts under
+    /// eviction.
+    cursor: u64,
+    /// The parent evicted past `cursor` before we drained it, so some
+    /// unknown number of matches are missing before our oldest line. The
+    /// count is unknowable by construction — we never saw the lines — so
+    /// this is a flag, not a number.
+    lost_history: bool,
     label: String,
     /// Display identity, captured from the parent at derivation (the
     /// pod/container never change; the since label can go stale across a
@@ -1056,6 +1340,7 @@ impl Element {
             rules,
             title: label.clone(),
             label,
+            marked: HashSet::new(),
             interaction: TableInteraction::default(),
         }))
     }
@@ -1115,6 +1400,54 @@ impl Element {
             pats.push(SearchPattern::new(draft));
         }
         pats
+    }
+
+    /// Whether this element lost matches to its parent's eviction before it
+    /// could collect them — the honest answer to "is this the whole story".
+    pub fn log_lost_history(&self) -> bool {
+        match self {
+            Element::LogFilter(e) => e.lost_history(),
+            _ => false,
+        }
+    }
+
+    /// The first grep in play that is NOT running as a regex, and why —
+    /// what the filter bars render.
+    ///
+    /// A pattern that quietly stopped being a regex reads exactly like one
+    /// that simply isn't matching, so `0 visible` was the only thing the
+    /// screen ever said about `a\{2,3}`. Committed greps are already
+    /// compiled (table predicates and log filters both hold a
+    /// [`CompiledGrep`]), so this costs at most one compile: the draft,
+    /// which changes once per keystroke regardless.
+    pub fn grep_fallback(&self) -> Option<String> {
+        let committed = match self {
+            Element::LogFilter(e) => e
+                .source
+                .patterns
+                .iter()
+                .find_map(|p| p.pattern().fallback_reason()),
+            _ => self.output_source().and_then(|s| {
+                s.predicates().iter().find_map(|p| match p.as_ref() {
+                    RowPredicate::Grep(g) => g.pattern().fallback_reason(),
+                    _ => None,
+                })
+            }),
+        };
+        if let Some(why) = committed {
+            return Some(why.to_string());
+        }
+        // The draft lives in two different places depending on the kind;
+        // `filter_input` is total (empty for log kinds) and `log_view` is
+        // `None` for tables, so exactly one of them speaks.
+        let draft = match self.log_view().and_then(|v| v.draft.as_deref()) {
+            Some(d) => d,
+            None => self.filter_input().text(),
+        };
+        if draft.is_empty() {
+            return None;
+        }
+        SearchPattern::new(draft).fallback_reason().map(str::to_string)
     }
 
     /// Capabilities for the help footer / key gating on non-table kinds.
@@ -1187,7 +1520,7 @@ impl Element {
     }
 
     /// The log-bearing kinds' line output (the handle a log grep narrows).
-    fn line_output(&self) -> Option<LineSource> {
+    pub(crate) fn line_output(&self) -> Option<LineSource> {
         match self {
             Element::LogSession(e) => Some(e.line_source()),
             Element::LogFilter(e) => Some(e.source.clone()),
@@ -1206,8 +1539,18 @@ impl Element {
         };
         let (header_pod, header_container, header_since) =
             top.log_header().unwrap_or_default();
+        // Starts where the parent IS, not at zero: everything already
+        // evicted from the parent is unreachable, and claiming otherwise
+        // would be the silent-gap this design exists to remove.
+        let (cursor, cap) = {
+            let store = source.store();
+            (store.with_read(|i| i.evicted), store.max_lines())
+        };
         Ok(Element::LogFilter(LogFilter {
             source: source.narrowed(Arc::new(pattern)),
+            retained: LineStore::new(cap),
+            cursor,
+            lost_history: false,
             label,
             header_pod,
             header_container,
@@ -1216,14 +1559,10 @@ impl Element {
         }))
     }
 
-    /// Display identity for log views: (pod, container label, since label).
+    /// Display identity for log views: (target, container label, since label).
     pub fn log_header(&self) -> Option<(String, String, String)> {
         match self {
-            Element::LogSession(e) => Some((
-                e.target.pod.clone(),
-                e.target.container_label().to_string(),
-                e.spec.since.clone().unwrap_or_else(|| "tail".to_string()),
-            )),
+            Element::LogSession(e) => Some(e.header()),
             Element::LogFilter(e) => Some((
                 e.header_pod.clone(),
                 e.header_container.clone(),
@@ -1270,7 +1609,7 @@ impl Element {
     pub fn log_lines(&mut self) -> Option<(Arc<Vec<usize>>, Arc<LineStore>)> {
         let store = match self {
             Element::LogSession(e) => Arc::clone(&e.store),
-            Element::LogFilter(e) => Arc::clone(e.source.store()),
+            Element::LogFilter(e) => Arc::clone(&e.retained),
             _ => return None,
         };
         Some((self.log_visible()?, store))
@@ -1281,8 +1620,64 @@ impl Element {
     pub fn log_store(&self) -> Option<&Arc<LineStore>> {
         match self {
             Element::LogSession(e) => Some(&e.store),
+            // The filter's OWN store — what it renders, saves and copies.
+            Element::LogFilter(e) => Some(&e.retained),
+            _ => None,
+        }
+    }
+
+    /// The SESSION's store at the root of this log chain — the identity the
+    /// stream-owning element is found by (`with_log_session_of`,
+    /// `ensure_top_live`) and the one `ClearLogs` empties.
+    ///
+    /// Distinct from [`Self::log_store`] since a filter grew its own: those
+    /// routing walks compare `Arc::ptr_eq` against the session's store, and
+    /// handing them a filter's store would silently find nothing.
+    pub fn log_root_store(&self) -> Option<&Arc<LineStore>> {
+        match self {
+            Element::LogSession(e) => Some(&e.store),
             Element::LogFilter(e) => Some(e.source.store()),
             _ => None,
+        }
+    }
+
+    /// Whether this element is the `?` keybindings view — the one thing `?`
+    /// needs to know to toggle rather than stack a second copy.
+    pub fn is_keybindings_view(&self) -> bool {
+        // Asked of the RID, not the element kind: `/` over help derives a
+        // `RowFilter`, and that is still help. Testing the kind meant the
+        // first keystroke of the grep the redesign exists to provide turned
+        // the float full-screen and made the next `?` push a SECOND help
+        // instead of closing the one you were reading.
+        matches!(
+            self.rid(),
+            Some(crate::kube::protocol::ResourceId::Local(
+                crate::kube::local::LocalResourceKind::Keybinding
+            ))
+        )
+    }
+
+    /// How much of the frame this element claims — see [`ViewExtent`].
+    ///
+    /// EXHAUSTIVE on the kind axis, not a `_ => Full` wildcard: whether a new
+    /// view floats is a decision its author has to make, and the renderer
+    /// reads the answer from here rather than each view deciding for itself
+    /// (which is how the overlay slot used to leave stale content inside a
+    /// dialog's border).
+    pub fn extent(&self) -> ViewExtent {
+        match self {
+            // Help floats over the view it documents — you are consulting it
+            // ABOUT something, and that something should stay on screen.
+            _ if self.is_keybindings_view() => {
+                ViewExtent::Dialog { max_width: Size::Pct(80), max_height: Size::Pct(85) }
+            }
+            Element::ResourceList(_)
+            | Element::RowFilter(_)
+            | Element::DerivedRows(_)
+            | Element::Overview(_)
+            | Element::ContentView(_)
+            | Element::LogSession(_)
+            | Element::LogFilter(_) => ViewExtent::Full,
         }
     }
 
@@ -1302,23 +1697,31 @@ impl Element {
 
     /// The visible line indices for a log element — the ephemeral log
     /// view, derived on read, memoized on (store generation, draft).
-    /// Heals the element's scroll against ring evictions first.
+    ///
+    /// Scroll is NOT healed here, and deliberately: the position is a line
+    /// identity now ([`crate::app::viewport::LineAnchor`]), so eviction moves
+    /// nothing that needs repairing. This used to shift the viewport up by the
+    /// eviction COUNT — a logical number applied to a physical row offset, so
+    /// under wrap it under-corrected (the view crept toward the tail) and
+    /// under a filter it over-corrected by the match rate.
     pub fn log_visible(&mut self) -> Option<Arc<Vec<usize>>> {
         // Store, patterns AND view come out of ONE destructure. Fetching the
         // view separately meant asking a question this match had already
         // answered and unwrapping the reply — the Option-as-deferred-lookup
         // shape, which is only ever one refactor away from a panic.
-        let (source_patterns, store, view) = match self {
-            Element::LogSession(e) => (Vec::new(), Arc::clone(&e.store), &mut e.view),
-            Element::LogFilter(e) => {
-                (e.source.patterns.clone(), Arc::clone(e.source.store()), &mut e.view)
-            }
+        // A filter pulls from its parent FIRST, then reads only its own
+        // store. The committed chain has already been applied by the drain,
+        // so the derive below applies the DRAFT alone — which is why the
+        // draft gets no storage: it changes on every keystroke.
+        if let Element::LogFilter(e) = self {
+            e.drain_from_parent();
+        }
+        let (store, view) = match self {
+            Element::LogSession(e) => (Arc::clone(&e.store), &mut e.view),
+            Element::LogFilter(e) => (Arc::clone(&e.retained), &mut e.view),
             _ => return None,
         };
         let key = LogDeriveKey { generation: store.generation(), draft: view.draft.clone() };
-        // Scroll healing happens even on a cache hit (evictions bump the
-        // generation, so a hit implies no NEW evictions — but the first
-        // read after several is a miss; heal before deriving).
         if let Some((k, v)) = &view.cache {
             if *k == key {
                 return Some(Arc::clone(v));
@@ -1326,28 +1729,19 @@ impl Element {
         }
         let draft = view.draft.clone().filter(|d| !d.is_empty()).map(|d| SearchPattern::new(&d));
         let indices = store.with_read(|inner| {
-            // Heal the scroll offset for lines evicted since this element last
-            // looked (best-effort: logical evicted-count vs physical offset —
-            // re-clamped next frame; see `Viewport::shift_up`).
-            let newly_evicted = inner.evicted.saturating_sub(view.evicted_seen);
-            if newly_evicted > 0 && !view.viewport.following() {
-                view.viewport.shift_up(newly_evicted as usize);
-            }
-            view.evicted_seen = inner.evicted;
-            if source_patterns.is_empty() && draft.is_none() {
-                (0..inner.lines.len()).collect::<Vec<usize>>()
-            } else {
-                (0..inner.lines.len())
+            // The DRAFT only. Committed patterns were applied by the drain
+            // when these lines were retained, so re-testing them here would
+            // be doing the same work a second time on every frame — which is
+            // exactly what this used to do.
+            match &draft {
+                None => (0..inner.lines.len()).collect::<Vec<usize>>(),
+                Some(d) => (0..inner.lines.len())
                     .filter(|&i| {
-                        let line = &inner.lines[i];
-                        let hit = |p: &SearchPattern| {
-                            p.is_match(&line.content)
-                                || line.container.as_deref().is_some_and(|c| p.is_match(c))
-                        };
-                        source_patterns.iter().all(|p| hit(p.pattern()))
-                            && draft.as_ref().is_none_or(hit)
+                        crate::kube::protocol::segments(&inner.lines[i])
+                            .filter(|(role, ..)| role.searchable())
+                            .any(|(_, text, _)| d.is_match(text))
                     })
-                    .collect()
+                    .collect(),
             }
         });
         let indices = Arc::new(indices);
@@ -1647,7 +2041,7 @@ impl Element {
     /// exists (the memo is dropped on cover, absent on new elements).
     /// Mirrors `view()`'s per-kind data plumbing minus presentation,
     /// which never affects row order. `None` for non-table kinds.
-    fn derive_selection_keys(&self) -> Option<Vec<ObjectKey>> {
+    pub(crate) fn derive_selection_keys(&self) -> Option<Vec<ObjectKey>> {
         use crate::app::store::derive_key_order;
         let it = self.table_interaction()?;
         let draft = compile_draft(&it.filter_input);
@@ -1847,13 +2241,58 @@ impl Element {
 
     // -- Marks -------------------------------------------------------------------
     //
-    // Markable = store-backed (ResourceList / RowFilter): the kinds whose
-    // marks live where row mutations are applied (pruned atomically with
-    // removals) and can feed batch operations. DerivedRows deliberately
-    // does NOT mark: its projected rows have no backing store, so a local
-    // set could never be pruned by data (dead keys forever) and no batch
-    // consumer exists — the future Aggregate feature gets to design
-    // container marks together with their consumer.
+    // Marks live in one of two places, and WHICH is a property of where the
+    // rows come from rather than a choice:
+    //
+    // - A store-backed list (ResourceList / RowFilter) keys its marks on the
+    //   shared `RowStore`. That is what lets a filter hide a row from view
+    //   without dropping it from the selection, and what prunes a mark
+    //   atomically with the delta that removes its row.
+    // - A PROJECTION (DerivedRows) has no such store — its rows are derived
+    //   from one parent row, per frame — so it owns its marks, and they die
+    //   with the element, which is exactly the lifetime its rows have. The
+    //   prune that can't happen is replaced by an intersection at READ time
+    //   (`live_keys`), so a container that vanished leaves no mark anyone
+    //   can observe.
+
+    /// The keys a PROJECTION currently yields, independent of any filter or
+    /// painted frame — the set its marks are meaningful against.
+    ///
+    /// Identity here is `(namespace, name)`, for the parent and the projected
+    /// rows alike, because that is all a `ResourceRow` carries. So if the
+    /// parent pod is deleted and recreated under the same name while this
+    /// view is open, a mark on `app` re-attaches to the new pod's `app`.
+    /// That is deliberate rather than overlooked: the element's own origin is
+    /// name-keyed too, so the view is already showing the new pod — a
+    /// selection that followed the object instead of the name would have to
+    /// empty itself under a table that visibly still has rows.
+    fn projected_keys(&self) -> Vec<ObjectKey> {
+        let Element::DerivedRows(e) = self else { return Vec::new() };
+        e.source.store().with_read(|inner| {
+            inner
+                .rows
+                .iter()
+                .find(|r| crate::app::store::row_matches_key(r, &e.key))
+                .map(|parent| {
+                    e.kind
+                        .project(parent)
+                        .iter()
+                        .map(crate::app::store::row_key)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// The keys this element currently offers, in view order: the last
+    /// PAINTED view when there is one, else a fresh derive of the same —
+    /// the totality contract `selected_key` uses.
+    fn live_keys(&self) -> Vec<ObjectKey> {
+        match self.table_interaction().and_then(|i| i.cached_view()) {
+            Some(view) => view.keys.clone(),
+            None => self.derive_selection_keys().unwrap_or_default(),
+        }
+    }
 
     /// Whether marking rows here can lead to anything.
     ///
@@ -1864,13 +2303,23 @@ impl Element {
     /// blocked `Enter`, the picker's only function, on the one screen a
     /// first-run user is forced onto.
     pub fn markable(&self) -> bool {
-        if !matches!(self, Element::ResourceList(_) | Element::RowFilter(_)) {
-            return false;
+        // Any BATCH-CAPABLE operation makes marking meaningful, not just the
+        // per-item ones: containers declare no Delete and no Restart, and
+        // their marks exist entirely to say which containers the ONE merged
+        // log stream is over.
+        fn feeds_a_batch(ops: &[crate::kube::protocol::OperationKind]) -> bool {
+            ops.iter().any(|op| {
+                !matches!(op.batch_support(), crate::kube::protocol::BatchSupport::SingleOnly)
+            })
         }
-        let Some(rid) = self.rid() else { return false };
-        rid.capabilities().operations.iter().any(|op| {
-            matches!(op.batch_support(), crate::kube::protocol::BatchSupport::PerItem)
-        })
+        match self {
+            Element::ResourceList(_) | Element::RowFilter(_) => match self.rid() {
+                Some(rid) => feeds_a_batch(&rid.capabilities().operations),
+                None => false,
+            },
+            Element::DerivedRows(e) => feeds_a_batch(&e.kind.operations()),
+            _ => false,
+        }
     }
 
     /// Toggle the mark on the row under the cursor.
@@ -1879,6 +2328,14 @@ impl Element {
             return MarkOutcome::Unsupported;
         }
         let Some(key) = self.selected_key() else { return MarkOutcome::RowGone };
+        if let Element::DerivedRows(e) = self {
+            // The key came from a row that exists right now, so there is no
+            // "row gone" case to distinguish here.
+            if !e.marked.remove(&key) {
+                e.marked.insert(key);
+            }
+            return MarkOutcome::Toggled;
+        }
         let Some(store) = self.data_store() else { return MarkOutcome::Unsupported };
         match store.toggle_mark(&key) {
             Some(_) => MarkOutcome::Toggled,
@@ -1897,12 +2354,7 @@ impl Element {
         if !self.markable() {
             return SpanOutcome::Unsupported;
         }
-        // Same totality contract as `selected_key`: the last painted
-        // view's order when one exists, else a fresh derive of the same.
-        let keys: Vec<ObjectKey> = match self.table_interaction().and_then(|i| i.cached_view()) {
-            Some(view) => view.keys.clone(),
-            None => self.derive_selection_keys().unwrap_or_default(),
-        };
+        let keys = self.live_keys();
         if keys.is_empty() {
             return SpanOutcome::NoAnchor;
         }
@@ -1911,9 +2363,10 @@ impl Element {
             return SpanOutcome::NoAnchor;
         };
         let marked = self.marked_snapshot();
-        let Some(store) = self.data_store() else { return SpanOutcome::Unsupported };
 
-        if marked.contains(&keys[current]) {
+        // Which rows the span covers is decided identically either way; only
+        // the write differs.
+        let span = if marked.contains(&keys[current]) {
             // Unmark the contiguous marked block around the cursor.
             let mut start = current;
             while start > 0 && marked.contains(&keys[start - 1]) {
@@ -1923,25 +2376,48 @@ impl Element {
             while end + 1 < keys.len() && marked.contains(&keys[end + 1]) {
                 end += 1;
             }
-            store.unmark_keys(keys[start..=end].iter());
+            Err(start..=end)
+        } else {
+            // Span needs a VISIBLE anchor. With none — no marks at all, or
+            // marks that this element's filter hides — refuse: falling back
+            // to row 0 would silently bulk-mark from the top of the view and
+            // grow an invisible marked set as a side effect of a miss.
+            let Some(anchor) = keys
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| marked.contains(*k))
+                .map(|(pos, _)| pos)
+                .min_by_key(|&pos| (pos as isize - current as isize).unsigned_abs())
+            else {
+                return SpanOutcome::NoAnchor;
+            };
+            Ok(if anchor <= current { anchor..=current } else { current..=anchor })
+        };
+
+        if let Element::DerivedRows(_) = self {
+            // Filtered to rows the projection actually yields, mirroring the
+            // store side's `mark_keys` (which intersects with present rows
+            // and says why). Extending straight from the painted view banked
+            // keys that no longer had a row behind them.
+            let present: HashSet<ObjectKey> = self.projected_keys().into_iter().collect();
+            let Element::DerivedRows(e) = self else { unreachable!("matched above") };
+            match span {
+                Ok(add) => {
+                    e.marked.extend(keys[add].iter().filter(|k| present.contains(*k)).cloned())
+                }
+                Err(remove) => {
+                    for k in &keys[remove] {
+                        e.marked.remove(k);
+                    }
+                }
+            }
             return SpanOutcome::Applied;
         }
-
-        // Span needs a VISIBLE anchor. With none — no marks at all, or
-        // marks that this element's filter hides — refuse: falling back
-        // to row 0 would silently bulk-mark from the top of the view and
-        // grow an invisible marked set as a side effect of a miss.
-        let Some(anchor) = keys
-            .iter()
-            .enumerate()
-            .filter(|(_, k)| marked.contains(*k))
-            .map(|(pos, _)| pos)
-            .min_by_key(|&pos| (pos as isize - current as isize).unsigned_abs())
-        else {
-            return SpanOutcome::NoAnchor;
-        };
-        let (start, end) = if anchor <= current { (anchor, current) } else { (current, anchor) };
-        store.mark_keys(keys[start..=end].iter().cloned());
+        let Some(store) = self.data_store() else { return SpanOutcome::Unsupported };
+        match span {
+            Ok(add) => store.mark_keys(keys[add].iter().cloned()),
+            Err(remove) => store.unmark_keys(keys[remove].iter()),
+        }
         SpanOutcome::Applied
     }
 
@@ -1952,21 +2428,49 @@ impl Element {
         if !self.markable() {
             return false;
         }
-        if let Some(store) = self.data_store() {
-            store.clear_marks();
+        match self {
+            Element::DerivedRows(e) => e.marked.clear(),
+            _ => {
+                if let Some(store) = self.data_store() {
+                    store.clear_marks();
+                }
+            }
+        }
+        // A DELIBERATE clear is not a stale frame. Without this, `Ctrl-\`
+        // then `Ctrl-D` inside one key-drain (up to 200 keys between paints)
+        // hit the select-mode race guard and answered "Selection changed —
+        // the marked rows are gone (nothing was done)" to a user who had just
+        // cleared them on purpose. The guard exists for marks that vanished
+        // ASYNCHRONOUSLY; this is the one path that empties them synchronously.
+        if let Some(it) = self.table_interaction_mut() {
+            it.rendered_select_mode = false;
         }
         true
     }
 
     pub fn has_marks(&self) -> bool {
-        self.markable() && self.data_store().map(|s| s.has_marks()).unwrap_or(false)
+        if !self.markable() {
+            return false;
+        }
+        match self {
+            // Cheapest honest answer: a projection's marks are only real
+            // where a row still backs them.
+            Element::DerivedRows(_) => !self.marked_snapshot().is_empty(),
+            _ => self.data_store().map(|s| s.has_marks()).unwrap_or(false),
+        }
     }
 
     pub fn marked_keys(&self) -> Vec<ObjectKey> {
         if !self.markable() {
             return Vec::new();
         }
-        self.data_store().map(|s| s.marked_keys()).unwrap_or_default()
+        match self {
+            Element::DerivedRows(_) => {
+                let marked = self.marked_snapshot();
+                self.live_keys().into_iter().filter(|k| marked.contains(k)).collect()
+            }
+            _ => self.data_store().map(|s| s.marked_keys()).unwrap_or_default(),
+        }
     }
 
     /// Marked count without cloning the set (for the `[N selected]`
@@ -1976,7 +2480,10 @@ impl Element {
         if !self.markable() {
             return 0;
         }
-        self.data_store().map(|s| s.with_read(|i| i.marked_count())).unwrap_or(0)
+        match self {
+            Element::DerivedRows(_) => self.marked_snapshot().len(),
+            _ => self.data_store().map(|s| s.with_read(|i| i.marked_count())).unwrap_or(0),
+        }
     }
 
     /// Marks for render-time row styling (cloned — small sets, per-frame).
@@ -1984,9 +2491,30 @@ impl Element {
         if !self.markable() {
             return HashSet::new();
         }
-        self.data_store()
-            .map(|s| s.with_read(|i| i.marked().clone()))
-            .unwrap_or_default()
+        match self {
+            // A projection's marks are intersected with the rows it
+            // currently yields: there is no delta to prune them, so a
+            // container that disappeared must simply stop counting.
+            //
+            // Against the PROJECTION, not the painted view. `live_keys()` is
+            // the last painted order, which has the draft filter applied — so
+            // typing `/c0` while two containers were marked silently dropped
+            // the other one from the selection, and typing a draft that
+            // matched neither ended select mode outright. A filter hides rows
+            // from view; it does not deselect them. That is the rule the
+            // store-backed side has always followed.
+            Element::DerivedRows(e) => {
+                if e.marked.is_empty() {
+                    return HashSet::new();
+                }
+                let live: HashSet<ObjectKey> = self.projected_keys().into_iter().collect();
+                e.marked.intersection(&live).cloned().collect()
+            }
+            _ => self
+                .data_store()
+                .map(|s| s.with_read(|i| i.marked().clone()))
+                .unwrap_or_default(),
+        }
     }
 
     /// Recently-changed rows for flash styling (identity → change time).
@@ -2003,27 +2531,47 @@ impl Element {
     // -- Sort ----------------------------------------------------------------
 
     /// Toggle sort on a target column (same column → flip direction).
-    pub fn sort_by(&mut self, target: crate::app::SortTarget) {
+    ///
+    /// Returns `false` when the target does not exist in THIS table — a
+    /// semantic target names a header, and not every table has every header.
+    /// Refusing is the honest answer: the previous positional guess always
+    /// found *a* column, which is why `N` silently sorted Events by TYPE.
+    pub fn sort_by(&mut self, target: crate::app::SortTarget) -> bool {
         let col = match target {
             crate::app::SortTarget::Column(c) => c,
-            crate::app::SortTarget::Last => match self.data_store() {
-                Some(store) => store.with_read(|i| {
-                    i.rows.first().map(|r| r.cells.len().saturating_sub(1)).unwrap_or(0)
-                }),
-                None => 0,
+            // Resolved HERE, not at key-mapping time. `selected_data_col`
+            // reads the last painted view, which is cold on a fresh element
+            // and dropped on cover — and keys are drained in a batch with no
+            // paint between them, so `Enter` then `S` used to map to no
+            // action at all and the key simply vanished. By dispatch the
+            // action layer has warmed the view, exactly as `~` relies on.
+            crate::app::SortTarget::CursorColumn => match self.selected_data_col() {
+                Some((c, _)) => c,
+                None => return false,
             },
+            crate::app::SortTarget::Named(header) => {
+                match self
+                    .headers_snapshot()
+                    .iter()
+                    .position(|h| h.eq_ignore_ascii_case(header))
+                {
+                    Some(c) => c,
+                    None => return false,
+                }
+            }
         };
-        let Some(it) = self.table_interaction_mut() else { return };
+        let Some(it) = self.table_interaction_mut() else { return false };
         if it.sort.col == col {
             it.sort.ascending = !it.sort.ascending;
         } else {
             it.sort = SortSpec { col, ascending: true };
         }
+        true
     }
 
     pub fn toggle_sort(&mut self) {
         let Some(col) = self.table_interaction().map(|i| i.sort.col) else { return };
-        self.sort_by(crate::app::SortTarget::Column(col));
+        let _ = self.sort_by(crate::app::SortTarget::Column(col));
     }
 
     // -- Liveness ----------------------------------------------------------------

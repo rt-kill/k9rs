@@ -57,14 +57,36 @@ pub(super) async fn build_session_client(
     };
 
     // `Client::try_from` eagerly runs the exec credential plugin, which kube-rs
-    // executes as a *synchronous* subprocess (`Command::output`). Run it on a
-    // blocking thread so a slow `aws eks get-token` can't stall an async worker.
+    // executes as a *synchronous* subprocess (`Command::output`) — a blocking
+    // `waitpid` with no timeout, on a child kube-rs owns. Run it on a blocking
+    // thread so a slow `aws eks get-token` can't stall an async worker.
+    //
+    // BOUNDED, because that child is the one process in the daemon no `Drop`
+    // of ours can reach. An interactive plugin (`kubelogin --grant-type=
+    // authcode`, device-code flows) that opens a browser and waits blocks its
+    // thread forever; the caller holds one of
+    // `MAX_CONCURRENT_CLIENT_BUILDS` semaphore permits while it does, and the
+    // TUI's reconnect backoff re-tries — so eight wedged plugins starve every
+    // future session on every context, and only `pkill` recovers. A timeout
+    // downgrades that to one leaked thread and an actionable message.
+    //
+    // (The thread itself cannot be cancelled — a blocking closure has no
+    // cancellation point — which is why `run_daemon` also bounds runtime
+    // shutdown rather than waiting on it.)
+    const CLIENT_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
     let client = {
         let config = config.clone();
-        tokio::task::spawn_blocking(move || kube::Client::try_from(config))
-            .await
-            .map_err(|e| anyhow::anyhow!("client build task panicked: {}", e))?
-            .map_err(summarize_client_error)?
+        let handle = tokio::task::spawn_blocking(move || kube::Client::try_from(config));
+        match tokio::time::timeout(CLIENT_BUILD_TIMEOUT, handle).await {
+            Ok(joined) => joined
+                .map_err(|e| anyhow::anyhow!("client build task panicked: {}", e))?
+                .map_err(summarize_client_error)?,
+            Err(_) => anyhow::bail!(
+                "credential plugin did not finish within {}s — if it needs a browser \
+                 or a prompt, run it once outside k9rs to cache the token",
+                CLIENT_BUILD_TIMEOUT.as_secs(),
+            ),
+        }
     };
     Ok((client, config))
 }

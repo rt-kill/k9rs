@@ -5,9 +5,8 @@ use crate::app::{App, Overlay};
 use crate::app::element::Element;
 #[cfg(test)]
 use crate::app::nav::rid;
-#[cfg(test)]
-use crate::app::ContainerRef;
 use crate::kube::protocol::OperationKind;
+use super::keymap::ViewClass;
 
 /// The chord of a key event, if it is a character key (Ctrl tracked,
 /// Shift riding in the character's case, Alt chords excluded — an
@@ -82,7 +81,6 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
             };
         }
         Some(Overlay::ContainerSelect { .. }) => return handle_container_select_keys(key),
-        Some(Overlay::Help { .. }) => return handle_help_view_keys(key),
         None => {}
     }
 
@@ -108,13 +106,14 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     // Per-kind keys: EXHAUSTIVE over the top element — adding a kind
     // forces a decision here.
     // -----------------------------------------------------------------------
-    match app.nav.top() {
-        Element::Overview(_) => handle_overview_keys(key),
-        Element::ResourceList(_) | Element::RowFilter(_) | Element::DerivedRows(_) => {
-            handle_resource_view_keys(app, key)
-        }
-        Element::ContentView(_) => handle_detail_view_keys(key),
-        Element::LogSession(_) | Element::LogFilter(_) => handle_log_view_keys(app, key),
+    // The class mapping lives in `keymap::ViewClass::of`, so the keymap that
+    // RUNS and the keymap that is DOCUMENTED are the same partition of the
+    // element kinds — help cannot describe a view it isn't dispatching for.
+    match super::keymap::ViewClass::of(app.nav.top()) {
+        ViewClass::Overview => handle_overview_keys(key),
+        ViewClass::Table => handle_resource_view_keys(app, key),
+        ViewClass::Detail => handle_detail_view_keys(key),
+        ViewClass::Log => handle_log_view_keys(app, key),
     }
 }
 
@@ -328,6 +327,9 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // UsedBy (U). Shows which resources reference the selected row.
         KeyCode::Char('U') => Some(Action::UsedBy),
 
+        // Events (E). The events ABOUT the selected row.
+        KeyCode::Char('E') => Some(Action::ShowEvents),
+
         // Column-restricted grep: filter by hovered column only.
         KeyCode::Char('~') => Some(Action::ColumnFilter),
 
@@ -337,25 +339,22 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Sort by current column (toggle direction).
         KeyCode::Char('O') => Some(Action::ToggleSortDirection),
 
-        // Sort by NAME: column 0 for cluster-scoped (no NAMESPACE column),
-        // column 1 for namespaced resources.
+        // Sort by NAME / AGE — BY NAME, resolved against the live headers.
+        // These used to be positional guesses (0-or-1 from a boolean, and
+        // "the last column"), which were wrong on any table whose shape
+        // didn't match the assumption. See `SortTarget::Named`.
         KeyCode::Char('N') => {
-            let col = if app.current_tab_is_cluster_scoped() { 0 } else { 1 };
-            Some(Action::Sort(crate::app::SortTarget::Column(col)))
+            Some(Action::Sort(crate::app::SortTarget::Named(crate::app::actions::COL_NAME)))
         }
-
-        // Sort by AGE (last column — resolved at apply time).
-        KeyCode::Char('A') => Some(Action::Sort(crate::app::SortTarget::Last)),
+        KeyCode::Char('A') => {
+            Some(Action::Sort(crate::app::SortTarget::Named(crate::app::actions::COL_AGE)))
+        }
 
         // Sort by the currently selected (cursor) column — works in every table
         // view. Repeats toggle direction (sort_by_column handles that). Uses the
         // DATA index (sort indexes the full cells array), translating from the
         // cursor's visible index so hidden columns don't shift the target.
-        KeyCode::Char('S') => app
-            .nav
-            .top()
-            .selected_data_col()
-            .map(|(col, _header)| Action::Sort(crate::app::SortTarget::Column(col))),
+        KeyCode::Char('S') => Some(Action::Sort(crate::app::SortTarget::CursorColumn)),
 
         // Copy.
         KeyCode::Char('c') => Some(Action::Copy),
@@ -420,7 +419,7 @@ fn handle_detail_view_keys(key: KeyEvent) -> Option<Action> {
 // Log view
 // ---------------------------------------------------------------------------
 
-fn handle_log_view_keys(_app: &App, key: KeyEvent) -> Option<Action> {
+fn handle_log_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
     // Shift-C: clear logs.
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Char('C') {
         return Some(Action::ClearLogs);
@@ -430,6 +429,22 @@ fn handle_log_view_keys(_app: &App, key: KeyEvent) -> Option<Action> {
     // (Ctrl-Q would otherwise alias to 'q' → Back, etc.).
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return None;
+    }
+
+    // Configured column bindings, same chords the table honours — this is
+    // what makes `colLeft`/`colRight` a property of the ACTION rather than
+    // of one view. Checked before the literals below so a rebind shadows
+    // them, exactly as it does on a table.
+    if let Some(combo) = combo_of(&key) {
+        if app.config.keys.col_left == Some(combo) {
+            return Some(Action::ColLeft);
+        }
+        if app.config.keys.col_right == Some(combo) {
+            return Some(Action::ColRight);
+        }
+        if app.config.keys.col_first == Some(combo) {
+            return Some(Action::ColFirst);
+        }
     }
 
     match key.code {
@@ -451,7 +466,23 @@ fn handle_log_view_keys(_app: &App, key: KeyEvent) -> Option<Action> {
         // Log-specific toggles.
         KeyCode::Char('s') => Some(Action::ToggleLogFollow),
         KeyCode::Char('w') => Some(Action::ToggleLogWrap),
+        // One key, whole cycle — see `Role::SHED_ORDER`.
         KeyCode::Char('t') => Some(Action::ToggleLogTimestamps),
+
+        // Horizontal pan. `ColLeft`/`ColRight` are the SAME actions the
+        // tables use for their column cursor — one intent, answered by each
+        // element in its own units. `p` hides the prefix; this reads past it,
+        // and past the right edge of a long line without turning wrap on.
+        // `ColFirst` is the way back: undoing a 400-column pan at a quarter
+        // of a screen per press is twenty keystrokes.
+        KeyCode::Left | KeyCode::Char('h') => Some(Action::ColLeft),
+        KeyCode::Right | KeyCode::Char('l') => Some(Action::ColRight),
+        // vim's own shape: `h`/`l` a column at a time, `^`/`$` the ends,
+        // `H`/`L` a stride in between.
+        KeyCode::Char('^') => Some(Action::ColFirst),
+        KeyCode::Char('$') => Some(Action::ColLast),
+        KeyCode::Char('H') => Some(Action::PageLeft),
+        KeyCode::Char('L') => Some(Action::PageRight),
 
         // Copy.
         KeyCode::Char('c') => Some(Action::Copy),
@@ -471,20 +502,6 @@ fn handle_log_view_keys(_app: &App, key: KeyEvent) -> Option<Action> {
 
 // ---------------------------------------------------------------------------
 // Help view
-// ---------------------------------------------------------------------------
-
-fn handle_help_view_keys(key: KeyEvent) -> Option<Action> {
-    match key.code {
-        // `q` or Esc in help view goes back.
-        KeyCode::Char('q') | KeyCode::Esc => Some(Action::Back),
-
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::NextItem),
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::PrevItem),
-        KeyCode::PageDown => Some(Action::PageDown),
-        KeyCode::PageUp => Some(Action::PageUp),
-        _ => None,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Context selector

@@ -6,7 +6,7 @@ fn cfg(name: &str, headers: &[&str], keys: &[&str]) -> ExecSourceConfig {
         name: name.to_string(),
         command: "echo".to_string(),
         args: vec![],
-        poll_interval_secs: 30,
+        poll_interval_secs: std::num::NonZeroU64::new(30).unwrap(),
         headers: headers.iter().map(|s| s.to_string()).collect(),
         json_field_keys: keys.iter().map(|s| s.to_string()).collect(),
     }

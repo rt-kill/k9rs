@@ -12,7 +12,7 @@ pub use dialog::{ConfirmDialogWidget, FormDialogWidget};
 pub use modal::{ModalOverlay, DialogSize};
 pub use filter::{FilterBar, LogFilterBar};
 pub use flash::FlashWidget;
-pub use help::HelpOverlay;
+pub use help::HelpContent;
 pub use log_view::{LogViewer, LogViewState};
 pub use table::{ResourceTable, ResourceTableState};
 pub use tabs::TabBar;

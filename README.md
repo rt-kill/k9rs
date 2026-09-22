@@ -7,7 +7,7 @@ A Kubernetes TUI written in Rust, inspired by [k9s](https://k9scli.io/).
 - Browse and manage Kubernetes resources (pods, deployments, services, nodes, CRDs, etc.)
 - Real-time streaming with automatic refresh
 - Describe, YAML view, edit, delete, scale, restart, port-forward, shell
-- Log streaming with filtering, timestamps, and wrap mode
+- Log streaming with filtering, timestamps, wrap mode and horizontal panning
 - Drill-down navigation (deployment → pods → containers → logs)
 - Context and namespace switching
 - k9s-compatible skin/theme support
@@ -94,7 +94,6 @@ k9rs:
                                #   overrides this for one run.
     skin: dracula              # skin name (loads from skins/ directory);
                                #   layers on top of the chosen theme
-    pageScrollLines: 40        # lines per PageUp/PageDown
     maxColumnWidth: 64         # max column width before truncation
     commandHistorySize: 50     # max : command history entries
     changeHighlightSecs: 5     # row change highlight duration
@@ -106,15 +105,26 @@ k9rs:
       errorSecs: 10            # error message duration
     logs:
       maxLines: 50000          # log buffer size
-      tailLines: 500           # lines fetched on log open
+      tailLines: 100           # lines fetched on log open
       defaultFollow: true      # auto-scroll logs
-      defaultTimestamps: true  # show timestamps
-      defaultWrap: false       # wrap long lines
+      defaultWrap: false       # wrap long lines (`w`)
+      defaultFields: source    # per-line fields to start on; `t` cycles them.
+                               #   all     = timestamp + source tag + message
+                               #   source  = source tag + message
+                               #   message = message only
 
   # Daemon tuning
   daemon:
     watcherPageSize: 1000      # K8s LIST pagination batch
     discoveryRefreshSecs: 300  # CRD/namespace discovery poll interval
+    fanoutRing: 64             # delta batches buffered per watcher
+    watcherGraceSecs: 60       # keep a watcher warm this long after the last viewer leaves
+    localsGraceSecs: 1800      # keep a context's PORT-FORWARDS alive this long after its
+                               # last session detaches. Deliberately much longer than
+                               # watcherGraceSecs: a warm watcher is a cache (costs a row
+                               # store + an apiserver watch, buys back a re-LIST), whereas a
+                               # port-forward is something you asked for and would have to
+                               # notice dying and recreate.
     backoff:
       initialMs: 300           # watcher retry start
       maxMs: 30000             # max single retry sleep

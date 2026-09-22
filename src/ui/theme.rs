@@ -535,6 +535,10 @@ pub struct Theme {
 
     // Filter
     pub filter: Style,
+    /// The `[literal: …]` chip: a pattern that couldn't compile and is
+    /// matching as plain text. Yellow — it's a warning about the pattern,
+    /// not an error about the data.
+    pub filter_degraded: Style,
 
     // Flash
     pub flash_info: Style,
@@ -695,6 +699,9 @@ impl Theme {
             // Filter prompt
             filter: Style::default()
                 .fg(p.blue),
+            filter_degraded: Style::default()
+                .fg(p.yellow)
+                .add_modifier(Modifier::BOLD),
 
             // Flash messages
             flash_info: Style::default()

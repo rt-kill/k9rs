@@ -97,7 +97,7 @@ use ratatui::Frame;
 
 use crate::app::element::Element;
 use crate::app::{App, Overlay};
-use crate::ui::widgets::{ConfirmDialogWidget, FormDialogWidget, FilterBar, FlashWidget, HelpOverlay};
+use crate::ui::widgets::{ConfirmDialogWidget, FormDialogWidget, FilterBar, FlashWidget};
 
 /// Main UI draw function.
 ///
@@ -106,21 +106,35 @@ use crate::ui::widgets::{ConfirmDialogWidget, FormDialogWidget, FilterBar, Flash
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    match app.nav.top() {
-        Element::Overview(_) => {
-            views::overview::draw_overview(f, app, area);
+    // A FLOATING element is drawn over the view beneath it, so that view is
+    // painted first — and its box is `Clear`ed before the float lands, so a
+    // view that paints only chrome can't leave the parent inside its border.
+    // Driven by the element's OWN declared extent, the same rule the overlay
+    // slot follows, so neither the erase nor the parent paint can be
+    // forgotten by an individual view.
+    let area = match app.nav.top().extent() {
+        crate::app::element::ViewExtent::Full => area,
+        crate::app::element::ViewExtent::Dialog { max_width, max_height } => {
+            if let Some(float) = app.nav.lift_top_for_render() {
+                draw_top_element(f, app, area);
+                app.nav.replace_lifted(float);
+            }
+            let box_area = centered_rect(
+                area,
+                max_width.resolve(area.width),
+                max_height.resolve(area.height),
+            );
+            f.render_widget(Clear, box_area);
+            // Clear only resets to the TERMINAL default, which is why the
+            // float had no background of its own and read as a hole punched
+            // in the view rather than a sheet laid over it. The old overlay
+            // renderer called this; the element path did not inherit it.
+            fill_dialog_bg(f.buffer_mut(), box_area, &app.ui.theme);
+            box_area
         }
-        Element::ResourceList(_) | Element::RowFilter(_) | Element::DerivedRows(_) => {
-            views::resource::draw_resources(f, app, area);
-        }
-        Element::ContentView(cv) => match cv.kind {
-            crate::app::element::ContentSpec::Yaml(_) => views::yaml::draw_yaml(f, app, area),
-            _ => views::describe::draw_describe(f, app, area),
-        },
-        Element::LogSession(_) | Element::LogFilter(_) => {
-            views::log::draw_logs(f, app, area);
-        }
-    }
+    };
+
+    draw_top_element(f, app, area);
 
     // An overlay that claims the whole frame gets an ERASED frame. The view
     // above still painted (it publishes the render geometry and the
@@ -132,16 +146,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, area);
     }
 
-    // The single modal slot, over whatever view is showing. Help renders first
-    // — it needs &mut App to publish its scroll extent to the viewport; the
-    // shared match below handles the other (immutable) overlays.
-    if matches!(app.ui.overlay(), Some(Overlay::Help { .. })) {
-        draw_help_overlay(f, app);
-    }
+    // The single modal slot, over whatever view is showing.
     match &app.ui.overlay() {
-        Some(Overlay::Help { .. }) => {}
-        Some(Overlay::ContainerSelect { target, containers, selected, .. }) => {
-            let names: Vec<String> = containers.iter().map(|ci| ci.display_name()).collect();
+        Some(Overlay::ContainerSelect { target, choices, selected, .. }) => {
+            let names: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
             let target = target.clone();
             let sel = *selected;
             draw_container_select(f, app, &target, &names, sel);
@@ -176,6 +184,27 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
     }
 
+    // WHO DRAWS THE MODAL SLOT — exhaustive, so a new variant breaks the
+    // build here instead of silently painting nothing.
+    //
+    // Each arm names the call that renders it; every one of those calls
+    // re-asks its own accessor further down, which is why this match can be
+    // empty. That indirection is exactly the problem it guards: `Overlay`
+    // has a wildcard-free dispatch in four places, `Modal` itself had one in
+    // none, so a fifth variant would have been invisible on screen AND
+    // unable to capture a key (see `try_handle_input_mode`'s fall-through).
+    match app.ui.modal() {
+        // draw_command_overlay below, or inline for the table kinds.
+        crate::app::Modal::Command { .. } => {}
+        // draw_confirm_dialog below.
+        crate::app::Modal::Confirm(_) => {}
+        // draw_form_dialog below.
+        crate::app::Modal::Form(_) => {}
+        // The overlay match above.
+        crate::app::Modal::Overlay(_) => {}
+        crate::app::Modal::None => {}
+    }
+
     // Draw flash messages on top of everything
     draw_flash(f, app);
 
@@ -189,23 +218,26 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// Draw the help overlay on top of the current view.
-fn draw_help_overlay(f: &mut Frame, app: &mut App) {
-    let area = f.area();
-    let caps = app.current_capabilities();
-    let keys = app.config.keys;
-    // Publish the dialog extent so the viewport clamps. The widget owns the
-    // geometry (`HelpOverlay::inner_rows`) — nothing here to keep in sync.
-    let inner_rows = HelpOverlay::inner_rows(area.height);
-    let total = HelpOverlay::content_line_count(Some(&caps), keys);
-    let offset = if let Some(crate::app::Overlay::Help { viewport }) = app.ui.overlay_mut() {
-        viewport.set_metrics(total, inner_rows, false);
-        viewport.offset()
-    } else {
-        0
-    };
-    let help = HelpOverlay::new(&app.ui.theme, offset, Some(caps), keys);
-    f.render_widget(help, area);
+
+/// The per-kind view dispatch, EXHAUSTIVE over element kinds. Extracted so a
+/// floating element can invoke it twice — once for the view it floats over,
+/// once for itself — without either call learning that it is the one doing it.
+fn draw_top_element(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    match app.nav.top() {
+        Element::Overview(_) => {
+            views::overview::draw_overview(f, app, area);
+        }
+        Element::ResourceList(_) | Element::RowFilter(_) | Element::DerivedRows(_) => {
+            views::resource::draw_resources(f, app, area);
+        }
+        Element::ContentView(cv) => match cv.kind {
+            crate::app::element::ContentSpec::Yaml(_) => views::yaml::draw_yaml(f, app, area),
+            _ => views::describe::draw_describe(f, app, area),
+        },
+        Element::LogSession(_) | Element::LogFilter(_) => {
+            views::log::draw_logs(f, app, area);
+        }
+    }
 }
 
 /// Draw a single status line centered horizontally in the visible area.
@@ -436,13 +468,15 @@ fn draw_filter_overlay(f: &mut Frame, app: &App) {
 
     let counts = app.active_table_items_count();
     let match_count = if app.nav.top().filter_input().text().is_empty() { counts.total } else { counts.filtered };
+    let fallback = app.nav.top().grep_fallback();
     let filter_bar = FilterBar::new(
         app.nav.top().filter_input().active(),
         app.nav.top().filter_input().text(),
         match_count,
         counts.total,
         theme,
-    );
+    )
+    .fallback(fallback.as_deref());
     f.render_widget(filter_bar, overlay_area);
 }
 

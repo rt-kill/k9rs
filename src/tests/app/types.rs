@@ -156,8 +156,18 @@ mod modal {
         app.ui.open(Modal::Command { input: ":pods".into(), history_index: None });
         assert!(app.ui.command_input().is_some());
 
-        app.ui.open(Modal::Overlay(Overlay::Help {
-            viewport: crate::app::viewport::Viewport::default(),
+        app.ui.open(Modal::Overlay(Overlay::ContainerSelect {
+            target: crate::kube::protocol::ObjectRef::new(
+                crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                "p".to_string(),
+                crate::kube::protocol::Namespace::Named("default".to_string()),
+            ),
+            choices: vec![crate::app::ContainerChoice {
+                label: "web".into(),
+                container: crate::kube::protocol::LogContainer::Named("web".into()),
+            }],
+            selected: 0,
+            action: crate::app::ContainerAction::Logs,
         }));
         assert!(app.ui.overlay().is_some());
         assert!(
@@ -178,8 +188,18 @@ mod modal {
         let mut app = App::new_for_test();
         let opens: Vec<(&str, Modal)> = vec![
             ("command", Modal::Command { input: String::new(), history_index: None }),
-            ("overlay", Modal::Overlay(Overlay::Help {
-                viewport: crate::app::viewport::Viewport::default(),
+            ("overlay", Modal::Overlay(Overlay::ContainerSelect {
+                target: crate::kube::protocol::ObjectRef::new(
+                    crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                    "p".to_string(),
+                    crate::kube::protocol::Namespace::Named("default".to_string()),
+                ),
+                choices: vec![crate::app::ContainerChoice {
+                    label: "web".into(),
+                    container: crate::kube::protocol::LogContainer::Named("web".into()),
+                }],
+                selected: 0,
+                action: crate::app::ContainerAction::Logs,
             })),
         ];
         for (label, modal) in opens {
@@ -197,4 +217,121 @@ mod modal {
             );
         }
     }
+}
+
+/// `entries()` is what `validate()` walks for reserved-chord and duplicate
+/// checks, and it used to be a THIRD hand-written list parallel to the struct
+/// fields and to `op_override` — so a binding added to those two and missed
+/// here escaped both checks, in the function whose doc says the point is
+/// "a startup error, not a mystery". It is derived now; this pins that.
+#[test]
+fn every_bindable_operation_reaches_the_validator() {
+    use crate::kube::protocol::OperationKind as Op;
+
+    // Give every bindable operation an override, then assert each one shows
+    // up by name in the list `validate` sees.
+    let keys = KeysConfig {
+        describe: Some(KeyCombo::plain('1')),
+        yaml: Some(KeyCombo::plain('2')),
+        logs: Some(KeyCombo::plain('3')),
+        previous_logs: Some(KeyCombo::plain('4')),
+        shell: Some(KeyCombo::plain('5')),
+        restart: Some(KeyCombo::plain('6')),
+        scale: Some(KeyCombo::plain('7')),
+        delete: Some(KeyCombo::plain('8')),
+        force_kill: Some(KeyCombo::plain('9')),
+        port_forward: Some(KeyCombo::plain('A')),
+        show_node: Some(KeyCombo::plain('B')),
+        node_shell: Some(KeyCombo::plain('C')),
+        decode_secret: Some(KeyCombo::plain('D')),
+        trigger_cron_job: Some(KeyCombo::plain('E')),
+        toggle_suspend_cron_job: Some(KeyCombo::plain('F')),
+        ..Default::default()
+    };
+
+    let seen: Vec<&str> = keys.entries().into_iter().map(|(n, _)| n).collect();
+    for op in Op::BUILT_IN {
+        let Some(name) = op.config_key() else { continue };
+        assert!(
+            seen.contains(&name),
+            "{op:?} is bindable as `keys.{name}` but never reaches validate(): {seen:?}",
+        );
+    }
+}
+
+/// The view starts one shed level in: source tag and message, no timestamp.
+///
+/// Not two independent flags — `t` cycles ONE level, so the config names a
+/// point on that cycle. Two booleans were four combinations for three
+/// reachable states, and the fourth (a timestamp with no attribution) was
+/// something a config could ask for and no keypress could produce.
+///
+/// The reasons for the level are not symmetric, which is why this is pinned:
+/// the kubelet stamp is 31 of ~97 columns duplicating one the service prints
+/// itself, while a source tag only EXISTS on a multi-source stream and is
+/// then the one thing saying which replica spoke.
+#[test]
+fn the_log_view_starts_on_source_and_message() {
+    let cfg = crate::app::LogConfig::default();
+    assert_eq!(cfg.default_fields, crate::app::LogFields::Source);
+    assert_eq!(cfg.initial_shed(), 1);
+    use crate::kube::protocol::Role;
+    assert!(!Role::Timestamp.shown(cfg.initial_shed()), "the stamp is shed first");
+    assert!(Role::Source.shown(cfg.initial_shed()), "attribution survives it");
+}
+
+/// Every level of the cycle has a name a config can write. Adding a role to
+/// `SHED_ORDER` creates a state, and this fails until someone names it —
+/// which is the only thing stopping the config from being a stale parallel
+/// list of the roles.
+#[test]
+fn log_fields_covers_every_shed_level() {
+    use crate::app::LogFields;
+    use crate::kube::protocol::Role;
+    let named = [LogFields::All, LogFields::Source, LogFields::Message];
+    assert_eq!(
+        named.len(),
+        Role::levels(),
+        "a role was added to SHED_ORDER without naming the level it creates",
+    );
+    // …and the names map onto distinct, ordered levels.
+    let mut levels: Vec<usize> = named.iter().map(|f| f.shed()).collect();
+    let before = levels.clone();
+    levels.sort_unstable();
+    levels.dedup();
+    assert_eq!(levels.len(), named.len(), "two names for one level");
+    assert_eq!(before, levels, "the names are not in shed order");
+}
+
+/// The README's sample config must PARSE. Every config struct carries
+/// `deny_unknown_fields` and `load_config` returns `Err` rather than falling
+/// back to defaults — deliberately — so one stale key in the documented
+/// sample is not a doc nit, it is an app that refuses to start for anyone who
+/// copies it. The README carried `ui.pageScrollLines` for two months after
+/// the Viewport rework deleted the concept.
+///
+/// The prior version of this test fed only the `keys:` and `daemon:` blocks,
+/// so it pinned "the documented config shape" without ever parsing the `ui:`
+/// block that had the dead key in it.
+#[test]
+fn the_readme_sample_config_actually_parses() {
+    let readme = include_str!("../../../README.md");
+    let block = readme
+        .split("```yaml")
+        .nth(1)
+        .and_then(|b| b.split("```").next())
+        .expect("README has a yaml config block");
+    // The file is rooted at `k9rs:`; `load_section::<AppConfig>("")` reads
+    // that section, so the test parses the same shape the app does.
+    #[derive(serde::Deserialize)]
+    struct Root {
+        k9rs: AppConfig,
+    }
+    let cfg = serde_yaml::from_str::<Root>(block)
+        .unwrap_or_else(|e| panic!("the documented config is rejected by the app: {e}\n{block}"))
+        .k9rs;
+    // …and the values it advertises are the ones the app actually defaults to,
+    // where it claims to be showing defaults.
+    assert_eq!(cfg.ui.logs.tail_lines, LogConfig::default().tail_lines);
+    assert_eq!(cfg.ui.logs.default_fields, LogConfig::default().default_fields);
 }

@@ -75,6 +75,12 @@ pub fn context_label(app: &App) -> String {
 /// staging" above prod's cluster and user. The candidate carries the
 /// kubeconfig's own view of the target, which is the honest thing to show
 /// until the daemon confirms.
+/// How an unknown [`ClusterIdentity`](crate::kube::protocol::ClusterIdentity)
+/// field reads. Same word the table side uses — `CellValue::Placeholder`
+/// renders exactly this — so a context with no `user:` says the same thing
+/// wherever you look at it.
+pub const UNKNOWN_FIELD: &str = "n/a";
+
 pub fn display_identity(app: &App) -> &crate::kube::protocol::ClusterIdentity {
     match (
         crate::app::Liveness::of_link(&app.conn).shows_data(),
@@ -98,9 +104,9 @@ pub fn draw_header(
 
     let ctx = context_label(app);
     let id = display_identity(app);
-    let cluster = if id.cluster.is_empty() { "n/a" } else { &id.cluster };
-    let user = if id.user.is_empty() { "n/a" } else { &id.user };
-    let k8s_ver = if id.k8s_version.is_empty() { "n/a" } else { &id.k8s_version };
+    let cluster = id.cluster().unwrap_or(UNKNOWN_FIELD);
+    let user = id.user().unwrap_or(UNKNOWN_FIELD);
+    let k8s_ver = id.k8s_version().unwrap_or(UNKNOWN_FIELD);
 
     let logo_width = LOGO.iter().map(|l| l.len()).max().unwrap_or(0) as u16 + 2;
     let cols = Layout::horizontal([

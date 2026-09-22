@@ -221,12 +221,17 @@ impl FormFieldState {
 /// `YamlState` and `DescribeState`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContentViewState {
-    pub content: String,
+    /// PRIVATE, with `describe_lines` and `line_count`, because the three are
+    /// one fact in three shapes and only the two setters below keep them
+    /// agreeing. While they were `pub`, a single `state.content = x` left the
+    /// typed lines and the cached count stale — the same reason `UiState`
+    /// keeps its modal slot private.
+    content: String,
     /// Typed describe lines when this view is a structured *describe* (empty
     /// for YAML, aliases, and kubectl-fallback text). When non-empty the
     /// renderer styles by the producer's role tags instead of re-inferring
     /// structure from `content`.
-    pub describe_lines: Vec<crate::kube::protocol::DescribeLine>,
+    describe_lines: Vec<crate::kube::protocol::DescribeLine>,
     /// Vertical scroll relationship — content views never wrap, so one line is
     /// one row; the render publishes the extent back via `set_metrics`.
     pub viewport: crate::app::viewport::Viewport,
@@ -256,6 +261,16 @@ impl ContentViewState {
         self.content = crate::kube::protocol::describe_lines_text(&lines);
         self.line_count = lines.len();
         self.describe_lines = lines;
+    }
+
+    /// The flat text — search, scroll, clipboard and export all read this.
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// The typed lines, empty for the views that have none.
+    pub fn describe_lines(&self) -> &[crate::kube::protocol::DescribeLine] {
+        &self.describe_lines
     }
 
     /// Get the cached line count (O(1) instead of O(n)).

@@ -30,6 +30,17 @@ pub enum LocalResourceKind {
     /// `Custom`. (`local_resource_kind_wire_tags_are_stable` caught exactly
     /// that when this variant was first written in the obvious place.)
     Context,
+    /// The keybindings of the view you pressed `?` in.
+    ///
+    /// Like [`Self::Context`], the daemon does not serve it — the rows are a
+    /// fact about the CLIENT (its keymap and its config), seeded in-process.
+    /// Modelling help as a resource rather than as an overlay is what gives
+    /// it grep, scroll, sort, column movement and copy for free, and is what
+    /// makes Esc the ordinary nav pop instead of a bespoke key path that had
+    /// to be remembered.
+    ///
+    /// APPENDED for the same wire-tag reason as `Context` above.
+    Keybinding,
 }
 
 impl LocalResourceKind {
@@ -37,7 +48,7 @@ impl LocalResourceKind {
     /// at runtime and are not part of this list — callers that need to
     /// enumerate customs maintain their own registry.
     pub fn all() -> Vec<Self> {
-        vec![Self::PortForward, Self::ExecResource, Self::Context]
+        vec![Self::PortForward, Self::ExecResource, Self::Context, Self::Keybinding]
     }
 
     /// Canonical singular name (e.g. `"portforward"`).
@@ -46,6 +57,7 @@ impl LocalResourceKind {
             Self::PortForward => "portforward",
             Self::ExecResource => "execresource",
             Self::Context => "context",
+            Self::Keybinding => "keybinding",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -57,6 +69,7 @@ impl LocalResourceKind {
             Self::PortForward => "v1",
             Self::ExecResource => "v1",
             Self::Context => "v1",
+            Self::Keybinding => "v1",
             Self::Custom(_) => "v1",
         }
     }
@@ -68,6 +81,7 @@ impl LocalResourceKind {
             Self::PortForward => "PortForward",
             Self::ExecResource => "ExecResource",
             Self::Context => "Context",
+            Self::Keybinding => "Keybinding",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -80,6 +94,7 @@ impl LocalResourceKind {
             Self::PortForward => "portforwards",
             Self::ExecResource => "execresources",
             Self::Context => "contexts",
+            Self::Keybinding => "keybindings",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -90,6 +105,7 @@ impl LocalResourceKind {
             Self::PortForward => ResourceScope::Cluster,
             Self::ExecResource => ResourceScope::Cluster,
             Self::Context => ResourceScope::Cluster,
+            Self::Keybinding => ResourceScope::Cluster,
             Self::Custom(_) => ResourceScope::Cluster,
         }
     }
@@ -102,6 +118,14 @@ impl LocalResourceKind {
             Self::PortForward => &["pf", "portforward", "portforwards", "port-forwards"],
             Self::ExecResource => &["exec", "execresource", "execresources"],
             Self::Context => &["ctx", "context", "contexts"],
+            // DELIBERATELY EMPTY. Every other alias here is a noun you
+            // browse; `?` is a sheet you consult ABOUT the view you are in,
+            // and it floats over that view for exactly that reason. Making
+            // it typeable at `:` gave it the resource-command path, which
+            // `nav.reset`s the stack — so `:keys` destroyed your drill to
+            // land on a table that `Action::Help` had never seeded, at depth
+            // 1 where `pop` refuses and there is no way back out.
+            Self::Keybinding => &[],
             Self::Custom(_) => &[],
         }
     }
@@ -113,6 +137,7 @@ impl LocalResourceKind {
             Self::PortForward => "PF",
             Self::ExecResource => "EXEC",
             Self::Context => "CTX",
+            Self::Keybinding => "KEYS",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -134,6 +159,15 @@ impl LocalResourceKind {
                     ColumnDef::new("CLUSTER").max_width(28),
                     ColumnDef::new("USER").max_width(24),
                     ColumnDef::new("ACTIVE").max_width(8),
+                ];
+                COLS
+            }
+            // KEY is narrow and the thing you scan; DESCRIPTION gets the rest.
+            Self::Keybinding => {
+                static COLS: &[ColumnDef] = &[
+                    ColumnDef::new("SECTION").max_width(36),
+                    ColumnDef::new("KEY").max_width(16),
+                    ColumnDef::new("DESCRIPTION").max_width(60),
                 ];
                 COLS
             }
@@ -162,21 +196,19 @@ impl LocalResourceKind {
             ],
             // Exec resource: describe (show raw JSON), yaml (show raw JSON
             // as yaml), delete (remove entry from internal store).
-            Self::ExecResource => vec![
-                OperationKind::Describe,
-                OperationKind::Yaml,
-                OperationKind::Delete,
-            ],
+            // Exec-backed rows ARE a command's output: there is nothing to
+            // delete, and the next poll would put the row straight back. The
+            // source's `delete` refuses; not advertising it means the key is
+            // never offered in the first place.
+            Self::ExecResource => vec![OperationKind::Describe, OperationKind::Yaml],
             // A context is switched to (Enter, via `DrillTarget`), not
             // described or deleted — every other operation would have to ask
             // a daemon about the client's own kubeconfig.
             Self::Context => vec![],
-            // Custom resources get the standard trio.
-            Self::Custom(_) => vec![
-                OperationKind::Describe,
-                OperationKind::Yaml,
-                OperationKind::Delete,
-            ],
+            // Nothing to act ON: a keybinding row is documentation.
+            Self::Keybinding => vec![],
+            // Same as `ExecResource` — a `Custom` kind IS an exec source.
+            Self::Custom(_) => vec![OperationKind::Describe, OperationKind::Yaml],
         }
     }
 }

@@ -80,8 +80,7 @@ impl Drop for LocalSubscription {
         crate::kube::spawn_grace(
             self._keepalive.clone(),
             |_src| false,
-            |src| src.try_begin_grace(),
-            |src| src.end_grace(),
+            |src| src.grace_gate(),
         );
     }
 }

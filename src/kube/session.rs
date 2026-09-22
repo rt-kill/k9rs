@@ -178,6 +178,17 @@ impl<'a, B: ratatui::backend::Backend + std::io::Write> SuspendGuard<'a, B> {
         let _ = input_suspend.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(1), input_suspend_ack.recv()).await;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        // RAW MODE IS PART OF THE SUSPENSION, so the guard owns it. It used
+        // to be two bare calls around the subprocess in
+        // `run_interactive_local`: `disable_raw_mode()` after `new`, and
+        // `enable_raw_mode()?` before `restore`. A failure at the second one
+        // returned through `?`, `Drop` put the alternate screen back, and the
+        // TUI carried on painting in COOKED mode — every keystroke
+        // line-buffered and echoed, nothing responding until Enter, and no
+        // key that could fix it. The guard's doc claimed it made a suspended
+        // state impossible to leave behind; that was true of the screen and
+        // false of the mode, and the mode is the half the user notices.
+        let _ = crossterm::terminal::disable_raw_mode();
         Ok(Self { terminal, input_suspend, input_rx, restored: false })
     }
 
@@ -190,6 +201,9 @@ impl<'a, B: ratatui::backend::Backend + std::io::Write> SuspendGuard<'a, B> {
     /// the async `restore` (normal exit) and `Drop` (panic / early-return
     /// fallback).
     fn restore_screen(&mut self) {
+        // Raw mode first: it is what makes the restored screen usable, and
+        // it must be re-entered on EVERY exit — `restore()` and `Drop` alike.
+        let _ = crossterm::terminal::enable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), crossterm::terminal::EnterAlternateScreen);
         let _ = self.terminal.clear();
         let _ = self.input_suspend.send(false);
@@ -238,14 +252,30 @@ impl<B: ratatui::backend::Backend + std::io::Write> Drop for SuspendGuard<'_, B>
 /// caller to replay — honoring the input arm's "keys are never dropped"
 /// contract, which the old drain-everything version quietly violated.
 async fn drain_stale_input(input_rx: &mut mpsc::Receiver<CtEvent>) -> Vec<CtEvent> {
+    /// Longest the window can run. Reached only while the terminal is still
+    /// talking; a quiet one exits after the first couple of passes.
+    const MAX_PASSES: usize = 8;
+    const PASS: Duration = Duration::from_millis(15);
+
     let mut kept = Vec::new();
     let mut state = DebrisState::Idle;
-    for pass in 0..4 {
+    let mut quiet = 0;
+    for pass in 0..MAX_PASSES {
+        let mut saw_any = false;
         while let Ok(ev) = input_rx.try_recv() {
+            saw_any = true;
             state = debris_step(state, ev, &mut kept);
         }
-        if pass < 3 {
-            tokio::time::sleep(Duration::from_millis(15)).await;
+        quiet = if saw_any { 0 } else { quiet + 1 };
+        // Stop once the terminal has gone quiet AND we are not holding half a
+        // sequence. Cutting the window mid-response is what let the tail of a
+        // reply through as keystrokes; waiting out the full window every time
+        // would delay every resume for the sake of the slow case.
+        if quiet >= 2 && matches!(state, DebrisState::Idle) {
+            break;
+        }
+        if pass + 1 < MAX_PASSES {
+            tokio::time::sleep(PASS).await;
         }
     }
     // A trailing unconfirmed Esc is a REAL keypress: debris Esc is always
@@ -265,32 +295,73 @@ enum DebrisState {
     PendingEsc(CtEvent),
     /// Inside a confirmed `Esc [` / `Esc O` shred — body until a final byte.
     InSeq,
+    /// Inside an `Esc ]` (OSC) / `Esc P` (DCS) / `Esc ^` (PM) / `Esc _` (APC)
+    /// STRING. Unlike CSI/SS3 these do not end at a final letter — they run to
+    /// a `BEL` or an `ST`, and their bodies contain arbitrary text. `consumed`
+    /// bounds them so a malformed one cannot swallow the rest of the window.
+    InString { consumed: usize },
+    /// Saw an `Esc` inside a string: `\` completes the `ST`, anything else
+    /// means the string was malformed and the event is judged afresh.
+    StringEsc,
+}
+
+/// Body characters tolerated inside an unterminated OSC/DCS string before the
+/// sieve gives up and starts keeping events again. An OSC 11 colour reply is
+/// ~25; real typing never reaches this inside one settling window.
+const STRING_BODY_CAP: usize = 128;
+
+/// The four introducers that begin a STRING rather than a control sequence.
+fn is_string_introducer(c: char) -> bool {
+    matches!(c, ']' | 'P' | '^' | '_')
 }
 
 /// One classifier step. A response sequence crossterm can't parse whole
-/// (cursor reports, DA / DSR / kitty-query replies) shreds into a bare
-/// `Esc` key, an introducer (`[` for CSI, `O` for SS3), body characters
-/// (digits, `;`, `?`, …), and a final letter — e.g. the `R` of a cursor
-/// report, or the spurious `r` that used to pop the restart dialog. Real
-/// type-ahead never takes that full shape: crossterm parses KNOWN
+/// shreds into an introducer and a body, in one of two grammars:
+///
+/// - **Control sequences** — `Esc [` (CSI) / `Esc O` (SS3) — run until a final
+///   letter: the `R` of a cursor report, the `c` of a DA1 reply, or the
+///   spurious `r` that used to pop the restart dialog.
+/// - **Strings** — `Esc ]` (OSC) / `Esc P` (DCS) / `Esc ^` / `Esc _` — have
+///   arbitrary bodies and run until a `BEL` or an `ST`.
+///
+/// Real type-ahead never takes either full shape: crossterm parses KNOWN
 /// sequences (arrows, F-keys) into proper key events, plain typing arrives
 /// as ordinary chars, and a real Esc press is followed by something other
 /// than an introducer — so the held Esc is released as real the moment the
-/// shape breaks. The trade is deliberate: an exotic response type (OSC/DCS
-/// replies, never provoked by our transitions) could still leak keys, but
-/// real typing is never eaten — the reverse of the old blanket drop's
-/// failure mode.
+/// shape breaks.
+///
+/// The strings arm exists because this comment used to say the opposite —
+/// that OSC/DCS replies were "never provoked by our transitions" and could
+/// therefore be left to leak. That was true of OUR transitions and false of
+/// the subprocess's: editors query the terminal's background color on startup,
+/// and a reply landing after the editor exits is ours to deal with. A claim
+/// about what the world does is not a fact about the code.
+///
+/// The residual trade is now only timing: a reply arriving after the settling
+/// window closes still leaks. `TextKey` bounds the damage (a leaked Ctrl chord
+/// can no longer type), but a leaked `:` still opens the command bar.
 fn debris_step(state: DebrisState, ev: CtEvent, kept: &mut Vec<CtEvent>) -> DebrisState {
-    use crossterm::event::KeyCode;
-    let code = match &ev {
-        CtEvent::Key(k) => Some(k.code),
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let (code, mods) = match &ev {
+        CtEvent::Key(k) => (Some(k.code), k.modifiers),
         // Focus/resize churn from the mode transition — never replayed
         // (the resume paint re-observes the real size), never state-changing.
-        _ => None,
+        _ => (None, KeyModifiers::NONE),
+    };
+    // crossterm folds `Esc <char>` into ONE Alt-modified event when both bytes
+    // land in the same read, and yields them separately when they don't — so
+    // an introducer can arrive either way and both shapes have to be caught.
+    let alt_char = |c: char| {
+        matches!(code, Some(KeyCode::Char(got)) if got == c) && mods.contains(KeyModifiers::ALT)
     };
     match state {
         DebrisState::Idle => match code {
             Some(KeyCode::Esc) => DebrisState::PendingEsc(ev),
+            Some(KeyCode::Char(c))
+                if mods.contains(KeyModifiers::ALT) && is_string_introducer(c) =>
+            {
+                DebrisState::InString { consumed: 0 }
+            }
             None => DebrisState::Idle,
             Some(_) => {
                 kept.push(ev);
@@ -300,11 +371,33 @@ fn debris_step(state: DebrisState, ev: CtEvent, kept: &mut Vec<CtEvent>) -> Debr
         DebrisState::PendingEsc(esc) => match code {
             // Introducer confirms the shred: drop the Esc and consume on.
             Some(KeyCode::Char('[' | 'O')) => DebrisState::InSeq,
+            Some(KeyCode::Char(c)) if is_string_introducer(c) => {
+                DebrisState::InString { consumed: 0 }
+            }
             // Anything else: the Esc was a real keypress after all.
             _ => {
                 kept.push(esc);
                 debris_step(DebrisState::Idle, ev, kept)
             }
+        },
+        DebrisState::InString { consumed } => {
+            // `BEL` terminates an OSC, and crossterm delivers 0x07 as Ctrl-G.
+            let bel = matches!(code, Some(KeyCode::Char('g')))
+                && mods.contains(KeyModifiers::CONTROL);
+            if bel || alt_char('\\') {
+                return DebrisState::Idle;
+            }
+            match code {
+                Some(KeyCode::Esc) => DebrisState::StringEsc,
+                _ if consumed >= STRING_BODY_CAP => debris_step(DebrisState::Idle, ev, kept),
+                // Anything else is body text — OSC payloads are arbitrary
+                // (`11;rgb:2f2f/3434/3f3f`), so there is nothing to validate.
+                _ => DebrisState::InString { consumed: consumed + 1 },
+            }
+        }
+        DebrisState::StringEsc => match code {
+            Some(KeyCode::Char('\\')) => DebrisState::Idle,
+            _ => debris_step(DebrisState::Idle, ev, kept),
         },
         DebrisState::InSeq => match code {
             Some(KeyCode::Char(c))
@@ -390,8 +483,10 @@ async fn handle_one_key(
 /// Run the editor flow when the route is `EditState::EditorReady`.
 /// Returns `true` if the editor was launched (the caller should `continue`
 /// the main loop regardless of outcome — success, abort, or error).
+#[allow(clippy::too_many_arguments)]
 async fn run_editor_flow(
     app: &mut App,
+    event_rx: &mut mpsc::Receiver<AppEvent>,
     terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
     data_source: &mut ClientSession,
     input_suspend: &tokio::sync::watch::Sender<bool>,
@@ -431,6 +526,7 @@ async fn run_editor_flow(
     let path_arg = temp_file.path().to_string_lossy().to_string();
     let args = vec![path_arg];
     let exit_status = match run_interactive_local(
+        app, event_rx,
         terminal, &editor, &args,
         crate::kube::session_commands::InteractiveKind::Editor,
         input_suspend, input_suspend_ack, input_rx, replay,
@@ -851,6 +947,12 @@ fn try_handle_input_mode(
     data_source: &mut ClientSession,
     event_tx: &mpsc::Sender<AppEvent>,
 ) -> bool {
+    // A Ctrl/Alt chord is never text. Guarded ONCE, here, by building the
+    // `TextKey` the sinks below require — see [`crate::app::TextKey`] for why
+    // this is a type rather than five copies of an `if`.
+    let Some(key) = crate::app::TextKey::new(key) else {
+        return false;
+    };
     // 1. Command mode (`:` prompt)
     if handle_command_key(app, key, data_source, event_tx) {
         return true;
@@ -871,7 +973,19 @@ fn try_handle_input_mode(
     if handle_content_search_key(app, key) {
         return true;
     }
-    false
+
+    // Fall-through guard, for a modal that none of the sinks above owns AND
+    // that `handler::handle_key_event` has no branch for. Such a modal would
+    // capture NOTHING: keys sail past and keep driving the table underneath
+    // it, while Esc pops the nav stack out from under the thing on screen.
+    //
+    // This used to be a blanket `is_modal()`, which is true for every modal
+    // — including the ones `handle_key_event` handles perfectly well. It
+    // therefore swallowed their keys BEFORE their own handler could run, and
+    // help, the container picker, a delete confirmation and a hanging shell
+    // connect all lost their Esc. The predicate has to name who handles
+    // what, and be exhaustive so the next modal cannot skip the question.
+    app.ui.modal_without_key_handler()
 }
 
 /// Capture a keystroke into the log filter input draft (`/`-prompt within
@@ -879,11 +993,11 @@ fn try_handle_input_mode(
 /// shape of `handle_command_key` / `handle_form_dialog_key` /
 /// `handle_filter_key` — each input modality has its own free function so
 /// the main loop just calls them in priority order.
-fn handle_log_filter_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+fn handle_log_filter_key(app: &mut App, key: crate::app::TextKey) -> bool {
     if !app.nav.top().log_view().is_some_and(|v| v.is_filtering()) {
         return false;
     }
-    match key.code {
+    match key.code() {
         KeyCode::Esc => {
             if let Some(view) = app.nav.top_mut().log_view_mut() {
                 view.draft = None;
@@ -926,7 +1040,7 @@ fn handle_log_filter_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool
 /// Both content-view routes share the same `ContentViewState`, so the
 /// match arms diverge only on which route variant we're inside —
 /// extracted so the main loop doesn't carry the same 20 lines twice.
-fn handle_content_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+fn handle_content_search_key(app: &mut App, key: crate::app::TextKey) -> bool {
     use crate::app::SearchInputResult;
     let search_context_lines = app.config.ui.search_context_lines;
     let state = match app.nav.top_mut() {
@@ -935,7 +1049,7 @@ fn handle_content_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> 
         }
         _ => return false,
     };
-    match crate::app::handle_search_key(&mut state.search_input, key.code) {
+    match crate::app::handle_search_key(&mut state.search_input, key) {
         SearchInputResult::Cancelled => {
             state.search_input_active = false;
             state.clear_search();
@@ -1174,7 +1288,7 @@ pub async fn session_main(
 
         // Unified edit flow: if route is EditorReady, run the editor.
         if run_editor_flow(
-            &mut app, &mut terminal, &mut data_source,
+            &mut app, &mut event_rx, &mut terminal, &mut data_source,
             &input.suspend_tx, &mut input.suspend_ack_rx, &mut input.input_rx,
             &mut replay,
         ).await {
@@ -1300,22 +1414,28 @@ pub async fn session_main(
                         Err(_) => break,
                     }
                 }
-                // Gap detection for log initial load: if we drained all
-                // pending events and the log view is still in initial_load,
-                // the initial tail batch is complete — snap to bottom.
-                // Initial tail-fetch completion: a gap in line delivery
-                // means the batch is done — release follow auto-scroll.
-                let has_lines = app
-                    .nav
-                    .top()
-                    .log_store()
-                    .is_some_and(|st| st.with_read(|i| !i.lines.is_empty()));
-                if has_lines {
-                    if let Some(view) = app.nav.top_mut().log_view_mut() {
-                        if view.initial_load {
-                            view.initial_load = false;
-                        }
-                    }
+                // Initial tail-fetch completion: a gap in line delivery means
+                // the batch is done, so release the auto-scroll suppression
+                // that keeps the view from racing while the tail streams in.
+                //
+                // This deliberately does NOT require the store to have lines.
+                // It used to, and a stream that produced none — a silent pod,
+                // or `1m` on something that last logged an hour ago — left
+                // `initial_load` true FOREVER, which suppressed autoscroll
+                // while the indicator cheerfully said "AutoScroll: On". With
+                // no lines there is nothing to race, so there is nothing to
+                // suppress.
+                // EVERY log view on the stack, not just the top — see
+                // `NavStack::for_each_log_view`.
+                app.nav.for_each_log_view(|view| view.initial_load = false);
+                // Covered filters collect too, or they come back with a hole.
+                app.nav.keep_log_filters_current();
+                // A range fetch that has the oldest N it asked for stops
+                // there rather than streaming the rest at us to discard.
+                if app.nav.stop_completed_head_fetches() {
+                    app.ui.flash = Some(crate::app::FlashMessage::info(
+                        "Reached the line limit for this range — showing the oldest".to_string(),
+                    ));
                 }
                 repaint.on_data(std::time::Instant::now(), tick_rate);
             }

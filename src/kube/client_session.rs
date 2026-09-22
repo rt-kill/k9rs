@@ -349,6 +349,68 @@ impl ClientSession {
 /// (accepted iff `event.epoch >= table.epoch`; a Baseline sets it).
 static NEXT_STREAM_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// What a new subscription REPLACES on its store.
+///
+/// Every stream raises its store's epoch floor the instant it is minted, so a
+/// predecessor still running against that store is a live hazard: its
+/// bridge-internal retries allocate FRESH epochs, and one minted after the
+/// successor's would out-floor the successor's own baseline permanently — the
+/// view would go quiet and never recover.
+///
+/// The order that avoids it (abort, then mint) used to be a comment repeated
+/// at each call site. It is now a parameter: you cannot reach the mint without
+/// stating what you are superseding, and [`Supersedes::Nothing`] is an
+/// explicit claim rather than something you get by forgetting.
+pub enum Supersedes<'a> {
+    /// A first subscription against this store — there is no predecessor.
+    Nothing,
+    /// The stream being replaced. Aborted before the successor's epoch is
+    /// minted.
+    Stream(&'a SubscriptionStream),
+    /// The log stream being replaced (a `since`-range restart reuses the
+    /// store, so its `LogFilter` children keep their handles).
+    LogStream(&'a LogStream),
+}
+
+/// A store that gates events on a stream-epoch floor. Exists so
+/// [`Supersedes::retire_and_mint`] can serve both the row and line stores;
+/// they have the same succession rule and differ only in what they hold.
+pub trait EpochFloor {
+    fn expect_epoch(&self, epoch: u64);
+}
+
+impl EpochFloor for crate::app::store::RowStore {
+    fn expect_epoch(&self, epoch: u64) {
+        crate::app::store::RowStore::expect_epoch(self, epoch);
+    }
+}
+
+impl EpochFloor for crate::app::store::LineStore {
+    fn expect_epoch(&self, epoch: u64) {
+        crate::app::store::LineStore::expect_epoch(self, epoch);
+    }
+}
+
+impl Supersedes<'_> {
+    /// Retire the predecessor and mint this stream's first epoch — in that
+    /// order, as ONE step.
+    ///
+    /// Fused deliberately. Two calls in the right order is a rule someone has
+    /// to keep; one call is a rule nobody can break. There is no way to reach
+    /// the epoch counter from outside this function, so "minted before the
+    /// predecessor was stopped" is not a state a caller can express.
+    fn retire_and_mint(self, store: &dyn EpochFloor) -> u64 {
+        match self {
+            Supersedes::Nothing => {}
+            Supersedes::Stream(s) => s.abort(),
+            Supersedes::LogStream(s) => s.abort(),
+        }
+        let epoch = NEXT_STREAM_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        store.expect_epoch(epoch);
+        epoch
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Connection manager
 // ---------------------------------------------------------------------------
@@ -621,9 +683,9 @@ async fn writer_loop(
 }
 
 /// Look up the cluster + user names for a given context inside a parsed
-/// `Kubeconfig`. Returns an empty [`ClusterIdentity`] if the context isn't
-/// found — matches what the rest of the code expects (rendered as `n/a` in
-/// the UI).
+/// `Kubeconfig`. An absent context — or one whose entry names no user —
+/// yields an all-unknown [`ClusterIdentity`], which every reader must
+/// destructure rather than read as a blank string.
 fn lookup_cluster_user(
     kubeconfig: &Kubeconfig,
     context_name: &crate::kube::protocol::ContextName,
@@ -747,6 +809,7 @@ impl ClientSession {
     /// (the parameter list used to be 7 strings/options long).
     pub fn stream_log_substream(
         &self,
+        supersedes: Supersedes<'_>,
         log_init: protocol::LogInit,
         store: std::sync::Arc<crate::app::store::LineStore>,
     ) -> LogStream {
@@ -754,8 +817,7 @@ impl ClientSession {
         // floor is raised BEFORE this returns, so a replaced stream's
         // queued lines are stale on arrival (range restarts reuse the
         // store so LogFilter children keep their handles).
-        let epoch = NEXT_STREAM_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        store.expect_epoch(epoch);
+        let epoch = supersedes.retire_and_mint(store.as_ref());
         let mut mux_rx = self.mux_handle_rx.clone();
         let event_tx = self.event_tx.clone();
         let init = protocol::SubstreamInit::Log(log_init);
@@ -937,14 +999,14 @@ impl ClientSession {
     /// the daemon), and the daemon's bridge exits on EOF.
     pub fn subscribe_stream(
         &self,
+        supersedes: Supersedes<'_>,
         resource: protocol::ResourceId,
         namespace: protocol::Namespace,
         filter: Option<protocol::SubscriptionFilter>,
         store: std::sync::Arc<crate::app::store::RowStore>,
         force: bool,
     ) -> SubscriptionStream {
-        let first_epoch = NEXT_STREAM_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        store.expect_epoch(first_epoch);
+        let first_epoch = supersedes.retire_and_mint(store.as_ref());
         let mut mux_rx = self.mux_handle_rx.clone();
         let event_tx = self.event_tx.clone();
         let rid = resource.clone();
@@ -1413,6 +1475,57 @@ mod stream_liveness_tests {
         let _ = done.await; // ensure the task has actually completed
         let dead = SubscriptionStream::from_abort_handle(abort);
         assert!(!dead.is_alive());
+    }
+
+    /// Minting an epoch supersedes whatever was feeding that store, and the
+    /// predecessor has to be stopped FIRST.
+    ///
+    /// A stream raises its store's floor when it is minted, and a bridge's
+    /// internal retries allocate fresh, higher epochs. So a predecessor left
+    /// running past the mint can raise the floor ABOVE its successor, at
+    /// which point the successor's own baseline is rejected as stale and the
+    /// view goes quiet forever. `retire_and_mint` fuses the two steps so the
+    /// wrong order isn't expressible.
+    #[tokio::test]
+    async fn minting_an_epoch_retires_the_stream_it_replaces() {
+        let store = crate::app::store::RowStore::new("pods");
+
+        let old_bridge = tokio::spawn(std::future::pending::<()>());
+        let previous = SubscriptionStream::from_abort_handle(old_bridge.abort_handle());
+        assert!(previous.is_alive());
+
+        let epoch = Supersedes::Stream(&previous).retire_and_mint(store.as_ref());
+
+        // Aborting is not instantaneous from the aborter's side; joining is
+        // how we observe it landed. Bounded, because the predecessor is a
+        // `pending()` task — if the abort never happens this must FAIL, not
+        // hang the suite.
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), old_bridge)
+            .await
+            .expect("the predecessor must be aborted, or it outlives its successor");
+        assert!(joined.is_err(), "aborted, not completed");
+        assert!(!previous.is_alive());
+
+        // And the floor is this stream's, so anything the predecessor had
+        // queued is stale on arrival.
+        assert!(
+            !store.would_accept_epoch(epoch - 1),
+            "a lower epoch must be floored out",
+        );
+        assert!(store.would_accept_epoch(epoch), "the successor's own epoch stands");
+    }
+
+    /// `Nothing` is a claim, not a default: it must NOT abort anything, or a
+    /// first subscription would tear down an unrelated live stream.
+    #[tokio::test]
+    async fn superseding_nothing_leaves_live_streams_alone() {
+        let store = crate::app::store::RowStore::new("pods");
+        let other = tokio::spawn(std::future::pending::<()>());
+        let unrelated = SubscriptionStream::from_abort_handle(other.abort_handle());
+
+        let _ = Supersedes::Nothing.retire_and_mint(store.as_ref());
+
+        assert!(unrelated.is_alive(), "an unrelated stream keeps running");
     }
 }
 

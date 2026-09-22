@@ -202,6 +202,7 @@ fn envelope_wire_tags_are_stable() {
             pid: 0,
             uptime_secs: 0,
             socket_path: String::new(),
+            caches: Default::default(),
         }),
         // v9 appendee — after DaemonStatus(8); appending keeps prior tags.
         // (v10 added the `op` field — a FIELD change, not a tag change.)
@@ -229,7 +230,7 @@ fn envelope_wire_tags_are_stable() {
     });
     assert_eq!(&bincode::serialize(&sub).unwrap()[..4], 0u32.to_le_bytes());
     let log_sub = SubstreamInit::Log(LogInit {
-        pod: String::new(),
+        target: LogTarget::One(String::new()),
         namespace: Namespace::All,
         container: LogContainer::Default,
         follow: false,
@@ -338,7 +339,7 @@ fn stream_event_ref_tags_match() {
 /// declaration-index). Appending is safe; reorder/insert is a break.
 #[test]
 fn stream_wire_tags_are_stable() {
-    assert_eq!(PROTOCOL_VERSION, 11);
+    assert_eq!(PROTOCOL_VERSION, 16);
     let b = bincode::serialize(&StreamEvent::Error("x".into())).unwrap();
     assert_eq!(&b[..4], 2u32.to_le_bytes()); // Baseline=0, Delta=1, Error=2
     // Stale/Live APPENDED for v11 — Resolved=3 keeps its tag.
@@ -346,8 +347,78 @@ fn stream_wire_tags_are_stable() {
     assert_eq!(&bincode::serialize(&StreamEvent::Live).unwrap()[..4], 5u32.to_le_bytes());
     let r = bincode::serialize(&RowChange::Remove(ObjectKey::new(String::new(), String::new()))).unwrap();
     assert_eq!(&r[..4], 1u32.to_le_bytes()); // Upsert=0, Remove=1
+    // LogTarget: One=0 is what every pre-fan-out call site produces, so a
+    // reorder would silently turn "this pod" into "these pods" / "this
+    // selector". (v14 replaced `Many` with `Union` in place — a same-tag
+    // shape change, which is exactly what the version gate exists for.)
+    assert_eq!(&bincode::serialize(&LogTarget::One(String::new())).unwrap()[..4], 0u32.to_le_bytes());
+    assert_eq!(
+        &bincode::serialize(&LogTarget::Union { targets: vec![], label: String::new() })
+            .unwrap()[..4],
+        1u32.to_le_bytes(),
+    );
+    assert_eq!(
+        &bincode::serialize(&LogTarget::Selector {
+            labels: Default::default(),
+            label: String::new(),
+        }).unwrap()[..4],
+        2u32.to_le_bytes(),
+    );
+    assert_eq!(
+        &bincode::serialize(&LogTarget::Owner { uid: String::new(), label: String::new() })
+            .unwrap()[..4],
+        3u32.to_le_bytes(),
+    );
     // Handshake preamble bytes are pinned: magic then version, BE.
     assert_eq!(PROTOCOL_MAGIC.to_be_bytes(), [0x4B, 0x39, 0x52, 0x53]);
+}
+
+/// `ClusterIdentity` is total: nothing can construct a field that is present
+/// but blank, so no reader has to know that a blank one means absent.
+#[test]
+fn a_blank_identity_field_is_absence_not_a_value() {
+    use crate::kube::protocol::ClusterIdentity;
+
+    // Every field independently unknown is the honest state before the
+    // handshake, and it is what `Default` means.
+    let unknown = ClusterIdentity::default();
+    assert_eq!(unknown.cluster(), None);
+    assert_eq!(unknown.user(), None);
+    assert_eq!(unknown.k8s_version(), None);
+
+    // Blank collapses AT the constructor — the one boundary these cross.
+    // kube-rs types `Context::user` as `Option<String>`, and the caller
+    // `unwrap_or_default()`s it, so "" is precisely what a `user:`-less
+    // kubeconfig entry looks like on the way in.
+    let no_user = ClusterIdentity::new("prod-eks".into(), String::new());
+    assert_eq!(no_user.cluster(), Some("prod-eks"));
+    assert_eq!(no_user.user(), None, "a blank user is not a user named \"\"");
+
+    // Same rule on the late-arriving field: an apiserver that gave us no
+    // version did not give us a version called "".
+    let mut id = ClusterIdentity::new("c".into(), "u".into());
+    assert_eq!(id.k8s_version(), None, "unknown until the daemon asks");
+    id.set_k8s_version(String::new());
+    assert_eq!(id.k8s_version(), None);
+    id.set_k8s_version("v1.29.4".into());
+    assert_eq!(id.k8s_version(), Some("v1.29.4"));
+}
+
+/// Why v11→v12 is a genuine break even though no field was added, removed or
+/// reordered: bincode writes `Option<T>` as a discriminant byte, and wrote
+/// `String` as an 8-byte length. An all-unknown identity went from 24 bytes
+/// of zero-length strings to 3 discriminant bytes — a v11 peer reading it
+/// mis-frames everything that follows.
+#[test]
+fn the_identity_encoding_is_why_the_version_moved() {
+    use crate::kube::protocol::ClusterIdentity;
+    let bytes = bincode::serialize(&ClusterIdentity::default()).unwrap();
+    assert_eq!(bytes, vec![0u8, 0, 0], "three Nones, one byte each");
+    assert_eq!(
+        bincode::serialize(&ClusterIdentity::new("c".into(), String::new())).unwrap().len(),
+        1 + 8 + 1 + 1 + 1,
+        "Some(\"c\") = tag + u64 len + 1 byte; then None, None",
+    );
 }
 
 /// The wire enums that carry no pin of their own. Grouped here because the
@@ -377,13 +448,39 @@ fn remaining_wire_enum_tags_are_stable() {
     assert_eq!(tag(bincode::serialize(&Namespace::All).unwrap()), 0);
     assert_eq!(tag(bincode::serialize(&Namespace::Named("x".into())).unwrap()), 1);
 
-    // SubscriptionFilter: Labels=0, Field=1, OwnerUid=2.
+    // SubscriptionFilter: Labels=0, Field=1, OwnerUid=2, References=3.
     assert_eq!(
         tag(bincode::serialize(&SubscriptionFilter::Labels(Default::default())).unwrap()),
         0,
     );
     assert_eq!(tag(bincode::serialize(&SubscriptionFilter::Field("f".into())).unwrap()), 1);
     assert_eq!(tag(bincode::serialize(&SubscriptionFilter::OwnerUid("u".into())).unwrap()), 2);
+    assert_eq!(
+        tag(bincode::serialize(&SubscriptionFilter::References {
+            kind: crate::kube::resource_def::BuiltInKind::Secret,
+            name: "s".into(),
+        })
+        .unwrap()),
+        3,
+    );
+
+    // K8sFieldSelector rides inside DrillTarget::PodsByField, so its tags are
+    // wire-frozen too. `InvolvedObject` was APPENDED for the `E` drill.
+    {
+        use crate::kube::resources::row::K8sFieldSelector as F;
+        assert_eq!(tag(bincode::serialize(&F::MetadataName("n".into())).unwrap()), 0);
+        assert_eq!(tag(bincode::serialize(&F::SpecNodeName("n".into())).unwrap()), 1);
+        assert_eq!(tag(bincode::serialize(&F::StatusPhase("p".into())).unwrap()), 2);
+        assert_eq!(
+            tag(bincode::serialize(&F::InvolvedObject {
+                kind: "Pod".into(),
+                name: "n".into(),
+                namespace: String::new(),
+            })
+            .unwrap()),
+            3,
+        );
+    }
 
     // ExecFrame: Data=0, Resize=1. A swap feeds a resize into the PTY.
     assert_eq!(tag(bincode::serialize(&ExecFrame::Data(vec![])).unwrap()), 0);
@@ -392,10 +489,12 @@ fn remaining_wire_enum_tags_are_stable() {
         1,
     );
 
-    // LogContainer: All=0, Named=1, Default=2.
+    // LogContainer: All=0, Named=1, Default=2, Set=3 (APPENDED in v14 —
+    // inserting it before `Default` would have moved every existing tag).
     assert_eq!(tag(bincode::serialize(&LogContainer::All).unwrap()), 0);
     assert_eq!(tag(bincode::serialize(&LogContainer::Named("c".into())).unwrap()), 1);
     assert_eq!(tag(bincode::serialize(&LogContainer::Default).unwrap()), 2);
+    assert_eq!(tag(bincode::serialize(&LogContainer::Set(vec![])).unwrap()), 3);
 
     // ResourceScope: Cluster=0, Namespaced=1 (declaration order — NOT the
     // alphabetical/intuitive order; I guessed the other way writing this and

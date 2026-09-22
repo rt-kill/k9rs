@@ -3,7 +3,7 @@ use k8s_openapi::api::core::v1::Endpoints;
 use crate::kube::protocol::ResourceScope;
 use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
-use crate::kube::resources::row::{CellValue, ResourceRow};
+use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
 // ---------------------------------------------------------------------------
 // EndpointsDef
@@ -46,16 +46,21 @@ impl ConvertToRow<Endpoints> for EndpointsDef {
             })
             .collect::<Vec<_>>()
             .join(",");
+        // No addresses means the Service in front of this resolves to
+        // nothing — the state you are looking for when a call times out and
+        // the pods all look Running. It is the whole content of the view.
+        let health = if endpoints.is_empty() { RowHealth::Failed } else { RowHealth::Normal };
         let endpoints = if endpoints.is_empty() { "<none>".to_string() } else { endpoints };
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.namespace.clone()),
             CellValue::Text(meta.name.clone()),
-            CellValue::Text(endpoints),
+            CellValue::Status { text: endpoints, health },
             CellValue::Age(meta.age.map(|t| t.timestamp())),
         ];        ResourceRow {
             name: meta.name,
             namespace: Some(meta.namespace),
             cells,
+            health,
             ..Default::default()
         }
     }

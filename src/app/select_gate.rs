@@ -76,7 +76,10 @@ pub fn gate_action(app: &App, action: Action) -> Gated {
         // paint runs between two keys — so the stale direction is only
         // select→normal.)
         if app.rendered_select_mode()
-            && matches!(action, Action::Delete | Action::Restart | Action::ForceKill)
+            && matches!(
+                action,
+                Action::Delete | Action::Restart | Action::ForceKill | Action::Logs
+            )
         {
             return Gated::Blocked(STALE_SELECT);
         }
@@ -90,6 +93,19 @@ pub fn gate_action(app: &App, action: Action) -> Gated {
         Action::Delete => Gated::Pass(Action::BatchDelete),
         Action::Restart => Gated::Pass(Action::BatchRestart),
         Action::ForceKill => Gated::Pass(Action::BatchForceKill),
+
+        // The one `Aggregate` operation: the marked pods' logs merge into
+        // ONE stream rather than N views. (`PreviousLogs` is deliberately
+        // NOT here — it stays SingleOnly and dies with the other
+        // single-target keys below.)
+        Action::Logs => Gated::Pass(Action::BatchLogs),
+
+        // Copy retargets for the same reason, even though it mutates
+        // nothing: it used to fall through and dump the WHOLE visible table
+        // while rows sat marked, which is precisely the single-vs-batch
+        // conflation this mode exists to kill. Marking three pods and
+        // pressing `c` now yields three rows.
+        Action::Copy => Gated::Pass(Action::BatchCopy),
 
         // Esc: leave the MODE before leaving the scope.
         //
@@ -115,7 +131,6 @@ pub fn gate_action(app: &App, action: Action) -> Gated {
         Action::Enter
         | Action::Describe
         | Action::Yaml
-        | Action::Logs
         | Action::PreviousLogs
         | Action::Shell
         | Action::Edit
@@ -129,6 +144,7 @@ pub fn gate_action(app: &App, action: Action) -> Gated {
         | Action::SuspendCronJob
         | Action::JumpToOwner
         | Action::UsedBy
+        | Action::ShowEvents
         | Action::OverlayCapability(_) => Gated::Blocked(DEAD_KEY),
 
         // Everything else stays live: navigation, marking, view ops,
@@ -156,7 +172,6 @@ pub fn gate_action(app: &App, action: Action) -> Gated {
         | Action::SwitchContext(_)
         | Action::ToggleHeader
         | Action::Refresh
-        | Action::Copy
         | Action::Confirm
         | Action::Cancel
         | Action::CommandMode
@@ -178,6 +193,8 @@ pub fn gate_action(app: &App, action: Action) -> Gated {
         | Action::LogSince(_)
         | Action::ColLeft
         | Action::ColRight
+        | Action::PageLeft
+        | Action::PageRight
         | Action::ColFirst
         | Action::ColLast
         | Action::ColumnFilter
@@ -186,7 +203,9 @@ pub fn gate_action(app: &App, action: Action) -> Gated {
         | Action::FlashInfo(_)
         | Action::BatchDelete
         | Action::BatchRestart
-        | Action::BatchForceKill) => Gated::Pass(a),
+        | Action::BatchForceKill
+        | Action::BatchCopy
+        | Action::BatchLogs) => Gated::Pass(a),
     }
 }
 

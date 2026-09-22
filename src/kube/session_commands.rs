@@ -1,5 +1,4 @@
 use anyhow::Result;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use tokio::sync::mpsc;
 
 use crate::app::App;
@@ -15,12 +14,54 @@ pub(crate) enum InteractiveKind {
     Editor,
 }
 
+/// Await `work` while applying everything the daemon sends in the meantime.
+///
+/// Extracted so the property can actually be tested: the TUI-suspension path
+/// around it needs a real terminal, this needs nothing. A closed channel
+/// disables its branch and `work` still runs to completion.
+async fn draining<F>(
+    app: &mut App,
+    event_rx: &mut mpsc::Receiver<crate::event::AppEvent>,
+    work: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            done = &mut work => return done,
+            Some(event) = event_rx.recv() => {
+                crate::kube::session_events::apply_event(app, event);
+            }
+        }
+    }
+}
+
 /// Suspend the TUI and run an interactive command directly (with bash->sh
 /// fallback for shell). The caller hands in a typed `InteractiveKind` so
 /// this function doesn't have to inspect `args` to guess what it's about
 /// to launch.
+///
+/// # Why this drains `event_rx` while the subprocess runs
+///
+/// The daemon link does not pause because a human is thinking. Events keep
+/// arriving on their substreams; if nobody reads them the client's channel
+/// fills, its reader tasks stop reading, the yamux stream windows fill, the
+/// daemon's writes stall, and its `connection_write_timeout` (60s) tears the
+/// whole connection down — so a leisurely edit came back to a dead session.
+/// Draining here keeps the transport moving. `apply_event` touches only app
+/// state and stores (never the terminal), so it is safe with the TUI
+/// suspended; the next render after `restore()` shows the accumulated result.
+///
+/// This is the same treatment `run_shell_bridge` already gives its own
+/// suspension, for the same reason — dropping the events instead would leave
+/// stores diverged (a missed delta is never re-sent) and could swallow a
+/// `DaemonDisconnected`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_interactive_local(
+    app: &mut App,
+    event_rx: &mut mpsc::Receiver<crate::event::AppEvent>,
     terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
     command: &str,
     args: &[String],
@@ -35,8 +76,8 @@ pub(crate) async fn run_interactive_local(
     // The guard suspends the TUI and restores it on `restore()` (or `Drop`).
     let mut guard = SuspendGuard::new(terminal, input_suspend, input_suspend_ack, input_rx).await?;
 
-    // Interactive subprocesses need a normal terminal.
-    disable_raw_mode()?;
+    // Raw mode is off already — `SuspendGuard::new` owns it, so no path out
+    // of here can leave the TUI in cooked mode.
     crossterm::execute!(
         guard.terminal_mut().backend_mut(),
         crossterm::cursor::Show,
@@ -47,18 +88,18 @@ pub(crate) async fn run_interactive_local(
     // worker threads stay unblocked.
     let command_owned = command.to_string();
     let args_owned: Vec<String> = args.to_vec();
-    let status = tokio::task::spawn_blocking(move || {
+    let child = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(command_owned);
         cmd.args(args_owned);
         cmd.status()
-    })
-    .await
-    .unwrap_or_else(|join_err| {
-        Err(std::io::Error::other(join_err.to_string()))
     });
+    // See the note on this function: the link must keep moving while a human
+    // is thinking.
+    let status = draining(app, event_rx, child)
+        .await
+        .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err.to_string())));
 
-    // Restore raw mode + hide cursor before guard drops.
-    enable_raw_mode()?;
+    // Raw mode is restored by the guard (on `restore()` AND on `Drop`).
     crossterm::execute!(
         guard.terminal_mut().backend_mut(),
         crossterm::cursor::Hide,
@@ -95,6 +136,7 @@ pub(crate) async fn run_interactive_local(
 ///
 /// The variants are ordered by priority in [`parse_command_input`] —
 /// listing them in the same order here makes the grammar self-documenting.
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) enum ParsedCommand {
     /// `:q`, `:quit`, `:exit`, `:q!`
     Quit,
@@ -181,6 +223,25 @@ pub(crate) fn parse_command_input(raw_cmd: &str, cmd: &str, app: &App) -> Parsed
         return ParsedCommand::Resource(rid);
     }
 
+    // 4b. A user-configured exec resource, by its own name (`:node-costs`).
+    //
+    // These cannot go through `ResourceId::from_alias`: that consults the
+    // built-in registry and `LocalResourceKind::all()`, and a `Custom` kind
+    // is in neither — it is created at runtime from daemon config, and
+    // `Custom(_).aliases()` is empty by construction. So `:node-costs` fell
+    // through to the CRD fallback below and the daemon answered "Unknown
+    // resource", while the README promised the name would work. `:exec`
+    // resolved to `exec_configs.first()`, so a SECOND configured source was
+    // unreachable by any keystroke at all.
+    //
+    // The client already has the answer: `AppConfig` parses the whole
+    // `daemon:` section (it has to — `deny_unknown_fields` on the root would
+    // otherwise reject a documented section) and then ignores it. Reading it
+    // here needs no wire change and no discovery round trip.
+    if let Some(rid) = exec_resource_by_name(cmd, app) {
+        return ParsedCommand::Resource(rid);
+    }
+
     // 5. `<resource> /<filter>` — resource drill with grep filter. Runs
     // BEFORE the `<resource> <ns>` rule below so `pods /Nginx` never
     // parses as namespace `/Nginx`. Uses the *raw* command so the filter
@@ -205,6 +266,20 @@ pub(crate) fn parse_command_input(raw_cmd: &str, cmd: &str, app: &App) -> Parsed
     // 8. Fallback: treat as a CRD name. The dispatcher resolves via the
     // discovery cache, or falls back to a typed unresolved placeholder.
     ParsedCommand::CrdCandidate(cmd.to_string())
+}
+
+/// Resolve a configured exec-resource name to its typed `ResourceId`.
+///
+/// Matched case-insensitively against `daemon.execResources[].name`, which is
+/// the same string `ExecSource::for_context` uses to build the `Custom` kind
+/// daemon-side — so the id the client sends is the id the daemon answers to.
+fn exec_resource_by_name(cmd: &str, app: &App) -> Option<ResourceId> {
+    let configs = &app.config.daemon.as_ref()?.exec_resources;
+    let matched = configs.iter().find(|c| c.name.eq_ignore_ascii_case(cmd))?;
+    Some(
+        crate::kube::local::LocalResourceKind::Custom(matched.name.clone())
+            .to_resource_id(),
+    )
 }
 
 /// Internal: check if `cmd` (the lowercased form) starts with any of
@@ -280,7 +355,7 @@ fn parse_crd_in_namespace(cmd: &str, app: &App) -> Option<(crate::app::CrdInfo, 
 // Input mode handlers — extracted from the main event loop
 // ---------------------------------------------------------------------------
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyCode;
 
 use crate::kube::client_session::ClientSession;
 use crate::kube::session::ds_try;
@@ -288,17 +363,29 @@ use crate::kube::session_actions::do_switch_namespace;
 
 // (COMMAND_HISTORY_LIMIT moved to app.config.ui.command_history_size)
 
-/// Handle a keystroke while in `:command` mode. Returns true if consumed.
-pub(crate) fn handle_command_key(
-    app: &mut App,
-    key: KeyEvent,
-    data_source: &mut ClientSession,
-    event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
-) -> bool {
+/// What a command-bar keystroke did, from [`edit_command_key`] — the half
+/// that only touches the buffer.
+///
+/// Split out because submitting is the ONLY thing that needs a live
+/// `ClientSession`, and an unused-in-this-path parameter is what forces a test
+/// to build a daemon connection to check that Ctrl-G doesn't type a `g`. The
+/// same shape was removed from `handle_filter_key` and `begin_context_switch`
+/// for the same reason.
+pub(crate) enum CommandKey {
+    /// Handled; nothing further to do.
+    Consumed,
+    /// Not a command-bar key — fall through to the global handler.
+    NotMine,
+    /// Enter: the bar is already closed and history recorded; run this.
+    Submit(String),
+}
+
+/// The pure half of command-bar input.
+pub(crate) fn edit_command_key(app: &mut App, key: crate::app::TextKey) -> CommandKey {
     if app.ui.command_input().is_none() {
-        return false;
+        return CommandKey::NotMine;
     }
-    match key.code {
+    match key.code() {
         KeyCode::Esc => {
             app.ui.close_modal();
         }
@@ -316,7 +403,7 @@ pub(crate) fn handle_command_key(
                 }
             }
             app.ui.close_modal();
-            handle_command_submit(app, &raw_cmd, &cmd, data_source, event_tx);
+            return CommandKey::Submit(raw_cmd);
         }
         KeyCode::Tab => {
             app.accept_completion();
@@ -360,7 +447,25 @@ pub(crate) fn handle_command_key(
         }
         _ => {}
     }
-    true
+    CommandKey::Consumed
+}
+
+/// Handle a keystroke while in `:command` mode. Returns true if consumed.
+pub(crate) fn handle_command_key(
+    app: &mut App,
+    key: crate::app::TextKey,
+    data_source: &mut ClientSession,
+    event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
+) -> bool {
+    match edit_command_key(app, key) {
+        CommandKey::NotMine => false,
+        CommandKey::Consumed => true,
+        CommandKey::Submit(raw_cmd) => {
+            let cmd = raw_cmd.to_lowercase();
+            handle_command_submit(app, &raw_cmd, &cmd, data_source, event_tx);
+            true
+        }
+    }
 }
 
 /// Dispatch a submitted `:command` string. Grammar is classified once via
@@ -388,7 +493,9 @@ fn handle_command_submit(
             app.should_quit = true;
         }
         ParsedCommand::Help => {
-            app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() }));
+            // `:help` and `?` are the same thing, so they go through the same
+            // action rather than each constructing the view themselves.
+            handle_action(app, crate::app::actions::Action::Help, event_tx, data_source);
         }
         ParsedCommand::Aliases => {
             handle_action(
@@ -515,24 +622,14 @@ fn handle_command_submit(
 ///   - Char                      → append to text field; digit-only for number/port
 pub(crate) fn handle_form_dialog_key(
     app: &mut App,
-    key: KeyEvent,
+    key: crate::app::TextKey,
     data_source: &mut ClientSession,
 ) -> bool {
-    // A Ctrl chord is never text. Both `Char` arms below match on `key.code`
-    // alone, so without this Ctrl-C typed a literal `c` into the buffer
-    // instead of quitting — and the fall-through comment at the bottom cited
-    // Ctrl-C as the very thing it was preserving. Same rule the per-view
-    // handlers already follow: an unmatched Ctrl chord is nothing, never its
-    // bare character.
-    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-        return false;
-    }
-
     use crate::app::FormFieldKind;
     if app.ui.form_dialog().is_none() {
         return false;
     }
-    match key.code {
+    match key.code() {
         KeyCode::Esc => {
             app.ui.close_modal();
         }
@@ -562,7 +659,7 @@ pub(crate) fn handle_form_dialog_key(
                     if let FormFieldKind::Select { ref options, ref mut selected } = field.kind {
                         if !options.is_empty() {
                             let n = options.len();
-                            *selected = if key.code == KeyCode::Left {
+                            *selected = if key.code() == KeyCode::Left {
                                 (*selected + n - 1) % n
                             } else {
                                 (*selected + 1) % n
@@ -642,16 +739,11 @@ fn dispatch_form_submit(
 /// parameter it used to carry is the same shape that kept the context-switch
 /// flow untestable — an argument nothing reads still forces every test to
 /// build a live daemon connection.
-pub(crate) fn handle_filter_key(app: &mut App, key: KeyEvent) -> bool {
-    // A Ctrl chord is never text — see `handle_form_dialog_key`.
-    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-        return false;
-    }
-
+pub(crate) fn handle_filter_key(app: &mut App, key: crate::app::TextKey) -> bool {
     if !app.nav.top().filter_input().active() {
         return false;
     }
-    match key.code {
+    match key.code() {
         // Draft mutations need no explicit re-filter: the draft is a
         // derive input, so the next frame's view re-derives naturally.
         KeyCode::Esc => {
@@ -822,3 +914,11 @@ mod parser_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/kube/session_commands.rs"]
+mod drain_tests;
+
+#[cfg(test)]
+#[path = "../tests/kube/session_commands_exec.rs"]
+mod exec_name_tests;

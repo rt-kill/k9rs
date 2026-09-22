@@ -73,6 +73,9 @@ pub struct ResourceRegistry {
     /// Insertion-order list of kinds, for deterministic iteration
     /// (tab cycling, alias listing).
     ordered: Vec<BuiltInKind>,
+    /// Lowercased alias → kind. An index rather than a scan, so lookup is
+    /// deterministic and a collision is rejected at registration.
+    by_alias: HashMap<String, BuiltInKind>,
 }
 
 impl Default for ResourceRegistry {
@@ -87,6 +90,7 @@ impl ResourceRegistry {
             by_kind: HashMap::new(),
             by_plural: HashMap::new(),
             ordered: Vec::new(),
+            by_alias: HashMap::new(),
         }
     }
 
@@ -159,6 +163,19 @@ impl ResourceRegistry {
     ) {
         let kind = def.kind();
         let plural_static: &'static str = def.gvr().plural;
+        // A duplicate ALIAS is as much a conflict as a duplicate kind or
+        // plural, and it used to be the one of the three that registered
+        // silently — `by_alias` would then resolve it to whichever entry the
+        // HashMap happened to yield first, differently on each launch.
+        for alias in def.aliases() {
+            let lower = alias.to_lowercase();
+            if let Some(owner) = self.by_alias.insert(lower.clone(), kind) {
+                panic!(
+                    "ResourceRegistry: alias {:?} registered for both {:?} and {:?}",
+                    lower, owner, kind,
+                );
+            }
+        }
         self.ordered.push(kind);
         if self.by_kind.insert(kind, RegistryEntry { def: Box::new(def), spawner, convert_default }).is_some() {
             panic!("ResourceRegistry: duplicate registration for {:?}", kind);
@@ -193,11 +210,16 @@ impl ResourceRegistry {
     }
 
     /// Look up by any alias (case-insensitive).
+    ///
+    /// Indexed, not scanned. The scan iterated `by_kind.values()` — a
+    /// `HashMap` with the default randomized hasher — so the FIRST alias
+    /// collision anyone introduced would have resolved to a different
+    /// resource on different launches of the same binary. It is an index now,
+    /// and `insert` rejects a collision outright, so there is nothing left to
+    /// resolve ambiguously.
     pub fn by_alias(&self, alias: &str) -> Option<&dyn ResourceDef> {
-        let lower = alias.to_lowercase();
-        self.by_kind.values()
-            .find(|e| e.def.aliases().iter().any(|a| a.eq_ignore_ascii_case(&lower)))
-            .map(|e| &*e.def)
+        let kind = self.by_alias.get(&alias.to_lowercase())?;
+        self.by_kind.get(kind).map(|e| &*e.def)
     }
 
     /// Iterate all registered resource definitions in registration order.

@@ -146,6 +146,27 @@ impl NavStack {
         self.items.iter()
     }
 
+    /// RENDER-ONLY: lift the top element off so the view BENEATH it can be
+    /// drawn, for a floating element ([`crate::app::element::ViewExtent`]).
+    /// Returns `None` at depth 1 — a float over nothing is just a view.
+    ///
+    /// Paired with [`Self::replace_lifted`], and the pair exists because
+    /// every draw function renders `nav.top()`: the alternative is threading
+    /// an element index through all seven of them so that six can ignore it.
+    /// The lift lasts exactly one render call and nothing observes the stack
+    /// in between — the draw path is synchronous and takes no events.
+    pub fn lift_top_for_render(&mut self) -> Option<Element> {
+        if self.items.len() < 2 {
+            return None;
+        }
+        self.items.pop()
+    }
+
+    /// Put back what [`Self::lift_top_for_render`] took.
+    pub fn replace_lifted(&mut self, element: Element) {
+        self.items.push(element);
+    }
+
     pub fn depth(&self) -> usize {
         self.items.len()
     }
@@ -200,14 +221,22 @@ impl NavStack {
         // stream otherwise renders as an eternally-following live view
         // (its `Ended` died in the closed channel), so this is what makes
         // a log view honest across a reconnect or a pop that reveals it.
-        if let Some(store) = self.top().log_store().cloned() {
+        if let Some(store) = self.top().log_root_store().cloned() {
+            let mut restarted = false;
             for element in self.items.iter_mut().rev() {
                 if let Element::LogSession(s) = element {
                     if Arc::ptr_eq(s.store(), &store) {
-                        s.revive_if_dead(session);
-                        return;
+                        restarted = s.revive_if_dead(session);
+                        break;
                     }
                 }
+            }
+            // A revive CLEARS the session store, so anything deriving from it
+            // is holding lines from the range that was just replaced. Done
+            // here rather than inside the loop because only the stack can see
+            // both sides of that relationship.
+            if restarted {
+                self.reset_log_filters_of(&store);
             }
         }
     }
@@ -247,6 +276,67 @@ impl NavStack {
     /// instead of a spinner orphaned by a deliver-to-top-only rule. Same
     /// named-walk discipline as `ensure_top_live` — data-plane maintenance,
     /// not scope interpretation.
+    /// Stop any range fetch that has collected the oldest N it asked for.
+    /// Returns true if one was stopped, so the caller can say so.
+    pub fn stop_completed_head_fetches(&mut self) -> bool {
+        let mut stopped = false;
+        for element in self.items.iter_mut() {
+            if let Element::LogSession(s) = element {
+                stopped |= s.stop_if_head_complete();
+            }
+        }
+        stopped
+    }
+
+    /// Advance every BURIED log filter's drain cursor.
+    ///
+    /// Retention is per-element now, and `log_visible` — the only other
+    /// thing that drains — runs on the top element alone. Without this, a
+    /// filter with anything stacked above it silently stops collecting and
+    /// comes back with a hole.
+    /// Reset every filter derived from `store` — call sites are exactly the
+    /// places that RESTART a log range, because `restart_range` empties the
+    /// session store and only the stack can see who was deriving from it.
+    pub fn reset_log_filters_of(&mut self, store: &Arc<crate::app::store::LineStore>) {
+        for element in self.items.iter_mut() {
+            if let Element::LogFilter(f) = element {
+                if Arc::ptr_eq(f.source_store(), store) {
+                    f.restarted_from_parent();
+                }
+            }
+        }
+    }
+
+    pub fn keep_log_filters_current(&mut self) {
+        for element in self.items.iter_mut() {
+            if let Element::LogFilter(f) = element {
+                f.keep_up();
+            }
+        }
+    }
+
+    /// Every log view on the stack, not just the top one.
+    ///
+    /// `initial_load` is SET by `restart_range`, which reaches a BURIED
+    /// session (`with_log_session_of` walks the whole stack by store
+    /// identity — a range key or a reconnect while a grep is on top). It was
+    /// CLEARED on `nav.top_mut()` only, so the flag latched on the session
+    /// while the drain cleared the filter's already-false copy. Escaping
+    /// back to the session then rendered the OLDEST retained lines at the
+    /// top of the box while the indicator said "AutoScroll: On" — and it
+    /// self-healed only if the stream kept producing, so a quiet pod stayed
+    /// stuck.
+    pub fn for_each_log_view(
+        &mut self,
+        mut f: impl FnMut(&mut crate::app::element::LogViewState),
+    ) {
+        for element in self.items.iter_mut() {
+            if let Some(view) = element.log_view_mut() {
+                f(view);
+            }
+        }
+    }
+
     pub fn for_each_content_view(
         &mut self,
         mut f: impl FnMut(&mut crate::app::element::ContentView),

@@ -53,12 +53,28 @@ fn push_content_element(app: &mut App, yaml: bool) {
 /// Push a log-session element (parked stream) as the top view.
 fn push_log_element(app: &mut App) {
     app.nav.push(crate::app::element::Element::LogSession(Box::new(
-        crate::app::element::LogSession::for_test(ContainerRef::new(
-            "test-pod",
-            "default",
-            crate::kube::protocol::LogContainer::Default,
-        )),
+        crate::app::element::LogSession::for_test(crate::kube::protocol::LogTarget::One("test-pod".to_string()), crate::kube::protocol::LogContainer::Default),
     )));
+}
+
+/// Push the `?` view the way `Action::Help` does.
+fn push_help_element(app: &mut App) {
+    let class = crate::event::keymap::ViewClass::of(app.nav.top());
+    let caps = Some(app.current_capabilities());
+    let store = app.core.seed_keybindings(caps, app.config.keys, class);
+    let rid = crate::kube::local::LocalResourceKind::Keybinding.to_resource_id();
+    app.nav.push(crate::app::element::Element::ResourceList(
+        crate::app::element::ResourceList::client(
+            crate::app::element::QuerySpec {
+                rid,
+                namespace: crate::kube::protocol::Namespace::All,
+                filter: None,
+            },
+            store,
+            &app.kube.metrics,
+            "keys".to_string(),
+        ),
+    ));
 }
 
 fn make_resource_app() -> App {
@@ -379,12 +395,20 @@ fn test_log_view_shift_c_clears_logs() {
     assert!(matches!(action, Some(Action::ClearLogs)));
 }
 
+/// Help is a nav ELEMENT now, so leaving it is the ordinary pop — there is
+/// no help-specific key path left to get wrong. Both `q` and Esc reach it
+/// through the table handler, like every other drilled view.
 #[test]
 fn test_q_goes_back_in_help_view() {
     let mut app = App::new_for_test();
-    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() }));
-    let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
-    assert!(matches!(action, Some(Action::Back)));
+    push_help_element(&mut app);
+    assert!(app.nav.top().is_keybindings_view());
+    // `ClearFilter` IS the pop in a table view (`q` drilled) — the same
+    // action every other drilled table uses, which is the point.
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char('q'))),
+        Some(Action::ClearFilter)
+    ));
 }
 
 #[test]
@@ -417,9 +441,40 @@ fn test_esc_goes_back_in_log_view() {
 #[test]
 fn test_esc_goes_back_in_help_view() {
     let mut app = App::new_for_test();
-    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Help { viewport: crate::app::viewport::Viewport::default() }));
-    let action = handle_key_event(&app, make_key(KeyCode::Esc));
-    assert!(matches!(action, Some(Action::Back)));
+    push_help_element(&mut app);
+    assert!(matches!(handle_key_event(&app, make_key(KeyCode::Esc)), Some(Action::ClearFilter)));
+}
+
+/// Help is a TABLE, so everything a table can do it can do: `/` opens the
+/// filter, `j`/`k` move the cursor, `c` copies. That is the whole point of
+/// modelling it as a resource rather than as a bespoke overlay.
+#[test]
+fn help_is_an_ordinary_table_view() {
+    let mut app = App::new_for_test();
+    push_help_element(&mut app);
+    for (key, want) in [
+        (KeyCode::Char('/'), Action::Filter(String::new())),
+        (KeyCode::Char('j'), Action::NextItem),
+        (KeyCode::Char('k'), Action::PrevItem),
+        (KeyCode::Char('c'), Action::Copy),
+    ] {
+        assert_eq!(handle_key_event(&app, make_key(key)), Some(want), "{key:?}");
+    }
+    assert_eq!(
+        crate::event::keymap::ViewClass::of(app.nav.top()),
+        crate::event::keymap::ViewClass::Table,
+        "help dispatches as a table, so it needs no class of its own",
+    );
+}
+
+/// It floats: the view it documents stays on screen behind it.
+#[test]
+fn help_declares_itself_a_floating_view() {
+    use crate::app::element::ViewExtent;
+    let mut app = App::new_for_test();
+    assert_eq!(app.nav.top().extent(), ViewExtent::Full, "an ordinary list fills the frame");
+    push_help_element(&mut app);
+    assert!(matches!(app.nav.top().extent(), ViewExtent::Dialog { .. }));
 }
 
 #[test]
@@ -431,7 +486,7 @@ fn test_q_goes_back_in_container_select() {
             String::new(),
             crate::kube::protocol::Namespace::All,
         ),
-        containers: Vec::new(),
+        choices: Vec::new(),
         selected: 0,
         action: crate::app::ContainerAction::Logs,
     }));
@@ -600,29 +655,37 @@ fn test_resource_view_toggle_sort_direction() {
     assert!(matches!(action, Some(Action::ToggleSortDirection)));
 }
 
+/// `N` and `A` name a column; they do not guess an index.
+///
+/// These three tests used to assert `Column(1)` for pods, `Column(0)` for
+/// nodes and `Last` for age — baking in the positional rule, and passing for
+/// the right answer for the wrong reason. The rule was wrong for any table
+/// whose shape didn't match: Events is namespaced but its headers are
+/// `[NAMESPACE, TYPE, …]`, so `N` sorted by event TYPE. The key emits a NAME
+/// now, and resolution happens against the live headers — see
+/// `semantic_sort_resolves_against_the_real_headers`.
 #[test]
-fn test_resource_view_sort_by_name() {
+fn sort_keys_name_a_column_rather_than_guessing_an_index() {
+    use crate::app::SortTarget;
     let mut app = make_resource_app();
-    // Pods are namespaced, so NAME is column 1.
-    reset_to_kind(&mut app, crate::kube::resource_def::BuiltInKind::Pod);
-    let action = handle_key_event(&app, make_key(KeyCode::Char('N')));
-    assert!(matches!(action, Some(Action::Sort(crate::app::SortTarget::Column(1)))));
-}
 
-#[test]
-fn test_resource_view_sort_by_name_cluster_scoped() {
-    let mut app = make_resource_app();
-    // Nodes are cluster-scoped, so NAME is column 0.
-    reset_to_kind(&mut app, crate::kube::resource_def::BuiltInKind::Node);
-    let action = handle_key_event(&app, make_key(KeyCode::Char('N')));
-    assert!(matches!(action, Some(Action::Sort(crate::app::SortTarget::Column(0)))));
-}
-
-#[test]
-fn test_resource_view_sort_by_age() {
-    let app = make_resource_app();
-    let action = handle_key_event(&app, make_key(KeyCode::Char('A')));
-    assert!(matches!(action, Some(Action::Sort(crate::app::SortTarget::Last))));
+    for kind in [
+        crate::kube::resource_def::BuiltInKind::Pod,
+        crate::kube::resource_def::BuiltInKind::Node,
+        crate::kube::resource_def::BuiltInKind::Event,
+    ] {
+        reset_to_kind(&mut app, kind);
+        assert_eq!(
+            handle_key_event(&app, make_key(KeyCode::Char('N'))),
+            Some(Action::Sort(SortTarget::Named(crate::app::actions::COL_NAME))),
+            "{kind:?}: N names NAME regardless of scope",
+        );
+        assert_eq!(
+            handle_key_event(&app, make_key(KeyCode::Char('A'))),
+            Some(Action::Sort(SortTarget::Named(crate::app::actions::COL_AGE))),
+            "{kind:?}: A names AGE regardless of width",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -851,4 +914,23 @@ fn test_log_view_slash_starts_search() {
     let app = make_log_app();
     let action = handle_key_event(&app, make_key(KeyCode::Char('/')));
     assert!(matches!(action, Some(Action::SearchStart)));
+}
+
+
+/// `h`/`l` and the arrows pan the log horizontally, and they do it through
+/// the SAME actions the tables use for their column cursor — one "move left
+/// in this view" intent, answered by each element in its own units. That is
+/// also why a user who rebound `colLeft`/`colRight` reaches the log pan with
+/// no second config key.
+#[test]
+fn test_log_view_h_l_and_arrows_pan() {
+    let app = make_log_app();
+    for (key, want) in [
+        (KeyCode::Char('h'), Action::ColLeft),
+        (KeyCode::Char('l'), Action::ColRight),
+        (KeyCode::Left, Action::ColLeft),
+        (KeyCode::Right, Action::ColRight),
+    ] {
+        assert_eq!(handle_key_event(&app, make_key(key)), Some(want), "{key:?}");
+    }
 }

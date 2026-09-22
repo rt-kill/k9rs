@@ -78,7 +78,7 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
         }
         crate::app::element::ContentPhase::Ready => {
             let viewer = YamlViewer::new(
-                &yaml.content,
+                yaml.content(),
                 &yaml_title,
                 theme,
             );
@@ -110,15 +110,11 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
         }
     } else {
         // Keybinding bar
-        let hints = vec![
-            ("j/k", "scroll"),
-            ("g/G", "top/bottom"),
-            ("Ctrl-d/u", "page"),
-            ("/", "search"),
-            ("n/N", "next/prev"),
-            ("Esc", "back"),
-        ];
-
+        // Projected from the ONE keymap declaration, so this bar cannot
+        // advertise a key the dispatcher doesn't have (or miss one it does).
+        let hints = crate::event::keymap::bar_hints(
+            crate::event::keymap::ViewClass::Detail,
+        );
         let line = crate::ui::header::render_keybinding_bar(&hints, theme);
         f.render_widget(line, bar_area);
     }

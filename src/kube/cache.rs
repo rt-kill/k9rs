@@ -253,6 +253,15 @@ impl DiscoveryCache {
         Self::default()
     }
 
+    /// Contexts with cached discovery, for `ctl status`.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Return (or lazily create) the per-context entry, stamping it accessed.
     /// The returned Arc lets the caller perform multiple field updates without
     /// re-taking the shard lock. Use it inline and drop it — don't hold it

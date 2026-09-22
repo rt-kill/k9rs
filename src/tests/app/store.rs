@@ -320,7 +320,7 @@ fn line_store_pushes_evicts_and_counts() {
     use crate::kube::protocol::LogLine;
     let store = LineStore::new(3);
     for i in 0..5 {
-        store.push(1, LogLine { content: format!("l{i}"), container: None });
+        store.push(1, LogLine { content: format!("l{i}"), source: None, timestamp: None });
     }
     store.with_read(|inner| {
         assert_eq!(inner.lines.len(), 3);
@@ -339,17 +339,17 @@ fn line_store_pushes_evicts_and_counts() {
 fn line_store_epoch_floor_gates_stale_streams() {
     use crate::kube::protocol::LogLine;
     let store = LineStore::new(10);
-    store.push(1, LogLine { content: "old".into(), container: None });
+    store.push(1, LogLine { content: "old".into(), source: None, timestamp: None });
     // A range restart raised the floor before the old stream's queued
     // lines drained.
     store.expect_epoch(5);
-    store.push(1, LogLine { content: "stale".into(), container: None });
+    store.push(1, LogLine { content: "stale".into(), source: None, timestamp: None });
     store.mark_ended(1); // the old stream's EOF must not mark the new one dead
     store.with_read(|inner| {
         assert_eq!(inner.lines.len(), 1);
         assert!(inner.live);
     });
-    store.push(5, LogLine { content: "fresh".into(), container: None });
+    store.push(5, LogLine { content: "fresh".into(), source: None, timestamp: None });
     store.mark_ended(5);
     store.with_read(|inner| {
         assert_eq!(inner.lines.back().unwrap().content, "fresh");
@@ -421,4 +421,149 @@ fn staleness_never_overwrites_a_louder_state() {
     // …and the quiet all-clear doesn't resurrect a failed stream either.
     store.apply(1, StorePayload::Live);
     store.with_read(|i| assert_eq!(i.state, TableDataState::Failed("forbidden".into())));
+}
+
+// ---------------------------------------------------------------------------
+// A typed percentage colours itself
+// ---------------------------------------------------------------------------
+
+/// Colouring used to come from ONE place: overlay YAML matching a column by
+/// header STRING. That is why `CPU%` instead of `%CPU` silently coloured
+/// nothing — and why every new percent column was born invisible. The cell
+/// already knows it is a percentage and already holds the number.
+#[test]
+fn a_percentage_cell_colours_itself_without_an_overlay() {
+    use crate::kube::resources::row::{CellValue, RowHealth};
+    assert_eq!(CellValue::Percentage(Some(95)).utilization_health(), Some(RowHealth::Failed));
+    assert_eq!(CellValue::Percentage(Some(80)).utilization_health(), Some(RowHealth::Pending));
+    assert_eq!(CellValue::Percentage(Some(10)).utilization_health(), None);
+    // Nothing to report is not a health state.
+    assert_eq!(CellValue::Percentage(None).utilization_health(), None);
+    // And it is a percentage rule, not a number rule: a count of 95 is a
+    // count.
+    assert_eq!(CellValue::Count(95).utilization_health(), None);
+    assert_eq!(CellValue::Text("95%".into()).utilization_health(), None);
+}
+
+/// The derive wires it up, and an explicit overlay rule still wins — the
+/// built-in is a default, not a policy.
+#[test]
+fn an_overlay_rule_outranks_the_built_in_threshold() {
+    use crate::kube::resources::row::{CellValue, RowHealth};
+
+    let row = ResourceRow {
+        name: "n1".into(),
+        cells: vec![CellValue::Text("n1".into()), CellValue::Percentage(Some(95))],
+        ..Default::default()
+    };
+    let headers = ["NAME", "%CPU"];
+    let visible: Vec<usize> = vec![0, 1];
+    let widths = vec![40u16, 40u16];
+    let spec = DeriveSpec {
+        predicates: &[],
+        draft: None,
+        sort: SortSpec::default(),
+        visible_cols: &visible,
+        headers: &headers,
+        max_col_widths: &widths,
+    };
+
+    // No overlay at all: 95% is critical by construction.
+    let view = derive_view(std::slice::from_ref(&row), &[], None, &spec);
+    assert_eq!(view.cell_style[0][1], Some(RowHealth::Failed));
+
+    // An overlay that calls 95% merely pending is obeyed: an explicit rule
+    // for THIS column beats the type's default.
+    let rules = vec![
+        crate::kube::overlay::ColumnRenderRules::default(),
+        crate::kube::overlay::ColumnRenderRules {
+            rules: vec![crate::kube::overlay::RenderRule {
+                predicate: crate::kube::overlay::RenderPredicate::parse_when(">= 50")
+                    .expect("a well-formed `when`"),
+                style: RowHealth::Pending,
+            }],
+        },
+    ];
+    let view = derive_view(&[row], &rules, None, &spec);
+    assert_eq!(
+        view.cell_style[0][1],
+        Some(RowHealth::Pending),
+        "the overlay rule wins, or it isn't an override",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Which end of an over-long stream a store keeps
+// ---------------------------------------------------------------------------
+
+/// A history request keeps its HEAD. The apiserver streams forward from the
+/// range's start, so the oldest lines arrive first — and a tail-anchored ring
+/// evicted them with the newer ones behind, leaving the newest N of a range
+/// asked for precisely to see the oldest. Asking for MORE history made it
+/// strictly worse.
+#[test]
+fn a_head_store_keeps_the_oldest_and_counts_what_it_refused() {
+    use crate::app::store::Retain;
+    use crate::kube::protocol::LogLine;
+
+    let store = LineStore::new(3);
+    store.set_retain(Retain::Head);
+    for i in 0..10 {
+        store.push(1, LogLine::untagged(format!("line-{i}")));
+    }
+
+    store.with_read(|i| {
+        let got: Vec<&str> = i.lines.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(got, ["line-0", "line-1", "line-2"], "the OLDEST three");
+        assert_eq!(i.evicted, 0, "nothing was evicted — arrivals were refused");
+        assert_eq!(i.truncated, 7, "…and the refusals are counted, not silent");
+    });
+    assert!(store.head_is_full(), "full means: there is more behind this window");
+}
+
+/// The default is unchanged: a follow keeps the newest.
+#[test]
+fn a_tail_store_still_keeps_the_newest() {
+    use crate::kube::protocol::LogLine;
+
+    let store = LineStore::new(3);
+    for i in 0..10 {
+        store.push(1, LogLine::untagged(format!("line-{i}")));
+    }
+    store.with_read(|i| {
+        let got: Vec<&str> = i.lines.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(got, ["line-7", "line-8", "line-9"]);
+        assert_eq!(i.evicted, 7);
+        assert_eq!(i.truncated, 0);
+    });
+    assert!(!store.head_is_full());
+}
+
+/// The palette assignment is the STREAM's, recorded as lines arrive, and it
+/// survives a range restart — a pod changing colour because you pressed `5`
+/// would be the hash problem wearing a different hat.
+#[test]
+fn source_slots_are_first_seen_order_and_outlive_a_clear() {
+    use crate::kube::protocol::LogLine;
+    let store = LineStore::new(100);
+    for src in ["pod-b", "pod-a", "pod-b", "pod-c"] {
+        store.push(1, LogLine {
+            source: Some(src.to_string()),
+            timestamp: None,
+            content: "x".into(),
+        });
+    }
+    assert_eq!(store.sources(), vec!["pod-b", "pod-a", "pod-c"], "first seen, no duplicates");
+
+    store.clear();
+    assert_eq!(
+        store.sources(),
+        vec!["pod-b", "pod-a", "pod-c"],
+        "a restart re-reads the same pods; their colours must not shuffle",
+    );
+
+    // An untagged stream records nothing — there is no tag to colour.
+    let store = LineStore::new(100);
+    store.push(1, LogLine { source: None, timestamp: None, content: "x".into() });
+    assert!(store.sources().is_empty());
 }

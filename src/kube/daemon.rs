@@ -282,6 +282,7 @@ async fn handle_management_command(
                 pid: std::process::id(),
                 uptime_secs: state.started_at.elapsed().as_secs(),
                 socket_path: state.socket_path.clone(),
+                caches: state.session_shared.cache_stats(),
             })).await?;
         }
 
@@ -310,9 +311,18 @@ async fn handle_management_command(
             protocol::write_bincode(writer, &SessionEvent::CommandResult(Ok(message))).await?;
         }
 
+        // NAMES the command, never its payload. `{:?}` on the whole value
+        // echoed a misdirected `Init` — `kubeconfig_yaml` with inline
+        // `client-key-data`, plus every forwarded env var — straight back to
+        // the peer, where `k9rs ctl` printed it. `server_session` already
+        // special-cases `Init` and `Apply` out of its debug logging for
+        // exactly this reason; the protection just never reached here.
         other => {
             protocol::write_bincode(writer, &SessionEvent::SessionError(
-                format!("Expected Init or management command, got: {:?}", other),
+                format!(
+                    "Expected a management command (ping/status/shutdown/clear), got: {}",
+                    other.kind_name(),
+                ),
             )).await?;
         }
     }

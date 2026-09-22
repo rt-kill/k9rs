@@ -244,6 +244,14 @@ impl RowStore {
         inner.epoch_floor = inner.epoch_floor.max(epoch);
     }
 
+    /// Whether an event stamped `epoch` would be accepted rather than
+    /// floored out as belonging to a superseded stream. Test-only: the
+    /// production path just calls `apply` and lets the floor decide.
+    #[cfg(test)]
+    pub(crate) fn would_accept_epoch(&self, epoch: u64) -> bool {
+        epoch >= self.lock().epoch_floor
+    }
+
     /// Flag the store as (re)initializing WITHOUT dropping rows — the
     /// reconnect-revive counterpart to [`RowStore::clear`]. Rows stay
     /// resident so the recovery Baseline can replace them in place (flash /
@@ -899,6 +907,21 @@ pub fn derive_view(
                             return Some(*health);
                         }
                     }
+                    // 3. A typed percentage colours itself, so a utilization
+                    //    column is never born invisible waiting for someone
+                    //    to spell its header right in a YAML file. Read the
+                    //    EFFECTIVE value: converters emit these as
+                    //    `Percentage(None)` placeholders and the metrics lens
+                    //    supplies the number (see `pods.rs`), so the stored
+                    //    cell is empty for exactly the columns that matter.
+                    //    The lens is only consulted for cells already known
+                    //    to be percentages.
+                    if matches!(row.cells.get(ci), Some(CellValue::Percentage(_))) {
+                        return metrics
+                            .and_then(|m| m.effective(row, ci))
+                            .or_else(|| row.cells.get(ci).cloned())
+                            .and_then(|v| v.utilization_health());
+                    }
                     None
                 })
                 .collect()
@@ -1058,18 +1081,65 @@ pub struct LineStore {
     inner: Mutex<LineStoreInner>,
 }
 
+/// Which END of an over-long stream a store keeps.
+///
+/// The ring is tail-anchored by default, which is right for a follow: the
+/// newest lines are the ones you want. It is exactly wrong for a history
+/// request. `since=24h` on a busy service streams oldest-first, so the old
+/// lines arrive, fill the ring, and are evicted by the newer ones behind
+/// them — the client keeps the NEWEST N of a range asked for precisely to
+/// see the oldest. Asking for more history made it strictly worse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retain {
+    /// Drop from the front; keep the newest. Follows and plain tails.
+    Tail,
+    /// Drop arrivals once full; keep the oldest. History requests.
+    Head,
+}
+
 #[derive(Debug)]
 pub struct LineStoreInner {
     /// Ring of typed log lines, bounded by `max_lines`.
     pub lines: std::collections::VecDeque<crate::kube::protocol::LogLine>,
     max_lines: usize,
+    retain: Retain,
+    /// Arrivals dropped because a `Head` store was already full — reported,
+    /// because "you are seeing the first N of more than N" is a different
+    /// statement from "this is all there was".
+    pub truncated: u64,
     /// Total lines ever evicted from the front. Elements holding scroll
     /// positions self-heal at read time by diffing against the count they
     /// last saw — the store never reaches into elements.
     pub evicted: u64,
+    /// Distinct source tags, in FIRST-SEEN order.
+    ///
+    /// The palette slot a source gets is its index here, not a hash of its
+    /// name. Hashing was both weak and wrong-tool: `31 mod 8 == -1` made the
+    /// bucket an alternating sum of the bytes, so replica names sharing a
+    /// long prefix collapsed onto the few low bits of a short suffix — and
+    /// even a perfect hash puts four sources in eight buckets with a 59%
+    /// chance of a collision. The set is KNOWN (the daemon plans it, and
+    /// every line carries its tag), so assignment gives distinct colours up
+    /// to the palette size by construction.
+    ///
+    /// Bounded by `MAX_LOG_FANOUT`, so the linear scan below is over at most
+    /// twenty short strings.
+    pub sources: Vec<String>,
     /// Whether the stream behind this store is still delivering (false
-    /// once the daemon closed the log substream).
+    /// once the daemon closed the log substream). Set by every arrival, so
+    /// it answers "is data flowing", NOT "did this stream finish".
     pub live: bool,
+    /// The stream reached an ORDERLY end — the container exited, or we
+    /// stopped it ourselves. Sticky: only [`LineStore::clear`] (a restart)
+    /// takes it back down.
+    ///
+    /// Separate from `live` because `live` cannot answer this. `push` sets
+    /// `live = true` on every arrival, and a deliberately-stopped stream
+    /// keeps delivering for a moment (`abort` is asynchronous and the event
+    /// queue is already full), so the first straggler flipped `live` back
+    /// and made a finished log look like a dead one — which
+    /// `revive_if_dead` then "recovered" by clearing it.
+    ended: bool,
     epoch_floor: u64,
 }
 
@@ -1080,8 +1150,12 @@ impl LineStore {
             inner: Mutex::new(LineStoreInner {
                 lines: std::collections::VecDeque::new(),
                 max_lines,
+                retain: Retain::Tail,
+                truncated: 0,
                 evicted: 0,
+                sources: Vec::new(),
                 live: true,
+                ended: false,
                 epoch_floor: 0,
             }),
         })
@@ -1099,6 +1173,73 @@ impl LineStore {
 
     fn bump(&self) {
         self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// This store's retention cap — a derived store inherits it.
+    pub fn max_lines(&self) -> usize {
+        self.lock().max_lines
+    }
+
+    /// Choose which end to keep. Set by the element when it opens or
+    /// restarts a stream, before any line can arrive.
+    pub fn set_retain(&self, retain: Retain) {
+        self.lock().retain = retain;
+    }
+
+    /// Whether this store has stopped accepting lines because it is a full
+    /// `Head` store — i.e. it has the oldest N and there is more behind.
+    /// Distinct source tags in first-seen order — the palette assignment.
+    /// Deliberately NOT reset by `clear`: a range restart re-reads the same
+    /// pods, and a pod changing colour because you pressed `5` would be the
+    /// hash problem wearing a different hat.
+    pub fn sources(&self) -> Vec<String> {
+        self.lock().sources.clone()
+    }
+
+    /// Whether this stream reached an orderly end — see `ended`.
+    pub fn has_ended(&self) -> bool {
+        self.lock().ended
+    }
+
+    pub fn head_is_full(&self) -> bool {
+        let inner = self.lock();
+        inner.retain == Retain::Head && inner.lines.len() >= inner.max_lines
+    }
+
+    /// Append a batch of already-matched lines (a derived store's drain).
+    /// Epoch-free: a derived store has exactly one producer, the element
+    /// that owns it, so there is no succession to gate.
+    pub fn extend_derived(&self, lines: impl IntoIterator<Item = crate::kube::protocol::LogLine>) {
+        let mut inner = self.lock();
+        let mut added = false;
+        for line in lines {
+            if inner.lines.len() >= inner.max_lines {
+                inner.lines.pop_front();
+                inner.evicted += 1;
+            }
+            if let Some(src) = &line.source {
+                if !inner.sources.iter().any(|s| s == src) {
+                    inner.sources.push(src.clone());
+                }
+            }
+            inner.lines.push_back(line);
+            added = true;
+        }
+        drop(inner);
+        if added {
+            self.bump();
+        }
+    }
+
+    /// Mirror the source stream's liveness onto a derived store, so the
+    /// "Waiting for logs…" / "No logs." branches read the same either way.
+    pub fn set_live(&self, live: bool) {
+        let mut inner = self.lock();
+        if inner.live != live {
+            inner.live = live;
+            drop(inner);
+            self.bump();
+        }
     }
 
     pub fn with_read<R>(&self, f: impl FnOnce(&LineStoreInner) -> R) -> R {
@@ -1120,8 +1261,29 @@ impl LineStore {
             return;
         }
         if inner.lines.len() >= inner.max_lines {
-            inner.lines.pop_front();
-            inner.evicted += 1;
+            match inner.retain {
+                Retain::Tail => {
+                    inner.lines.pop_front();
+                    inner.evicted += 1;
+                }
+                // Full and keeping the head: the oldest N are what was
+                // asked for, so the arrival is what goes.
+                Retain::Head => {
+                    inner.truncated += 1;
+                    // Deliberately does NOT touch `live`: a refused arrival
+                    // says nothing about liveness that was not already true,
+                    // and asserting it here is what let a straggler
+                    // un-finish a stream we had just stopped.
+                    drop(inner);
+                    self.bump();
+                    return;
+                }
+            }
+        }
+        if let Some(src) = &line.source {
+            if !inner.sources.iter().any(|s| s == src) {
+                inner.sources.push(src.clone());
+            }
         }
         inner.lines.push_back(line);
         inner.live = true;
@@ -1136,6 +1298,7 @@ impl LineStore {
             return;
         }
         inner.live = false;
+        inner.ended = true;
         drop(inner);
         self.bump();
     }
@@ -1147,7 +1310,15 @@ impl LineStore {
         let mut inner = self.lock();
         let dropped = inner.lines.len() as u64;
         inner.lines.clear();
+        inner.truncated = 0;
         inner.evicted += dropped;
+        // A clear precedes a fresh stream, so the previous stream's ending
+        // is no longer this store's ending. Without this, a range restart
+        // over a log that had ended left `ended` set forever and
+        // `revive_if_dead` became a permanent no-op — the opposite failure,
+        // a log that genuinely died and could never be recovered.
+        inner.ended = false;
+        inner.live = true;
         drop(inner);
         self.bump();
     }

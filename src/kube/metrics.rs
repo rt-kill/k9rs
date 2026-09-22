@@ -181,10 +181,26 @@ pub fn parse_mem_to_bytes(s: &str) -> u64 {
     if let Some(val) = s.strip_suffix("Ki") {
         return scale_quantity(val, 1024);
     }
+    // Pi/Ei really do turn up on large clusters — a ResourceQuota's computed
+    // `status.used` is canonicalised into whichever suffix fits, so a
+    // petabyte-scale storage quota reports `1Pi`. These were named in the
+    // comment below and not implemented, which meant they parsed as 0.
+    if let Some(val) = s.strip_suffix("Pi") {
+        return scale_quantity(val, 1024u64.pow(5));
+    }
+    if let Some(val) = s.strip_suffix("Ei") {
+        return scale_quantity(val, 1024u64.pow(6));
+    }
     // One-char decimal suffixes per the K8s Quantity spec
     // (E, P, T, G, M, k — note the *lowercase* k for kilo). Some real-world
     // configs use uppercase 'K' anyway; accept both to avoid silently
     // dropping a value to "0 bytes" on a typo.
+    if let Some(val) = s.strip_suffix('E') {
+        return scale_quantity(val, 1_000_000_000_000_000_000);
+    }
+    if let Some(val) = s.strip_suffix('P') {
+        return scale_quantity(val, 1_000_000_000_000_000);
+    }
     if let Some(val) = s.strip_suffix('T') {
         return scale_quantity(val, 1_000_000_000_000);
     }

@@ -98,12 +98,21 @@ pub struct PortForwardEntry {
     pub last_message: String,
 }
 
-/// Arguments for creating a new forward. The source's bound context is
-/// used implicitly — there's no per-request context override since each
-/// `PortForwardSource` instance is per-context already.
+/// Arguments for creating a new forward.
 pub struct PortForwardRequest {
     pub target: ObjectRef,
     pub kubectl_target: String,
+    /// The context name the CREATING SESSION knows itself by — display
+    /// metadata, recorded per entry.
+    ///
+    /// It has to ride the request rather than being read off the source,
+    /// because a source is shared by every context that resolves to the same
+    /// `ContextId` (same cluster, same credentials — the name is deliberately
+    /// not part of that identity). Reading it from the source stamped every
+    /// forward with whichever context happened to create the source FIRST, and
+    /// `PortForwardEntry` is `Serialize` — so that wrong name was on the
+    /// describe/yaml view of forwards created from the other context.
+    pub context: crate::kube::protocol::ContextName,
     /// The namespace the target lives in. Typed [`Namespace`] —
     /// `Namespace::All` is rejected at create time because port-forward
     /// has no meaning across all namespaces.
@@ -142,10 +151,18 @@ struct EntrySlot {
 /// viewing the `:pf` list, and die only on explicit stop or context teardown.
 pub struct PortForwardSource {
     id: ResourceId,
-    /// Context name this source is bound to — display metadata on every
-    /// entry (describe/yaml). Authentication rides on each request's
-    /// `kube::Client`, which IS that context; this is the human label.
-    bound_context: crate::kube::protocol::ContextName,
+    // NO context name is stored here, deliberately.
+    //
+    // A source belongs to a `ContextId`, whose identity is
+    // `(server_url, credential fingerprint)` — the context NAME is excluded so
+    // watchers are shared by actual cluster endpoint rather than by a label
+    // that collides across kubeconfig files. Two context entries pointing at
+    // one cluster with one set of credentials therefore share this source,
+    // which is correct: the forwards are equally real and equally reachable
+    // from either. Naming the source after whichever context happened to
+    // create it would just be a label that is wrong half the time, so the
+    // right number of context names to keep here is zero. Authentication
+    // rides on each request's `kube::Client`, which IS the context.
     entries: DashMap<u64, EntrySlot>,
     next_id: AtomicU64,
     tx: watch::Sender<crate::kube::protocol::TableBaseline>,
@@ -165,9 +182,9 @@ pub struct PortForwardSource {
 // canary, and pumps. The old manual abort-every-task loop is subsumed.
 
 impl PortForwardSource {
-    /// Construct a fresh source bound to a single context. Called by the
-    /// registry the first time any session subscribes for that context.
-    pub fn for_context(bound_context: crate::kube::protocol::ContextName) -> Arc<Self> {
+    /// Construct a fresh source for one `ContextId`'s local slice. Called by
+    /// the registry the first time any session attaches to that context.
+    pub fn for_context() -> Arc<Self> {
         let id = super::types::LocalResourceKind::PortForward.to_resource_id();
         let empty = crate::kube::protocol::TableBaseline {
             resource: id.clone(),
@@ -177,7 +194,6 @@ impl PortForwardSource {
         let (tx, rx) = watch::channel(empty);
         Arc::new_cyclic(|weak: &Weak<Self>| Self {
             id,
-            bound_context,
             entries: DashMap::new(),
             next_id: AtomicU64::new(1),
             tx,
@@ -203,15 +219,18 @@ impl PortForwardSource {
             .expect("self_weak must upgrade while a method is running on this source")
     }
 
-    /// The context this source is bound to.
-    pub fn bound_context(&self) -> &crate::kube::protocol::ContextName {
-        &self.bound_context
+    /// How many forwards this source is currently running. Forwards outlive
+    /// any view of them, so `ctl status` is the only way to count them
+    /// without opening the `:pf` table.
+    pub fn live_count(&self) -> usize {
+        self.entries.len()
     }
 
     /// Create a new port-forward. Returns the assigned id immediately; the
     /// supervised tunnel runs in the background and every state transition
-    /// is published via the watch channel. The request's `client` carries
-    /// the context identity — `self.bound_context` is display metadata.
+    /// is published via the watch channel. The request carries both the
+    /// `client` (the actual identity every tunnel authenticates with) and the
+    /// `context` name (display metadata for this entry).
     pub fn create(self: &Arc<Self>, req: PortForwardRequest) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         // Stored as a String (serialized into the YAML describe view).
@@ -222,7 +241,7 @@ impl PortForwardSource {
             target: req.target.clone(),
             kubectl_target: req.kubectl_target.clone(),
             namespace: ns_string,
-            context: self.bound_context.clone(),
+            context: req.context.clone(),
             local_port: req.local_port,
             remote_port: req.remote_port,
             state: PortForwardState::Starting,
@@ -510,16 +529,12 @@ impl LocalResourceSource for PortForwardSource {
         headers()
     }
 
-    fn try_begin_grace(&self) -> bool {
-        // Port forward sources are held strongly by their ContextLocals —
-        // a forward's lifetime is the context's, so subscription-level
-        // grace doesn't apply. Returning false tells LocalSubscription::Drop
-        // to just drop its Arc without spawning a grace task.
-        false
-    }
-
-    fn end_grace(&self) {
-        // No-op: grace is never started for port forwards.
+    fn grace_gate(&self) -> Option<&crate::kube::GraceGate> {
+        // Port-forward sources are held strongly by their `ContextLocals` —
+        // a forward's lifetime is the CONTEXT's, not any view of it — so
+        // subscription-level grace doesn't apply. `None` tells
+        // `LocalSubscription::Drop` to just drop its Arc.
+        None
     }
 
     fn subscribe(&self) -> watch::Receiver<crate::kube::protocol::TableBaseline> {
@@ -606,6 +621,10 @@ impl LocalResourceSource for PortForwardSource {
         let arc = self.arc_self();
         let new_id = arc.create(PortForwardRequest {
             target: current.target,
+            // The edit reconciles by stop-and-recreate, so the replacement
+            // inherits the original's context label along with its client —
+            // an edit does not move a forward to whoever is editing it.
+            context: current.context,
             kubectl_target: edit.kubectl_target,
             namespace: Namespace::Named(edit.namespace),
             local_port: edit.local_port,
@@ -717,3 +736,7 @@ pub fn pf_to_row(entry: &PortForwardEntry) -> ResourceRow {
     }
 }
 
+
+#[cfg(test)]
+#[path = "../../tests/kube/local/port_forward.rs"]
+mod tests;
