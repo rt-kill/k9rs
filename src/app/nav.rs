@@ -268,14 +268,6 @@ impl NavStack {
         }
     }
 
-    /// Run `f` over every ContentView in the stack — the delivery walk for
-    /// fetched content (yaml / describe / decoded secrets) and the
-    /// failure-marking walk at the session-rebuild choke point. Routing is
-    /// by each view's OWN spec (content identity), wherever it sits:
-    /// covered views fill while hidden, so a pop-reveal shows the content
-    /// instead of a spinner orphaned by a deliver-to-top-only rule. Same
-    /// named-walk discipline as `ensure_top_live` — data-plane maintenance,
-    /// not scope interpretation.
     /// Stop any range fetch that has collected the oldest N it asked for.
     /// Returns true if one was stopped, so the caller can say so.
     pub fn stop_completed_head_fetches(&mut self) -> bool {
@@ -288,12 +280,6 @@ impl NavStack {
         stopped
     }
 
-    /// Advance every BURIED log filter's drain cursor.
-    ///
-    /// Retention is per-element now, and `log_visible` — the only other
-    /// thing that drains — runs on the top element alone. Without this, a
-    /// filter with anything stacked above it silently stops collecting and
-    /// comes back with a hole.
     /// Reset every filter derived from `store` — call sites are exactly the
     /// places that RESTART a log range, because `restart_range` empties the
     /// session store and only the stack can see who was deriving from it.
@@ -307,6 +293,12 @@ impl NavStack {
         }
     }
 
+    /// Advance every BURIED log filter's drain cursor.
+    ///
+    /// Retention is per-element now, and `log_visible` — the only other
+    /// thing that drains — runs on the top element alone. Without this, a
+    /// filter with anything stacked above it silently stops collecting and
+    /// comes back with a hole.
     pub fn keep_log_filters_current(&mut self) {
         for element in self.items.iter_mut() {
             if let Element::LogFilter(f) = element {
@@ -328,7 +320,7 @@ impl NavStack {
     /// stuck.
     pub fn for_each_log_view(
         &mut self,
-        mut f: impl FnMut(&mut crate::app::element::LogViewState),
+        mut f: impl FnMut(&mut crate::app::element::LogInteraction),
     ) {
         for element in self.items.iter_mut() {
             if let Some(view) = element.log_view_mut() {
@@ -337,6 +329,14 @@ impl NavStack {
         }
     }
 
+    /// Run `f` over every ContentView in the stack — the delivery walk for
+    /// fetched content (yaml / describe / decoded secrets) and the
+    /// failure-marking walk at the session-rebuild choke point. Routing is
+    /// by each view's OWN spec (content identity), wherever it sits:
+    /// covered views fill while hidden, so a pop-reveal shows the content
+    /// instead of a spinner orphaned by a deliver-to-top-only rule. Same
+    /// named-walk discipline as `ensure_top_live` — data-plane maintenance,
+    /// not scope interpretation.
     pub fn for_each_content_view(
         &mut self,
         mut f: impl FnMut(&mut crate::app::element::ContentView),
@@ -432,7 +432,7 @@ pub fn rid(kind: crate::kube::resource_def::BuiltInKind) -> ResourceId {
 #[derive(Debug, Default, Clone)]
 pub struct FilterInputState {
     active: bool,
-    text: String,
+    text: crate::app::text_input::TextInput,
     column: Option<ColumnTarget>,
 }
 
@@ -463,7 +463,7 @@ impl FilterInputState {
     }
     /// The text being typed (not yet committed as a RowFilter element).
     pub fn text(&self) -> &str {
-        &self.text
+        self.text.value()
     }
     /// Column restriction index, if any (`~` mode).
     pub fn column(&self) -> Option<usize> {
@@ -500,7 +500,7 @@ impl FilterInputState {
     /// is empty (nothing to commit).
     pub(crate) fn commit(&mut self) -> Option<CommittedFilter> {
         self.active = false;
-        let text = std::mem::take(&mut self.text);
+        let text = self.text.take();
         let column = self.column.take();
         if text.is_empty() {
             None
@@ -511,11 +511,22 @@ impl FilterInputState {
 
     // -- Keystroke handling ---------------------------------------------------
 
+    /// Direct access for editing — the caret and its boundary invariant are
+    /// the input's to keep, not this wrapper's.
+    pub fn input_mut(&mut self) -> &mut crate::app::text_input::TextInput {
+        &mut self.text
+    }
+
+    /// Caret position for the renderer, in columns.
+    pub fn caret_col(&self) -> usize {
+        self.text.cursor_col()
+    }
+
     pub fn push_char(&mut self, c: char) {
-        self.text.push(c);
+        self.text.insert(c);
     }
     pub fn pop_char(&mut self) {
-        self.text.pop();
+        self.text.backspace();
     }
 }
 

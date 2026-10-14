@@ -1,6 +1,6 @@
 use super::*;
 use crate::app::nav::CompiledGrep;
-use crate::kube::protocol::{TableBaseline, TableDelta};
+use crate::kube::protocol::{LogLine, TableBaseline, TableDelta};
 use crate::kube::resource_def::BuiltInKind;
 
 fn rid() -> ResourceId {
@@ -566,4 +566,189 @@ fn source_slots_are_first_seen_order_and_outlive_a_clear() {
     let store = LineStore::new(100);
     store.push(1, LogLine { source: None, timestamp: None, content: "x".into() });
     assert!(store.sources().is_empty());
+}
+
+/// The committed predicate obeys the same rule as the draft — they are two
+/// code paths for one statement, and the draft is the one you see while
+/// typing. If they disagreed, a pattern would match rows while you typed it
+/// and lose them the moment you pressed Enter.
+#[test]
+fn the_committed_grep_also_scans_only_visible_columns() {
+    use crate::kube::resources::row::{CellValue, ResourceRow};
+    let row = ResourceRow {
+        cells: vec![
+            CellValue::Text("fetcher-playwright".into()),
+            CellValue::Text("1/1".into()),
+            CellValue::Text("registry/pimp-base:v2".into()), // hidden column
+        ],
+        name: "fetcher-playwright".into(),
+        ..Default::default()
+    };
+    let cells: Vec<String> =
+        row.cells.iter().map(|c| c.to_string()).collect();
+    let grep = RowPredicate::Grep(crate::app::nav::CompiledGrep::new("pimp"));
+
+    assert!(
+        !grep.matches(&row, &cells, &[0, 1]),
+        "the needle is only in column 2, which is not displayed",
+    );
+    assert!(
+        grep.matches(&row, &cells, &[0, 1, 2]),
+        "…and Ctrl-w, which shows it, must also search it",
+    );
+
+    // A column-restricted grep (`~`) indexes ABSOLUTE data columns, so it is
+    // unaffected by which happen to be on screen.
+    let col = RowPredicate::ColumnGrep {
+        pattern: crate::app::nav::CompiledGrep::new("pimp"),
+        col: 2,
+        header: "IMAGES".into(),
+    };
+    assert!(col.matches(&row, &cells, &[0, 1]));
+}
+
+// ---------------------------------------------------------------------------
+// StoredLine — a log line plus the one form everything derives from it
+// ---------------------------------------------------------------------------
+
+fn stored(ts: Option<&str>, source: Option<&str>, content: &str) -> StoredLine {
+    StoredLine::from(LogLine {
+        timestamp: ts.map(str::to_string),
+        source: source.map(str::to_string),
+        content: content.to_string(),
+    })
+}
+
+#[test]
+fn logline_flat_text() {
+    // Export carries the line's SUBSTANCE, not a transcript of the drawn
+    // cells: both pieces of provenance ride along whatever `t` and `p` are
+    // set to. All FOUR shapes are pinned, because the one the daemon
+    // actually produces — timestamped — is the one the old test left out,
+    // and it was the one being silently dropped.
+    assert_eq!(StoredLine::from(LogLine::untagged("hi")).flat_text().as_ref(), "hi");
+    assert_eq!(
+        stored(None, Some("web"), "msg").flat_text().as_ref(),
+        "[web] msg",
+    );
+    let ts = "2026-09-18T20:29:40.6Z";
+    assert_eq!(
+        stored(Some(ts), None, "msg").flat_text().as_ref(),
+        format!("{ts} msg"),
+    );
+    assert_eq!(
+        stored(Some(ts), Some("web"), "msg").flat_text().as_ref(),
+        format!("{ts} [web] msg"),
+    );
+}
+
+/// A file is not a terminal: the export form carries the line's visible
+/// text, and nothing can hand it a colour code.
+///
+/// This used to be the callers' job — three of them, all saying
+/// `strip_ansi(&l.flat_text())` through a tokenizer that was not the
+/// renderer's. With the decision inside `flat_text` there is no way to ask
+/// for the export form and get escapes, so the fourth caller cannot get it
+/// wrong, and a `grep` over a saved log sees what the screen showed.
+#[test]
+fn an_export_is_never_a_transcript_of_colour() {
+    let coloured = "\u{1b}[2mts\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[2mworkers\u{1b}[0m=0";
+    let line = stored(Some("2026-09-18T20:29:40.6Z"), Some("web"), coloured);
+    assert_eq!(
+        line.flat_text().as_ref(),
+        "2026-09-18T20:29:40.6Z [web] ts  INFO workers=0",
+        "the body is the VISIBLE text — and `workers=0` is contiguous in it",
+    );
+
+    // The untagged shape is the one that can stay borrowed, so it is the one
+    // that could have skipped the cleaning by accident.
+    let bare = StoredLine::from(LogLine::untagged(coloured));
+    assert!(
+        !bare.flat_text().contains('\u{1b}'),
+        "even the zero-copy arm cleans: {:?}",
+        bare.flat_text(),
+    );
+    assert_eq!(
+        StoredLine::from(LogLine::untagged("plain")).flat_text(),
+        std::borrow::Cow::Borrowed("plain"),
+        "and a clean line still costs nothing",
+    );
+}
+
+/// The derived form is derived ONCE, from the line, and cannot drift from it.
+///
+/// This is the whole point of the type: four consumers wanted the visible
+/// text and each derived it at the point of use, so one of them (the grep)
+/// could be — and was — still looking at the raw bytes. A stored line has no
+/// spelling that yields the raw body to a consumer that wanted the visible
+/// one.
+#[test]
+fn a_stored_line_derives_its_visible_text_once() {
+    use crate::kube::protocol::Role;
+
+    let coloured = "\u{1b}[2mts\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[2mworkers\u{1b}[0m=0";
+    let line = stored(Some("2026-09-18T20:29:40.6Z"), Some("web"), coloured);
+
+    // The one definition, not a second copy of its rules.
+    assert_eq!(line.visible(), crate::util::visible_text(coloured).as_ref());
+    assert_eq!(line.visible(), "ts  INFO workers=0");
+    // `Deref`: the RAW content is still there, because the renderer's colour
+    // comes from it. Both forms, one line, no third view.
+    assert_eq!(line.content, coloured);
+
+    // The body segment IS the visible text — which is what makes a grep,
+    // a highlight and an export index one offset space.
+    let body = line
+        .segments()
+        .find(|(r, ..)| *r == Role::Body)
+        .expect("a line always has a body");
+    assert_eq!(body.1, "ts  INFO workers=0");
+    assert!(
+        line.segments().all(|(_, text, _)| !text.contains('\u{1b}')),
+        "no segment carries an escape",
+    );
+
+    // The roles and their order are the wire fields', unchanged.
+    let roles: Vec<Role> = line.segments().map(|(r, ..)| r).collect();
+    assert_eq!(roles, vec![Role::Source, Role::Timestamp, Role::Body]);
+
+    // A line with nothing to strip keeps no second copy of itself.
+    let clean = stored(None, None, "workers=0");
+    assert_eq!(clean.visible(), "workers=0");
+    assert!(
+        std::ptr::eq(clean.visible(), clean.content.as_str()),
+        "a clean line's visible text IS its content, not a duplicate of it",
+    );
+}
+
+/// Arrival is where the derivation happens — so it happens once per line in
+/// its whole lifetime, not once per line per frame.
+///
+/// Measuring a wrapped 50,000-line buffer cost 49 ms a frame, nearly all of
+/// it re-deriving a value that cannot change. `push` is the only door a wire
+/// line comes through, which is why that is where it is made.
+#[test]
+fn the_store_materializes_on_arrival() {
+    use crate::kube::protocol::LogLine;
+
+    let store = LineStore::new(4);
+    store.push(0, LogLine::untagged("\u{1b}[32mok\u{1b}[0m yes"));
+    store.push(0, LogLine::untagged("plain"));
+
+    store.with_read(|inner| {
+        assert_eq!(inner.lines[0].visible(), "ok yes", "already visible text");
+        assert_eq!(inner.lines[0].content, "\u{1b}[32mok\u{1b}[0m yes", "raw kept for colour");
+        assert_eq!(inner.lines[1].visible(), "plain");
+    });
+
+    // A derived store (a grep's own retention) takes ALREADY-materialized
+    // lines: the filter clones what the parent derived rather than deriving
+    // the same bytes a second time.
+    let derived = LineStore::new(4);
+    let batch: Vec<StoredLine> = store.with_read(|inner| inner.lines.iter().cloned().collect());
+    derived.extend_derived(batch);
+    derived.with_read(|inner| {
+        assert_eq!(inner.lines.len(), 2);
+        assert_eq!(inner.lines[0].visible(), "ok yes");
+    });
 }

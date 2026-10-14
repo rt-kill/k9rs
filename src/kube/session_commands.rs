@@ -142,8 +142,6 @@ pub(crate) enum ParsedCommand {
     Quit,
     /// `:help`, `:h`, `:?`
     Help,
-    /// `:alias`, `:aliases`, `:a`
-    Aliases,
     /// `:overview`, `:home`
     Overview,
     /// `:ctx <name>`, `:context <name>`
@@ -166,6 +164,91 @@ pub(crate) enum ParsedCommand {
     CrdCandidate(String),
 }
 
+/// One static `:` word, for the aliases view to list, the completer to
+/// offer, and this module's test to probe.
+///
+/// The same shape as [`crate::event::keymap::Binding`], for the same reason:
+/// the grammar below is a linear match, so the only way the documentation and
+/// the parser can be held together is to declare the documentation once and
+/// probe it. There were THREE hand-written copies of this list — `Ctrl-a`'s
+/// text document, and two slices in the completer — and the words that take
+/// an argument were spelled differently in each.
+///
+/// Resource aliases are NOT here: they come from the registry and from
+/// `LocalResourceKind`, which are already their single declaration.
+pub(crate) struct CommandDoc {
+    /// The words that select it, exactly as typed — what the completer
+    /// offers. A word that takes an argument appears here bare; the
+    /// placeholder is display only.
+    pub words: &'static [&'static str],
+    /// What the argument is called, for display. `None` takes none.
+    pub arg: Option<&'static str>,
+    pub label: &'static str,
+    /// One input the parser must classify, and the check that it did.
+    /// Read only by `every_documented_command_word_is_one_the_parser_accepts`
+    /// — it exists to hold the declaration and the grammar together, which is
+    /// a test's job, so it is dead in a release build by design.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub probe: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub accepts: fn(&ParsedCommand) -> bool,
+}
+
+impl CommandDoc {
+    /// How a reference view prints it: `q / quit / exit` or `ns <name>`.
+    pub fn display(&self) -> String {
+        match self.arg {
+            None => self.words.join(" / "),
+            Some(arg) => self
+                .words
+                .iter()
+                .map(|w| format!("{w} <{arg}>"))
+                .collect::<Vec<_>>()
+                .join(" / "),
+        }
+    }
+}
+
+/// Every `:` word that is a command rather than a resource, in the order the
+/// grammar tries them.
+pub(crate) const COMMAND_WORDS: &[CommandDoc] = &[
+    CommandDoc {
+        words: &["q", "quit", "exit", "q!"],
+        arg: None,
+        label: "Quit",
+        probe: "q",
+        accepts: |p| matches!(p, ParsedCommand::Quit),
+    },
+    CommandDoc {
+        words: &["help", "h", "?"],
+        arg: None,
+        label: "Show help for this view",
+        probe: "help",
+        accepts: |p| matches!(p, ParsedCommand::Help),
+    },
+    CommandDoc {
+        words: &["overview", "home"],
+        arg: None,
+        label: "Cluster overview",
+        probe: "overview",
+        accepts: |p| matches!(p, ParsedCommand::Overview),
+    },
+    CommandDoc {
+        words: &["ctx", "context"],
+        arg: Some("name"),
+        label: "Switch context",
+        probe: "ctx dev",
+        accepts: |p| matches!(p, ParsedCommand::ContextSwitch(_)),
+    },
+    CommandDoc {
+        words: &["ns", "namespace"],
+        arg: Some("name"),
+        label: "Switch namespace",
+        probe: "ns kube-system",
+        accepts: |p| matches!(p, ParsedCommand::NamespaceSwitch(_)),
+    },
+];
+
 /// Classify a `:command` string into a [`ParsedCommand`]. The caller
 /// passes both the raw case-preserving string (for filter text that must
 /// keep its case) and the lowercased form (for alias matching). `app`
@@ -182,8 +265,11 @@ pub(crate) fn parse_command_input(raw_cmd: &str, cmd: &str, app: &App) -> Parsed
     // 1. Static command words.
     if matches!(cmd, "q" | "quit" | "exit" | "q!") { return ParsedCommand::Quit; }
     if matches!(cmd, "help" | "h" | "?") { return ParsedCommand::Help; }
-    if matches!(cmd, "alias" | "aliases" | "a") { return ParsedCommand::Aliases; }
     if matches!(cmd, "overview" | "home") { return ParsedCommand::Overview; }
+    // `:alias` / `:aliases` / `:a` are NOT special-cased, for the same
+    // reason `:ctx` is not: aliases ARE an ordinary resource now (a
+    // client-owned one), so the resource path below resolves them and they
+    // reset the nav stack like every other root-level resource command.
     // `:ctx` / `:context` / `:contexts` are NOT special-cased here — they
     // resolve through the ordinary resource-alias path below, because
     // contexts ARE an ordinary resource (a client-owned one). That is what
@@ -416,7 +502,7 @@ pub(crate) fn edit_command_key(app: &mut App, key: crate::app::TextKey) -> Comma
                         Some(i) => i.saturating_sub(1),
                     };
                     *history_index = Some(idx);
-                    *input = app.command_history[idx].clone();
+                    input.set(app.command_history[idx].clone());
                 }
             }
         }
@@ -425,7 +511,7 @@ pub(crate) fn edit_command_key(app: &mut App, key: crate::app::TextKey) -> Comma
                 if let Some(idx) = *history_index {
                     if idx + 1 < app.command_history.len() {
                         *history_index = Some(idx + 1);
-                        *input = app.command_history[idx + 1].clone();
+                        input.set(app.command_history[idx + 1].clone());
                     } else {
                         *history_index = None;
                         input.clear();
@@ -433,16 +519,37 @@ pub(crate) fn edit_command_key(app: &mut App, key: crate::app::TextKey) -> Comma
                 }
             }
         }
-        KeyCode::Backspace => {
+        // Editing goes through the ONE text input. Any edit drops the
+        // history position: what is in the box is no longer the recalled
+        // command, so Up must resume from the end rather than from wherever
+        // the recall had got to.
+        code @ (KeyCode::Backspace
+        | KeyCode::Delete
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::Char(_)) => {
             if let Some((input, history_index)) = app.ui.command_input_mut() {
-                input.pop();
-                *history_index = None;
-            }
-        }
-        KeyCode::Char(c) => {
-            if let Some((input, history_index)) = app.ui.command_input_mut() {
-                input.push(c);
-                *history_index = None;
+                match code {
+                    KeyCode::Backspace => {
+                        input.backspace();
+                        *history_index = None;
+                    }
+                    KeyCode::Delete => {
+                        input.delete();
+                        *history_index = None;
+                    }
+                    KeyCode::Char(c) => {
+                        input.insert(c);
+                        *history_index = None;
+                    }
+                    // Moving the caret is not an edit — the recalled command
+                    // is still the recalled command.
+                    KeyCode::Left => input.left(),
+                    KeyCode::Right => input.right(),
+                    KeyCode::Home => input.home(),
+                    KeyCode::End => input.end(),
+                    _ => unreachable!("the pattern above admits nothing else"),
+                }
             }
         }
         _ => {}
@@ -496,12 +603,6 @@ fn handle_command_submit(
             // `:help` and `?` are the same thing, so they go through the same
             // action rather than each constructing the view themselves.
             handle_action(app, crate::app::actions::Action::Help, event_tx, data_source);
-        }
-        ParsedCommand::Aliases => {
-            handle_action(
-                app, crate::app::actions::Action::ShowAliases, event_tx,
-                data_source,
-            );
         }
         ParsedCommand::Overview => {
             app.nav.reset(crate::app::element::Element::Overview(
@@ -626,7 +727,10 @@ pub(crate) fn handle_form_dialog_key(
     data_source: &mut ClientSession,
 ) -> bool {
     use crate::app::FormFieldKind;
-    if app.ui.form_dialog().is_none() {
+    // The form is an ELEMENT now; its typing still runs here because a
+    // keystroke that edits text has to mutate, and `handle_key_event` only
+    // names actions. Every other text surface is handled the same way.
+    if !matches!(app.nav.top(), crate::app::element::Element::Form(_)) {
         return false;
     }
     match key.code() {
@@ -634,29 +738,34 @@ pub(crate) fn handle_form_dialog_key(
             app.ui.close_modal();
         }
         KeyCode::Tab | KeyCode::Down => {
-            if let Some(d) = app.ui.form_dialog_mut() {
+            if let Some(d) = app.nav.top_mut().form_dialog_mut() {
                 d.focus_next();
             }
         }
         KeyCode::BackTab | KeyCode::Up => {
-            if let Some(d) = app.ui.form_dialog_mut() {
+            if let Some(d) = app.nav.top_mut().form_dialog_mut() {
                 d.focus_prev();
             }
         }
         KeyCode::Enter => {
-            let ok = app.ui.form_dialog().as_ref().is_some_and(|d| d.ok_focused());
+            let ok = app.nav.top().form_dialog().as_ref().is_some_and(|d| d.ok_focused());
             if ok {
-                if let Some(dialog) = app.ui.take_modal().into_form() {
+                if let Some(crate::app::element::Element::Form(dialog)) = app.nav.pop() {
+                    let dialog = *dialog;
                     dispatch_form_submit(app, data_source, dialog);
                 }
-            } else if let Some(d) = app.ui.form_dialog_mut() {
+            } else if let Some(d) = app.nav.top_mut().form_dialog_mut() {
                 d.focus_next();
             }
         }
+        // Left/Right mean different things to different FIELD kinds, and the
+        // field decides: a Select cycles its options, a text field moves the
+        // caret. Before the caret existed only the first half had a meaning,
+        // so arrows on a text field did nothing at all.
         KeyCode::Left | KeyCode::Right => {
-            if let Some(d) = app.ui.form_dialog_mut() {
-                if let Some(field) = d.current_field_mut() {
-                    if let FormFieldKind::Select { ref options, ref mut selected } = field.kind {
+            if let Some(field) = app.nav.top_mut().form_dialog_mut().and_then(|d| d.current_field_mut()) {
+                match field.kind {
+                    FormFieldKind::Select { ref options, ref mut selected } => {
                         if !options.is_empty() {
                             let n = options.len();
                             *selected = if key.code() == KeyCode::Left {
@@ -666,31 +775,48 @@ pub(crate) fn handle_form_dialog_key(
                             };
                         }
                     }
-                }
-            }
-        }
-        KeyCode::Backspace => {
-            if let Some(d) = app.ui.form_dialog_mut() {
-                if let Some(field) = d.current_field_mut() {
-                    if field.is_text_input() {
-                        field.value.pop();
-                    }
-                }
-            }
-        }
-        KeyCode::Char(c) => {
-            if let Some(d) = app.ui.form_dialog_mut() {
-                if let Some(field) = d.current_field_mut() {
-                    let accept = match field.kind {
-                        FormFieldKind::Text { max_len } => {
-                            max_len.is_none_or(|m| field.value.chars().count() < m)
+                    _ => {
+                        if key.code() == KeyCode::Left {
+                            field.value.left()
+                        } else {
+                            field.value.right()
                         }
-                        FormFieldKind::Number { .. } | FormFieldKind::Port => c.is_ascii_digit(),
-                        FormFieldKind::Select { .. } => false,
-                    };
-                    if accept {
-                        field.value.push(c);
                     }
+                }
+            }
+        }
+        // Editing goes through the ONE text input, so a form field takes the
+        // caret like every other box. What a field ACCEPTS is still the
+        // field's own business — a Port takes digits wherever the caret is.
+        code @ (KeyCode::Backspace
+        | KeyCode::Delete
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::Char(_)) => {
+            if let Some(field) = app.nav.top_mut().form_dialog_mut().and_then(|d| d.current_field_mut()) {
+                if !field.is_text_input() {
+                    return true;
+                }
+                match code {
+                    KeyCode::Backspace => field.value.backspace(),
+                    KeyCode::Delete => field.value.delete(),
+                    KeyCode::Home => field.value.home(),
+                    KeyCode::End => field.value.end(),
+                    KeyCode::Char(c) => {
+                        let accept = match field.kind {
+                            FormFieldKind::Text { max_len } => {
+                                max_len.is_none_or(|m| field.value.value().chars().count() < m)
+                            }
+                            FormFieldKind::Number { .. } | FormFieldKind::Port => {
+                                c.is_ascii_digit()
+                            }
+                            FormFieldKind::Select { .. } => false,
+                        };
+                        if accept {
+                            field.value.insert(c);
+                        }
+                    }
+                    _ => unreachable!("the pattern above admits nothing else"),
                 }
             }
         }
@@ -765,14 +891,26 @@ pub(crate) fn handle_filter_key(app: &mut App, key: crate::app::TextKey) -> bool
                 }
             }
         }
-        KeyCode::Backspace => {
-            if let Some(fi) = app.nav.top_mut().filter_input_mut() {
-                fi.pop_char();
-            }
-        }
-        KeyCode::Char(c) => {
-            if let Some(fi) = app.nav.top_mut().filter_input_mut() {
-                fi.push_char(c);
+        // Editing goes through the ONE text input, so the caret behaves
+        // here exactly as it does in the log grep and the command prompt.
+        code @ (KeyCode::Backspace
+        | KeyCode::Delete
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::Char(_)) => {
+            let Some(fi) = app.nav.top_mut().filter_input_mut() else { return false };
+            let t = fi.input_mut();
+            match code {
+                KeyCode::Backspace => t.backspace(),
+                KeyCode::Delete => t.delete(),
+                KeyCode::Left => t.left(),
+                KeyCode::Right => t.right(),
+                KeyCode::Home => t.home(),
+                KeyCode::End => t.end(),
+                KeyCode::Char(c) => t.insert(c),
+                _ => unreachable!("the pattern above admits nothing else"),
             }
         }
         // Don't consume keys we don't handle — let them fall through
@@ -797,13 +935,58 @@ mod parser_tests {
         parse_command_input(input, &input.to_lowercase(), &app)
     }
 
+    /// Every documented `:` word really parses to what it claims.
+    ///
+    /// `COMMAND_WORDS` exists so the aliases view does not hand-write its own
+    /// copy of this grammar — which is exactly what `Ctrl-a` used to do, and
+    /// why its key list had drifted from the keymap. A declaration the parser
+    /// does not read needs a probe, so this is the same arrangement the
+    /// keymap has: documentation beside a check that it is true.
+    #[test]
+    fn every_documented_command_word_is_one_the_parser_accepts() {
+        for doc in COMMAND_WORDS {
+            let parsed = parse(doc.probe);
+            assert!(
+                (doc.accepts)(&parsed),
+                "`:{}` is documented as `{}` but parsed as {:?}",
+                doc.probe,
+                doc.label,
+                parsed,
+            );
+            // The declared words must include the probe's first token, or
+            // the row documents one thing and the test checks another.
+            let head = doc.probe.split(' ').next().unwrap_or(doc.probe);
+            assert!(
+                doc.words.contains(&head),
+                "`{}` lists {:?}, which does not include the probe `{}`",
+                doc.label,
+                doc.words,
+                head,
+            );
+            // And a word that takes an argument must be probed WITH one,
+            // or the probe exercises a different grammar rule.
+            assert_eq!(
+                doc.arg.is_some(),
+                doc.probe.contains(' '),
+                "`{}`: the probe and the declared arity disagree",
+                doc.label,
+            );
+        }
+    }
+
     #[test]
     fn static_words_classify() {
         assert!(matches!(parse("q"), ParsedCommand::Quit));
         assert!(matches!(parse("quit"), ParsedCommand::Quit));
         assert!(matches!(parse("help"), ParsedCommand::Help));
         assert!(matches!(parse("?"), ParsedCommand::Help));
-        assert!(matches!(parse("alias"), ParsedCommand::Aliases));
+        // `:alias` resolves as the ordinary client-owned RESOURCE it is now.
+        assert!(matches!(
+            parse("alias"),
+            ParsedCommand::Resource(ResourceId::Local(
+                crate::kube::local::LocalResourceKind::Alias
+            ))
+        ));
         assert!(matches!(parse("home"), ParsedCommand::Overview));
     }
 

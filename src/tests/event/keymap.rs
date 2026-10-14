@@ -25,10 +25,29 @@ fn app_in(class: ViewClass) -> App {
                 crate::kube::protocol::LogTarget::One("canarypod".to_string()), LogContainer::Default,
             ))));
         }
+        ViewClass::Dialog => {
+            app.nav.push(Element::Confirm(Box::new(crate::app::ConfirmDialog {
+                message: "Delete pod/canary?".to_string(),
+                action_label: "Delete".to_string(),
+                pending: crate::app::PendingAction::Single {
+                    op: crate::app::SingleOp::Delete,
+                    target: crate::kube::protocol::ObjectRef::new(
+                        crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                        "canary".to_string(),
+                        crate::kube::protocol::Namespace::Named("default".to_string()),
+                    ),
+                },
+                action_focused: false,
+            })));
+        }
         ViewClass::Detail => {
             app.nav.push(Element::ContentView(
                 crate::app::element::ContentView::new(
-                    crate::app::element::ContentSpec::Aliases,
+                    crate::app::element::ContentSpec::Describe(crate::kube::protocol::ObjectRef::new(
+                    crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                    "some-pod".to_string(),
+                    crate::kube::protocol::Namespace::Named("default".to_string()),
+                )),
                     crate::app::ContentViewState::default(),
                     crate::app::element::ContentPhase::Ready,
                 ),
@@ -43,8 +62,8 @@ fn app_in(class: ViewClass) -> App {
     app
 }
 
-const CLASSES: [ViewClass; 4] =
-    [ViewClass::Overview, ViewClass::Table, ViewClass::Detail, ViewClass::Log];
+const CLASSES: [ViewClass; 5] =
+    [ViewClass::Overview, ViewClass::Table, ViewClass::Detail, ViewClass::Log, ViewClass::Dialog];
 
 #[test]
 fn every_documented_view_key_dispatches_to_the_action_it_claims() {
@@ -74,6 +93,26 @@ fn every_documented_global_key_works_in_every_view() {
     // intercept it as search — so it is checked per class below.
     for class in CLASSES {
         let app = app_in(class);
+        // A MODAL class is the one real exception, and it is a stronger
+        // statement than "skip": every global must be CAPTURED there, not
+        // leaked to the view underneath. A confirm box whose `:` opened the
+        // command prompt behind it would be answering a question you could
+        // no longer see — and its "any other key cancels" safety net, which
+        // exists so a spurious keystroke dismisses the box, would be dead.
+        if app.nav.top().captures_all_input() {
+            for binding in global() {
+                let Some((key, expected)) = binding.probe else { continue };
+                let got = handle_key_event(&app, key);
+                assert_ne!(
+                    got.as_ref(),
+                    Some(&expected),
+                    "{class:?}: a modal element must capture global `{}`, not pass it through",
+                    binding.keys,
+                );
+                assert!(got.is_some(), "{class:?}: …and must answer it, not drop it");
+            }
+            continue;
+        }
         for binding in global() {
             let Some((key, expected)) = binding.probe else { continue };
             if key.code == crossterm::event::KeyCode::Char('/') {
@@ -139,10 +178,102 @@ fn a_hint_bar_is_a_subset_of_what_help_shows() {
     // advertise a key help had never heard of. They project from the same
     // declaration now, so this holds by construction — pinned because the
     // construction is the point.
+    //
+    // A hint may now cover a RUN of keys (bindings sharing one bar label),
+    // which is how seven `since` keys became `<0-6> range` instead of 44
+    // columns of the bar. So the check is that each hint IS the derivation of
+    // its run, which can only be true if both endpoints are real bindings.
     for class in CLASSES {
-        let all: Vec<&str> = for_class(class).iter().map(|b| b.keys).collect();
-        for (key, _) in bar_hints(class) {
-            assert!(all.contains(&key), "{class:?}: bar key `{key}` is not in the keymap");
+        let bindings = for_class(class);
+        let hints = bar_hints(class);
+        let labels: Vec<&str> = bindings.iter().filter_map(|b| b.bar_label).collect();
+
+        // One hint per RUN of equal labels, in order.
+        let mut runs: Vec<&str> = Vec::new();
+        for l in &labels {
+            if runs.last() != Some(l) {
+                runs.push(l);
+            }
+        }
+        assert_eq!(
+            hints.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            runs,
+            "{class:?}: the bar is one hint per run of bar labels",
+        );
+
+        for (shown, label) in &hints {
+            let members: Vec<&str> = bindings
+                .iter()
+                .filter(|b| b.bar_label == Some(*label))
+                .map(|b| b.keys)
+                .collect();
+            let expect = match (members.first(), members.len()) {
+                (Some(only), 1) => (*only).to_string(),
+                (Some(first), _) => format!("{}-{}", first, members.last().unwrap()),
+                (None, _) => unreachable!("every hint came from a binding"),
+            };
+            assert_eq!(
+                shown, &expect,
+                "{class:?}: hint `{label}` must name its own run's keys",
+            );
+            // A run is printed as `first-last`, which only reads as a range
+            // for single-character keys. `Ctrl-d-Ctrl-k` would be nonsense,
+            // so grouping is restricted to the keys it suits.
+            if members.len() > 1 {
+                for k in &members {
+                    assert_eq!(
+                        k.chars().count(),
+                        1,
+                        "{class:?}: `{k}` is grouped under `{label}` but is not a single key",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A bar that does not fit says so, and never silently loses its tail.
+///
+/// The log bar was 115 columns against a 97-column terminal, so `1h`, `24h`
+/// and `back` vanished — `back` being the key that gets you out. Grouping the
+/// `since` keys bought 31 of those columns back; this is the guard that holds
+/// for every class at every width, including the ones nobody has measured.
+#[test]
+fn a_hint_bar_fits_or_admits_it() {
+    let theme = crate::ui::theme::Theme::dark();
+    for class in CLASSES {
+        let hints = bar_hints(class);
+        if hints.is_empty() {
+            continue;
+        }
+        // The natural width, which every class must now fit in 80 columns —
+        // the narrowest terminal worth designing for.
+        let full = crate::ui::header::render_keybinding_bar(&hints, u16::MAX, &theme);
+        assert!(
+            full.width() <= 80,
+            "{class:?}: the bar wants {} columns; group or shorten its hints",
+            full.width(),
+        );
+        assert!(
+            !full.spans.iter().any(|s| s.content.contains('\u{2026}')),
+            "{class:?}: nothing is dropped when there is room",
+        );
+
+        // Narrower than the first hint: nothing fits, and it still says so
+        // rather than drawing a half-written one.
+        for w in [1u16, 4, 12, 40, 60] {
+            let line = crate::ui::header::render_keybinding_bar(&hints, w, &theme);
+            assert!(
+                line.width() <= w as usize,
+                "{class:?} at width {w}: drew {} columns",
+                line.width(),
+            );
+            let dropped = line.spans.iter().any(|s| s.content.contains('\u{2026}'));
+            assert_eq!(
+                dropped,
+                full.width() > w as usize,
+                "{class:?} at width {w}: the ellipsis must appear exactly when something is cut",
+            );
         }
     }
 }

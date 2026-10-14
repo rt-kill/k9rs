@@ -526,7 +526,11 @@ fn a_single_source_line_stays_untagged() {
     let line = tag_kubectl_line("hello".to_string(), false, None);
     assert_eq!(line.source, None);
     assert_eq!(line.content, "hello");
-    assert_eq!(line.flat_text(), "hello", "and exports with no prefix");
+    assert_eq!(
+        crate::app::store::StoredLine::from(line).flat_text(),
+        "hello",
+        "and exports with no prefix",
+    );
 }
 
 /// `--all-containers` on ONE pod: the container alone identifies the source,
@@ -544,7 +548,7 @@ fn a_fanout_tags_the_pod() {
     let line = tag_kubectl_line("hello".to_string(), false, Some("pod-b"));
     assert_eq!(line.source.as_deref(), Some("pod-b"));
     assert_eq!(line.content, "hello");
-    assert_eq!(line.flat_text(), "[pod-b] hello");
+    assert_eq!(crate::app::store::StoredLine::from(line).flat_text(), "[pod-b] hello");
 }
 
 /// Both axes at once. A bare container name here would be ambiguous —

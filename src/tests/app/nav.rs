@@ -68,11 +68,15 @@ fn breadcrumb_is_a_label_fold() {
         .unwrap(),
     );
     stack.push(Element::ContentView(ContentView::new(
-        ContentSpec::Aliases,
+        ContentSpec::Describe(crate::kube::protocol::ObjectRef::new(
+                crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                "some-pod".to_string(),
+                crate::kube::protocol::Namespace::Named("default".to_string()),
+            )),
         crate::app::ContentViewState::default(),
         crate::app::element::ContentPhase::Ready,
     )));
-    assert_eq!(stack.breadcrumb(), "pods > /api > aliases");
+    assert_eq!(stack.breadcrumb(), "pods > /api > describe(some-pod)");
 }
 
 #[test]

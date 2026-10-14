@@ -12,6 +12,18 @@ fn pod_target() -> ObjectRef {
     )
 }
 
+/// A settled content view for some OTHER object — what covers the one being
+/// awaited. It used to be `ContentSpec::Aliases`, the one kind that had no
+/// target at all; `:alias` is a table now, so every content view is a fetch
+/// FOR something and the cover has to be a real one.
+fn other_target() -> crate::kube::protocol::ObjectRef {
+    crate::kube::protocol::ObjectRef::new(
+        crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+        "other".to_string(),
+        Namespace::Named("ns".to_string()),
+    )
+}
+
 #[test]
 fn content_delivery_reaches_covered_views() {
     // The 2026-08 audit wedge: a yaml/describe view pushed (Fetching),
@@ -27,7 +39,7 @@ fn content_delivery_reaches_covered_views() {
         ContentPhase::Fetching,
     )));
     app.nav.push(Element::ContentView(ContentView::new(
-        ContentSpec::Aliases,
+        ContentSpec::Describe(other_target()),
         crate::app::ContentViewState::default(),
         ContentPhase::Ready,
     )));
@@ -92,7 +104,7 @@ fn orphaned_fetch_fails_instead_of_spinning() {
         ContentPhase::Fetching,
     )));
     app.nav.push(Element::ContentView(ContentView::new(
-        ContentSpec::Aliases,
+        ContentSpec::Describe(other_target()),
         crate::app::ContentViewState::default(),
         ContentPhase::Ready,
     )));
@@ -525,7 +537,7 @@ fn a_text_key_types_into_the_filter_and_the_command_bar() {
     assert_eq!(app.nav.top().filter_input().text(), "c");
 
     let mut app = App::new_for_test();
-    app.ui.open(crate::app::Modal::Command { input: String::new(), history_index: None });
+    app.ui.open(crate::app::Modal::Command { input: crate::app::text_input::TextInput::new(), history_index: None });
     assert!(matches!(
         crate::kube::session_commands::edit_command_key(&mut app, text('g')),
         crate::kube::session_commands::CommandKey::Consumed,

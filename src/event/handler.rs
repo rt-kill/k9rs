@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::actions::Action;
-use crate::app::{App, Overlay};
+use crate::app::{App, TakeoverOp};
 use crate::app::element::Element;
 #[cfg(test)]
 use crate::app::nav::rid;
@@ -62,16 +62,12 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     // -----------------------------------------------------------------------
     // Confirmation dialog: only y/n/Enter/Esc.
     // -----------------------------------------------------------------------
-    if app.ui.confirm_dialog().is_some() {
-        return handle_confirm_dialog(app, key);
-    }
-
     // -----------------------------------------------------------------------
     // Overlays first. Checked BEFORE global keys so `:q`, Ctrl-C, etc.
     // can't leak through during the edit flow or a shell connect.
     // -----------------------------------------------------------------------
-    match &app.ui.overlay() {
-        Some(Overlay::Edit { .. }) | Some(Overlay::Shell(_)) => {
+    match &app.ui.takeover() {
+        Some(TakeoverOp::Edit { .. }) | Some(TakeoverOp::Shell(_)) => {
             // Modal operations block ALL keys except Esc. (Shell during
             // Connecting: Esc cancels; during bridge mode the TUI is
             // suspended and this path is never reached.)
@@ -80,7 +76,6 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
                 _ => None,
             };
         }
-        Some(Overlay::ContainerSelect { .. }) => return handle_container_select_keys(key),
         None => {}
     }
 
@@ -93,6 +88,16 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     ) && key.code == KeyCode::Char('/')
     {
         return Some(Action::SearchStart);
+    }
+
+    // A MODAL element owns every key, globals included — see
+    // `Element::captures_all_input`. Checked here rather than inside each
+    // global binding because the rule is about the element, not about `:`.
+    if app.nav.top().captures_all_input() {
+        return match super::keymap::ViewClass::of(app.nav.top()) {
+            ViewClass::Dialog => handle_dialog_keys(app, key),
+            _ => None,
+        };
     }
 
     // -----------------------------------------------------------------------
@@ -114,6 +119,7 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
         ViewClass::Table => handle_resource_view_keys(app, key),
         ViewClass::Detail => handle_detail_view_keys(key),
         ViewClass::Log => handle_log_view_keys(app, key),
+        ViewClass::Dialog => handle_dialog_keys(app, key),
     }
 }
 
@@ -127,7 +133,7 @@ fn handle_confirm_dialog(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Enter => {
             // Confirm or cancel based on which button is selected
-            if app.ui.confirm_dialog().as_ref().is_some_and(|d| d.action_focused) {
+            if matches!(app.nav.top(), Element::Confirm(d) if d.action_focused) {
                 Some(Action::Confirm)
             } else {
                 Some(Action::Cancel)
@@ -524,6 +530,16 @@ fn handle_overview_keys(key: KeyEvent) -> Option<Action> {
 // ---------------------------------------------------------------------------
 // Container select view
 // ---------------------------------------------------------------------------
+
+/// Dialog keys, routed by WHICH dialog is on top. Both are
+/// `ElementClass::Dialog`, so they share the modality rule and the keymap
+/// class; what differs is the question being asked.
+fn handle_dialog_keys(app: &App, key: KeyEvent) -> Option<Action> {
+    match app.nav.top() {
+        Element::Picker(_) => handle_container_select_keys(key),
+        _ => handle_confirm_dialog(app, key),
+    }
+}
 
 fn handle_container_select_keys(key: KeyEvent) -> Option<Action> {
     match key.code {

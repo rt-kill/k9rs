@@ -4,7 +4,6 @@ use ratatui::{
     Frame,
 };
 
-use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::ui::widgets::{YamlViewer, YamlViewState};
@@ -43,7 +42,6 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
         | ContentSpec::DecodedSecret(target) => {
             (target.resource.display_label(), target.name.as_str())
         }
-        ContentSpec::Aliases => ("unknown", "unknown"),
     };
     let yaml_title = format!("YAML: {}/{}", resource_type, resource_name);
     let yaml = &cv.state;
@@ -99,11 +97,12 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
 
     if yaml.search_input_active {
         // Show search input prompt
-        let prompt = format!(" /{}", yaml.search_input);
+        let prompt = format!(" /{}", yaml.search_input.value());
         let line = Line::from(Span::styled(prompt, theme.filter));
         f.render_widget(line, bar_area);
         // Place cursor after the search input text
-        let cursor_x = bar_area.x + 2 + yaml.search_input.width() as u16; // +2 for " /"
+        // Caret in COLUMNS at its actual position, not the end of the text.
+        let cursor_x = bar_area.x + 2 + yaml.search_input.cursor_col() as u16;
         let cursor_y = bar_area.y;
         if cursor_x < bar_area.x + bar_area.width {
             f.set_cursor_position((cursor_x, cursor_y));
@@ -115,7 +114,7 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
         let hints = crate::event::keymap::bar_hints(
             crate::event::keymap::ViewClass::Detail,
         );
-        let line = crate::ui::header::render_keybinding_bar(&hints, theme);
+        let line = crate::ui::header::render_keybinding_bar(&hints, bar_area.width, theme);
         f.render_widget(line, bar_area);
     }
 }

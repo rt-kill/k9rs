@@ -90,10 +90,19 @@ pub fn describe_lines_from_text(text: &str) -> Vec<DescribeLine> {
     text.lines().map(classified).collect()
 }
 
-/// Build one describe line by classifying its text. `Into<String>` so callers
-/// can hand over either an owned `String` or a `&str` line.
-fn classified(text: impl Into<String>) -> DescribeLine {
-    let text = text.into();
+/// Build one describe line by classifying its visible text.
+///
+/// Cleaning and classification are ONE step, not two: `key_end` is a byte
+/// index into this string, so cleaning afterwards — which is what the
+/// kubectl path used to do one layer up with `strip_ansi`, and what the
+/// client's ingest sanitizer still does for the typed path — can slide the
+/// index off its colon. Built together, the index and the string it indexes
+/// cannot disagree.
+///
+/// The owning `into_owned` is free here: `DescribeLine.text` is a `String`,
+/// so the `&str` callers were allocating anyway.
+fn classified(text: &str) -> DescribeLine {
+    let text = crate::util::visible_text(text).into_owned();
     let kind = classify_describe_line(&text);
     DescribeLine { text, kind }
 }
@@ -307,7 +316,7 @@ fn format_describe(obj: &kube::api::DynamicObject) -> Vec<DescribeLine> {
         lines.push(DescribeLine::section("Spec:"));
         if let Ok(yaml) = serde_yaml::to_string(spec) {
             for line in yaml.lines() {
-                lines.push(classified(format!("  {}", line)));
+                lines.push(classified(&format!("  {}", line)));
             }
         }
     }
@@ -316,7 +325,7 @@ fn format_describe(obj: &kube::api::DynamicObject) -> Vec<DescribeLine> {
         lines.push(DescribeLine::section("Status:"));
         if let Ok(yaml) = serde_yaml::to_string(status) {
             for line in yaml.lines() {
-                lines.push(classified(format!("  {}", line)));
+                lines.push(classified(&format!("  {}", line)));
             }
         }
     }
@@ -341,9 +350,7 @@ async fn fetch_describe_via_kubectl(target: &ObjectRef, context: &crate::kube::p
     // kubectl's output has no producer-side structure for us — classify each
     // line (same as the UI used to, now done once here).
     let text = match cmd.output().await {
-        Ok(output) if output.status.success() => {
-            crate::util::strip_ansi(&String::from_utf8_lossy(&output.stdout))
-        }
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).into_owned(),
         Ok(output) => format!("Error running kubectl describe:\n{}", String::from_utf8_lossy(&output.stderr)),
         Err(e) => format!("Failed to run kubectl: {}", e),
     };
@@ -364,84 +371,5 @@ async fn fetch_yaml_via_kubectl(target: &ObjectRef, context: &crate::kube::proto
 }
 
 #[cfg(test)]
-mod describe_line_tests {
-    use super::*;
-    use crate::kube::protocol::{describe_lines_text, DescribeLineKind};
-
-    #[test]
-    fn classify_blank_and_no_colon_are_plain() {
-        assert_eq!(classify_describe_line(""), DescribeLineKind::Plain);
-        assert_eq!(classify_describe_line("    "), DescribeLineKind::Plain);
-        assert_eq!(classify_describe_line("- item"), DescribeLineKind::Plain);
-        assert_eq!(classify_describe_line("              app=foo"), DescribeLineKind::Plain);
-    }
-
-    #[test]
-    fn classify_section_ends_with_colon() {
-        assert_eq!(classify_describe_line("Spec:"), DescribeLineKind::Section);
-        assert_eq!(classify_describe_line("  Limits:"), DescribeLineKind::Section);
-    }
-
-    #[test]
-    fn classify_field_colon_is_absolute_index() {
-        // Top-level: colon at byte 4.
-        assert_eq!(classify_describe_line("Name:         foo"), DescribeLineKind::Field { key_end: 4 });
-        // Indented YAML sub-line: key_end is the absolute index (indent 2 + 8).
-        assert_eq!(classify_describe_line("  replicas: 3"), DescribeLineKind::Field { key_end: 10 });
-    }
-
-    #[test]
-    fn field_line_targets_label_colon_not_value_colon() {
-        // The fragility the typed wire fixes. `field_line` (used by the
-        // structured producer) tags at the LABEL's colon, ignoring colons in
-        // the value...
-        assert_eq!(
-            field_line("Annotations:  ref: a:b".to_string()).kind,
-            DescribeLineKind::Field { key_end: 11 }, // "Annotations".len()
-        );
-        // ...and keeps a value that ENDS in ':' a Field, where the opaque
-        // heuristic used to (and still, for genuinely-opaque text) reads it as
-        // a Section header. This divergence is exactly the bug being fixed.
-        assert_eq!(
-            field_line("Annotations:  trailing:".to_string()).kind,
-            DescribeLineKind::Field { key_end: 11 },
-        );
-        assert_eq!(
-            classify_describe_line("Annotations:  trailing:"),
-            DescribeLineKind::Section,
-        );
-    }
-
-    #[test]
-    fn flat_projection_roundtrips_line_count() {
-        // Flatten-then-split must preserve the line count exactly (no trailing
-        // newline drift, no embedded newlines) so search/scroll/line_count are
-        // unaffected by the typed representation.
-        let lines = describe_lines_from_text("a: 1\nSection:\n  b: 2\n\n- x");
-        assert_eq!(lines.len(), 5);
-        assert_eq!(describe_lines_text(&lines).lines().count(), lines.len());
-    }
-
-    #[test]
-    fn format_describe_tags_precisely() {
-        let obj: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": { "name": "foo", "namespace": "default" },
-            "spec": { "replicas": 3 },
-        }))
-        .expect("valid DynamicObject");
-        let lines = format_describe(&obj);
-
-        // The Name field is tagged Field by the producer (not inferred).
-        assert!(matches!(lines[0].kind, DescribeLineKind::Field { .. }));
-        assert!(lines[0].text.starts_with("Name:"));
-        // The Spec subsection header is a Section; the Kind footer a Field.
-        assert!(lines.iter().any(|l| l.text == "Spec:" && l.kind == DescribeLineKind::Section));
-        assert!(lines
-            .iter()
-            .any(|l| l.text.starts_with("Kind:") && matches!(l.kind, DescribeLineKind::Field { .. })));
-        // Flat projection round-trips for search/scroll.
-        assert_eq!(describe_lines_text(&lines).lines().count(), lines.len());
-    }
-}
+#[path = "../tests/kube/describe.rs"]
+mod describe_line_tests;

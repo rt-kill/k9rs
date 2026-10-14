@@ -42,13 +42,15 @@ k9rs --readonly         # read-only mode (no mutations)
 
 ## Key Bindings
 
-Press `?` in any view to see the full help overlay. Key highlights:
+Press `?` in any view for the full keybinding table — a filterable, sortable
+view of the keys for the view you pressed it in. Key highlights:
 
 | Key | Action |
 |-----|--------|
 | `:` | Command mode (type resource names, `:ns`, `:ctx`) |
 | `/` | Filter current view |
 | `?` | Help |
+| `Ctrl-a` | Aliases — everything `:` accepts (`:alias` does the same) |
 | `d` | Describe |
 | `y` | YAML view |
 | `e` | Edit |
@@ -64,6 +66,21 @@ Resource-specific keys (shown in `?` help when available):
 - `Shift-F` — Port forward
 - `o` — Show node
 
+In a **log view** (`l`):
+
+| Key | Action |
+|-----|--------|
+| `s` | Toggle autoscroll |
+| `w` | Toggle line wrap |
+| `t` | Cycle shown fields — timestamp + source + message, source + message, message |
+| `h` / `l` | Pan one column left / right |
+| `H` / `L` | Pan a stride left / right |
+| `^` / `$` | Pan to the left margin / the far edge |
+| `/` | Grep (stacks — each commit narrows the last) |
+| `0`–`6` | Time range: tail, 1m, 5m, 15m, 30m, 1h, 24h |
+| `Shift-C` | Clear the buffer |
+| `Ctrl-s` | Save to a file |
+
 Marking rows with `Space` enters **select mode**: single-row keys go
 dead, and `Ctrl-d` / `r` / `Ctrl-k` act on ALL marked rows (with a
 confirm dialog listing the targets). `Ctrl-\` clears the selection.
@@ -74,16 +91,29 @@ Config file: `~/.config/k9rs/config.yaml`
 
 ```yaml
 k9rs:
-  # Key rebindings (resource views). An operation entry MOVES that
-  # operation's binding (its default key stops working); colLeft/colRight
-  # ADD chords for the column cursor (arrows always work) and win over an
-  # operation bound to the same key. Chords: "x", "X", or "ctrl-x".
+  noExitOnCtrlC: false       # Ctrl-C quits (it is a key, not a signal —
+                             #   the TUI runs in raw mode)
+  readOnly: false            # refuse every mutation client-side as well as
+                             #   server-side
+
+  # Key rebindings. An operation entry MOVES that operation's binding (its
+  # default key stops working) — except for delete, forceKill and portForward,
+  # whose real chords (Ctrl-D / Ctrl-K / Shift-F) are structural, so rebinding
+  # those ADDS a second key rather than moving the first. The col* entries ADD
+  # chords for column
+  # movement (arrows always work) and win over an operation bound to the
+  # same key. In a LOG view the same col* chords pan horizontally — one
+  # "move left/right in this view" intent, answered by each view in its own
+  # units. Chords: "x", "X", or "ctrl-x".
   # Rebindable operations: describe, yaml, logs, previousLogs, shell,
   # restart, scale, delete, forceKill, portForward, showNode, nodeShell,
   # decodeSecret, triggerCronJob, toggleSuspendCronJob.
   keys:
     colLeft: h                 # vim-style column movement …
     colRight: l
+    colFirst: "0"              # … and jumps to the first / last column
+    colLast: "$"               #   (in a log view: the pan margins)
+    namespaceAll: ")"          # rebind all-namespaces, freeing `0`
     logs: ctrl-l               # … freed by moving logs off plain `l`
 
   # TUI preferences

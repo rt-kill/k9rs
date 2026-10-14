@@ -120,10 +120,12 @@ impl ContextLocals {
             // reach for it precisely when you have no usable context. A
             // subscribe request for one is a client bug, and `None` here
             // makes the daemon say so instead of inventing an answer.
-            // Same rule, same reason: keybindings are a fact about the
-            // CLIENT's keymap and its config file. The daemon has never seen
-            // either.
-            LocalResourceKind::Context | LocalResourceKind::Keybinding => None,
+            // Same rule, same reason: keybindings and aliases are facts
+            // about the CLIENT — its keymap, its config file, its registry
+            // and its command grammar. The daemon has never seen any of it.
+            LocalResourceKind::Context
+            | LocalResourceKind::Keybinding
+            | LocalResourceKind::Alias => None,
             LocalResourceKind::Custom(ref name) => {
                 self.exec_source_for(name).map(|arc| arc as SharedLocalSource)
             }

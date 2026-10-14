@@ -40,6 +40,19 @@ fn local_resource_kind_wire_tags_are_stable() {
     // Custom carries a payload; pin only its 4-byte tag.
     let custom = bincode::serialize(&LocalResourceKind::Custom("x".into())).unwrap();
     assert_eq!(&custom[..4], 2u32.to_le_bytes());
+    assert_eq!(bincode::serialize(&LocalResourceKind::Context).unwrap(), 3u32.to_le_bytes());
+    assert_eq!(bincode::serialize(&LocalResourceKind::Keybinding).unwrap(), 4u32.to_le_bytes());
+    assert_eq!(bincode::serialize(&LocalResourceKind::Alias).unwrap(), 5u32.to_le_bytes());
+    // EVERY variant, counted — not a prefix of them. This pin stopped one
+    // short THREE TIMES: `Context`, `Keybinding` and `Alias`, each time with
+    // the explanation sitting directly above it. Asserting the COUNT is what
+    // makes the next append fail here instead of being silently unpinned.
+    assert_eq!(
+        LocalResourceKind::all().len() + 1,
+        6,
+        "a variant was added without pinning its wire tag above \
+         (`all()` omits `Custom`, hence the +1)",
+    );
 }
 
 /// `?` is not a `:cmd` resource, and must not become one by having aliases.
@@ -69,4 +82,23 @@ fn the_keybindings_view_is_not_reachable_as_a_command() {
     // The sibling client-owned kind still IS browsable, so this is a
     // statement about help specifically, not about local kinds in general.
     assert_eq!(super::find_by_alias("ctx"), Some(LocalResourceKind::Context));
+}
+
+/// `:alias`, `:aliases` and `:a` all land on the aliases view, through the
+/// ordinary resource path — and none of them is a word some other resource
+/// had already claimed.
+#[test]
+fn the_aliases_view_is_reachable_by_every_word_it_advertises() {
+    for word in LocalResourceKind::Alias.aliases() {
+        assert_eq!(
+            super::find_by_alias(word),
+            Some(LocalResourceKind::Alias),
+            "`:{word}` is advertised by the Alias kind",
+        );
+        assert_eq!(
+            crate::kube::protocol::ResourceId::from_alias(word),
+            Some(LocalResourceKind::Alias.to_resource_id()),
+            "`:{word}` must not be intercepted by a built-in with the same alias",
+        );
+    }
 }

@@ -206,7 +206,7 @@ fn selected_context_user(
         .and_then(|ctx| ctx.user.clone())
 }
 
-/// Overlay the session env onto an exec credential plugin's `env`; non-exec
+/// TakeoverOp the session env onto an exec credential plugin's `env`; non-exec
 /// auth (`None`) is returned unchanged. kube-rs runs the plugin with
 /// `Command::envs(exec.env)`, which overrides the inherited host env, so the
 /// session's values win for every name it carries. `drop_env` is deliberately

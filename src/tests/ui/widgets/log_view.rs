@@ -1,4 +1,5 @@
 use super::{line_phys_rows, wrap_line, LogViewState, LogViewer};
+use crate::app::store::StoredLine;
 use crate::kube::protocol::LogLine;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -6,17 +7,17 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::StatefulWidget;
 
-fn ll(content: &str) -> LogLine {
-    LogLine { source: None, timestamp: None, content: content.to_string() }
+fn ll(content: &str) -> StoredLine {
+    StoredLine::from(LogLine { source: None, timestamp: None, content: content.to_string() })
 }
 
 /// Render the widget into a throwaway buffer and give back the visible text,
 /// row by row. `state` is mutated with the write-backs (`offset`, `top`,
 /// `content_rows`) exactly as the real draw pass sees them.
-fn render_rows(lines: &[LogLine], state: &mut LogViewState, w: u16, h: u16) -> Vec<String> {
+fn render_rows(lines: &[StoredLine], state: &mut LogViewState, w: u16, h: u16) -> Vec<String> {
     let area = Rect::new(0, 0, w, h);
     let mut buf = Buffer::empty(area);
-    let refs: Vec<&LogLine> = lines.iter().collect();
+    let refs: Vec<&StoredLine> = lines.iter().collect();
     let theme = crate::ui::theme::Theme::dark();
     LogViewer::new(&refs, &theme).render(area, &mut buf, state);
     (0..h)
@@ -50,7 +51,7 @@ fn state(wrap: bool, anchor: Option<(usize, usize)>) -> LogViewState {
 #[test]
 fn the_anchor_parks_on_its_line_in_both_layouts() {
     // 30 lines; every third one wraps to 3 rows at width 10.
-    let lines: Vec<LogLine> = (0..30)
+    let lines: Vec<StoredLine> = (0..30)
         .map(|i| {
             if i % 3 == 0 {
                 ll(&format!("L{i:02}-aaaaaaaaaaaaaaaaaaaaaaaa"))
@@ -86,7 +87,7 @@ fn the_anchor_parks_on_its_line_in_both_layouts() {
 /// got wider, so the line is shorter than it was when the record was written).
 #[test]
 fn an_out_of_range_anchor_resolves_instead_of_panicking() {
-    let lines: Vec<LogLine> = (0..20).map(|i| ll(&format!("L{i:02}"))).collect();
+    let lines: Vec<StoredLine> = (0..20).map(|i| ll(&format!("L{i:02}"))).collect();
 
     for wrap in [false, true] {
         let mut st = state(wrap, Some((999, 0)));
@@ -107,7 +108,7 @@ fn an_out_of_range_anchor_resolves_instead_of_panicking() {
 /// reports the line it landed on so the next frame has a fresh record.
 #[test]
 fn following_overrides_the_anchor_and_reports_what_it_drew() {
-    let lines: Vec<LogLine> = (0..20).map(|i| ll(&format!("L{i:02}"))).collect();
+    let lines: Vec<StoredLine> = (0..20).map(|i| ll(&format!("L{i:02}"))).collect();
     let mut st = state(false, Some((2, 0)));
     st.follow = true;
     let rows = render_rows(&lines, &mut st, 10, 5);
@@ -164,7 +165,7 @@ fn phys_row_count_equals_rendered_rows_across_ansi_forms() {
 fn phys_row_count_matches_with_container_and_timestamp() {
     // Mirror prepare_line: raw container span + raw timestamp/separator +
     // parse_ansi_line(body).
-    fn styled_full(line: &LogLine, show_ts: bool) -> Line<'static> {
+    fn styled_full(line: &StoredLine, show_ts: bool) -> Line<'static> {
         let mut spans: Vec<Span<'static>> = Vec::new();
         if let Some(c) = &line.source {
             spans.push(Span::raw(format!("{} ", c)));
@@ -195,7 +196,8 @@ fn phys_row_count_matches_with_container_and_timestamp() {
             content: "日本語 wide body".to_string(),
         },
         LogLine { timestamp: None, source: Some("proxy-プロキシ".into()), content: "wide container prefix".into() },
-    ];
+    ]
+    .map(StoredLine::from);
     for line in &lines {
         for show_ts in [false, true] {
             for w in [3usize, 6, 12, 40] {
@@ -213,11 +215,11 @@ fn phys_row_count_matches_with_container_and_timestamp() {
 /// that are not drawn — a scrollbar claiming content that is not there.
 #[test]
 fn hiding_the_source_tag_shortens_the_line_everywhere() {
-    let tagged = LogLine {
+    let tagged = StoredLine::from(LogLine {
         source: Some("fetcher-chromium-pimp".into()),
         timestamp: None,
         content: "the actual message body".into(),
-    };
+    });
     // 22 columns of tag at width 10 is 3 extra rows' worth of text.
     assert!(
         line_phys_rows(&tagged, 1, 10) > line_phys_rows(&tagged, 2, 10),
@@ -296,7 +298,7 @@ fn panning_into_a_wide_glyph_keeps_the_columns_aligned() {
 #[test]
 fn the_scrollbar_never_eats_the_last_character() {
     // Enough lines to force a scrollbar, each exactly as wide as the area.
-    let lines: Vec<LogLine> = (0..10).map(|_| ll("0123456789")).collect();
+    let lines: Vec<StoredLine> = (0..10).map(|_| ll("0123456789")).collect();
     let mut st = state(false, None);
     let rows = render_rows(&lines, &mut st, 10, 3);
     for (i, row) in rows.iter().enumerate() {
@@ -478,7 +480,7 @@ fn workload_ansi_colour_reaches_the_buffer() {
         let mut st = state(false, None);
         let area = Rect::new(0, 0, 70, 1);
         let mut buf = Buffer::empty(area);
-        let refs: Vec<&LogLine> = vec![&line];
+        let refs: Vec<&StoredLine> = vec![&line];
         let theme = crate::ui::theme::Theme::dark();
         LogViewer::new(&refs, &theme).render(area, &mut buf, &mut st);
         let text: String = (0..70u16).map(|x| buf[(x, 0)].symbol()).collect();
@@ -540,27 +542,36 @@ fn measuring_and_rendering_agree_on_every_run() {
 
 /// A guard on the cost, not the shape.
 ///
-/// Measuring 50,000 lines' wrap heights took **301 ms a frame** — a third of
-/// a second per repaint — because every line allocated a cleaned copy and
-/// then grapheme-segmented it. Routing every walk through one `Units`
-/// enumeration, which segments only when the cleaned run is not ASCII, took
-/// it to ~30 ms. The remaining cost is that one cleaned copy per line per
-/// frame, and the cure is to clean ONCE on arrival rather than to special-
-/// case the walk.
+/// The history, in release-build numbers for this exact buffer:
 ///
-/// The budget is deliberately loose: the failure being guarded against was
-/// 30x, not 30%.
+/// - **301 ms a frame** — a third of a second per repaint — when every line
+///   allocated a cleaned copy and then grapheme-segmented it.
+/// - **~50 ms** once every walk went through one `Units` enumeration, which
+///   segments only when the cleaned run is not ASCII.
+/// - **16 ms** now: `StoredLine` derives the visible text ONCE on arrival, so
+///   a frame allocates nothing per line, and `Units` asks "is every byte
+///   printable ASCII" in one scan instead of asking "is it ASCII" and "has
+///   it controls" in two.
+///
+/// What is left is the per-unit enumeration itself, over every line in the
+/// buffer rather than over the window — the wrap branch needs a physical
+/// total that the unwrapped branch does not. Fixing THAT is a scroll-model
+/// question (what `content_rows` counts when a line is more than one row),
+/// not a walk to special-case.
+///
+/// The budget is in debug-build time and deliberately loose: the failure
+/// being guarded against was 30x, not 30%.
 #[test]
 fn measuring_a_full_buffer_is_not_a_per_frame_disaster() {
-    let lines: Vec<LogLine> = (0..50_000)
-        .map(|i| LogLine {
+    let lines: Vec<StoredLine> = (0..50_000)
+        .map(|i| StoredLine::from(LogLine {
             source: Some("fetcher-chromium-pimp".into()),
             timestamp: Some("2026-09-18T20:29:38.601013184Z".into()),
             content: format!(
                 "\u{1b}[2m2026-09-18T20:29:38\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
                  pimp::management::metrics: relay.priority.low: depth_client=0, entered=+{i}"
             ),
-        })
+        }))
         .collect();
     let start = std::time::Instant::now();
     let total: usize = lines.iter().map(|l| line_phys_rows(l, 0, 98)).sum();
@@ -612,11 +623,11 @@ fn shedding_chrome_is_one_ordered_cycle() {
 /// skipped by the other.
 #[test]
 fn a_shed_role_costs_no_columns() {
-    let line = LogLine {
+    let line = StoredLine::from(LogLine {
         source: Some("fetcher-chromium-pimp".into()),
         timestamp: Some("2026-09-18T20:29:38.601013184Z".into()),
         content: "the message".into(),
-    };
+    });
     let all = line_phys_rows(&line, 0, 20);
     let no_ts = line_phys_rows(&line, 1, 20);
     let bare = line_phys_rows(&line, 2, 20);

@@ -213,7 +213,7 @@ fn log_filters_chain_and_own_their_lines() {
     assert_eq!(filter.log_committed_patterns(), vec!["err".to_string()]);
     assert_eq!(filter.log_visible().unwrap().len(), 5);
     // Draft narrows further (a derive input — no rebuild call).
-    filter.log_view_mut().unwrap().draft = Some("line-2".to_string());
+    filter.log_view_mut().unwrap().draft = Some(crate::app::text_input::TextInput::seeded("line-2"));
     assert_eq!(filter.log_visible().unwrap().len(), 1);
     filter.log_view_mut().unwrap().draft = None;
 
@@ -547,12 +547,15 @@ fn kind_name(el: &crate::app::element::Element) -> &'static str {
         Element::LogFilter(_) => "LogFilter",
         Element::ContentView(_) => "ContentView",
         Element::Overview(_) => "Overview",
+        Element::Confirm(_) => "Confirm",
+        Element::Picker(_) => "Picker",
+        Element::Form(_) => "Form",
     }
 }
 
 /// Every name `kind_name` can return. Kept beside it deliberately: the match
 /// forces the compile error, this forces an instance to actually exist.
-const EVERY_KIND: [&str; 7] = [
+const EVERY_KIND: [&str; 10] = [
     "ResourceList",
     "RowFilter",
     "DerivedRows",
@@ -560,6 +563,9 @@ const EVERY_KIND: [&str; 7] = [
     "LogFilter",
     "ContentView",
     "Overview",
+    "Confirm",
+    "Picker",
+    "Form",
 ];
 
 /// One live instance of EVERY element kind — enforced by
@@ -589,7 +595,11 @@ fn one_of_every_kind() -> Vec<crate::app::element::Element> {
             .expect("a log can be filtered");
 
     let content = Element::ContentView(ContentView::new(
-        ContentSpec::Aliases,
+        ContentSpec::Describe(crate::kube::protocol::ObjectRef::new(
+                crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                "some-pod".to_string(),
+                crate::kube::protocol::Namespace::Named("default".to_string()),
+            )),
         crate::app::ContentViewState::default(),
         ContentPhase::Ready,
     ));
@@ -624,6 +634,49 @@ fn one_of_every_kind() -> Vec<crate::app::element::Element> {
         log_filtered,
         content,
         Element::Overview(crate::app::element::Overview),
+        Element::Confirm(Box::new(crate::app::ConfirmDialog {
+            message: "Delete pod/canary?".to_string(),
+            action_label: "Delete".to_string(),
+            pending: crate::app::PendingAction::Single {
+                op: crate::app::SingleOp::Delete,
+                target: crate::kube::protocol::ObjectRef::new(
+                    rid.clone(),
+                    "canary".to_string(),
+                    Namespace::Named("default".to_string()),
+                ),
+            },
+            action_focused: false,
+        })),
+        Element::Picker(Box::new(crate::app::ContainerPicker {
+            target: crate::kube::protocol::ObjectRef::new(
+                rid.clone(),
+                "canary".to_string(),
+                Namespace::Named("default".to_string()),
+            ),
+            choices: vec![crate::app::ContainerChoice {
+                label: "web".into(),
+                container: LogContainer::Named("web".into()),
+            }],
+            selected: 0,
+            action: crate::app::ContainerAction::Logs,
+        })),
+        Element::Form(Box::new(crate::app::FormDialog {
+            submit: crate::app::FormSubmit::Scale,
+            title: "Scale deploy/api".to_string(),
+            subtitle: "namespace: default".to_string(),
+            target: crate::kube::protocol::ObjectRef::new(
+                rid.clone(),
+                "api".to_string(),
+                Namespace::Named("default".to_string()),
+            ),
+            fields: vec![crate::app::FormFieldState {
+                name: "replicas".to_string(),
+                label: "Replicas".to_string(),
+                kind: crate::app::FormFieldKind::Number { min: 0, max: 100 },
+                value: crate::app::text_input::TextInput::seeded("3"),
+            }],
+            focused: 0,
+        })),
     ]
 }
 
@@ -709,6 +762,20 @@ fn element_accessors_match_their_class() {
                 );
                 assert!(!el.is_table(), "{label}: a log is not a table");
                 assert!(el.data_store().is_none(), "{label}: a log has no row store");
+            }
+            ElementClass::Dialog => {
+                // A dialog carries a question and a continuation. No rows,
+                // no lines, no cursor — and crucially it FLOATS, which is
+                // the property that lets it be an element at all rather
+                // than a modal slot.
+                assert!(!el.is_table(), "{label}: not a table");
+                assert!(el.data_store().is_none(), "{label}: no row store");
+                assert!(el.log_store().is_none(), "{label}: no line store");
+                assert!(el.table_interaction().is_none(), "{label}: no cursor");
+                assert!(
+                    matches!(el.extent(), crate::app::element::ViewExtent::Dialog { .. }),
+                    "{label}: a dialog must declare a Dialog extent",
+                );
             }
             ElementClass::Content | ElementClass::Chrome => {
                 assert!(!el.is_table(), "{label}: not a table");
@@ -1134,7 +1201,12 @@ fn restarting_a_range_resets_the_greps_over_it() {
 fn help_opens_on_the_section_for_the_view_you_came_from() {
     let mut app = crate::app::App::new_for_test();
     let class = crate::event::keymap::ViewClass::of(app.nav.top());
-    let store = app.core.seed_keybindings(Some(app.current_capabilities()), app.config.keys, class);
+    let store = app.core.seed_keybindings(
+        Some(app.current_capabilities()),
+        app.config.keys,
+        class,
+        app.nav.top().markable(),
+    );
     let rid = crate::kube::local::LocalResourceKind::Keybinding.to_resource_id();
     app.nav.push(crate::app::element::Element::ResourceList(
         crate::app::element::ResourceList::client(
@@ -1224,7 +1296,7 @@ fn a_grep_searches_exactly_the_roles_that_declare_themselves_searchable() {
     });
 
     let visible = |el: &mut Element, pat: &str| {
-        el.log_view_mut().unwrap().draft = Some(pat.to_string());
+        el.log_view_mut().unwrap().draft = Some(crate::app::text_input::TextInput::seeded(pat));
         el.log_view_mut().unwrap().drop_cache();
         el.log_visible().unwrap().len()
     };
@@ -1246,4 +1318,364 @@ fn a_grep_searches_exactly_the_roles_that_declare_themselves_searchable() {
     assert_eq!(f.log_visible().unwrap().len(), 0, "committed greps skip it too");
     let mut f = Element::derive_log_filter(&session, CompiledGrep::new("api-7f9")).unwrap();
     assert_eq!(f.log_visible().unwrap().len(), 1);
+}
+
+/// A bare grep scans the columns you can SEE, not every cell the row carries.
+///
+/// Deployment rows carry NAMESPACE, NAME, READY, UP-TO-DATE, AVAILABLE,
+/// CONTAINERS, IMAGES, LABELS, AGE; the default level shows five of them.
+/// `/pimp` used to match `IMAGES` and `LABELS` too, returning rows with no
+/// visible `pimp` anywhere — convenient exactly when it happened to hit the
+/// column you meant, and unexplainable otherwise.
+#[test]
+fn a_bare_grep_scans_only_the_displayed_columns() {
+    use crate::app::store::StorePayload;
+    use crate::kube::protocol::TableBaseline;
+    use crate::kube::resources::row::{CellValue, ResourceRow};
+
+    let mut app = crate::app::App::new_for_test();
+    let store: Arc<crate::app::store::RowStore> =
+        Arc::clone(app.nav.top().data_store().expect("root is a list"));
+    let row = |name: &str, hidden: &str| ResourceRow {
+        cells: vec![
+            CellValue::Text(name.into()),
+            CellValue::Text("1/1".into()),
+            CellValue::Text(hidden.into()),
+        ],
+        name: name.into(),
+        namespace: Some("ns".into()),
+        ..Default::default()
+    };
+    store.apply(
+        1,
+        StorePayload::Baseline(TableBaseline {
+            resource: crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+            // Only the first two are shown at the default level; the test
+            // rows put the needle in the third.
+            headers: vec!["NAME".into(), "READY".into(), "IMAGES".into()],
+            rows: vec![
+                row("fetcher-chromium-pimp", "registry/other:v1"),
+                row("fetcher-playwright", "registry/pimp-base:v2"),
+                row("parser-ocr", "registry/plain:v3"),
+            ],
+        }),
+    );
+
+    let visible_names = |el: &mut Element, pat: &str| -> Vec<String> {
+        {
+            let fi = el.filter_input_mut().unwrap();
+            fi.start();
+            for c in pat.chars() {
+                fi.push_char(c);
+            }
+        }
+        el.table_interaction_mut().unwrap().drop_cache();
+        el.view(ColumnLevel::Default, 200).keys.iter().map(|k| k.name.clone()).collect()
+    };
+
+    let el = app.nav.top_mut();
+    let names = visible_names(el, "pimp");
+    assert!(
+        names.contains(&"fetcher-chromium-pimp".to_string()),
+        "the row whose NAME contains it still matches: {names:?}",
+    );
+    assert!(
+        !names.contains(&"fetcher-playwright".to_string()),
+        "a match in a HIDDEN column must not select the row: {names:?}",
+    );
+    assert!(!names.contains(&"parser-ocr".to_string()));
+}
+
+/// THE reported bug, through the real log paths.
+///
+/// `/workers=` against lines that read `workers=0` on screen. It failed
+/// because the filter ran on raw `content`, where a reset sequence sits
+/// between the `s` and the `=` — while the renderer stripped the escapes.
+/// Four views of one line, and the filter had the one nobody could see.
+///
+/// Both the DRAFT (as you type) and the COMMITTED path are checked: they are
+/// the two places that consume a segment, and a rule true in one of them is
+/// how this class of bug survives.
+#[test]
+fn a_grep_matches_across_a_colour_boundary() {
+    use crate::kube::protocol::{LogContainer, LogLine};
+    let mut session = Element::LogSession(Box::new(LogSession::for_test(
+        crate::kube::protocol::LogTarget::One("pod-x".to_string()),
+        LogContainer::Default,
+    )));
+    let store = Arc::clone(session.log_store().unwrap());
+    // Exactly what `tracing` emits with ANSI on: a dim timestamp, a coloured
+    // level, and a coloured field NAME — which is what puts a reset between
+    // `workers` and `=`.
+    for c in [
+        "\u{1b}[2mts\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[2mworkers\u{1b}[0m=0, depth=1",
+        "\u{1b}[2mts\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m workers=256, depth=2",
+        "\u{1b}[2mts\u{1b}[0m \u{1b}[33m WARN\u{1b}[0m nothing relevant here",
+    ] {
+        store.push(1, LogLine { source: None, timestamp: None, content: c.to_string() });
+    }
+
+    let draft_hits = |el: &mut Element, pat: &str| {
+        el.log_view_mut().unwrap().draft =
+            Some(crate::app::text_input::TextInput::seeded(pat));
+        el.log_view_mut().unwrap().drop_cache();
+        el.log_visible().unwrap().len()
+    };
+
+    assert_eq!(draft_hits(&mut session, "workers="), 2, "both lines READ `workers=`");
+    assert_eq!(draft_hits(&mut session, "workers=0"), 1, "…and a value can follow it");
+    assert_eq!(draft_hits(&mut session, "INFO"), 2, "a pattern inside a coloured run");
+    assert_eq!(draft_hits(&mut session, "\u{1b}"), 0, "the escapes are NOT searchable");
+
+    // The committed path agrees — it is the other consumer of a segment.
+    session.log_view_mut().unwrap().draft = None;
+    session.log_view_mut().unwrap().drop_cache();
+    let mut f = Element::derive_log_filter(&session, CompiledGrep::new("workers=")).unwrap();
+    assert_eq!(f.log_visible().unwrap().len(), 2, "committed greps see the same text");
+}
+
+/// Help must document select mode exactly where select mode exists.
+///
+/// Marking is a per-ELEMENT answer: `Element::markable` is false for a
+/// resource that declares no batch-capable operation, which is why marking a
+/// context does nothing (it used to silently enter select mode and block
+/// `Enter`, the picker's only function). Help gated its Select-mode section
+/// on the view CLASS instead, so `?` on the contexts view — a table —
+/// documented `Space`, `Ctrl-Space`, `Ctrl-\` and `c` as if they worked.
+///
+/// Pinned as an AGREEMENT between the two, not as a fact about either, so
+/// neither can move without the other. This is the surface the keymap
+/// agreement test cannot see: the section is hand-written, not projected.
+#[test]
+fn help_documents_select_mode_exactly_where_marking_works() {
+    let app = crate::app::App::new_for_test();
+    let section = "Select mode (while rows are marked)";
+
+    let documents_select_mode = |el: &crate::app::element::Element| -> bool {
+        let class = crate::event::keymap::ViewClass::of(el);
+        let (_, rows) = crate::ui::widgets::HelpContent::rows(
+            Some(el.capabilities()),
+            app.config.keys,
+            class,
+            el.markable(),
+        );
+        rows.iter().any(|r| {
+            matches!(
+                &r.cells[0],
+                crate::kube::resources::row::CellValue::Text(t) if t == section
+            )
+        })
+    };
+
+    let contexts = app
+        .core
+        .client_root_element(
+            &app.kube.metrics,
+            &crate::kube::local::LocalResourceKind::Context.to_resource_id(),
+            crate::kube::protocol::Namespace::All,
+        )
+        .expect("contexts is a client-owned root element");
+
+    // The reported case: a table you cannot mark.
+    assert_eq!(
+        crate::event::keymap::ViewClass::of(&contexts),
+        crate::event::keymap::ViewClass::Table,
+        "contexts IS a table — gating on the class could never have excluded it",
+    );
+    assert!(!contexts.markable(), "a context feeds no batch operation");
+    assert!(
+        !documents_select_mode(&contexts),
+        "so help must not document marking there",
+    );
+
+    // …and the pod table, where every one of those keys really does work.
+    let pods = app.nav.top();
+    assert!(pods.markable(), "pods feed Delete/Restart batches");
+    assert!(
+        documents_select_mode(pods),
+        "where marking works, help still says how",
+    );
+}
+
+/// `:alias` / `Ctrl-a` is an ordinary table now, not a formatted document.
+///
+/// It used to be a `ContentView` holding hand-formatted text: no grep, no
+/// sort, no scroll, no copy — and it carried its own "Key Bindings" block,
+/// a seventh hand-written copy of the keymap that the agreement test could
+/// not see and that had already drifted (missing `Ctrl-w`, `Ctrl-z`,
+/// `Ctrl-Space`, `Ctrl-\`). Keys belong to `?`.
+///
+/// The resource aliases come from the registry, which is already their one
+/// declaration; the command words come from `COMMAND_WORDS`, which the
+/// parser's own test probes.
+#[test]
+fn the_aliases_view_is_a_table_of_what_the_prompt_accepts() {
+    use crate::kube::resources::row::CellValue;
+
+    let app = crate::app::App::new_for_test();
+    let rid = crate::kube::local::LocalResourceKind::Alias.to_resource_id();
+    let el = app
+        .core
+        .client_root_element(&app.kube.metrics, &rid, crate::kube::protocol::Namespace::All)
+        .expect("aliases routes through the client-owned path, like contexts");
+
+    // A table: so grep, sort, column movement and copy come for free.
+    assert_eq!(el.class(), crate::app::element::ElementClass::Table);
+    assert_eq!(
+        crate::event::keymap::ViewClass::of(&el),
+        crate::event::keymap::ViewClass::Table,
+    );
+
+    let cells = |r: &crate::kube::resources::row::ResourceRow| -> Vec<String> {
+        r.cells
+            .iter()
+            .map(|c| match c {
+                CellValue::Text(t) => t.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    };
+    let rows = app.core.aliases.with_read(|i| i.rows.iter().map(cells).collect::<Vec<_>>());
+    assert!(!rows.is_empty(), "the view has content without any daemon");
+
+    // Every resource alias the prompt accepts is listed…
+    let pods = rows
+        .iter()
+        .find(|r| r[2] == "Pod")
+        .expect("pods is in the registry, so it is in the view");
+    assert_eq!(pods[0], "resource");
+    for word in pods[1].split(" / ") {
+        assert!(
+            crate::kube::protocol::ResourceId::from_alias(word).is_some(),
+            "`:{word}` is advertised but the parser does not resolve it",
+        );
+    }
+
+    // …including the client-owned ones, which are resources like any other.
+    assert!(
+        rows.iter().any(|r| r[1].split(" / ").any(|w| w == "ctx")),
+        "contexts are an ordinary resource and `:ctx` is how you reach them",
+    );
+    // …and NOT the one that deliberately has no alias.
+    assert!(
+        !rows.iter().any(|r| r[2] == "Keybinding"),
+        "`?` is not a noun you browse; advertising a word for it would lie",
+    );
+
+    // The command words, from the declaration the parser is tested against.
+    for doc in crate::kube::session_commands::COMMAND_WORDS {
+        assert!(
+            rows.iter().any(|r| r[0] == "command" && r[1] == doc.display()),
+            "`{}` is a documented command word but is not in the view",
+            doc.display(),
+        );
+    }
+
+    // And no keys: that is `?`'s table, with its own agreement test.
+    for key in ["Ctrl-r", "Ctrl-e", "Ctrl-a", "Ctrl-s"] {
+        assert!(
+            !rows.iter().any(|r| r.iter().any(|c| c.contains(key))),
+            "`{key}` is a KEY — it belongs to help, not to the alias list",
+        );
+    }
+}
+
+/// A key that still works must still be documented — especially a
+/// destructive one.
+///
+/// `Ctrl-D`, `Ctrl-K` and `Shift-F` are matched in the handler on the CHORD,
+/// guarded only by whether the resource declares the operation. Rebinding
+/// `delete` therefore ADDS a key; it does not move one. Help used to skip the
+/// `Ctrl-d` row exactly when the user had rebound `delete`, so the override
+/// was documented and the chord that went on deleting things was not.
+#[test]
+fn rebinding_delete_does_not_hide_the_chord_that_still_deletes() {
+    let app = crate::app::App::new_for_test();
+    let caps = Some(app.nav.top().capabilities());
+    assert!(
+        caps.as_ref().unwrap().supports(crate::kube::protocol::OperationKind::Delete),
+        "pods declare Delete",
+    );
+
+    let keys_of = |cfg: crate::app::KeysConfig| -> Vec<String> {
+        let (_, rows) = crate::ui::widgets::HelpContent::rows(
+            caps.clone(),
+            cfg,
+            crate::event::keymap::ViewClass::Table,
+            app.nav.top().markable(),
+        );
+        rows.iter()
+            .filter_map(|r| match (&r.cells[1], &r.cells[2]) {
+                (
+                    crate::kube::resources::row::CellValue::Text(k),
+                    crate::kube::resources::row::CellValue::Text(d),
+                ) if d == "Delete" => Some(k.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Default: the structural chord is the only way in, and it is listed.
+    assert!(keys_of(app.config.keys).contains(&"Ctrl-d".to_string()));
+
+    // Rebound: BOTH work, so both are listed.
+    let mut rebound = app.config.keys;
+    rebound.delete = Some(crate::app::KeyCombo::plain('x'));
+    let listed = keys_of(rebound);
+    assert!(
+        listed.contains(&"x".to_string()),
+        "the override is documented: {listed:?}",
+    );
+    assert!(
+        listed.contains(&"Ctrl-d".to_string()),
+        "…and so is the chord that still deletes: {listed:?}",
+    );
+}
+
+/// Completion offers every `:` word something else declares — no third copy.
+///
+/// There were two hand-written slices in the completer beside a loop that
+/// derived every resource's aliases from the registry: `["alias", "aliases",
+/// "a"]` (duplicating what the loop now covers, invisible only because a
+/// `dedup` followed) and a list of command words that was missing
+/// `namespace` outright, so `:names…` completed to nothing while `:ns`
+/// worked. Both are gone; this is the pin that keeps them from returning.
+#[test]
+fn completion_offers_every_word_something_else_declares() {
+    let mut app = crate::app::App::new_for_test();
+    let complete = |app: &mut crate::app::App, typed: &str| -> Vec<String> {
+        app.ui.open(crate::app::Modal::Command {
+            input: crate::app::text_input::TextInput::seeded(typed),
+            history_index: None,
+        });
+        app.command_completions()
+    };
+
+    // The aliases VIEW, whose words come from `LocalResourceKind`.
+    for word in crate::kube::local::LocalResourceKind::Alias.aliases() {
+        let hits = complete(&mut app, word);
+        assert!(
+            hits.iter().any(|h| h == word),
+            "`:{word}` is advertised by the Alias kind but not offered: {hits:?}",
+        );
+    }
+
+    // Every static command word, from `COMMAND_WORDS`.
+    for doc in crate::kube::session_commands::COMMAND_WORDS {
+        for word in doc.words {
+            let hits = complete(&mut app, word);
+            assert!(
+                hits.iter().any(|h| h == word),
+                "`:{word}` ({}) is documented but not offered: {hits:?}",
+                doc.label,
+            );
+        }
+    }
+
+    // The one the old hand-written slice had simply left out.
+    let hits = complete(&mut app, "names");
+    assert!(
+        hits.iter().any(|h| h == "namespace"),
+        "`:names…` must complete to `namespace`: {hits:?}",
+    );
 }

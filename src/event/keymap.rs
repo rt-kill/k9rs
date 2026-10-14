@@ -58,6 +58,8 @@ pub enum ViewClass {
     Detail,
     /// A log stream or a grep over one.
     Log,
+    /// A yes/no dialog floating over the view that raised it.
+    Dialog,
 }
 
 impl ViewClass {
@@ -83,6 +85,7 @@ impl ViewClass {
             crate::app::element::ElementClass::Log => ViewClass::Log,
             crate::app::element::ElementClass::Content => ViewClass::Detail,
             crate::app::element::ElementClass::Chrome => ViewClass::Overview,
+            crate::app::element::ElementClass::Dialog => ViewClass::Dialog,
         }
     }
 
@@ -93,6 +96,7 @@ impl ViewClass {
             ViewClass::Table => "This view (table)",
             ViewClass::Detail => "This view (YAML / describe)",
             ViewClass::Log => "This view (logs)",
+            ViewClass::Dialog => "This dialog",
         }
     }
 }
@@ -249,6 +253,13 @@ pub fn for_class(class: ViewClass) -> Vec<Binding> {
             bar("q", "Back", "back", plain('q'), Action::Back),
         ],
 
+        ViewClass::Dialog => vec![
+            bar("y", "Confirm", "yes", plain('y'), Action::Confirm),
+            bar("n / Esc", "Cancel", "no", plain('n'), Action::Cancel),
+            b("\u{2190} / \u{2192} / Tab", "Switch button", code(KeyCode::Tab), Action::ToggleDialogButton),
+            b("Enter", "Activate the focused button", code(KeyCode::Enter), Action::Cancel),
+        ],
+
         ViewClass::Log => vec![
             b("j / k", "Scroll down / up", plain('j'), Action::ScrollDown(1)),
             b("PgDn / PgUp", "Page down / up", code(KeyCode::PageDown), Action::PageDown),
@@ -263,13 +274,13 @@ pub fn for_class(class: ViewClass) -> Vec<Binding> {
             b("/", "Grep (stacks)", plain('/'), Action::SearchStart),
             bar("c", "Copy", "copy", plain('c'), Action::Copy),
             b("Ctrl-s", "Save logs to a file", ctrl('s'), Action::SaveLogs),
-            bar("0", "Tail", "tail", plain('0'), Action::LogSince(None)),
-            bar("1", "1m", "1m", plain('1'), Action::LogSince(Some("1m".into()))),
-            bar("2", "5m", "5m", plain('2'), Action::LogSince(Some("5m".into()))),
-            bar("3", "15m", "15m", plain('3'), Action::LogSince(Some("15m".into()))),
-            bar("4", "30m", "30m", plain('4'), Action::LogSince(Some("30m".into()))),
-            bar("5", "1h", "1h", plain('5'), Action::LogSince(Some("1h".into()))),
-            bar("6", "24h", "24h", plain('6'), Action::LogSince(Some("24h".into()))),
+            bar("0", "Tail", "range", plain('0'), Action::LogSince(None)),
+            bar("1", "1m", "range", plain('1'), Action::LogSince(Some("1m".into()))),
+            bar("2", "5m", "range", plain('2'), Action::LogSince(Some("5m".into()))),
+            bar("3", "15m", "range", plain('3'), Action::LogSince(Some("15m".into()))),
+            bar("4", "30m", "range", plain('4'), Action::LogSince(Some("30m".into()))),
+            bar("5", "1h", "range", plain('5'), Action::LogSince(Some("1h".into()))),
+            bar("6", "24h", "range", plain('6'), Action::LogSince(Some("24h".into()))),
             bar("q", "Back", "back", plain('q'), Action::Back),
         ],
     }
@@ -281,11 +292,33 @@ pub fn for_class(class: ViewClass) -> Vec<Binding> {
 /// Only the detail and log views HAVE a bar; a table's key doc is `?` help,
 /// which is why no `Table` binding carries a `bar_label`. Declaring one there
 /// would be a label nothing renders.
-pub fn bar_hints(class: ViewClass) -> Vec<(&'static str, &'static str)> {
-    for_class(class)
-        .into_iter()
-        .filter_map(|b| b.bar_label.map(|short| (b.keys, short)))
-        .collect()
+/// The hint-bar projection of a class's keymap.
+///
+/// Consecutive bindings that share a bar label are ONE hint, printed as the
+/// range of their keys: the seven `since` bindings are `0`…`6` under "range",
+/// so the bar says `<0-6> range` where it used to spend 44 of its columns
+/// listing `tail`, `1m`, `5m`, `15m`, `30m`, `1h`, `24h` one at a time. Help
+/// still documents each key with its own duration, because help has a column
+/// per row and the bar has a shared line — the same split `bar_label` already
+/// exists for, applied to a group instead of a key.
+///
+/// Grouping is DECLARED (by repeating the label), not inferred, and the keys
+/// are printed first-to-last, so a run must be contiguous and in order. That
+/// is a property of the list above, where it is visible.
+pub fn bar_hints(class: ViewClass) -> Vec<(String, &'static str)> {
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    for b in for_class(class) {
+        let Some(short) = b.bar_label else { continue };
+        match out.last_mut() {
+            Some((keys, label)) if *label == short => {
+                // Extend the run: keep the first key, re-point the last.
+                let first = keys.split('-').next().unwrap_or(keys).to_string();
+                *keys = format!("{}-{}", first, b.keys);
+            }
+            _ => out.push((b.keys.to_string(), short)),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

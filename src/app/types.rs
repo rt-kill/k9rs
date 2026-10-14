@@ -1,4 +1,3 @@
-use crate::app::form::FormDialog;
 use crate::app::kubectl_cache::KubectlCache;
 
 use std::collections::HashMap;
@@ -96,14 +95,24 @@ pub enum Modal {
     None,
     /// The `:` command prompt.
     Command {
-        input: String,
+        input: crate::app::text_input::TextInput,
         history_index: Option<usize>,
     },
-    Confirm(ConfirmDialog),
-    Form(FormDialog),
-    /// Dialogues and operations ABOUT the current view (help, container
-    /// picker, edit flow, live shell). Esc closes; closing is not navigation.
-    Overlay(Overlay),
+    // `Confirm` used to live here. It is a nav ELEMENT now
+    // (`Element::Confirm`), which is what makes Esc the ordinary pop and
+    // puts its keys through the same per-kind dispatch as every other view.
+    // `Form` used to live here. It is a nav ELEMENT now (`Element::Form`)
+    // like the other dialogs; only its TYPING still goes through the input
+    // sink, which is where every text surface in the app is handled.
+    /// An operation that TAKES OVER the terminal — `$EDITOR`, a live shell.
+    ///
+    /// Not a view, which is why it is not a nav element: you do not navigate
+    /// to it and you cannot drill from it. It suspends the TUI, holds RAII
+    /// (an `ExecStream`, a `TempFile`) and completes. Every dialog that WAS
+    /// here — help, the container picker, the confirm box — is an element
+    /// now, so this variant finally means one thing instead of "whatever
+    /// isn't an element".
+    Takeover(TakeoverOp),
 }
 
 impl UiState {
@@ -115,83 +124,25 @@ impl UiState {
             flash: None,
             modal: Modal::None,
             show_header: true,
+            theme,
             tick_count: 0,
             column_level: crate::kube::resource_def::ColumnLevel::Default,
-            theme,
             anim: crate::app::anim::Anim::default(),
-        }
-    }
-
-    /// Open a modal, displacing whatever was open. The ONLY way in.
-    pub fn open(&mut self, modal: Modal) {
-        self.modal = modal;
-    }
-
-    /// Close whatever is open. Idempotent.
-    pub fn close_modal(&mut self) {
-        self.modal = Modal::None;
-    }
-
-    pub fn modal(&self) -> &Modal {
-        &self.modal
-    }
-
-    pub fn modal_mut(&mut self) -> &mut Modal {
-        &mut self.modal
-    }
-
-    pub fn overlay(&self) -> Option<&Overlay> {
-        match &self.modal {
-            Modal::Overlay(o) => Some(o),
-            _ => None,
-        }
-    }
-
-    pub fn overlay_mut(&mut self) -> Option<&mut Overlay> {
-        match &mut self.modal {
-            Modal::Overlay(o) => Some(o),
-            _ => None,
-        }
-    }
-
-    pub fn confirm_dialog(&self) -> Option<&ConfirmDialog> {
-        match &self.modal {
-            Modal::Confirm(d) => Some(d),
-            _ => None,
-        }
-    }
-
-    pub fn confirm_dialog_mut(&mut self) -> Option<&mut ConfirmDialog> {
-        match &mut self.modal {
-            Modal::Confirm(d) => Some(d),
-            _ => None,
-        }
-    }
-
-    pub fn form_dialog(&self) -> Option<&FormDialog> {
-        match &self.modal {
-            Modal::Form(d) => Some(d),
-            _ => None,
-        }
-    }
-
-    pub fn form_dialog_mut(&mut self) -> Option<&mut FormDialog> {
-        match &mut self.modal {
-            Modal::Form(d) => Some(d),
-            _ => None,
         }
     }
 
     /// The `:` prompt's buffer, if it is the open modal.
     pub fn command_input(&self) -> Option<(&str, Option<usize>)> {
         match &self.modal {
-            Modal::Command { input, history_index } => Some((input, *history_index)),
+            Modal::Command { input, history_index } => Some((input.value(), *history_index)),
             _ => None,
         }
     }
 
     /// Mutable access to the `:` prompt's buffer, for the editing keys.
-    pub fn command_input_mut(&mut self) -> Option<(&mut String, &mut Option<usize>)> {
+    pub fn command_input_mut(
+        &mut self,
+    ) -> Option<(&mut crate::app::text_input::TextInput, &mut Option<usize>)> {
         match &mut self.modal {
             Modal::Command { input, history_index } => Some((input, history_index)),
             _ => None,
@@ -204,34 +155,52 @@ impl UiState {
         std::mem::replace(&mut self.modal, Modal::None)
     }
 
+    /// Close whatever is open.
+    pub fn close_modal(&mut self) {
+        self.modal = Modal::None;
+    }
+
+    /// Open a modal, replacing anything already there. The single write
+    /// site — which is what stops two of them being open at once.
+    pub fn open(&mut self, modal: Modal) {
+        self.modal = modal;
+    }
+
+    /// What is open, for the render dispatch.
+    pub fn modal(&self) -> &Modal {
+        &self.modal
+    }
+
+    pub fn takeover(&self) -> Option<&TakeoverOp> {
+        match &self.modal {
+            Modal::Takeover(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    pub fn takeover_mut(&mut self) -> Option<&mut TakeoverOp> {
+        match &mut self.modal {
+            Modal::Takeover(o) => Some(o),
+            _ => None,
+        }
+    }
 }
 
 impl Modal {
     /// Owned-variant extractors, for flows that must MOVE what they close
-    /// out of the slot (the edit flow moves its `TempFile`).
-    pub fn into_overlay(self) -> Option<Overlay> {
+    /// (the edit flow takes its `TempFile`, the shell its `ExecStream`).
+    pub fn into_takeover(self) -> Option<TakeoverOp> {
         match self {
-            Modal::Overlay(o) => Some(o),
+            Modal::Takeover(o) => Some(o),
             _ => None,
         }
     }
 
-    pub fn into_form(self) -> Option<FormDialog> {
-        match self {
-            Modal::Form(d) => Some(d),
-            _ => None,
-        }
-    }
 
-    pub fn into_confirm(self) -> Option<ConfirmDialog> {
-        match self {
-            Modal::Confirm(d) => Some(d),
-            _ => None,
-        }
-    }
 }
 
 impl UiState {
+
     /// The `:` prompt's rendered prefix, or `""` when it isn't open.
     pub fn command_prompt(&self) -> &'static str {
         match &self.modal {
@@ -275,14 +244,11 @@ impl UiState {
             // `_ => return false`, so PageUp/PageDown/Home/End fell through
             // to the table underneath and moved its cursor under an open
             // dialog. The comment that used to sit here said the sinks
-            // "consume unconditionally", and justified the leak by wanting
-            // Ctrl-C to reach the global handler — which it never could,
-            // since `TextKey::new` rejects chords two frames earlier.
-            Modal::Form(_) => true,
-            // Owned by `handler::handle_key_event`, whose `Overlay` match is
+
+            // Owned by `handler::handle_key_event`, whose `TakeoverOp` match is
             // wildcard-free — a new overlay variant is a compile error
             // there, which is the guard that actually holds.
-            Modal::Confirm(_) | Modal::Overlay(_) => false,
+            Modal::Takeover(_) => false,
         }
     }
 }
@@ -561,7 +527,7 @@ impl TryFrom<String> for KeyCombo {
 ///   Shift-0) to restore the action after `colFirst: "0"` shadowed
 ///   the `0` key.
 ///
-/// Overlay-defined (`Custom`) operations bind through the overlay
+/// TakeoverOp-defined (`Custom`) operations bind through the overlay
 /// config, never here.
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
@@ -1138,22 +1104,46 @@ impl TextKey {
     }
 }
 
-pub fn handle_search_key(input: &mut String, key: TextKey) -> SearchInputResult {
+pub fn handle_search_key(
+    input: &mut crate::app::text_input::TextInput,
+    key: TextKey,
+) -> SearchInputResult {
+    use crossterm::event::KeyCode;
     match key.code() {
-        crossterm::event::KeyCode::Esc => {
+        KeyCode::Esc => {
             input.clear();
             SearchInputResult::Cancelled
         }
-        crossterm::event::KeyCode::Enter => {
-            let text = std::mem::take(input);
-            SearchInputResult::Committed(text)
-        }
-        crossterm::event::KeyCode::Backspace => {
-            input.pop();
+        KeyCode::Enter => SearchInputResult::Committed(input.take()),
+        // Editing and caret motion are the input's, not this function's —
+        // the fifth and last place that used to keep its own `String` and
+        // reimplement backspace.
+        KeyCode::Backspace => {
+            input.backspace();
             SearchInputResult::Updated
         }
-        crossterm::event::KeyCode::Char(c) => {
-            input.push(c);
+        KeyCode::Delete => {
+            input.delete();
+            SearchInputResult::Updated
+        }
+        KeyCode::Left => {
+            input.left();
+            SearchInputResult::Updated
+        }
+        KeyCode::Right => {
+            input.right();
+            SearchInputResult::Updated
+        }
+        KeyCode::Home => {
+            input.home();
+            SearchInputResult::Updated
+        }
+        KeyCode::End => {
+            input.end();
+            SearchInputResult::Updated
+        }
+        KeyCode::Char(c) => {
+            input.insert(c);
             SearchInputResult::Updated
         }
         _ => SearchInputResult::Updated,
@@ -1179,7 +1169,7 @@ pub type CrdInfo = crate::kube::protocol::CrdRef;
 // container label lives on `LogContainer::label` next to the variants.)
 
 // ---------------------------------------------------------------------------
-// Overlay — the single modal slot
+// TakeoverOp — the single modal slot
 // ---------------------------------------------------------------------------
 
 /// A dialogue or operation layered over the current view. NOT navigation:
@@ -1187,23 +1177,15 @@ pub type CrdInfo = crate::kube::protocol::CrdRef;
 /// overlay has no history, no data handle, no self-definition — Esc
 /// closes it (dropping its RAII: [`crate::kube::client_session::ExecStream`],
 /// [`TempFile`]) and the view underneath was never displaced.
-pub enum Overlay {
+pub enum TakeoverOp {
     // The `?` help sheet used to live here. It is a nav ELEMENT now
     // (`LocalResourceKind::Keybinding`), which is what gives it grep,
     // scroll, sort and copy for free and makes Esc the ordinary pop —
     // see `Element::extent` for how it still floats.
-    /// "Which container?" picker for multi-container pods. Captures its
-    /// container list at construction — self-contained (no table lookups
-    /// under a dialog that may outlive the row).
-    ContainerSelect {
-        target: crate::kube::protocol::ObjectRef,
-        /// The rows to pick from, already resolved for `action` — see
-        /// [`ContainerChoice::list`]. `selected` indexes THIS, so there is
-        /// one index space and no "row 0 means something else" offset.
-        choices: Vec<ContainerChoice>,
-        selected: usize,
-        action: ContainerAction,
-    },
+    // `ContainerSelect` used to live here. It is a nav ELEMENT now
+    // (`Element::Picker`) for the same reasons help and confirm are: Esc is
+    // the ordinary pop, and its keys arrive through the one per-kind
+    // dispatch instead of a branch that has to be remembered.
     /// The unified edit flow (a transient state machine that suspends the
     /// TUI for `$EDITOR`):
     ///
@@ -1226,51 +1208,71 @@ pub enum Overlay {
     Shell(Box<ShellState>),
 }
 
-/// How much of the frame an overlay claims — the single authority for what
-/// is erased before it paints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OverlayExtent {
-    /// A self-positioned dialog box over a view that stays honest around
-    /// it: the renderer erases its OWN rect as part of drawing its chrome,
-    /// and everything outside that rect belongs to the view.
-    Dialog,
-    /// The overlay claims the WHOLE frame. [`crate::ui::draw`] erases the
-    /// frame before the overlay paints, so no part of the view beneath can
-    /// show through — a full-frame renderer that draws only chrome (a
-    /// bordered block leaves its interior cells untouched) cannot end up
-    /// framing the stale view it was supposed to replace.
-    FullFrame,
-}
-
-impl Overlay {
-    /// The frame area this overlay claims. EXHAUSTIVE: a new overlay kind
-    /// must declare its extent, and full-frame erasure happens centrally in
-    /// [`crate::ui::draw`] rather than being re-remembered by each renderer.
-    pub fn extent(&self) -> OverlayExtent {
+impl TakeoverOp {
+    /// The frame area this operation claims — the same
+    /// [`ViewExtent`](crate::app::element::ViewExtent) a nav element
+    /// declares, because it is the same question.
+    ///
+    /// There used to be an `OpExtent` beside it with its own `Dialog` and
+    /// `FullFrame`, which meant one question had two answers and the
+    /// takeover's `Dialog` could not say how big it was — so its renderer
+    /// centred itself, a second geometry authority beside the float path's.
+    /// Now `Dialog` carries a size here too and [`crate::ui::dialog_box`]
+    /// places both.
+    ///
+    /// EXHAUSTIVE: a new operation must choose, and the central erase in
+    /// [`crate::ui::draw`] reads the answer rather than each renderer
+    /// re-remembering it.
+    pub fn extent(&self) -> crate::app::element::ViewExtent {
+        use crate::app::element::{Size, ViewExtent};
         match self {
-            // All three clear their own rect (Clear + dialog chrome) and
-            // sit over a view that is still live and worth seeing.
-            Overlay::ContainerSelect { .. } => OverlayExtent::Dialog,
-            Overlay::Edit { .. } => OverlayExtent::Dialog,
+            // A status line in a box, sized from the line — the same rule
+            // the confirm/form/picker elements follow, in the same units.
+            // `+ 6`: two cells of padding each side plus the border.
+            TakeoverOp::Edit { .. } => ViewExtent::Dialog {
+                max_width: Size::Cells(self.label().chars().count() as u16 + 6),
+                max_height: Size::Cells(3),
+            },
             // The connect screen is a full-screen titled frame: the view
             // beneath must not render inside it. It used to — the shell
             // block painted its border over the resource table and left
             // every interior cell as the table had drawn it.
-            Overlay::Shell(_) => OverlayExtent::FullFrame,
+            TakeoverOp::Shell(_) => ViewExtent::Full,
+        }
+    }
+
+    /// The one line this operation has to say for itself, when it has one.
+    ///
+    /// On the op rather than in the renderer because [`Self::extent`] has to
+    /// measure it: a box sized from a label the renderer invents separately
+    /// is two statements about one string.
+    pub fn label(&self) -> String {
+        match self {
+            TakeoverOp::Edit { target, state } => {
+                let kind = target.resource.display_label();
+                let name = &target.name;
+                match state {
+                    EditState::AwaitingYaml => format!("Fetching YAML for {}/{}…", kind, name),
+                    EditState::EditorReady { .. } => {
+                        format!("Launching editor for {}/{}…", kind, name)
+                    }
+                    EditState::Applying { .. } => format!("Applying {}/{}…", kind, name),
+                }
+            }
+            // The shell draws its own titled frame; it has no one-liner.
+            TakeoverOp::Shell(s) => s.title.clone(),
         }
     }
 }
 
-impl std::fmt::Debug for Overlay {
+impl std::fmt::Debug for TakeoverOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Overlay::ContainerSelect { target, .. } => {
-                f.debug_struct("ContainerSelect").field("target", target).finish_non_exhaustive()
-            }
-            Overlay::Edit { target, .. } => {
+
+            TakeoverOp::Edit { target, .. } => {
                 f.debug_struct("Edit").field("target", target).finish_non_exhaustive()
             }
-            Overlay::Shell(state) => f.debug_tuple("Shell").field(state).finish(),
+            TakeoverOp::Shell(state) => f.debug_tuple("Shell").field(state).finish(),
         }
     }
 }
@@ -1544,7 +1546,7 @@ mod key_combo_tests {
         assert_eq!(keys.op_key(&Op::Delete), None);
         keys.delete = Some(KeyCombo::plain('x'));
         assert_eq!(keys.op_key(&Op::Delete), Some(KeyCombo::plain('x')));
-        // Overlay-defined ops are never bindable here.
+        // TakeoverOp-defined ops are never bindable here.
         assert_eq!(keys.op_key(&Op::Custom("z".into())), None);
     }
 
@@ -1683,3 +1685,18 @@ mod context_switch_tests {
 #[cfg(test)]
 #[path = "../tests/app/types.rs"]
 mod mirror_tests;
+
+/// "Which container?" — a pick-one list floating over the view that asked.
+///
+/// Captures its choices at construction: self-contained, so no table lookup
+/// happens under a dialog that may outlive the row it came from.
+#[derive(Debug, Clone)]
+pub struct ContainerPicker {
+    pub target: crate::kube::protocol::ObjectRef,
+    /// The rows to pick from, already resolved for `action` — see
+    /// [`ContainerChoice::list`]. `selected` indexes THIS, so there is one
+    /// index space and no "row 0 means something else" offset.
+    pub choices: Vec<ContainerChoice>,
+    pub selected: usize,
+    pub action: ContainerAction,
+}

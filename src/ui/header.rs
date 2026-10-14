@@ -5,6 +5,8 @@ use ratatui::{
     Frame,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::app::App;
 use crate::ui::theme::Theme;
 
@@ -146,15 +148,43 @@ pub fn draw_header(
 
 /// Build a keybinding bar `Line` from a list of `(key, description)` pairs.
 /// Used by describe, yaml, log, and context views for their bottom status bars.
-pub fn render_keybinding_bar(hints: &[(&str, &str)], theme: &Theme) -> Line<'static> {
-    let mut spans = Vec::new();
-    spans.push(Span::styled(" ", theme.status_bar));
+pub fn render_keybinding_bar(
+    hints: &[(impl AsRef<str>, impl AsRef<str>)],
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    // The bar is ONE line and ratatui truncates at the right edge, silently.
+    // The log bar was 115 columns, so a 97-column terminal lost `1h`, `24h`
+    // and `back` with nothing to say so — the last of those being the key
+    // that gets you out. Fitting here instead means the omission is visible
+    // (`…`, and `?` is the complete answer), and it holds for every class at
+    // every width rather than for the ones that happen to be short.
+    let width = width as usize;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut dropped = false;
     for (i, (key, desc)) in hints.iter().enumerate() {
-        spans.push(Span::styled(format!("<{}>", key), theme.status_bar_key));
-        spans.push(Span::styled(format!(" {} ", desc), theme.status_bar));
-        if i < hints.len() - 1 {
+        let (key, desc) = (key.as_ref(), desc.as_ref());
+        // One column of lead-in each: a space before the first, a `│`
+        // between the rest. Then `<key>` and ` desc `.
+        let cost = 1 + key.width() + 2 + desc.width() + 2;
+        // Keep room for the `…` unless this is the last hint and it fits.
+        let reserve = if i + 1 < hints.len() { 1 } else { 0 };
+        if used + cost + reserve > width {
+            dropped = true;
+            break;
+        }
+        if i == 0 {
+            spans.push(Span::styled(" ", theme.status_bar));
+        } else {
             spans.push(Span::styled("\u{2502}", theme.status_bar));
         }
+        spans.push(Span::styled(format!("<{}>", key), theme.status_bar_key));
+        spans.push(Span::styled(format!(" {} ", desc), theme.status_bar));
+        used += cost;
+    }
+    if dropped {
+        spans.push(Span::styled("\u{2026}", theme.status_bar));
     }
     Line::from(spans)
 }

@@ -61,7 +61,8 @@ fn push_log_element(app: &mut App) {
 fn push_help_element(app: &mut App) {
     let class = crate::event::keymap::ViewClass::of(app.nav.top());
     let caps = Some(app.current_capabilities());
-    let store = app.core.seed_keybindings(caps, app.config.keys, class);
+    let store =
+        app.core.seed_keybindings(caps, app.config.keys, class, app.nav.top().markable());
     let rid = crate::kube::local::LocalResourceKind::Keybinding.to_resource_id();
     app.nav.push(crate::app::element::Element::ResourceList(
         crate::app::element::ResourceList::client(
@@ -290,7 +291,7 @@ fn test_ctrl_chord_does_not_alias_bare_char() {
 #[test]
 fn test_confirm_dialog_keys() {
     let mut app = App::new_for_test();
-    app.ui.open(crate::app::Modal::Confirm(crate::app::ConfirmDialog {
+    app.nav.push(crate::app::element::Element::Confirm(Box::new(crate::app::ConfirmDialog {
         message: "Are you sure?".to_string(),
         pending: crate::app::PendingAction::Single {
             op: crate::app::SingleOp::Delete,
@@ -302,7 +303,7 @@ fn test_confirm_dialog_keys() {
         },
         action_label: "Delete".to_string(),
         action_focused: false,
-    }));
+    })));
 
     assert!(matches!(
         handle_key_event(&app, make_key(KeyCode::Char('y'))),
@@ -480,18 +481,41 @@ fn help_declares_itself_a_floating_view() {
 #[test]
 fn test_q_goes_back_in_container_select() {
     let mut app = App::new_for_test();
-    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::ContainerSelect {
-        target: crate::kube::protocol::ObjectRef::new(
-            rid(crate::kube::resource_def::BuiltInKind::Pod),
-            String::new(),
-            crate::kube::protocol::Namespace::All,
-        ),
-        choices: Vec::new(),
-        selected: 0,
-        action: crate::app::ContainerAction::Logs,
-    }));
-    let action = handle_key_event(&app, make_key(KeyCode::Char('q')));
-    assert!(matches!(action, Some(Action::Back)));
+    app.nav.push(crate::app::element::Element::Picker(Box::new(
+        crate::app::ContainerPicker {
+            target: crate::kube::protocol::ObjectRef::new(
+                crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                "p".to_string(),
+                crate::kube::protocol::Namespace::Named("default".to_string()),
+            ),
+            choices: vec![
+                crate::app::ContainerChoice {
+                    label: "web".into(),
+                    container: crate::kube::protocol::LogContainer::Named("web".into()),
+                },
+                crate::app::ContainerChoice {
+                    label: "sidecar".into(),
+                    container: crate::kube::protocol::LogContainer::Named("sidecar".into()),
+                },
+            ],
+            selected: 0,
+            action: crate::app::ContainerAction::Logs,
+        },
+    )));
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char('q'))),
+        Some(Action::Back)
+    ));
+    // The picker keeps its own cursor keys, and `Enter` picks.
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char('j'))),
+        Some(Action::NextItem)
+    ));
+    assert!(matches!(handle_key_event(&app, make_key(KeyCode::Enter)), Some(Action::Enter)));
+    // …and like every dialog it owns the globals too, rather than letting
+    // `:` open the command prompt behind it.
+    assert!(app.nav.top().captures_all_input());
+    assert!(handle_key_event(&app, make_key(KeyCode::Char(':'))).is_none());
 }
 
 #[test]
@@ -776,14 +800,14 @@ fn test_second_batch_refused_while_one_outstanding() {
         crate::kube::protocol::OperationKind::Delete,
     ));
     crate::kube::session_actions::handle_batch_op(&mut app, Action::BatchDelete);
-    assert!(app.ui.confirm_dialog().is_none());
+    assert!(!matches!(app.nav.top(), crate::app::element::Element::Confirm(_)));
     assert!(app.ui.flash.as_ref().is_some_and(|f| f.message.contains("in flight")));
     assert!(app.nav.top().has_marks(), "refusal leaves the selection untouched");
 
     // Tracker cleared → the same dispatch opens the confirm dialog.
     app.pending_batch = None;
     crate::kube::session_actions::handle_batch_op(&mut app, Action::BatchDelete);
-    assert!(app.ui.confirm_dialog().is_some());
+    assert!(matches!(app.nav.top(), crate::app::element::Element::Confirm(_)));
 }
 
 // ---------------------------------------------------------------------------

@@ -153,6 +153,15 @@ pub struct TableInteraction {
     /// falling through to single-item semantics (the "act through the
     /// last painted view" doctrine, applied to mode).
     pub rendered_select_mode: bool,
+    /// The column level the last derive used.
+    ///
+    /// A bare grep now scans only the DISPLAYED columns, so which rows pass
+    /// depends on the level — and the level is ambient UI state the element
+    /// cannot see. Recorded here by `view()` for the same reason
+    /// `rendered_select_mode` is: the cold-memo fallback has to resolve what
+    /// the next paint will show, and this is the only thing it would
+    /// otherwise have to guess.
+    pub derived_level: ColumnLevel,
     /// Memo of the ephemeral view — a pure cache, droppable at any time
     /// (cleared when the element is covered; rebuilt on first read).
     cache: Option<(DeriveKey, Arc<PreparedView>)>,
@@ -168,6 +177,7 @@ impl Default for TableInteraction {
             sort: SortSpec::default(),
             filter_input: FilterInputState::default(),
             rendered_select_mode: false,
+            derived_level: ColumnLevel::Default,
             cache: None,
         }
     }
@@ -188,6 +198,7 @@ impl TableInteraction {
             sort: parent.sort,
             filter_input: FilterInputState::default(),
             rendered_select_mode: false,
+            derived_level: ColumnLevel::Default,
             cache: None,
         }
     }
@@ -664,14 +675,21 @@ pub enum DeriveError {
     NoSelection,
 }
 
-/// How much of the frame an element claims when it is on top.
+/// How much of the frame a thing claims when it is on top.
 ///
-/// The overlay slot already answered this question for modals
-/// ([`crate::app::OverlayExtent`]); this is the same question asked of a nav
-/// ELEMENT, which is what lets a floating view be an ordinary element rather
-/// than a second kind of thing with its own key routing. A `Dialog` element
-/// is drawn in a centered box over the element beneath it — that one is
-/// rendered first, exactly as it would be if it were on top.
+/// ONE answer for both axes of "on top": a nav ELEMENT
+/// ([`Element::extent`]) and an orthogonal operation
+/// ([`crate::app::TakeoverOp::extent`]). That is what lets a floating view be
+/// an ordinary element rather than a second kind of thing with its own key
+/// routing — and the operations had their own `OpExtent`, with its own
+/// `Dialog` and `FullFrame`, until it collapsed into this one. Its `Dialog`
+/// could not say how big it was, so its renderer centred itself: a second
+/// geometry authority for one rect.
+///
+/// A `Dialog` is drawn in a centered box over whatever is beneath it (which
+/// is rendered first, exactly as it would be if it were on top), placed by
+/// [`crate::ui::dialog_box`]. `Full` claims the frame, and the one path that
+/// paints OVER a live view erases it first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewExtent {
     /// Claims the frame. Every element does this unless it says otherwise.
@@ -737,8 +755,13 @@ pub enum SpanOutcome {
 /// Persistent interaction state for log-bearing elements (scroll, follow,
 /// display toggles, the draft filter being typed). The visible-line set is
 /// the ephemeral view: derived on read, memoized, droppable.
+///
+/// Named for what it is, and to pair with [`TableInteraction`]: it used to be
+/// `LogViewState`, which is also the name of the log WIDGET's per-draw
+/// parameter block (`ui::widgets::LogViewState`) — two different things one
+/// `use` away from each other.
 #[derive(Debug)]
-pub struct LogViewState {
+pub struct LogInteraction {
     /// Vertical scroll relationship, in PHYSICAL (wrap-expanded) rows — owned
     /// by the render pass, which alone knows the width and wrap layout. Carries
     /// the follow/autoscroll flag too.
@@ -757,8 +780,9 @@ pub struct LogViewState {
     /// follow-mode auto-scroll so the view doesn't jump as the tail
     /// streams in.
     pub initial_load: bool,
-    /// Draft filter text; `Some` = the filter bar is open.
-    pub draft: Option<String>,
+    /// Draft filter text; `Some` = the filter bar is open. Editable with a
+    /// caret — see [`crate::app::text_input::TextInput`].
+    pub draft: Option<crate::app::text_input::TextInput>,
     cache: Option<(LogDeriveKey, Arc<Vec<usize>>)>,
 }
 
@@ -768,7 +792,7 @@ struct LogDeriveKey {
     draft: Option<String>,
 }
 
-impl LogViewState {
+impl LogInteraction {
     fn from_config(cfg: &crate::app::LogConfig, follow: bool) -> Self {
         Self {
             viewport: if follow {
@@ -794,7 +818,7 @@ impl LogViewState {
     /// counts only the lines it retained). `restarted()` is the existing
     /// answer to exactly this question, asked by the `since`-range restart:
     /// same surface, new content, keep what the user chose.
-    fn seeded_from(parent: &LogViewState) -> Self {
+    fn seeded_from(parent: &LogInteraction) -> Self {
         Self {
             viewport: parent.viewport.restarted(),
             // The pan IS carried, unlike the vertical position: every line in
@@ -856,7 +880,7 @@ pub struct LogSession {
     /// Tail size for rate restarts (from config at construction).
     tail_default: u64,
     label: String,
-    pub view: LogViewState,
+    pub view: LogInteraction,
 }
 
 impl std::fmt::Debug for LogSession {
@@ -881,7 +905,7 @@ impl LogSession {
         );
         let label = log_label(&spec);
         Self {
-            view: LogViewState::from_config(cfg, spec.follow),
+            view: LogInteraction::from_config(cfg, spec.follow),
             tail_default: cfg.tail_lines,
             spec,
             stream,
@@ -1028,7 +1052,7 @@ impl LogSession {
         };
         let label = log_label(&spec);
         Self {
-            view: LogViewState::from_config(&cfg, true),
+            view: LogInteraction::from_config(&cfg, true),
             tail_default: cfg.tail_lines,
             spec,
             stream: crate::app::test_support::parked_log_stream(),
@@ -1060,7 +1084,7 @@ impl LogFilter {
         let (evicted, live, batch) = parent.with_read(|inner| {
             let start = self.cursor.max(inner.evicted);
             let end = inner.evicted + inner.lines.len() as u64;
-            let matched: Vec<crate::kube::protocol::LogLine> = (start..end)
+            let matched: Vec<crate::app::store::StoredLine> = (start..end)
                 .filter_map(|seq| inner.lines.get((seq - inner.evicted) as usize))
                 .filter(|line| {
                     // Which PARTS a grep sees is `Role::searchable`'s to say,
@@ -1070,7 +1094,7 @@ impl LogFilter {
                     // timestamp is not searchable" becomes true in one of them
                     // and not the others.
                     let hit = |p: &SearchPattern| {
-                        crate::kube::protocol::segments(line)
+                        line.segments()
                             .filter(|(role, ..)| role.searchable())
                             .any(|(_, text, _)| p.is_match(text))
                     };
@@ -1173,7 +1197,7 @@ pub struct LogFilter {
     header_pod: String,
     header_container: String,
     header_since: String,
-    pub view: LogViewState,
+    pub view: LogInteraction,
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,7 +1215,6 @@ pub enum ContentSpec {
     Yaml(ObjectRef),
     Describe(ObjectRef),
     DecodedSecret(ObjectRef),
-    Aliases,
 }
 
 /// Fetch lifecycle of a one-shot content view. Replaces an
@@ -1209,8 +1232,7 @@ pub enum ContentPhase {
     Failed(String),
 }
 
-/// A one-shot fetched text view (yaml / describe / decoded secret /
-/// aliases).
+/// A one-shot fetched text view (yaml / describe / decoded secret).
 #[derive(Debug)]
 pub struct ContentView {
     pub kind: ContentSpec,
@@ -1227,20 +1249,10 @@ impl ContentView {
             ContentSpec::Yaml(t) => format!("yaml({})", t.name),
             ContentSpec::Describe(t) => format!("describe({})", t.name),
             ContentSpec::DecodedSecret(t) => format!("decoded({})", t.name),
-            ContentSpec::Aliases => "aliases".to_string(),
         };
         Self { kind, phase, state, label }
     }
 
-    /// The target this content was fetched for, if any.
-    pub fn target(&self) -> Option<&ObjectRef> {
-        match &self.kind {
-            ContentSpec::Yaml(t) | ContentSpec::Describe(t) | ContentSpec::DecodedSecret(t) => {
-                Some(t)
-            }
-            ContentSpec::Aliases => None,
-        }
-    }
 }
 
 /// The landing page. Its content (cluster health stats) comes from the
@@ -1265,6 +1277,11 @@ pub enum ElementClass {
     Content,
     /// App chrome with no data source of its own.
     Chrome,
+    /// A question with a continuation and no data source: one keymap, no
+    /// cursor, no scroll. Distinct from `Chrome` because the keys differ —
+    /// mapping it to the Overview keymap would document `Tab`-to-next-view
+    /// at a box whose `Tab` switches buttons.
+    Dialog,
 }
 
 /// One nav-stack element. A closed enum: the renderer, key dispatch, and
@@ -1279,6 +1296,28 @@ pub enum Element {
     LogFilter(LogFilter),
     ContentView(ContentView),
     Overview(Overview),
+    /// A yes/no question about an operation, floating over the view that
+    /// raised it.
+    ///
+    /// An ELEMENT rather than a modal slot: Esc is then the ordinary pop,
+    /// its keys arrive through the same per-kind dispatch as every other
+    /// view, and there is no second authority deciding who owns input. The
+    /// guard that used to arbitrate that (`modal_without_key_handler`) was
+    /// wrong twice in one day, and it existed only because dialogs captured
+    /// keys from outside the stack.
+    Confirm(Box<crate::app::ConfirmDialog>),
+    /// "Which container?" — a pick-one list, floating over the view that
+    /// asked. Same reasoning as `Confirm`: a dialog is an element whose
+    /// extent happens to be a box.
+    Picker(Box<crate::app::ContainerPicker>),
+    /// A form gathering input for one operation (scale, port-forward).
+    ///
+    /// Storage, extent and Esc are the stack's, like the other dialogs. Its
+    /// TYPING still goes through the input sink in `try_handle_input_mode`,
+    /// and that is the pattern rather than an exception: every text surface
+    /// in the app is handled there, because a keystroke that edits text has
+    /// to mutate, and `handle_key_event` only names actions.
+    Form(Box<crate::app::FormDialog>),
 }
 
 impl Element {
@@ -1353,6 +1392,9 @@ impl Element {
             Element::ResourceList(e) => &e.label,
             Element::RowFilter(e) => &e.label,
             Element::DerivedRows(e) => &e.label,
+            Element::Confirm(_) => "confirm",
+            Element::Picker(_) => "container",
+            Element::Form(f) => f.name(),
             Element::LogSession(e) => &e.label,
             Element::LogFilter(e) => &e.label,
             Element::ContentView(e) => &e.label,
@@ -1440,7 +1482,7 @@ impl Element {
         // The draft lives in two different places depending on the kind;
         // `filter_input` is total (empty for log kinds) and `log_view` is
         // `None` for tables, so exactly one of them speaks.
-        let draft = match self.log_view().and_then(|v| v.draft.as_deref()) {
+        let draft = match self.log_view().and_then(|v| v.draft.as_ref().map(|d| d.value())) {
             Some(d) => d,
             None => self.filter_input().text(),
         };
@@ -1474,6 +1516,9 @@ impl Element {
             Element::ResourceList(_) | Element::RowFilter(_) | Element::DerivedRows(_) => {
                 ElementClass::Table
             }
+            // No data source of its own — it carries the question and the
+            // continuation, nothing else.
+            Element::Confirm(_) | Element::Picker(_) | Element::Form(_) => ElementClass::Dialog,
             Element::LogSession(_) | Element::LogFilter(_) => ElementClass::Log,
             Element::ContentView(_) => ElementClass::Content,
             Element::Overview(_) => ElementClass::Chrome,
@@ -1495,7 +1540,13 @@ impl Element {
             | Element::DerivedRows(_)
             | Element::Overview(_) => true,
             // Sub-views have no inline prompt row — they rely on the overlay.
-            Element::ContentView(_) | Element::LogSession(_) | Element::LogFilter(_) => false,
+            Element::ContentView(_)
+            | Element::LogSession(_)
+            | Element::LogFilter(_)
+            // A dialog answers one question; `:` belongs to the view under it.
+            | Element::Confirm(_)
+            | Element::Picker(_)
+            | Element::Form(_) => false,
         }
     }
 
@@ -1555,7 +1606,7 @@ impl Element {
             header_pod,
             header_container,
             header_since,
-            view: LogViewState::seeded_from(parent_view),
+            view: LogInteraction::seeded_from(parent_view),
         }))
     }
 
@@ -1586,7 +1637,7 @@ impl Element {
     }
 
     /// Log view state, for the kinds that have one.
-    pub fn log_view(&self) -> Option<&LogViewState> {
+    pub fn log_view(&self) -> Option<&LogInteraction> {
         match self {
             Element::LogSession(e) => Some(&e.view),
             Element::LogFilter(e) => Some(&e.view),
@@ -1594,7 +1645,7 @@ impl Element {
         }
     }
 
-    pub fn log_view_mut(&mut self) -> Option<&mut LogViewState> {
+    pub fn log_view_mut(&mut self) -> Option<&mut LogInteraction> {
         match self {
             Element::LogSession(e) => Some(&mut e.view),
             Element::LogFilter(e) => Some(&mut e.view),
@@ -1657,6 +1708,33 @@ impl Element {
         )
     }
 
+    /// The form this element IS, if it is one.
+    pub fn form_dialog(&self) -> Option<&crate::app::FormDialog> {
+        match self {
+            Element::Form(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    pub fn form_dialog_mut(&mut self) -> Option<&mut crate::app::FormDialog> {
+        match self {
+            Element::Form(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Whether this element owns EVERY key, global bindings included.
+    ///
+    /// That is what "modal" means, and it is a property of the element
+    /// rather than of where it is stored — which is the whole reason a
+    /// dialog can be a nav element at all. `Confirm` answers yes because
+    /// its safety net is "any other key cancels": a spurious keystroke (a
+    /// stale terminal response misparsed as `r`, say) must dismiss the box
+    /// rather than open the command prompt behind it.
+    pub fn captures_all_input(&self) -> bool {
+        matches!(self.class(), ElementClass::Dialog)
+    }
+
     /// How much of the frame this element claims — see [`ViewExtent`].
     ///
     /// EXHAUSTIVE on the kind axis, not a `_ => Full` wildcard: whether a new
@@ -1670,6 +1748,41 @@ impl Element {
             // ABOUT something, and that something should stay on screen.
             _ if self.is_keybindings_view() => {
                 ViewExtent::Dialog { max_width: Size::Pct(80), max_height: Size::Pct(85) }
+            }
+            // Sized from its own content, which is what `Size::Cells` is
+            // for: a yes/no box wants the rows its message needs, not a
+            // percentage of somebody's terminal. No extra `Size` variant —
+            // the element that knows the content answers in cells.
+            Element::Confirm(d) => {
+                // EXACTLY the size `ConfirmDialogWidget` asks for, so the
+                // centring it does inside the box is a no-op and the two
+                // do not disagree about where the dialog is. A batch confirm
+                // lists its targets on extra lines and the box grows with
+                // them — seeing what the batch will hit is the whole point.
+                let (w, h) = crate::ui::widgets::confirm_dialog_size(d);
+                // `+ 4` / `+ 2`: `ModalOverlay` keeps that much margin inside
+                // whatever rect it is handed, so a box sized to the dialog
+                // exactly would shrink it until the message had no room. The
+                // float reserves the OUTER box; the widget still owns the
+                // inside of it.
+                ViewExtent::Dialog {
+                    max_width: Size::Cells(w + 4),
+                    max_height: Size::Cells(h + 2),
+                }
+            }
+            Element::Form(d) => {
+                let (w, h) = crate::ui::widgets::form_dialog_size(d);
+                ViewExtent::Dialog {
+                    max_width: Size::Cells(w + 4),
+                    max_height: Size::Cells(h + 2),
+                }
+            }
+            Element::Picker(p) => {
+                let (w, h) = crate::ui::widgets::container_picker_size(p);
+                ViewExtent::Dialog {
+                    max_width: Size::Cells(w + 4),
+                    max_height: Size::Cells(h + 2),
+                }
             }
             Element::ResourceList(_)
             | Element::RowFilter(_)
@@ -1688,7 +1801,7 @@ impl Element {
         if let Some(view) = self.log_view() {
             if let Some(d) = &view.draft {
                 if !d.is_empty() {
-                    pats.push(d.clone());
+                    pats.push(d.value().to_string());
                 }
             }
         }
@@ -1721,13 +1834,21 @@ impl Element {
             Element::LogFilter(e) => (Arc::clone(&e.retained), &mut e.view),
             _ => return None,
         };
-        let key = LogDeriveKey { generation: store.generation(), draft: view.draft.clone() };
+        let key = LogDeriveKey {
+            generation: store.generation(),
+            draft: view.draft.as_ref().map(|d| d.value().to_string()),
+        };
         if let Some((k, v)) = &view.cache {
             if *k == key {
                 return Some(Arc::clone(v));
             }
         }
-        let draft = view.draft.clone().filter(|d| !d.is_empty()).map(|d| SearchPattern::new(&d));
+        let draft = view
+            .draft
+            .as_ref()
+            .map(|d| d.value())
+            .filter(|d| !d.is_empty())
+            .map(SearchPattern::new);
         let indices = store.with_read(|inner| {
             // The DRAFT only. Committed patterns were applied by the drain
             // when these lines were retained, so re-testing them here would
@@ -1737,7 +1858,8 @@ impl Element {
                 None => (0..inner.lines.len()).collect::<Vec<usize>>(),
                 Some(d) => (0..inner.lines.len())
                     .filter(|&i| {
-                        crate::kube::protocol::segments(&inner.lines[i])
+                        inner.lines[i]
+                            .segments()
                             .filter(|(role, ..)| role.searchable())
                             .any(|(_, text, _)| d.is_match(text))
                     })
@@ -1873,7 +1995,7 @@ impl Element {
 
     /// Persistent table-interaction state — `Some` for the row-bearing
     /// kinds only. Non-table kinds keep their own state shapes
-    /// ([`LogViewState`], [`crate::app::ContentViewState`], the context
+    /// ([`LogInteraction`], [`crate::app::ContentViewState`], the context
     /// table).
     pub fn table_interaction(&self) -> Option<&TableInteraction> {
         match self {
@@ -1919,7 +2041,10 @@ impl Element {
     /// memoized on the derive key; cleared when covered.
     pub fn view(&mut self, level: ColumnLevel, max_col_width: u16) -> Arc<PreparedView> {
         match self {
-            Element::LogSession(_)
+            Element::Confirm(_)
+            | Element::Picker(_)
+            | Element::Form(_)
+            | Element::LogSession(_)
             | Element::LogFilter(_)
             | Element::ContentView(_)
             | Element::Overview(_) => {
@@ -2045,28 +2170,34 @@ impl Element {
         use crate::app::store::derive_key_order;
         let it = self.table_interaction()?;
         let draft = compile_draft(&it.filter_input);
+        let level = it.derived_level;
+        let policy = self.column_policy();
         match self {
             Element::ResourceList(e) => {
                 let lens = e.source.metrics().map(|m| m.lens());
                 Some(e.query.store.with_read(|inner| {
+                    let visible = policy.visible_indices(&inner.headers, level);
                     derive_key_order(
                         &inner.rows,
                         lens.as_ref(),
                         e.source.predicates(),
                         draft.as_ref(),
                         it.sort,
+                        &visible,
                     )
                 }))
             }
             Element::RowFilter(e) => {
                 let lens = e.source.metrics().map(|m| m.lens());
                 Some(e.source.store().with_read(|inner| {
+                    let visible = policy.visible_indices(&inner.headers, level);
                     derive_key_order(
                         &inner.rows,
                         lens.as_ref(),
                         e.source.predicates(),
                         draft.as_ref(),
                         it.sort,
+                        &visible,
                     )
                 }))
             }
@@ -2079,7 +2210,11 @@ impl Element {
                         .map(|r| e.kind.project(r))
                         .unwrap_or_default()
                 });
-                Some(derive_key_order(&projected, None, &[], draft.as_ref(), it.sort))
+                {
+                    // Projections declare no columns — every one is visible.
+                    let visible: Vec<usize> = (0..projected.first().map_or(0, |r| r.cells.len())).collect();
+                    Some(derive_key_order(&projected, None, &[], draft.as_ref(), it.sort, &visible))
+                }
             }
             _ => None,
         }
@@ -2636,6 +2771,7 @@ fn view_over_store(
             },
         ))
     });
+    interaction.derived_level = level;
     interaction.cache = Some((key, Arc::clone(&view)));
     view
 }

@@ -8,7 +8,7 @@ pub mod table;
 pub mod tabs;
 pub mod yaml_view;
 
-pub use dialog::{ConfirmDialogWidget, FormDialogWidget};
+pub use dialog::{confirm_dialog_size, container_picker_size, form_dialog_size, ConfirmDialogWidget, FormDialogWidget};
 pub use modal::{ModalOverlay, DialogSize};
 pub use filter::{FilterBar, LogFilterBar};
 pub use flash::FlashWidget;

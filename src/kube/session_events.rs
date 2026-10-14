@@ -88,7 +88,7 @@ pub(crate) fn apply_event(
             }
         }
         AppEvent::ExecData(bytes) => {
-            if let Some(crate::app::Overlay::Shell(shell)) = app.ui.overlay_mut() {
+            if let Some(crate::app::TakeoverOp::Shell(shell)) = app.ui.takeover_mut() {
                 shell.connect_state = crate::app::ShellConnectState::Connected;
                 // Buffer output until the main loop enters bridge mode.
                 // These bytes (typically the initial shell prompt) will be
@@ -105,7 +105,7 @@ pub(crate) fn apply_event(
             // (error flash); already `Connected` = the shell came up and
             // exited immediately (fast command / instant exit — a normal end,
             // not a failure).
-            if let Some(crate::app::Overlay::Shell(ref shell)) = app.ui.overlay() {
+            if let Some(crate::app::TakeoverOp::Shell(ref shell)) = app.ui.takeover() {
                 app.ui.flash = Some(match shell.connect_state {
                     crate::app::ShellConnectState::Connecting => {
                         crate::app::FlashMessage::error("Shell connection failed".to_string())
@@ -261,18 +261,18 @@ fn apply_op_result(
     // if this result IS an apply for the edited object.
     let is_applying_this = op == crate::kube::protocol::OperationKind::Apply
         && matches!(
-            app.ui.overlay(),
-            Some(crate::app::Overlay::Edit {
+            app.ui.takeover(),
+            Some(crate::app::TakeoverOp::Edit {
                 target: ref t,
                 state: crate::app::EditState::Applying { .. },
             }) if *t == target
         );
     if is_applying_this {
         // Move the overlay out so we own TempFile (not clone).
-        if let Some(crate::app::Overlay::Edit {
+        if let Some(crate::app::TakeoverOp::Edit {
             target: edit_target,
             state: crate::app::EditState::Applying { temp_file, original },
-        }) = app.ui.take_modal().into_overlay() {
+        }) = app.ui.take_modal().into_takeover() {
             match &result {
                 Ok(_) => {
                     drop(temp_file);
@@ -285,7 +285,7 @@ fn apply_op_result(
                         msg, current,
                     );
                     let _ = std::fs::write(temp_file.path(), &with_error);
-                    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Edit {
+                    app.ui.open(crate::app::Modal::Takeover(crate::app::TakeoverOp::Edit {
                         target: edit_target,
                         state: crate::app::EditState::EditorReady { temp_file, original },
                     }));
@@ -355,7 +355,7 @@ fn apply_resource_update(
             if view_took_it {
                 return;
             }
-            if let Some(crate::app::Overlay::Edit { target, state }) = app.ui.overlay_mut() {
+            if let Some(crate::app::TakeoverOp::Edit { target, state }) = app.ui.takeover_mut() {
                 if *target != response_target { return; }
                 if matches!(state, crate::app::EditState::AwaitingYaml) {
                     match write_edit_temp_file(target, &content) {
@@ -430,7 +430,7 @@ fn apply_resource_update(
                         cv.state.set_describe_lines(lines.clone());
                     }
                     // Delivered over their own events, not this one.
-                    ContentSpec::Yaml(_) | ContentSpec::Aliases => {}
+                    ContentSpec::Yaml(_) => {}
                 }
             });
         }

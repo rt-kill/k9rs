@@ -9,6 +9,7 @@ pub mod liveness;
 pub mod nav;
 pub mod select_gate;
 pub mod store;
+pub mod text_input;
 pub mod table;
 pub mod types;
 pub mod viewport;
@@ -47,6 +48,62 @@ pub struct KubeContext {
     pub name: crate::kube::protocol::ContextName,
     pub identity: crate::kube::protocol::ClusterIdentity,
     pub is_current: bool,
+}
+
+/// Project what the `:` prompt accepts into rows.
+///
+/// Two sections, in the order you reach for them: the resources (whose
+/// aliases are declared by the registry and by `LocalResourceKind`, which is
+/// already their single source) and the static command words (declared by
+/// [`crate::kube::session_commands::COMMAND_WORDS`], which this module's
+/// agreement test probes against the parser).
+///
+/// `Ctrl-a` used to format this as a plain-text DOCUMENT, so it could not be
+/// grepped, sorted or scrolled, and it carried a hand-written copy of the
+/// keymap that had drifted. Keys belong to `?`.
+///
+/// Known gap: a user-configured exec resource is reachable by its exact name
+/// (`:node-costs`) but is not listed, because its name comes from the
+/// DAEMON's config and the client never sees the list.
+fn seed_aliases(store: &store::RowStore) {
+    use crate::kube::resources::row::{CellValue, ResourceRow};
+    let mut rows: Vec<ResourceRow> = Vec::new();
+    let mut push = |section: &str, alias: String, target: String| {
+        rows.push(ResourceRow {
+            cells: vec![
+                CellValue::Text(section.to_string()),
+                CellValue::Text(alias.clone()),
+                CellValue::Text(target),
+            ],
+            name: format!("{}/{}", section, alias),
+            namespace: None,
+            ..Default::default()
+        });
+    };
+    for def in crate::kube::resource_defs::REGISTRY.all() {
+        push("resource", def.aliases().join(" / "), def.gvr().kind.to_string());
+    }
+    for kind in crate::kube::local::LocalResourceKind::all() {
+        // A kind with no alias is deliberately not typeable (`?` is not a
+        // noun you browse); listing it would advertise a word that does
+        // nothing.
+        let aliases = kind.aliases();
+        if aliases.is_empty() {
+            continue;
+        }
+        push("resource", aliases.join(" / "), kind.kind_str().to_string());
+    }
+    for doc in crate::kube::session_commands::COMMAND_WORDS {
+        push("command", doc.display(), doc.label.to_string());
+    }
+    store.apply(
+        CoreData::SEED_EPOCH,
+        store::StorePayload::Baseline(crate::kube::protocol::TableBaseline {
+            resource: crate::kube::local::LocalResourceKind::Alias.to_resource_id(),
+            headers: vec!["SECTION".into(), "ALIAS".into(), "TARGET".into()],
+            rows,
+        }),
+    );
 }
 
 /// Column headers for the contexts table. Same shape as any other
@@ -124,6 +181,9 @@ pub struct CoreData {
     /// watched, and deliberately NOT in `streams`: there is nothing to
     /// subscribe to. See [`crate::app::element::LiveQuery::client`].
     pub contexts: std::sync::Arc<store::RowStore>,
+    /// What you can type at the `:` prompt. Client-owned like `contexts`:
+    /// the rows are a fact about this binary's registry and command grammar.
+    pub aliases: std::sync::Arc<store::RowStore>,
     /// The always-on subscriptions feeding the stores above. Replaced
     /// wholesale on (re)connect — the old streams drop, RSTing their
     /// substreams.
@@ -147,6 +207,14 @@ impl Default for CoreData {
             nodes: store::RowStore::new("nodes"),
             crds: store::RowStore::new("customresourcedefinitions"),
             contexts: store::RowStore::client("contexts"),
+            aliases: {
+                // Static content — the registry and the command grammar are
+                // both compiled in — so it is seeded once here rather than
+                // re-derived per open. Pure computation; `new` stays I/O-free.
+                let store = store::RowStore::client("aliases");
+                seed_aliases(&store);
+                store
+            },
             streams: Vec::new(),
             parked: None,
         }
@@ -229,6 +297,9 @@ impl CoreData {
             ResourceId::Local(crate::kube::local::LocalResourceKind::Context) => {
                 Some(&self.contexts)
             }
+            ResourceId::Local(crate::kube::local::LocalResourceKind::Alias) => {
+                Some(&self.aliases)
+            }
             _ => None,
         }
     }
@@ -296,6 +367,7 @@ impl CoreData {
         caps: Option<crate::kube::protocol::ResourceCapabilities>,
         keys: crate::app::KeysConfig,
         class: crate::event::keymap::ViewClass,
+        markable: bool,
     ) -> std::sync::Arc<store::RowStore> {
         // A FRESH store per press, not one shared field.
         //
@@ -307,7 +379,7 @@ impl CoreData {
         // breadcrumb. Contextual content and shared storage cannot both be
         // true.
         let store = store::RowStore::client("keybindings");
-        let (headers, rows) = crate::ui::widgets::HelpContent::rows(caps, keys, class);
+        let (headers, rows) = crate::ui::widgets::HelpContent::rows(caps, keys, class, markable);
         store.apply(
             Self::SEED_EPOCH,
             store::StorePayload::Baseline(crate::kube::protocol::TableBaseline {
@@ -782,7 +854,7 @@ impl App {
     pub fn accept_completion(&mut self) {
         if let Some(completion) = self.best_completion() {
             if let Some((input, _)) = self.ui.command_input_mut() {
-                *input = completion;
+                input.set(completion);
             }
         }
     }
@@ -868,7 +940,10 @@ fn resource_commands() -> Vec<&'static str> {
     for kind in &crate::kube::local::LocalResourceKind::all() {
         v.extend(kind.aliases().iter().copied());
     }
-    v.extend(["alias", "aliases", "a"]);
+    // `["alias", "aliases", "a"]` used to be appended by hand here, because
+    // `:alias` was a bespoke command rather than a resource. It is a
+    // `LocalResourceKind` now, so the loop above already has it — and the
+    // hand-written copy was only ever invisible because of the `dedup`.
     v.sort();
     v.dedup();
     v
@@ -950,13 +1025,16 @@ fn complete_command(
 
     // Base command completion
     let mut all_commands: Vec<&str> = resource_commands();
-    all_commands.extend_from_slice(&[
-        "ctx", "context", "contexts",
-        "q", "quit", "exit",
-        "help", "h",
-        "home", "overview",
-        "alias", "aliases",
-    ]);
+    // The static command words, from the ONE declaration the parser is
+    // tested against. This used to be a hand-written slice beside
+    // `resource_commands()` — which already derived `ctx` and `alias` from
+    // the registry, so those three were duplicated, and `namespace` was
+    // missing entirely: `:names…` completed to nothing while `:ns` worked.
+    all_commands.extend(
+        crate::kube::session_commands::COMMAND_WORDS
+            .iter()
+            .flat_map(|doc| doc.words.iter().copied()),
+    );
 
     let mut completions: Vec<String> = all_commands.iter()
         .map(|s| String::from(*s))

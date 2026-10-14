@@ -77,6 +77,10 @@ pub struct LogFilterBar<'a> {
     active: bool,
     /// Text being typed. Empty unless `active`.
     draft: &'a str,
+    /// Caret position within `draft`, in COLUMNS. The block is drawn THERE,
+    /// not appended, so editing mid-pattern shows where the next character
+    /// lands — which is the whole point of the input having a caret.
+    caret_col: usize,
     /// Committed greps, oldest first.
     committed: &'a [String],
     /// Lines visible through the whole chain, draft included.
@@ -90,11 +94,12 @@ impl<'a> LogFilterBar<'a> {
     pub fn new(
         active: bool,
         draft: &'a str,
+        caret_col: usize,
         committed: &'a [String],
         visible_count: usize,
         theme: &'a Theme,
     ) -> Self {
-        Self { active, draft, committed, visible_count, fallback: None, theme }
+        Self { active, draft, caret_col, committed, visible_count, fallback: None, theme }
     }
 
     pub fn fallback(mut self, why: Option<&'a str>) -> Self {
@@ -132,8 +137,21 @@ impl Widget for LogFilterBar<'_> {
             if !self.committed.is_empty() {
                 spans.push(Span::styled(" | ", self.theme.status_bar));
             }
-            spans.push(Span::styled(self.draft.to_string(), self.theme.filter));
+            // Split at the caret and draw the block between the halves. The
+            // split is by COLUMNS, walked as graphemes, so it lands on a
+            // character boundary whatever the pattern contains.
+            let mut col = 0usize;
+            let mut at = self.draft.len();
+            for (i, g) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(self.draft, true) {
+                if col >= self.caret_col {
+                    at = i;
+                    break;
+                }
+                col += unicode_width::UnicodeWidthStr::width(g);
+            }
+            spans.push(Span::styled(self.draft[..at].to_string(), self.theme.filter));
             spans.push(Span::styled("\u{2588}", self.theme.filter));
+            spans.push(Span::styled(self.draft[at..].to_string(), self.theme.filter));
         }
         // A visible-line count is meaningless while the pattern isn't the one
         // you wrote, so the reason takes its place rather than sitting beside

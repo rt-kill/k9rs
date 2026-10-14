@@ -116,28 +116,3 @@ fn logline_wire_layout_golden() {
         "000002000000000000006869",
     );
 }
-
-#[test]
-fn logline_flat_text() {
-    // Export carries the line's SUBSTANCE, not a transcript of the drawn
-    // cells: both pieces of provenance ride along whatever `t` and `p` are
-    // set to. All FOUR shapes are pinned, because the one the daemon
-    // actually produces — timestamped — is the one the old test left out,
-    // and it was the one being silently dropped.
-    assert_eq!(LogLine::untagged("hi").flat_text().as_ref(), "hi");
-    assert_eq!(
-        LogLine { timestamp: None, source: Some("web".into()), content: "msg".into() }.flat_text().as_ref(),
-        "[web] msg",
-    );
-    let ts = "2026-09-18T20:29:40.6Z";
-    assert_eq!(
-        LogLine { timestamp: Some(ts.into()), source: None, content: "msg".into() }.flat_text().as_ref(),
-        format!("{ts} msg"),
-    );
-    assert_eq!(
-        LogLine { timestamp: Some(ts.into()), source: Some("web".into()), content: "msg".into() }
-            .flat_text()
-            .as_ref(),
-        format!("{ts} [web] msg"),
-    );
-}

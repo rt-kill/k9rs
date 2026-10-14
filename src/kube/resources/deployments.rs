@@ -47,6 +47,14 @@ impl ConvertToRow<Deployment> for DeploymentDef {
         let status = dep.status.unwrap_or_default();
         let up_to_date = status.updated_replicas.unwrap_or(0);
         let available = status.available_replicas.unwrap_or(0);
+        // READY is `readyReplicas`, which is what `kubectl get deploy` shows
+        // and what the column means. It used to read `availableReplicas` —
+        // a pod is Ready when its probe passes and Available only after
+        // `minReadySeconds` on top, so the two agree at the default of 0 and
+        // diverge exactly when a rollout is in the window where you are
+        // watching this column. It also made READY and AVAILABLE the same
+        // number by construction, so one of the two columns said nothing.
+        let ready = status.ready_replicas.unwrap_or(0);
 
         // Drill-down: deployment -> pods by selector labels.
         let drill_target = if !selector_labels.is_empty() {
@@ -58,14 +66,19 @@ impl ConvertToRow<Deployment> for DeploymentDef {
             Some(DrillTarget::PodsByNameGrep(meta.name.clone()))
         };
 
+        // Health follows the column the user is READING. Driving it from
+        // `available` while READY shows `ready` would paint a row red next
+        // to a `3/3` — the colour and the number beside it have to agree
+        // about what they mean. The rollout-window detail that `available`
+        // carries is still its own column.
         let health = if desired == 0 { RowHealth::Pending }
-            else if available < desired { RowHealth::Failed }
+            else if ready < desired { RowHealth::Failed }
             else { RowHealth::Normal };
 
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.namespace.clone()),
             CellValue::Text(meta.name.clone()),
-            CellValue::Ratio { num: available as u32, denom: desired as u32 },
+            CellValue::Ratio { num: ready as u32, denom: desired as u32 },
             CellValue::Count(up_to_date as i64),
             CellValue::Count(available as i64),
             CellValue::from_comma_str(&containers.names),
@@ -84,3 +97,7 @@ impl ConvertToRow<Deployment> for DeploymentDef {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/kube/resources/deployments.rs"]
+mod tests;

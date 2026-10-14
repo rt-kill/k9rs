@@ -106,7 +106,7 @@ pub(crate) async fn open_exec_overlay(
 
     app.ui.close_modal();
     app.ui.close_modal();
-    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Shell(Box::new(crate::app::ShellState {
+    app.ui.open(crate::app::Modal::Takeover(crate::app::TakeoverOp::Shell(Box::new(crate::app::ShellState {
         title,
         stream: Some(stream),
         connect_state: crate::app::ShellConnectState::Connecting,
@@ -495,8 +495,8 @@ async fn run_editor_flow(
     replay: &mut std::collections::VecDeque<CtEvent>,
 ) -> bool {
     let is_editor_ready = matches!(
-        app.ui.overlay(),
-        Some(crate::app::Overlay::Edit {
+        app.ui.takeover(),
+        Some(crate::app::TakeoverOp::Edit {
             state: crate::app::EditState::EditorReady { .. }, ..
         })
     );
@@ -505,8 +505,8 @@ async fn run_editor_flow(
     }
 
     // Take the overlay out so we own TempFile (move, not borrow).
-    let (target, temp_file, original) = match app.ui.take_modal().into_overlay() {
-        Some(crate::app::Overlay::Edit {
+    let (target, temp_file, original) = match app.ui.take_modal().into_takeover() {
+        Some(crate::app::TakeoverOp::Edit {
             target,
             state: crate::app::EditState::EditorReady { temp_file, original },
         }) => (target, temp_file, original),
@@ -593,7 +593,7 @@ async fn run_editor_flow(
 
     // Send Apply. Move TempFile to the Applying state.
     let target_clone = target.clone();
-    app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Edit {
+    app.ui.open(crate::app::Modal::Takeover(crate::app::TakeoverOp::Edit {
         target,
         state: crate::app::EditState::Applying {
             temp_file,
@@ -634,8 +634,8 @@ async fn run_shell_bridge(
     use tokio::io::AsyncWriteExt;
 
     // Extract the exec stream and pending output from the Shell overlay.
-    let (mut stream, pending) = match app.ui.overlay_mut() {
-        Some(crate::app::Overlay::Shell(ref mut shell)) => {
+    let (mut stream, pending) = match app.ui.takeover_mut() {
+        Some(crate::app::TakeoverOp::Shell(ref mut shell)) => {
             let s = shell.stream.take();
             let p = std::mem::take(&mut shell.pending_output);
             (s, p)
@@ -1011,6 +1011,7 @@ fn handle_log_filter_key(app: &mut App, key: crate::app::TextKey) -> bool {
                 .top_mut()
                 .log_view_mut()
                 .and_then(|v| v.draft.take())
+                .map(|mut d| d.take())
                 .filter(|t| !t.is_empty());
             if let Some(text) = draft {
                 if let Ok(el) = crate::app::element::Element::derive_log_filter(
@@ -1021,17 +1022,22 @@ fn handle_log_filter_key(app: &mut App, key: crate::app::TextKey) -> bool {
                 }
             }
         }
-        KeyCode::Backspace => {
+        // Editing goes through the ONE text input, so the caret works here
+        // exactly as it does in the command prompt and the table filter.
+        code => {
             if let Some(Some(d)) = app.nav.top_mut().log_view_mut().map(|v| v.draft.as_mut()) {
-                d.pop();
+                match code {
+                    KeyCode::Backspace => d.backspace(),
+                    KeyCode::Delete => d.delete(),
+                    KeyCode::Left => d.left(),
+                    KeyCode::Right => d.right(),
+                    KeyCode::Home => d.home(),
+                    KeyCode::End => d.end(),
+                    KeyCode::Char(c) => d.insert(c),
+                    _ => {}
+                }
             }
         }
-        KeyCode::Char(c) => {
-            if let Some(Some(d)) = app.nav.top_mut().log_view_mut().map(|v| v.draft.as_mut()) {
-                d.push(c);
-            }
-        }
-        _ => {}
     }
     true
 }
@@ -1259,7 +1265,7 @@ pub async fn session_main(
                 el => el.log_view().is_some_and(|v| v.is_filtering()),
             };
             let in_input_mode = app.ui.command_input().is_some()
-                || app.ui.form_dialog().as_ref().is_some_and(|d| {
+                || app.nav.top().form_dialog().is_some_and(|d| {
                     d.fields.get(d.focused).is_some_and(|field| field.is_text_input())
                 })
                 || app.nav.top().filter_input().active()
@@ -1301,7 +1307,7 @@ pub async fn session_main(
         // Shell bridge: when the daemon confirms the shell is connected,
         // suspend the TUI and enter a raw byte bridge. stdin→daemon,
         // daemon→stdout, no parsing. Restores TUI on exit.
-        if let Some(crate::app::Overlay::Shell(ref shell)) = app.ui.overlay() {
+        if let Some(crate::app::TakeoverOp::Shell(ref shell)) = app.ui.takeover() {
             if shell.connect_state == crate::app::ShellConnectState::Connected {
                 run_shell_bridge(
                     &mut app, &mut terminal, &mut event_rx,

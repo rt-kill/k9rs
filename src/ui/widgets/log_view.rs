@@ -8,7 +8,8 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::kube::protocol::{LogLine, Role};
+use crate::app::store::StoredLine;
+use crate::kube::protocol::Role;
 use crate::ui::theme::Theme;
 
 /// Display width of one grapheme cluster, measured the way ratatui measures
@@ -78,9 +79,11 @@ struct Units<'a> {
 
 impl<'a> Units<'a> {
     fn new(text: &'a str) -> Self {
-        // Pure ASCII with nothing to strip is handed straight back: the
-        // common case allocates nothing and segments nothing.
-        let plain = text.is_ascii() && !text.bytes().any(|b| b < 0x20 || b == 0x7f);
+        // Printable ASCII is handed straight back: nothing to strip, and no
+        // two such bytes can form one cluster, so the common case allocates
+        // nothing and segments nothing. ONE predicate, because "ASCII" and
+        // "no controls" were two scans asking one question.
+        let plain = text.bytes().all(|b| (0x20..0x7f).contains(&b));
         if plain {
             return Self { src: std::borrow::Cow::Borrowed(text), at: 0, plain };
         }
@@ -174,7 +177,7 @@ fn wrap_feed(text: &str, w: usize, col: &mut usize, rows: &mut usize) {
 /// source prefix + optional timestamp + body — INCLUDING which of those the
 /// toggles are currently showing, since a hidden prefix is a shorter line and
 /// a wrong height here is a scrollbar that lies.
-fn line_phys_rows(line: &LogLine, shed: usize, w: usize) -> usize {
+fn line_phys_rows(line: &StoredLine, shed: usize, w: usize) -> usize {
     if w == 0 {
         return 1;
     }
@@ -183,7 +186,7 @@ fn line_phys_rows(line: &LogLine, shed: usize, w: usize) -> usize {
     // ONE walk over the visible roles, in order. The measurer and the
     // renderer below consume the SAME projection, so neither can disagree
     // with the other about which parts are on screen.
-    for (role, text, sep) in crate::kube::protocol::segments(line) {
+    for (role, text, sep) in line.segments() {
         if !role.shown(shed) {
             continue;
         }
@@ -377,7 +380,7 @@ pub struct LogViewState {
 }
 
 // `LogViewState` is pure data — the authoritative state lives in the nav
-// element ([`crate::app::element::LogViewState`], reached via
+// element ([`crate::app::element::LogInteraction`], reached via
 // `Element::log_view`). The view function snapshots into this struct by
 // literal each draw, so impl methods on this type would never be called.
 
@@ -392,12 +395,12 @@ pub struct LogViewer<'a> {
     /// optional `source` — daemon-tagged whenever the stream has more than
     /// one source (`--all-containers`, or a multi-pod fan-out). The renderer
     /// colors it as a prefix directly, with no per-line string parsing.
-    lines: &'a [&'a LogLine],
+    lines: &'a [&'a StoredLine],
     theme: &'a Theme,
 }
 
 impl<'a> LogViewer<'a> {
-    pub fn new(lines: &'a [&'a LogLine], theme: &'a Theme) -> Self {
+    pub fn new(lines: &'a [&'a StoredLine], theme: &'a Theme) -> Self {
         Self { lines, theme }
     }
 
@@ -444,7 +447,7 @@ impl StatefulWidget for LogViewer<'_> {
             .collect();
 
         let sources: &[String] = &state.sources;
-        let prepare_line = |line: &LogLine, theme: &Theme, shed: usize,
+        let prepare_line = |line: &StoredLine, theme: &Theme, shed: usize,
                             compiled: &[crate::util::SearchPattern]| -> Line<'static> {
             let mut spans: Vec<Span<'static>> = Vec::new();
 
@@ -484,18 +487,21 @@ impl StatefulWidget for LogViewer<'_> {
             //    ranges on stripped text and apply highlight to matching spans.
             let ansi_spans = crate::util::parse_ansi_line(body, theme.log_text);
             if !compiled.is_empty() {
-                // Match on the ACTUAL rendered text — the concatenated span
-                // content — so the offsets align with the spans indexed below.
-                // `strip_ansi` would be a THIRD, differently-tokenized view of
-                // the line (different control-char/OSC/CSI rules than
-                // `parse_ansi_line`) whose offsets don't map onto these spans,
-                // causing mis-highlights and a mid-char / reversed-range slice
-                // panic under multibyte content.
-                let visible: String = ansi_spans.iter().map(|s| s.content.as_ref()).collect();
+                // Match in the ONE visible-text space, which is where the
+                // filter decided this line was a hit — and which equals the
+                // concatenated span content by construction
+                // (`visible_text_matches_the_spans`), so these offsets index
+                // the spans below. It used to BE that concatenation, built
+                // per line per frame; the shared definition is the same
+                // bytes and borrows when the line has no escapes at all.
+                // Indexing spans with offsets from a differently-tokenized
+                // view has already produced mis-highlights and a mid-char
+                // slice panic here, which is why there is only one view.
+                let visible = line.visible();
                 let match_ranges = {
                     let mut ranges = Vec::new();
                     for pat in compiled {
-                        ranges.extend(pat.find_all(&visible));
+                        ranges.extend(pat.find_all(visible));
                     }
                     ranges.sort_unstable();
                     // Snap every boundary OUT to a grapheme-cluster edge.

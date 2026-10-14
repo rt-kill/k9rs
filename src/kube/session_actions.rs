@@ -42,7 +42,7 @@ pub(crate) fn handle_action(
             // ONE undo path: close the overlay if any, else pop the top
             // element (reviving its data if the subscription died while
             // covered). At the root: no-op.
-            if app.ui.overlay().is_some() {
+            if app.ui.takeover().is_some() {
                 app.ui.close_modal();
             } else if app.nav.pop().is_some() {
                 app.nav.ensure_top_live(data_source);
@@ -58,7 +58,9 @@ pub(crate) fn handle_action(
             } else {
                 let class = crate::event::keymap::ViewClass::of(app.nav.top());
                 let caps = Some(app.current_capabilities());
-                let store = app.core.seed_keybindings(caps, app.config.keys, class);
+                let markable = app.nav.top().markable();
+                let store =
+                    app.core.seed_keybindings(caps, app.config.keys, class, markable);
                 let rid = crate::kube::local::LocalResourceKind::Keybinding.to_resource_id();
                 app.nav.push(crate::app::element::Element::ResourceList(
                     crate::app::element::ResourceList::client(
@@ -139,10 +141,15 @@ pub(crate) fn handle_action(
 
         // --- Confirmation dialog ---
         Action::Confirm => return handle_confirm_action(app, data_source),
-        Action::Cancel => { app.ui.close_modal(); }
+        // Cancel is the ordinary pop now — the dialog is on the stack.
+        Action::Cancel => {
+            if matches!(app.nav.top(), crate::app::element::Element::Confirm(_)) {
+                app.nav.pop();
+            }
+        }
         Action::ToggleDialogButton => {
-            if let Some(dialog) = app.ui.confirm_dialog_mut() {
-                dialog.action_focused = !dialog.action_focused;
+            if let crate::app::element::Element::Confirm(d) = app.nav.top_mut() {
+                d.action_focused = !d.action_focused;
             }
         }
 
@@ -175,7 +182,7 @@ pub(crate) fn handle_action(
         Action::SwitchNamespace(ns) => do_switch_namespace(app, data_source, ns),
         Action::SwitchContext(ctx) => begin_context_switch(app, &ctx),
         Action::CommandMode => {
-            app.ui.open(crate::app::Modal::Command { input: String::new(), history_index: None });
+            app.ui.open(crate::app::Modal::Command { input: crate::app::text_input::TextInput::new(), history_index: None });
         }
         Action::Sort(target) => app.sort_by(target),
         Action::ToggleSortDirection => app.toggle_sort_direction(),
@@ -238,7 +245,7 @@ pub(crate) fn handle_action(
             let headers = app.nav.top().headers_snapshot();
             if let Some(info) = get_selected_resource_info(app) {
                 if let Some(dialog) = build_form_from_schema(schema, crate::kube::protocol::OperationKind::PortForward, info, row.as_ref(), &headers) {
-                    app.ui.open(crate::app::Modal::Form(dialog));
+                    app.nav.push(crate::app::element::Element::Form(Box::new(dialog)));
                 } else {
                     app.ui.flash = Some(crate::app::FlashMessage::error(
                         "No target found for port-forward".to_string()
@@ -251,7 +258,7 @@ pub(crate) fn handle_action(
             }
         }
         Action::Refresh => handle_refresh(app, data_source),
-        Action::ShowAliases => handle_show_aliases(app),
+        Action::ShowAliases => handle_show_aliases(app, data_source),
         Action::FlashInfo(msg) => {
             app.ui.flash = Some(crate::app::FlashMessage::info(msg));
         }
@@ -266,13 +273,13 @@ pub(crate) fn handle_action(
 fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
     use crate::app::actions::Action;
     use crate::app::element::Element;
-    use crate::app::Overlay;
 
     // Overlays capture scroll keys first (help sheet, container picker).
     // The one overlay that still takes scroll keys. `if let` rather than a
     // `match` with a `_ => {}`: after help became a nav element there is only
     // one arm left, and a wildcard would hide the next one that needs adding.
-    if let Some(Overlay::ContainerSelect { choices, selected, .. }) = app.ui.overlay_mut() {
+    if let Element::Picker(p) = app.nav.top_mut() {
+        let (choices, selected) = (&p.choices, &mut p.selected);
         match action {
             Action::NextItem => {
                 if !choices.is_empty() && *selected + 1 < choices.len() {
@@ -311,6 +318,9 @@ fn handle_scroll(app: &mut App, action: crate::app::actions::Action) {
                 _ => {}
             }
         }
+        // A confirm box has nothing to scroll; the picker moves its own
+        // cursor in the arm above, before this dispatch.
+        Element::Confirm(_) | Element::Picker(_) | Element::Form(_) => {}
         // Content views: pure intent — the render publishes the (non-wrapping)
         // extent back into the viewport, so no geometry is guessed here.
         Element::ContentView(cv) => match action {
@@ -409,14 +419,13 @@ fn handle_resource_op(
                     );
                     if containers.len() > 1 {
                         app.ui.close_modal();
-                        app.ui.close_modal();
                         let action = crate::app::ContainerAction::Shell;
-                        app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::ContainerSelect {
+                        app.nav.push(crate::app::element::Element::Picker(Box::new(crate::app::ContainerPicker {
                             target,
                             choices: crate::app::ContainerChoice::list(action, containers),
                             selected: 0,
                             action,
-                        }));
+                        })));
                     } else {
                         let container = containers.first().map(|c| c.name.clone()).unwrap_or_default();
                         return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget::Pod {
@@ -434,16 +443,16 @@ fn handle_resource_op(
         // semantics (or, stale-frame-wise, single semantics).
         Action::Delete => {
             if let Some(info) = require_selected(app) {
-                app.ui.open(crate::app::Modal::Confirm(crate::app::ConfirmDialog {
+                app.nav.push(crate::app::element::Element::Confirm(Box::new(crate::app::ConfirmDialog {
                     message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Delete".to_string(),
                     pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::Delete, target: info },
                     action_focused: false,
-                }));
+                })));
             }
         }
         Action::Edit => {
-            if matches!(app.ui.overlay(), Some(crate::app::Overlay::Edit { .. })) {
+            if matches!(app.ui.takeover(), Some(crate::app::TakeoverOp::Edit { .. })) {
                 app.ui.flash = Some(crate::app::FlashMessage::warn("Edit already in progress".to_string()));
                 return ActionResult::None;
             }
@@ -451,7 +460,7 @@ fn handle_resource_op(
                 ds_try!(app, data_source.yaml(&info));
                 app.ui.close_modal();
                 app.ui.close_modal();
-                app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::Edit {
+                app.ui.open(crate::app::Modal::Takeover(crate::app::TakeoverOp::Edit {
                     target: info,
                     state: crate::app::EditState::AwaitingYaml,
                 }));
@@ -463,28 +472,28 @@ fn handle_resource_op(
                 let row = app.nav.top().selected_row();
                 let headers = app.nav.top().headers_snapshot();
                 if let Some(dialog) = build_form_from_schema(schema, crate::kube::protocol::OperationKind::Scale, info, row.as_ref(), &headers) {
-                    app.ui.open(crate::app::Modal::Form(dialog));
+                    app.nav.push(crate::app::element::Element::Form(Box::new(dialog)));
                 }
             }
         }
         Action::Restart => {
             if let Some(info) = require_selected(app) {
-                app.ui.open(crate::app::Modal::Confirm(crate::app::ConfirmDialog {
+                app.nav.push(crate::app::element::Element::Confirm(Box::new(crate::app::ConfirmDialog {
                     message: format!("Restart {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Restart".to_string(),
                     pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::Restart, target: info },
                     action_focused: false,
-                }));
+                })));
             }
         }
         Action::ForceKill => {
             if let Some(info) = require_selected(app) {
-                app.ui.open(crate::app::Modal::Confirm(crate::app::ConfirmDialog {
+                app.nav.push(crate::app::element::Element::Confirm(Box::new(crate::app::ConfirmDialog {
                     message: format!("Force-kill {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Force Kill".to_string(),
                     pending: crate::app::PendingAction::Single { op: crate::app::SingleOp::ForceKill, target: info },
                     action_focused: false,
-                }));
+                })));
             }
         }
         Action::DecodeSecret => {
@@ -572,12 +581,12 @@ pub(crate) fn handle_batch_op(app: &mut App, action: crate::app::actions::Action
         _ => return,
     };
 
-    app.ui.open(crate::app::Modal::Confirm(crate::app::ConfirmDialog {
+    app.nav.push(crate::app::element::Element::Confirm(Box::new(crate::app::ConfirmDialog {
         message: batch_confirm_message(verb, &targets),
         action_label: label.to_string(),
         pending,
         action_focused: false,
-    }));
+    })));
 }
 
 /// The batch confirm text names its targets — marks live on the shared
@@ -817,7 +826,17 @@ fn handle_confirm_action(
     app: &mut App,
     data_source: &mut ClientSession,
 ) -> ActionResult {
-    if let Some(dialog) = app.ui.take_modal().into_confirm() {
+    // Pop FIRST, then act: the dialog is the element being answered, and
+    // taking it off the stack is what "answered" means. It also means the
+    // operation dispatches against the view the question was asked from.
+    let dialog = match app.nav.top() {
+        crate::app::element::Element::Confirm(_) => match app.nav.pop() {
+            Some(crate::app::element::Element::Confirm(d)) => Some(*d),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(dialog) = dialog {
         app.kube.kubectl_cache.clear();
         match dialog.pending {
             crate::app::PendingAction::Single { op: crate::app::SingleOp::Delete, ref target } => {
@@ -868,7 +887,7 @@ fn handle_filter_search(
     match action {
         Action::Filter(_) => {
             if let Some(view) = app.nav.top_mut().log_view_mut() {
-                view.draft = Some(String::new());
+                view.draft = Some(crate::app::text_input::TextInput::new());
             } else if let Some(fi) = app.nav.top_mut().filter_input_mut() {
                 fi.start();
             }
@@ -897,7 +916,7 @@ fn handle_filter_search(
                     return;
                 }
             }
-            if app.ui.overlay().is_some() {
+            if app.ui.takeover().is_some() {
                 app.ui.close_modal();
             } else if app.nav.pop().is_some() {
                 // Pop = drop: the popped element's stream RSTs, its
@@ -934,7 +953,7 @@ fn handle_filter_search(
                 }
                 el => {
                     if let Some(view) = el.log_view_mut() {
-                        view.draft = Some(String::new());
+                        view.draft = Some(crate::app::text_input::TextInput::new());
                     }
                 }
             }
@@ -1065,7 +1084,7 @@ fn handle_log_action(
             );
             let content: String = s.store().with_read(|i| {
                 i.lines.iter()
-                    .map(|l| crate::util::strip_ansi(&l.flat_text()))
+                    .map(|l| l.flat_text())
                     .collect::<Vec<_>>()
                     .join("\n")
             });
@@ -1082,7 +1101,7 @@ fn save_visible_logs(app: &mut App) {
     let content: String = store.with_read(|i| {
         indices.iter()
             .filter_map(|&idx| i.lines.get(idx))
-            .map(|l| crate::util::strip_ansi(&l.flat_text()))
+            .map(|l| l.flat_text())
             .collect::<Vec<_>>()
             .join("\n")
     });
@@ -1330,7 +1349,7 @@ fn handle_io(
                             let joined: String = store.with_read(|i| {
                                 indices.iter()
                                     .filter_map(|&idx| i.lines.get(idx))
-                                    .map(|l| crate::util::strip_ansi(&l.flat_text()))
+                                    .map(|l| l.flat_text())
                                     .collect::<Vec<_>>()
                                     .join("\n")
                             });
@@ -1421,7 +1440,6 @@ fn handle_refresh(app: &mut App, data_source: &mut ClientSession) {
             ContentSpec::Describe(target) => Some(data_source.describe(target)),
             ContentSpec::Yaml(target) => Some(data_source.yaml(target)),
             ContentSpec::DecodedSecret(target) => Some(data_source.decode_secret(target)),
-            ContentSpec::Aliases => None,
         };
         if let Some(result) = result {
             app.kube.kubectl_cache.clear();
@@ -1454,35 +1472,19 @@ fn handle_refresh(app: &mut App, data_source: &mut ClientSession) {
     app.ui.flash = Some(crate::app::FlashMessage::info("Refreshed"));
 }
 
-fn handle_show_aliases(app: &mut App) {
-    let mut content = String::from("Resource Aliases\n================\n\n");
-    content.push_str(&format!("  {:<45} {}\n", "ALIAS", "RESOURCE"));
-    content.push_str(&format!("  {:<45} {}\n", "-----", "--------"));
-    for def in crate::kube::resource_defs::REGISTRY.all() {
-        let aliases = def.aliases().join("/");
-        content.push_str(&format!("  {:<45} {}\n", aliases, def.gvr().kind));
-    }
-    content.push_str("\n\nSpecial Commands\n================\n\n");
-    content.push_str("  :q / :quit / :exit         Quit\n");
-    content.push_str("  :help / :h / :?            Show help\n");
-    content.push_str("  :ctx / :context            Context selector\n");
-    content.push_str("  :ctx <name>                Switch context\n");
-    content.push_str("  :ns <name>                 Switch namespace\n");
-    content.push_str("  :alias / :aliases / :a     This view\n");
-    content.push_str("\n\nKey Bindings\n============\n\n");
-    content.push_str("  Ctrl-a                     Aliases view\n");
-    content.push_str("  Ctrl-c                     Quit\n");
-    content.push_str("  Ctrl-r                     Refresh\n");
-    content.push_str("  Ctrl-e                     Toggle header\n");
-    content.push_str("  Ctrl-s                     Save table to file\n");
-    let mut state = crate::app::ContentViewState::default();
-    state.set_content(content);
-    app.nav.push(crate::app::element::Element::ContentView(
-        crate::app::element::ContentView::new(
-            crate::app::element::ContentSpec::Aliases,
-            state,
-            crate::app::element::ContentPhase::Ready,
-        ),
+fn handle_show_aliases(app: &mut App, data_source: &crate::kube::client_session::ClientSession) {
+    // The same ROOT element `:alias` resolves to, through the same
+    // client-owned routing — `Ctrl-a` is a shortcut for the command, not a
+    // second way of building the view. Resets rather than pushes, for the
+    // reason every root-level resource command does: this is a reference
+    // view you go TO, not a sheet you consult about where you are.
+    let rid = crate::kube::local::LocalResourceKind::Alias.to_resource_id();
+    app.nav.reset(crate::app::App::root_list_element(
+        data_source,
+        &app.kube.metrics,
+        &app.core,
+        rid,
+        protocol::Namespace::All,
     ));
 }
 
@@ -1512,15 +1514,15 @@ pub(crate) fn handle_enter(
         return ActionResult::None;
     }
 
-    // Handle ContainerSelect overlay: open logs or shell for the pick.
-    // Copy what we need OUT of the overlay before touching `app.ui` again —
-    // the borrow would otherwise still be live across the flash and the close.
-    let pick = match app.ui.overlay() {
-        Some(crate::app::Overlay::ContainerSelect { target, choices, selected, action }) => Some((
-            target.clone(),
-            choices.get(*selected).cloned(),
-            *selected,
-            *action,
+    // A pick: open logs or a shell for the chosen container. Copied OUT of
+    // the element before the stack is touched again, so no borrow is live
+    // across the pop and the flash.
+    let pick = match app.nav.top() {
+        Element::Picker(p) => Some((
+            p.target.clone(),
+            p.choices.get(p.selected).cloned(),
+            p.selected,
+            p.action,
         )),
         _ => None,
     };
@@ -1774,13 +1776,12 @@ fn open_logs(
             crate::app::ContainerAction::Logs
         };
         app.ui.close_modal();
-        app.ui.close_modal();
-        app.ui.open(crate::app::Modal::Overlay(crate::app::Overlay::ContainerSelect {
+        app.nav.push(crate::app::element::Element::Picker(Box::new(crate::app::ContainerPicker {
             target: info.clone(),
             choices: crate::app::ContainerChoice::list(action, &containers),
             selected: 0,
             action,
-        }));
+        })));
         return;
     }
 
@@ -2016,7 +2017,7 @@ pub(crate) fn build_form_from_schema(
                     name: field_schema.name.into(),
                     label: field_schema.label.into(),
                     kind: FormFieldKind::Number { min: *min, max: *max },
-                    value: default_value,
+                    value: crate::app::text_input::TextInput::seeded(default_value),
                 }
             }
             FormFieldSchemaKind::Port => {
@@ -2027,7 +2028,7 @@ pub(crate) fn build_form_from_schema(
                     name: field_schema.name.into(),
                     label: field_schema.label.into(),
                     kind: FormFieldKind::Port,
-                    value: default_port.to_string(),
+                    value: crate::app::text_input::TextInput::seeded(default_port.to_string()),
                 }
             }
             FormFieldSchemaKind::DynamicSelect { fallback } => {
@@ -2040,7 +2041,7 @@ pub(crate) fn build_form_from_schema(
                         name: field_schema.name.into(),
                         label: field_schema.label.into(),
                         kind: FormFieldKind::Port,
-                        value: default_port.to_string(),
+                        value: crate::app::text_input::TextInput::seeded(default_port.to_string()),
                     }
                 } else {
                     let options: Vec<crate::app::SelectOption> = ports
@@ -2051,7 +2052,7 @@ pub(crate) fn build_form_from_schema(
                         name: field_schema.name.into(),
                         label: field_schema.label.into(),
                         kind: FormFieldKind::Select { options, selected: 0 },
-                        value: String::new(),
+                        value: crate::app::text_input::TextInput::new(),
                     }
                 }
             }

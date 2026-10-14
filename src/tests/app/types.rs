@@ -145,7 +145,7 @@ mod no_context {
 // ---------------------------------------------------------------------------
 
 mod modal {
-    use crate::app::{App, Modal, Overlay};
+    use crate::app::{App, Modal, TakeoverOp};
 
     #[test]
     fn opening_a_modal_displaces_whatever_was_open() {
@@ -153,23 +153,18 @@ mod modal {
         // any path that forgot one left a modal buried under another,
         // invisible until the top one closed. Now it is an assignment.
         let mut app = App::new_for_test();
-        app.ui.open(Modal::Command { input: ":pods".into(), history_index: None });
+        app.ui.open(Modal::Command { input: crate::app::text_input::TextInput::seeded(":pods"), history_index: None });
         assert!(app.ui.command_input().is_some());
 
-        app.ui.open(Modal::Overlay(Overlay::ContainerSelect {
+        app.ui.open(Modal::Takeover(TakeoverOp::Edit {
             target: crate::kube::protocol::ObjectRef::new(
                 crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
                 "p".to_string(),
                 crate::kube::protocol::Namespace::Named("default".to_string()),
             ),
-            choices: vec![crate::app::ContainerChoice {
-                label: "web".into(),
-                container: crate::kube::protocol::LogContainer::Named("web".into()),
-            }],
-            selected: 0,
-            action: crate::app::ContainerAction::Logs,
+            state: crate::app::EditState::AwaitingYaml,
         }));
-        assert!(app.ui.overlay().is_some());
+        assert!(app.ui.takeover().is_some());
         assert!(
             app.ui.command_input().is_none(),
             "the command prompt cannot still be open behind the overlay",
@@ -177,7 +172,7 @@ mod modal {
 
         app.ui.close_modal();
         assert!(!app.ui.is_modal());
-        assert!(app.ui.overlay().is_none());
+        assert!(app.ui.takeover().is_none());
     }
 
     #[test]
@@ -187,27 +182,20 @@ mod modal {
         // could not state, let alone hold.
         let mut app = App::new_for_test();
         let opens: Vec<(&str, Modal)> = vec![
-            ("command", Modal::Command { input: String::new(), history_index: None }),
-            ("overlay", Modal::Overlay(Overlay::ContainerSelect {
-                target: crate::kube::protocol::ObjectRef::new(
-                    crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
-                    "p".to_string(),
-                    crate::kube::protocol::Namespace::Named("default".to_string()),
-                ),
-                choices: vec![crate::app::ContainerChoice {
-                    label: "web".into(),
-                    container: crate::kube::protocol::LogContainer::Named("web".into()),
-                }],
-                selected: 0,
-                action: crate::app::ContainerAction::Logs,
-            })),
+            ("command", Modal::Command { input: crate::app::text_input::TextInput::new(), history_index: None }),
+            ("overlay", Modal::Takeover(TakeoverOp::Edit {
+            target: crate::kube::protocol::ObjectRef::new(
+                crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                "p".to_string(),
+                crate::kube::protocol::Namespace::Named("default".to_string()),
+            ),
+            state: crate::app::EditState::AwaitingYaml,
+        })),
         ];
         for (label, modal) in opens {
             app.ui.open(modal);
             let answers = [
-                app.ui.overlay().is_some(),
-                app.ui.confirm_dialog().is_some(),
-                app.ui.form_dialog().is_some(),
+                app.ui.takeover().is_some(),
                 app.ui.command_input().is_some(),
             ];
             assert_eq!(

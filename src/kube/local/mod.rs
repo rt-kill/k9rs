@@ -64,6 +64,19 @@
 //! 4. Add a field on [`context_locals::ContextLocals`] (strong for
 //!    side-effect resources, `Weak` for derived views) and a match arm in
 //!    `ContextLocals::get` for the new kind.
+//! 5. Answer [`LocalResourceSource::describe`] and
+//!    [`LocalResourceSource::yaml`] if the rows have detail worth a `d`/`y`.
+//!    Both return `Option`, and `None` is a real answer — the dispatcher
+//!    turns it into "describe is not supported on <plural>", so there is
+//!    nothing to register and nothing a new kind can forget.
+//!
+//! Nothing else needs touching: capabilities come from the typed
+//! [`LocalResourceKind`] (not the trait), the alias lookup reads the same
+//! enum, and describe/yaml dispatch through the trait rather than a per-kind
+//! match. The one kind that does NOT follow this recipe is
+//! [`LocalResourceKind::Context`], and it says why on the variant: its rows
+//! are a fact about the CLIENT's kubeconfig, so it has no daemon-side source
+//! at all.
 
 pub mod context_locals;
 pub mod exec_source;

@@ -193,7 +193,7 @@ pub enum Action {
     UsedBy,
     /// Show the events ABOUT the selected row — "why is this Pending".
     ShowEvents,
-    /// Overlay-defined capability. Carries only the capability name; the
+    /// TakeoverOp-defined capability. Carries only the capability name; the
     /// handler resolves implementation details from the overlay config.
     /// Currently only Drill (read-only navigation) is supported. If
     /// mutating capability types are added, update `is_mutating()`.

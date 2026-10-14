@@ -142,6 +142,17 @@ pub struct ResourceTable<'a> {
     warning: Option<&'a str>,
 }
 
+/// The three per-ROW facts `render_row` needs, as against the per-table
+/// `ColumnLayout` beside it. One parameter, because three positional ones
+/// read as a tuple of unrelated flags.
+#[derive(Clone, Copy)]
+struct RowPaint {
+    base_style: Style,
+    is_row_selected: bool,
+    /// The display column this row may leave blank — see
+    /// [`ResourceTable::repeated_cell`].
+    repeated: Option<usize>,
+}
 impl<'a> ResourceTable<'a> {
     pub fn new(
         headers: Vec<&'a str>,
@@ -315,22 +326,50 @@ impl<'a> ResourceTable<'a> {
     }
 
     /// Render a row of cells (header or data) using the shared layout.
+    /// The display column whose value this row REPEATS from the row above,
+    /// and may therefore leave blank.
+    ///
+    /// Only ever the sorted column, because that is the only one whose equal
+    /// values are guaranteed contiguous — blanking a repeat in an unsorted
+    /// column would hide a value whose neighbour above it is a coincidence.
+    /// Only ever below the first VISIBLE row, so the top of the screen always
+    /// carries the group it is in rather than inheriting a label that scrolled
+    /// off. And never a cell the search matched: the highlight exists to show
+    /// where the match is, and collapsing the matches after the first would
+    /// read as "only one row matched".
+    ///
+    /// Render-only. Copy and save carry the substance of a row, not a
+    /// transcript of the cells it was drawn in, so they still see the value.
+    fn repeated_cell(&self, row_idx: usize, first_visible: usize) -> Option<usize> {
+        let col = self.sort_col?;
+        if row_idx <= first_visible {
+            return None;
+        }
+        let here: &str = self.rows[row_idx].get(col)?.as_ref();
+        let above: &str = self.rows[row_idx - 1].get(col)?.as_ref();
+        if here != above || here.is_empty() {
+            return None;
+        }
+        self.cell_match_ranges(here).is_empty().then_some(col)
+    }
+
     fn render_row<S: AsRef<str>>(
         &self,
         buf: &mut Buffer,
         y: u16,
         cells: &[S],
-        base_style: Style,
-        is_row_selected: bool,
+        row: RowPaint,
         layout: &ColumnLayout,
     ) {
+        let RowPaint { base_style, is_row_selected, repeated } = row;
         let hl = self.theme.search_match;
         let first = layout.first_visible();
         for (i, cell) in cells.iter().enumerate() {
             if i >= layout.widths.len() || !layout.is_visible(i) { continue; }
             let (content_style, border_style) = self.cell_styles(base_style, i, is_row_selected, layout);
-            let ranges = self.cell_match_ranges(cell.as_ref());
-            Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style, &ranges, hl, first == Some(i));
+            let text = if repeated == Some(i) { "" } else { cell.as_ref() };
+            let ranges = self.cell_match_ranges(text);
+            Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), text, content_style, border_style, &ranges, hl, first == Some(i));
         }
         // Trailing │ after last column.
         if let Some(tx) = layout.trailing_border_x() {
@@ -433,7 +472,14 @@ impl StatefulWidget for ResourceTable<'_> {
         // --- Header row ---
         let header_y = inner.y;
         let header_style = self.theme.header;
-        self.render_row(buf, header_y, &self.headers, header_style, false, &layout);
+        // The header row repeats nothing, and is never the cursor row.
+        self.render_row(
+            buf,
+            header_y,
+            &self.headers,
+            RowPaint { base_style: header_style, is_row_selected: false, repeated: None },
+            &layout,
+        );
 
         // Sort indicator overlay (on top of the header cell).
         if let Some(sort_i) = self.sort_col {
@@ -504,6 +550,11 @@ impl StatefulWidget for ResourceTable<'_> {
             let has_cell_overrides = !is_selected && !is_marked && !is_changed
                 && self.cell_style.get(row_idx).is_some_and(|ch| ch.iter().any(|c| c.is_some()));
 
+            // Repeated values of the column you sorted by collapse, so a
+            // three-column help sheet stops printing "Everywhere" thirteen
+            // times down its left edge. ONE rule, asked by both paths.
+            let repeated = self.repeated_cell(row_idx, state.offset);
+
             if has_cell_overrides {
                 let cell_styles = &self.cell_style[row_idx];
                 let hl = self.theme.search_match;
@@ -521,15 +572,22 @@ impl StatefulWidget for ResourceTable<'_> {
                         row_base
                     };
                     let (content_style, border_style) = self.cell_styles(style, i, is_selected, &layout);
-                    let ranges = self.cell_match_ranges(cell.as_ref());
-                    Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), cell.as_ref(), content_style, border_style, &ranges, hl, first == Some(i));
+                    let text = if repeated == Some(i) { "" } else { cell.as_ref() };
+                    let ranges = self.cell_match_ranges(text);
+                    Self::render_cell(buf, layout.screen_x(i), y, layout.visible_width(i), text, content_style, border_style, &ranges, hl, first == Some(i));
                 }
                 // Trailing border.
                 if let Some(tx) = layout.trailing_border_x() {
                     buf.set_string(tx, y, "│", self.theme.border);
                 }
             } else {
-                self.render_row(buf, y, row, row_base, is_selected, &layout);
+                self.render_row(
+                    buf,
+                    y,
+                    row,
+                    RowPaint { base_style: row_base, is_row_selected: is_selected, repeated },
+                    &layout,
+                );
             }
         }
     }

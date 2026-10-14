@@ -41,6 +41,18 @@ pub enum LocalResourceKind {
     ///
     /// APPENDED for the same wire-tag reason as `Context` above.
     Keybinding,
+    /// What you can type at the `:` prompt: every resource alias, and the
+    /// static command words.
+    ///
+    /// Client-side like [`Self::Keybinding`], and for the same reason — the
+    /// rows are a fact about this binary's registry and its command grammar.
+    /// `Ctrl-a` used to format a plain-text DOCUMENT instead, which meant it
+    /// could not be grepped, sorted or scrolled as a table, and it carried a
+    /// hand-written copy of the keymap that had already drifted (missing
+    /// `Ctrl-w`, `Ctrl-z`, `Ctrl-Space`, `Ctrl-\`). Keys belong to `?`.
+    ///
+    /// APPENDED for the same wire-tag reason as `Context` above.
+    Alias,
 }
 
 impl LocalResourceKind {
@@ -48,7 +60,13 @@ impl LocalResourceKind {
     /// at runtime and are not part of this list — callers that need to
     /// enumerate customs maintain their own registry.
     pub fn all() -> Vec<Self> {
-        vec![Self::PortForward, Self::ExecResource, Self::Context, Self::Keybinding]
+        vec![
+            Self::PortForward,
+            Self::ExecResource,
+            Self::Context,
+            Self::Keybinding,
+            Self::Alias,
+        ]
     }
 
     /// Canonical singular name (e.g. `"portforward"`).
@@ -58,6 +76,7 @@ impl LocalResourceKind {
             Self::ExecResource => "execresource",
             Self::Context => "context",
             Self::Keybinding => "keybinding",
+            Self::Alias => "alias",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -70,6 +89,7 @@ impl LocalResourceKind {
             Self::ExecResource => "v1",
             Self::Context => "v1",
             Self::Keybinding => "v1",
+            Self::Alias => "v1",
             Self::Custom(_) => "v1",
         }
     }
@@ -82,6 +102,7 @@ impl LocalResourceKind {
             Self::ExecResource => "ExecResource",
             Self::Context => "Context",
             Self::Keybinding => "Keybinding",
+            Self::Alias => "Alias",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -95,6 +116,7 @@ impl LocalResourceKind {
             Self::ExecResource => "execresources",
             Self::Context => "contexts",
             Self::Keybinding => "keybindings",
+            Self::Alias => "aliases",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -106,6 +128,7 @@ impl LocalResourceKind {
             Self::ExecResource => ResourceScope::Cluster,
             Self::Context => ResourceScope::Cluster,
             Self::Keybinding => ResourceScope::Cluster,
+            Self::Alias => ResourceScope::Cluster,
             Self::Custom(_) => ResourceScope::Cluster,
         }
     }
@@ -126,6 +149,12 @@ impl LocalResourceKind {
             // land on a table that `Action::Help` had never seeded, at depth
             // 1 where `pop` refuses and there is no way back out.
             Self::Keybinding => &[],
+            // UNLIKE `Keybinding`: this one IS a noun you browse, and
+            // `:alias` has always been the way in. It goes through the
+            // ordinary resource-command path, so it resets the stack like
+            // every other `:` resource — which is what you want from a
+            // root-level reference view.
+            Self::Alias => &["alias", "aliases", "a"],
             Self::Custom(_) => &[],
         }
     }
@@ -138,6 +167,7 @@ impl LocalResourceKind {
             Self::ExecResource => "EXEC",
             Self::Context => "CTX",
             Self::Keybinding => "KEYS",
+            Self::Alias => "ALIAS",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -168,6 +198,17 @@ impl LocalResourceKind {
                     ColumnDef::new("SECTION").max_width(36),
                     ColumnDef::new("KEY").max_width(16),
                     ColumnDef::new("DESCRIPTION").max_width(60),
+                ];
+                COLS
+            }
+            // ALIAS is what you scan and type; TARGET says where it goes.
+            // SECTION first so the default sort groups resources apart from
+            // commands (and the repeated value collapses as it draws).
+            Self::Alias => {
+                static COLS: &[ColumnDef] = &[
+                    ColumnDef::new("SECTION").max_width(12),
+                    ColumnDef::new("ALIAS").max_width(44),
+                    ColumnDef::new("TARGET").max_width(40),
                 ];
                 COLS
             }
@@ -207,6 +248,11 @@ impl LocalResourceKind {
             Self::Context => vec![],
             // Nothing to act ON: a keybinding row is documentation.
             Self::Keybinding => vec![],
+            // Same — an alias row is documentation. (Drilling into the
+            // resource it names would be a nice `Enter`, but it would need a
+            // `DrillTarget` from a cell, and the alias is already one
+            // keystroke away at `:`.)
+            Self::Alias => vec![],
             // Same as `ExecResource` — a `Custom` kind IS an exec source.
             Self::Custom(_) => vec![OperationKind::Describe, OperationKind::Yaml],
         }

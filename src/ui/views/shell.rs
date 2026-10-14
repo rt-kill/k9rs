@@ -9,7 +9,7 @@ use crate::ui::theme::Theme;
 /// the TUI and enters raw bridge mode (this code is never reached).
 ///
 /// Claims the whole frame, so it declares
-/// [`crate::app::OverlayExtent::FullFrame`] and `ui::draw` erases the frame
+/// [`crate::app::element::ViewExtent::Full`] and `ui::draw` erases the frame
 /// first: the block below paints a border and one centered line, and every
 /// interior cell it never writes would otherwise still hold the view
 /// underneath.

@@ -40,7 +40,7 @@ pub struct FormFieldState {
     /// text-like kinds (Text/Number/Port). For `Select` the chosen option is
     /// the typed `selected` index carried on the kind itself, and this field
     /// stays empty.
-    pub value: String,
+    pub value: crate::app::text_input::TextInput,
 }
 
 /// Field type discriminator. Owned client-side — there is no wire-level
@@ -141,7 +141,7 @@ impl FormSubmit {
 fn find_field_value(fields: &[FormFieldState], name: &str) -> Result<String, String> {
     fields.iter()
         .find(|f| f.name == name)
-        .map(|f| f.value.trim().to_string())
+        .map(|f| f.value.value().trim().to_string())
         .ok_or_else(|| format!("Missing field: {}", name))
 }
 
@@ -157,8 +157,8 @@ fn parse_port_field(fields: &[FormFieldState], name: &str) -> Result<u16, String
                 .and_then(|opt| opt.value.parse::<u16>().ok())
                 .ok_or_else(|| "Invalid port selection".to_string())
         }
-        _ => field.value.trim().parse::<u16>()
-            .map_err(|_| format!("Invalid port: {}", field.value.trim())),
+        _ => field.value.value().trim().parse::<u16>()
+            .map_err(|_| format!("Invalid port: {}", field.value.value().trim())),
     }
 }
 
@@ -181,6 +181,14 @@ pub struct FormDialog {
 }
 
 impl FormDialog {
+    /// Crumb label — the operation being configured.
+    pub fn name(&self) -> &'static str {
+        match self.submit {
+            FormSubmit::Scale => "scale",
+            FormSubmit::PortForward => "port-forward",
+        }
+    }
+
     /// Number of focusable positions (one per field, plus the OK button).
     pub fn focus_count(&self) -> usize {
         self.fields.len() + 1
@@ -239,7 +247,7 @@ pub struct ContentViewState {
     pub search_matches: Vec<usize>,
     pub current_match: usize,
     pub search_input_active: bool,
-    pub search_input: String,
+    pub search_input: crate::app::text_input::TextInput,
     /// Cached line count — updated when content changes.
     line_count: usize,
 }
@@ -418,7 +426,7 @@ mod form_submit_tests {
                     ],
                     selected: 1,
                 },
-                value: String::new(),
+                value: crate::app::text_input::TextInput::new(),
             },
             FormFieldState {
                 name: "local_port".into(),

@@ -1,6 +1,7 @@
 use crate::app::element::{Element, LogSession};
 use crate::app::store::StorePayload;
-use crate::app::{App, Overlay, OverlayExtent, ShellState};
+use crate::app::element::ViewExtent;
+use crate::app::{App, ShellState, TakeoverOp};
 use crate::kube::protocol::{LogContainer, LogLine, TableBaseline};
 use crate::kube::resource_def::BuiltInKind;
 use crate::kube::resources::row::{CellValue, ResourceRow};
@@ -86,8 +87,8 @@ fn seed_row(app: &App, name: &str) {
     );
 }
 
-fn shell_overlay() -> Overlay {
-    Overlay::Shell(Box::new(ShellState {
+fn shell_overlay() -> TakeoverOp {
+    TakeoverOp::Shell(Box::new(ShellState {
         title: "canarypod".to_string(),
         stream: None,
         connect_state: crate::app::ShellConnectState::Connecting,
@@ -109,7 +110,7 @@ fn a_full_frame_overlay_erases_the_view_beneath() {
     let before = paint(&mut t, &mut app);
     assert!(before.contains("canary-row-marker"), "table paints its rows normally");
 
-    app.ui.open(crate::app::Modal::Overlay(shell_overlay()));
+    app.ui.open(crate::app::Modal::Takeover(shell_overlay()));
     let during = paint(&mut t, &mut app);
     assert!(
         !during.contains("canary-row-marker"),
@@ -127,18 +128,13 @@ fn a_dialog_overlay_keeps_the_live_view_around_it() {
     app.conn.established();
     seed_row(&app, "canary-row-marker");
     let mut t = term();
-    app.ui.open(crate::app::Modal::Overlay(Overlay::ContainerSelect {
+    app.ui.open(crate::app::Modal::Takeover(TakeoverOp::Edit {
             target: crate::kube::protocol::ObjectRef::new(
-                crate::app::nav::rid(BuiltInKind::Pod),
+                crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
                 "p".to_string(),
                 crate::kube::protocol::Namespace::Named("default".to_string()),
             ),
-            choices: vec![crate::app::ContainerChoice {
-                label: "web".into(),
-                container: crate::kube::protocol::LogContainer::Named("web".into()),
-            }],
-            selected: 0,
-            action: crate::app::ContainerAction::Logs,
+            state: crate::app::EditState::AwaitingYaml,
         }));
 
     let painted = paint(&mut t, &mut app);
@@ -146,14 +142,21 @@ fn a_dialog_overlay_keeps_the_live_view_around_it() {
         painted.contains("canary-row-marker"),
         "a Dialog-extent overlay leaves the surrounding view alone"
     );
+    // …and it says what it is doing, in the box its own extent asked for.
+    // The label is the op's (`TakeoverOp::label`) because the extent has to
+    // measure it; a renderer inventing its own would size one string twice.
+    assert!(
+        painted.contains("Fetching YAML for Pod/p"),
+        "the takeover's own label is drawn:\n{painted}",
+    );
 }
 
 #[test]
 fn overlay_extents_are_declared_not_improvised() {
     // Extent drives the central erase; a new overlay kind must choose one.
-    assert_eq!(shell_overlay().extent(), OverlayExtent::FullFrame);
+    assert_eq!(shell_overlay().extent(), ViewExtent::Full);
     assert_eq!(
-        Overlay::Edit {
+        TakeoverOp::Edit {
             target: crate::kube::protocol::ObjectRef {
                 resource: crate::app::nav::rid(BuiltInKind::Pod),
                 namespace: crate::kube::protocol::Namespace::Named("default".into()),
@@ -162,7 +165,16 @@ fn overlay_extents_are_declared_not_improvised() {
             state: crate::app::EditState::AwaitingYaml,
         }
         .extent(),
-        OverlayExtent::Dialog
+        ViewExtent::Dialog {
+            // Sized from its own label, in cells, exactly as the dialog
+            // ELEMENTS are — which is the point of there being one extent
+            // type: a takeover's box can state its size, so it no longer
+            // has to centre itself.
+            max_width: crate::app::element::Size::Cells(
+                "Fetching YAML for Pod/p…".chars().count() as u16 + 6,
+            ),
+            max_height: crate::app::element::Size::Cells(3),
+        }
     );
 }
 
@@ -483,18 +495,13 @@ fn the_light_palette_actually_reaches_the_screen() {
     let mut app = App::new_for_test();
     app.conn.established();
     app.ui.theme = crate::ui::theme::Theme::light();
-    app.ui.open(crate::app::Modal::Overlay(Overlay::ContainerSelect {
+    app.ui.open(crate::app::Modal::Takeover(TakeoverOp::Edit {
             target: crate::kube::protocol::ObjectRef::new(
-                crate::app::nav::rid(BuiltInKind::Pod),
+                crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
                 "p".to_string(),
                 crate::kube::protocol::Namespace::Named("default".to_string()),
             ),
-            choices: vec![crate::app::ContainerChoice {
-                label: "web".into(),
-                container: crate::kube::protocol::LogContainer::Named("web".into()),
-            }],
-            selected: 0,
-            action: crate::app::ContainerAction::Logs,
+            state: crate::app::EditState::AwaitingYaml,
         }));
 
     let mut t = term();
@@ -543,7 +550,7 @@ fn a_grep_that_matches_nothing_still_shows_its_pattern() {
     app.conn.established();
     app.nav.push(log_session_with(&["hello world"]));
     app.nav.top_mut().log_view_mut().expect("log view").draft =
-        Some("zzz-no-such-line".to_string());
+        Some(crate::app::text_input::TextInput::seeded("zzz-no-such-line"));
 
     let mut t = term();
     let painted = paint(&mut t, &mut app);
@@ -627,7 +634,12 @@ fn help_documents_the_view_you_pressed_it_in() {
     fn help_rows(app: &mut App) -> Vec<String> {
         let class = crate::event::keymap::ViewClass::of(app.nav.top());
         let caps = Some(app.current_capabilities());
-        let store = app.core.seed_keybindings(caps, app.config.keys, class);
+        let store = app.core.seed_keybindings(
+            caps,
+            app.config.keys,
+            class,
+            app.nav.top().markable(),
+        );
         store.with_read(|i| {
             i.rows
                 .iter()
@@ -856,7 +868,7 @@ fn a_grep_that_momentarily_matches_nothing_keeps_your_scroll_position() {
     // One keystroke of a grep that matches nothing → the "No matching lines."
     // status screen, which renders no content.
     app.nav.top_mut().log_view_mut().expect("log view").draft =
-        Some("zzz-no-such-line".to_string());
+        Some(crate::app::text_input::TextInput::seeded("zzz-no-such-line"));
     let painted = paint(&mut t, &mut app);
     assert!(painted.contains("No matching lines."), "the status screen is up:\n{painted}");
 
@@ -884,13 +896,13 @@ fn a_degraded_grep_explains_itself_instead_of_showing_a_zero() {
 
     // `\zs` compiles in Rust as the end-of-text anchor followed by `s`: a
     // valid regex that can never match. It is now refused by name.
-    app.nav.top_mut().log_view_mut().unwrap().draft = Some(r"\zsaab".to_string());
+    app.nav.top_mut().log_view_mut().unwrap().draft = Some(crate::app::text_input::TextInput::seeded(r"\zsaab"));
     let painted = paint(&mut term(), &mut app);
     assert!(painted.contains("literal"), "the bar must name the degradation:\n{painted}");
     assert!(painted.contains("zs"), "and say which atom caused it:\n{painted}");
 
     // A pattern that DOES compile keeps the ordinary count.
-    app.nav.top_mut().log_view_mut().unwrap().draft = Some(r"aa\|xy".to_string());
+    app.nav.top_mut().log_view_mut().unwrap().draft = Some(crate::app::text_input::TextInput::seeded(r"aa\|xy"));
     let painted = paint(&mut term(), &mut app);
     assert!(!painted.contains("literal"), "a working regex says nothing:\n{painted}");
     assert!(painted.contains("visible"), "{painted}");
@@ -923,16 +935,463 @@ fn a_case_sensitive_grep_says_so() {
     let mut t = term();
 
     // All-lowercase: smartcase is off, the search is insensitive, no note.
-    app.nav.top_mut().log_view_mut().unwrap().draft = Some("client".to_string());
+    app.nav.top_mut().log_view_mut().unwrap().draft = Some(crate::app::text_input::TextInput::seeded("client"));
     let painted = paint(&mut t, &mut app);
     assert!(!painted.contains("case-sensitive"), "no capital, nothing to say:\n{painted}");
 
     // One capital flips it — and the bar now says why the view emptied.
-    app.nav.top_mut().log_view_mut().unwrap().draft = Some("Client".to_string());
+    app.nav.top_mut().log_view_mut().unwrap().draft = Some(crate::app::text_input::TextInput::seeded("Client"));
     let painted = paint(&mut t, &mut app);
     assert!(
         painted.contains("case-sensitive"),
         "a capital turned smartcase off and the bar must say so:\n{painted}"
     );
     assert!(painted.contains("No matching lines."), "…which is why there are none");
+}
+
+/// A confirm dialog is a nav ELEMENT: it floats over the view that raised
+/// it, that view stays on screen, and Esc is the ordinary pop.
+///
+/// It also owns EVERY key while it is up. `:` used to reach the global
+/// handler and open the command prompt behind the box; the dialog's own
+/// "any other key cancels" safety net — which exists so a spurious
+/// keystroke dismisses it rather than being swallowed — was dead.
+#[test]
+fn a_confirm_dialog_floats_over_the_view_that_raised_it() {
+    use crate::app::element::ViewExtent;
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "canary-row-marker");
+    let mut t = term();
+    let depth = app.nav.depth();
+
+    app.nav.push(Element::Confirm(Box::new(crate::app::ConfirmDialog {
+        message: "Delete pod/canary-row-marker?".to_string(),
+        action_label: "Delete".to_string(),
+        pending: crate::app::PendingAction::Single {
+            op: crate::app::SingleOp::Delete,
+            target: crate::kube::protocol::ObjectRef::new(
+                crate::app::nav::rid(BuiltInKind::Pod),
+                "canary-row-marker".to_string(),
+                crate::kube::protocol::Namespace::Named("default".to_string()),
+            ),
+        },
+        action_focused: false,
+    })));
+
+    // Content-sized, not a percentage of somebody's terminal.
+    let ViewExtent::Dialog { max_height, .. } = app.nav.top().extent() else {
+        panic!("a confirm must declare a Dialog extent");
+    };
+    assert_eq!(
+        max_height,
+        crate::app::element::Size::Cells(11),
+        "one message line plus its chrome — not 85% of the screen",
+    );
+
+    let painted = paint(&mut t, &mut app);
+    assert!(painted.contains("Delete pod/canary-row-marker?"), "the question is drawn");
+    assert!(
+        painted.contains("canary-row-marker"),
+        "…over the table that raised it, which stays visible:\n{painted}"
+    );
+
+    // Every key is the dialog's, globals included.
+    use crossterm::event::KeyCode;
+    for key in [KeyCode::Char(':'), KeyCode::Char('?'), KeyCode::Char('q')] {
+        let action = crate::event::handler::handle_key_event(
+            &app,
+            crossterm::event::KeyEvent::new(key, crossterm::event::KeyModifiers::NONE),
+        );
+        assert_eq!(
+            action,
+            Some(crate::app::actions::Action::Cancel),
+            "{key:?} must be answered by the dialog, not leak to the view under it",
+        );
+    }
+
+    // …and Esc is the ordinary pop.
+    assert_eq!(app.nav.depth(), depth + 1);
+    app.nav.pop();
+    assert_eq!(app.nav.depth(), depth, "no bespoke close path");
+}
+
+/// The container picker floats over the view that asked, and is a nav
+/// element like every other dialog — one class, one modality rule, one pop.
+#[test]
+fn the_container_picker_is_a_floating_element() {
+    use crate::app::element::ViewExtent;
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "canary-row-marker");
+    let mut t = term();
+
+    app.nav.push(Element::Picker(Box::new(crate::app::ContainerPicker {
+        target: crate::kube::protocol::ObjectRef::new(
+            crate::app::nav::rid(BuiltInKind::Pod),
+            "canary-row-marker".to_string(),
+            crate::kube::protocol::Namespace::Named("default".to_string()),
+        ),
+        choices: vec![
+            crate::app::ContainerChoice {
+                label: "web".into(),
+                container: crate::kube::protocol::LogContainer::Named("web".into()),
+            },
+            crate::app::ContainerChoice {
+                label: "sidecar".into(),
+                container: crate::kube::protocol::LogContainer::Named("sidecar".into()),
+            },
+        ],
+        selected: 0,
+        action: crate::app::ContainerAction::Logs,
+    })));
+
+    // Sized from its own contents, like the confirm box — two choices plus
+    // chrome, not a share of the terminal.
+    assert!(matches!(
+        app.nav.top().extent(),
+        ViewExtent::Dialog { max_height: crate::app::element::Size::Cells(8), .. }
+    ));
+
+    let painted = paint(&mut t, &mut app);
+    assert!(painted.contains("web") && painted.contains("sidecar"), "the choices are drawn");
+    assert!(
+        painted.contains("canary-row-marker"),
+        "…over the table that asked, which stays visible:\n{painted}"
+    );
+
+    // Both dialogs share one class, so they share the modality rule.
+    assert_eq!(app.nav.top().class(), crate::app::element::ElementClass::Dialog);
+    assert!(app.nav.top().captures_all_input());
+}
+
+/// A form is a floating element like the other two dialogs — and this is the
+/// test that would have caught `ui/mod.rs` losing its render arms, which is
+/// how all three of them went missing at once.
+#[test]
+fn every_dialog_kind_paints_itself_over_its_parent() {
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "canary-row-marker");
+    let target = crate::kube::protocol::ObjectRef::new(
+        crate::app::nav::rid(BuiltInKind::Pod),
+        "canary-row-marker".to_string(),
+        crate::kube::protocol::Namespace::Named("default".to_string()),
+    );
+
+    let dialogs: Vec<(&str, Element, &str)> = vec![
+        (
+            "confirm",
+            Element::Confirm(Box::new(crate::app::ConfirmDialog {
+                message: "Delete pod/canary?".to_string(),
+                action_label: "Delete".to_string(),
+                pending: crate::app::PendingAction::Single {
+                    op: crate::app::SingleOp::Delete,
+                    target: target.clone(),
+                },
+                action_focused: false,
+            })),
+            "Delete pod/canary?",
+        ),
+        (
+            "picker",
+            Element::Picker(Box::new(crate::app::ContainerPicker {
+                target: target.clone(),
+                choices: vec![crate::app::ContainerChoice {
+                    label: "sidecar".into(),
+                    container: crate::kube::protocol::LogContainer::Named("sidecar".into()),
+                }],
+                selected: 0,
+                action: crate::app::ContainerAction::Logs,
+            })),
+            "sidecar",
+        ),
+        (
+            "form",
+            Element::Form(Box::new(crate::app::FormDialog {
+                submit: crate::app::FormSubmit::Scale,
+                title: "Scale deploy/api".to_string(),
+                subtitle: "namespace: default".to_string(),
+                target: target.clone(),
+                fields: vec![crate::app::FormFieldState {
+                    name: "replicas".to_string(),
+                    label: "Replicas".to_string(),
+                    kind: crate::app::FormFieldKind::Number { min: 0, max: 100 },
+                    value: crate::app::text_input::TextInput::seeded("3"),
+                }],
+                focused: 0,
+            })),
+            "Replicas",
+        ),
+    ];
+
+    for (label, dialog, needle) in dialogs {
+        let mut t = term();
+        app.nav.push(dialog);
+        assert!(
+            matches!(app.nav.top().extent(), crate::app::element::ViewExtent::Dialog { .. }),
+            "{label}: must declare a Dialog extent",
+        );
+        assert_eq!(app.nav.top().class(), crate::app::element::ElementClass::Dialog);
+        assert!(app.nav.top().captures_all_input(), "{label}: a dialog owns every key");
+
+        let painted = paint(&mut t, &mut app);
+        assert!(painted.contains(needle), "{label}: its own content is drawn:\n{painted}");
+        assert!(
+            painted.contains("canary-row-marker"),
+            "{label}: …over the view that raised it, which stays visible:\n{painted}",
+        );
+        app.nav.pop();
+    }
+}
+
+/// "The whole frame" means the TERMINAL, not whatever is on top of the stack.
+///
+/// `draw` had two rects and one name: the float path rebound `area` to the
+/// dialog's box, so the `FullFrame` erase below it erased the BOX and the
+/// shell's connect screen painted inside it, framed by the dialog it was
+/// supposed to replace — the stale-background class the extent authority
+/// exists to make impossible. Latent only because a dialog captures every
+/// key, so today you cannot start a shell from under one; the next takeover
+/// raised from a background event would have found it.
+#[test]
+fn a_full_frame_takeover_erases_the_frame_not_the_float_over_it() {
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "canary-row-marker");
+
+    // A float on top, and a full-frame takeover raised while it is there.
+    app.nav.push(Element::Confirm(Box::new(crate::app::ConfirmDialog {
+        message: "Delete pod/canary?".to_string(),
+        action_label: "Delete".to_string(),
+        pending: crate::app::PendingAction::Single {
+            op: crate::app::SingleOp::Delete,
+            target: crate::kube::protocol::ObjectRef::new(
+                crate::app::nav::rid(BuiltInKind::Pod),
+                "canary-row-marker".to_string(),
+                crate::kube::protocol::Namespace::Named("default".to_string()),
+            ),
+        },
+        action_focused: false,
+    })));
+    app.ui.open(crate::app::Modal::Takeover(crate::app::TakeoverOp::Shell(Box::new(
+        crate::app::ShellState {
+            title: "shell-takeover-marker".to_string(),
+            stream: None,
+            connect_state: crate::app::ShellConnectState::Connecting,
+            pending_output: Vec::new(),
+        },
+    ))));
+    assert_eq!(
+        app.ui.takeover().map(crate::app::TakeoverOp::extent),
+        Some(ViewExtent::Full),
+        "the shell connect screen claims the frame",
+    );
+
+    let mut t = term();
+    let painted = paint(&mut t, &mut app);
+
+    assert!(
+        painted.contains("shell-takeover-marker"),
+        "the takeover paints:\n{painted}",
+    );
+    assert!(
+        !painted.contains("canary-row-marker"),
+        "nothing of the view beneath survives a full-frame erase:\n{painted}",
+    );
+    assert!(
+        !painted.contains("Delete pod/canary?"),
+        "nor the dialog that happened to be on top when it was raised:\n{painted}",
+    );
+}
+
+/// The column you sorted by stops repeating itself.
+///
+/// Help is three columns and thirteen of its rows said "Everywhere" down the
+/// left edge — the value you are grouped BY, printed once per row. Collapsing
+/// a repeat is a property of the table, not of help: it holds for a pod list
+/// sorted by NAMESPACE too, and it is render-only, so copy and save still
+/// carry the row's substance.
+///
+/// Three conditions are pinned here because each one is load-bearing: only
+/// the SORTED column (equal values are contiguous only there), never the top
+/// VISIBLE row (so the screen always carries the group it is in), and never a
+/// cell the search matched (collapsing matches would read as "only one row
+/// matched").
+#[test]
+fn a_sorted_column_stops_repeating_itself() {
+    use crate::ui::widgets::{ResourceTable, ResourceTableState};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::StatefulWidget;
+
+    let theme = crate::ui::theme::Theme::dark();
+    let rows: Vec<Vec<String>> = [
+        ["All", "?", "aaa"],
+        ["All", ":", "bbb"],
+        ["All", "R", "ccc"],
+        ["View", "d", "ddd"],
+    ]
+    .iter()
+    .map(|r| r.iter().map(|c| c.to_string()).collect())
+    .collect();
+    let headers = vec!["SEC", "KEY", "DESC"];
+    // The widget takes measured widths (the memoized `PreparedView` carries
+    // them in the real path). Deliberately generous — nothing here is a claim
+    // about layout, the columns just have to be wide enough to read.
+    let widths: Vec<u16> = vec![12, 12, 12];
+
+    let paint = |sort: Option<usize>, offset: usize, pats: &[crate::util::SearchPattern]| -> Vec<String> {
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        let mut st = ResourceTableState {
+            selected: usize::MAX,
+            offset,
+            selected_col: 0,
+            col_offset: 0,
+            filtered_count: 0,
+            visible_height: 0,
+        };
+        ResourceTable::new(headers.clone(), &rows, "help", &theme)
+            .sort(sort, true)
+            .col_widths(&widths)
+            .search_patterns(pats)
+            .render(area, &mut buf, &mut st);
+        (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    };
+
+    // Sorted on SECTION: the run collapses after its first row.
+    let shown = paint(Some(0), 0, &[]);
+    let section_rows: Vec<&String> = shown
+        .iter()
+        .filter(|l| l.contains("aaa") || l.contains("bbb") || l.contains("ccc"))
+        .collect();
+    assert_eq!(section_rows.len(), 3, "all three rows drew:\n{shown:#?}");
+    assert!(section_rows[0].contains("All"), "the first carries the group:\n{shown:#?}");
+    assert!(
+        !section_rows[1].contains("All") && !section_rows[2].contains("All"),
+        "the rest do not repeat it:\n{shown:#?}",
+    );
+    // The group ENDS, and the next value still prints.
+    assert!(
+        shown.iter().any(|l| l.contains("View") && l.contains("ddd")),
+        "a different value is never suppressed:\n{shown:#?}",
+    );
+
+    // NOT sorted on SECTION: equal neighbours are a coincidence, so nothing
+    // is collapsed.
+    let unsorted = paint(Some(1), 0, &[]);
+    assert_eq!(
+        unsorted.iter().filter(|l| l.contains("All")).count(),
+        3,
+        "sorted on KEY, the SECTION column prints in full:\n{unsorted:#?}",
+    );
+
+    // No sort column visible at all (`display_sort_col` is an Option because
+    // the sorted column can be hidden): nothing is contiguous by assumption,
+    // so nothing collapses.
+    let no_sort = paint(None, 0, &[]);
+    assert_eq!(
+        no_sort.iter().filter(|l| l.contains("All")).count(),
+        3,
+        "with no sorted column there is no grouping to collapse:\n{no_sort:#?}",
+    );
+
+    // Scrolled: the top visible row carries its group even though the row
+    // above it (off screen) has the same value.
+    let scrolled = paint(Some(0), 1, &[]);
+    assert!(
+        scrolled.iter().any(|l| l.contains("All") && l.contains("bbb")),
+        "the first visible row is never suppressed:\n{scrolled:#?}",
+    );
+
+    // Searched: every matching cell shows, or the highlight would claim one
+    // row matched when three did.
+    let searched = paint(Some(0), 0, &[crate::util::SearchPattern::new("All")]);
+    assert_eq!(
+        searched.iter().filter(|l| l.contains("All")).count(),
+        3,
+        "a matched cell always draws:\n{searched:#?}",
+    );
+}
+
+/// The aliases view actually PAINTS.
+///
+/// Its rows, its element class and its routing all have tests; none of them
+/// would notice if the renderer never drew it. That is exactly how five
+/// render functions once went missing from `ui/mod.rs` with the suite still
+/// green — nothing painted a dialog. So: paint it, and read the cells back
+/// off the screen.
+#[test]
+fn the_aliases_view_paints_what_the_prompt_accepts() {
+    let mut app = App::new_for_test();
+    app.conn.established();
+
+    let rid = crate::kube::local::LocalResourceKind::Alias.to_resource_id();
+    app.nav.reset(
+        app.core
+            .client_root_element(&app.kube.metrics, &rid, crate::kube::protocol::Namespace::All)
+            .expect("aliases is client-owned"),
+    );
+
+    let mut t = term();
+    let painted = paint(&mut t, &mut app);
+
+    assert!(painted.contains("ALIAS"), "the table header is drawn:\n{painted}");
+    assert!(painted.contains("TARGET"), "…including the last column:\n{painted}");
+    // A row from each section, so neither projection is silently empty.
+    assert!(
+        painted.contains("resource"),
+        "the resource aliases are there:\n{painted}",
+    );
+    assert!(
+        painted.contains("command"),
+        "…and the command words:\n{painted}",
+    );
+    // And it is a NAVIGABLE table, not a document: `/` and sort belong to it
+    // because it is an ordinary element.
+    assert_eq!(app.nav.top().class(), crate::app::element::ElementClass::Table);
+    assert!(!app.nav.top().markable(), "nothing to batch on a reference row");
+}
+
+/// The log view's hint bar reaches `back` on a real terminal.
+///
+/// The reported symptom: at ~97 columns the bar silently lost its tail, and
+/// the tail ended in `<q> back`. Two fixes answered it — grouping the seven
+/// `since` keys into `<0-6> range`, and giving the renderer the width — but
+/// NOTHING paints the bar, so neither would notice if the view handed it the
+/// wrong rect. It passes `bar_area.width` for the rect it renders into; this
+/// is the test that says so.
+#[test]
+fn the_log_hint_bar_reaches_its_last_hint_on_screen() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    for width in [97u16, 80, 100] {
+        let mut app = App::new_for_test();
+        app.conn.established();
+        app.nav.push(Element::LogSession(Box::new(LogSession::for_test(
+            crate::kube::protocol::LogTarget::One("canarypod".to_string()),
+            LogContainer::Named("app".to_string()),
+        ))));
+
+        let mut t = Terminal::new(TestBackend::new(width, 24)).expect("test terminal");
+        let painted = paint(&mut t, &mut app);
+
+        assert!(painted.contains("follow"), "w={width}: the bar is drawn:\n{painted}");
+        assert!(
+            painted.contains("range"),
+            "w={width}: the since keys are ONE hint, not seven:\n{painted}",
+        );
+        assert!(
+            painted.contains("back"),
+            "w={width}: the last hint is the way out — it must be on screen:\n{painted}",
+        );
+        assert!(
+            !painted.contains('\u{2026}'),
+            "w={width}: and nothing had to be dropped to get there:\n{painted}",
+        );
+    }
 }

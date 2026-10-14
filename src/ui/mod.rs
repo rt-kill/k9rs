@@ -96,7 +96,7 @@ use ratatui::widgets::{Block, Clear, Widget};
 use ratatui::Frame;
 
 use crate::app::element::Element;
-use crate::app::{App, Overlay};
+use crate::app::{App, TakeoverOp};
 use crate::ui::widgets::{ConfirmDialogWidget, FormDialogWidget, FilterBar, FlashWidget};
 
 /// Main UI draw function.
@@ -104,7 +104,14 @@ use crate::ui::widgets::{ConfirmDialogWidget, FormDialogWidget, FilterBar, Flash
 /// Blindly renders the TOP nav element (exhaustive over element kinds),
 /// then layers the overlay slot and the input/flash/dialog chrome.
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let area = f.area();
+    // TWO rects, deliberately named apart: `frame` is the terminal, `top_area`
+    // is whatever the top element draws into. They differ exactly when the top
+    // element floats — and when a `FullFrame` takeover went out over a float,
+    // the one name shadowing the other meant "erase the frame" erased the
+    // DIALOG BOX and the shell painted inside it. A takeover claiming the
+    // whole frame is a statement about the terminal, never about whatever
+    // happens to be on top of the stack.
+    let frame = f.area();
 
     // A FLOATING element is drawn over the view beneath it, so that view is
     // painted first — and its box is `Clear`ed before the float lands, so a
@@ -112,60 +119,44 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Driven by the element's OWN declared extent, the same rule the overlay
     // slot follows, so neither the erase nor the parent paint can be
     // forgotten by an individual view.
-    let area = match app.nav.top().extent() {
-        crate::app::element::ViewExtent::Full => area,
+    let top_area = match app.nav.top().extent() {
+        crate::app::element::ViewExtent::Full => frame,
         crate::app::element::ViewExtent::Dialog { max_width, max_height } => {
             if let Some(float) = app.nav.lift_top_for_render() {
-                draw_top_element(f, app, area);
+                draw_top_element(f, app, frame);
                 app.nav.replace_lifted(float);
             }
-            let box_area = centered_rect(
-                area,
-                max_width.resolve(area.width),
-                max_height.resolve(area.height),
-            );
-            f.render_widget(Clear, box_area);
-            // Clear only resets to the TERMINAL default, which is why the
-            // float had no background of its own and read as a hole punched
-            // in the view rather than a sheet laid over it. The old overlay
-            // renderer called this; the element path did not inherit it.
-            fill_dialog_bg(f.buffer_mut(), box_area, &app.ui.theme);
-            box_area
+            dialog_box(f, frame, max_width, max_height, &app.ui.theme)
         }
     };
 
-    draw_top_element(f, app, area);
-
-    // An overlay that claims the whole frame gets an ERASED frame. The view
-    // above still painted (it publishes the render geometry and the
-    // select-mode bit that the action layer reads back), but nothing of it
-    // may show through. Driven by the overlay's own declared extent, so the
-    // erase can't be forgotten by an individual renderer — and a renderer
-    // that paints only chrome can't leave the old view inside its border.
-    if app.ui.overlay().map(Overlay::extent) == Some(crate::app::OverlayExtent::FullFrame) {
-        f.render_widget(Clear, area);
-    }
+    draw_top_element(f, app, top_area);
 
     // The single modal slot, over whatever view is showing.
-    match &app.ui.overlay() {
-        Some(Overlay::ContainerSelect { target, choices, selected, .. }) => {
-            let names: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
-            let target = target.clone();
-            let sel = *selected;
-            draw_container_select(f, app, &target, &names, sel);
+    //
+    // Its area comes from the SAME `ViewExtent` a floating element declares,
+    // placed by the same `dialog_box`. The view above still painted (it
+    // publishes the render geometry and the select-mode bit the action layer
+    // reads back), but a `Full` takeover gets an erased frame, so nothing of
+    // it may show through — a renderer that paints only chrome cannot leave
+    // the old view inside its border. Erasing centrally is what stops that
+    // being re-remembered per renderer.
+    let takeover_area = match app.ui.takeover().map(TakeoverOp::extent) {
+        None => frame,
+        Some(crate::app::element::ViewExtent::Full) => {
+            f.render_widget(Clear, frame);
+            frame
         }
-        Some(Overlay::Edit { target, state }) => {
-            let kind = target.resource.display_label().to_string();
-            let name = target.name.clone();
-            let label = match state {
-                crate::app::EditState::AwaitingYaml => format!("Fetching YAML for {}/{}…", kind, name),
-                crate::app::EditState::EditorReady { .. } => format!("Launching editor for {}/{}…", kind, name),
-                crate::app::EditState::Applying { .. } => format!("Applying {}/{}…", kind, name),
-            };
-            draw_centered_overlay(f, &label, &app.ui.theme);
+        Some(crate::app::element::ViewExtent::Dialog { max_width, max_height }) => {
+            dialog_box(f, frame, max_width, max_height, &app.ui.theme)
         }
-        Some(Overlay::Shell(shell)) => {
-            views::shell::draw_shell(f, shell, area, &app.ui.theme, &app.ui.anim);
+    };
+    match &app.ui.takeover() {
+        Some(op @ TakeoverOp::Edit { .. }) => {
+            draw_takeover_label(f, &op.label(), takeover_area, &app.ui.theme);
+        }
+        Some(TakeoverOp::Shell(shell)) => {
+            views::shell::draw_shell(f, shell, takeover_area, &app.ui.theme, &app.ui.anim);
         }
         None => {}
     }
@@ -189,19 +180,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     //
     // Each arm names the call that renders it; every one of those calls
     // re-asks its own accessor further down, which is why this match can be
-    // empty. That indirection is exactly the problem it guards: `Overlay`
+    // empty. That indirection is exactly the problem it guards: `TakeoverOp`
     // has a wildcard-free dispatch in four places, `Modal` itself had one in
     // none, so a fifth variant would have been invisible on screen AND
     // unable to capture a key (see `try_handle_input_mode`'s fall-through).
     match app.ui.modal() {
         // draw_command_overlay below, or inline for the table kinds.
         crate::app::Modal::Command { .. } => {}
-        // draw_confirm_dialog below.
-        crate::app::Modal::Confirm(_) => {}
-        // draw_form_dialog below.
-        crate::app::Modal::Form(_) => {}
         // The overlay match above.
-        crate::app::Modal::Overlay(_) => {}
+        crate::app::Modal::Takeover(_) => {}
         crate::app::Modal::None => {}
     }
 
@@ -209,15 +196,34 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_flash(f, app);
 
     // Draw confirmation dialog if present
-    draw_confirm_dialog(f, app);
 
-    // Draw the generic form dialog if present (Scale, PortForward, …).
-    if let Some(dialog) = app.ui.form_dialog() {
-        let widget = FormDialogWidget::new(dialog, &app.ui.theme);
-        f.render_widget(widget, f.area());
-    }
+
 }
 
+
+/// Size, erase and back a centered dialog box, returning the rect its content
+/// draws into.
+///
+/// ONE authority for "where a floating thing goes and what is underneath it".
+/// `Clear` alone resets to the TERMINAL default, which is why a float with no
+/// background of its own read as a hole punched in the view rather than a
+/// sheet laid over it.
+pub(crate) fn dialog_box(
+    f: &mut Frame,
+    frame: ratatui::layout::Rect,
+    max_width: crate::app::element::Size,
+    max_height: crate::app::element::Size,
+    theme: &crate::ui::theme::Theme,
+) -> ratatui::layout::Rect {
+    let box_area = centered_rect(
+        frame,
+        max_width.resolve(frame.width),
+        max_height.resolve(frame.height),
+    );
+    f.render_widget(Clear, box_area);
+    fill_dialog_bg(f.buffer_mut(), box_area, theme);
+    box_area
+}
 
 /// The per-kind view dispatch, EXHAUSTIVE over element kinds. Extracted so a
 /// floating element can invoke it twice — once for the view it floats over,
@@ -237,34 +243,48 @@ fn draw_top_element(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         Element::LogSession(_) | Element::LogFilter(_) => {
             views::log::draw_logs(f, app, area);
         }
+        // The dialogs draw into the box the float path already sized,
+        // cleared and filled for them. The frame owns geometry; a widget
+        // owns content. Two centrings would be two authorities for one rect,
+        // which is how both of these were wrong the first time.
+        Element::Confirm(dialog) => {
+            f.render_widget(ConfirmDialogWidget::new(dialog, &app.ui.theme), area);
+        }
+        Element::Form(dialog) => {
+            f.render_widget(FormDialogWidget::new(dialog, &app.ui.theme), area);
+        }
+        Element::Picker(p) => {
+            let names: Vec<String> = p.choices.iter().map(|c| c.label.clone()).collect();
+            let (target, sel) = (p.target.clone(), p.selected);
+            draw_container_select(f, app, &target, &names, sel, area);
+        }
     }
 }
 
-/// Draw a single status line centered horizontally in the visible area.
-/// Used by the modal stages of the unified edit flow ("Fetching YAML…",
-/// "Launching editor…", "Applying…") to give the user feedback while the
-/// async pipeline runs.
-fn draw_centered_overlay(f: &mut Frame, label: &str, theme: &crate::ui::theme::Theme) {
-    use ratatui::widgets::Clear;
-    let area = f.area();
-    if area.height == 0 || area.width == 0 {
+/// Draw a takeover's one-line status into the box the extent already sized,
+/// cleared and backed for it — the edit flow's "Fetching YAML…", "Launching
+/// editor…", "Applying…".
+///
+/// It used to size and centre ITSELF from `f.area()`, which made it a second
+/// geometry authority beside the float path: the same mistake, in the same
+/// file, that `draw_top_element`'s dialog arms carry a comment about.
+fn draw_takeover_label(
+    f: &mut Frame,
+    label: &str,
+    rect: ratatui::layout::Rect,
+    theme: &crate::ui::theme::Theme,
+) {
+    if rect.height == 0 || rect.width == 0 {
         return;
     }
-    let len = label.chars().count() as u16;
-    let pad = 2u16;
-    let box_w = (len + pad * 2 + 2).min(area.width);
-    let box_h = 3u16.min(area.height);
-    let x = area.x + (area.width.saturating_sub(box_w)) / 2;
-    let y = area.y + (area.height.saturating_sub(box_h)) / 2;
-    let rect = ratatui::layout::Rect::new(x, y, box_w, box_h);
-    f.render_widget(Clear, rect);
     let block = ratatui::widgets::Block::bordered()
         .border_style(theme.dialog_border)
         .style(theme.dialog_bg);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     if inner.height > 0 && inner.width > 0 {
-        let line = Line::from(Span::styled(label, theme.info_value));
+        let len = label.chars().count() as u16;
+        let line = Line::from(Span::styled(label.to_string(), theme.info_value));
         let lx = inner.x + inner.width.saturating_sub(len) / 2;
         f.render_widget(line, ratatui::layout::Rect::new(lx, inner.y, inner.width, 1));
     }
@@ -299,41 +319,24 @@ fn draw_flash(f: &mut Frame, app: &App) {
 /// Draw the container selection overlay for multi-container pods. The
 /// container list was captured on the route at construction — the dialog
 /// is self-contained.
+/// Draw the picker into the box the float path already sized for it.
+///
+/// `area` IS the dialog — it no longer centres itself, because the frame
+/// owns geometry (`Element::extent`) and the widget owns content.
 fn draw_container_select(
     f: &mut Frame,
     app: &App,
     target: &crate::kube::protocol::ObjectRef,
     containers: &[String],
     selected_idx: usize,
+    area: ratatui::layout::Rect,
 ) {
-    use ratatui::layout::{Constraint, Layout, Rect};
+    use ratatui::layout::Rect;
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Clear};
 
     let theme = &app.ui.theme;
-    let area = f.area();
-
-    if containers.is_empty() {
-        return;
-    }
-
-    // Size the dialog
-    let max_name_len = containers.iter().map(|c| c.len()).max().unwrap_or(10);
-    let dialog_width = (max_name_len as u16 + 6).clamp(30, 60).min(area.width.saturating_sub(4));
-    let dialog_height = (containers.len() as u16 + 4).min(area.height.saturating_sub(4));
-
-    // Center the dialog
-    let vert = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(dialog_height),
-        Constraint::Fill(1),
-    ]).split(area);
-    let horiz = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(dialog_width),
-        Constraint::Fill(1),
-    ]).split(vert[1]);
-    let dialog_area = horiz[1];
+    let dialog_area = area;
 
     Clear.render(dialog_area, f.buffer_mut());
 
@@ -385,14 +388,6 @@ fn draw_container_select(
     f.render_widget(hint, Rect::new(inner.x, hint_y, inner.width, 1));
 }
 
-/// Draw the confirmation dialog overlay.
-fn draw_confirm_dialog(f: &mut Frame, app: &App) {
-    if let Some(dialog) = app.ui.confirm_dialog() {
-        let theme = &app.ui.theme;
-        let dialog_widget = ConfirmDialogWidget::new(dialog, theme);
-        f.render_widget(dialog_widget, f.area());
-    }
-}
 
 /// Draw the command prompt as an overlay at the bottom of the screen.
 /// Used for sub-views (logs, describe, yaml) where the resource view's

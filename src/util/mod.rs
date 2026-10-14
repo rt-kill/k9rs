@@ -1,4 +1,5 @@
 pub mod atomic_option;
+pub mod one_task;
 
 pub use atomic_option::AtomicOption;
 
@@ -687,47 +688,62 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
     false
 }
 
-/// Strip ANSI escape sequences from a string.
-/// Handles CSI sequences (ESC[...m), OSC sequences (ESC]...BEL/ST), and simple ESC sequences.
-pub fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // ESC character — consume the escape sequence
-            match chars.peek() {
-                Some('[') => {
-                    chars.next(); // consume '['
-                    // CSI sequence: consume until a letter (0x40-0x7E)
-                    while let Some(&nc) = chars.peek() {
-                        chars.next();
-                        if nc.is_ascii_alphabetic() || nc == '~' || nc == '@' {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next(); // consume ']'
-                    // OSC sequence: consume until BEL (\x07) or ST (ESC \)
-                    while let Some(&nc) = chars.peek() {
-                        chars.next();
-                        if nc == '\x07' { break; }
-                        if nc == '\x1b' {
-                            if chars.peek() == Some(&'\\') { chars.next(); }
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    // Simple ESC sequence — skip next char
-                    chars.next();
-                }
+/// THE visible text of a line: what the renderer's spans actually contain.
+///
+/// One definition, because there were four views of a log line and they
+/// disagreed. The filter matched raw `content` (escapes and all) while the
+/// screen showed this — so `/workers=` missed a line reading `workers=0`
+/// whenever the logger coloured the field name, because a reset sequence sat
+/// between the `s` and the `=`. Which patterns worked was decided by where a
+/// logger happened to put its colour codes.
+///
+/// Built on [`skip_ansi_escape`] — the SAME tokenizer [`parse_ansi_line`]
+/// uses — and dropping the same control characters `sanitize_terminal` does,
+/// so `visible_text(s)` equals the concatenation of `parse_ansi_line(s)` BY
+/// CONSTRUCTION rather than by coincidence. `visible_text_matches_the_spans`
+/// pins that; the `strip_ansi` this replaced could not make the claim,
+/// because its CSI rules were its own.
+///
+/// Keeps tabs, because the spans do. "What ratatui will DRAW" is a different
+/// question one layer down (`log_view::Units` drops them, since a grapheme
+/// containing a control char is never painted) — matching and layout are
+/// genuinely different spaces, and conflating them is how a tab-indented
+/// line measured one row wider than it drew.
+pub fn visible_text(s: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = s.as_bytes();
+    let needs_work = {
+        let mut i = 0usize;
+        loop {
+            if i >= bytes.len() {
+                break false;
             }
-        } else {
+            if skip_ansi_escape(bytes, i).is_some() {
+                break true;
+            }
+            let c = s[i..].chars().next().unwrap();
+            if c != '\t' && c.is_control() {
+                break true;
+            }
+            i += c.len_utf8();
+        }
+    };
+    if !needs_work {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_ansi_escape(bytes, i) {
+            i = next;
+            continue;
+        }
+        let c = s[i..].chars().next().unwrap();
+        i += c.len_utf8();
+        if c == '\t' || !c.is_control() {
             out.push(c);
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 /// Strip terminal control characters from cluster-controlled text before

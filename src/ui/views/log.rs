@@ -5,7 +5,7 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::kube::protocol::LogLine;
+use crate::app::store::StoredLine;
 use crate::ui::widgets::{LogFilterBar, LogViewer};
 
 /// Draw the log streaming view for the TOP element (LogSession or a
@@ -98,7 +98,7 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     // below, including the ones with no content at all.
     let visible_count = indices.len();
     let grep_bar =
-        LogFilterBar::new(filter_input_active, &filter_input, &committed, visible_count, theme)
+        LogFilterBar::new(filter_input_active, filter_input.value(), filter_input.cursor_col(), &committed, visible_count, theme)
             .fallback(grep_note.as_deref());
     let grep_height: u16 = if grep_bar.wants_row() { 1 } else { 0 };
 
@@ -153,7 +153,7 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
             if visible_count > 0 {
                 // Pass ALL visible lines; the widget windows PHYSICAL (wrap-
                 // expanded) rows from the offset and reports the extent back.
-                let all_lines: Vec<&LogLine> =
+                let all_lines: Vec<&StoredLine> =
                     indices.iter().filter_map(|&i| inner.lines.get(i)).collect();
                 let log_viewer = LogViewer::new(&all_lines, theme);
                 let mut view_state = crate::ui::widgets::LogViewState {
@@ -310,6 +310,6 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
 
     crate::ui::fill_line_bg(f, bar_area, theme.status_bar);
 
-    let line = crate::ui::header::render_keybinding_bar(&hints, theme);
+    let line = crate::ui::header::render_keybinding_bar(&hints, bar_area.width, theme);
     f.render_widget(line, bar_area);
 }

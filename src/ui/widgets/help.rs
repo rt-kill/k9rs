@@ -29,6 +29,11 @@ pub struct HelpContent {
     /// context-free dump had to describe `s` and `Ctrl-d` without saying
     /// which view it meant, so it was wrong in at least one of them.
     class: crate::event::keymap::ViewClass,
+    /// Whether the element `?` was pressed in has markable rows — the SAME
+    /// answer `Element::markable` gives the select gate, handed in rather
+    /// than re-derived from the capability manifest, so the screen and the
+    /// behaviour cannot disagree.
+    markable: bool,
 }
 
 impl HelpContent {
@@ -54,9 +59,10 @@ impl HelpContent {
         caps: Option<crate::kube::protocol::ResourceCapabilities>,
         keys: crate::app::KeysConfig,
         class: crate::event::keymap::ViewClass,
+        markable: bool,
     ) -> (Vec<String>, Vec<crate::kube::resources::row::ResourceRow>) {
         use crate::kube::resources::row::{CellValue, ResourceRow};
-        let tmp = HelpContent { caps, keys, class };
+        let tmp = HelpContent { caps, keys, class, markable };
         let mut rows = Vec::new();
         for section in tmp.sections() {
             for entry in section.entries {
@@ -111,7 +117,16 @@ impl HelpContent {
             sections.push(resource_actions);
         }
 
-        if self.class == keymap::ViewClass::Table {
+        // Marking is a per-ELEMENT answer, not a per-class one: a table whose
+        // resource declares no batch-capable operation is deliberately not
+        // markable (`Element::markable`, which is why the contexts view does
+        // not silently enter select mode). This section used to be gated on
+        // the class alone, so `?` on contexts documented four keys that do
+        // nothing — help lying, which is the one thing the keymap agreement
+        // test exists to prevent and the one surface it cannot see. The gate
+        // is now the SAME answer the select gate uses, handed in rather than
+        // re-derived, so the two cannot drift.
+        if self.markable {
             let mut entries = vec![
                 HelpEntry {
                     key: "Space".into(),
@@ -249,12 +264,19 @@ impl HelpContent {
                     });
                 }
             }
-            // Structural chords with no descriptor default. `op_key` returns
-            // `None` for these unless the user rebound them, in which case the
-            // loop above already listed the override.
-            if caps.supports(crate::kube::protocol::OperationKind::Delete)
-                && self.keys.op_key(&crate::kube::protocol::OperationKind::Delete).is_none()
-            {
+            // Structural chords with no descriptor default. These are
+            // matched in the handler on the CHORD, guarded only by whether
+            // the resource declares the operation — so rebinding `delete`
+            // ADDS a key, it does not move one, and all three are listed
+            // unconditionally.
+            //
+            // Delete used to be skipped when `op_key` returned `Some`, i.e.
+            // when the user had rebound it. That HID a working `Ctrl-d`:
+            // help showed only the override while the chord went on deleting
+            // things. Of the two directions to be wrong in, an undocumented
+            // destructive key is the worse one — and it made Delete
+            // inconsistent with the two siblings below, which were right.
+            if caps.supports(crate::kube::protocol::OperationKind::Delete) {
                 entries.push(HelpEntry { key: "Ctrl-d".into(), description: "Delete".into() });
             }
             if caps.supports(crate::kube::protocol::OperationKind::ForceKill) {

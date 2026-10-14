@@ -17,8 +17,10 @@
 //! access happens on the session task: the event loop applies stream
 //! events (each event CARRIES its destination store `Arc` — bridges never
 //! touch a store), key handlers toggle marks, and the renderer reads
-//! under [`RowStore::with_read`] on the same task. `try_lock().expect()`
-//! encodes the convention: contention is a bug to surface, never a wait.
+//! under [`RowStore::with_read`] on the same task. The convention is
+//! enforced by the lock itself — see [`crate::util::one_task`], which also
+//! says why one task (and not merely one at a time) is what the epoch floor
+//! and the delta tracker assume.
 //!
 //! # Metrics
 //!
@@ -30,7 +32,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, MutexGuard};
 
 use crate::app::table::TableDataState;
 use crate::app::types::DeltaTracker;
@@ -83,12 +85,34 @@ pub enum RowPredicate {
 }
 
 impl RowPredicate {
-    /// Whether `row` passes. `cells` are the row's *effective* (metrics-
-    /// overlaid) display strings, one per data column — greps match what
-    /// the user sees.
-    pub fn matches(&self, row: &ResourceRow, cells: &[String]) -> bool {
+    /// Whether `row` passes.
+    ///
+    /// `cells` are the row's *effective* (metrics-overlaid) strings, one per
+    /// DATA column; `visible` indexes the ones currently on screen.
+    ///
+    /// A bare grep scans only the visible ones, per cell. Two decisions,
+    /// both deliberate:
+    ///
+    /// - **Only what is displayed.** It used to scan every cell the row
+    ///   carried, so `/pimp` on a deployment list matched `CONTAINERS`,
+    ///   `IMAGES` and `LABELS` — columns hidden at the default level — and
+    ///   returned rows with no visible `pimp` anywhere. A match you cannot
+    ///   see is one you can neither predict nor check, and the convenience
+    ///   was luck: it happened to hit the column you meant. `Ctrl-w` now
+    ///   widens what you SEARCH as well as what you see, so the rule is one
+    ///   sentence and the evidence is always on screen.
+    /// - **Per cell, not per rendered row.** Never the painted line: that
+    ///   would let a pattern span the gap between two columns and match
+    ///   padding and truncation artefacts. The cell value is also the FULL
+    ///   one, not the width-clipped display string — eliding a value is a
+    ///   rendering accident, and a column you are looking at should be
+    ///   searchable whether or not it fits.
+    pub fn matches(&self, row: &ResourceRow, cells: &[String], visible: &[usize]) -> bool {
         match self {
-            RowPredicate::Grep(g) => cells.iter().any(|c| g.pattern().is_match(c)),
+            RowPredicate::Grep(g) => visible
+                .iter()
+                .filter_map(|&i| cells.get(i))
+                .any(|c| g.pattern().is_match(c)),
             RowPredicate::ColumnGrep { pattern, col, .. } => {
                 cells.get(*col).is_some_and(|c| pattern.pattern().is_match(c))
             }
@@ -142,7 +166,7 @@ pub struct RowStore {
     /// Lock-free data version: one `Acquire` load per frame decides
     /// cache-hit vs re-derive. Bumped by every content mutation.
     generation: AtomicU64,
-    inner: Mutex<RowStoreInner>,
+    inner: crate::util::one_task::OneTask<RowStoreInner>,
 }
 
 /// The store's contents. Reads happen through [`RowStore::with_read`];
@@ -199,7 +223,7 @@ impl RowStore {
             plural: plural.into(),
             client_owned,
             generation: AtomicU64::new(0),
-            inner: Mutex::new(RowStoreInner {
+            inner: crate::util::one_task::OneTask::new("RowStore", RowStoreInner {
                 rows: Vec::new(),
                 headers: Vec::new(),
                 column_rules: Vec::new(),
@@ -211,13 +235,12 @@ impl RowStore {
         })
     }
 
-    /// Single-writer convention, encoded: the session task is the only
-    /// toucher, so the lock is never contended. A wait here would mean a
-    /// second writer exists — surface it, don't hide it.
+    /// The single-toucher convention, enforced by the lock itself — see
+    /// [`crate::util::one_task`]. This used to be the FIFTH copy of the
+    /// `try_lock().expect("… convention violated")` line, and it caught only
+    /// the half of the rule where two touchers overlap in time.
     fn lock(&self) -> MutexGuard<'_, RowStoreInner> {
-        self.inner
-            .try_lock()
-            .expect("RowStore lock contended — single-writer (session task) convention violated")
+        self.inner.lock()
     }
 
     /// Current data version. One atomic load; no lock.
@@ -548,11 +571,24 @@ impl RowSource {
 /// Latest metrics-server usage, replaced wholesale per poll. `None` maps
 /// mean "never polled" — distinct from "polled, currently empty", which
 /// blanks absent nodes to n/a (the poller answered; missing means gone).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MetricsHub {
     version: AtomicU64,
-    pods: Mutex<Option<HashMap<ObjectKey, MetricsUsage>>>,
-    nodes: Mutex<Option<HashMap<NodeName, MetricsUsage>>>,
+    pods: crate::util::one_task::OneTask<Option<HashMap<ObjectKey, MetricsUsage>>>,
+    nodes: crate::util::one_task::OneTask<Option<HashMap<NodeName, MetricsUsage>>>,
+}
+
+impl Default for MetricsHub {
+    fn default() -> Self {
+        // Hand-written rather than derived: each slot carries the name that
+        // goes in the panic, and a `Default` that named neither would make
+        // the two indistinguishable in the one message that matters.
+        Self {
+            version: AtomicU64::new(0),
+            pods: crate::util::one_task::OneTask::new("MetricsHub::pods", None),
+            nodes: crate::util::one_task::OneTask::new("MetricsHub::nodes", None),
+        }
+    }
 }
 
 impl MetricsHub {
@@ -566,7 +602,7 @@ impl MetricsHub {
     }
 
     pub fn set_pods(&self, usage: HashMap<ObjectKey, MetricsUsage>) {
-        let mut slot = self.pods.try_lock().expect("MetricsHub: single-writer convention violated");
+        let mut slot = self.pods.lock();
         // Skip the version bump when the map is unchanged: the bump
         // invalidates every pods-table view memo, forcing a full
         // O(rows×cols) re-derive on the next paint. A 30s metrics poll on
@@ -580,7 +616,7 @@ impl MetricsHub {
     }
 
     pub fn set_nodes(&self, usage: HashMap<NodeName, MetricsUsage>) {
-        let mut slot = self.nodes.try_lock().expect("MetricsHub: single-writer convention violated");
+        let mut slot = self.nodes.lock();
         if slot.as_ref() == Some(&usage) {
             return;
         }
@@ -590,8 +626,8 @@ impl MetricsHub {
 
     /// Context switch: all usage is stale, back to never-polled.
     pub fn clear(&self) {
-        *self.pods.try_lock().expect("MetricsHub: single-writer convention violated") = None;
-        *self.nodes.try_lock().expect("MetricsHub: single-writer convention violated") = None;
+        *self.pods.lock() = None;
+        *self.nodes.lock() = None;
         self.version.fetch_add(1, Ordering::Release);
     }
 }
@@ -674,11 +710,11 @@ impl MetricsBinding {
     pub fn lens(&self) -> MetricsLens<'_> {
         match self.cols {
             MetricsCols::Pod(cols) => MetricsLens(LensInner::Pods {
-                map: self.hub.pods.try_lock().expect("MetricsHub: lens while writing"),
+                map: self.hub.pods.lock(),
                 cols,
             }),
             MetricsCols::Node(cols) => MetricsLens(LensInner::Nodes {
-                map: self.hub.nodes.try_lock().expect("MetricsHub: lens while writing"),
+                map: self.hub.nodes.lock(),
                 cols,
             }),
         }
@@ -850,7 +886,7 @@ pub fn derive_view(
 ) -> PreparedView {
     // Steps 1–3 — the IDENTITY half (shared with `derive_key_order`, the
     // selection fallback): effective strings, filter, sort.
-    let (order, mut eff) = filter_and_sort(rows_in, metrics, spec.predicates, spec.draft, spec.sort);
+    let (order, mut eff) = filter_and_sort(rows_in, metrics, spec.predicates, spec.draft, spec.sort, spec.visible_cols);
     let has_filter = !spec.predicates.is_empty() || spec.draft.is_some();
 
     // 4. Materialize the VISIBLE cells in screen order. When `eff` exists
@@ -892,7 +928,7 @@ pub fn derive_view(
                 .iter()
                 .zip(row_strs.iter())
                 .map(|(&ci, cell_str)| {
-                    // 1. Overlay column rules — only for cells that exist
+                    // 1. TakeoverOp column rules — only for cells that exist
                     //    (a missing cell's empty placeholder must not match).
                     if let Some(rules) = column_rules.get(ci) {
                         if row.cells.get(ci).is_some() {
@@ -971,6 +1007,8 @@ fn filter_and_sort(
     predicates: &[Arc<RowPredicate>],
     draft: Option<&SearchPattern>,
     sort: SortSpec,
+    // `visible`: the data columns currently on screen — what a bare grep may scan.
+    visible: &[usize],
 ) -> (Vec<usize>, Vec<Vec<String>>) {
     // 1. Effective strings for EVERY cell — needed ONLY when a filter must
     //    scan all columns. In the default browse state (no predicate, no
@@ -992,8 +1030,17 @@ fn filter_and_sort(
             .filter(|&i| {
                 let row = &rows_in[i];
                 let strings = &eff[i];
-                predicates.iter().all(|p| p.matches(row, strings))
-                    && draft.is_none_or(|d| strings.iter().any(|c| d.is_match(c)))
+                predicates.iter().all(|p| p.matches(row, strings, visible))
+                    // The DRAFT scans the same columns as a committed grep.
+                    // It used to scan every cell, so a pattern matched while
+                    // you typed it and then lost rows the moment you pressed
+                    // Enter — the two paths disagreeing about their own rule.
+                    && draft.is_none_or(|d| {
+                        visible
+                            .iter()
+                            .filter_map(|&i| strings.get(i))
+                            .any(|c| d.is_match(c))
+                    })
             })
             .collect()
     } else {
@@ -1024,18 +1071,23 @@ fn filter_and_sort(
 
 /// The row-identity order a derive over these inputs would produce —
 /// `derive_view`'s `keys`, without materializing any presentation.
-/// Selection reads fall back to this when no painted view exists (the
-/// memo is dropped on cover and absent on fresh elements): since
-/// presentation params never influence WHICH rows show or their order,
-/// the fallback resolves exactly what the next paint will show.
+/// Selection reads fall back to this when no painted view exists (the memo
+/// is dropped on cover and absent on fresh elements).
+///
+/// It used to say presentation never influences which rows show. That
+/// stopped being true when a bare grep was restricted to the DISPLAYED
+/// columns: the visible set is now an input, and the caller passes the level
+/// the last derive used (`TableInteraction::derived_level`) so this still
+/// resolves exactly what the next paint will.
 pub fn derive_key_order(
     rows_in: &[ResourceRow],
     metrics: Option<&MetricsLens<'_>>,
     predicates: &[Arc<RowPredicate>],
     draft: Option<&SearchPattern>,
     sort: SortSpec,
+    visible: &[usize],
 ) -> Vec<ObjectKey> {
-    let (order, _) = filter_and_sort(rows_in, metrics, predicates, draft, sort);
+    let (order, _) = filter_and_sort(rows_in, metrics, predicates, draft, sort, visible);
     order.iter().map(|&i| row_key(&rows_in[i])).collect()
 }
 
@@ -1069,6 +1121,121 @@ fn column_widths(headers: &[&str], rows: &[Vec<String>], max_col_widths: &[u16])
 // LineStore — one live log stream's buffer (the log analogue of RowStore)
 // ---------------------------------------------------------------------------
 
+/// A log line as the CLIENT holds it: the wire line, plus the one form every
+/// consumer derives from it.
+///
+/// [`LogLine`](crate::kube::protocol::LogLine) is a wire message — `content`
+/// is exactly the bytes the workload wrote, ANSI and all. Almost nothing on
+/// the client wants those bytes: the grep, the highlight offsets, the width
+/// measurement and the export all want the VISIBLE text, and each of them
+/// used to derive it again at the point of use. That is how `/workers=` came
+/// to miss a line reading `workers=0` — one call site out of four was still
+/// matching the raw form, and which patterns worked was decided by where a
+/// logger happened to put its colour codes.
+///
+/// So the store's element is the PAIR, built once on arrival:
+///
+/// - A line cannot be held here without its visible text, so forgetting to
+///   derive it is unexpressable rather than merely discouraged.
+/// - A stored line never changes, so the derivation has no invalidation rule
+///   to get wrong. This is a materialization, not a cache.
+/// - It was also several allocations per line per frame for a value that
+///   cannot change. Measuring a wrapped 50,000-line buffer cost 49 ms a
+///   frame, nearly all of it re-deriving this.
+///
+/// [`Deref`](std::ops::Deref) to the wire line, because a stored line IS one
+/// — `source`, `timestamp` and `content` are read exactly as before. The two
+/// projections that need the derived body ([`Self::segments`],
+/// [`Self::flat_text`]) live HERE and only here, so there is no bare-
+/// `LogLine` spelling of either to reach for by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLine {
+    line: crate::kube::protocol::LogLine,
+    /// `None` when `line.content` IS its own visible text — the common case
+    /// for a logger that does not colour, and no second copy for it.
+    visible: Option<String>,
+}
+
+impl std::ops::Deref for StoredLine {
+    type Target = crate::kube::protocol::LogLine;
+    fn deref(&self) -> &Self::Target {
+        &self.line
+    }
+}
+
+impl From<crate::kube::protocol::LogLine> for StoredLine {
+    fn from(line: crate::kube::protocol::LogLine) -> Self {
+        let visible = match crate::util::visible_text(&line.content) {
+            // The raw content already IS its visible text.
+            std::borrow::Cow::Borrowed(_) => None,
+            std::borrow::Cow::Owned(cleaned) => Some(cleaned),
+        };
+        Self { line, visible }
+    }
+}
+
+impl StoredLine {
+    /// What the screen shows for the body — and therefore the offset space a
+    /// pattern matches in and a highlight indexes. Equals the concatenation
+    /// of the renderer's spans by construction; see
+    /// [`crate::util::visible_text`].
+    pub fn visible(&self) -> &str {
+        self.visible.as_deref().unwrap_or(&self.line.content)
+    }
+
+    /// This line's parts, in render order, with the separator each carries.
+    ///
+    /// Borrowed throughout — this is a projection, not a second copy. The
+    /// measurer, the renderer and both matchers consume THIS, so none of
+    /// them can disagree with another about which parts a line has or what
+    /// text they hold.
+    pub fn segments(
+        &self,
+    ) -> impl Iterator<Item = (crate::kube::protocol::Role, &str, &'static str)> {
+        use crate::kube::protocol::Role;
+        [
+            self.line.source.as_deref().map(|t| (Role::Source, t, " ")),
+            self.line.timestamp.as_deref().map(|t| (Role::Timestamp, t, " ")),
+            // The BODY is the only part carrying the workload's own ANSI,
+            // and what it yields is the VISIBLE text. So a grep matches what
+            // is on screen, a highlight lands on the glyphs it meant, and an
+            // export carries the same characters.
+            Some((Role::Body, self.visible(), "")),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// Flat text form for clipboard / file export.
+    ///
+    /// Export carries the SUBSTANCE of a line, not a transcript of the cells
+    /// it was drawn in: both pieces of provenance ride along regardless of
+    /// what the display toggles are showing, because `t` governs how much of
+    /// a 97-column terminal the chrome may eat — a question that has no
+    /// meaning in a file. The same rule that keeps the export from being
+    /// truncated to the visible window keeps it from being thinned to the
+    /// visible fields.
+    ///
+    /// The body is the line's VISIBLE text: colour is chrome, and a file is
+    /// not a terminal. This used to be the callers' job (all three said
+    /// `strip_ansi(&l.flat_text())`, through a tokenizer that was not the
+    /// renderer's), which meant the fourth call site would have decided
+    /// again.
+    ///
+    /// It also used to include the source and drop the timestamp, which was
+    /// not a decision — it predates `timestamp` being a typed field at all,
+    /// so it carried one half of the provenance and silently lost the other.
+    pub fn flat_text(&self) -> std::borrow::Cow<'_, str> {
+        let body = self.visible();
+        match (&self.line.timestamp, &self.line.source) {
+            (Some(ts), Some(c)) => std::borrow::Cow::Owned(format!("{} [{}] {}", ts, c, body)),
+            (Some(ts), None) => std::borrow::Cow::Owned(format!("{} {}", ts, body)),
+            (None, Some(c)) => std::borrow::Cow::Owned(format!("[{}] {}", c, body)),
+            (None, None) => std::borrow::Cow::Borrowed(body),
+        }
+    }
+}
+
 /// One live log stream's line buffer. Owned strongly by the `LogSession`
 /// element; shared (via `Arc`) with `LogFilter` children and queued
 /// events. Same single-writer/lock discipline as [`RowStore`]; same
@@ -1078,7 +1245,7 @@ fn column_widths(headers: &[&str], rows: &[Vec<String>], max_col_widths: &[u16])
 #[derive(Debug)]
 pub struct LineStore {
     generation: AtomicU64,
-    inner: Mutex<LineStoreInner>,
+    inner: crate::util::one_task::OneTask<LineStoreInner>,
 }
 
 /// Which END of an over-long stream a store keeps.
@@ -1099,8 +1266,8 @@ pub enum Retain {
 
 #[derive(Debug)]
 pub struct LineStoreInner {
-    /// Ring of typed log lines, bounded by `max_lines`.
-    pub lines: std::collections::VecDeque<crate::kube::protocol::LogLine>,
+    /// Ring of materialized log lines, bounded by `max_lines`.
+    pub lines: std::collections::VecDeque<StoredLine>,
     max_lines: usize,
     retain: Retain,
     /// Arrivals dropped because a `Head` store was already full — reported,
@@ -1147,7 +1314,7 @@ impl LineStore {
     pub fn new(max_lines: usize) -> Arc<Self> {
         Arc::new(Self {
             generation: AtomicU64::new(0),
-            inner: Mutex::new(LineStoreInner {
+            inner: crate::util::one_task::OneTask::new("LineStore", LineStoreInner {
                 lines: std::collections::VecDeque::new(),
                 max_lines,
                 retain: Retain::Tail,
@@ -1161,10 +1328,9 @@ impl LineStore {
         })
     }
 
+    /// Same convention, same enforcement — see [`crate::util::one_task`].
     fn lock(&self) -> MutexGuard<'_, LineStoreInner> {
-        self.inner
-            .try_lock()
-            .expect("LineStore lock contended — single-writer (session task) convention violated")
+        self.inner.lock()
     }
 
     pub fn generation(&self) -> u64 {
@@ -1209,7 +1375,7 @@ impl LineStore {
     /// Append a batch of already-matched lines (a derived store's drain).
     /// Epoch-free: a derived store has exactly one producer, the element
     /// that owns it, so there is no succession to gate.
-    pub fn extend_derived(&self, lines: impl IntoIterator<Item = crate::kube::protocol::LogLine>) {
+    pub fn extend_derived(&self, lines: impl IntoIterator<Item = StoredLine>) {
         let mut inner = self.lock();
         let mut added = false;
         for line in lines {
@@ -1285,7 +1451,9 @@ impl LineStore {
                 inner.sources.push(src.clone());
             }
         }
-        inner.lines.push_back(line);
+        // ARRIVAL: the one place a wire line becomes a stored one, so the
+        // derivation happens exactly once per line in its whole lifetime.
+        inner.lines.push_back(StoredLine::from(line));
         inner.live = true;
         drop(inner);
         self.bump();

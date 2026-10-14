@@ -1589,11 +1589,6 @@ pub struct LogInit {
 /// - `LogContainer` gains `Set(Vec<String>)`: the marked containers of one
 ///   pod, streamed one apiece and merged.
 ///
-/// v16: `LogLine` gains `timestamp: Option<String>`. The daemon now passes
-/// `--timestamps` / `timestamps: true` and splits the kubelet's stamp off
-/// itself, because the renderer's heuristic was scoring application text and
-/// deleting it from the body when timestamps were toggled off.
-///
 /// v15: the reverse lookup stops being a guess.
 /// - `ResourceRow` gains `references: Vec<ResourceRefInfo>` — the objects a
 ///   pod's spec NAMES (claims, secrets, configmaps, its service account),
@@ -1604,6 +1599,11 @@ pub struct LogInit {
 ///   resource's NAME and call the result "pods referencing X".
 /// - `K8sFieldSelector::InvolvedObject` (appended) carries the `E` drill —
 ///   the events ABOUT one object.
+///
+/// v16: `LogLine` gains `timestamp: Option<String>`. The daemon now passes
+/// `--timestamps` / `timestamps: true` and splits the kubelet's stamp off
+/// itself, because the renderer's heuristic was scoring application text and
+/// deleting it from the body when timestamps were toggled off.
 pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Handshake magic — "K9RS" as a big-endian u32. Doubles as a poison
@@ -1944,6 +1944,11 @@ pub struct LogLine {
 /// renderer, which is why `show_source` appears as the identical
 /// `then_some(..).flatten()` in both, with a test pinning that the two copies
 /// agree.
+///
+/// The roles are declared here because they ARE the wire fields. The
+/// PROJECTION of a line into them lives with the stored line
+/// (`app::store::StoredLine::segments`), because the body it yields is the
+/// derived visible text and only the client has that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     /// The daemon's tag for where the line came from. Only present when more
@@ -1992,22 +1997,6 @@ impl Role {
     }
 }
 
-/// One line's parts, in render order, with the separator each carries.
-///
-/// Borrowed from the line — this is a projection, not a second copy. It is
-/// the seam the eventual materialize-on-arrival slots into: the roles and
-/// their order stay exactly as they are, only `text` stops being derived per
-/// frame.
-pub fn segments(line: &LogLine) -> impl Iterator<Item = (Role, &str, &'static str)> {
-    [
-        line.source.as_deref().map(|t| (Role::Source, t, " ")),
-        line.timestamp.as_deref().map(|t| (Role::Timestamp, t, " ")),
-        Some((Role::Body, line.content.as_str(), "")),
-    ]
-    .into_iter()
-    .flatten()
-}
-
 impl LogLine {
     /// A line from a single-source stream — no per-line tag, and no stamp
     /// (this is k9rs speaking, not the workload).
@@ -2032,28 +2021,6 @@ impl LogLine {
         }
     }
 
-    /// Flat text form for clipboard / file export.
-    ///
-    /// Export carries the SUBSTANCE of a line, not a transcript of the cells
-    /// it was drawn in: both pieces of provenance ride along regardless of
-    /// what the display toggles are showing, because `t` and `p` govern how
-    /// much of a 97-column terminal the chrome may eat — a question that has
-    /// no meaning in a file. The same rule that keeps the export from being
-    /// truncated to the visible window keeps it from being thinned to the
-    /// visible fields.
-    ///
-    /// It used to include the source and drop the timestamp, which was not a
-    /// decision — `flat_text` predates `timestamp` being a typed field at
-    /// all, so it carried one half of the provenance and silently lost the
-    /// other.
-    pub fn flat_text(&self) -> std::borrow::Cow<'_, str> {
-        match (&self.timestamp, &self.source) {
-            (Some(ts), Some(c)) => std::borrow::Cow::Owned(format!("{} [{}] {}", ts, c, self.content)),
-            (Some(ts), None) => std::borrow::Cow::Owned(format!("{} {}", ts, self.content)),
-            (None, Some(c)) => std::borrow::Cow::Owned(format!("[{}] {}", c, self.content)),
-            (None, None) => std::borrow::Cow::Borrowed(&self.content),
-        }
-    }
 }
 
 /// What a log stream is OVER.

@@ -112,7 +112,7 @@
 
     #[test]
     fn build_column_rules_missing_column_is_empty() {
-        // Overlay references a column that doesn't exist in headers.
+        // TakeoverOp references a column that doesn't exist in headers.
         let headers = vec!["NAME".to_string(), "STATUS".to_string()];
         let rules = build_column_rules(&headers, "nonexistent-resource");
         // No overlay for this resource → all rules empty.
@@ -151,7 +151,7 @@ coloring:
         assert_eq!(overlay.coloring.len(), 1);
     }
 
-    // -- Overlay key canonicalization -------------------------------------------
+    // -- TakeoverOp key canonicalization -------------------------------------------
 
     /// An overlay written against an ALIAS must attach to the resource.
     ///

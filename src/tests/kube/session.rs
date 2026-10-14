@@ -274,7 +274,7 @@ fn a_bare_esc_not_followed_by_an_introducer_is_still_real() {
 /// `handle_help_view_keys` at all: the overlay cannot be closed.
 #[test]
 fn a_modal_with_a_key_handler_is_not_swallowed_before_reaching_it() {
-    use crate::app::{Modal, Overlay, TextKey};
+    use crate::app::{Modal, TakeoverOp, TextKey};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -288,57 +288,47 @@ fn a_modal_with_a_key_handler_is_not_swallowed_before_reaching_it() {
     let modals: Vec<(&str, Modal)> = vec![
         (
             "help",
-            Modal::Overlay(Overlay::ContainerSelect {
-                target: target.clone(),
-                choices: vec![crate::app::ContainerChoice {
-                    label: "web".into(),
-                    container: crate::kube::protocol::LogContainer::Named("web".into()),
-                }],
-                selected: 0,
-                action: crate::app::ContainerAction::Logs,
-            }),
+            Modal::Takeover(TakeoverOp::Edit {
+            target: crate::kube::protocol::ObjectRef::new(
+                crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                "p".to_string(),
+                crate::kube::protocol::Namespace::Named("default".to_string()),
+            ),
+            state: crate::app::EditState::AwaitingYaml,
+        }),
         ),
         (
             "container picker",
-            Modal::Overlay(Overlay::ContainerSelect {
-                target: target.clone(),
-                choices: vec![crate::app::ContainerChoice {
-                    label: "web".into(),
-                    container: crate::kube::protocol::LogContainer::Named("web".into()),
-                }],
-                selected: 0,
-                action: crate::app::ContainerAction::Logs,
-            }),
+            Modal::Takeover(TakeoverOp::Edit {
+            target: crate::kube::protocol::ObjectRef::new(
+                crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                "p".to_string(),
+                crate::kube::protocol::Namespace::Named("default".to_string()),
+            ),
+            state: crate::app::EditState::AwaitingYaml,
+        }),
         ),
         (
             "edit flow",
-            Modal::Overlay(Overlay::Edit {
+            Modal::Takeover(TakeoverOp::Edit {
                 target: target.clone(),
                 state: crate::app::EditState::AwaitingYaml,
             }),
         ),
         (
             "shell connect",
-            Modal::Overlay(Overlay::Shell(Box::new(crate::app::ShellState {
+            Modal::Takeover(TakeoverOp::Shell(Box::new(crate::app::ShellState {
                 title: "p".to_string(),
                 stream: None,
                 connect_state: crate::app::ShellConnectState::Connecting,
                 pending_output: Vec::new(),
             }))),
         ),
-        (
-            "delete confirmation",
-            Modal::Confirm(crate::app::ConfirmDialog {
-                message: "Delete pod p?".to_string(),
-                action_label: "Delete".to_string(),
-                pending: crate::app::PendingAction::Single {
-                    op: crate::app::SingleOp::Delete,
-                    target,
-                },
-                action_focused: false,
-            }),
-        ),
+        // The delete confirmation used to be here. It is a nav ELEMENT now,
+        // so it is not routed through the modal slot at all — its keys go
+        // through the ordinary per-kind dispatch, which is the whole point.
     ];
+    let _ = target;
 
     for (name, modal) in modals {
         let mut app = App::new_for_test();
@@ -360,7 +350,7 @@ fn a_modal_with_a_key_handler_is_not_swallowed_before_reaching_it() {
         assert!(!super::handle_log_filter_key(&mut app, tk), "{name}");
         let tk = TextKey::new(esc).unwrap();
         assert!(!super::handle_content_search_key(&mut app, tk), "{name}");
-        assert!(app.ui.form_dialog().is_none(), "{name}");
+        assert!(!matches!(app.nav.top(), crate::app::element::Element::Form(_)), "{name}");
 
         assert!(
             !app.ui.modal_without_key_handler(),
