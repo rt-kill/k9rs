@@ -119,14 +119,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Driven by the element's OWN declared extent, the same rule the overlay
     // slot follows, so neither the erase nor the parent paint can be
     // forgotten by an individual view.
-    let top_area = match app.nav.top().extent() {
+    // Warm the top element's view memo BEFORE asking its extent: a table
+    // dialog sizes its box from the same `col_widths` the renderer lays out
+    // with, and a cold memo would have it answer "no opinion" on the one
+    // frame that opens it. Cheap — `view()` returns the memo when warm, and
+    // the action path warms it too.
+    app.nav
+        .top_mut()
+        .ensure_view_cached(app.ui.column_level, app.config.ui.max_column_width);
+    let top_area = match app.nav.top().extent(frame) {
         crate::app::element::ViewExtent::Full => frame,
-        crate::app::element::ViewExtent::Dialog { max_width, max_height } => {
+        crate::app::element::ViewExtent::Dialog { width, height } => {
             if let Some(float) = app.nav.lift_top_for_render() {
                 draw_top_element(f, app, frame);
                 app.nav.replace_lifted(float);
             }
-            dialog_box(f, frame, max_width, max_height, &app.ui.theme)
+            dialog_box(f, frame, width, height, &app.ui.theme)
         }
     };
 
@@ -141,14 +149,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // it may show through — a renderer that paints only chrome cannot leave
     // the old view inside its border. Erasing centrally is what stops that
     // being re-remembered per renderer.
-    let takeover_area = match app.ui.takeover().map(TakeoverOp::extent) {
+    let takeover_area = match app.ui.takeover().map(|op| op.extent(frame)) {
         None => frame,
         Some(crate::app::element::ViewExtent::Full) => {
             f.render_widget(Clear, frame);
             frame
         }
-        Some(crate::app::element::ViewExtent::Dialog { max_width, max_height }) => {
-            dialog_box(f, frame, max_width, max_height, &app.ui.theme)
+        Some(crate::app::element::ViewExtent::Dialog { width, height }) => {
+            dialog_box(f, frame, width, height, &app.ui.theme)
         }
     };
     match &app.ui.takeover() {
@@ -211,15 +219,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 pub(crate) fn dialog_box(
     f: &mut Frame,
     frame: ratatui::layout::Rect,
-    max_width: crate::app::element::Size,
-    max_height: crate::app::element::Size,
+    width: u16,
+    height: u16,
     theme: &crate::ui::theme::Theme,
 ) -> ratatui::layout::Rect {
-    let box_area = centered_rect(
-        frame,
-        max_width.resolve(frame.width),
-        max_height.resolve(frame.height),
-    );
+    let box_area = centered_rect(frame, width, height);
     f.render_widget(Clear, box_area);
     fill_dialog_bg(f.buffer_mut(), box_area, theme);
     box_area
@@ -422,16 +426,26 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
 
     let prefix = app.ui.command_prompt();
     let prefix_len: u16 = prefix.width() as u16;
-    let typed_len = input.width() as u16;
+
+    // WINDOWED around the caret: a command longer than the box used to clip
+    // AND lose its caret (`if cursor_x < inner.width`), so you typed blind.
+    let avail = (inner.width as usize).saturating_sub(prefix_len as usize);
+    let (shown, caret_col) = match app.ui.command_text() {
+        Some(t) => t.window(avail),
+        None => (input, input.width()),
+    };
 
     let mut spans = vec![
         Span::styled(prefix, theme.command.add_modifier(Modifier::BOLD)),
-        Span::styled(input, theme.command),
+        Span::styled(shown.to_string(), theme.command),
     ];
 
-    if !ghost.is_empty() {
+    // The ghost is a HINT, so it takes only what the input left over — it
+    // must never push the caret off, nor get clipped without being bounded.
+    let left = avail.saturating_sub(shown.width());
+    if !ghost.is_empty() && left > 0 {
         spans.push(Span::styled(
-            ghost,
+            crate::util::truncate(&ghost, left),
             theme.command_suggestion.add_modifier(Modifier::DIM | Modifier::ITALIC),
         ));
     }
@@ -439,12 +453,9 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
     let line = Line::from(spans);
     f.render_widget(line, inner);
 
-    // Place terminal cursor
-    let cursor_x = inner.x + prefix_len + typed_len;
-    let cursor_y = inner.y;
-    if cursor_x < inner.x + inner.width {
-        f.set_cursor_position((cursor_x, cursor_y));
-    }
+    // The caret is INSIDE the window by construction, so there is nothing
+    // left to guard against.
+    f.set_cursor_position((inner.x + prefix_len + caret_col as u16, inner.y));
 }
 
 /// Draw the filter bar as an overlay at the bottom of the screen.

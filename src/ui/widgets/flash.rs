@@ -39,10 +39,20 @@ impl Widget for FlashWidget<'_> {
             buf.set_string(area.x + dx, area.y, " ", style);
         }
 
-        // Center-align flash text using display width (not byte length)
+        // Centred when it fits; LEFT-ALIGNED and visibly cut when it does
+        // not. Centring a message wider than the line put `start_x` at the
+        // left edge and let `set_line` clip the right, so a long error lost
+        // its TAIL in silence — and the tail of an error is usually the part
+        // that names the cause. Truncating here marks the cut with `…`, and
+        // the whole message is still in the daemon log.
         let content = format!("{}{}", prefix, self.message.message);
-        let content_width = content.width() as u16;
-        let start_x = area.x + area.width.saturating_sub(content_width) / 2;
+        let width = area.width as usize;
+        let (content, start_x) = if content.width() <= width {
+            let pad = area.width.saturating_sub(content.width() as u16) / 2;
+            (content, area.x + pad)
+        } else {
+            (crate::util::truncate(&content, width), area.x)
+        };
 
         let line = Line::from(Span::styled(content, style));
         buf.set_line(start_x, area.y, &line, area.width.saturating_sub(start_x - area.x));

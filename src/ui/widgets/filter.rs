@@ -140,18 +140,31 @@ impl Widget for LogFilterBar<'_> {
             // Split at the caret and draw the block between the halves. The
             // split is by COLUMNS, walked as graphemes, so it lands on a
             // character boundary whatever the pattern contains.
+            //
+            // WINDOWED first: a long committed chain pushes the draft right,
+            // and the line is clipped at the bar's edge — so what you were
+            // typing, caret and all, could be off screen while you typed it.
+            // The chain is context; the draft is the thing in your hands.
+            let used: usize = spans
+                .iter()
+                .map(|sp| unicode_width::UnicodeWidthStr::width(sp.content.as_ref()))
+                .sum();
+            // `- 1` for the caret block itself.
+            let avail = (area.width as usize).saturating_sub(used).saturating_sub(1);
+            let (draft, caret_col) =
+                crate::util::window_around(self.draft, self.caret_col, avail);
             let mut col = 0usize;
-            let mut at = self.draft.len();
-            for (i, g) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(self.draft, true) {
-                if col >= self.caret_col {
+            let mut at = draft.len();
+            for (i, g) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(draft, true) {
+                if col >= caret_col {
                     at = i;
                     break;
                 }
                 col += unicode_width::UnicodeWidthStr::width(g);
             }
-            spans.push(Span::styled(self.draft[..at].to_string(), self.theme.filter));
+            spans.push(Span::styled(draft[..at].to_string(), self.theme.filter));
             spans.push(Span::styled("\u{2588}", self.theme.filter));
-            spans.push(Span::styled(self.draft[at..].to_string(), self.theme.filter));
+            spans.push(Span::styled(draft[at..].to_string(), self.theme.filter));
         }
         // A visible-line count is meaningless while the pattern isn't the one
         // you wrote, so the reason takes its place rather than sitting beside

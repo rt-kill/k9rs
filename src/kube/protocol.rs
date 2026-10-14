@@ -1097,6 +1097,46 @@ impl OperationKind {
     // NOT live here — it's `impl From<&OperationKind> for Action` in
     // `app::actions`, so this wire module never depends on client types.
 
+    /// The fixed chord that reaches this operation when it has no
+    /// descriptor default key — `None` for everything that does.
+    ///
+    /// Three operations are structural: `Delete`, `ForceKill` and
+    /// `PortForward` are destructive or modal enough that they are NOT on a
+    /// bare letter. Their chords were written as the strings `"Ctrl-d"`,
+    /// `"Ctrl-k"` and `"Shift-F"` in two places in `help.rs` AND matched
+    /// separately in `event::handler` — three copies of one fact, none of
+    /// them the authority, and `Shift-F` was the one the handler did not
+    /// gate on the resource declaring the operation at all.
+    ///
+    /// Returned as a [`KeyCombo`](crate::app::KeyCombo) rather than a
+    /// string so the handler can compare against a key event and help can
+    /// print it, from the same declaration.
+    pub fn structural_chord(&self) -> Option<crate::app::KeyCombo> {
+        use crate::app::KeyCombo;
+        match self {
+            OperationKind::Delete => Some(KeyCombo { ctrl: true, ch: 'd' }),
+            OperationKind::ForceKill => Some(KeyCombo { ctrl: true, ch: 'k' }),
+            OperationKind::PortForward => Some(KeyCombo::plain('F')),
+            // Everything else is reached by its descriptor's default key, or
+            // by a chord the user configured. EXHAUSTIVE deliberately: a new
+            // operation has to say which it is.
+            OperationKind::Describe
+            | OperationKind::Yaml
+            | OperationKind::Scale
+            | OperationKind::StreamLogs
+            | OperationKind::PreviousLogs
+            | OperationKind::Shell
+            | OperationKind::Restart
+            | OperationKind::ShowNode
+            | OperationKind::NodeShell
+            | OperationKind::DecodeSecret
+            | OperationKind::TriggerCronJob
+            | OperationKind::ToggleSuspendCronJob
+            | OperationKind::Apply
+            | OperationKind::Custom(_) => None,
+        }
+    }
+
     /// Batch stance: whether this operation may act on the MARKED SET
     /// (select mode) or is inherently single-target. Static manifest like
     /// [`Self::form_schema`] / [`Self::exec_template`] — NOT a wire type.

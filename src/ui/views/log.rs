@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    text::{Line, Span},
+    text::Span,
     Frame,
 };
 
@@ -274,18 +274,27 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     let fields_state =
         if fields.is_empty() { "message".to_string() } else { format!("{}+message", fields.join("+")) };
 
-    let mut indicator_spans = vec![
-        Span::styled(" AutoScroll:", theme.status_bar_key),
-        Span::styled(follow_state, theme.status_bar),
-        Span::styled(" \u{2502} ", theme.status_bar),
-        Span::styled("Wrap:", theme.status_bar_key),
-        Span::styled(wrap_state, theme.status_bar),
-        Span::styled(" \u{2502} ", theme.status_bar),
-        Span::styled("Fields:", theme.status_bar_key),
-        Span::styled(fields_state.as_str(), theme.status_bar),
-        Span::styled(" \u{2502} ", theme.status_bar),
-        Span::styled("Since:", theme.status_bar_key),
-        Span::styled(since_label.as_str(), theme.status_bar),
+    // GROUPS, not a flat span list: a bar that does not fit drops whole
+    // indicators from the right and says so (`crate::ui::header::fit_bar`),
+    // and half of `Since:24h` would be worse than none of it. This used to
+    // be one `Line::from(spans)` with no width at all — the same silent
+    // right-edge truncation the hint bar below it had, at 76 columns with
+    // every field shown.
+    let pair = |label: &'static str, value: String, first: bool| -> Vec<Span<'static>> {
+        let mut g = Vec::new();
+        g.push(Span::styled(
+            if first { " " } else { " \u{2502} " },
+            theme.status_bar,
+        ));
+        g.push(Span::styled(label, theme.status_bar_key));
+        g.push(Span::styled(value, theme.status_bar));
+        g
+    };
+    let mut indicator_groups = vec![
+        pair("AutoScroll:", follow_state.to_string(), true),
+        pair("Wrap:", wrap_state.to_string(), false),
+        pair("Fields:", fields_state.clone(), false),
+        pair("Since:", since_label.to_string(), false),
     ];
     // A horizontally panned view is missing its left edge, which looks like
     // corruption rather than a setting unless the bar says so. Shown only
@@ -295,13 +304,12 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     // the content did not take is worse than saying nothing.
 
     if pan > 0 && !wrap {
-        indicator_spans.push(Span::styled(" \u{2502} ", theme.status_bar));
-        indicator_spans.push(Span::styled("Pan:", theme.status_bar_key));
-        indicator_spans.push(Span::styled(format!("+{pan}"), theme.status_bar));
+        indicator_groups.push(pair("Pan:", format!("+{pan}"), false));
     }
 
     crate::ui::fill_line_bg(f, indicator_area, theme.status_bar);
-    let indicator_line = Line::from(indicator_spans);
+    let indicator_line =
+        crate::ui::header::fit_bar(indicator_groups, indicator_area.width, theme);
     f.render_widget(indicator_line, indicator_area);
 
     // Keybinding bar

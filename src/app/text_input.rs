@@ -57,6 +57,17 @@ impl TextInput {
         UnicodeWidthStr::width(&self.value[..self.cursor])
     }
 
+    /// The slice visible in `width` columns, and the caret's column within
+    /// it — a one-line viewport over the value, anchored on the caret.
+    ///
+    /// The algorithm is [`crate::util::window_around`], which the filter bar
+    /// also uses (it is handed a `&str` and a column, not an input). This is
+    /// the typed entry point: the caret it passes is this type's invariant,
+    /// so no caller can window around a position that does not exist.
+    pub fn window(&self, width: usize) -> (&str, usize) {
+        crate::util::window_around(&self.value, self.cursor_col(), width)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.value.is_empty()
     }

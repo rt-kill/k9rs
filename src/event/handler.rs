@@ -5,7 +5,6 @@ use crate::app::{App, TakeoverOp};
 use crate::app::element::Element;
 #[cfg(test)]
 use crate::app::nav::rid;
-use crate::kube::protocol::OperationKind;
 use super::keymap::ViewClass;
 
 /// The chord of a key event, if it is a character key (Ctrl tracked,
@@ -223,24 +222,24 @@ fn handle_global_keys(app: &App, key: KeyEvent) -> Option<Action> {
 // ---------------------------------------------------------------------------
 
 fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
-    // Ctrl-D: delete with confirmation — only if the resource declares it,
-    // exactly like Ctrl-K below. Unconditional, it offered "Delete
-    // Context/prod?" on the contexts view, whose `operations()` is
-    // deliberately empty because a kubeconfig context is switched to, not
-    // deleted.
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.code == KeyCode::Char('d')
-        && app.current_capabilities().supports(OperationKind::Delete)
-    {
-        return Some(Action::Delete);
-    }
-
-    // Ctrl-K: force-kill — only if the resource declares it.
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.code == KeyCode::Char('k')
-        && app.current_capabilities().supports(OperationKind::ForceKill)
-    {
-        return Some(Action::ForceKill);
+    // STRUCTURAL chords — Ctrl-D, Ctrl-K, Shift-F — read off
+    // `OperationKind::structural_chord`, the one place they are declared.
+    //
+    // Iterating what the resource DECLARES is what makes "only if it is
+    // supported" true by construction. It used to be an `if` per chord with
+    // the support check written out each time, and `Shift-F` (further down
+    // the match, before this) had no check at all: help only advertised it
+    // where port-forward was declared, but the key fired anywhere and failed
+    // later with "No target found". Unconditional Ctrl-D had the same shape
+    // once — it offered "Delete Context/prod?" on the contexts view, whose
+    // `operations()` is deliberately empty because a kubeconfig context is
+    // switched to, not deleted.
+    if let Some(combo) = combo_of(&key) {
+        for op in &app.current_capabilities().operations {
+            if op.structural_chord() == Some(combo) {
+                return Some(Action::from(op));
+            }
+        }
     }
 
     // Configured column-cursor bindings (exact chord). Checked before the
@@ -322,8 +321,9 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // above (descriptor defaults d/y, user-rebindable); Edit is a
         // client-side flow, not an OperationKind, so it stays structural.
         KeyCode::Char('e') => Some(Action::Edit),
-        // F: create a new port-forward (opens dialog).
-        KeyCode::Char('F') => Some(Action::PortForward),
+        // `F` (port-forward) is a STRUCTURAL chord, handled above against
+        // the resource's declared operations — not here, where it fired
+        // whether or not the resource had a port to forward.
         // f: show active port-forwards for this resource.
         KeyCode::Char('f') => Some(Action::ShowPortForwards),
 

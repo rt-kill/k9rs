@@ -159,3 +159,70 @@ fn every_text_surface_is_one_type() {
     draft.insert('s');
     assert_eq!(draft.value(), "workers=");
 }
+
+/// The caret is always on screen, and the window is always a legal slice.
+///
+/// Five render sites each guarded with `if cursor_x < right_edge { draw the
+/// caret }`, so outgrowing the bar clipped the text AND stopped drawing the
+/// caret: you were typing blind. The window makes that unexpressable — the
+/// caret's column is returned relative to what is shown, so it cannot be
+/// outside it.
+#[test]
+fn the_window_always_contains_the_caret() {
+    use crate::app::text_input::TextInput;
+    use unicode_width::UnicodeWidthStr;
+
+    for value in [
+        "",
+        "short",
+        "a-very-long-grep-pattern-that-outgrows-any-reasonable-filter-bar",
+        "日本語のパターンはとても長い",
+        "emoji \u{1F469}\u{200D}\u{1F467} family \u{26a0}\u{FE0F} warn",
+    ] {
+        let mut input = TextInput::seeded(value);
+        // Walk the caret across every position, in both directions.
+        input.home();
+        for _ in 0..=value.chars().count() {
+            for width in [0usize, 1, 2, 5, 12, 40, 200] {
+                let (shown, col) = input.window(width);
+                assert!(
+                    UnicodeWidthStr::width(shown) <= width,
+                    "{value:?} w={width}: window {shown:?} is wider than {width}",
+                );
+                assert!(
+                    col <= width.saturating_sub(1).max(0) || width == 0,
+                    "{value:?} w={width}: caret column {col} is off the right edge",
+                );
+                // The window is a real slice of the value, not a rebuild.
+                assert!(
+                    value.contains(shown),
+                    "{value:?} w={width}: {shown:?} is not a slice of it",
+                );
+                // Everything that fits is shown: no needless scrolling.
+                // STRICTLY wider, because the caret needs a cell of its own
+                // — a value that exactly fills the bar must give up its
+                // first column for the caret sitting after its last.
+                if width > UnicodeWidthStr::width(value) {
+                    assert_eq!(shown, value, "{value:?} w={width}: it all fits");
+                    assert_eq!(col, input.cursor_col(), "…and the caret is where it is");
+                }
+            }
+            input.right();
+        }
+    }
+}
+
+/// A caret at the very end of a long value still has a column to sit in.
+#[test]
+fn a_caret_past_the_last_character_is_still_on_screen() {
+    use crate::app::text_input::TextInput;
+
+    let mut input = TextInput::seeded("abcdefghij");
+    input.end();
+    assert_eq!(input.cursor_col(), 10, "the caret sits past the last char");
+
+    // Five columns: the caret takes the fifth, so four characters precede it.
+    let (shown, col) = input.window(5);
+    assert_eq!(shown, "ghij", "the window follows the caret to the end");
+    assert_eq!(col, 4, "and the caret is the last column, not past it");
+}

@@ -117,22 +117,34 @@ pub fn draw_header(
     ]).split(area);
 
     // Left: context / cluster / user / k8s version stacked vertically.
+    //
+    // Each value is elided from the LEFT, because these are identifiers whose
+    // distinguishing part is at the END: `aws eks update-kubeconfig` without
+    // `--alias` writes a context of
+    // `arn:aws:eks:us-west-2:123456789012:cluster/prod-usw2`, where every
+    // column before `prod-usw2` is boilerplate shared with every other
+    // context you have. The `Paragraph` clipped it on the right instead, so
+    // below ~80 columns the four lines read as four copies of the same ARN
+    // prefix — same reasoning as the nav breadcrumb, which is also a path.
+    let label_w = " Context: ".width();
+    let value_w = (cols[0].width as usize).saturating_sub(label_w);
+    let elide = |v: &str| crate::util::truncate_left(v, value_w).into_owned();
     let info = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(" Context: ", theme.info_label),
-            Span::styled(ctx, theme.info_value),
+            Span::styled(elide(&ctx), theme.info_value),
         ]),
         Line::from(vec![
             Span::styled(" Cluster: ", theme.info_label),
-            Span::styled(cluster, theme.info_value),
+            Span::styled(elide(cluster), theme.info_value),
         ]),
         Line::from(vec![
             Span::styled(" User:    ", theme.info_label),
-            Span::styled(user, theme.info_value),
+            Span::styled(elide(user), theme.info_value),
         ]),
         Line::from(vec![
             Span::styled(" K8s:     ", theme.info_label),
-            Span::styled(k8s_ver, theme.info_value),
+            Span::styled(elide(k8s_ver), theme.info_value),
         ]),
     ]);
     f.render_widget(info, cols[0]);
@@ -146,6 +158,41 @@ pub fn draw_header(
     f.render_widget(logo, cols[1]);
 }
 
+/// Fit a one-line bar into `width`, dropping whole groups from the right and
+/// saying that it did.
+///
+/// A bar is a sequence of GROUPS — a separator, a label, a value — and a
+/// group is indivisible: half of `<q> back` is worse than none of it. So the
+/// unit of dropping is the group, and an `…` marks that any were dropped.
+///
+/// Shared, because this is the one mistake both bars made. ratatui truncates
+/// a `Line` at the right edge in silence, so the log hint bar (115 columns
+/// against a 97-column terminal) lost `1h`, `24h` and `back` — the last being
+/// the key that gets you out — and the log STATUS bar could lose `Since` and
+/// `Pan` the same way at 80. Each surface measuring its own content was how
+/// one of them got a fix and the other did not.
+pub fn fit_bar(groups: Vec<Vec<Span<'static>>>, width: u16, theme: &Theme) -> Line<'static> {
+    let width = width as usize;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut dropped = false;
+    for (i, group) in groups.iter().enumerate() {
+        let cost: usize = group.iter().map(|s| s.content.width()).sum();
+        // Keep a column for the `…` unless this is the last group.
+        let reserve = usize::from(i + 1 < groups.len());
+        if used + cost + reserve > width {
+            dropped = true;
+            break;
+        }
+        spans.extend(group.iter().cloned());
+        used += cost;
+    }
+    if dropped {
+        spans.push(Span::styled("\u{2026}", theme.status_bar));
+    }
+    Line::from(spans)
+}
+
 /// Build a keybinding bar `Line` from a list of `(key, description)` pairs.
 /// Used by describe, yaml, log, and context views for their bottom status bars.
 pub fn render_keybinding_bar(
@@ -153,38 +200,19 @@ pub fn render_keybinding_bar(
     width: u16,
     theme: &Theme,
 ) -> Line<'static> {
-    // The bar is ONE line and ratatui truncates at the right edge, silently.
-    // The log bar was 115 columns, so a 97-column terminal lost `1h`, `24h`
-    // and `back` with nothing to say so — the last of those being the key
-    // that gets you out. Fitting here instead means the omission is visible
-    // (`…`, and `?` is the complete answer), and it holds for every class at
-    // every width rather than for the ones that happen to be short.
-    let width = width as usize;
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut used = 0usize;
-    let mut dropped = false;
-    for (i, (key, desc)) in hints.iter().enumerate() {
-        let (key, desc) = (key.as_ref(), desc.as_ref());
-        // One column of lead-in each: a space before the first, a `│`
-        // between the rest. Then `<key>` and ` desc `.
-        let cost = 1 + key.width() + 2 + desc.width() + 2;
-        // Keep room for the `…` unless this is the last hint and it fits.
-        let reserve = if i + 1 < hints.len() { 1 } else { 0 };
-        if used + cost + reserve > width {
-            dropped = true;
-            break;
-        }
-        if i == 0 {
-            spans.push(Span::styled(" ", theme.status_bar));
-        } else {
-            spans.push(Span::styled("\u{2502}", theme.status_bar));
-        }
-        spans.push(Span::styled(format!("<{}>", key), theme.status_bar_key));
-        spans.push(Span::styled(format!(" {} ", desc), theme.status_bar));
-        used += cost;
-    }
-    if dropped {
-        spans.push(Span::styled("\u{2026}", theme.status_bar));
-    }
-    Line::from(spans)
+    let groups: Vec<Vec<Span<'static>>> = hints
+        .iter()
+        .enumerate()
+        .map(|(i, (key, desc))| {
+            // One column of lead-in each: a space before the first, a `│`
+            // between the rest.
+            let lead = if i == 0 { " " } else { "\u{2502}" };
+            vec![
+                Span::styled(lead, theme.status_bar),
+                Span::styled(format!("<{}>", key.as_ref()), theme.status_bar_key),
+                Span::styled(format!(" {} ", desc.as_ref()), theme.status_bar),
+            ]
+        })
+        .collect();
+    fit_bar(groups, width, theme)
 }

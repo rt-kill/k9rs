@@ -97,16 +97,15 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
 
     if yaml.search_input_active {
         // Show search input prompt
-        let prompt = format!(" /{}", yaml.search_input.value());
-        let line = Line::from(Span::styled(prompt, theme.filter));
+        // The input is WINDOWED to what the bar can hold, with the caret as
+        // the anchor — see `TextInput::window`. The caret used to be dropped
+        // entirely once the pattern outgrew the bar (`if cursor_x < right`),
+        // so you typed blind into your own grep.
+        let avail = (bar_area.width as usize).saturating_sub(2);
+        let (shown, caret_col) = yaml.search_input.window(avail);
+        let line = Line::from(Span::styled(format!(" /{}", shown), theme.filter));
         f.render_widget(line, bar_area);
-        // Place cursor after the search input text
-        // Caret in COLUMNS at its actual position, not the end of the text.
-        let cursor_x = bar_area.x + 2 + yaml.search_input.cursor_col() as u16;
-        let cursor_y = bar_area.y;
-        if cursor_x < bar_area.x + bar_area.width {
-            f.set_cursor_position((cursor_x, cursor_y));
-        }
+        f.set_cursor_position((bar_area.x + 2 + caret_col as u16, bar_area.y));
     } else {
         // Keybinding bar
         // Projected from the ONE keymap declaration, so this bar cannot

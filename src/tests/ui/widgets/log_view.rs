@@ -555,12 +555,46 @@ fn measuring_and_rendering_agree_on_every_run() {
 ///
 /// What is left is the per-unit enumeration itself, over every line in the
 /// buffer rather than over the window — the wrap branch needs a physical
-/// total that the unwrapped branch does not. Fixing THAT is a scroll-model
-/// question (what `content_rows` counts when a line is more than one row),
-/// not a walk to special-case.
+/// total that the unwrapped branch does not.
 ///
-/// The budget is in debug-build time and deliberately loose: the failure
-/// being guarded against was 30x, not 30%.
+/// # That O(buffer) walk is a DECISION, not an oversight (2026-10-14)
+///
+/// It survives only for the scrollbar's thumb: following needs the last
+/// screenful, which is an O(window) walk backwards, and a parked view
+/// already knows its line from the anchor. The two changes that would
+/// remove it were designed and REJECTED, on their own merits:
+///
+/// - *Measure the scrollbar in lines rather than rows.* Makes a truthful
+///   indicator approximate, to save milliseconds in the one case that is
+///   already inside frame budget.
+/// - *Let a relative scroll intent keep the anchor and carry a row delta.*
+///   This contradicts [`crate::app::viewport::Viewport`]'s own invariant,
+///   stated on its `anchor` field: it is `None` "on any viewport whose
+///   offset has been moved since the record was written, which is exactly
+///   when it would be a lie". A delta beside a live anchor is that lie, plus
+///   a third representation of one position with nothing enforcing the
+///   relationship between them — the "two fields, one question" shape this
+///   codebase spent 2026-10-13/14 deleting everywhere else.
+///
+/// 16 ms is a sixtieth of a second, in wrap mode, with a full 50,000-line
+/// ring, and `ui.logs.defaultWrap` is false. Revisit if `ui.logs.maxLines`
+/// grows a lot (500k would put it near 165 ms) or if wrap feels slow against
+/// a real cluster — and revisit with a better design than those two, not
+/// with these.
+///
+/// Also: do NOT "pin" the O(buffer) property with a counter. A test that
+/// asserts every line is measured FAILS when someone improves it, and
+/// instrumenting `line_phys_rows` to count calls made this very measurement
+/// 2.7x slower — the guard would have been measuring itself.
+///
+/// The budget is in debug-build time and deliberately VERY loose: the
+/// failure being guarded against is a 30x cliff, not a 30% drift, and this
+/// measures wall clock inside a suite that runs tests in PARALLEL. At a
+/// 1500 ms budget against a ~285 ms measurement it still flaked on a loaded
+/// machine — and a guard that cries wolf is worse than no guard, because the
+/// next real failure gets re-run instead of read. 5 s keeps roughly a 17x
+/// margin while leaving the cliff (which lands near 3 s in a debug build)
+/// comfortably inside it.
 #[test]
 fn measuring_a_full_buffer_is_not_a_per_frame_disaster() {
     let lines: Vec<StoredLine> = (0..50_000)
@@ -580,7 +614,7 @@ fn measuring_a_full_buffer_is_not_a_per_frame_disaster() {
     // Debug builds are ~10x slower than release; the budget is deliberately
     // loose because the failure being guarded against was 30x, not 30%.
     assert!(
-        elapsed < std::time::Duration::from_millis(1500),
+        elapsed < std::time::Duration::from_millis(5000),
         "50k wrap heights took {elapsed:?} — the per-frame cost has regressed",
     );
 }

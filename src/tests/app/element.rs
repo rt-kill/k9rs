@@ -773,7 +773,7 @@ fn element_accessors_match_their_class() {
                 assert!(el.log_store().is_none(), "{label}: no line store");
                 assert!(el.table_interaction().is_none(), "{label}: no cursor");
                 assert!(
-                    matches!(el.extent(), crate::app::element::ViewExtent::Dialog { .. }),
+                    el.floats(),
                     "{label}: a dialog must declare a Dialog extent",
                 );
             }
@@ -1677,5 +1677,117 @@ fn completion_offers_every_word_something_else_declares() {
     assert!(
         hits.iter().any(|h| h == "namespace"),
         "`:names…` must complete to `namespace`: {hits:?}",
+    );
+}
+
+/// Help repeats a key across sections only when its MEANING differs.
+///
+/// The sections are partly hand-written, so they can re-describe a key the
+/// keymap already owns — and did: `Space`, `Ctrl-Space` and `Ctrl-\` were
+/// listed under Select mode in different words from the keymap rows that
+/// declare them ("Mark / unmark row" vs "Toggle the mark on the cursor
+/// row"). Marking behaves the same marked or not, so those rows said nothing
+/// the section exists to say, were free to drift, and made the sheet longer.
+///
+/// The repeats that remain are the ones worth having: `Ctrl-d` is "Delete" in
+/// general and "Delete — EVERY marked row" in select mode, which is exactly
+/// what contextual help is for.
+#[test]
+fn help_repeats_a_key_only_to_say_something_new_about_it() {
+    use crate::kube::resources::row::CellValue;
+
+    let app = crate::app::App::new_for_test();
+    let (_, rows) = crate::ui::widgets::HelpContent::rows(
+        Some(app.current_capabilities()),
+        app.config.keys,
+        crate::event::keymap::ViewClass::Table,
+        app.nav.top().markable(),
+    );
+    let text = |c: &CellValue| match c {
+        CellValue::Text(t) => t.clone(),
+        other => format!("{other:?}"),
+    };
+
+    let mut seen: Vec<(String, String, String)> = Vec::new();
+    for r in &rows {
+        let (section, key, desc) = (text(&r.cells[0]), text(&r.cells[1]), text(&r.cells[2]));
+        if key.is_empty() {
+            continue; // prose lines belonging to a section
+        }
+        if let Some((prev_section, _, prev_desc)) =
+            seen.iter().find(|(_, k, _)| *k == key)
+        {
+            assert_ne!(
+                &desc, prev_desc,
+                "`{key}` is documented identically in `{prev_section}` and \
+                 `{section}` — one of them is a hand-written copy of the \
+                 keymap row that owns it",
+            );
+        }
+        seen.push((section, key, desc));
+    }
+}
+
+/// A structural chord fires only where the resource declares the operation,
+/// and is spelled the same everywhere.
+///
+/// `Ctrl-D`, `Ctrl-K` and `Shift-F` were string literals in two places in
+/// `help.rs` and matched separately in `event::handler` — three copies of one
+/// fact, none of them the authority. `Shift-F` was the copy that went wrong:
+/// the handler's arm had NO capability check, so it fired on any resource and
+/// failed later with "No target found for port-forward", while help only
+/// advertised it where port-forward was declared. The two disagreed about the
+/// same key.
+#[test]
+fn a_structural_chord_fires_only_where_its_operation_is_declared() {
+    use crate::kube::protocol::OperationKind;
+
+    // The declaration, and nothing else, decides the chord.
+    assert_eq!(
+        OperationKind::PortForward.structural_chord().map(|c| c.label()),
+        Some("Shift-f".to_string()),
+    );
+    assert_eq!(
+        OperationKind::Delete.structural_chord().map(|c| c.label()),
+        Some("Ctrl-d".to_string()),
+    );
+    // An operation WITH a descriptor default has no structural chord: it is
+    // reached by that key, and by whatever the user rebound it to.
+    assert_eq!(OperationKind::Describe.structural_chord(), None);
+    assert!(OperationKind::Describe.descriptor().default_key.is_some());
+
+    // Pods declare port-forward, so `F` reaches it.
+    let mut app = crate::app::App::new_for_test();
+    assert!(app.current_capabilities().supports(OperationKind::PortForward));
+    let shift_f = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('F'),
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    assert!(
+        matches!(
+            crate::event::handler::handle_key_event(&app, shift_f),
+            Some(crate::app::actions::Action::PortForward)
+        ),
+        "where the resource declares it, the chord works",
+    );
+
+    // Contexts declare NO operations, so the same chord does nothing —
+    // rather than raising an action that fails with a flash two layers down.
+    app.nav.reset(
+        app.core
+            .client_root_element(
+                &app.kube.metrics,
+                &crate::kube::local::LocalResourceKind::Context.to_resource_id(),
+                crate::kube::protocol::Namespace::All,
+            )
+            .expect("contexts is client-owned"),
+    );
+    assert!(app.current_capabilities().operations.is_empty());
+    assert!(
+        !matches!(
+            crate::event::handler::handle_key_event(&app, shift_f),
+            Some(crate::app::actions::Action::PortForward)
+        ),
+        "where it is not declared, the chord is inert — it used to fire anyway",
     );
 }

@@ -115,10 +115,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     // again inside an 80%-wide box gave two header panels, two breadcrumbs,
     // two `? help` hints, and a flash row that blanked the parent's border
     // across the width of the box.
-    let floating = !matches!(
-        app.nav.top().extent(),
-        crate::app::element::ViewExtent::Full
-    );
+    let floating = app.nav.top().floats();
 
     // Determine dynamic section heights
     let header_height: u16 =
@@ -278,18 +275,33 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // 5. Breadcrumb bar — nav path on left, ? help hint on right
+    //
+    // The path is elided from the LEFT, which is the opposite of every other
+    // bar on screen and the only correct direction here: the last crumb is
+    // where you ARE, and the first is a resource name you typed yourself.
+    // It used to be an unbounded `Line` with the right-aligned hint STAMPED
+    // over it afterwards, so a deep drill lost its tail underneath `? help`
+    // with nothing to say so.
+    let hint = " ? help ";
+    let suffix_w: u16 = if app.nav.is_drilled() { 9 } else { 0 }; // " | Esc back"
+    let budget = breadcrumb_area
+        .width
+        .saturating_sub(hint.len() as u16)
+        .saturating_sub(suffix_w)
+        .saturating_sub(2); // the spaces either side of the path
     let bc = app.nav.breadcrumb();
+    let bc = crate::util::truncate_left(&bc, budget as usize);
     let mut spans = Vec::new();
     spans.push(Span::styled(format!(" {} ", bc), theme.title));
     if app.nav.is_drilled() {
-        spans.push(Span::styled(" | ", theme.info_label));
+        spans.push(Span::styled("| ", theme.info_label));
         spans.push(Span::styled("Esc", theme.title_filter_indicator));
         spans.push(Span::styled(" back", theme.info_label));
     }
     let left = Line::from(spans);
     f.render_widget(left, breadcrumb_area);
-    // Right-aligned help hint
-    let hint = " ? help ";
+    // Right-aligned help hint. The left side is budgeted around it now, so
+    // this no longer overwrites anything.
     let hint_x = breadcrumb_area.x + breadcrumb_area.width.saturating_sub(hint.len() as u16);
     f.buffer_mut().set_string(hint_x, breadcrumb_area.y, hint, theme.info_label);
 
@@ -329,16 +341,26 @@ pub fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) 
     // is placed right after the typed text via set_cursor_position.
     let prefix = app.ui.command_prompt();
     let prefix_len: u16 = prefix.width() as u16;
-    let typed_len = input.width() as u16;
+
+    // WINDOWED around the caret — same rule, same reason as
+    // `ui::draw_command_overlay`, which this is the inline twin of.
+    let avail = (inner.width as usize).saturating_sub(prefix_len as usize);
+    let (shown, caret_col) = match app.ui.command_text() {
+        Some(t) => t.window(avail),
+        None => (input, input.width()),
+    };
 
     let mut spans = vec![
         Span::styled(prefix, theme.command.add_modifier(Modifier::BOLD)),
-        Span::styled(input, theme.command),
+        Span::styled(shown.to_string(), theme.command),
     ];
 
-    if !ghost.is_empty() {
+    // The ghost takes only what the input left over: a hint must never push
+    // the caret off its own line.
+    let left = avail.saturating_sub(shown.width());
+    if !ghost.is_empty() && left > 0 {
         spans.push(Span::styled(
-            ghost,
+            crate::util::truncate(&ghost, left),
             theme.command_suggestion.add_modifier(Modifier::DIM | Modifier::ITALIC),
         ));
     }
@@ -346,12 +368,8 @@ pub fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) 
     let line = Line::from(spans);
     f.render_widget(line, inner);
 
-    // Place the real terminal cursor right after the typed text (thin line /
-    // blinking bar depending on the user's terminal emulator settings).
-    let cursor_x = inner.x + prefix_len + typed_len;
-    let cursor_y = inner.y;
-    if cursor_x < inner.x + inner.width {
-        f.set_cursor_position((cursor_x, cursor_y));
-    }
+    // The real terminal cursor (thin line / blinking bar, per the user's
+    // emulator). Inside the window by construction, so nothing to guard.
+    f.set_cursor_position((inner.x + prefix_len + caret_col as u16, inner.y));
 }
 

@@ -471,11 +471,10 @@ fn help_is_an_ordinary_table_view() {
 /// It floats: the view it documents stays on screen behind it.
 #[test]
 fn help_declares_itself_a_floating_view() {
-    use crate::app::element::ViewExtent;
     let mut app = App::new_for_test();
-    assert_eq!(app.nav.top().extent(), ViewExtent::Full, "an ordinary list fills the frame");
+    assert!(!app.nav.top().floats(), "an ordinary list fills the frame");
     push_help_element(&mut app);
-    assert!(matches!(app.nav.top().extent(), ViewExtent::Dialog { .. }));
+    assert!(app.nav.top().floats());
 }
 
 #[test]

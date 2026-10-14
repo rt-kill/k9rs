@@ -139,6 +139,15 @@ impl UiState {
         }
     }
 
+    /// The `:` prompt's buffer itself, for the renderer — which needs the
+    /// CARET, not just the text, to window a long command around it.
+    pub fn command_text(&self) -> Option<&crate::app::text_input::TextInput> {
+        match &self.modal {
+            Modal::Command { input, .. } => Some(input),
+            _ => None,
+        }
+    }
+
     /// Mutable access to the `:` prompt's buffer, for the editing keys.
     pub fn command_input_mut(
         &mut self,
@@ -465,10 +474,16 @@ impl KeyCombo {
         Self { ctrl: false, ch }
     }
 
-    /// Display label for hints/help ("l", "C-l").
+    /// Display label for hints/help ("l", "Shift-l", "Ctrl-l").
+    ///
+    /// `Ctrl-` and not `C-`, because the static keymap rows spell it that way
+    /// (`b("Ctrl-r", ..)`) and so does the README — so help showed `Ctrl-r`
+    /// on one row and `C-h` on the next for the same kind of thing. Display
+    /// only: nothing parses this back (the config reader has its own
+    /// `TryFrom`, which already accepts `ctrl-x`).
     pub fn label(&self) -> String {
         if self.ctrl {
-            format!("C-{}", self.ch)
+            format!("Ctrl-{}", self.ch)
         } else if self.ch.is_uppercase() {
             format!("Shift-{}", self.ch.to_lowercase())
         } else {
@@ -1223,15 +1238,15 @@ impl TakeoverOp {
     /// EXHAUSTIVE: a new operation must choose, and the central erase in
     /// [`crate::ui::draw`] reads the answer rather than each renderer
     /// re-remembering it.
-    pub fn extent(&self) -> crate::app::element::ViewExtent {
-        use crate::app::element::{Size, ViewExtent};
+    pub fn extent(&self, frame: ratatui::layout::Rect) -> crate::app::element::ViewExtent {
+        use crate::app::element::ViewExtent;
         match self {
             // A status line in a box, sized from the line — the same rule
             // the confirm/form/picker elements follow, in the same units.
             // `+ 6`: two cells of padding each side plus the border.
             TakeoverOp::Edit { .. } => ViewExtent::Dialog {
-                max_width: Size::Cells(self.label().chars().count() as u16 + 6),
-                max_height: Size::Cells(3),
+                width: (self.label().chars().count() as u16 + 6).min(frame.width),
+                height: 3u16.min(frame.height),
             },
             // The connect screen is a full-screen titled frame: the view
             // beneath must not render inside it. It used to — the shell
@@ -1554,7 +1569,7 @@ mod key_combo_tests {
     fn labels_render_ctrl_and_shift() {
         assert_eq!(KeyCombo::plain('l').label(), "l");
         assert_eq!(KeyCombo::plain('L').label(), "Shift-l");
-        assert_eq!(KeyCombo { ctrl: true, ch: 'l' }.label(), "C-l");
+        assert_eq!(KeyCombo { ctrl: true, ch: 'l' }.label(), "Ctrl-l");
     }
 
     /// Pins the documented config shape (what `load_section` hands to

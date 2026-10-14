@@ -694,35 +694,24 @@ pub enum DeriveError {
 pub enum ViewExtent {
     /// Claims the frame. Every element does this unless it says otherwise.
     Full,
-    /// A centered box over the view beneath, AT MOST this big on each axis
-    /// and shrunk to whatever the content actually needs.
+    /// A centered box over the view beneath, EXACTLY this big in cells —
+    /// already the smaller of what the content needs and what the element
+    /// will allow itself.
     ///
-    /// A cap plus content-shrink, rather than a flat percentage, because one
-    /// rule then serves a three-row yes/no box and a sixty-row help sheet:
-    /// the confirm box asks for `Cells(60) × Cells(5)` and gets exactly that;
-    /// help asks for `Pct(80) × Pct(85)` and fills it because it has more
-    /// content than that. A percentage alone can only ever describe the
-    /// second, which is why the first was a separate mechanism.
-    Dialog { max_width: Size, max_height: Size },
-}
-
-/// One axis of a dialog's maximum size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Size {
-    /// Exactly this many cells, clamped to the frame.
-    Cells(u16),
-    /// This percentage of the frame.
-    Pct(u16),
-}
-
-impl Size {
-    /// Resolve against the frame's size on this axis.
-    pub fn resolve(self, available: u16) -> u16 {
-        match self {
-            Size::Cells(n) => n.min(available),
-            Size::Pct(p) => (u32::from(available) * u32::from(p) / 100) as u16,
-        }
-    }
+    /// It used to be a `Size` per axis, `Cells` or `Pct`, and the doc here
+    /// claimed the box was "at most this big and shrunk to whatever the
+    /// content actually needs". Nothing shrank anything: the three
+    /// content-sized dialogs passed `Cells(exact)`, so cap and need
+    /// coincided and the claim looked true, while help — the only user of
+    /// `Pct` — got a flat 80% of the frame whatever it held. Its 105-column
+    /// table was therefore CLIPPED by 27 columns at a 100-wide terminal and
+    /// floating in 53 columns of DEAD SPACE at 200. Both halves of one
+    /// unimplemented sentence.
+    ///
+    /// So each element resolves its own box against the frame it is given,
+    /// which is the rule the three already followed, and `Size` — with its
+    /// `Pct` variant existing for exactly one caller — is gone.
+    Dialog { width: u16, height: u16 },
 }
 
 /// Outcome of a mark keypress. The element stays UI-free — the action
@@ -1735,6 +1724,38 @@ impl Element {
         matches!(self.class(), ElementClass::Dialog)
     }
 
+    /// Whether this element floats, without asking how big.
+    ///
+    /// Derived from [`Self::extent`] with an empty frame, because WHICH
+    /// variant it returns never depends on the frame — only the size does.
+    /// One match, so a view that floats cannot also be told it is full
+    /// frame (which is how a float once drew the cluster header, the
+    /// breadcrumb and the flash line a second time inside its own box).
+    pub fn floats(&self) -> bool {
+        matches!(
+            self.extent(ratatui::layout::Rect::new(0, 0, 0, 0)),
+            ViewExtent::Dialog { .. }
+        )
+    }
+
+    /// The cells a TABLE element's content wants: its columns' natural
+    /// widths plus the border, and a row each plus the header and border.
+    ///
+    /// Read from the view memo, which the draw path warms before asking —
+    /// the same `col_widths` the renderer lays out with, so the box and the
+    /// table inside it cannot disagree about how wide the table is. A cold
+    /// memo answers `u16::MAX`, i.e. "no opinion", which leaves the caller's
+    /// allowance as the only bound and is exactly the old behaviour.
+    fn table_content_size(&self) -> (u16, u16) {
+        let Some(view) = self.table_interaction().and_then(|i| i.cached_view()) else {
+            return (u16::MAX, u16::MAX);
+        };
+        let width = view.col_widths.iter().copied().fold(0u16, u16::saturating_add);
+        let rows = u16::try_from(view.rows.len()).unwrap_or(u16::MAX);
+        // `+2` border on each axis, `+1` for the header row.
+        (width.saturating_add(2), rows.saturating_add(3))
+    }
+
     /// How much of the frame this element claims — see [`ViewExtent`].
     ///
     /// EXHAUSTIVE on the kind axis, not a `_ => Full` wildcard: whether a new
@@ -1742,17 +1763,32 @@ impl Element {
     /// reads the answer from here rather than each view deciding for itself
     /// (which is how the overlay slot used to leave stale content inside a
     /// dialog's border).
-    pub fn extent(&self) -> ViewExtent {
+    pub fn extent(&self, frame: ratatui::layout::Rect) -> ViewExtent {
+        // A dialog is the SMALLER of what its content needs and what it will
+        // allow itself of the frame. One rule, applied by the element that
+        // knows the content — which is why the frame comes in here.
+        let fit = |need: (u16, u16), allow: (u16, u16)| ViewExtent::Dialog {
+            width: need.0.min(allow.0),
+            height: need.1.min(allow.1),
+        };
+        let pct = |p: u16, of: u16| (u32::from(of) * u32::from(p) / 100) as u16;
+        // What a `ModalOverlay`-chromed dialog needs AROUND its content —
+        // asked of the widget rather than written as `+ 4` here, so the two
+        // halves of that arithmetic cannot drift apart in different files.
+        let margin = |w: u16, h: u16| {
+            let (mw, mh) = crate::ui::widgets::DIALOG_MARGIN;
+            (w + mw, h + mh)
+        };
         match self {
             // Help floats over the view it documents — you are consulting it
-            // ABOUT something, and that something should stay on screen.
-            _ if self.is_keybindings_view() => {
-                ViewExtent::Dialog { max_width: Size::Pct(80), max_height: Size::Pct(85) }
-            }
-            // Sized from its own content, which is what `Size::Cells` is
-            // for: a yes/no box wants the rows its message needs, not a
-            // percentage of somebody's terminal. No extra `Size` variant —
-            // the element that knows the content answers in cells.
+            // ABOUT something, and that something should stay on screen, so
+            // it never takes the whole frame however much it holds.
+            _ if self.is_keybindings_view() => fit(
+                self.table_content_size(),
+                (pct(80, frame.width), pct(85, frame.height)),
+            ),
+            // Sized from its own content: a yes/no box wants the rows its
+            // message needs, not a percentage of somebody's terminal.
             Element::Confirm(d) => {
                 // EXACTLY the size `ConfirmDialogWidget` asks for, so the
                 // centring it does inside the box is a no-op and the two
@@ -1760,29 +1796,21 @@ impl Element {
                 // lists its targets on extra lines and the box grows with
                 // them — seeing what the batch will hit is the whole point.
                 let (w, h) = crate::ui::widgets::confirm_dialog_size(d);
-                // `+ 4` / `+ 2`: `ModalOverlay` keeps that much margin inside
-                // whatever rect it is handed, so a box sized to the dialog
-                // exactly would shrink it until the message had no room. The
-                // float reserves the OUTER box; the widget still owns the
-                // inside of it.
-                ViewExtent::Dialog {
-                    max_width: Size::Cells(w + 4),
-                    max_height: Size::Cells(h + 2),
-                }
+                // The float reserves the OUTER box; the widget still owns
+                // the inside of it, and spends `MARGIN` of the box on its own
+                // outer gap — so a box sized to the dialog exactly would
+                // shrink it until the message had no room. Asking the widget
+                // rather than writing `+ 4` here is what stops the two
+                // numbers drifting apart in different files.
+                fit(margin(w, h), (frame.width, frame.height))
             }
             Element::Form(d) => {
                 let (w, h) = crate::ui::widgets::form_dialog_size(d);
-                ViewExtent::Dialog {
-                    max_width: Size::Cells(w + 4),
-                    max_height: Size::Cells(h + 2),
-                }
+                fit(margin(w, h), (frame.width, frame.height))
             }
             Element::Picker(p) => {
                 let (w, h) = crate::ui::widgets::container_picker_size(p);
-                ViewExtent::Dialog {
-                    max_width: Size::Cells(w + 4),
-                    max_height: Size::Cells(h + 2),
-                }
+                fit(margin(w, h), (frame.width, frame.height))
             }
             Element::ResourceList(_)
             | Element::RowFilter(_)

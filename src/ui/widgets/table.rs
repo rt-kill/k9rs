@@ -65,6 +65,23 @@ impl ColumnLayout {
         self.viewport_right = col_offset + viewport_width;
     }
 
+    /// How many columns are at least partly on screen, out of how many
+    /// there are — `None` when they all are.
+    ///
+    /// The layout has held both numbers all along; nothing said them. A pod
+    /// table with metrics is 200 columns wide, so on a 97-column terminal
+    /// you see seven of fourteen and AGE — the LAST column — simply is not
+    /// there. It reads as a missing field rather than as one you can scroll
+    /// to, and `Ctrl-R` cannot help, because it is a fact about the window
+    /// and not about the data.
+    fn clipped(&self) -> Option<(usize, usize)> {
+        if self.total_width <= self.viewport_right.saturating_sub(self.viewport_left) {
+            return None;
+        }
+        let shown = (0..self.widths.len()).filter(|&i| self.is_visible(i)).count();
+        Some((shown, self.widths.len()))
+    }
+
     /// Is column `i` at least partially visible in the viewport?
     fn is_visible(&self, i: usize) -> bool {
         let start = self.positions[i];
@@ -276,33 +293,113 @@ impl<'a> ResourceTable<'a> {
         }
     }
 
-    fn build_title_spans(&self, row_count: usize) -> Line<'a> {
-        let mut spans = Vec::new();
-        spans.push(Span::styled(format!(" {}", self.title), self.theme.title));
-        if !self.namespace.is_empty() {
-            spans.push(Span::styled("(", self.theme.title));
-            spans.push(Span::styled(self.namespace, self.theme.title_namespace));
-            spans.push(Span::styled(")", self.theme.title));
-        }
-        spans.push(Span::styled(format!("[{}]", row_count), self.theme.title_counter));
-        // Select mode: the count is the STORE-wide marked set (what a
-        // batch acts on). When the active filter hides some of it, say
-        // so — the title must not imply everything selected is on screen.
-        if !self.marked.is_empty() {
+    /// The title, fitted by PRIORITY rather than left to right.
+    ///
+    /// It is the one line that reports what you cannot otherwise see — how
+    /// many rows there are, how many are marked, how many columns are off
+    /// screen, and whether any of it is still tracking the cluster — and it
+    /// lives in the top border, where ratatui truncates it in silence. A
+    /// CRD name plus a namespace plus a batch selection plus the column
+    /// count plus a staleness reason passes 100 columns easily, and dropping
+    /// from the right would take the liveness warning first: the single
+    /// thing here you must not miss.
+    ///
+    /// So two parts are mandatory — the view's NAME (you have to know where
+    /// you are) and the WARNING (you must not trust stale rows as live) —
+    /// and the rest are admitted in the order they are worth keeping, while
+    /// the budget lasts. They are then emitted in POSITION order, so what
+    /// survives reads the same as it always did.
+    fn build_title_spans(
+        &self,
+        row_count: usize,
+        shown_rows: std::ops::Range<usize>,
+        clipped_cols: Option<(usize, usize)>,
+        width: u16,
+    ) -> Line<'a> {
+        // Mandatory, whatever it costs.
+        let name = format!(" {}", self.title);
+        let warning = self.warning.map(|w| format!(" {}", w));
+
+        // Optional, in POSITION order.
+        let namespace: Option<String> =
+            (!self.namespace.is_empty()).then(|| format!("({})", self.namespace));
+        // Which rows, not just how many, once there are more than fit.
+        //
+        // Deliberately NOT a scrollbar, which is what the log, describe and
+        // yaml views use: each of those reserves a column for it
+        // unconditionally, and this is the one view with no column to spare
+        // — a pod table with metrics is already 200 columns against a 97-
+        // column terminal. The title costs nothing, is already here, and
+        // already reports the other things you cannot see.
+        let count = if shown_rows.len() < row_count && !shown_rows.is_empty() {
+            format!("[{}-{}/{}]", shown_rows.start + 1, shown_rows.end, row_count)
+        } else {
+            format!("[{}]", row_count)
+        };
+        let selection: Option<String> = (!self.marked.is_empty()).then(|| {
+            // The count is the STORE-wide marked set (what a batch acts on).
+            // When the active filter hides some of it, say so — the title
+            // must not imply everything selected is on screen.
             let shown = self.row_keys.iter().filter(|k| self.marked.contains(*k)).count();
-            let sel = if shown < self.marked.len() {
-                format!("[{} selected · {} shown]", self.marked.len(), shown)
+            if shown < self.marked.len() {
+                format!("[{} selected \u{b7} {} shown]", self.marked.len(), shown)
             } else {
                 format!("[{} selected]", self.marked.len())
-            };
-            spans.push(Span::styled(sel, self.theme.title_filter_indicator));
+            }
+        });
+        let cols: Option<String> =
+            clipped_cols.map(|(shown, total)| format!("[{}/{} cols \u{2192}]", shown, total));
+
+        let widths = [
+            namespace.as_deref().map_or(0, UnicodeWidthStr::width),
+            count.width(),
+            selection.as_deref().map_or(0, UnicodeWidthStr::width),
+            cols.as_deref().map_or(0, UnicodeWidthStr::width),
+        ];
+        // What to give up first, read right to left: the column hint goes
+        // before the selection detail, which goes before the namespace,
+        // which goes before the row count. The column hint is the cheapest
+        // loss — the arrows still reach those columns either way.
+        const KEEP_ORDER: [usize; 4] = [1, 0, 2, 3];
+        let mut budget = usize::from(width)
+            .saturating_sub(name.width())
+            .saturating_sub(warning.as_deref().map_or(0, UnicodeWidthStr::width))
+            // The trailing space that closes the title.
+            .saturating_sub(1);
+        let mut keep = [false; 4];
+        for &i in &KEEP_ORDER {
+            if widths[i] > 0 && widths[i] <= budget {
+                keep[i] = true;
+                budget -= widths[i];
+            }
+        }
+
+        let mut spans = Vec::new();
+        spans.push(Span::styled(name, self.theme.title));
+        if keep[0] {
+            if let Some(ns) = namespace {
+                spans.push(Span::styled(ns, self.theme.title_namespace));
+            }
+        }
+        if keep[1] {
+            spans.push(Span::styled(count, self.theme.title_counter));
+        }
+        if keep[2] {
+            if let Some(sel) = selection {
+                spans.push(Span::styled(sel, self.theme.title_filter_indicator));
+            }
+        }
+        if keep[3] {
+            if let Some(c) = cols {
+                spans.push(Span::styled(c, self.theme.title_filter_indicator));
+            }
         }
         // Liveness last, so it reads as the final word on everything left
         // of it: these counts describe rows that stopped tracking the
         // cluster. Never silent — if the rows are painted and not live, the
         // title says which.
-        if let Some(w) = self.warning {
-            spans.push(Span::styled(format!(" {}", w), self.theme.status_failed));
+        if let Some(w) = warning {
+            spans.push(Span::styled(w, self.theme.status_failed));
         }
         spans.push(Span::styled(" ", self.theme.title));
         Line::from(spans)
@@ -411,24 +508,43 @@ impl StatefulWidget for ResourceTable<'_> {
             state.selected = row_count - 1;
         }
 
-        // Draw bordered block with title.
-        let title_line = self.build_title_spans(row_count);
-        let block = Block::bordered()
-            .title(title_line)
-            .border_style(self.theme.border);
+        // The block's inner rect does not depend on its title, so it can be
+        // measured before the title exists — which it has to be, because the
+        // title reports how many COLUMNS fit and only the layout below knows
+        // that. The block is still rendered once, titled.
+        let block = Block::bordered().border_style(self.theme.border);
         let inner = block.inner(area);
-        block.render(area, buf);
-        if inner.height == 0 || inner.width == 0 { return; }
+        if inner.height == 0 || inner.width == 0 {
+            // Nothing will fit, but the border and title still belong on
+            // screen: a degenerate frame must not lose the view's name.
+            block.title(self.build_title_spans(row_count, 0..row_count, None, area.width.saturating_sub(2))).render(area, buf);
+            return;
+        }
 
         // Report the true data-row height (inner minus the 1 header row) back to
         // the Viewport BEFORE the column early-return below, so paging keeps a
         // real page size even on a (degenerate) zero-column frame.
         state.visible_height = (inner.height as usize).saturating_sub(1);
 
+        // The VERTICAL window, settled here rather than beside the row loop:
+        // it depends only on `inner` and the row count, and the title below
+        // reports it. Same adjustment, moved up.
+        let visible_height = state.visible_height;
+        if state.selected < state.offset {
+            state.offset = state.selected;
+        }
+        if visible_height > 0 && state.selected >= state.offset + visible_height {
+            state.offset = state.selected - visible_height + 1;
+        }
+        let shown_rows = state.offset..(state.offset + visible_height).min(row_count);
+
         // Column layout — widths are pre-computed with the memoized view
         // (see `PreparedView::col_widths`), not re-scanned per frame.
         let col_widths = self.col_widths.to_vec();
-        if col_widths.is_empty() { return; }
+        if col_widths.is_empty() {
+            block.title(self.build_title_spans(row_count, 0..row_count, None, area.width.saturating_sub(2))).render(area, buf);
+            return;
+        }
 
         // Clamp column selection.
         if state.selected_col >= col_widths.len() {
@@ -469,6 +585,18 @@ impl StatefulWidget for ResourceTable<'_> {
             layout.reposition(state.col_offset, inner.width);
         }
 
+        // NOW the title can say what is off screen — after the horizontal
+        // scroll has settled, so the count describes the frame being drawn
+        // rather than the previous one.
+        block
+            .title(self.build_title_spans(
+                row_count,
+                shown_rows.clone(),
+                layout.clipped(),
+                area.width.saturating_sub(2),
+            ))
+            .render(area, buf);
+
         // --- Header row ---
         let header_y = inner.y;
         let header_style = self.theme.header;
@@ -495,17 +623,9 @@ impl StatefulWidget for ResourceTable<'_> {
 
         // --- Data rows (virtual scroll) ---
         let data_start_y = header_y + 1;
-        let visible_height = (inner.y + inner.height).saturating_sub(data_start_y) as usize;
         if visible_height == 0 { return; }
 
-        // Adjust vertical offset.
-        if state.selected < state.offset { state.offset = state.selected; }
-        if state.selected >= state.offset + visible_height {
-            state.offset = state.selected - visible_height + 1;
-        }
-
-        let end = (state.offset + visible_height).min(row_count);
-        for (vi, row_idx) in (state.offset..end).enumerate() {
+        for (vi, row_idx) in shown_rows.clone().enumerate() {
             let y = data_start_y + vi as u16;
             if y >= inner.y + inner.height { break; }
 

@@ -66,6 +66,27 @@ fn top_log_marker(term: &Terminal<TestBackend>) -> String {
         .expect("no painted row carries a log marker")
 }
 
+/// Push the help element, exactly as `Action::Help` does.
+fn push_help(app: &mut App) {
+    app.conn.established();
+    let class = crate::event::keymap::ViewClass::of(app.nav.top());
+    let caps = Some(app.current_capabilities());
+    let markable = app.nav.top().markable();
+    let store = app.core.seed_keybindings(caps, app.config.keys, class, markable);
+    let rid = crate::kube::local::LocalResourceKind::Keybinding.to_resource_id();
+    app.nav.push(Element::ResourceList(crate::app::element::ResourceList::client(
+        crate::app::element::QuerySpec {
+            rid,
+            namespace: crate::kube::protocol::Namespace::All,
+            filter: None,
+        },
+        store,
+        &app.kube.metrics,
+        "keys".to_string(),
+    )));
+    assert!(app.nav.top().is_keybindings_view(), "that IS the help element");
+}
+
 /// Seed the root pod table with one recognizable row.
 fn seed_row(app: &App, name: &str) {
     let store = app.nav.top().data_store().expect("root is a table");
@@ -154,7 +175,7 @@ fn a_dialog_overlay_keeps_the_live_view_around_it() {
 #[test]
 fn overlay_extents_are_declared_not_improvised() {
     // Extent drives the central erase; a new overlay kind must choose one.
-    assert_eq!(shell_overlay().extent(), ViewExtent::Full);
+    assert_eq!(shell_overlay().extent(term().get_frame().area()), ViewExtent::Full);
     assert_eq!(
         TakeoverOp::Edit {
             target: crate::kube::protocol::ObjectRef {
@@ -164,16 +185,14 @@ fn overlay_extents_are_declared_not_improvised() {
             },
             state: crate::app::EditState::AwaitingYaml,
         }
-        .extent(),
+        .extent(term().get_frame().area()),
         ViewExtent::Dialog {
             // Sized from its own label, in cells, exactly as the dialog
             // ELEMENTS are — which is the point of there being one extent
-            // type: a takeover's box can state its size, so it no longer
-            // has to centre itself.
-            max_width: crate::app::element::Size::Cells(
-                "Fetching YAML for Pod/p…".chars().count() as u16 + 6,
-            ),
-            max_height: crate::app::element::Size::Cells(3),
+            // type: a takeover's box states its size, so it no longer has
+            // to centre itself.
+            width: "Fetching YAML for Pod/p…".chars().count() as u16 + 6,
+            height: 3,
         }
     );
 }
@@ -980,12 +999,11 @@ fn a_confirm_dialog_floats_over_the_view_that_raised_it() {
     })));
 
     // Content-sized, not a percentage of somebody's terminal.
-    let ViewExtent::Dialog { max_height, .. } = app.nav.top().extent() else {
+    let ViewExtent::Dialog { height, .. } = app.nav.top().extent(t.get_frame().area()) else {
         panic!("a confirm must declare a Dialog extent");
     };
     assert_eq!(
-        max_height,
-        crate::app::element::Size::Cells(11),
+        height, 11,
         "one message line plus its chrome — not 85% of the screen",
     );
 
@@ -1049,8 +1067,8 @@ fn the_container_picker_is_a_floating_element() {
     // Sized from its own contents, like the confirm box — two choices plus
     // chrome, not a share of the terminal.
     assert!(matches!(
-        app.nav.top().extent(),
-        ViewExtent::Dialog { max_height: crate::app::element::Size::Cells(8), .. }
+        app.nav.top().extent(t.get_frame().area()),
+        ViewExtent::Dialog { height: 8, .. }
     ));
 
     let painted = paint(&mut t, &mut app);
@@ -1129,7 +1147,7 @@ fn every_dialog_kind_paints_itself_over_its_parent() {
         let mut t = term();
         app.nav.push(dialog);
         assert!(
-            matches!(app.nav.top().extent(), crate::app::element::ViewExtent::Dialog { .. }),
+            app.nav.top().floats(),
             "{label}: must declare a Dialog extent",
         );
         assert_eq!(app.nav.top().class(), crate::app::element::ElementClass::Dialog);
@@ -1183,7 +1201,7 @@ fn a_full_frame_takeover_erases_the_frame_not_the_float_over_it() {
         },
     ))));
     assert_eq!(
-        app.ui.takeover().map(crate::app::TakeoverOp::extent),
+        app.ui.takeover().map(|op| op.extent(term().get_frame().area())),
         Some(ViewExtent::Full),
         "the shell connect screen claims the frame",
     );
@@ -1394,4 +1412,540 @@ fn the_log_hint_bar_reaches_its_last_hint_on_screen() {
             "w={width}: and nothing had to be dropped to get there:\n{painted}",
         );
     }
+}
+
+/// A dialog's box is the SMALLER of what it needs and what it allows itself.
+///
+/// Help was the one dialog sized by a flat percentage, and `ViewExtent`'s own
+/// doc claimed boxes were "shrunk to whatever the content actually needs".
+/// Nothing shrank anything. Its 105-column table was therefore clipped by 27
+/// columns on a 100-wide terminal and floating in 53 columns of DEAD SPACE on
+/// a 200-wide one — both halves of one unimplemented sentence, and the second
+/// is the "unused column on the right edge" that went unreproduced for weeks
+/// because 100×30 is on the clipped side of the crossover.
+#[test]
+fn a_dialog_fits_its_content_at_every_terminal_width() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let natural = {
+        let mut app = App::new_for_test();
+        push_help(&mut app);
+        // Measured the way the renderer measures: the memo's own widths.
+        let mut t = Terminal::new(TestBackend::new(400, 120)).expect("wide terminal");
+        let _ = paint(&mut t, &mut app);
+        let crate::app::element::ViewExtent::Dialog { width, .. } =
+            app.nav.top().extent(ratatui::layout::Rect::new(0, 0, 400, 120))
+        else {
+            panic!("help floats")
+        };
+        width
+    };
+    assert!(
+        (60..200).contains(&natural),
+        "sanity: help's table is a few dozen columns wide, got {natural}",
+    );
+
+    for (term_w, term_h) in [(80u16, 24u16), (100, 30), (160, 50), (240, 80)] {
+        let mut app = App::new_for_test();
+        push_help(&mut app);
+        let mut t = Terminal::new(TestBackend::new(term_w, term_h)).expect("terminal");
+        let _ = paint(&mut t, &mut app);
+
+        let frame = ratatui::layout::Rect::new(0, 0, term_w, term_h);
+        let crate::app::element::ViewExtent::Dialog { width, .. } = app.nav.top().extent(frame)
+        else {
+            panic!("help floats")
+        };
+        let allowance = term_w * 80 / 100;
+
+        // NEVER wider than the content needs — that is the dead space.
+        assert!(
+            width <= natural,
+            "{term_w}x{term_h}: box {width} exceeds the content's {natural} — dead space",
+        );
+        // NEVER wider than it allows itself — it floats OVER something.
+        assert!(
+            width <= allowance,
+            "{term_w}x{term_h}: box {width} exceeds its {allowance}-column allowance",
+        );
+        // And it takes everything it can, so a wide terminal is not wasted.
+        assert_eq!(
+            width,
+            natural.min(allowance),
+            "{term_w}x{term_h}: the box is exactly min(need, allowance)",
+        );
+    }
+}
+
+/// A table that cannot show all its columns says so.
+///
+/// The reported symptom was "AGE doesn't always appear". It always appeared —
+/// a pod table with metrics is 200 columns wide, so at 97 you see seven of
+/// fourteen and AGE, being LAST, is a hundred columns past the right edge.
+/// Nothing said so, which is why it read as a missing field; and `Ctrl-R`
+/// could never help, because it is a fact about the window, not the data.
+///
+/// The count goes in the TITLE, beside the row count, because the title sits
+/// on the border and cannot be scrolled past.
+#[test]
+fn a_table_says_when_its_columns_do_not_fit() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new_for_test();
+    app.conn.established();
+    // Three columns whose natural widths overflow a 60-column frame, the way
+    // a real pod table does at 200: the NODE column alone is 41 of them.
+    let store = app.nav.top().data_store().expect("root is a table");
+    store.apply(
+        1,
+        StorePayload::Baseline(TableBaseline {
+            resource: crate::app::nav::rid(BuiltInKind::Pod),
+            headers: vec!["NAME".into(), "NODE".into(), "AGE".into()],
+            rows: vec![ResourceRow {
+                name: "canary-row-marker".into(),
+                namespace: Some("default".into()),
+                cells: vec![
+                    CellValue::Text("canary-row-marker".to_string()),
+                    CellValue::Text("ip-10-1-133-34.us-west-2.compute.internal".to_string()),
+                    CellValue::Text("4m28s".to_string()),
+                ],
+                ..Default::default()
+            }],
+        }),
+    );
+
+    // Narrow: the columns cannot all fit, so the title reports the shortfall
+    // and names a direction, because the column cursor is how you get there.
+    let mut narrow = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+    let painted = paint(&mut narrow, &mut app);
+    assert!(
+        painted.contains('\u{2192}'),
+        "a clipped table must say so, with a direction:\n{painted}",
+    );
+    let digits: Vec<usize> = painted[painted.find("cols").map(|i| i.saturating_sub(6)).unwrap_or(0)..]
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap())
+        .take(2)
+        .collect();
+    assert_eq!(digits.len(), 2, "the count is two numbers:\n{painted}");
+    let (shown, total) = (digits[0], digits[1]);
+    assert_eq!(total, 3, "three columns in all");
+    assert!(shown < total, "it reports {shown} of {total} — fewer than all");
+    assert!(shown >= 1, "and at least one column is drawn");
+    // AGE really is the one you cannot see, which is the reported symptom.
+    assert!(
+        !painted.contains("4m28s"),
+        "the last column is off screen — that IS the complaint:\n{painted}",
+    );
+
+    // Wide enough for everything: silence. An indicator that is always on
+    // is not an indicator.
+    let mut wide = Terminal::new(TestBackend::new(300, 12)).expect("terminal");
+    let painted = paint(&mut wide, &mut app);
+    assert!(
+        !painted.contains("cols"),
+        "nothing is clipped, so nothing is claimed:\n{painted}",
+    );
+}
+
+/// A bar or a message that does not fit says so, rather than losing its end.
+///
+/// Three surfaces made the same mistake in three different ways, and only
+/// one of them had been fixed: the hint bar fitted itself, the log STATUS bar
+/// did not (one `Line::from(spans)` with no width — 76 columns with every
+/// field shown), and a flash wider than the line was CENTRED, which put it at
+/// the left edge and clipped its tail in silence. The tail of an error is
+/// usually the part that names the cause.
+#[test]
+fn a_one_line_surface_that_overflows_marks_the_cut() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    // --- The log status bar, at a width its own indicators exceed. ---
+    for width in [40u16, 60, 100] {
+        let mut app = App::new_for_test();
+        app.conn.established();
+        app.nav.push(Element::LogSession(Box::new(LogSession::for_test(
+            crate::kube::protocol::LogTarget::One("canarypod".to_string()),
+            LogContainer::Named("app".to_string()),
+        ))));
+        let mut t = Terminal::new(TestBackend::new(width, 20)).expect("terminal");
+        let painted = paint(&mut t, &mut app);
+        // Never a half-written indicator: either a group is whole or absent.
+        for label in ["AutoScroll:", "Wrap:", "Fields:", "Since:"] {
+            if let Some(at) = painted.find(label) {
+                let rest = &painted[at + label.len()..];
+                assert!(
+                    rest.starts_with(|c: char| c.is_alphanumeric()),
+                    "w={width}: `{label}` is drawn without its value:\n{painted}",
+                );
+            }
+        }
+        assert!(
+            painted.contains("AutoScroll:"),
+            "w={width}: the first indicator always fits:\n{painted}",
+        );
+    }
+
+    // --- A flash longer than the line. ---
+    let mut app = App::new_for_test();
+    app.conn.established();
+    let long = "a".repeat(400);
+    app.ui.flash = Some(crate::app::FlashMessage::error(long));
+    let mut t = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        painted.contains('\u{2026}'),
+        "an over-long flash is visibly cut, not silently clipped:\n{painted}",
+    );
+
+    // …and one that fits is untouched, centred as before.
+    let mut app = App::new_for_test();
+    app.conn.established();
+    app.ui.flash = Some(crate::app::FlashMessage::info("short and sweet".to_string()));
+    let mut t = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+    assert!(painted.contains("short and sweet"), "a fitting flash is whole:\n{painted}");
+    assert!(!painted.contains('\u{2026}'), "and unmarked:\n{painted}");
+}
+
+/// The title gives up its cheapest parts first, and never the warning.
+///
+/// It is the one line reporting what you cannot otherwise see, it lives in
+/// the top border where ratatui truncates in silence, and I had just made it
+/// LONGER by adding the column count. Dropping from the right would sacrifice
+/// the liveness warning first — the single thing here you must not miss.
+#[test]
+fn a_crowded_title_keeps_the_warning_and_drops_the_hint() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new_for_test();
+    app.conn.established();
+    // Enough columns to be clipped at any width, so the hint is on offer.
+    let store = app.nav.top().data_store().expect("root is a table");
+    store.apply(
+        1,
+        StorePayload::Baseline(TableBaseline {
+            resource: crate::app::nav::rid(BuiltInKind::Pod),
+            // Six node-name columns: ~270 wide, so clipped at every width a
+            // terminal actually has — the pod table's real shape.
+            headers: vec![
+                "NAME".into(),
+                "NODE1".into(),
+                "NODE2".into(),
+                "NODE3".into(),
+                "NODE4".into(),
+                "NODE5".into(),
+                "AGE".into(),
+            ],
+            rows: vec![ResourceRow {
+                name: "canary".into(),
+                namespace: Some("default".into()),
+                cells: vec![
+                    CellValue::Text("canary".to_string()),
+                    CellValue::Text("ip-10-1-133-34.us-west-2.compute.internal".to_string()),
+                    CellValue::Text("ip-10-1-133-35.us-west-2.compute.internal".to_string()),
+                    CellValue::Text("ip-10-1-133-36.us-west-2.compute.internal".to_string()),
+                    CellValue::Text("ip-10-1-133-37.us-west-2.compute.internal".to_string()),
+                    CellValue::Text("ip-10-1-133-38.us-west-2.compute.internal".to_string()),
+                    CellValue::Text("4m".to_string()),
+                ],
+                ..Default::default()
+            }],
+        }),
+    );
+    // …and a staleness reason, which is the part that must survive.
+    store.mark_stale("watch closed by apiserver");
+
+    // Wide: everything is affordable, so everything is there.
+    let mut wide = Terminal::new(TestBackend::new(200, 12)).expect("terminal");
+    let painted = paint(&mut wide, &mut app);
+    assert!(painted.contains("cols"), "the hint fits here:\n{painted}");
+    assert!(painted.contains("watch closed"), "and so does the warning:\n{painted}");
+
+    // Narrow: the hint is the first thing surrendered; the warning is not.
+    let mut narrow = Terminal::new(TestBackend::new(46, 12)).expect("terminal");
+    let painted = paint(&mut narrow, &mut app);
+    assert!(
+        painted.contains("watch closed"),
+        "the warning is mandatory — stale rows must never read as live:\n{painted}",
+    );
+    assert!(
+        !painted.contains("cols"),
+        "…and the column hint is what pays for it, since the arrows still \
+         reach those columns:\n{painted}",
+    );
+    // The view's name survives too: you have to know where you are.
+    assert!(painted.contains("pods"), "the name is mandatory:\n{painted}");
+}
+
+/// A table with more rows than fit says WHICH rows, not just how many.
+///
+/// The log, describe and yaml views all have a scrollbar; the table had only
+/// a total, so a 1200-row list gave no sense of position at all. It gets the
+/// position in its TITLE rather than a scrollbar, because every one of those
+/// other views reserves a column for the bar unconditionally and this is the
+/// one view with no column to spare — a pod table with metrics is already 200
+/// columns against a 97-column terminal.
+#[test]
+fn a_table_longer_than_its_window_says_where_you_are() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new_for_test();
+    app.conn.established();
+    let store = app.nav.top().data_store().expect("root is a table");
+    let rows: Vec<ResourceRow> = (0..200)
+        .map(|i| ResourceRow {
+            name: format!("pod-{i:03}"),
+            namespace: Some("default".into()),
+            cells: vec![
+                CellValue::Text(format!("pod-{i:03}")),
+                CellValue::Text("Running".to_string()),
+            ],
+            ..Default::default()
+        })
+        .collect();
+    store.apply(
+        1,
+        StorePayload::Baseline(TableBaseline {
+            resource: crate::app::nav::rid(BuiltInKind::Pod),
+            headers: vec!["NAME".into(), "STATUS".into()],
+            rows,
+        }),
+    );
+
+    let mut t = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        painted.contains("/200]"),
+        "the total is still there, with a position:\n{painted}",
+    );
+    assert!(
+        painted.contains("[1-"),
+        "at the top, the window starts at row 1 (1-based, as a human reads):\n{painted}",
+    );
+
+    // Move the cursor past the window and the position follows it.
+    for _ in 0..40 {
+        app.nav.top_mut().select_next();
+    }
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        !painted.contains("[1-"),
+        "scrolled down, the window no longer starts at the first row:\n{painted}",
+    );
+    assert!(painted.contains("/200]"), "and the total does not change:\n{painted}");
+
+    // A table that fits says only the count — a position would be noise.
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "only-row");
+    let painted = paint(&mut t, &mut app);
+    assert!(painted.contains("[1]"), "one row, one number:\n{painted}");
+    assert!(!painted.contains("1-1/"), "no position when there is nowhere to be:\n{painted}");
+}
+
+/// A deep breadcrumb keeps its TAIL, and never hides under the help hint.
+///
+/// Every other bar on screen drops from the right; this one must not. The
+/// last crumb is where you ARE — the first is a resource name you typed
+/// yourself. And the ` ? help ` hint used to be stamped at a fixed right
+/// position AFTER an unbounded breadcrumb line, so a long path lost its tail
+/// underneath it with nothing to say so.
+#[test]
+fn a_deep_breadcrumb_keeps_its_tail_and_clears_the_hint() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "a-pod-with-quite-a-long-name");
+    // Drill: each level lengthens the path from the left.
+    for pat in ["a", "pod", "with", "quite", "long", "name"] {
+        let predicate = crate::app::store::RowPredicate::Grep(
+            crate::app::nav::CompiledGrep::new(pat),
+        );
+        if let Ok(el) = crate::app::element::Element::derive_filter(app.nav.top(), predicate) {
+            app.nav.push(el);
+        }
+    }
+    let path = app.nav.breadcrumb();
+    assert!(path.len() > 40, "the fixture really is a long path: {path:?}");
+
+    let mut t = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+
+    // The LAST crumb is on screen…
+    let last = path.rsplit(" > ").next().expect("a last crumb");
+    assert!(
+        painted.contains(last),
+        "the tail is where you are, so it must survive: {last:?}\n{painted}",
+    );
+    // …the cut is marked…
+    assert!(painted.contains('\u{2026}'), "and the elision is visible:\n{painted}");
+    // …and the hint is intact rather than overwritten, or overwriting.
+    assert!(painted.contains("? help"), "the hint is whole:\n{painted}");
+
+    // Wide enough: nothing elided, whole path shown.
+    let mut wide = Terminal::new(TestBackend::new(200, 12)).expect("terminal");
+    let painted = paint(&mut wide, &mut app);
+    assert!(painted.contains(&path), "all of it fits here:\n{painted}");
+}
+
+/// What you are TYPING is always on screen, caret included.
+///
+/// Five render sites guarded the caret with `if cursor_x < right_edge`, so
+/// the moment the text outgrew its bar the text clipped AND the caret stopped
+/// being drawn: you were typing blind into your own `:` prompt or grep. The
+/// guard looked defensive and was the bug.
+#[test]
+fn a_long_input_keeps_its_caret_and_its_tail_on_screen() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    // The `:` prompt. The TAIL is what you just typed, so that is what has
+    // to be visible — the head is a resource name you already know.
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "a-row");
+    let typed = "clickhouseinstallations some-extremely-long-namespace-name-here";
+    app.ui.open(crate::app::Modal::Command {
+        input: crate::app::text_input::TextInput::seeded(typed),
+        history_index: None,
+    });
+
+    let mut t = Terminal::new(TestBackend::new(40, 16)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+    let tail = &typed[typed.len() - 12..];
+    assert!(
+        painted.contains(tail),
+        "the end of what you typed must be visible: {tail:?}\n{painted}",
+    );
+    // And the caret is actually placed, which is what used to be skipped.
+    // Read off the backend, which records where the frame put it.
+    let caret = t.get_cursor_position().expect("the backend tracks the caret");
+    assert!(
+        caret.x < 40,
+        "the caret must land INSIDE the terminal, not past its right edge: {caret:?}",
+    );
+
+    // The log grep draft, behind a committed chain that pushes it right.
+    let mut app = App::new_for_test();
+    app.conn.established();
+    app.nav.push(Element::LogSession(Box::new(LogSession::for_test(
+        crate::kube::protocol::LogTarget::One("canarypod".to_string()),
+        LogContainer::Named("app".to_string()),
+    ))));
+    for pat in ["alpha", "bravo", "charlie"] {
+        if let Ok(el) = crate::app::element::Element::derive_log_filter(
+            app.nav.top(),
+            crate::app::nav::CompiledGrep::new(pat),
+        ) {
+            app.nav.push(el);
+        }
+    }
+    let draft = "a-very-long-pattern-being-typed-right-now";
+    // The log bar reads the element's own `draft`, not the table filter.
+    app.nav.top_mut().log_view_mut().expect("a log element").draft =
+        Some(crate::app::text_input::TextInput::seeded(draft));
+    let mut t = Terminal::new(TestBackend::new(60, 16)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+    let tail = &draft[draft.len() - 10..];
+    assert!(
+        painted.contains(tail),
+        "the draft's tail survives a committed chain pushing it right: {tail:?}\n{painted}",
+    );
+    assert!(
+        painted.contains('\u{2588}'),
+        "and its caret block is drawn:\n{painted}",
+    );
+}
+
+/// The cluster header keeps the identifying END of each identifier.
+///
+/// `aws eks update-kubeconfig` without `--alias` writes a context of
+/// `arn:aws:eks:us-west-2:123456789012:cluster/prod-usw2`. Every column
+/// before `prod-usw2` is boilerplate shared with every other context you
+/// have, so clipping on the right — which the `Paragraph` did — made the four
+/// header lines read as four copies of the same ARN prefix.
+#[test]
+fn the_header_keeps_the_telling_end_of_an_arn() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new_for_test();
+    let arn = "arn:aws:eks:us-west-2:123456789012:cluster/prod-usw2";
+    app.kube.context = crate::kube::protocol::ContextName::new(arn);
+    app.conn.established();
+
+    // Narrow enough that the ARN cannot fit beside the logo.
+    let mut t = Terminal::new(TestBackend::new(80, 16)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        painted.contains("prod-usw2"),
+        "the cluster you are ON is the end of the ARN, so it must survive:\n{painted}",
+    );
+    assert!(painted.contains('\u{2026}'), "and the elision is marked:\n{painted}");
+
+    // Wide: no elision, the whole thing.
+    let mut wide = Terminal::new(TestBackend::new(200, 16)).expect("terminal");
+    let painted = paint(&mut wide, &mut app);
+    assert!(painted.contains(arn), "all of it fits here:\n{painted}");
+}
+
+/// A dialog's box and its chrome agree about the margin, because there is one.
+///
+/// `Element::extent` added a bare `+ 4` / `+ 2` in three match arms and
+/// `ModalOverlay::render` subtracted `saturating_sub(4)` / `(2)` in another
+/// file. The two cancelling was the only thing keeping the dialogs the right
+/// size, and nothing said so — changing one would have silently mis-sized all
+/// three. Pinned as the RELATIONSHIP, so the numbers cannot drift apart.
+#[test]
+fn a_dialogs_box_reserves_exactly_the_chrome_its_widget_spends() {
+    let (mw, mh) = crate::ui::widgets::DIALOG_MARGIN;
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "canary-row-marker");
+    let target = crate::kube::protocol::ObjectRef::new(
+        crate::app::nav::rid(BuiltInKind::Pod),
+        "canary-row-marker".to_string(),
+        crate::kube::protocol::Namespace::Named("default".to_string()),
+    );
+
+    app.nav.push(Element::Confirm(Box::new(crate::app::ConfirmDialog {
+        message: "Delete pod/canary-row-marker?".to_string(),
+        action_label: "Delete".to_string(),
+        pending: crate::app::PendingAction::Single {
+            op: crate::app::SingleOp::Delete,
+            target,
+        },
+        action_focused: false,
+    })));
+
+    let crate::app::element::ViewExtent::Dialog { width, height } =
+        app.nav.top().extent(ratatui::layout::Rect::new(0, 0, 200, 60))
+    else {
+        panic!("a confirm floats")
+    };
+    let crate::app::element::Element::Confirm(d) = app.nav.top() else { panic!() };
+    let (cw, ch) = crate::ui::widgets::confirm_dialog_size(d);
+    assert_eq!(
+        (width, height),
+        (cw + mw, ch + mh),
+        "the box is the widget's content plus exactly the chrome it spends",
+    );
+
+    // And it really draws: the box is big enough for the message after the
+    // widget has taken its margin back out.
+    let mut t = term();
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        painted.contains("Delete pod/canary-row-marker?"),
+        "the message fits the box its own size asked for:\n{painted}",
+    );
 }

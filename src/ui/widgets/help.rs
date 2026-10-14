@@ -127,22 +127,21 @@ impl HelpContent {
         // is now the SAME answer the select gate uses, handed in rather than
         // re-derived, so the two cannot drift.
         if self.markable {
+            // ONLY what CHANGES when rows are marked.
+            //
+            // `Space`, `Ctrl-Space` and `Ctrl-\` were also listed here, in
+            // slightly different words from the keymap rows that already
+            // declare them ("Mark / unmark row" vs "Toggle the mark on the
+            // cursor row", "Span-mark from nearest" vs "Span-mark to/from
+            // the nearest mark"). Marking behaves the same marked or not, so
+            // those rows said nothing this section exists to say — they were
+            // a second hand-written description of a key the keymap owns,
+            // free to drift from it, and part of the repetition that makes
+            // this sheet longer than it needs to be.
             let mut entries = vec![
-                HelpEntry {
-                    key: "Space".into(),
-                    description: "Toggle the mark on the cursor row".into(),
-                },
-                HelpEntry {
-                    key: "Ctrl-Space".into(),
-                    description: "Span-mark to/from the nearest mark".into(),
-                },
                 HelpEntry {
                     key: "Esc".into(),
                     description: "Clear the selection (then Esc pops as usual)".into(),
-                },
-                HelpEntry {
-                    key: "Ctrl-\\".into(),
-                    description: "Clear all marks".into(),
                 },
                 HelpEntry { key: "c".into(), description: "Copy ONLY the marked rows".into() },
             ];
@@ -212,14 +211,16 @@ impl HelpContent {
         caps.operations
             .iter()
             .filter_map(|op| {
-                let key = self.keys.op_key(op).map(|c| c.label()).unwrap_or_else(|| {
-                    // Structural chords: no descriptor default, always live.
-                    match op {
-                        crate::kube::protocol::OperationKind::Delete => "Ctrl-d".into(),
-                        crate::kube::protocol::OperationKind::ForceKill => "Ctrl-k".into(),
-                        _ => String::new(),
-                    }
-                });
+                // The user's chord if they set one, else the operation's own
+                // declaration — `structural_chord` for the three that have no
+                // descriptor default. These used to be string literals here
+                // AND again below AND matched in `event::handler`.
+                let key = self
+                    .keys
+                    .op_key(op)
+                    .or_else(|| op.structural_chord())
+                    .map(|c| c.label())
+                    .unwrap_or_default();
                 let label = op.descriptor().label;
                 match op.batch_support() {
                     BatchSupport::PerItem => Some(HelpEntry {
@@ -276,14 +277,13 @@ impl HelpContent {
             // things. Of the two directions to be wrong in, an undocumented
             // destructive key is the worse one — and it made Delete
             // inconsistent with the two siblings below, which were right.
-            if caps.supports(crate::kube::protocol::OperationKind::Delete) {
-                entries.push(HelpEntry { key: "Ctrl-d".into(), description: "Delete".into() });
-            }
-            if caps.supports(crate::kube::protocol::OperationKind::ForceKill) {
-                entries.push(HelpEntry { key: "Ctrl-k".into(), description: "Force kill".into() });
-            }
-            if caps.supports(crate::kube::protocol::OperationKind::PortForward) {
-                entries.push(HelpEntry { key: "Shift-F".into(), description: "Port forward".into() });
+            for op in &caps.operations {
+                if let Some(chord) = op.structural_chord() {
+                    entries.push(HelpEntry {
+                        key: chord.label(),
+                        description: op.descriptor().label.into(),
+                    });
+                }
             }
         }
 
