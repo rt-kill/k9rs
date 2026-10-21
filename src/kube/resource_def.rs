@@ -99,18 +99,37 @@ pub struct ColumnDef {
     /// next to the column it describes, so it travels with the column instead
     /// of living in a table someone has to remember to update.
     pub max_width: Option<u16>,
+    /// Whether consecutive EQUAL values in this column collapse to one, when
+    /// it is the column being sorted on.
+    ///
+    /// OPT-IN, and declared next to the column, because the two cases look
+    /// identical from the data and read in opposite ways. Help's `SECTION` is
+    /// a category you grouped BY, so thirteen rows repeating "Everywhere"
+    /// down the left edge is noise. A resource's `AGE` is a per-row fact you
+    /// scan, and a ReplicaSet's pods are all created in the same second — so
+    /// collapsing it blanked eighteen rows and read as MISSING DATA. (It was
+    /// reported that way: "is the age not properly populated for every single
+    /// row?") Inferring from "is it sorted" got that backwards for every
+    /// resource column, which is why the column now says.
+    pub groups: bool,
 }
 
 impl ColumnDef {
     pub const fn new(header: &'static str) -> Self {
-        Self { header, level: ColumnLevel::Default, metrics: None, max_width: None }
+        Self { header, level: ColumnLevel::Default, metrics: None, max_width: None, groups: false }
     }
     pub const fn extra(header: &'static str) -> Self {
-        Self { header, level: ColumnLevel::Extra, metrics: None, max_width: None }
+        Self { header, level: ColumnLevel::Extra, metrics: None, max_width: None, groups: false }
     }
     /// Cap this column's width regardless of how long its values run.
     pub const fn max_width(self, w: u16) -> Self {
         Self { max_width: Some(w), ..self }
+    }
+
+    /// Collapse consecutive equal values when sorted on this column — for a
+    /// column that is a CATEGORY, not a per-row measurement. See `groups`.
+    pub const fn groups(self) -> Self {
+        Self { groups: true, ..self }
     }
     // (`age`/`extra_age` ctors removed — they were byte-identical to
     // `new`/`extra`. Age columns are rendered from `CellValue::Age` in the
@@ -149,20 +168,50 @@ impl ColumnDef {
 // BuiltInKind — closed enum of every built-in K8s resource the daemon serves
 // ---------------------------------------------------------------------------
 
-/// Closed enum of every built-in resource type the daemon knows about. The
-/// canonical typed identity for built-ins — [`ResourceId::BuiltIn`] wraps it,
-/// and [`ResourceRegistry`](crate::kube::resource_defs::ResourceRegistry)
-/// indexes defs by it.
+/// Declare `BuiltInKind` and its complete `ALL` from ONE list.
 ///
-/// The enum is closed at the type level: adding a variant forces an update
-/// to every exhaustive match downstream, and the registry's
-/// `registry_consistency` test walks the live registry (not a parallel
-/// slice), so any def whose `kind()` disagrees with its registration key
-/// fails at test time. Adding a variant without backing it with a
-/// `ResourceDef` impl surfaces as a runtime panic on first use, which is
-/// caught during any test that exercises the new variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum BuiltInKind {
+/// Rust cannot enumerate an enum's variants, so any "every kind" list is a
+/// second copy by construction — and a hand-maintained `BuiltInKind::ALL`
+/// previously existed, was found to be exactly that, and was deleted. This
+/// generates the list from the declaration instead, so the copy cannot
+/// disagree: adding a variant adds it to `ALL`, and `ALL` is what the
+/// registration guard walks.
+macro_rules! built_in_kinds {
+    ($(#[$m:meta])* pub enum $name:ident { $($variant:ident),* $(,)? }) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum $name { $($variant),* }
+
+        impl $name {
+            /// Every variant, generated from the enum's own declaration.
+            pub const ALL: &'static [$name] = &[$($name::$variant),*];
+        }
+    };
+}
+built_in_kinds! {
+    /// Closed enum of every built-in resource type the daemon knows about.
+    ///
+    /// The canonical typed identity for built-ins — [`ResourceId::BuiltIn`] wraps it,
+    /// and [`ResourceRegistry`](crate::kube::resource_defs::ResourceRegistry)
+    /// indexes defs by it.
+    ///
+    /// Declared through [`built_in_kinds!`] so that [`BuiltInKind::ALL`] is
+    /// generated FROM this list and cannot omit a variant. That is what makes
+    /// `every_built_in_kind_is_registered` a real guarantee: the registry's
+    /// `registry_consistency` test walks the LIVE registry, so it can only ever
+    /// see kinds that were registered — a variant nobody called `register_*` for
+    /// was invisible to it and panicked in `by_kind` the first time a user
+    /// navigated there, in a TUI.
+    ///
+    /// The doc here used to claim "adding a variant forces an update to every
+    /// exhaustive match downstream". There were NO exhaustive matches over this
+    /// enum, so nothing was forced and the claim was simply untrue; the rest of
+    /// it leaned on "caught during any test that exercises the new variant",
+    /// which required somebody to write that test.
+    ///
+    /// WIRE-ORDERED: the enum derives `Serialize`/`Deserialize` and rides
+    /// `ResourceId` on the wire, so variants are APPENDED, never reordered.
+    pub enum BuiltInKind {
     // Workloads
     Pod,
     Deployment,
@@ -202,6 +251,7 @@ pub enum BuiltInKind {
     ValidatingWebhookConfiguration,
     MutatingWebhookConfiguration,
     CustomResourceDefinition,
+}
 }
 
 // `BuiltInKind::ALL` used to live here as a hand-maintained `&[BuiltInKind]`

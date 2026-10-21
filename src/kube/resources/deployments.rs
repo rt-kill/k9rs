@@ -3,8 +3,8 @@ use k8s_openapi::api::apps::v1::Deployment;
 
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
-use crate::kube::resources::{CommonMeta, WorkloadContainers};
-use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
+use crate::kube::resources::{CommonMeta, WorkloadContainers, WorkloadTally};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // DeploymentDef — ResourceDef + ConvertToRow
@@ -66,14 +66,20 @@ impl ConvertToRow<Deployment> for DeploymentDef {
             Some(DrillTarget::PodsByNameGrep(meta.name.clone()))
         };
 
-        // Health follows the column the user is READING. Driving it from
+        // Red follows the column the user is READING: driving it from
         // `available` while READY shows `ready` would paint a row red next
-        // to a `3/3` — the colour and the number beside it have to agree
-        // about what they mean. The rollout-window detail that `available`
-        // carries is still its own column.
-        let health = if desired == 0 { RowHealth::Pending }
-            else if ready < desired { RowHealth::Failed }
-            else { RowHealth::Normal };
+        // to a `3/3`, and the colour and the number beside it have to agree
+        // about what they mean. `status.replicas` — non-terminated pods
+        // across every revision — is read for the verdict only, and is the
+        // field that says "more pods than we are scaled to" during a surge.
+        // At one to three replicas it is the *only* field that says a
+        // rollout is happening; see `WorkloadTally::rollout_in_flight`.
+        let health = WorkloadTally {
+            desired,
+            ready,
+            total: status.replicas.unwrap_or(0),
+            up_to_date: Some(up_to_date),
+        }.health();
 
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.namespace.clone()),

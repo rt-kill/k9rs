@@ -111,9 +111,11 @@ impl Widget for ConfirmDialogWidget<'_> {
 //   - Port   → digit-only line edit (1..=65535 enforced on submit)
 //   - Select → cycling picker with `< value >` and a hint about Left/Right
 //
-// Below the fields the widget draws an OK button (focusable as the last
-// position) and a hint bar with Tab/Enter/Esc bindings. There is no Cancel
-// button — Esc cancels.
+// Below the fields the widget draws an OK and a Cancel button, both in the
+// Tab cycle, plus a hint bar. Cancel is not decoration: the widget used to
+// say "There is no Cancel button — Esc cancels", and Esc did not cancel
+// (see `FormDialog::focused`), which left OK as the only way out of a form
+// you had opened by mistake.
 
 pub struct FormDialogWidget<'a> {
     dialog: &'a FormDialog,
@@ -155,7 +157,7 @@ impl Widget for FormDialogWidget<'_> {
             hint_spans.push(Span::styled(" select  ", self.theme.help_desc));
         }
         hint_spans.push(Span::styled("<Enter>", self.theme.status_bar_key));
-        hint_spans.push(Span::styled(" ok  ", self.theme.help_desc));
+        hint_spans.push(Span::styled(" confirm  ", self.theme.help_desc));
         hint_spans.push(Span::styled("<Esc>", self.theme.status_bar_key));
         hint_spans.push(Span::styled(" cancel", self.theme.help_desc));
         let hints = Line::from(hint_spans);
@@ -182,22 +184,27 @@ impl Widget for FormDialogWidget<'_> {
             // Fields.
             for (idx, field) in dialog.fields.iter().enumerate() {
                 if y >= content.y + content.height { break; }
-                let focused = dialog.focused == idx;
+                let focused = dialog.field_focused(idx);
                 render_form_field(buf, FieldLayout { x: content.x, y, width: content.width, label_col }, field, focused, theme);
                 y += 1;
             }
             y += 1;
 
-            // OK button.
+            // Button row: OK then Cancel, centred as one group so the pair
+            // stays put when either is focused.
             if y < content.y + content.height {
-                let ok_text = "  OK  ";
-                let bx = content.x + content.width.saturating_sub(ok_text.len() as u16) / 2;
-                let ok_style = if dialog.ok_focused() {
+                const OK: &str = "  OK  ";
+                const CANCEL: &str = "  Cancel  ";
+                const GAP: u16 = 2;
+                let row_w = OK.len() as u16 + GAP + CANCEL.len() as u16;
+                let bx = content.x + content.width.saturating_sub(row_w) / 2;
+                let style = |on: bool| if on {
                     theme.dialog_button_active
                 } else {
                     theme.dialog_button_inactive
                 };
-                buf.set_string(bx, y, ok_text, ok_style);
+                buf.set_string(bx, y, OK, style(dialog.ok_focused()));
+                buf.set_string(bx + OK.len() as u16 + GAP, y, CANCEL, style(dialog.cancel_focused()));
             }
         })
         .title(&self.dialog.title)

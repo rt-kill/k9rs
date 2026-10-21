@@ -3,8 +3,8 @@ use k8s_openapi::api::apps::v1::ReplicaSet;
 
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
-use crate::kube::resources::{CommonMeta, WorkloadContainers};
-use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
+use crate::kube::resources::{CommonMeta, WorkloadContainers, WorkloadTally};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // ReplicaSetDef — ResourceDef + ConvertToRow
@@ -57,9 +57,16 @@ impl ConvertToRow<ReplicaSet> for ReplicaSetDef {
             Some(DrillTarget::PodsByNameGrep(meta.name.clone()))
         };
 
-        let health = if desired == 0 { RowHealth::Pending }
-            else if ready < desired { RowHealth::Failed }
-            else { RowHealth::Normal };
+        // A ReplicaSet *is* one revision — there is no pod template for it
+        // to be behind on, so `up_to_date` has no meaning here. `total` still
+        // does: it is what CURRENT shows, and a scale in either direction
+        // leaves it disagreeing with DESIRED while pods come and go.
+        let health = WorkloadTally {
+            desired,
+            ready,
+            total: current,
+            up_to_date: None,
+        }.health();
 
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.namespace.clone()),

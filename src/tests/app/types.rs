@@ -323,3 +323,307 @@ fn the_readme_sample_config_actually_parses() {
     assert_eq!(cfg.ui.logs.tail_lines, LogConfig::default().tail_lines);
     assert_eq!(cfg.ui.logs.default_fields, LogConfig::default().default_fields);
 }
+
+// ---------------------------------------------------------------------------
+// delta_tracker_tests (mirrored out of types.rs)
+// ---------------------------------------------------------------------------
+
+    use crate::kube::protocol::{ObjectKey, RowChange};
+    use crate::kube::resources::row::{CellValue, ResourceRow};
+
+    fn row(name: &str, val: &str) -> ResourceRow {
+        ResourceRow {
+            name: name.into(),
+            namespace: Some("ns".into()),
+            cells: vec![CellValue::Text(val.into())],
+            ..Default::default()
+        }
+    }
+    fn key(name: &str) -> ObjectKey {
+        ObjectKey::new("ns".to_string(), name.to_string())
+    }
+
+    /// E4: a metadata-only upsert (identical cells) must NOT flash — kube
+    /// heartbeat churn would otherwise light the table permanently. A real
+    /// change flashes; an insert doesn't (matches the baseline path);
+    /// removes clear their state.
+    #[test]
+    fn apply_changes_flashes_only_genuine_changes() {
+        let mut d = DeltaTracker::new();
+        d.rebaseline(&[row("a", "1")]);
+        assert!(d.changed_rows().is_empty(), "baseline seeds hashes, no flash");
+
+        d.apply_changes(&[RowChange::Upsert(row("a", "1"))]); // heartbeat
+        assert!(d.changed_rows().is_empty(), "identical cells: no flash");
+
+        d.apply_changes(&[RowChange::Upsert(row("a", "2"))]); // real change
+        assert!(d.changed_rows().contains_key(&key("a")));
+
+        d.apply_changes(&[RowChange::Upsert(row("new", "1"))]); // insert
+        assert!(!d.changed_rows().contains_key(&key("new")), "inserts don't flash");
+
+        d.apply_changes(&[RowChange::Remove(key("a"))]);
+        assert!(!d.changed_rows().contains_key(&key("a")), "remove clears state");
+    }
+
+    /// Cross-recovery continuity: hashes survive a re-baseline, so a row
+    /// that changed while a watcher was down flashes after the recovery
+    /// baseline — and unchanged rows do NOT mass-flash.
+    #[test]
+    fn rebaseline_keeps_continuity_without_mass_flash() {
+        let mut d = DeltaTracker::new();
+        d.rebaseline(&[row("a", "1"), row("b", "1")]);
+        d.rebaseline(&[row("a", "1"), row("b", "2")]); // recovery baseline
+        assert!(!d.changed_rows().contains_key(&key("a")), "unchanged: quiet");
+        assert!(d.changed_rows().contains_key(&key("b")), "changed-during-gap: flash");
+    }
+
+// ---------------------------------------------------------------------------
+// key_combo_tests (mirrored out of types.rs)
+// ---------------------------------------------------------------------------
+
+
+    fn parse(s: &str) -> Result<KeyCombo, String> {
+        KeyCombo::try_from(s.to_string())
+    }
+
+    #[test]
+    fn parses_plain_ctrl_and_case() {
+        assert_eq!(parse("l"), Ok(KeyCombo::plain('l')));
+        assert_eq!(parse("L"), Ok(KeyCombo::plain('L')));
+        assert_eq!(parse("-"), Ok(KeyCombo::plain('-')), "a lone dash is a character");
+        assert_eq!(parse(" "), Ok(KeyCombo::plain(' ')), "space is a character");
+        assert_eq!(parse("ctrl-l"), Ok(KeyCombo { ctrl: true, ch: 'l' }));
+        // Ctrl chords arrive lowercase from the terminal — an uppercase
+        // spec is normalized so it can actually match.
+        assert_eq!(parse("Ctrl-L"), Ok(KeyCombo { ctrl: true, ch: 'l' }));
+        assert_eq!(parse("C-x"), Ok(KeyCombo { ctrl: true, ch: 'x' }));
+        assert_eq!(parse(" ctrl-l "), Ok(KeyCombo { ctrl: true, ch: 'l' }), "trimmed");
+    }
+
+    #[test]
+    fn rejects_malformed_specs() {
+        for bad in ["", "ctrl-", "meta-l", "ll", "ctrl-ll", "alt-x"] {
+            assert!(parse(bad).is_err(), "'{bad}' must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_reserved_and_duplicate_chords() {
+        // Reserved: a binding an earlier dispatch layer always consumes.
+        let keys = KeysConfig {
+            logs: Some(KeyCombo { ctrl: true, ch: 'r' }),
+            ..Default::default()
+        };
+        let err = keys.validate().unwrap_err();
+        assert!(err.contains("keys.logs") && err.contains("reserved"), "{err}");
+
+        // Duplicate chords across entries.
+        let keys = KeysConfig {
+            col_right: Some(KeyCombo::plain('x')),
+            logs: Some(KeyCombo::plain('x')),
+            ..Default::default()
+        };
+        let err = keys.validate().unwrap_err();
+        assert!(err.contains("already bound"), "{err}");
+
+        // The user's real shape is fine.
+        let keys = KeysConfig {
+            col_left: Some(KeyCombo::plain('h')),
+            col_right: Some(KeyCombo::plain('l')),
+            logs: Some(KeyCombo { ctrl: true, ch: 'l' }),
+            ..Default::default()
+        };
+        assert!(keys.validate().is_ok());
+    }
+
+    #[test]
+    fn op_key_override_replaces_default() {
+        use crate::kube::protocol::OperationKind as Op;
+        let mut keys = KeysConfig::default();
+        // Default: descriptor key as a plain chord.
+        assert_eq!(keys.op_key(&Op::StreamLogs), Some(KeyCombo::plain('l')));
+        // Override REPLACES it (the default char is no longer the binding).
+        keys.logs = Some(KeyCombo { ctrl: true, ch: 'l' });
+        assert_eq!(keys.op_key(&Op::StreamLogs), Some(KeyCombo { ctrl: true, ch: 'l' }));
+        // Structural-default ops have no chord unless the user adds one.
+        assert_eq!(keys.op_key(&Op::Delete), None);
+        keys.delete = Some(KeyCombo::plain('x'));
+        assert_eq!(keys.op_key(&Op::Delete), Some(KeyCombo::plain('x')));
+        // TakeoverOp-defined ops are never bindable here.
+        assert_eq!(keys.op_key(&Op::Custom("z".into())), None);
+    }
+
+    #[test]
+    fn labels_render_ctrl_and_shift() {
+        assert_eq!(KeyCombo::plain('l').label(), "l");
+        assert_eq!(KeyCombo::plain('L').label(), "Shift-l");
+        assert_eq!(KeyCombo { ctrl: true, ch: 'l' }.label(), "Ctrl-l");
+    }
+
+    /// Pins the documented config shape (what `load_section` hands to
+    /// AppConfig after stripping the `k9rs:` root) — INCLUDING a sibling
+    /// `daemon:` section, which the README documents in the same file
+    /// and must not be rejected as an unknown field.
+    #[test]
+    fn app_config_parses_keys_section() {
+        let yaml = "keys:\n  colLeft: h\n  colRight: l\n  colFirst: \"0\"\n  colLast: \"$\"\n  namespaceAll: \")\"\n  logs: ctrl-l\n\
+                    daemon:\n  watcherPageSize: 500\n";
+        let cfg: AppConfig = serde_yaml::from_str(yaml).expect("keys + daemon sections parse");
+        assert_eq!(cfg.keys.col_left, Some(KeyCombo::plain('h')));
+        assert_eq!(cfg.keys.col_right, Some(KeyCombo::plain('l')));
+        assert_eq!(cfg.keys.col_first, Some(KeyCombo::plain('0')));
+        assert_eq!(cfg.keys.col_last, Some(KeyCombo::plain('$')));
+        // Shift-0 (`)`) restores switch-to-all-namespaces once `0` is colFirst.
+        assert_eq!(cfg.keys.namespace_all, Some(KeyCombo::plain(')')));
+        // `0` / `$` / `)` are not reserved chords, so the binding validates.
+        assert!(cfg.keys.validate().is_ok(), "vim 0/$ column jumps + namespaceAll must validate");
+        assert_eq!(cfg.keys.logs, Some(KeyCombo { ctrl: true, ch: 'l' }));
+        // A typo'd binding name is a load-time error (deny_unknown_fields),
+        // not a silently ignored key.
+        assert!(serde_yaml::from_str::<AppConfig>("keys:\n  colleft: h\n").is_err());
+        // A malformed chord is too.
+        assert!(serde_yaml::from_str::<AppConfig>("keys:\n  logs: meta-l\n").is_err());
+        // And so is a typo inside the daemon section — the TUI's loud
+        // startup validation covers the whole file.
+        assert!(serde_yaml::from_str::<AppConfig>("daemon:\n  watcherPagesize: 5\n").is_err());
+    }
+
+// ---------------------------------------------------------------------------
+// context_switch_tests (mirrored out of types.rs)
+// ---------------------------------------------------------------------------
+
+    use crate::kube::protocol::ContextName;
+
+    #[test]
+    fn stable_accepts_new_switches() {
+        let s = ContextSwitchState::Stable;
+        assert!(s.is_stable());
+    }
+
+    #[test]
+    fn requested_rejects_new_switches() {
+        let s = ContextSwitchState::Requested(ContextName::new("prod").unwrap());
+        assert!(!s.is_stable());
+    }
+
+    #[test]
+    fn in_flight_rejects_new_switches() {
+        let s = ContextSwitchState::InFlight(ContextName::new("prod").unwrap());
+        assert!(!s.is_stable());
+    }
+
+    #[test]
+    fn target_names_the_context_in_flight() {
+        assert_eq!(ContextSwitchState::Stable.target(), None);
+        assert_eq!(
+            ContextSwitchState::Requested(ContextName::new("prod").unwrap()).target().map(|c| c.as_str()),
+            Some("prod")
+        );
+        assert_eq!(
+            ContextSwitchState::InFlight(ContextName::new("prod").unwrap()).target().map(|c| c.as_str()),
+            Some("prod")
+        );
+    }
+
+    #[test]
+    fn take_requested_transitions_requested_to_in_flight_keeping_target() {
+        let mut s = ContextSwitchState::Requested(ContextName::new("prod").unwrap());
+        assert_eq!(s.take_requested().as_ref().map(|c| c.as_str()), Some("prod"));
+        // InFlight carries the target forward, so the failure path can name it.
+        assert_eq!(s, ContextSwitchState::InFlight(ContextName::new("prod").unwrap()));
+    }
+
+    #[test]
+    fn take_requested_is_noop_from_stable() {
+        let mut s = ContextSwitchState::Stable;
+        assert!(s.take_requested().is_none());
+        assert_eq!(s, ContextSwitchState::Stable);
+    }
+
+    #[test]
+    fn take_requested_is_noop_from_in_flight() {
+        let mut s = ContextSwitchState::InFlight(ContextName::new("prod").unwrap());
+        assert!(s.take_requested().is_none());
+        assert_eq!(s, ContextSwitchState::InFlight(ContextName::new("prod").unwrap()));
+    }
+
+    #[test]
+    fn settle_from_any_state() {
+        for mut s in [
+            ContextSwitchState::Stable,
+            ContextSwitchState::Requested(ContextName::new("prod").unwrap()),
+            ContextSwitchState::InFlight(ContextName::new("prod").unwrap()),
+        ] {
+            s.settle();
+            assert_eq!(s, ContextSwitchState::Stable);
+        }
+    }
+
+    #[test]
+    fn settle_resolves_a_failed_switch() {
+        // The failure edge: an in-flight switch whose connection never comes
+        // up settles back to Stable, so the next switch is accepted (no lock).
+        let mut s = ContextSwitchState::Requested(ContextName::new("does-not-exist").unwrap());
+        s.take_requested();
+        assert!(!s.is_stable(), "in flight while connecting");
+        s.settle(); // ConnectionFailed for the target
+        assert!(s.is_stable(), "a failed switch must not stay stuck InFlight");
+    }
+
+    #[test]
+    fn full_lifecycle() {
+        // Stable → Requested(name) → InFlight(name) → Stable
+        let mut s = ContextSwitchState::Stable;
+        assert!(s.is_stable());
+        s = ContextSwitchState::Requested(ContextName::new("prod").unwrap());
+        assert!(!s.is_stable());
+        let taken = s.take_requested();
+        assert_eq!(taken.as_ref().map(|c| c.as_str()), Some("prod"));
+        assert_eq!(s, ContextSwitchState::InFlight(ContextName::new("prod").unwrap()));
+        s.settle();
+        assert!(s.is_stable());
+    }
+
+// ---------------------------------------------------------------------------
+// The README is a hand-written copy of an exhaustive source
+// ---------------------------------------------------------------------------
+
+/// The README's "Rebindable operations:" list matches the code.
+///
+/// Fifteen names, written out in prose beside an exhaustive `config_key`
+/// match — the "one decision, many copies" shape, with the copy in a file no
+/// compiler reads. Adding an operation forces a `config_key` arm (the match
+/// is exhaustive) but nothing forces the README, so this list drifts the
+/// moment anyone adds one. The in-app surfaces already project from one
+/// declaration; the docs were the last copy.
+#[test]
+fn the_readme_lists_exactly_the_rebindable_operations() {
+    use crate::kube::protocol::OperationKind;
+
+    let readme = include_str!("../../../README.md");
+    let marker = "# Rebindable operations:";
+    let at = readme.find(marker).expect("the README documents the rebindable set");
+    // The sentence runs to its full stop, wrapped over comment lines.
+    let tail = &readme[at + marker.len()..];
+    let sentence = &tail[..tail.find('.').expect("the list ends in a full stop")];
+    let documented: std::collections::BTreeSet<String> = sentence
+        .split(',')
+        .map(|w| w.trim().trim_start_matches('#').trim().to_string())
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    let actual: std::collections::BTreeSet<String> = OperationKind::BUILT_IN
+        .iter()
+        .filter_map(|op| op.config_key())
+        .map(str::to_string)
+        .collect();
+
+    assert_eq!(
+        documented, actual,
+        "the README's rebindable list and `OperationKind::config_key` disagree \
+         — documented-but-absent: {:?}; real-but-undocumented: {:?}",
+        documented.difference(&actual).collect::<Vec<_>>(),
+        actual.difference(&documented).collect::<Vec<_>>(),
+    );
+}

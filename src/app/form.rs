@@ -175,9 +175,35 @@ pub struct FormDialog {
     pub target: ObjectRef,
     /// Schema fields, in display order.
     pub fields: Vec<FormFieldState>,
-    /// Currently focused position. `0..fields.len()` are field indices;
-    /// `fields.len()` is the OK button. Esc cancels regardless of focus.
-    pub focused: usize,
+    /// Where the caret is.
+    ///
+    /// Leaving a form — Esc, or Enter on Cancel — is the ACTION layer's job
+    /// (`handler::handle_form_keys` → [`crate::app::actions::Action::Back`]),
+    /// so there is ONE undo path rather than a second pop in the typing
+    /// handler. That is what the old doc here got wrong: it claimed "Esc
+    /// cancels regardless of focus" while the handler called
+    /// `UiState::close_modal`, which clears the modal SLOT — and a form has
+    /// been a nav element since `Modal::Form` was removed, so Esc cleared
+    /// nothing and the dialog stayed on screen with OK as its only exit.
+    pub focused: FormFocus,
+}
+
+/// Where the caret sits in a form: one of the fields, or one of the buttons.
+///
+/// This was a bare `usize` over `0..=fields.len()`, with `fields.len()`
+/// *meaning* the OK button — an index space carrying a second meaning. That
+/// is why there was exactly one button: a second one would have been
+/// `fields.len() + 1`, leaving two predicates over arithmetic that could
+/// disagree about which was focused. Naming the three cases makes the Tab
+/// cycle explicit and the buttons exhaustive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormFocus {
+    /// A schema field, by index into [`FormDialog::fields`].
+    Field(usize),
+    /// The OK button — submits the form.
+    Ok,
+    /// The Cancel button — leaves without submitting, exactly like Esc.
+    Cancel,
 }
 
 impl FormDialog {
@@ -189,32 +215,75 @@ impl FormDialog {
         }
     }
 
-    /// Number of focusable positions (one per field, plus the OK button).
-    pub fn focus_count(&self) -> usize {
-        self.fields.len() + 1
-    }
-
-    /// Move focus to the next position, wrapping around.
+    /// Tab order: each field in display order, then OK, then Cancel, and
+    /// round again. One function owns the cycle, so the two buttons cannot
+    /// be reachable in one direction and not the other.
     pub fn focus_next(&mut self) {
-        self.focused = (self.focused + 1) % self.focus_count();
+        self.focused = match self.focused {
+            FormFocus::Field(i) if i + 1 < self.fields.len() => FormFocus::Field(i + 1),
+            FormFocus::Field(_) => FormFocus::Ok,
+            FormFocus::Ok => FormFocus::Cancel,
+            FormFocus::Cancel => self.first_focus(),
+        };
     }
 
-    /// Move focus to the previous position, wrapping around.
+    /// The same cycle, backwards.
     pub fn focus_prev(&mut self) {
-        let n = self.focus_count();
-        self.focused = (self.focused + n - 1) % n;
+        self.focused = match self.focused {
+            FormFocus::Field(0) => FormFocus::Cancel,
+            FormFocus::Field(i) => FormFocus::Field(i.saturating_sub(1)),
+            FormFocus::Ok => self.last_field_or_cancel(),
+            FormFocus::Cancel => FormFocus::Ok,
+        };
+    }
+
+    /// Where Tab lands after Cancel: the first field, or OK in a form that
+    /// has no fields at all.
+    fn first_focus(&self) -> FormFocus {
+        if self.fields.is_empty() { FormFocus::Ok } else { FormFocus::Field(0) }
+    }
+
+    /// Where Shift-Tab lands from OK: the last field, or Cancel when there
+    /// are none (the cycle is then just the two buttons).
+    fn last_field_or_cancel(&self) -> FormFocus {
+        match self.fields.len() {
+            0 => FormFocus::Cancel,
+            n => FormFocus::Field(n - 1),
+        }
+    }
+
+    /// True if field `idx` holds the caret — for the renderer.
+    pub fn field_focused(&self, idx: usize) -> bool {
+        self.focused == FormFocus::Field(idx)
     }
 
     /// True if the OK button is currently focused.
     pub fn ok_focused(&self) -> bool {
-        self.focused == self.fields.len()
+        self.focused == FormFocus::Ok
+    }
+
+    /// True if the Cancel button is currently focused.
+    pub fn cancel_focused(&self) -> bool {
+        self.focused == FormFocus::Cancel
+    }
+
+    /// The focused field, if the caret is on a field rather than a button.
+    /// A button is not a text sink, which is what the cursor-style gate and
+    /// the editing keys both need to know.
+    pub fn focused_field(&self) -> Option<&FormFieldState> {
+        match self.focused {
+            FormFocus::Field(i) => self.fields.get(i),
+            FormFocus::Ok | FormFocus::Cancel => None,
+        }
     }
 
     /// Mutably borrow the currently focused field, if any.
     pub fn current_field_mut(&mut self) -> Option<&mut FormFieldState> {
-        self.fields.get_mut(self.focused)
+        match self.focused {
+            FormFocus::Field(i) => self.fields.get_mut(i),
+            FormFocus::Ok | FormFocus::Cancel => None,
+        }
     }
-
 }
 
 impl FormFieldState {
@@ -339,109 +408,5 @@ pub type YamlState = ContentViewState;
 pub type DescribeState = ContentViewState;
 
 #[cfg(test)]
-mod form_submit_tests {
-    use super::*;
-    use crate::kube::protocol::{Namespace, ObjectRef, ResourceId};
-    use crate::kube::resource_def::BuiltInKind;
-
-    fn pod_target() -> ObjectRef {
-        ObjectRef::new(
-            ResourceId::BuiltIn(BuiltInKind::Pod),
-            "test-pod",
-            Namespace::from_user_command("default"),
-        )
-    }
-
-    #[test]
-    fn scale_build_command_valid() {
-        let target = pod_target();
-        let fields = vec![FormFieldState {
-            name: "replicas".into(),
-            label: "Replicas".into(),
-            kind: FormFieldKind::Number { min: 0, max: 100 },
-            value: "3".into(),
-        }];
-        let cmd = FormSubmit::Scale.build_command(&target, &fields).unwrap();
-        match cmd {
-            crate::kube::protocol::SessionCommand::Scale { replicas, .. } => {
-                assert_eq!(replicas, 3);
-            }
-            _ => panic!("expected Scale command"),
-        }
-    }
-
-    #[test]
-    fn scale_build_command_invalid() {
-        let target = pod_target();
-        let fields = vec![FormFieldState {
-            name: "replicas".into(),
-            label: "Replicas".into(),
-            kind: FormFieldKind::Number { min: 0, max: 100 },
-            value: "abc".into(),
-        }];
-        assert!(FormSubmit::Scale.build_command(&target, &fields).is_err());
-    }
-
-    #[test]
-    fn port_forward_build_command_valid() {
-        let target = pod_target();
-        let fields = vec![
-            FormFieldState {
-                name: "container_port".into(),
-                label: "".into(),
-                kind: FormFieldKind::Port,
-                value: "8080".into(),
-            },
-            FormFieldState {
-                name: "local_port".into(),
-                label: "".into(),
-                kind: FormFieldKind::Port,
-                value: "9090".into(),
-            },
-        ];
-        let cmd = FormSubmit::PortForward.build_command(&target, &fields).unwrap();
-        match cmd {
-            crate::kube::protocol::SessionCommand::PortForward { local_port, container_port, .. } => {
-                assert_eq!(container_port, 8080);
-                assert_eq!(local_port, 9090);
-            }
-            _ => panic!("expected PortForward command"),
-        }
-    }
-
-    #[test]
-    fn port_forward_build_command_select_uses_typed_index() {
-        let target = pod_target();
-        // The pf_ports path builds a Select container_port. The chosen option is
-        // the typed `selected` index — no digit-string round-trip — so selected=1
-        // resolves to the second option ("8443").
-        let fields = vec![
-            FormFieldState {
-                name: "container_port".into(),
-                label: "".into(),
-                kind: FormFieldKind::Select {
-                    options: vec![
-                        SelectOption::new("8080", "8080"),
-                        SelectOption::new("8443", "8443"),
-                    ],
-                    selected: 1,
-                },
-                value: crate::app::text_input::TextInput::new(),
-            },
-            FormFieldState {
-                name: "local_port".into(),
-                label: "".into(),
-                kind: FormFieldKind::Port,
-                value: "9090".into(),
-            },
-        ];
-        let cmd = FormSubmit::PortForward.build_command(&target, &fields).unwrap();
-        match cmd {
-            crate::kube::protocol::SessionCommand::PortForward { container_port, local_port, .. } => {
-                assert_eq!(container_port, 8443);
-                assert_eq!(local_port, 9090);
-            }
-            _ => panic!("expected PortForward command"),
-        }
-    }
-}
+#[path = "../tests/app/form.rs"]
+mod form_submit_tests_mirror;

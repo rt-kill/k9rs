@@ -151,7 +151,7 @@ pub enum Action {
     /// Show the alias view (all resource type shortcuts).
     ShowAliases,
     /// Change the log time range (--since flag). None = tail all logs.
-    LogSince(Option<String>),
+    LogRange(LogRange),
     /// Move left in this view: the column cursor on a table, a horizontal
     /// pan on a log. One action because it is one intent — each element kind
     /// answers it in its own units, which is why the log view did not need a
@@ -224,6 +224,30 @@ pub enum Action {
 /// on `OperationKind`, so the wire module never imports client action types
 /// — protocol stays pure shared substrate; the dependency flows
 /// client → protocol only.
+/// Which slice of a container's log to fetch.
+///
+/// Three states, because `Option<String>` could only hold two: `None` meant
+/// "tail" and `Some(d)` meant "the last `d`". There was no way to say "from
+/// the beginning", so the digits capped the reachable history at 24h — and
+/// the user's original complaint was that the OLDEST logs were unreachable.
+/// We built `Retain::Head` and `stop_if_head_complete` for exactly that and
+/// then left the UI unable to ask for it.
+///
+/// No wire change: [`crate::kube::protocol::LogInit`] already carries `since`
+/// and `tail` independently, and both absent means "everything" to the
+/// apiserver. This type is the thing that was missing — a name for the third
+/// combination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogRange {
+    /// The last `tail_lines`, following. The default, and what `0` asks for.
+    Tail,
+    /// Everything there is, oldest first, head-retained so a long history
+    /// fills the ring from the START and stops rather than evicting itself.
+    Head,
+    /// The last `d`, a kubectl duration (`15m`, `24h`).
+    Since(String),
+}
+
 impl From<&crate::kube::protocol::OperationKind> for Action {
     fn from(op: &crate::kube::protocol::OperationKind) -> Self {
         use crate::kube::protocol::OperationKind as Op;

@@ -77,7 +77,9 @@ In a **log view** (`l`):
 | `H` / `L` | Pan a stride left / right |
 | `^` / `$` | Pan to the left margin / the far edge |
 | `/` | Grep (stacks — each commit narrows the last) |
+| `/!pat` | Grep the other way: EXCLUDE lines matching `pat` (`\!` for a literal `!`) |
 | `0`–`6` | Time range: tail, 1m, 5m, 15m, 30m, 1h, 24h |
+| `7` | Everything, oldest first — stops once the buffer is full |
 | `Shift-C` | Clear the buffer |
 | `Ctrl-s` | Save to a file |
 

@@ -195,7 +195,11 @@ impl LocalResourceKind {
             // KEY is narrow and the thing you scan; DESCRIPTION gets the rest.
             Self::Keybinding => {
                 static COLS: &[ColumnDef] = &[
-                    ColumnDef::new("SECTION").max_width(36),
+                    // The one column in the program that GROUPS: it is the
+                    // category the rows were gathered under, so repeating it
+                    // per row is noise. Every resource column leaves this
+                    // off — see `ColumnDef::groups`.
+                    ColumnDef::new("SECTION").max_width(36).groups(),
                     ColumnDef::new("KEY").max_width(16),
                     ColumnDef::new("DESCRIPTION").max_width(60),
                 ];
@@ -206,7 +210,10 @@ impl LocalResourceKind {
             // commands (and the repeated value collapses as it draws).
             Self::Alias => {
                 static COLS: &[ColumnDef] = &[
-                    ColumnDef::new("SECTION").max_width(12),
+                    // Groups, for help's reason: `resource` repeated sixty
+                    // times down the left edge is noise, because it is the
+                    // category the rows were gathered under.
+                    ColumnDef::new("SECTION").max_width(12).groups(),
                     ColumnDef::new("ALIAS").max_width(44),
                     ColumnDef::new("TARGET").max_width(40),
                 ];

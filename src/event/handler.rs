@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::actions::Action;
+use crate::app::actions::{Action, LogRange};
 use crate::app::{App, TakeoverOp};
 use crate::app::element::Element;
 #[cfg(test)]
@@ -494,13 +494,17 @@ fn handle_log_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('c') => Some(Action::Copy),
 
         // Digits 0-6: log time range selection.
-        KeyCode::Char('0') => Some(Action::LogSince(None)),
-        KeyCode::Char('1') => Some(Action::LogSince(Some("1m".to_string()))),
-        KeyCode::Char('2') => Some(Action::LogSince(Some("5m".to_string()))),
-        KeyCode::Char('3') => Some(Action::LogSince(Some("15m".to_string()))),
-        KeyCode::Char('4') => Some(Action::LogSince(Some("30m".to_string()))),
-        KeyCode::Char('5') => Some(Action::LogSince(Some("1h".to_string()))),
-        KeyCode::Char('6') => Some(Action::LogSince(Some("24h".to_string()))),
+        KeyCode::Char('0') => Some(Action::LogRange(LogRange::Tail)),
+        KeyCode::Char('1') => Some(Action::LogRange(LogRange::Since("1m".to_string()))),
+        KeyCode::Char('2') => Some(Action::LogRange(LogRange::Since("5m".to_string()))),
+        KeyCode::Char('3') => Some(Action::LogRange(LogRange::Since("15m".to_string()))),
+        KeyCode::Char('4') => Some(Action::LogRange(LogRange::Since("30m".to_string()))),
+        KeyCode::Char('5') => Some(Action::LogRange(LogRange::Since("1h".to_string()))),
+        KeyCode::Char('6') => Some(Action::LogRange(LogRange::Since("24h".to_string()))),
+        // `7` extends the lookback ladder to its end: everything there is.
+        // Not a duration, which is why `Option<String>` could not hold it —
+        // and why the oldest logs were unreachable past 24h.
+        KeyCode::Char('7') => Some(Action::LogRange(LogRange::Head)),
 
         _ => None,
     }
@@ -537,7 +541,24 @@ fn handle_overview_keys(key: KeyEvent) -> Option<Action> {
 fn handle_dialog_keys(app: &App, key: KeyEvent) -> Option<Action> {
     match app.nav.top() {
         Element::Picker(_) => handle_container_select_keys(key),
+        Element::Form(_) => handle_form_keys(app, key),
         _ => handle_confirm_dialog(app, key),
+    }
+}
+
+/// The ways OUT of a form, and only those.
+///
+/// A form is a nav element, so leaving it is the ordinary pop —
+/// `Action::Back`, the one undo path. Typing and focus movement are
+/// mutations and stay in `session_commands::handle_form_dialog_key`; naming
+/// them in both places is what let Esc be "handled" by a call that cleared
+/// the modal slot a form does not live in.
+fn handle_form_keys(app: &App, key: KeyEvent) -> Option<Action> {
+    let cancel_focused = app.nav.top().form_dialog().is_some_and(|d| d.cancel_focused());
+    match key.code {
+        KeyCode::Esc => Some(Action::Back),
+        KeyCode::Enter if cancel_focused => Some(Action::Back),
+        _ => None,
     }
 }
 

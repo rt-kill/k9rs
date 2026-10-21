@@ -199,9 +199,11 @@ impl ResourceRegistry {
 
     /// Typed lookup by [`BuiltInKind`] — infallible in correct code, panics
     /// if called with an unregistered variant (adding an enum variant
-    /// without a corresponding `register_*` call in `build_registry` is
-    /// the only way this can happen, and any test that exercises the new
-    /// variant catches it immediately). Returns `&'static dyn ResourceDef`
+    /// without a corresponding `register_*` call in `build_registry` is the
+    /// only way this can happen, and `every_built_in_kind_is_registered`
+    /// walks `BuiltInKind::ALL` — generated from the enum's declaration — so
+    /// it now fails at test time rather than panicking under a user's
+    /// cursor). Returns `&'static dyn ResourceDef`
     /// because the registry lives in a `LazyLock` for the process lifetime.
     pub fn by_kind(&'static self, kind: BuiltInKind) -> &'static dyn ResourceDef {
         let entry = self.by_kind.get(&kind)

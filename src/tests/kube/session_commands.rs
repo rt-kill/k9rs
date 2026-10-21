@@ -63,3 +63,181 @@ async fn a_closed_event_channel_does_not_strand_the_subprocess() {
     .expect("the work must still complete with no daemon behind it");
     assert_eq!(out, 42);
 }
+
+// ---------------------------------------------------------------------------
+// parser_tests (mirrored out of session_commands.rs)
+// ---------------------------------------------------------------------------
+
+    use crate::kube::protocol::Namespace;
+    use crate::kube::resource_def::BuiltInKind;
+
+    fn make_app() -> App {
+        App::new_for_test()
+    }
+
+    fn parse(input: &str) -> ParsedCommand {
+        let app = make_app();
+        parse_command_input(input, &input.to_lowercase(), &app)
+    }
+
+    /// Every documented `:` word really parses to what it claims.
+    ///
+    /// `COMMAND_WORDS` exists so the aliases view does not hand-write its own
+    /// copy of this grammar — which is exactly what `Ctrl-a` used to do, and
+    /// why its key list had drifted from the keymap. A declaration the parser
+    /// does not read needs a probe, so this is the same arrangement the
+    /// keymap has: documentation beside a check that it is true.
+    #[test]
+    fn every_documented_command_word_is_one_the_parser_accepts() {
+        for doc in COMMAND_WORDS {
+            let parsed = parse(doc.probe);
+            assert!(
+                (doc.accepts)(&parsed),
+                "`:{}` is documented as `{}` but parsed as {:?}",
+                doc.probe,
+                doc.label,
+                parsed,
+            );
+            // The declared words must include the probe's first token, or
+            // the row documents one thing and the test checks another.
+            let head = doc.probe.split(' ').next().unwrap_or(doc.probe);
+            assert!(
+                doc.words.contains(&head),
+                "`{}` lists {:?}, which does not include the probe `{}`",
+                doc.label,
+                doc.words,
+                head,
+            );
+            // And a word that takes an argument must be probed WITH one,
+            // or the probe exercises a different grammar rule.
+            assert_eq!(
+                doc.arg.is_some(),
+                doc.probe.contains(' '),
+                "`{}`: the probe and the declared arity disagree",
+                doc.label,
+            );
+        }
+    }
+
+    #[test]
+    fn static_words_classify() {
+        assert!(matches!(parse("q"), ParsedCommand::Quit));
+        assert!(matches!(parse("quit"), ParsedCommand::Quit));
+        assert!(matches!(parse("help"), ParsedCommand::Help));
+        assert!(matches!(parse("?"), ParsedCommand::Help));
+        // `:alias` resolves as the ordinary client-owned RESOURCE it is now.
+        assert!(matches!(
+            parse("alias"),
+            ParsedCommand::Resource(ResourceId::Local(
+                crate::kube::local::LocalResourceKind::Alias
+            ))
+        ));
+        assert!(matches!(parse("home"), ParsedCommand::Overview));
+    }
+
+    /// `:ctx` is not a special word any more — it resolves through the same
+    /// alias path as `:pods` and `:pf`, which is what makes it RESET the nav
+    /// stack (contexts are a root, not a drill) and pick up grep, sort and
+    /// the rest of the table machinery for free.
+    #[test]
+    fn ctx_resolves_as_an_ordinary_resource_alias() {
+        for word in ["ctx", "context", "contexts"] {
+            match parse(word) {
+                ParsedCommand::Resource(rid) => assert_eq!(
+                    rid,
+                    crate::kube::local::LocalResourceKind::Context.to_resource_id(),
+                    "`:{word}` must name the contexts resource",
+                ),
+                _ => panic!("`:{word}` should resolve to a resource"),
+            }
+        }
+    }
+
+    #[test]
+    fn ctx_switch_keeps_case() {
+        match parse("ctx prod-us-east") {
+            ParsedCommand::ContextSwitch(name) => assert_eq!(name.as_str(), "prod-us-east"),
+            _ => panic!("expected ContextSwitch"),
+        }
+    }
+
+    #[test]
+    fn ns_switch_respects_all_and_named() {
+        match parse("ns kube-system") {
+            ParsedCommand::NamespaceSwitch(Namespace::Named(n)) => assert_eq!(n, "kube-system"),
+            _ => panic!("expected NamespaceSwitch(Named)"),
+        }
+        match parse("ns all") {
+            ParsedCommand::NamespaceSwitch(Namespace::All) => {}
+            _ => panic!("expected NamespaceSwitch(All)"),
+        }
+    }
+
+    #[test]
+    fn bare_resource_alias_resolves() {
+        match parse("pods") {
+            ParsedCommand::Resource(rid) => {
+                assert_eq!(rid.built_in_kind(), Some(BuiltInKind::Pod));
+            }
+            _ => panic!("expected Resource"),
+        }
+    }
+
+    #[test]
+    fn resource_with_filter_runs_before_resource_with_ns() {
+        // The pass-11 bug: `pods /Nginx` used to parse as namespace `/Nginx`.
+        // The filter rule must come first.
+        match parse("pods /Nginx") {
+            ParsedCommand::ResourceFilter { rid, filter } => {
+                assert_eq!(rid.built_in_kind(), Some(BuiltInKind::Pod));
+                assert_eq!(filter, "Nginx", "filter must preserve case");
+            }
+            other => panic!("expected ResourceFilter, got {:?}", match other {
+                ParsedCommand::NamespaceSwitch(_) => "NamespaceSwitch",
+                ParsedCommand::ResourceInNamespace { .. } => "ResourceInNamespace",
+                _ => "other",
+            }),
+        }
+    }
+
+    #[test]
+    fn resource_in_namespace_classifies() {
+        match parse("deploy kube-system") {
+            ParsedCommand::ResourceInNamespace { rid, namespace } => {
+                assert_eq!(rid.built_in_kind(), Some(BuiltInKind::Deployment));
+                assert_eq!(namespace, Namespace::Named("kube-system".into()));
+            }
+            _ => panic!("expected ResourceInNamespace"),
+        }
+    }
+
+    #[test]
+    fn cluster_scoped_rejects_ns_arg() {
+        // Nodes are cluster-scoped — "nodes foo" isn't a ns-switch, so it
+        // falls through to the CRD-candidate fallback.
+        match parse("nodes foo") {
+            ParsedCommand::CrdCandidate(_) => {}
+            _ => panic!("expected CrdCandidate fallback for cluster-scoped + ns"),
+        }
+    }
+
+    #[test]
+    fn unknown_input_falls_through_to_crd_candidate() {
+        match parse("clickhouseinstallation") {
+            ParsedCommand::CrdCandidate(name) => assert_eq!(name, "clickhouseinstallation"),
+            _ => panic!("expected CrdCandidate fallback"),
+        }
+    }
+
+    #[test]
+    fn bare_ns_alias_opens_namespace_resource() {
+        // `:ns` alone is the resource alias for Namespace (matches rule 4,
+        // "plain resource alias"). The `:ns <name>` form only triggers
+        // when there's an explicit namespace argument.
+        match parse("ns") {
+            ParsedCommand::Resource(rid) => {
+                assert_eq!(rid.built_in_kind(), Some(BuiltInKind::Namespace));
+            }
+            _ => panic!("expected Resource(Namespace)"),
+        }
+    }

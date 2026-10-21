@@ -752,3 +752,52 @@ fn the_store_materializes_on_arrival() {
         assert_eq!(inner.lines[0].visible(), "ok yes");
     });
 }
+
+/// The two column spaces convert in ONE place, in both directions.
+///
+/// A data column indexes `ResourceRow.cells`; a visible column indexes the
+/// view's `visible_cols`/`headers`/`col_widths`. `TableInteraction` holds one
+/// of each as a bare `usize` — `sort.col` is data, `selected_col` is visible —
+/// so the two conversions are where a mix-up would land. They were hand-rolled
+/// (`position()` here, `get()` there); now they are named, so the direction is
+/// readable at the call site.
+#[test]
+fn the_two_column_spaces_convert_in_one_place() {
+    let view = PreparedView {
+        rows: vec![vec!["a".into(), "c".into()]],
+        health: vec![crate::kube::resources::row::RowHealth::Normal],
+        cell_style: vec![vec![None, None]],
+        keys: vec![],
+        col_widths: vec![10, 10],
+        total_rows: 1,
+        // Column 1 is HIDDEN: the visible set is data columns 0 and 2.
+        visible_cols: vec![0, 2],
+        headers: vec!["NAME".into(), "AGE".into()],
+    };
+
+    // visible -> data, with the header, and the hidden column skipped.
+    assert_eq!(view.data_col(0), Some((0, "NAME".to_string())));
+    assert_eq!(view.data_col(1), Some((2, "AGE".to_string())));
+    // A cursor past the end CLAMPS rather than failing: the visible set
+    // shrinks under a column-level change while the cursor is still the old
+    // one, and display-time clamping is the rule here.
+    assert_eq!(view.data_col(99), Some((2, "AGE".to_string())));
+
+    // data -> visible, and `None` for a column that is not on screen —
+    // which is exactly when a sort indicator must not be drawn.
+    assert_eq!(view.visible_col(0), Some(0));
+    assert_eq!(view.visible_col(2), Some(1));
+    assert_eq!(view.visible_col(1), None, "data column 1 is hidden");
+
+    // Round-trip: every visible column maps back to itself.
+    for v in 0..view.visible_cols.len() {
+        let (data, _) = view.data_col(v).expect("in range");
+        assert_eq!(view.visible_col(data), Some(v), "visible {v} round-trips");
+    }
+
+    // An empty view has no columns to convert, and says so rather than
+    // panicking on `len() - 1`.
+    let empty = PreparedView { visible_cols: vec![], headers: vec![], ..view };
+    assert_eq!(empty.data_col(0), None);
+    assert_eq!(empty.visible_col(0), None);
+}

@@ -1014,11 +1014,17 @@ fn handle_log_filter_key(app: &mut App, key: crate::app::TextKey) -> bool {
                 .map(|mut d| d.take())
                 .filter(|t| !t.is_empty());
             if let Some(text) = draft {
-                if let Ok(el) = crate::app::element::Element::derive_log_filter(
-                    app.nav.top(),
-                    crate::app::nav::CompiledGrep::new(text),
-                ) {
-                    app.nav.push(el);
+                // `!pat` excludes — the sense comes off the front before the
+                // pattern is compiled, so the vim translator never sees it.
+                let (sense, pattern) = crate::app::element::sense_of(&text);
+                if !pattern.is_empty() {
+                    if let Ok(el) = crate::app::element::Element::derive_log_filter(
+                        app.nav.top(),
+                        crate::app::nav::CompiledGrep::new(pattern),
+                        sense,
+                    ) {
+                        app.nav.push(el);
+                    }
                 }
             }
         }
@@ -1266,7 +1272,7 @@ pub async fn session_main(
             };
             let in_input_mode = app.ui.command_input().is_some()
                 || app.nav.top().form_dialog().is_some_and(|d| {
-                    d.fields.get(d.focused).is_some_and(|field| field.is_text_input())
+                    d.focused_field().is_some_and(|field| field.is_text_input())
                 })
                 || app.nav.top().filter_input().active()
                 || view_has_text_input;

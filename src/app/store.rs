@@ -272,7 +272,7 @@ impl RowStore {
     /// production path just calls `apply` and lets the floor decide.
     #[cfg(test)]
     pub(crate) fn would_accept_epoch(&self, epoch: u64) -> bool {
-        epoch >= self.lock().epoch_floor
+        self.lock().accepts(epoch)
     }
 
     /// Flag the store as (re)initializing WITHOUT dropping rows — the
@@ -305,7 +305,7 @@ impl RowStore {
     /// the per-variant semantics.
     pub fn apply(&self, epoch: u64, payload: StorePayload) {
         let mut inner = self.lock();
-        if epoch < inner.epoch_floor {
+        if !inner.accepts(epoch) {
             return; // stale stream: superseded before this event landed
         }
         match payload {
@@ -493,6 +493,18 @@ impl RowStore {
 }
 
 impl RowStoreInner {
+    /// Whether an event stamped `epoch` belongs to the CURRENT stream rather
+    /// than a superseded one.
+    ///
+    /// Named, because the comparison was written out four times — three
+    /// production guards and a test helper that stated it INVERTED
+    /// (`epoch >= floor` against their `epoch < floor`). An inverted fourth
+    /// copy is the worst kind: change the rule and the guard meant to catch
+    /// the change keeps passing, because it never read the rule.
+    pub(crate) fn accepts(&self, epoch: u64) -> bool {
+        epoch >= self.epoch_floor
+    }
+
     pub fn is_marked(&self, key: &ObjectKey) -> bool {
         self.marked.contains(key)
     }
@@ -861,12 +873,51 @@ pub struct PreparedView {
     /// Total rows in the store (pre-filter), for the `filtered/total`
     /// count display.
     pub total_rows: usize,
-    /// DATA indices of the visible columns, in display order — the bridge
-    /// between a visible-column cursor and cell data (sort by column,
-    /// column-restricted grep).
+    /// DATA indices of the visible columns, in display order — THE bridge
+    /// between the two column spaces.
+    ///
+    /// # Three index spaces share `usize` here
+    ///
+    /// A **data** column indexes `ResourceRow.cells`; a **visible** column
+    /// indexes this vector, `headers` and `col_widths`; a **screen** row
+    /// indexes the drawn rows. `TableInteraction` holds one of each —
+    /// `sort.col` is a DATA index, `selected_col` is a VISIBLE one — and
+    /// nothing in the type system keeps them apart.
+    ///
+    /// Newtypes were considered and measured (2026-10-14): only TWO sites in
+    /// the client actually CONVERT between the spaces, so three wrappers
+    /// would have added ~35 `.0`s across the widget and the interaction
+    /// state to guard two lines. Instead the conversions are named — see
+    /// [`Self::data_col`] and [`Self::visible_col`] — so no caller hand-rolls
+    /// a `position()` or a `get()` and the direction is readable at the call
+    /// site. Revisit if a third space ever meets these two in one struct.
     pub visible_cols: Vec<usize>,
     /// Headers of the visible columns (parallel to `visible_cols`).
     pub headers: Vec<String>,
+}
+
+impl PreparedView {
+    /// The DATA index a VISIBLE column reads its cells from, with the header
+    /// alongside — the pair every caller of this actually wanted.
+    ///
+    /// Clamps rather than failing on an out-of-range cursor: the visible set
+    /// shrinks under a column-level change while `selected_col` is still the
+    /// old one, and display-time clamping is the established rule here (the
+    /// stored cursor is not written back).
+    pub fn data_col(&self, visible: usize) -> Option<(usize, String)> {
+        if self.visible_cols.is_empty() {
+            return None;
+        }
+        let at = visible.min(self.visible_cols.len() - 1);
+        Some((*self.visible_cols.get(at)?, self.headers.get(at)?.clone()))
+    }
+
+    /// Where a DATA column sits among the visible ones — `None` when it is
+    /// hidden at the current column level, which is exactly when a sort
+    /// indicator must not be drawn.
+    pub fn visible_col(&self, data: usize) -> Option<usize> {
+        self.visible_cols.iter().position(|&i| i == data)
+    }
 }
 
 /// Materialize a view: overlay metrics, filter by the predicate chain +
@@ -1310,6 +1361,15 @@ pub struct LineStoreInner {
     epoch_floor: u64,
 }
 
+impl LineStoreInner {
+    /// Same question, same reason as [`RowStoreInner::accepts`]: a
+    /// `since`-range restart replaces the stream but reuses the store, and
+    /// the floor is what keeps the dead stream's queued lines out.
+    fn accepts(&self, epoch: u64) -> bool {
+        epoch >= self.epoch_floor
+    }
+}
+
 impl LineStore {
     pub fn new(max_lines: usize) -> Arc<Self> {
         Arc::new(Self {
@@ -1423,7 +1483,7 @@ impl LineStore {
     /// `max_lines`, counting evictions for element-side scroll healing.
     pub fn push(&self, epoch: u64, line: crate::kube::protocol::LogLine) {
         let mut inner = self.lock();
-        if epoch < inner.epoch_floor {
+        if !inner.accepts(epoch) {
             return;
         }
         if inner.lines.len() >= inner.max_lines {
@@ -1462,7 +1522,7 @@ impl LineStore {
     /// The stream behind this store ended (daemon closed the substream).
     pub fn mark_ended(&self, epoch: u64) {
         let mut inner = self.lock();
-        if epoch < inner.epoch_floor {
+        if !inner.accepts(epoch) {
             return;
         }
         inner.live = false;

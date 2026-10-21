@@ -35,6 +35,11 @@ struct TableSnapshot<'a> {
     col_offset: u16,
     sort_ascending: bool,
     display_sort_col: Option<usize>,
+    /// The visible column whose consecutive equal values collapse, if the
+    /// sorted column declares that it groups. Separate from
+    /// `display_sort_col` because being sorted is not a reason to hide a
+    /// value — see [`crate::app::ColumnDef::groups`].
+    group_col: Option<usize>,
     namespace: &'a str,
     marked: &'a std::collections::HashSet<crate::kube::protocol::ObjectKey>,
     changed_rows: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>,
@@ -61,6 +66,7 @@ fn draw_resource_table(
 ) -> (usize, usize, u16) {
     let rt = ResourceTable::new(snap.headers.clone(), snap.rows, title, theme)
         .sort(snap.display_sort_col, snap.sort_ascending)
+        .group_col(snap.group_col)
         .namespace(snap.namespace)
         .marked(snap.marked)
         .changed_rows(snap.changed_rows)
@@ -246,7 +252,16 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         let title = element.title().to_string();
         let Some(it) = element.table_interaction() else { return };
         let headers: Vec<&str> = view.headers.iter().map(String::as_str).collect();
-        let display_sort_col = view.visible_cols.iter().position(|&i| i == it.sort.col);
+        // `sort.col` is a DATA index; the widget wants a VISIBLE one. Named
+        // conversion rather than a hand-rolled `position`, so which space is
+        // which is readable here — see `PreparedView::visible_cols`.
+        let display_sort_col = view.visible_col(it.sort.col);
+        // Collapsing repeats is the COLUMN's call, not "it happens to be
+        // sorted". Sorting by AGE put a ReplicaSet's identically-aged pods
+        // adjacent and blanked eighteen of them, which read as missing data.
+        let group_col = display_sort_col.filter(|&v| {
+            view.headers.get(v).is_some_and(|h| element.column_policy().groups(h))
+        });
         let snap = TableSnapshot {
             headers,
             rows: &view.rows,
@@ -256,6 +271,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
             col_offset: it.col_offset,
             sort_ascending: it.sort.ascending,
             display_sort_col,
+            group_col,
             namespace: element.scope_label(),
             marked: &marked,
             changed_rows: &changed,

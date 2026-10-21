@@ -30,7 +30,16 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
     let inner_rows = content_area.height.saturating_sub(2) as usize;
     if let crate::app::element::Element::ContentView(cv) = app.nav.top_mut() {
         let lc = cv.state.line_count();
-        cv.state.viewport.set_metrics(lc, inner_rows, false);
+        // `follow` is honoured here, not hardcoded `false`. `G` on a
+        // freshly-loaded view set `follow` and moved to `max_scroll()` — but
+        // the extent was still 0 because nothing had rendered yet, so it went
+        // to the TOP and the flag was then ignored forever: the first `G`
+        // after a load silently did nothing and only a second one worked.
+        // Resolving follow against the extent measured THIS frame is the same
+        // rule the log widget follows, and `line_up`/`home`/`scroll_to` all
+        // clear the flag, so this cannot strand the view at the bottom.
+        let following = cv.state.viewport.following();
+        cv.state.viewport.set_metrics(lc, inner_rows, following);
     }
 
     // The top element IS the view.

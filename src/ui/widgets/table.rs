@@ -140,6 +140,11 @@ pub struct ResourceTable<'a> {
     title: &'a str,
     namespace: &'a str,
     sort_col: Option<usize>,
+    /// The visible column whose repeats collapse — the sorted column ONLY if
+    /// it declared that it groups. Sorting alone is not a licence to hide a
+    /// value: AGE sorted put a ReplicaSet's identically-aged pods adjacent
+    /// and blanking them read as missing data.
+    group_col: Option<usize>,
     sort_asc: bool,
     theme: &'a Theme,
     marked: &'a std::collections::HashSet<crate::kube::protocol::ObjectKey>,
@@ -181,7 +186,7 @@ impl<'a> ResourceTable<'a> {
         static EMPTY_MARKED: std::sync::LazyLock<std::collections::HashSet<crate::kube::protocol::ObjectKey>> = std::sync::LazyLock::new(std::collections::HashSet::new);
         Self {
             headers, rows, col_widths: &[], title, namespace: "",
-            sort_col: None, sort_asc: true, theme,
+            sort_col: None, group_col: None, sort_asc: true, theme,
             marked: &EMPTY_MARKED,
             changed_rows: &EMPTY_MAP,
             row_keys: &[],
@@ -199,6 +204,8 @@ impl<'a> ResourceTable<'a> {
     pub fn cell_style(mut self, ch: &'a [Vec<Option<crate::kube::resources::row::RowHealth>>]) -> Self { self.cell_style = ch; self }
     pub fn marked(mut self, marked: &'a std::collections::HashSet<crate::kube::protocol::ObjectKey>) -> Self { self.marked = marked; self }
     pub fn sort(mut self, col: Option<usize>, ascending: bool) -> Self { self.sort_col = col; self.sort_asc = ascending; self }
+    /// The column whose consecutive equal values collapse, if any declares it.
+    pub fn group_col(mut self, col: Option<usize>) -> Self { self.group_col = col; self }
     pub fn namespace(mut self, ns: &'a str) -> Self { self.namespace = ns; self }
     pub fn changed_rows(mut self, changed: &'a std::collections::HashMap<crate::kube::protocol::ObjectKey, std::time::Instant>) -> Self { self.changed_rows = changed; self }
     pub fn search_patterns(mut self, pats: &'a [crate::util::SearchPattern]) -> Self { self.search_patterns = pats; self }
@@ -438,7 +445,12 @@ impl<'a> ResourceTable<'a> {
     /// Render-only. Copy and save carry the substance of a row, not a
     /// transcript of the cells it was drawn in, so they still see the value.
     fn repeated_cell(&self, row_idx: usize, first_visible: usize) -> Option<usize> {
-        let col = self.sort_col?;
+        // `group_col`, not `sort_col`. Being the sorted column was the wrong
+        // test: it is true of AGE, STATUS and every other per-row fact, and
+        // blanking those reads as absent data rather than as grouping. Only
+        // a column that DECLARES it groups collapses — see
+        // `crate::app::ColumnDef::groups`.
+        let col = self.group_col?;
         if row_idx <= first_visible {
             return None;
         }

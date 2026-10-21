@@ -94,3 +94,116 @@ fn colorfgbg_uses_the_last_field_and_declines_politely() {
     assert_eq!(classify_colorfgbg("15;default"), None);
     assert_eq!(classify_colorfgbg(""), None);
 }
+
+// ---------------------------------------------------------------------------
+// tests (mirrored out of term_bg.rs)
+// ---------------------------------------------------------------------------
+
+
+    #[test]
+    fn parses_osc11_replies() {
+        // xterm's canonical form: 16-bit components, ST-terminated.
+        assert_eq!(
+            parse_osc11(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"),
+            Some((255, 255, 255))
+        );
+        // BEL-terminated, 8-bit components (kitty, foot).
+        assert_eq!(parse_osc11(b"\x1b]11;rgb:2e/34/40\x07"), Some((46, 52, 64)));
+        // Alpha channel appended (some VTE builds).
+        assert_eq!(
+            parse_osc11(b"\x1b]11;rgba:0000/0000/0000/ffff\x07"),
+            Some((0, 0, 0))
+        );
+        assert_eq!(parse_osc11(b"\x1b]11;#fdf6e3\x07"), Some((253, 246, 227)));
+    }
+
+    #[test]
+    fn incomplete_reply_is_not_a_color() {
+        // Still streaming in: no terminator yet, so committing to these
+        // digits would read #2e2e2e as the background.
+        assert_eq!(parse_osc11(b"\x1b]11;rgb:2e2e/34"), None);
+        assert_eq!(parse_osc11(b"\x1b]11;"), None);
+        assert_eq!(parse_osc11(b"\x1b[?62;c"), None);
+    }
+
+    #[test]
+    fn scales_components_to_eight_bits() {
+        assert_eq!(scale("f"), Some(255));
+        assert_eq!(scale("ffff"), Some(255));
+        assert_eq!(scale("0"), Some(0));
+        assert_eq!(scale("8080"), Some(128));
+        assert_eq!(scale("fffff"), None);
+        assert_eq!(scale("zz"), None);
+    }
+
+    #[test]
+    fn classifies_real_terminal_backgrounds() {
+        // Nord, Solarized dark, black.
+        assert_eq!(appearance_of((46, 52, 64)), Appearance::Dark);
+        assert_eq!(appearance_of((0, 43, 54)), Appearance::Dark);
+        assert_eq!(appearance_of((0, 0, 0)), Appearance::Dark);
+        // Solarized light, white, GitHub light gray.
+        assert_eq!(appearance_of((253, 246, 227)), Appearance::Light);
+        assert_eq!(appearance_of((255, 255, 255)), Appearance::Light);
+        assert_eq!(appearance_of((214, 216, 219)), Appearance::Light);
+    }
+
+    #[test]
+    fn reads_background_index_from_colorfgbg() {
+        assert_eq!(classify_colorfgbg("15;0"), Some(Appearance::Dark));
+        assert_eq!(classify_colorfgbg("0;15"), Some(Appearance::Light));
+        assert_eq!(classify_colorfgbg("15;default;0"), Some(Appearance::Dark));
+        assert_eq!(classify_colorfgbg("0;default;7"), Some(Appearance::Light));
+        // Bright black is still a dark background.
+        assert_eq!(classify_colorfgbg("15;8"), Some(Appearance::Dark));
+        // Nothing usable — fall through to the default.
+        assert_eq!(classify_colorfgbg("15;default"), None);
+        assert_eq!(classify_colorfgbg(""), None);
+    }
+
+    /// Feed a reply to the state machine one byte at a time — the read loop
+    /// sees whatever chunks the tty hands it, and must not settle early.
+    fn drive(reply: &[u8]) -> (ReplyState, usize) {
+        let mut buf = Vec::new();
+        for (i, byte) in reply.iter().enumerate() {
+            buf.push(*byte);
+            match classify_reply(&buf) {
+                ReplyState::NeedMore => {}
+                settled => return (settled, i + 1),
+            }
+        }
+        (ReplyState::NeedMore, reply.len())
+    }
+
+    #[test]
+    fn a_color_reply_is_read_through_to_the_chaser() {
+        // xterm answers the color, then DA1.
+        //
+        // This test used to assert the opposite — "we stop at the color and
+        // never look at the DA1 bytes behind it" — which pinned a bug as if it
+        // were a feature. Those unread bytes stay in `/dev/tty`, which is the
+        // tty the TUI begins reading milliseconds later, where
+        // `ESC [ ? 6 2 ; 1 ; 6 c` shreds into a stray `?` and `c`.
+        let reply = b"\x1b]11;rgb:2e2e/3434/4040\x1b\\\x1b[?62;1;6c";
+        let (state, consumed) = drive(reply);
+        assert_eq!(state, ReplyState::Done(Some((46, 52, 64))));
+        assert_eq!(
+            consumed,
+            reply.len(),
+            "every byte we provoked is consumed, not just the ones we wanted",
+        );
+    }
+
+    #[test]
+    fn da1_alone_means_the_terminal_cannot_answer() {
+        // A terminal that ignores OSC 11 still answers DA1 — that's what
+        // keeps startup from burning the whole timeout.
+        assert_eq!(drive(b"\x1b[?62;1;6c").0, ReplyState::Done(None));
+        // ... but only once its reply is complete.
+        assert_eq!(drive(b"\x1b[?62;1;6").0, ReplyState::NeedMore);
+    }
+
+    #[test]
+    fn partial_color_reply_keeps_waiting() {
+        assert_eq!(drive(b"\x1b]11;rgb:2e2e/3434/40").0, ReplyState::NeedMore);
+    }

@@ -594,6 +594,7 @@ fn a_committed_grep_that_matches_nothing_still_shows_its_chain() {
     let filter = Element::derive_log_filter(
         &session,
         crate::app::nav::CompiledGrep::new("zzz-no-such-line"),
+            crate::app::element::Sense::Keep,
     )
     .expect("log session yields a line output");
     app.nav.push(session);
@@ -624,7 +625,7 @@ fn the_grep_bar_does_not_cover_the_last_log_line() {
     let lines: Vec<String> = (0..200).map(|i| format!("line-{i} keep")).collect();
     let session = log_session_with(&lines.iter().map(String::as_str).collect::<Vec<_>>());
     let filter =
-        Element::derive_log_filter(&session, crate::app::nav::CompiledGrep::new("keep"))
+        Element::derive_log_filter(&session, crate::app::nav::CompiledGrep::new("keep"), crate::app::element::Sense::Keep)
             .expect("log session yields a line output");
     app.nav.push(session);
     app.nav.push(filter);
@@ -1137,7 +1138,7 @@ fn every_dialog_kind_paints_itself_over_its_parent() {
                     kind: crate::app::FormFieldKind::Number { min: 0, max: 100 },
                     value: crate::app::text_input::TextInput::seeded("3"),
                 }],
-                focused: 0,
+                focused: crate::app::FormFocus::Field(0),
             })),
             "Replicas",
         ),
@@ -1155,6 +1156,12 @@ fn every_dialog_kind_paints_itself_over_its_parent() {
 
         let painted = paint(&mut t, &mut app);
         assert!(painted.contains(needle), "{label}: its own content is drawn:\n{painted}");
+        if label == "form" {
+            // A form had ONE button (OK), so submitting was the only way out
+            // of one opened by mistake. Both must be on screen.
+            assert!(painted.contains("OK"), "form: the OK button is drawn:\n{painted}");
+            assert!(painted.contains("Cancel"), "form: the Cancel button is drawn:\n{painted}");
+        }
         assert!(
             painted.contains("canary-row-marker"),
             "{label}: …over the view that raised it, which stays visible:\n{painted}",
@@ -1223,43 +1230,34 @@ fn a_full_frame_takeover_erases_the_frame_not_the_float_over_it() {
     );
 }
 
-/// The column you sorted by stops repeating itself.
+/// Repeats collapse only in a column that DECLARES it groups.
 ///
-/// Help is three columns and thirteen of its rows said "Everywhere" down the
-/// left edge — the value you are grouped BY, printed once per row. Collapsing
-/// a repeat is a property of the table, not of help: it holds for a pod list
-/// sorted by NAMESPACE too, and it is render-only, so copy and save still
-/// carry the row's substance.
+/// The first version keyed on "is this the sorted column", which is true of
+/// AGE, STATUS and every other per-row fact. Sorting a pod list by AGE put a
+/// ReplicaSet's identically-aged pods adjacent and blanked eighteen of them —
+/// reported, correctly, as "is the age not properly populated for every
+/// single row?". Content present but not shown, reading as missing: the exact
+/// class the rest of this file exists to prevent.
 ///
-/// Three conditions are pinned here because each one is load-bearing: only
-/// the SORTED column (equal values are contiguous only there), never the top
-/// VISIBLE row (so the screen always carries the group it is in), and never a
-/// cell the search matched (collapsing matches would read as "only one row
-/// matched").
+/// Help's `SECTION` is the one column that opts in, because it is the
+/// category the rows were gathered under rather than a fact about each one.
 #[test]
-fn a_sorted_column_stops_repeating_itself() {
+fn only_a_grouping_column_collapses_its_repeats() {
     use crate::ui::widgets::{ResourceTable, ResourceTableState};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::widgets::StatefulWidget;
 
     let theme = crate::ui::theme::Theme::dark();
-    let rows: Vec<Vec<String>> = [
-        ["All", "?", "aaa"],
-        ["All", ":", "bbb"],
-        ["All", "R", "ccc"],
-        ["View", "d", "ddd"],
-    ]
-    .iter()
-    .map(|r| r.iter().map(|c| c.to_string()).collect())
-    .collect();
+    // Three rows sharing a value in column 0, as a rollout's pods share an age.
+    let rows: Vec<Vec<String>> = [["All", "?", "aaa"], ["All", ":", "bbb"], ["View", "d", "ccc"]]
+        .iter()
+        .map(|r| r.iter().map(|c| c.to_string()).collect())
+        .collect();
     let headers = vec!["SEC", "KEY", "DESC"];
-    // The widget takes measured widths (the memoized `PreparedView` carries
-    // them in the real path). Deliberately generous — nothing here is a claim
-    // about layout, the columns just have to be wide enough to read.
     let widths: Vec<u16> = vec![12, 12, 12];
 
-    let paint = |sort: Option<usize>, offset: usize, pats: &[crate::util::SearchPattern]| -> Vec<String> {
+    let paint = |group: Option<usize>, offset: usize, pats: &[crate::util::SearchPattern]| -> Vec<String> {
         let area = Rect::new(0, 0, 60, 10);
         let mut buf = Buffer::empty(area);
         let mut st = ResourceTableState {
@@ -1270,8 +1268,10 @@ fn a_sorted_column_stops_repeating_itself() {
             filtered_count: 0,
             visible_height: 0,
         };
-        ResourceTable::new(headers.clone(), &rows, "help", &theme)
-            .sort(sort, true)
+        ResourceTable::new(headers.clone(), &rows, "t", &theme)
+            // SORTED on column 0 throughout: sorting is not the question.
+            .sort(Some(0), true)
+            .group_col(group)
             .col_widths(&widths)
             .search_patterns(pats)
             .render(area, &mut buf, &mut st);
@@ -1280,45 +1280,31 @@ fn a_sorted_column_stops_repeating_itself() {
             .collect()
     };
 
-    // Sorted on SECTION: the run collapses after its first row.
-    let shown = paint(Some(0), 0, &[]);
-    let section_rows: Vec<&String> = shown
+    // SORTED but NOT grouping — the AGE case. Every value prints.
+    let plain = paint(None, 0, &[]);
+    assert_eq!(
+        plain.iter().filter(|l| l.contains("All")).count(),
+        2,
+        "a sorted column that does not group keeps every value:\n{plain:#?}",
+    );
+
+    // Grouping: the run collapses after its first row, and the next value
+    // still prints.
+    let grouped = paint(Some(0), 0, &[]);
+    let rows_shown: Vec<&String> = grouped
         .iter()
-        .filter(|l| l.contains("aaa") || l.contains("bbb") || l.contains("ccc"))
+        .filter(|l| l.contains("aaa") || l.contains("bbb"))
         .collect();
-    assert_eq!(section_rows.len(), 3, "all three rows drew:\n{shown:#?}");
-    assert!(section_rows[0].contains("All"), "the first carries the group:\n{shown:#?}");
+    assert_eq!(rows_shown.len(), 2, "both rows drew:\n{grouped:#?}");
+    assert!(rows_shown[0].contains("All"), "the first carries the group");
+    assert!(!rows_shown[1].contains("All"), "the second does not repeat it");
     assert!(
-        !section_rows[1].contains("All") && !section_rows[2].contains("All"),
-        "the rest do not repeat it:\n{shown:#?}",
-    );
-    // The group ENDS, and the next value still prints.
-    assert!(
-        shown.iter().any(|l| l.contains("View") && l.contains("ddd")),
-        "a different value is never suppressed:\n{shown:#?}",
-    );
-
-    // NOT sorted on SECTION: equal neighbours are a coincidence, so nothing
-    // is collapsed.
-    let unsorted = paint(Some(1), 0, &[]);
-    assert_eq!(
-        unsorted.iter().filter(|l| l.contains("All")).count(),
-        3,
-        "sorted on KEY, the SECTION column prints in full:\n{unsorted:#?}",
-    );
-
-    // No sort column visible at all (`display_sort_col` is an Option because
-    // the sorted column can be hidden): nothing is contiguous by assumption,
-    // so nothing collapses.
-    let no_sort = paint(None, 0, &[]);
-    assert_eq!(
-        no_sort.iter().filter(|l| l.contains("All")).count(),
-        3,
-        "with no sorted column there is no grouping to collapse:\n{no_sort:#?}",
+        grouped.iter().any(|l| l.contains("View") && l.contains("ccc")),
+        "a different value is never suppressed:\n{grouped:#?}",
     );
 
     // Scrolled: the top visible row carries its group even though the row
-    // above it (off screen) has the same value.
+    // above it (off screen) shares the value.
     let scrolled = paint(Some(0), 1, &[]);
     assert!(
         scrolled.iter().any(|l| l.contains("All") && l.contains("bbb")),
@@ -1326,11 +1312,11 @@ fn a_sorted_column_stops_repeating_itself() {
     );
 
     // Searched: every matching cell shows, or the highlight would claim one
-    // row matched when three did.
+    // row matched when two did.
     let searched = paint(Some(0), 0, &[crate::util::SearchPattern::new("All")]);
     assert_eq!(
         searched.iter().filter(|l| l.contains("All")).count(),
-        3,
+        2,
         "a matched cell always draws:\n{searched:#?}",
     );
 }
@@ -1845,6 +1831,7 @@ fn a_long_input_keeps_its_caret_and_its_tail_on_screen() {
         if let Ok(el) = crate::app::element::Element::derive_log_filter(
             app.nav.top(),
             crate::app::nav::CompiledGrep::new(pat),
+            crate::app::element::Sense::Keep,
         ) {
             app.nav.push(el);
         }
@@ -1947,5 +1934,267 @@ fn a_dialogs_box_reserves_exactly_the_chrome_its_widget_spends() {
     assert!(
         painted.contains("Delete pod/canary-row-marker?"),
         "the message fits the box its own size asked for:\n{painted}",
+    );
+}
+
+/// The grep bar says which STEP emptied the chain, not just that it is empty.
+///
+/// It showed one aggregate — `[3 filters, 0 visible]` told you the chain was
+/// dead but not which pattern killed it, and with a conjunction that is the
+/// only question worth asking. Each step's own `retained` store already knew.
+#[test]
+fn the_grep_bar_counts_every_step_of_the_chain() {
+    use crate::kube::protocol::{LogContainer, LogLine};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new_for_test();
+    app.conn.established();
+    let session = LogSession::for_test(
+        crate::kube::protocol::LogTarget::One("canarypod".to_string()),
+        LogContainer::Default,
+    );
+    for text in ["alpha one", "alpha two", "beta three"] {
+        session.store().push(0, LogLine::untagged(text));
+    }
+    app.nav.push(Element::LogSession(Box::new(session)));
+
+    // Two steps: the first keeps 2 of 3, the second keeps none of those.
+    for (pat, sense) in [
+        ("alpha", crate::app::element::Sense::Keep),
+        ("zzz", crate::app::element::Sense::Keep),
+    ] {
+        let el = crate::app::element::Element::derive_log_filter(
+            app.nav.top(),
+            crate::app::nav::CompiledGrep::new(pat),
+            sense,
+        )
+        .expect("a log can be filtered");
+        app.nav.push(el);
+        let _ = app.nav.top_mut().log_visible();
+    }
+
+    let mut t = Terminal::new(TestBackend::new(70, 14)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        painted.contains("alpha[2]"),
+        "the first step kept two — say so:\n{painted}",
+    );
+    assert!(
+        painted.contains("zzz[0]"),
+        "and the second is the one that emptied it — THAT is the datum:\n{painted}",
+    );
+}
+
+/// Sorting a pod list by AGE shows an age on EVERY row.
+///
+/// The reported regression, end to end: a ReplicaSet creates its pods within
+/// the same second, so sorting by AGE put identical rendered values adjacent
+/// and the repeat-collapse blanked all but the first of each run. Eighteen
+/// rows with no age reads as broken data, not as grouping — and it was read
+/// that way.
+///
+/// The widget-level rule is pinned by `only_a_grouping_column_collapses_its_
+/// repeats`; this one pins the WIRING, because the bug was not in the rule
+/// but in which column the view handed it.
+#[test]
+fn a_pod_list_sorted_by_age_shows_every_age() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new_for_test();
+    app.conn.established();
+    let store = app.nav.top().data_store().expect("root is a table");
+    // Four pods of one rollout: the SAME age, as a real ReplicaSet produces.
+    let rows: Vec<ResourceRow> = (0..4)
+        .map(|i| ResourceRow {
+            name: format!("parser-web-{i}"),
+            namespace: Some("default".into()),
+            cells: vec![
+                CellValue::Text(format!("parser-web-{i}")),
+                CellValue::Text("3m43s".to_string()),
+            ],
+            ..Default::default()
+        })
+        .collect();
+    store.apply(
+        1,
+        StorePayload::Baseline(TableBaseline {
+            resource: crate::app::nav::rid(BuiltInKind::Pod),
+            headers: vec!["NAME".into(), "AGE".into()],
+            rows,
+        }),
+    );
+
+    // Sort on AGE, which is where the blanks appeared.
+    let age_col = app
+        .nav
+        .top()
+        .headers_snapshot()
+        .iter()
+        .position(|h| h == "AGE")
+        .expect("the fixture has an AGE column");
+    let _ = app.nav.top_mut().sort_by(crate::app::SortTarget::Column(age_col));
+
+    // Tall enough for all four data rows: the title's `[n-m/total]` makes a
+    // short frame obvious, but this assertion is about the CELLS.
+    let mut t = Terminal::new(TestBackend::new(70, 16)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+    let with_age = painted.matches("3m43s").count();
+    assert_eq!(
+        with_age, 4,
+        "every row keeps its age — AGE is a fact about each pod, not a \
+         heading they share:\n{painted}",
+    );
+}
+
+/// No resource column collapses, whichever one you sort by.
+///
+/// The AGE regression was reported for AGE, but the broken rule applied to
+/// EVERY sorted column — STATUS repeated "Running" and NODE repeated a node
+/// name just as readily, and both would have blanked the same way. I had
+/// written "worth re-checking on the next run"; this checks it instead.
+#[test]
+fn no_resource_column_collapses_whichever_one_is_sorted() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new_for_test();
+    app.conn.established();
+    let store = app.nav.top().data_store().expect("root is a table");
+    // Four pods that AGREE on every column — the shape a rollout produces,
+    // and the shape that made the collapse visible.
+    let node = "ip-10-1-177-41.us-west-2.compute.internal";
+    let rows: Vec<ResourceRow> = (0..4)
+        .map(|i| ResourceRow {
+            name: format!("parser-web-{i}"),
+            namespace: Some("default".into()),
+            cells: vec![
+                CellValue::Text(format!("parser-web-{i}")),
+                CellValue::Text("Running".to_string()),
+                CellValue::Text(node.to_string()),
+                CellValue::Text("3m43s".to_string()),
+            ],
+            ..Default::default()
+        })
+        .collect();
+    store.apply(
+        1,
+        StorePayload::Baseline(TableBaseline {
+            resource: crate::app::nav::rid(BuiltInKind::Pod),
+            headers: vec!["NAME".into(), "STATUS".into(), "NODE".into(), "AGE".into()],
+            rows,
+        }),
+    );
+
+    for (header, value) in [("STATUS", "Running"), ("NODE", node), ("AGE", "3m43s")] {
+        let col = app
+            .nav
+            .top()
+            .headers_snapshot()
+            .iter()
+            .position(|h| h == header)
+            .unwrap_or_else(|| panic!("the fixture has {header}"));
+        let _ = app.nav.top_mut().sort_by(crate::app::SortTarget::Column(col));
+
+        let mut t = Terminal::new(TestBackend::new(120, 16)).expect("terminal");
+        let painted = paint(&mut t, &mut app);
+        assert_eq!(
+            painted.matches(value).count(),
+            4,
+            "sorted by {header}: all four rows keep their {header} — it is a \
+             fact about each pod, not a heading they share:\n{painted}",
+        );
+    }
+}
+
+/// …and help's SECTION still collapses, which is what the feature was FOR.
+///
+/// The fix narrowed collapsing to columns that declare it. The other half of
+/// "re-check next run" was whether the case that motivated it still works.
+#[test]
+fn help_section_still_collapses_after_the_narrowing() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new_for_test();
+    push_help(&mut app);
+
+    // Tall enough for EVERY help row: help opens on the section for the view
+    // you came from, so `Everywhere` sits well below the fold on a normal
+    // frame and a short terminal would prove nothing either way.
+    let mut t = Terminal::new(TestBackend::new(200, 90)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+
+    // Help opens sorted on SECTION, and `Everywhere` has many rows — so if
+    // it collapses, the label appears far fewer times than its row count.
+    let (_, rows) = crate::ui::widgets::HelpContent::rows(
+        Some(app.current_capabilities()),
+        app.config.keys,
+        crate::event::keymap::ViewClass::Table,
+        app.nav.top().markable(),
+    );
+    let everywhere_rows = rows
+        .iter()
+        .filter(|r| {
+            matches!(&r.cells[0], crate::kube::resources::row::CellValue::Text(t)
+                if t == "Everywhere")
+        })
+        .count();
+    assert!(everywhere_rows > 3, "the fixture really has a run to collapse");
+
+    let drawn = painted.matches("Everywhere").count();
+    assert!(
+        drawn < everywhere_rows,
+        "SECTION must still collapse — it is the category the rows were \
+         gathered under, and this is the case the feature exists for \
+         ({drawn} drawn vs {everywhere_rows} rows):\n{painted}",
+    );
+    assert!(drawn >= 1, "…but the group is still labelled once");
+}
+
+/// `G` on a just-opened describe reaches the bottom on the FIRST press.
+///
+/// I fixed this at the `Viewport` level and tested it there, then wrote
+/// "worth re-checking on the next run" for the view. But the bug was never in
+/// `Viewport` — it was the content path passing a literal `false` where the
+/// follow flag belonged, so a unit test of `set_metrics` could not have
+/// caught it. This drives the real describe view.
+#[test]
+fn g_on_a_freshly_opened_describe_reaches_the_bottom_at_once() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new_for_test();
+    app.conn.established();
+    let mut state = crate::app::ContentViewState::default();
+    // More lines than fit, each identifiable, so "which window is drawn" is
+    // readable off the frame.
+    state.set_content((0..200).map(|i| format!("line-{i:03}")).collect::<Vec<_>>().join("\n"));
+    app.nav.push(Element::ContentView(crate::app::element::ContentView::new(
+        crate::app::element::ContentSpec::Describe(crate::kube::protocol::ObjectRef::new(
+            crate::app::nav::rid(BuiltInKind::Pod),
+            "canary".to_string(),
+            crate::kube::protocol::Namespace::Named("default".to_string()),
+        )),
+        state,
+        crate::app::element::ContentPhase::Ready,
+    )));
+
+    let mut t = Terminal::new(TestBackend::new(60, 14)).expect("terminal");
+
+    // `G` BEFORE anything has rendered — the state the bug lived in. The
+    // extent is still 0, so the intent is all the viewport has to go on.
+    if let Element::ContentView(cv) = app.nav.top_mut() {
+        cv.state.viewport.end();
+    }
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        painted.contains("line-199"),
+        "the FIRST `G` must land on the last line, not the top:\n{painted}",
+    );
+    assert!(
+        !painted.contains("line-000"),
+        "…and the top must be gone, not merely scrolled past:\n{painted}",
     );
 }

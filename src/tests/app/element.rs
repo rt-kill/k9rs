@@ -80,7 +80,7 @@ fn view_is_memoized_and_invalidated_by_data_draft_and_sort() {
     // Draft change invalidates (the draft is a derive input — no
     // explicit re-filter call exists anywhere).
     el.filter_input_mut().unwrap().start();
-    el.filter_input_mut().unwrap().push_char('a');
+    el.filter_input_mut().unwrap().input_mut().insert('a');
     let v4 = el.view(ColumnLevel::Default, 40);
     assert_eq!(v4.keys.len(), 1);
     assert_eq!(v4.rows[0][0], "a");
@@ -208,7 +208,7 @@ fn log_filters_chain_and_own_their_lines() {
     assert_eq!(session.log_header().unwrap().0, "pod-x");
 
     let mut filter =
-        Element::derive_log_filter(&session, CompiledGrep::new("err")).unwrap();
+        Element::derive_log_filter(&session, CompiledGrep::new("err"), crate::app::element::Sense::Keep).unwrap();
     assert_eq!(filter.label(), "/err");
     assert_eq!(filter.log_committed_patterns(), vec!["err".to_string()]);
     assert_eq!(filter.log_visible().unwrap().len(), 5);
@@ -591,7 +591,7 @@ fn one_of_every_kind() -> Vec<crate::app::element::Element> {
 
     let log = Element::LogSession(Box::new(LogSession::for_test(crate::kube::protocol::LogTarget::One("pod".to_string()), LogContainer::Default)));
     let log_filtered =
-        Element::derive_log_filter(&log, crate::app::nav::CompiledGrep::new("y"))
+        Element::derive_log_filter(&log, crate::app::nav::CompiledGrep::new("y"), crate::app::element::Sense::Keep)
             .expect("a log can be filtered");
 
     let content = Element::ContentView(ContentView::new(
@@ -675,7 +675,7 @@ fn one_of_every_kind() -> Vec<crate::app::element::Element> {
                 kind: crate::app::FormFieldKind::Number { min: 0, max: 100 },
                 value: crate::app::text_input::TextInput::seeded("3"),
             }],
-            focused: 0,
+            focused: crate::app::FormFocus::Field(0),
         })),
     ]
 }
@@ -966,7 +966,7 @@ fn a_draft_filter_does_not_shrink_a_projections_marks() {
         let fi = derived.filter_input_mut().unwrap();
         fi.start();
         for c in "c0".chars() {
-            fi.push_char(c);
+            fi.input_mut().insert(c);
         }
     }
     let _ = derived.view(ColumnLevel::Default, 40);
@@ -981,7 +981,7 @@ fn a_draft_filter_does_not_shrink_a_projections_marks() {
         let fi = derived.filter_input_mut().unwrap();
         fi.start();
         for c in "zzz".chars() {
-            fi.push_char(c);
+            fi.input_mut().insert(c);
         }
     }
     let _ = derived.view(ColumnLevel::Default, 40);
@@ -1029,6 +1029,7 @@ fn the_tail_load_latch_clears_on_buried_log_views_too() {
     let filter = Element::derive_log_filter(
         app.nav.top(),
         crate::app::nav::CompiledGrep::new("err"),
+            crate::app::element::Sense::Keep,
     )
     .expect("a log session yields a line output");
     app.nav.push(filter);
@@ -1067,11 +1068,21 @@ fn a_buried_filter_keeps_collecting() {
     app.nav.push(Element::LogSession(Box::new(session)));
 
     let filter =
-        Element::derive_log_filter(app.nav.top(), CompiledGrep::new("err")).expect("log output");
+        Element::derive_log_filter(
+            app.nav.top(),
+            CompiledGrep::new("err"),
+            crate::app::element::Sense::Keep,
+        )
+        .expect("log output");
     app.nav.push(filter);
     // Something else on top of the filter.
     let deeper =
-        Element::derive_log_filter(app.nav.top(), CompiledGrep::new("err")).expect("log output");
+        Element::derive_log_filter(
+            app.nav.top(),
+            CompiledGrep::new("err"),
+            crate::app::element::Sense::Keep,
+        )
+        .expect("log output");
     app.nav.push(deeper);
 
     for i in 0..6 {
@@ -1167,7 +1178,7 @@ fn restarting_a_range_resets_the_greps_over_it() {
     for i in 0..10 {
         store.push(1, LogLine { timestamp: None, content: format!("line-{i} err"), source: None });
     }
-    let mut filter = Element::derive_log_filter(&session, CompiledGrep::new("err")).unwrap();
+    let mut filter = Element::derive_log_filter(&session, CompiledGrep::new("err"), crate::app::element::Sense::Keep).unwrap();
     assert_eq!(filter.log_visible().unwrap().len(), 10);
 
     let mut nav = crate::app::nav::NavStack::new(session);
@@ -1314,9 +1325,9 @@ fn a_grep_searches_exactly_the_roles_that_declare_themselves_searchable() {
     // places the rule used to be written out by hand.
     session.log_view_mut().unwrap().draft = None;
     session.log_view_mut().unwrap().drop_cache();
-    let mut f = Element::derive_log_filter(&session, CompiledGrep::new("2026-09-19")).unwrap();
+    let mut f = Element::derive_log_filter(&session, CompiledGrep::new("2026-09-19"), crate::app::element::Sense::Keep).unwrap();
     assert_eq!(f.log_visible().unwrap().len(), 0, "committed greps skip it too");
-    let mut f = Element::derive_log_filter(&session, CompiledGrep::new("api-7f9")).unwrap();
+    let mut f = Element::derive_log_filter(&session, CompiledGrep::new("api-7f9"), crate::app::element::Sense::Keep).unwrap();
     assert_eq!(f.log_visible().unwrap().len(), 1);
 }
 
@@ -1366,7 +1377,7 @@ fn a_bare_grep_scans_only_the_displayed_columns() {
             let fi = el.filter_input_mut().unwrap();
             fi.start();
             for c in pat.chars() {
-                fi.push_char(c);
+                fi.input_mut().insert(c);
             }
         }
         el.table_interaction_mut().unwrap().drop_cache();
@@ -1430,7 +1441,7 @@ fn a_grep_matches_across_a_colour_boundary() {
     // The committed path agrees — it is the other consumer of a segment.
     session.log_view_mut().unwrap().draft = None;
     session.log_view_mut().unwrap().drop_cache();
-    let mut f = Element::derive_log_filter(&session, CompiledGrep::new("workers=")).unwrap();
+    let mut f = Element::derive_log_filter(&session, CompiledGrep::new("workers="), crate::app::element::Sense::Keep).unwrap();
     assert_eq!(f.log_visible().unwrap().len(), 2, "committed greps see the same text");
 }
 
@@ -1789,5 +1800,247 @@ fn a_structural_chord_fires_only_where_its_operation_is_declared() {
             Some(crate::app::actions::Action::PortForward)
         ),
         "where it is not declared, the chord is inert — it used to fire anyway",
+    );
+}
+
+/// The grep chain can narrow AWAY from something, not only toward it.
+///
+/// `/health` showed you the health checks and nothing hid them — and that was
+/// a wall, not a gap: vim's `\@!` is refused by name and `regex` 1.x has no
+/// look-around at all (a finite-automaton engine, which is what makes a
+/// pathological pattern compile promptly). So exclusion cannot be a property
+/// of the PATTERN; it is a property of the chain STEP.
+#[test]
+fn a_chain_step_can_exclude_what_it_matches() {
+    use crate::app::element::{sense_of, Sense};
+    use crate::kube::protocol::{LogContainer, LogLine};
+
+    // The prefix is parsed before the vim translator sees the text, so that
+    // grammar stays exactly vim magic.
+    assert_eq!(sense_of("health"), (Sense::Keep, "health"));
+    assert_eq!(sense_of("!health"), (Sense::Drop, "health"));
+    assert_eq!(sense_of("\\!urgent"), (Sense::Keep, "!urgent"));
+    assert_eq!(sense_of("!"), (Sense::Drop, ""));
+
+    let session = LogSession::for_test(
+        crate::kube::protocol::LogTarget::One("pod-x".to_string()),
+        LogContainer::Default,
+    );
+    for text in ["GET /healthz 200", "worker started", "GET /healthz 200", "worker failed"] {
+        session.store().push(0, LogLine::untagged(text));
+    }
+    let log = Element::LogSession(Box::new(session));
+
+    // Exclude: everything the pattern matched is gone, the rest stays.
+    let mut excluded = Element::derive_log_filter(
+        &log,
+        CompiledGrep::new("healthz"),
+        Sense::Drop,
+    )
+    .expect("a log can be filtered");
+    let visible = excluded.log_visible().expect("a filter has a visible set");
+    assert_eq!(visible.len(), 2, "both health lines are gone");
+    let kept: Vec<String> = excluded
+        .log_store()
+        .unwrap()
+        .with_read(|i| i.lines.iter().map(|l| l.content.clone()).collect());
+    assert!(kept.iter().all(|l| !l.contains("healthz")), "and really gone: {kept:?}");
+    assert!(kept.iter().any(|l| l.contains("worker failed")), "the rest survive: {kept:?}");
+
+    // It LABELS itself with the `!`, so a chain of four is readable.
+    assert_eq!(excluded.log_committed_patterns(), vec!["!healthz".to_string()]);
+
+    // And contributes NO highlight: every line it matched is off screen, so
+    // painting its matches would colour the one thing certainly not there.
+    assert!(
+        excluded.log_patterns().is_empty(),
+        "an excluding step highlights nothing: {:?}",
+        excluded.log_patterns(),
+    );
+
+    // Chains mix: exclude then narrow.
+    let mut both = Element::derive_log_filter(&excluded, CompiledGrep::new("failed"), Sense::Keep)
+    .expect("a filter can be filtered");
+    assert_eq!(both.log_visible().expect("visible").len(), 1, "worker failed alone");
+    assert_eq!(
+        both.log_committed_patterns(),
+        vec!["!healthz".to_string(), "failed".to_string()],
+        "the chain reads in order, senses included",
+    );
+    assert_eq!(
+        both.log_patterns(),
+        vec!["failed".to_string()],
+        "only the narrowing step highlights",
+    );
+}
+
+/// "From the beginning" is reachable, which is the other half of P1.
+///
+/// `restart_range` took an `Option<String>`: `None` meant tail and `Some(d)`
+/// meant the last `d`. There was no third state, so the digits capped the
+/// reachable history at 24h — and the original complaint was that the OLDEST
+/// logs could not be reached. `Retain::Head` and `stop_if_head_complete` were
+/// built for exactly that and then left unaskable.
+///
+/// No wire change: `since` and `tail` were always independent, and both
+/// absent is "everything" to the apiserver. What was missing was a name for
+/// that combination.
+#[test]
+fn a_log_range_can_ask_for_everything_from_the_beginning() {
+    use crate::app::actions::LogRange;
+
+    let session = LogSession::for_test(
+        crate::kube::protocol::LogTarget::One("pod-x".to_string()),
+        crate::kube::protocol::LogContainer::Default,
+    );
+    // A fresh stream is a tail: a bounded number of lines, newest kept.
+    assert_eq!(session.current_range(), LogRange::Tail);
+    let (_, _, label) = session.header();
+    assert_eq!(label, "tail", "and says so");
+
+    // All three ranges round-trip through the spec, which is the only place
+    // the choice is stored — so a revival cannot change what you were
+    // looking at.
+    for range in [
+        LogRange::Tail,
+        LogRange::Head,
+        LogRange::Since("24h".to_string()),
+    ] {
+        let mut s = LogSession::for_test(
+            crate::kube::protocol::LogTarget::One("pod-x".to_string()),
+            crate::kube::protocol::LogContainer::Default,
+        );
+        s.write_range(range.clone());
+        assert_eq!(s.current_range(), range, "the spec remembers {range:?}");
+    }
+
+    // The header distinguishes all three, so you can tell a bounded tail
+    // from an unbounded history at a glance.
+    let labels: Vec<String> = [LogRange::Tail, LogRange::Head, LogRange::Since("15m".into())]
+        .into_iter()
+        .map(|r| {
+            let mut s = LogSession::for_test(
+                crate::kube::protocol::LogTarget::One("pod-x".to_string()),
+                crate::kube::protocol::LogContainer::Default,
+            );
+            s.write_range(r);
+            s.header().2
+        })
+        .collect();
+    assert_eq!(labels, vec!["tail", "all", "15m"]);
+}
+
+/// The two accessors where a wildcard would be a GUESS are exhaustive.
+///
+/// A 2026-09 audit counted the `_ =>` arms as one hazard; most are answers
+/// (an `Option` for "the kinds that have one", or delegation to the general
+/// case). Two were guesses a new kind would silently inherit and be wrong
+/// about, and those are the ones pinned here — adding an element kind must
+/// force a decision about its liveness and its stream, and nowhere else.
+#[test]
+fn a_new_element_kind_must_declare_liveness_and_stream_ownership() {
+    // This test is a STATEMENT, checked by the compiler rather than by
+    // asserting: `is_live` and `abort_data_stream` both match every variant
+    // by name, so adding one breaks the build in those two arms. What the
+    // assertions pin is the ANSWERS, because an exhaustive match that
+    // answered wrongly would still compile.
+    let app = crate::app::App::new_for_test();
+
+    // A table with a live query reports its query's liveness — not a
+    // blanket `true`, which is what suppressed the stale banner.
+    assert!(app.nav.top().is_live(), "a fresh list is live");
+
+    // A derived kind rides its ancestor's stream, so it reports live and
+    // owns nothing to abort. Both are deliberate, not defaults.
+    let filter = crate::app::element::Element::derive_filter(
+        app.nav.top(),
+        crate::app::store::RowPredicate::Grep(crate::app::nav::CompiledGrep::new("x")),
+    )
+    .expect("a table can be filtered");
+    assert!(filter.is_live(), "a filter's liveness is its ancestor's");
+    // Aborting a stream it does not own is a no-op, not a panic: the
+    // ancestor is aborted on its own turn in the walk.
+    filter.abort_data_stream();
+
+    // A dialog is chrome: live by definition, owns no stream.
+    let confirm = crate::app::element::Element::Confirm(Box::new(crate::app::ConfirmDialog {
+        message: "x".to_string(),
+        action_label: "Delete".to_string(),
+        pending: crate::app::PendingAction::Single {
+            op: crate::app::SingleOp::Delete,
+            target: crate::kube::protocol::ObjectRef::new(
+                crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
+                "p".to_string(),
+                crate::kube::protocol::Namespace::Named("default".to_string()),
+            ),
+        },
+        action_focused: false,
+    }));
+    assert!(confirm.is_live());
+    confirm.abort_data_stream();
+}
+
+/// `Esc` peels ONE grep off the chain, which is the only way to undo one.
+///
+/// I documented this in the keymap (`q / Esc` — "Back — pops one grep off the
+/// chain") and never tested it: the agreement test probes `plain('q')`, so
+/// `Esc` was a claim help made with nothing behind it. Written up as "worth
+/// re-checking on the next run", which is how a documented-but-unverified
+/// behaviour becomes a lie later.
+#[test]
+fn esc_peels_one_grep_off_the_chain() {
+    use crate::app::actions::Action;
+    use crate::app::element::Sense;
+    use crate::kube::protocol::{LogContainer, LogLine};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = crate::app::App::new_for_test();
+    let session = LogSession::for_test(
+        crate::kube::protocol::LogTarget::One("pod-x".to_string()),
+        LogContainer::Default,
+    );
+    for text in ["alpha beta", "alpha only", "beta only"] {
+        session.store().push(0, LogLine::untagged(text));
+    }
+    app.nav.push(Element::LogSession(Box::new(session)));
+
+    for pat in ["alpha", "beta"] {
+        let el = Element::derive_log_filter(
+            app.nav.top(),
+            CompiledGrep::new(pat),
+            Sense::Keep,
+        )
+        .expect("a log can be filtered");
+        app.nav.push(el);
+    }
+    assert_eq!(app.nav.top().log_committed_patterns().len(), 2, "two greps deep");
+
+    // BOTH keys the log class documents reach `Back`, which is what pops.
+    for key in [KeyCode::Esc, KeyCode::Char('q')] {
+        let action = crate::event::handler::handle_key_event(
+            &app,
+            KeyEvent::new(key, KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(action, Some(Action::Back)),
+            "{key:?} in a log view must reach Back — the keymap says so",
+        );
+    }
+
+    // And Back really takes ONE level, not the whole chain.
+    app.nav.pop();
+    assert_eq!(
+        app.nav.top().log_committed_patterns(),
+        vec!["alpha".to_string()],
+        "one press, one grep — the outer one survives",
+    );
+    app.nav.pop();
+    assert!(
+        app.nav.top().log_committed_patterns().is_empty(),
+        "the second press leaves the bare log session",
+    );
+    assert!(
+        matches!(app.nav.top(), Element::LogSession(_)),
+        "…and that IS the session, not something popped too far",
     );
 }

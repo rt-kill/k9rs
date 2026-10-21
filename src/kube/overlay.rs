@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
-use tracing::warn;
 
 use crate::kube::resources::row::RowHealth;
 
@@ -164,17 +163,70 @@ pub struct ColumnColorRule {
     pub rules: Vec<ColorRule>,
 }
 
-/// A single coloring rule: predicate + resulting health level.
+/// A single coloring rule: ONE trigger plus the health it assigns.
+///
+/// The trigger used to be two `Option<String>`s — `match` and `when` — of
+/// which exactly one had to be present. That is four invalid states, and each
+/// one had a runtime guard: both set (match silently wins), neither set
+/// (never fires), an empty `match` (fires on everything), an unparseable
+/// `when`. Every guard was warn-and-continue, so a contradictory rule LOADED
+/// and then quietly did the wrong thing — and they were written out twice,
+/// once at load and again in `build_column_rules`, which also re-parsed
+/// `when` on every call.
+///
+/// Now the trigger is parsed and validated ONCE, at deserialize, into the
+/// same [`RenderPredicate`] the renderer evaluates. A rule that cannot say
+/// what it means fails its file, reported through `overlay_diagnostics` like
+/// any other parse error — which is already what a typo'd key does, because
+/// `deny_unknown_fields` has always been on this struct. "Both `match` and
+/// `when`" being a mere warning was the inconsistency.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawColorRule")]
 pub struct ColorRule {
-    /// Exact text match on the cell's display value.
-    #[serde(rename = "match")]
-    pub match_text: Option<String>,
-    /// Numeric comparison (e.g. "> 90", "< 10").
-    pub when: Option<String>,
-    /// Health level to assign when the predicate matches.
+    /// What makes this rule fire. Exactly one, by construction.
+    pub(crate) trigger: RenderPredicate,
+    /// Health level to assign when it does.
     pub health: OverlayHealth,
+}
+
+/// The on-disk shape of a [`ColorRule`], before validation. Exists only as
+/// `try_from`'s input: the two-`Option` form is what the user writes, and is
+/// not a form the rest of the program should be able to hold.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawColorRule {
+    #[serde(rename = "match")]
+    match_text: Option<String>,
+    when: Option<String>,
+    health: OverlayHealth,
+}
+
+impl TryFrom<RawColorRule> for ColorRule {
+    type Error = String;
+
+    fn try_from(raw: RawColorRule) -> Result<Self, Self::Error> {
+        let trigger = match (raw.match_text, raw.when) {
+            (Some(_), Some(_)) => {
+                return Err("sets both `match` and `when` — a rule fires on one \
+                            thing, so give it one"
+                    .to_string())
+            }
+            (None, None) => {
+                return Err("has neither `match` nor `when`, so it could never \
+                            fire"
+                    .to_string())
+            }
+            (Some(text), None) if text.is_empty() => {
+                return Err("has an empty `match`, which would colour every row"
+                    .to_string())
+            }
+            (Some(text), None) => RenderPredicate::Contains(text),
+            (None, Some(when)) => RenderPredicate::parse_when(&when).ok_or_else(|| {
+                format!("has an invalid `when` predicate `{when}` (expected e.g. `>= 90`)")
+            })?,
+        };
+        Ok(Self { trigger, health: raw.health })
+    }
 }
 
 /// Health level in overlay config. Mapped to `RowHealth` after deser.
@@ -200,18 +252,32 @@ impl From<OverlayHealth> for RowHealth {
 // Loader
 // ---------------------------------------------------------------------------
 
-/// Load all overlay files from `~/.config/k9rs/overlays/`.
-/// Returns a map keyed by resource plural name. Errors in individual
-/// files are logged and skipped — one bad overlay doesn't break the rest.
-pub fn load_overlays() -> HashMap<String, ResourceOverlay> {
-    load_overlays_reporting(&mut Vec::new())
+/// Load every overlay file from `~/.config/k9rs/overlays/`, collecting each
+/// complaint as a user-facing string.
+///
+/// Returns a map keyed by resource plural. One bad overlay never breaks the
+/// rest: its file is reported and skipped. Every `warn!` below also pushes a
+/// report, so the two cannot drift — the log line is for `--log-file`, the
+/// report is for the person who wrote the overlay and is looking at a TUI.
+///
+/// (A discarding `load_overlays()` wrapper sat here with no callers. `pub`,
+/// so nothing flagged it.)
+pub fn load_overlays_reporting(problems: &mut Vec<String>) -> HashMap<String, ResourceOverlay> {
+    let Ok(home) = std::env::var("HOME") else { return HashMap::new() };
+    load_overlays_from(&Path::new(&home).join(".config/k9rs/overlays"), problems)
 }
 
-/// `load_overlays`, also collecting every diagnostic as a user-facing string.
-/// Each `warn!` below is paired with a `report!` so the two cannot drift: the
-/// log line is for `--log-file`, the report is for the person who wrote the
-/// overlay and is looking at a TUI.
-pub fn load_overlays_reporting(problems: &mut Vec<String>) -> HashMap<String, ResourceOverlay> {
+/// `load_overlays_reporting` over a given directory.
+///
+/// The directory is a PARAMETER so the diagnostics path is testable without
+/// mutating `HOME` — which is process-global, and this suite runs in
+/// parallel. The earlier test for a refused coloring rule could only check
+/// serde in isolation; what matters to the user is that the refusal reaches
+/// the startup flash, and that is this function's output.
+pub fn load_overlays_from(
+    dir: &Path,
+    problems: &mut Vec<String>,
+) -> HashMap<String, ResourceOverlay> {
     // One site, two destinations — a `warn!` that the user can also see.
     macro_rules! warn {
         ($($arg:tt)*) => {{
@@ -220,12 +286,7 @@ pub fn load_overlays_reporting(problems: &mut Vec<String>) -> HashMap<String, Re
         }};
     }
     let mut overlays = HashMap::new();
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return overlays,
-    };
-    let dir = Path::new(&home).join(".config/k9rs/overlays");
-    let entries = match std::fs::read_dir(&dir) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return overlays, // directory doesn't exist — no overlays
     };
@@ -334,29 +395,10 @@ pub fn load_overlays_reporting(problems: &mut Vec<String>) -> HashMap<String, Re
                     // checks them too, but only lazily when the resource is
                     // first viewed — surfacing a malformed rule here means a
                     // typo'd threshold is reported at startup, not on navigation.
-                    for color_rule in &overlay.coloring {
-                        for cr in &color_rule.rules {
-                            match (cr.match_text.as_deref(), cr.when.as_deref()) {
-                                (Some(_), Some(_)) => warn!(
-                                    "overlay: coloring rule for column '{}' on '{}' sets both 'match' and 'when' — 'match' wins, 'when' is ignored in {}",
-                                    color_rule.column, overlay.resource, path.display()
-                                ),
-                                (None, None) => warn!(
-                                    "overlay: coloring rule for column '{}' on '{}' has neither 'match' nor 'when' — it will never apply in {}",
-                                    color_rule.column, overlay.resource, path.display()
-                                ),
-                                (Some(""), None) => warn!(
-                                    "overlay: coloring rule for column '{}' on '{}' has an empty 'match' (would match everything) in {}",
-                                    color_rule.column, overlay.resource, path.display()
-                                ),
-                                (None, Some(when)) if RenderPredicate::parse_when(when).is_none() => warn!(
-                                    "overlay: coloring rule for column '{}' on '{}' has an invalid 'when' predicate '{}' (expected e.g. '>= 90') in {}",
-                                    color_rule.column, overlay.resource, when, path.display()
-                                ),
-                                _ => {}
-                            }
-                        }
-                    }
+                    // A coloring rule that cannot say what it means no longer
+                    // reaches here: `ColorRule`'s `try_from` refuses it at
+                    // deserialize, and the file's parse error is reported
+                    // above like any other.
                     let key = canonical_key(&overlay.resource);
                     if let Some(prior) = overlays.get(&key) {
                         // Same plural from two files. If their `group`s differ
@@ -514,27 +556,13 @@ pub fn build_column_rules(headers: &[String], plural: &str) -> Vec<ColumnRenderR
             None => continue,
         };
         for cr in &col_rule.rules {
-            let predicate = if let Some(ref text) = cr.match_text {
-                if text.is_empty() {
-                    warn!("overlay: empty match text for column '{}' in resource '{}' (would match everything)",
-                        col_rule.column, plural);
-                    continue;
-                }
-                RenderPredicate::Contains(text.clone())
-            } else if let Some(ref when) = cr.when {
-                match RenderPredicate::parse_when(when) {
-                    Some(p) => p,
-                    None => {
-                        warn!("overlay: invalid predicate '{}' for column '{}' in resource '{}'",
-                            when, col_rule.column, plural);
-                        continue;
-                    }
-                }
-            } else {
-                continue;
-            };
-            let style: RowHealth = cr.health.into();
-            result[col_idx].rules.push(RenderRule { predicate, style });
+            // No guards and no parsing: the trigger was validated once, at
+            // deserialize, into exactly this type. This used to re-parse
+            // every `when` on every call and warn-and-skip the bad ones —
+            // the same four decisions the loader had already made.
+            result[col_idx]
+                .rules
+                .push(RenderRule { predicate: cr.trigger.clone(), style: cr.health.into() });
         }
     }
     result

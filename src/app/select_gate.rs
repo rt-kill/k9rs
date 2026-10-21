@@ -190,7 +190,7 @@ pub fn gate_action(app: &App, action: Action) -> Gated {
         | Action::SaveTable
         | Action::SaveLogs
         | Action::ShowAliases
-        | Action::LogSince(_)
+        | Action::LogRange(_)
         | Action::ColLeft
         | Action::ColRight
         | Action::PageLeft

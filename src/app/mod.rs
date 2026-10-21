@@ -757,15 +757,6 @@ impl App {
         self.nav.top_mut().go_end();
     }
 
-    /// The cursor index on the top element.
-    pub fn active_table_selected(&self) -> usize {
-        self.nav.top().table_interaction().map(|i| i.selected).unwrap_or(0)
-    }
-
-    /// Move the top element's cursor (clamped to its view).
-    pub fn select_in_active_table(&mut self, idx: usize) {
-        self.nav.top_mut().select(idx);
-    }
 
     /// Toggle mark on the row under the cursor.
     pub fn toggle_mark(&mut self) -> element::MarkOutcome {
@@ -893,10 +884,6 @@ impl App {
         stats
     }
 
-    /// Whether the top element's view is cluster-scoped (no namespace).
-    pub fn current_tab_is_cluster_scoped(&self) -> bool {
-        self.nav.top().is_cluster_scoped()
-    }
 
     /// Find a discovered CRD by its kind name (case-insensitive), from
     /// the app-level CRD store (Discovery-fed).

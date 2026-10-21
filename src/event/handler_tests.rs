@@ -878,24 +878,29 @@ fn test_log_view_toggle_wrap() {
 }
 
 #[test]
-fn test_log_view_log_since_digits() {
+fn test_log_view_log_range_digits() {
+    use crate::app::actions::LogRange;
     let app = make_log_app();
-    assert!(matches!(
-        handle_key_event(&app, make_key(KeyCode::Char('1'))),
-        Some(Action::LogSince(Some(_)))
-    ));
-    assert!(matches!(
-        handle_key_event(&app, make_key(KeyCode::Char('3'))),
-        Some(Action::LogSince(Some(_)))
-    ));
-    assert!(matches!(
-        handle_key_event(&app, make_key(KeyCode::Char('6'))),
-        Some(Action::LogSince(Some(_)))
-    ));
-    // '0' clears the time range.
+    for d in ['1', '3', '6'] {
+        assert!(
+            matches!(
+                handle_key_event(&app, make_key(KeyCode::Char(d))),
+                Some(Action::LogRange(LogRange::Since(_)))
+            ),
+            "`{d}` asks for a duration",
+        );
+    }
+    // '0' is back to the tail.
     assert!(matches!(
         handle_key_event(&app, make_key(KeyCode::Char('0'))),
-        Some(Action::LogSince(None))
+        Some(Action::LogRange(LogRange::Tail))
+    ));
+    // '7' is the end of the ladder: everything. This is the state the old
+    // `Option<String>` payload could not express, which is why the digits
+    // capped the reachable history at 24h.
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Char('7'))),
+        Some(Action::LogRange(LogRange::Head))
     ));
 }
 
@@ -956,4 +961,82 @@ fn test_log_view_h_l_and_arrows_pan() {
     ] {
         assert_eq!(handle_key_event(&app, make_key(key)), Some(want), "{key:?}");
     }
+}
+
+/// THE bug: Esc in a form did nothing. The typing handler claimed it by
+/// calling `UiState::close_modal`, which clears the modal SLOT — and a form
+/// has been a nav ELEMENT since `Modal::Form` was removed, so Esc cleared an
+/// already-empty slot, the dialog stayed on screen, and OK was the only exit.
+/// Nothing tested it, and `FormDialog::focused`'s own doc asserted the
+/// opposite ("Esc cancels regardless of focus").
+///
+/// Esc must come back as `Action::Back` — the one undo path, the same pop
+/// that leaves every other element.
+#[test]
+fn esc_in_a_form_pops_it() {
+    let mut app = App::new_for_test();
+    app.nav.push(form_element());
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Esc)),
+        Some(Action::Back)
+    ));
+}
+
+/// The other half of the same bug is the fall-through: Esc only reaches the
+/// action layer if no input sink claims it first. The sink that could is
+/// `modal_without_key_handler`, and a form does not live in the modal slot
+/// at all — which is the same fact that made `close_modal()` a no-op.
+///
+/// `handle_form_dialog_key` itself cannot be called from a sync test: it
+/// takes a `ClientSession`, which spawns onto a runtime, and no test in this
+/// crate constructs one (tests never touch the daemon). So the `return
+/// false` in its Esc arm is covered by this invariant plus its own comment,
+/// not by a direct call.
+#[test]
+fn no_modal_sink_claims_a_forms_keys() {
+    let mut app = App::new_for_test();
+    app.nav.push(form_element());
+    assert!(
+        !app.ui.modal_without_key_handler(),
+        "a form is a nav element, so no modal sink may swallow its Esc",
+    );
+}
+
+/// Enter on Cancel means exactly what Esc means — it is not a second way
+/// out with its own implementation.
+#[test]
+fn enter_on_cancel_pops_but_enter_on_ok_does_not() {
+    let mut app = App::new_for_test();
+    app.nav.push(form_element());
+
+    app.nav.top_mut().form_dialog_mut().unwrap().focused = crate::app::FormFocus::Cancel;
+    assert!(matches!(
+        handle_key_event(&app, make_key(KeyCode::Enter)),
+        Some(Action::Back)
+    ));
+
+    // On OK, Enter is the typing handler's business (it submits), so the
+    // action layer must stay out of it.
+    app.nav.top_mut().form_dialog_mut().unwrap().focused = crate::app::FormFocus::Ok;
+    assert!(handle_key_event(&app, make_key(KeyCode::Enter)).is_none());
+}
+
+fn form_element() -> crate::app::element::Element {
+    crate::app::element::Element::Form(Box::new(crate::app::FormDialog {
+        submit: crate::app::FormSubmit::Scale,
+        title: "Scale".to_string(),
+        subtitle: String::new(),
+        target: ObjectRef::new(
+            ResourceId::BuiltIn(crate::kube::resource_def::BuiltInKind::Deployment),
+            "api",
+            Namespace::from_user_command("default"),
+        ),
+        fields: vec![crate::app::FormFieldState {
+            name: "replicas".to_string(),
+            label: "Replicas".to_string(),
+            kind: crate::app::FormFieldKind::Number { min: 0, max: 100 },
+            value: crate::app::text_input::TextInput::seeded("3"),
+        }],
+        focused: crate::app::FormFocus::Field(0),
+    }))
 }

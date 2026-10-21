@@ -1782,6 +1782,14 @@ pub enum SessionCommand {
     Restart(ObjectRef),
     // StreamLogs and StopLogs are gone — logs now flow on yamux substreams.
     // The TUI opens a log substream with LogInit, reads lines, drops to stop.
+    /// Fetch the API surface (CRDs, namespaces) now.
+    ///
+    /// THE CLIENT NEVER SENDS THIS, and the sender was deleted 2026-10-14 as
+    /// dead code: the daemon fetches discovery eagerly when a session opens
+    /// (`run_session_inner`) and refreshes it on `discoveryRefreshSecs`, so
+    /// there has never been a moment the client had to ask. The variant and
+    /// its handler stay because removing a variant renumbers the ones after
+    /// it — a protocol break, and a `pkill`, to delete something harmless.
     GetDiscovery,
     /// Apply edited YAML to a resource. The unified edit flow goes
     /// `Yaml(target)` → user edits in `$EDITOR` → `Apply(target, new_yaml)`.

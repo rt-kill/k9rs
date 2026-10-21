@@ -3,8 +3,8 @@ use k8s_openapi::api::apps::v1::StatefulSet;
 
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
-use crate::kube::resources::{CommonMeta, WorkloadContainers};
-use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
+use crate::kube::resources::{CommonMeta, WorkloadContainers, WorkloadTally};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // StatefulSetDef — ResourceDef + ConvertToRow
@@ -44,7 +44,8 @@ impl ConvertToRow<StatefulSet> for StatefulSetDef {
         let service_name = spec.service_name.clone();
 
         let desired = spec.replicas.unwrap_or(0);
-        let ready_replicas = sts.status.and_then(|s| s.ready_replicas).unwrap_or(0);
+        let status = sts.status.unwrap_or_default();
+        let ready_replicas = status.ready_replicas.unwrap_or(0);
         let drill_target = if !selector_labels.is_empty() {
             Some(DrillTarget::PodsByLabels {
                 labels: selector_labels,
@@ -54,9 +55,18 @@ impl ConvertToRow<StatefulSet> for StatefulSetDef {
             Some(DrillTarget::PodsByNameGrep(meta.name.clone()))
         };
 
-        let health = if desired == 0 { RowHealth::Pending }
-            else if ready_replicas < desired { RowHealth::Failed }
-            else { RowHealth::Normal };
+        // `updatedReplicas` is deliberately not fed in: the StatefulSet table
+        // shows no UP-TO-DATE column (neither does k9s's, nor `kubectl get
+        // sts`), so it could only produce a yellow with nothing in the row to
+        // explain it. It costs nothing to leave out — an STS rolling update
+        // recreates pods in place one at a time, so its rollout already shows
+        // as a READY dip, which is red by clause 2.
+        let health = WorkloadTally {
+            desired,
+            ready: ready_replicas,
+            total: status.replicas,
+            up_to_date: None,
+        }.health();
 
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.namespace.clone()),

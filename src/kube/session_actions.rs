@@ -162,7 +162,7 @@ pub(crate) fn handle_action(
 
         // --- Log view actions ---
         a @ (Action::ToggleLogFollow | Action::ToggleLogWrap | Action::ToggleLogTimestamps
-            | Action::ClearLogs | Action::LogSince(_)
+            | Action::ClearLogs | Action::LogRange(_)
             | Action::SaveLogs) => {
             handle_log_action(app, a, data_source);
         }
@@ -1054,15 +1054,20 @@ fn handle_log_action(
             }
         }
 
-        Action::LogSince(ref since) => {
+        Action::LogRange(ref range) => {
+            use crate::app::actions::LogRange;
             // Range keys re-run the OWNING session's spec. Under a filter,
             // the owner is found by store pointer identity — the same
             // named-walk discipline as subscription revival.
             let Some(store) = app.nav.top().log_root_store().cloned() else { return };
-            let since_label = since.as_deref().unwrap_or("tail");
-            app.ui.flash = Some(crate::app::FlashMessage::info(format!("Log range: {}", since_label)));
+            let label = match range {
+                LogRange::Tail => "tail".to_string(),
+                LogRange::Head => "everything, oldest first".to_string(),
+                LogRange::Since(d) => d.clone(),
+            };
+            app.ui.flash = Some(crate::app::FlashMessage::info(format!("Log range: {}", label)));
             app.nav.with_log_session_of(&store, |session_el| {
-                session_el.restart_range(data_source, since.clone());
+                session_el.restart_range(data_source, range.clone());
             });
             // The session store was just emptied and refilled from a new
             // range; a grep over it is still holding the OLD range's matches.
@@ -2065,7 +2070,7 @@ pub(crate) fn build_form_from_schema(
         subtitle,
         target,
         fields,
-        focused: 0,
+        focused: crate::app::FormFocus::Field(0),
     })
 }
 

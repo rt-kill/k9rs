@@ -283,3 +283,101 @@ fn a_real_resources_columns_come_from_its_headers() {
     .expect("overlay yaml");
     assert_eq!(unknown_coloring_columns(&typo, &known), vec!["REDY"]);
 }
+
+/// A coloring rule that cannot say what it means is REFUSED, not warned about.
+///
+/// The trigger was two `Option<String>`s where exactly one had to be present
+/// — four invalid states, each with a warn-and-continue guard, written out
+/// twice (at load, and again at use where `when` was re-parsed per call). So
+/// a rule setting both `match` and `when` loaded fine and then silently
+/// ignored the `when`; one setting neither loaded and never fired. Now the
+/// trigger IS a parsed `RenderPredicate`, so none of those states exist.
+///
+/// Refusing the file is already what a typo'd key does — `deny_unknown_fields`
+/// has always been on this struct — so "both `match` and `when` is merely a
+/// warning" was the inconsistency, not the fix.
+#[test]
+fn a_contradictory_coloring_rule_is_refused_at_parse() {
+    let rule = |body: &str| -> Result<ResourceOverlay, String> {
+        serde_yaml::from_str::<ResourceOverlay>(&format!(
+            "resource: pods\ncoloring:\n  - column: CPU%\n    rules:\n      - {body}\n"
+        ))
+        .map_err(|e| e.to_string())
+    };
+
+    // The four states that used to load and misbehave.
+    for (body, needle) in [
+        ("match: Running\n        when: \">= 90\"\n        health: failed", "both"),
+        ("health: failed", "neither"),
+        ("match: \"\"\n        health: failed", "empty `match`"),
+        ("when: \"definitely not a predicate\"\n        health: failed", "invalid `when`"),
+    ] {
+        let err = rule(body).expect_err(&format!("must be refused: {body}"));
+        assert!(
+            err.contains(needle),
+            "the message has to say WHICH mistake ({needle}): {err}",
+        );
+    }
+
+    // …and the two legal shapes still parse, into a predicate the renderer
+    // evaluates directly rather than a string it re-parses.
+    let ok = rule("match: Running\n        health: normal").expect("a match rule is legal");
+    assert!(matches!(
+        ok.coloring[0].rules[0].trigger,
+        crate::kube::overlay::RenderPredicate::Contains(ref t) if t == "Running"
+    ));
+    let ok = rule("when: \">= 90\"\n        health: failed").expect("a when rule is legal");
+    assert!(matches!(
+        ok.coloring[0].rules[0].trigger,
+        crate::kube::overlay::RenderPredicate::Gte(v) if (v - 90.0).abs() < f64::EPSILON
+    ));
+}
+
+/// A refused overlay rule reaches the USER, not just the parser.
+///
+/// The earlier test checked `serde` rejects a contradictory coloring rule.
+/// What the person who wrote the overlay cares about is different: does the
+/// refusal arrive at the startup flash, naming the file and the mistake, or
+/// does their overlay just sit dead? That is the whole reason
+/// `overlay_diagnostics` exists — "the fix for the node overlay sitting dead
+/// for months shipped into /dev/null" — and it was untested end to end.
+#[test]
+fn a_refused_overlay_rule_is_reported_with_its_file_and_its_mistake() {
+    let dir = std::env::temp_dir().join(format!("k9rs-overlay-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp overlay dir");
+
+    // One overlay that cannot say what it means, and one that is fine — the
+    // good one must still load, because per-FILE isolation is deliberate.
+    std::fs::write(
+        dir.join("broken.yaml"),
+        "resource: pods\ncoloring:\n  - column: CPU%\n    rules:\n      - match: Running\n        when: \">= 90\"\n        health: failed\n",
+    )
+    .expect("write");
+    std::fs::write(
+        dir.join("good.yaml"),
+        "resource: nodes\ncoloring:\n  - column: STATUS\n    rules:\n      - match: NotReady\n        health: failed\n",
+    )
+    .expect("write");
+
+    let mut problems = Vec::new();
+    let loaded = crate::kube::overlay::load_overlays_from(&dir, &mut problems);
+
+    // The good one loaded; the broken one did not.
+    assert!(loaded.contains_key("nodes"), "a sound overlay still loads: {:?}", loaded.keys());
+    assert!(!loaded.contains_key("pods"), "the broken one is skipped");
+
+    // And the complaint names the FILE and the MISTAKE — enough to fix it
+    // without guessing which of four rules is wrong.
+    let report = problems.join("\n");
+    assert!(
+        report.contains("broken.yaml"),
+        "the report names the file:\n{report}",
+    );
+    assert!(
+        report.contains("both"),
+        "…and which mistake it was, not just 'failed to parse':\n{report}",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

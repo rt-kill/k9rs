@@ -168,3 +168,80 @@ impl WorkloadContainers {
         Self { names, images, tcp_ports }
     }
 }
+
+/// The replica counts a workload row's health is decided from — the one place
+/// that decision lives. Deployment, StatefulSet, ReplicaSet and DaemonSet
+/// each spell these fields differently in their status (`readyReplicas` vs
+/// `numberReady`, `replicas` vs `currentNumberScheduled`), so the *mapping*
+/// is each call site's job; the *verdict* is this type's. It was written out
+/// by hand in all four converters, which is how a fourth clause would have
+/// become three-quarters of a rule.
+pub(crate) struct WorkloadTally {
+    /// The scale target: how many pods there are supposed to be.
+    pub desired: i32,
+    /// Pods passing their readiness probe, across every revision.
+    pub ready: i32,
+    /// Non-terminated pods that exist, across every revision. Exceeds
+    /// `desired` during a surge, trails it while pods are still being
+    /// created, and lags it while a scale-down drains.
+    pub total: i32,
+    /// Pods running the current pod template. `None` for a workload with no
+    /// revision axis to be behind on (a ReplicaSet *is* one revision), and
+    /// for one whose table shows no column that would explain the verdict —
+    /// see [`WorkloadTally::rollout_in_flight`].
+    pub up_to_date: Option<i32>,
+}
+
+impl WorkloadTally {
+    /// `true` while the fleet is not settled: some pods are still on the old
+    /// template, or there are more (or fewer) pods than the scale target.
+    ///
+    /// Both halves are load-bearing. At one to three replicas a Deployment's
+    /// default strategy works out to `maxUnavailable: 0` / `maxSurge: 1`
+    /// (25% rounds *down* for unavailable and *up* for surge), so the new pod
+    /// is created alongside the old and `up_to_date` reaches `desired` the
+    /// instant it exists — only `total` sees that rollout at all. Above that,
+    /// a rollout steps through states where every pod is present but some are
+    /// still the old template, which only `up_to_date` sees.
+    fn rollout_in_flight(&self) -> bool {
+        self.total != self.desired || self.up_to_date.is_some_and(|u| u < self.desired)
+    }
+
+    /// The row's health, in precedence order:
+    ///
+    /// 1. **Scaled to zero** → `Pending`. Nothing to judge; parked, not
+    ///    broken. k9s agrees, keyed on READY's denominator being `0`
+    ///    (`render/dp.go`'s `ColorerFunc`).
+    /// 2. **Fewer ready pods than asked for** → `Failed`. Less serving
+    ///    capacity than requested, *whatever the reason*. A rollout being the
+    ///    cause does not make the shortfall untrue, and a rollout wedged at
+    ///    `3/4` must not read as "relax, it's in progress".
+    /// 3. **Full capacity, fleet unsettled** → `Pending`. A rollout in
+    ///    flight, or a scale-down still draining. Yellow, not red: this is a
+    ///    transient, not a fault. k9s flattens this into (2) — its hidden
+    ///    VALID column compares `status.replicas` against
+    ///    `status.availableReplicas`, so it paints the row red for the whole
+    ///    rollout.
+    /// 4. Otherwise `Normal`.
+    ///
+    /// Clause 3 is the *only* indication during the window where a surge pod
+    /// has been created but is not yet ready: at one replica `READY` still
+    /// reads `1/1` and `UP-TO-DATE` still reads `1`. Colouring that window is
+    /// the point — it is the state no number in the row can carry.
+    pub(crate) fn health(&self) -> row::RowHealth {
+        use row::RowHealth;
+        if self.desired == 0 {
+            RowHealth::Pending
+        } else if self.ready < self.desired {
+            RowHealth::Failed
+        } else if self.rollout_in_flight() {
+            RowHealth::Pending
+        } else {
+            RowHealth::Normal
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/kube/resources.rs"]
+mod tests;

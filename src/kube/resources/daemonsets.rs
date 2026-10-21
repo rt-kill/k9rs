@@ -3,8 +3,8 @@ use k8s_openapi::api::apps::v1::DaemonSet;
 
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
-use crate::kube::resources::{CommonMeta, WorkloadContainers};
-use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
+use crate::kube::resources::{CommonMeta, WorkloadContainers, WorkloadTally};
+use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 
 // ---------------------------------------------------------------------------
 // DaemonSetDef — ResourceDef + ConvertToRow
@@ -69,9 +69,18 @@ impl ConvertToRow<DaemonSet> for DaemonSetDef {
             Some(DrillTarget::PodsByNameGrep(meta.name.clone()))
         };
 
-        let health = if desired == 0 { RowHealth::Pending }
-            else if ready < desired { RowHealth::Failed }
-            else { RowHealth::Normal };
+        // A DaemonSet's "scale target" is a node count, so `total` is the
+        // pods actually scheduled. Unlike a Deployment, its default strategy
+        // is `maxSurge: 0` / `maxUnavailable: 1` — it takes a pod away before
+        // adding one, so its rollouts were always visible as a READY dip.
+        // That asymmetry, not a wrong field, is why a Deployment rollout used
+        // to pass silently and this one did not.
+        let health = WorkloadTally {
+            desired,
+            ready,
+            total: current,
+            up_to_date: Some(up_to_date),
+        }.health();
 
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.namespace.clone()),

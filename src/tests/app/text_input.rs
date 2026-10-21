@@ -123,7 +123,7 @@ fn every_text_surface_is_one_type() {
     let fi = el.filter_input_mut().expect("a table has one");
     fi.start();
     for c in "runing".chars() {
-        fi.push_char(c);
+        fi.input_mut().insert(c);
     }
     let t = fi.input_mut();
     for _ in 0..3 {

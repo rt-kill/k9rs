@@ -87,6 +87,13 @@ impl ColumnPolicy {
         }
     }
 
+    /// Whether this column collapses consecutive equal values when sorted
+    /// on — declared by the column, never inferred. See
+    /// [`crate::app::ColumnDef::groups`].
+    pub fn groups(&self, name: &str) -> bool {
+        self.def_for(name).is_some_and(|d| d.groups)
+    }
+
     fn level_for(&self, name: &str) -> ColumnLevel {
         let Some(rid) = &self.rid else {
             return crate::app::ColumnDef::infer(name);
@@ -831,12 +838,99 @@ impl LogInteraction {
     }
 }
 
+/// What a chain step does with the lines its pattern matches.
+///
+/// The chain could only ever narrow TOWARD something: `/health` shows you the
+/// health checks and nothing hid them. That was not a missing feature so much
+/// as a wall — vim's negative look-around `\@!` is refused by name in
+/// [`crate::util`], and `regex` 1.x has no look-around AT ALL, by design (it
+/// is a finite-automaton engine, which is what makes a pathological pattern
+/// compile promptly instead of exploding). So exclusion cannot be a property
+/// of the pattern. It is a property of the STEP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sense {
+    /// Keep the lines this pattern matches — `/pattern`.
+    Keep,
+    /// Drop them — `/!pattern`. Spelled with `!` because `less` spells it
+    /// `&!pattern`, and `less` is what everyone has already read a log in.
+    Drop,
+}
+
+/// One step of the committed grep chain: a pattern and what to do with it.
+#[derive(Debug, Clone)]
+pub struct Narrowing {
+    pattern: Arc<CompiledGrep>,
+    sense: Sense,
+}
+
+impl Narrowing {
+    /// Whether this step lets a line through, given a tester that says
+    /// whether the line matches a pattern. The tester is the caller's,
+    /// because WHICH parts of a line a grep sees is `Role::searchable`'s to
+    /// say and not this type's.
+    pub fn admits(&self, matches: impl Fn(&crate::util::SearchPattern) -> bool) -> bool {
+        let hit = matches(self.pattern.pattern());
+        match self.sense {
+            Sense::Keep => hit,
+            Sense::Drop => !hit,
+        }
+    }
+
+    /// Why this step's pattern is matching literally rather than as a
+    /// regex, if it is — the `[literal: …]` chip's input.
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.pattern.pattern().fallback_reason()
+    }
+
+    /// As the user typed it, `!` included — what the grep bar and the
+    /// breadcrumb label themselves with.
+    pub fn label(&self) -> String {
+        match self.sense {
+            Sense::Keep => self.pattern.source().to_string(),
+            Sense::Drop => format!("!{}", self.pattern.source()),
+        }
+    }
+
+    /// The pattern to HIGHLIGHT with, if this step is a reason a visible line
+    /// is visible. A `Drop` step has none: every line it had anything to say
+    /// about is gone, so highlighting its matches would paint the one thing
+    /// that is certainly not on screen.
+    pub fn highlight(&self) -> Option<&str> {
+        match self.sense {
+            Sense::Keep => Some(self.pattern.source()),
+            Sense::Drop => None,
+        }
+    }
+}
+
+/// Split a raw draft into its [`Sense`] and the pattern text.
+///
+/// `!pat` excludes, `\!pat` is a literal `!pat`, anything else keeps.
+///
+/// Parsed HERE, before the vim translator ever sees the text, so that
+/// grammar is untouched: `\!` is not a vim escape (the translator would
+/// refuse it by name) and `regex` would reject `\!` as an unknown escape.
+/// One prefix, consumed in one place, and the translator keeps speaking
+/// exactly vim magic.
+pub fn sense_of(draft: &str) -> (Sense, &str) {
+    if let Some(rest) = draft.strip_prefix('!') {
+        (Sense::Drop, rest)
+    } else if draft.starts_with("\\!") {
+        // Strip the BACKSLASH only — the `!` is the thing being protected,
+        // so it stays in the pattern. Dropping both would turn a search for
+        // `!urgent` into a search for `urgent`.
+        (Sense::Keep, &draft[1..])
+    } else {
+        (Sense::Keep, draft)
+    }
+}
+
 /// A composable line source: the backing [`LineStore`] plus the
 /// accumulated committed grep chain — the log analogue of [`RowSource`].
 #[derive(Debug, Clone)]
 pub struct LineSource {
     store: Arc<LineStore>,
-    patterns: Vec<Arc<CompiledGrep>>,
+    patterns: Vec<Narrowing>,
 }
 
 impl LineSource {
@@ -844,9 +938,9 @@ impl LineSource {
         Self { store, patterns: Vec::new() }
     }
 
-    fn narrowed(&self, pattern: Arc<CompiledGrep>) -> Self {
+    fn narrowed(&self, pattern: Arc<CompiledGrep>, sense: Sense) -> Self {
         let mut child = self.clone();
-        child.patterns.push(pattern);
+        child.patterns.push(Narrowing { pattern, sense });
         child
     }
 
@@ -908,7 +1002,13 @@ impl LogSession {
         (
             self.spec.target.display(),
             self.spec.container.label().to_string(),
-            self.spec.since.clone().unwrap_or_else(|| "tail".to_string()),
+            // Derived from the two wire fields rather than stored twice: the
+            // spec IS what we asked the daemon for.
+            match (&self.spec.since, &self.spec.tail) {
+                (Some(d), _) => d.clone(),
+                (None, None) => "all".to_string(),
+                (None, Some(_)) => "tail".to_string(),
+            },
         )
     }
 
@@ -916,9 +1016,13 @@ impl LogSession {
     /// element's OWN spec against the SAME store (children keep their
     /// handles); the raised epoch floor keeps the dead stream's queued
     /// lines out.
-    pub fn restart_range(&mut self, session: &ClientSession, since: Option<String>) {
-        self.spec.since = since.clone();
-        self.spec.tail = if since.is_none() { Some(self.tail_default) } else { None };
+    pub fn restart_range(
+        &mut self,
+        session: &ClientSession,
+        range: crate::app::actions::LogRange,
+    ) {
+        use crate::app::actions::LogRange;
+        self.write_range(range.clone());
         self.spec.follow = true;
         self.store.clear();
         // A RANGE request keeps its head; a plain tail keeps its tail.
@@ -929,10 +1033,11 @@ impl LogSession {
         // precisely to see the oldest. Head retention also stops the stream
         // once full (see `revive_if_dead`'s sibling check in the session
         // loop), so we no longer pay to receive lines we will discard.
-        self.store.set_retain(if since.is_some() {
-            crate::app::store::Retain::Head
-        } else {
-            crate::app::store::Retain::Tail
+        // Anything that reaches BACKWARD keeps its head; a plain tail keeps
+        // its tail.
+        self.store.set_retain(match range {
+            LogRange::Tail => crate::app::store::Retain::Tail,
+            LogRange::Head | LogRange::Since(_) => crate::app::store::Retain::Head,
         });
         // The extent is gone with the store, but AUTOSCROLL IS A USER
         // PREFERENCE and survives. Unconditionally re-tailing here meant
@@ -946,11 +1051,6 @@ impl LogSession {
             self.spec.clone(),
             Arc::clone(&self.store),
         );
-    }
-
-    /// Whether the underlying substream is still running.
-    pub fn stream_alive(&self) -> bool {
-        self.stream.is_alive()
     }
 
     /// Stop a range fetch once we have the oldest N it was asked for.
@@ -999,9 +1099,22 @@ impl LogSession {
         if !self.needs_revival() {
             return false;
         }
-        let since = self.spec.since.clone();
-        self.restart_range(session, since);
+        // Re-ask for the SAME range, read back off the spec — a revival must
+        // not quietly change what you were looking at.
+        self.restart_range(session, self.current_range());
         true
+    }
+
+    /// The range this stream is currently over, recovered from the two wire
+    /// fields it was built from. The spec is the authority for what we asked
+    /// the daemon for, so there is no second copy to drift.
+    pub fn current_range(&self) -> crate::app::actions::LogRange {
+        use crate::app::actions::LogRange;
+        match (&self.spec.since, &self.spec.tail) {
+            (Some(d), _) => LogRange::Since(d.clone()),
+            (None, None) => LogRange::Head,
+            (None, Some(_)) => LogRange::Tail,
+        }
     }
 
     /// The decision behind [`Self::revive_if_dead`], named so it can be
@@ -1020,6 +1133,28 @@ impl LogSession {
     #[cfg(test)]
     pub(crate) fn kill_stream_for_test(&mut self) {
         self.stream = crate::app::test_support::finished_log_stream();
+    }
+
+    /// Turn the user's range choice into the two wire fields — THE mapping,
+    /// and the only one.
+    ///
+    /// `restart_range` calls it and so does the test that checks it. It was
+    /// briefly written out twice, once here and once in a `set_range_for_test`
+    /// helper, which meant the test asserted that the COPY round-tripped: had
+    /// `restart_range` changed, the guard would have gone on passing. The
+    /// same "one decision, two copies" shape this codebase spent 2026-10-13
+    /// deleting everywhere else, introduced in the test for it.
+    pub(crate) fn write_range(&mut self, range: crate::app::actions::LogRange) {
+        use crate::app::actions::LogRange;
+        let (since, tail) = match &range {
+            LogRange::Tail => (None, Some(self.tail_default)),
+            // Both absent IS "everything" to the apiserver — the state
+            // `Option<String>` could not express.
+            LogRange::Head => (None, None),
+            LogRange::Since(d) => (Some(d.clone()), None),
+        };
+        self.spec.since = since;
+        self.spec.tail = tail;
     }
 
     /// Test-only: a log session over a parked stream.
@@ -1060,6 +1195,17 @@ impl LogSession {
 }
 
 impl LogFilter {
+    /// This step's OWN label — the last of the accumulated chain, since a
+    /// filter carries every pattern above it as well.
+    pub fn own_label(&self) -> String {
+        self.source.patterns.last().map(Narrowing::label).unwrap_or_default()
+    }
+
+    /// How many lines this step retained.
+    pub fn retained_len(&self) -> usize {
+        self.retained.with_read(|i| i.lines.len())
+    }
+
     /// Pull everything new from the parent, keep what matches, advance the
     /// cursor. Idempotent and cheap: O(lines arrived since last call), not
     /// O(lines resident) — the derive it replaces re-scanned the whole store
@@ -1093,7 +1239,10 @@ impl LogFilter {
                     // conjunction and evaluating it whole keeps that true by
                     // construction, at a cost of one extra `is_match` per
                     // level on lines that are about to be kept anyway.
-                    self.source.patterns.iter().all(|p| hit(p.pattern()))
+                    //
+                    // Each step decides for itself whether a match is a
+                    // reason to keep or to drop — see [`Sense`].
+                    self.source.patterns.iter().all(|n| n.admits(|p| hit(p)))
                 })
                 .cloned()
                 .collect();
@@ -1276,6 +1425,31 @@ pub enum ElementClass {
 /// One nav-stack element. A closed enum: the renderer, key dispatch, and
 /// crumb builder all match exhaustively — adding a kind forces every
 /// consumer to decide, which is the point.
+///
+/// # When an accessor may use `_ =>`, and when it may not
+///
+/// A 2026-09 audit counted "~28 `_ =>` accessors" as a hazard; it is now 44
+/// and most of them are correct. The distinction, triaged 2026-10-14, is
+/// whether the wildcard is an ANSWER or a GUESS:
+///
+/// - **An answer.** `Option` accessors for "the kinds that have one" —
+///   `log_view`, `data_store`, `form_dialog`, `table_interaction`. `None`
+///   means "not that kind of element", the caller must handle it, and a new
+///   kind inheriting `None` is telling the truth.
+/// - **An answer.** Delegation to the general case — `title` falls back to
+///   `label`, `capabilities` to `rid`'s, `marked_count` to the data store's.
+///   The default is the composition, not a shrug.
+/// - **A GUESS, and therefore banned.** A bare default that a new kind would
+///   silently inherit AND be wrong about. Two such existed and are now
+///   exhaustive: [`Self::is_live`] (`_ => true` is what suppresses the stale
+///   banner, so a new kind with a dead stream claimed to be tracking the
+///   cluster) and [`Self::abort_data_stream`] (`_ => {}` leaks a new kind's
+///   stream straight past the choke point that exists to abort it).
+///
+/// The test is not "is there a wildcard" but "would a new variant be WRONG
+/// under it". Adding a kind should force a decision exactly where a wrong
+/// answer is silent and harmful, and nowhere else — a hundred exhaustive
+/// matches over nine kinds would bury the two that matter.
 #[derive(Debug)]
 pub enum Element {
     ResourceList(ResourceList),
@@ -1457,7 +1631,7 @@ impl Element {
                 .source
                 .patterns
                 .iter()
-                .find_map(|p| p.pattern().fallback_reason()),
+                .find_map(Narrowing::fallback_reason),
             _ => self.output_source().and_then(|s| {
                 s.predicates().iter().find_map(|p| match p.as_ref() {
                     RowPredicate::Grep(g) => g.pattern().fallback_reason(),
@@ -1569,9 +1743,16 @@ impl Element {
     }
 
     /// Push-site for a committed log grep: narrow the top's line output.
-    pub fn derive_log_filter(top: &Element, pattern: CompiledGrep) -> Result<Element, DeriveError> {
+    pub fn derive_log_filter(
+        top: &Element,
+        pattern: CompiledGrep,
+        sense: Sense,
+    ) -> Result<Element, DeriveError> {
         let source = top.line_output().ok_or(DeriveError::NoRows)?;
-        let label = format!("/{}", pattern.source());
+        let label = match sense {
+            Sense::Keep => format!("/{}", pattern.source()),
+            Sense::Drop => format!("/!{}", pattern.source()),
+        };
         let parent_view = match top {
             Element::LogSession(e) => &e.view,
             Element::LogFilter(e) => &e.view,
@@ -1587,7 +1768,7 @@ impl Element {
             (store.with_read(|i| i.evicted), store.max_lines())
         };
         Ok(Element::LogFilter(LogFilter {
-            source: source.narrowed(Arc::new(pattern)),
+            source: source.narrowed(Arc::new(pattern), sense),
             retained: LineStore::new(cap),
             cursor,
             lost_history: false,
@@ -1618,9 +1799,7 @@ impl Element {
     /// interchangeable.
     pub fn log_committed_patterns(&self) -> Vec<String> {
         match self {
-            Element::LogFilter(e) => {
-                e.source.patterns.iter().map(|p| p.source().to_string()).collect()
-            }
+            Element::LogFilter(e) => e.source.patterns.iter().map(Narrowing::label).collect(),
             _ => Vec::new(),
         }
     }
@@ -1825,11 +2004,25 @@ impl Element {
     /// The committed log-grep patterns active on this element (labels for
     /// highlight + the filter bar).
     pub fn log_patterns(&self) -> Vec<String> {
-        let mut pats = self.log_committed_patterns();
+        // HIGHLIGHTS, not labels: an excluding step contributes none, because
+        // every line it matched is gone and painting its matches would
+        // highlight the one thing certainly not on screen.
+        let mut pats: Vec<String> = match self {
+            Element::LogFilter(e) => e
+                .source
+                .patterns
+                .iter()
+                .filter_map(|n| n.highlight().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
         if let Some(view) = self.log_view() {
             if let Some(d) = &view.draft {
-                if !d.is_empty() {
-                    pats.push(d.value().to_string());
+                // Same rule for the draft: an excluding draft shows its
+                // effect by what disappears, not by colour.
+                let (sense, text) = crate::app::element::sense_of(d.value());
+                if !text.is_empty() && sense == Sense::Keep {
+                    pats.push(text.to_string());
                 }
             }
         }
@@ -2015,7 +2208,20 @@ impl Element {
         match self {
             Element::ResourceList(e) => e.query().abort(),
             Element::LogSession(s) => s.abort(),
-            _ => {}
+            // EXHAUSTIVE, unlike the `_ => {}` this replaced. Every arm here
+            // is a claim that the kind owns no stream, and a new kind that
+            // DID own one would have inherited the no-op silently — leaking
+            // it past the choke point this function exists to be. Owning a
+            // stream is the kind of thing a new element is likely to do, so
+            // the compiler should ask.
+            Element::RowFilter(_)
+            | Element::DerivedRows(_)
+            | Element::LogFilter(_)
+            | Element::ContentView(_)
+            | Element::Overview(_)
+            | Element::Confirm(_)
+            | Element::Picker(_)
+            | Element::Form(_) => {}
         }
     }
 
@@ -2397,9 +2603,10 @@ impl Element {
     /// the renderer used, so a mis-map is unrepresentable.
     pub fn selected_data_col(&self) -> Option<(usize, String)> {
         let it = self.table_interaction()?;
-        let view = it.cached_view()?;
-        let vis = it.selected_col.min(view.visible_cols.len().saturating_sub(1));
-        Some((*view.visible_cols.get(vis)?, view.headers.get(vis)?.clone()))
+        // `selected_col` is a VISIBLE index; cells are addressed by DATA
+        // index. The clamp and the lookup are the bridge's, not this
+        // function's — see `PreparedView::visible_cols`.
+        it.cached_view()?.data_col(it.selected_col)
     }
 
     // -- Marks -------------------------------------------------------------------
@@ -2746,7 +2953,24 @@ impl Element {
     pub fn is_live(&self) -> bool {
         match self {
             Element::ResourceList(e) => e.query.is_live(),
-            _ => true,
+            // EXHAUSTIVE, and the arms are grouped by WHY they are live, not
+            // lumped under a `_ => true`. "Assume live" is the unsafe
+            // default: it is what suppresses the stale banner, so a new kind
+            // that owned a stream would have claimed to be tracking the
+            // cluster while its subscription was dead.
+            //
+            // Riding an ancestor's stream — revived by the stack's owner
+            // walk, so liveness is the ancestor's to report.
+            Element::RowFilter(_) | Element::DerivedRows(_) | Element::LogFilter(_) => true,
+            // Nothing to be stale ABOUT: a one-shot fetch carries its own
+            // phase (`ContentPhase`), a log session's liveness is the link's
+            // (`Liveness::of_link`), and the rest are chrome or dialogs.
+            Element::ContentView(_)
+            | Element::LogSession(_)
+            | Element::Overview(_)
+            | Element::Confirm(_)
+            | Element::Picker(_)
+            | Element::Form(_) => true,
         }
     }
 }

@@ -81,8 +81,9 @@ pub struct LogFilterBar<'a> {
     /// not appended, so editing mid-pattern shows where the next character
     /// lands — which is the whole point of the input having a caret.
     caret_col: usize,
-    /// Committed greps, oldest first.
-    committed: &'a [String],
+    /// Committed greps, oldest first: each as the user typed it (`!` and
+    /// all) with how many lines survive it.
+    committed: &'a [(String, usize)],
     /// Lines visible through the whole chain, draft included.
     visible_count: usize,
     /// Why a grep in the chain isn't running as a regex, if one isn't.
@@ -95,7 +96,7 @@ impl<'a> LogFilterBar<'a> {
         active: bool,
         draft: &'a str,
         caret_col: usize,
-        committed: &'a [String],
+        committed: &'a [(String, usize)],
         visible_count: usize,
         theme: &'a Theme,
     ) -> Self {
@@ -127,11 +128,22 @@ impl Widget for LogFilterBar<'_> {
         let mut spans = vec![Span::styled(" /", self.theme.status_bar_key)];
         // The committed chain shows even while a new grep is being typed:
         // refining a filter you can't see is the same defect one level down.
-        for (i, pattern) in self.committed.iter().enumerate() {
+        for (i, (pattern, kept)) in self.committed.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" | ", self.theme.status_bar));
             }
-            spans.push(Span::styled(pattern.clone(), self.theme.filter));
+            // An EXCLUDING step reads differently from a narrowing one, so
+            // it is coloured differently — the `!` alone is one glyph to
+            // miss in a chain of four.
+            let style = if pattern.starts_with('!') {
+                self.theme.filter_degraded
+            } else {
+                self.theme.filter
+            };
+            spans.push(Span::styled(pattern.clone(), style));
+            // PER-STEP counts, because the aggregate could only say the
+            // chain was empty, never which step emptied it.
+            spans.push(Span::styled(format!("[{kept}]"), self.theme.title_counter));
         }
         if self.active {
             if !self.committed.is_empty() {

@@ -100,3 +100,40 @@ fn every_alias_resolves_to_its_own_resource() {
         }
     }
 }
+
+/// EVERY `BuiltInKind` resolves in the registry.
+///
+/// `registry_consistency` above walks `REGISTRY.all()` — i.e. only what was
+/// registered — so a variant nobody called `register_*` for was invisible to
+/// it. `by_kind` panics on a missing entry, so the first user to navigate
+/// there crashed the TUI, and the enum's own doc conceded the gap: "caught
+/// during any test that exercises the new variant", which required somebody
+/// to write that test.
+///
+/// This is that test, and it cannot go stale: `BuiltInKind::ALL` is generated
+/// from the enum's declaration by `built_in_kinds!`, so a new variant is in
+/// it the moment it exists.
+#[test]
+fn every_built_in_kind_is_registered() {
+    use crate::kube::resource_def::BuiltInKind;
+
+    assert!(BuiltInKind::ALL.len() > 30, "the generated list is really the whole enum");
+    for &kind in BuiltInKind::ALL {
+        // Panics with "missing entry for {kind}" if unregistered — here,
+        // where it is a test failure naming the variant, instead of under a
+        // user's cursor.
+        let def = REGISTRY.by_kind(kind);
+        assert_eq!(def.kind(), kind, "{kind:?} is registered under its own kind");
+        // And reachable the way every caller reaches it.
+        assert!(
+            REGISTRY.by_plural(def.gvr().plural).is_some(),
+            "{kind:?} is reachable by plural, which is how the command bar finds it",
+        );
+    }
+    // The two indexes agree in size: no kind registered twice, none lost.
+    assert_eq!(
+        REGISTRY.all().count(),
+        BuiltInKind::ALL.len(),
+        "the registry holds exactly the enum's kinds",
+    );
+}

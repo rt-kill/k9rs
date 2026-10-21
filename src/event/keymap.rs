@@ -271,17 +271,38 @@ pub fn for_class(class: ViewClass) -> Vec<Binding> {
             b("H / L", "Pan a stride left / right", plain('H'), Action::PageLeft),
             b("^ / $", "Pan to the left margin / far edge", plain('^'), Action::ColFirst),
             b("Shift-C", "Clear logs", KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT), Action::ClearLogs),
-            b("/", "Grep (stacks)", plain('/'), Action::SearchStart),
+            b(
+                "/",
+                "Grep — stacks; `!pat` EXCLUDES, `\\!` for a literal `!`",
+                plain('/'),
+                Action::SearchStart,
+            ),
             bar("c", "Copy", "copy", plain('c'), Action::Copy),
             b("Ctrl-s", "Save logs to a file", ctrl('s'), Action::SaveLogs),
-            bar("0", "Tail", "range", plain('0'), Action::LogSince(None)),
-            bar("1", "1m", "range", plain('1'), Action::LogSince(Some("1m".into()))),
-            bar("2", "5m", "range", plain('2'), Action::LogSince(Some("5m".into()))),
-            bar("3", "15m", "range", plain('3'), Action::LogSince(Some("15m".into()))),
-            bar("4", "30m", "range", plain('4'), Action::LogSince(Some("30m".into()))),
-            bar("5", "1h", "range", plain('5'), Action::LogSince(Some("1h".into()))),
-            bar("6", "24h", "range", plain('6'), Action::LogSince(Some("24h".into()))),
-            bar("q", "Back", "back", plain('q'), Action::Back),
+            bar("0", "Tail", "range", plain('0'), Action::LogRange(crate::app::actions::LogRange::Tail)),
+            bar("1", "1m", "range", plain('1'), Action::LogRange(crate::app::actions::LogRange::Since("1m".into()))),
+            bar("2", "5m", "range", plain('2'), Action::LogRange(crate::app::actions::LogRange::Since("5m".into()))),
+            bar("3", "15m", "range", plain('3'), Action::LogRange(crate::app::actions::LogRange::Since("15m".into()))),
+            bar("4", "30m", "range", plain('4'), Action::LogRange(crate::app::actions::LogRange::Since("30m".into()))),
+            bar("5", "1h", "range", plain('5'), Action::LogRange(crate::app::actions::LogRange::Since("1h".into()))),
+            bar("6", "24h", "range", plain('6'), Action::LogRange(crate::app::actions::LogRange::Since("24h".into()))),
+            // The end of the ladder. Documented as its own row because "from
+            // the beginning" is not a duration — which is exactly why the
+            // old `Option<String>` payload could not express it, and why the
+            // oldest logs were unreachable past 24h.
+            bar(
+                "7",
+                "Everything (oldest first, stops when the buffer is full)",
+                "range",
+                plain('7'),
+                Action::LogRange(crate::app::actions::LogRange::Head),
+            ),
+            // Esc documented alongside `q` because in a LOG view `Back` peels
+            // one grep off the chain (a committed grep IS an element), and
+            // the chain was the one thing here with no stated way to undo it.
+            // The bar still shows just `<q> back`: the label is the display
+            // string, `bar_label` is the bar's.
+            bar("q / Esc", "Back — pops one grep off the chain", "back", plain('q'), Action::Back),
         ],
     }
 }

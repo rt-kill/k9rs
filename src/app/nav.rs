@@ -268,6 +268,32 @@ impl NavStack {
         }
     }
 
+    /// The committed grep chain over the CURRENT log view, oldest step
+    /// first: each step as the user typed it, and how many lines survive it.
+    ///
+    /// The count is the step's own `retained` length, which is what makes a
+    /// dead chain diagnosable: the bar used to show one aggregate, so
+    /// `[3 filters, 0 visible]` told you the chain was empty but not WHICH
+    /// step emptied it — and with a conjunction that is the only question
+    /// worth asking.
+    ///
+    /// Walked from the top DOWN and stopped at the first non-filter, so a
+    /// log view reached from inside another one reports its own chain rather
+    /// than both.
+    pub fn log_chain(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for element in self.items.iter().rev() {
+            match element {
+                Element::LogFilter(f) => {
+                    out.push((f.own_label(), f.retained_len()));
+                }
+                _ => break,
+            }
+        }
+        out.reverse();
+        out
+    }
+
     /// Stop any range fetch that has collected the oldest N it asked for.
     /// Returns true if one was stopped, so the caller can say so.
     pub fn stop_completed_head_fetches(&mut self) -> bool {
@@ -522,12 +548,6 @@ impl FilterInputState {
         self.text.cursor_col()
     }
 
-    pub fn push_char(&mut self, c: char) {
-        self.text.insert(c);
-    }
-    pub fn pop_char(&mut self) {
-        self.text.backspace();
-    }
 }
 
 // ---------------------------------------------------------------------------

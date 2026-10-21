@@ -69,7 +69,9 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
                 "case-sensitive: a capital in the pattern turns smartcase off".to_string()
             })
         });
-    let committed = element.log_committed_patterns();
+    // The chain WITH per-step counts, walked off the nav stack — the
+    // element only knows its accumulated patterns, not what each step kept.
+    let committed = app.nav.log_chain();
     let Some(view) = element.log_view() else { return };
     let (offset, anchor, follow, wrap, shed, pan, initial_load) = (
         view.viewport.offset(),

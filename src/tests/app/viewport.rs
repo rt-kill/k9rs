@@ -329,3 +329,37 @@ fn the_pan_keys_follow_vims_gears() {
     p.home();
     assert_eq!(p.offset(), 0, "`^` is the left margin");
 }
+
+/// `G` works the FIRST time on a view that has not rendered yet.
+///
+/// `end()` sets `follow` and moves to `max_scroll()` — but on a
+/// freshly-loaded content view the extent is still 0, so it moved to the TOP.
+/// The content path then called `set_metrics(.., autoscroll: false)`, which
+/// ignored the flag, so the position never corrected: the first `G` after a
+/// load silently did nothing and only a second press worked.
+///
+/// The log widget had always resolved follow against the extent it measured
+/// that frame. This is the same rule, applied to the surface that had the
+/// third argument available and was passing a literal `false`.
+#[test]
+fn end_on_a_never_rendered_view_lands_at_the_bottom_once_measured() {
+    use crate::app::viewport::Viewport;
+
+    let mut v = Viewport::default();
+    // Nothing has rendered: the viewport knows no extent at all.
+    assert_eq!(v.max_scroll(), 0);
+
+    v.end();
+    assert!(v.following(), "`G` states the intent even with nothing measured");
+    assert_eq!(v.offset(), 0, "…and can only land at 0, because 0 is all it knows");
+
+    // The frame measures the real content and resolves the intent against it.
+    v.set_metrics(500, 20, v.following());
+    assert_eq!(v.offset(), 480, "the intent is honoured once the extent exists");
+
+    // And an upward move drops it, so this cannot strand the view down there.
+    v.line_up(5);
+    assert!(!v.following());
+    v.set_metrics(500, 20, v.following());
+    assert_eq!(v.offset(), 475, "a deliberate move is kept, not re-pinned");
+}
