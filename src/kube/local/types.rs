@@ -23,7 +23,7 @@ pub enum LocalResourceKind {
     /// the rows are a fact about the CLIENT's kubeconfig, and the whole
     /// point of the view is to be usable when there is no session at all
     /// (no `current-context`, or the one you have is unreachable). Its
-    /// store is seeded in-process — see [`crate::app::element::LiveQuery::client`].
+    /// store is seeded in-process — see the client's `LiveQuery` element.
     ///
     /// APPENDED, not slotted in next to its siblings: this enum rides
     /// `ResourceId` on the wire, so inserting mid-enum silently re-tags

@@ -12,18 +12,51 @@ use serde::Deserialize;
 
 use crate::kube::resources::row::RowHealth;
 
-/// Global overlay store, loaded once at startup. Both the daemon and TUI
-/// read from the same `~/.config/k9rs/overlays/` directory.
-static OVERLAYS: std::sync::LazyLock<(HashMap<String, ResourceOverlay>, Vec<String>)> =
-    std::sync::LazyLock::new(|| {
+/// The overlays this process was GIVEN, with everything wrong with them.
+struct LoadedOverlays {
+    by_plural: HashMap<String, ResourceOverlay>,
+    problems: Vec<String>,
+}
+
+/// Overlays, once the entry point has loaded them.
+///
+/// This was a `LazyLock` that read `$HOME` on first access — so the first
+/// reader decided where overlays came from, and in a test binary the first
+/// reader was whichever test ran first. `lookup_overlay_key`
+/// (`event::handler::lookup_overlay_key`) sits on the key path, so a developer's own
+/// `~/.config/k9rs/overlays/*.yaml` could change what the suite asserted,
+/// and `App::new_for_test`'s promise that "no test path can open the file"
+/// named a mechanism that covered `config.yaml` and not this.
+///
+/// A `OnceLock` moves the decision to whoever starts the process: `main`
+/// loads it before dispatching any subcommand, and a process that never
+/// loads it — every test binary — sees no overlays at all. The hermeticity
+/// is the ABSENCE of a call, which is the default, rather than a parameter
+/// someone has to remember to pass. Pinned by
+/// `a_process_that_never_loads_overlays_has_none`.
+static OVERLAYS: std::sync::OnceLock<LoadedOverlays> = std::sync::OnceLock::new();
+
+/// Load the user's overlays from `~/.config/k9rs/overlays/`.
+///
+/// Called from exactly ONE place — `main`, before the subcommand dispatch —
+/// so neither the TUI nor the daemon nor a subcommand added later can forget
+/// it, and so nothing else in the tree decides where overlays come from.
+/// Idempotent: a second call is ignored, because the first reader may already
+/// hold `&'static` borrows into the map.
+pub fn load_from_home() {
+    let _ = OVERLAYS.set({
         let mut problems = Vec::new();
-        let map = load_overlays_reporting(&mut problems);
-        (map, problems)
+        let by_plural = load_overlays_reporting(&mut problems);
+        LoadedOverlays { by_plural, problems }
     });
+}
 
 /// Look up the overlay for a resource by its plural name.
+///
+/// `None` both when the user has no overlay for this resource and when this
+/// process never loaded any — the two are the same thing to every caller.
 pub fn overlay_for(plural: &str) -> Option<&'static ResourceOverlay> {
-    OVERLAYS.0.get(&plural.to_lowercase())
+    OVERLAYS.get()?.by_plural.get(&plural.to_lowercase())
 }
 
 /// Everything wrong with the user's overlay files, in load order.
@@ -35,7 +68,7 @@ pub fn overlay_for(plural: &str) -> Option<&'static ResourceOverlay> {
 /// fix for "the node overlay sat dead for months" shipped into /dev/null.
 /// The TUI surfaces these at startup instead.
 pub fn overlay_diagnostics() -> &'static [String] {
-    &OVERLAYS.1
+    OVERLAYS.get().map_or(&[], |o| o.problems.as_slice())
 }
 
 /// Coloring rules that name a column the resource does not have.
@@ -261,8 +294,9 @@ impl From<OverlayHealth> for RowHealth {
 /// report is for the person who wrote the overlay and is looking at a TUI.
 ///
 /// (A discarding `load_overlays()` wrapper sat here with no callers. `pub`,
-/// so nothing flagged it.)
-pub fn load_overlays_reporting(problems: &mut Vec<String>) -> HashMap<String, ResourceOverlay> {
+/// so nothing flagged it. Private now: [`load_from_home`] is the only caller,
+/// and `pub` on a thing with one in-module caller is how that wrapper hid.)
+fn load_overlays_reporting(problems: &mut Vec<String>) -> HashMap<String, ResourceOverlay> {
     let Ok(home) = std::env::var("HOME") else { return HashMap::new() };
     load_overlays_from(&Path::new(&home).join(".config/k9rs/overlays"), problems)
 }

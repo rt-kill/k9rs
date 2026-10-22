@@ -245,5 +245,5 @@ fn wait_readable(fd: i32, timeout: Duration) -> bool {
 
 
 #[cfg(test)]
-#[path = "../tests/ui/term_bg.rs"]
+#[path = "../tests/theme/term_bg.rs"]
 mod mirror_tests;

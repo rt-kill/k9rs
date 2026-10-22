@@ -18,7 +18,7 @@ fn render_rows(lines: &[StoredLine], state: &mut LogViewState, w: u16, h: u16) -
     let area = Rect::new(0, 0, w, h);
     let mut buf = Buffer::empty(area);
     let refs: Vec<&StoredLine> = lines.iter().collect();
-    let theme = crate::ui::theme::Theme::dark();
+    let theme = crate::theme::Theme::dark();
     LogViewer::new(&refs, &theme).render(area, &mut buf, state);
     (0..h)
         .map(|y| {
@@ -145,7 +145,7 @@ fn phys_row_count_equals_rendered_rows_across_ansi_forms() {
     for content in cases {
         for w in [1usize, 2, 3, 5, 8, 40] {
             let styled = Line::from(
-                crate::util::parse_ansi_line(content, Style::default())
+                crate::ui::ansi::parse_ansi_line(content, Style::default())
                     .into_iter()
                     .map(|s| Span::styled(s.content.to_string(), s.style))
                     .collect::<Vec<_>>(),
@@ -176,7 +176,7 @@ fn phys_row_count_matches_with_container_and_timestamp() {
                 spans.push(Span::raw(" ".to_string()));
             }
         }
-        for s in crate::util::parse_ansi_line(&line.content, Style::default()) {
+        for s in crate::ui::ansi::parse_ansi_line(&line.content, Style::default()) {
             spans.push(Span::styled(s.content.to_string(), s.style));
         }
         Line::from(spans)
@@ -481,7 +481,7 @@ fn workload_ansi_colour_reaches_the_buffer() {
         let area = Rect::new(0, 0, 70, 1);
         let mut buf = Buffer::empty(area);
         let refs: Vec<&StoredLine> = vec![&line];
-        let theme = crate::ui::theme::Theme::dark();
+        let theme = crate::theme::Theme::dark();
         LogViewer::new(&refs, &theme).render(area, &mut buf, &mut st);
         let text: String = (0..70u16).map(|x| buf[(x, 0)].symbol()).collect();
         let needle = if content.contains("ERROR") { "ERROR" } else { "INFO" };
@@ -529,7 +529,7 @@ fn measuring_and_rendering_agree_on_every_run() {
             // subtracting nothing — instead, compare against the renderer,
             // which is the thing both paths exist to predict.
             let styled = Line::from(
-                crate::util::parse_ansi_line(content, Style::default())
+                crate::ui::ansi::parse_ansi_line(content, Style::default())
                     .into_iter()
                     .map(|s| Span::styled(s.content.to_string(), s.style))
                     .collect::<Vec<_>>(),

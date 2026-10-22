@@ -480,7 +480,7 @@ impl K8sFieldSelector {
 /// A client-side derived view type (containers of a pod, ...). The DATA
 /// enum lives here because it rides the wire inside
 /// [`DrillTarget::Derived`]; the BEHAVIOR (labels, projection, operations)
-/// lives in [`crate::app::view`], next to the projection registry it
+/// lives in the client's view-projection registry, next to the projections it
 /// dispatches into.
 ///
 /// WIRE-FROZEN: variant order is part of the bincode layout — append-only,
@@ -518,7 +518,7 @@ pub enum DrillTarget {
     /// Drill down to pods filtered by ownerReference UID (replicaset/job).
     PodsByOwner {
         uid: String,
-        /// Parent kind, typed. Producers have a [`BuiltInKind`] in hand
+        /// Parent kind, typed. Producers have a [`crate::kube::resource_def::BuiltInKind`] in hand
         /// already; stringifying and re-parsing on the client was extra
         /// motion. Breadcrumb display fetches the human string via
         /// [`crate::kube::resource_defs::REGISTRY`].
@@ -554,7 +554,26 @@ pub enum DrillTarget {
     SwitchContext(crate::kube::protocol::ContextName),
 }
 
-impl super::KubeResource for ResourceRow {
+/// The row contract the derivation machinery reads through: cells, name,
+/// namespace. The only implementor is [`ResourceRow`], immediately below —
+/// the trait exists so the client's `derive_view` and the sort/filter helpers
+/// do not have to name the concrete row type.
+///
+/// It lived in `resources::mod` beside the k8s-openapi helpers, which put a
+/// trait and its single implementor in different files for no reason and left
+/// a standing hazard: separate them across a crate line and the `impl` below
+/// becomes an orphan. Beside each other, it is a local-trait impl wherever
+/// they end up.
+pub trait KubeResource: Clone + std::fmt::Debug + Send + Sync + 'static {
+    /// The typed cell values for this row, in header order.
+    fn cells(&self) -> &[CellValue];
+    /// Resource name (cached for O(1) access in sorts/filters).
+    fn name(&self) -> &str;
+    /// Resource namespace, or `""` for cluster-scoped rows.
+    fn namespace(&self) -> &str;
+}
+
+impl KubeResource for ResourceRow {
     fn cells(&self) -> &[CellValue] {
         &self.cells
     }

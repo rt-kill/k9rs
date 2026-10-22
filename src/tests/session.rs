@@ -336,7 +336,7 @@ fn a_modal_with_a_key_handler_is_not_swallowed_before_reaching_it() {
 
         // Downstream HAS an answer for Esc…
         assert!(
-            crate::event::handler::handle_key_event(&app, esc).is_some(),
+            crate::app::handler::handle_key_event(&app, esc).is_some(),
             "{name}: handle_key_event must answer Esc",
         );
 
@@ -345,7 +345,7 @@ fn a_modal_with_a_key_handler_is_not_swallowed_before_reaching_it() {
         // blanket `is_modal()` fall-through is what decides — and it
         // swallows.
         let tk = TextKey::new(esc).expect("Esc is not a Ctrl chord");
-        assert!(!crate::kube::session_commands::handle_filter_key(&mut app, tk), "{name}");
+        assert!(!crate::session::commands::handle_filter_key(&mut app, tk), "{name}");
         let tk = TextKey::new(esc).unwrap();
         assert!(!super::handle_log_filter_key(&mut app, tk), "{name}");
         let tk = TextKey::new(esc).unwrap();

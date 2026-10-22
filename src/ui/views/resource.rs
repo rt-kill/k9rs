@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::App;
 
 use crate::ui::header;
-use crate::ui::theme::Theme;
+use crate::theme::Theme;
 use crate::ui::widgets::{FilterBar, ResourceTable, ResourceTableState};
 
 // ---------------------------------------------------------------------------
@@ -47,7 +47,7 @@ struct TableSnapshot<'a> {
     row_health: &'a [crate::kube::resources::row::RowHealth],
     cell_style: &'a [Vec<Option<crate::kube::resources::row::RowHealth>>],
     /// Pre-computed per-column display widths, carried from the memoized
-    /// [`PreparedView`] so the widget doesn't re-scan rows each frame.
+    /// [`crate::app::store::PreparedView`] so the widget doesn't re-scan rows each frame.
     col_widths: &'a [u16],
     search_patterns: &'a [crate::util::SearchPattern],
     /// Non-live rows are still painted, but never silently — see

@@ -381,3 +381,32 @@ fn a_refused_overlay_rule_is_reported_with_its_file_and_its_mistake() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The suite must not be able to read the developer's own overlays.
+///
+/// This was a `LazyLock` over `$HOME`, and `lookup_overlay_key` sits on the
+/// key path — so a `~/.config/k9rs/overlays/pods.yaml` on the machine running
+/// the tests could add a binding and change what the key tests asserted. The
+/// hermeticity is now the absence of a `load_from_home()` call, and this is
+/// the assertion that says so: it fails the moment any test (or any helper a
+/// test reaches) loads them, which is exactly when the suite would stop being
+/// hermetic.
+///
+/// `plural` here is deliberately a real resource — the kind a developer is
+/// most likely to have written an overlay for.
+#[test]
+fn a_process_that_never_loads_overlays_has_none() {
+    // The MECHANISM, not the outcome: `overlay_for("pods").is_none()` alone
+    // would pass vacuously on a machine with no overlay files, which is the
+    // machine where this bug is invisible. Asserting the slot is empty holds
+    // everywhere, and is only reachable because this mirror is a child module
+    // of `overlay` and can see a private static.
+    assert!(
+        OVERLAYS.get().is_none(),
+        "a test binary must never have loaded overlays — something called \
+         `load_from_home`, and the suite is now reading ~/.config/k9rs/overlays",
+    );
+    // ...and therefore nothing resolves and nothing was complained about.
+    assert!(overlay_for("pods").is_none());
+    assert!(overlay_diagnostics().is_empty());
+}

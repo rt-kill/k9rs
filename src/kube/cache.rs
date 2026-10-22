@@ -265,7 +265,7 @@ impl DiscoveryCache {
     /// Return (or lazily create) the per-context entry, stamping it accessed.
     /// The returned Arc lets the caller perform multiple field updates without
     /// re-taking the shard lock. Use it inline and drop it — don't hold it
-    /// across a TTL window: a concurrent [`sweep_stale`] could detach it from
+    /// across a TTL window: a concurrent `sweep_stale` could detach it from
     /// the map (the Arc stays valid, but later writes through it become
     /// invisible to fresh lookups, which re-create the entry).
     fn entry_for(&self, ctx: &ContextId) -> Arc<PerContext> {
@@ -378,7 +378,7 @@ impl DiscoveryCache {
         self.sweep_older_than(now_secs().saturating_sub(ttl.as_secs()))
     }
 
-    /// Eviction mechanism for [`sweep_stale`], split from the `now_secs` policy
+    /// Eviction mechanism for `sweep_stale`, split from the `now_secs` policy
     /// so it can be exercised with a deterministic cutoff in tests. Removes
     /// every entry whose `last_access` is at or before `cutoff_secs`.
     fn sweep_older_than(&self, cutoff_secs: u64) -> usize {

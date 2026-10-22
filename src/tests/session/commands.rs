@@ -2,7 +2,7 @@
 //! sitting in `$EDITOR`.
 
 use super::*;
-use crate::event::AppEvent;
+use crate::app::event::AppEvent;
 
 /// Events that arrive while a subprocess is running must be APPLIED, not
 /// queued behind a loop that isn't running.
@@ -89,7 +89,7 @@ async fn a_closed_event_channel_does_not_strand_the_subprocess() {
     /// keymap has: documentation beside a check that it is true.
     #[test]
     fn every_documented_command_word_is_one_the_parser_accepts() {
-        for doc in COMMAND_WORDS {
+        for doc in crate::app::commands::COMMAND_WORDS {
             let parsed = parse(doc.probe);
             assert!(
                 (doc.accepts)(&parsed),

@@ -212,8 +212,8 @@ pub fn draw_describe(f: &mut Frame, app: &mut App, area: Rect) {
         // Keybinding bar
         // Projected from the ONE keymap declaration, so this bar cannot
         // advertise a key the dispatcher doesn't have (or miss one it does).
-        let hints = crate::event::keymap::bar_hints(
-            crate::event::keymap::ViewClass::Detail,
+        let hints = crate::app::keymap::bar_hints(
+            crate::app::keymap::ViewClass::Detail,
         );
         let line = crate::ui::header::render_keybinding_bar(&hints, bar_area.width, theme);
         f.render_widget(line, bar_area);
@@ -223,7 +223,7 @@ pub fn draw_describe(f: &mut Frame, app: &mut App, area: Rect) {
 /// Style a tagged `Field` line: indent + key + value (colon onward), matching
 /// the long-standing visual but driven by the producer's `key_end` rather than
 /// the renderer re-finding the colon.
-fn field_spans<'a>(text: &'a str, key_end: usize, theme: &crate::ui::theme::Theme) -> Line<'a> {
+fn field_spans<'a>(text: &'a str, key_end: usize, theme: &crate::theme::Theme) -> Line<'a> {
     let indent_len = text.len() - text.trim_start().len();
     if indent_len <= key_end && key_end <= text.len() && text.is_char_boundary(key_end) {
         Line::from(vec![
@@ -240,7 +240,7 @@ fn field_spans<'a>(text: &'a str, key_end: usize, theme: &crate::ui::theme::Them
 /// Best-effort styling for genuinely-opaque text (YAML, aliases, kubectl
 /// fallback): the former render-time inference, retained only where there is no
 /// producer structure to trust.
-fn infer_line<'a>(line: &'a str, theme: &crate::ui::theme::Theme) -> Line<'a> {
+fn infer_line<'a>(line: &'a str, theme: &crate::theme::Theme) -> Line<'a> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         Line::from(Span::styled(line, theme.row_normal))

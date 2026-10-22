@@ -1,6 +1,6 @@
 //! Trait-based resource type definitions.
 //!
-//! Each K8s resource is a zero-sized struct implementing [`ResourceDef`]
+//! Each K8s resource is a zero-sized struct implementing [`crate::kube::resource_def::ResourceDef`]
 //! and relevant capability marker traits. The [`REGISTRY`] static
 //! provides lookup by plural name or alias, and stores a type-erased
 //! watcher spawner per resource for dispatch without string matching.

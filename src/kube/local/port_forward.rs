@@ -1,5 +1,5 @@
 //! Port-forward source — the first implementation of [`LocalResourceSource`],
-//! and the first [`LocalOperator`](super::supervise::LocalOperator).
+//! and the first [`LocalOperator`].
 //!
 //! Each forward is one supervised **native websocket tunnel**
 //! (`Api::portforward` — no kubectl subprocess): an attempt resolves the

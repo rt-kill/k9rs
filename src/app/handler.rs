@@ -236,7 +236,7 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
     // switched to, not deleted.
     if let Some(combo) = combo_of(&key) {
         for op in &app.current_capabilities().operations {
-            if op.structural_chord() == Some(combo) {
+            if super::keymap::structural_chord(op) == Some(combo) {
                 return Some(Action::from(op));
             }
         }
@@ -575,5 +575,5 @@ fn handle_container_select_keys(key: KeyEvent) -> Option<Action> {
 }
 
 #[cfg(test)]
-#[path = "handler_tests.rs"]
+#[path = "../tests/app/handler.rs"]
 mod tests;

@@ -28,11 +28,11 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, warn};
 
-use super::daemon::socket_path;
-use super::protocol::{self, SessionCommand, SessionEvent};
-use super::server_session::{ServerSession, SessionSharedState};
+use crate::kube::daemon::socket_path;
+use crate::kube::protocol::{self, SessionCommand, SessionEvent};
+use crate::kube::server_session::{ServerSession, SessionSharedState};
 use crate::app::{FlashMessage, KubeContext};
-use crate::event::{AppEvent, ResourceUpdate};
+use crate::app::event::{AppEvent, ResourceUpdate};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -684,7 +684,7 @@ async fn writer_loop(
 
 /// Look up the cluster + user names for a given context inside a parsed
 /// `Kubeconfig`. An absent context — or one whose entry names no user —
-/// yields an all-unknown [`ClusterIdentity`], which every reader must
+/// yields an all-unknown [`crate::kube::protocol::ClusterIdentity`], which every reader must
 /// destructure rather than read as a blank string.
 fn lookup_cluster_user(
     kubeconfig: &Kubeconfig,
@@ -835,10 +835,10 @@ impl ClientSession {
             let stream = match mux_handle.open().await {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = event_tx.send(AppEvent::Log(crate::event::LogEvent {
+                    let _ = event_tx.send(AppEvent::Log(crate::app::event::LogEvent {
                         store: store.clone(),
                         epoch,
-                        payload: crate::event::LogPayload::Ended,
+                        payload: crate::app::event::LogPayload::Ended,
                     })).await;
                     let _ = event_tx.send(AppEvent::Flash(FlashMessage::error(
                         format!("log substream open failed: {}", e),
@@ -853,10 +853,10 @@ impl ClientSession {
             );
 
             if protocol::write_bincode(&mut write_half, &init).await.is_err() {
-                let _ = event_tx.send(AppEvent::Log(crate::event::LogEvent {
+                let _ = event_tx.send(AppEvent::Log(crate::app::event::LogEvent {
                     store: store.clone(),
                     epoch,
-                    payload: crate::event::LogPayload::Ended,
+                    payload: crate::app::event::LogPayload::Ended,
                 })).await;
                 let _ = event_tx.send(AppEvent::Flash(FlashMessage::error(
                     "Log init handshake failed".to_string(),
@@ -874,19 +874,19 @@ impl ClientSession {
                         // Pass ANSI codes through — the log renderer parses
                         // SGR sequences into ratatui Styles so application-
                         // embedded colors are preserved faithfully.
-                        let event = AppEvent::Log(crate::event::LogEvent {
+                        let event = AppEvent::Log(crate::app::event::LogEvent {
                             store: store.clone(),
                             epoch,
-                            payload: crate::event::LogPayload::Line(line),
+                            payload: crate::app::event::LogPayload::Line(line),
                         });
                         if event_tx.send(event).await.is_err() { break; }
                     }
                     Err(_) => {
                         // EOF — log stream ended.
-                        let _ = event_tx.send(AppEvent::Log(crate::event::LogEvent {
+                        let _ = event_tx.send(AppEvent::Log(crate::app::event::LogEvent {
                             store: store.clone(),
                             epoch,
-                            payload: crate::event::LogPayload::Ended,
+                            payload: crate::app::event::LogPayload::Ended,
                         })).await;
                         let _ = event_tx.send(AppEvent::Flash(
                             FlashMessage::info("Log stream ended"),
@@ -904,10 +904,10 @@ impl ClientSession {
                 } else {
                     "unknown panic".to_string()
                 };
-                let _ = panic_tx.send(AppEvent::Log(crate::event::LogEvent {
+                let _ = panic_tx.send(AppEvent::Log(crate::app::event::LogEvent {
                     store: panic_store,
                     epoch,
-                    payload: crate::event::LogPayload::Ended,
+                    payload: crate::app::event::LogPayload::Ended,
                 })).await;
                 let _ = panic_tx.send(AppEvent::Flash(FlashMessage::error(
                     format!("log bridge panicked: {}", msg),
@@ -1060,7 +1060,7 @@ impl ClientSession {
                     Err(e) => {
                         if !ever_received_data {
                             let message = format!("substream open failed: {}", e);
-                            let _ = event_tx.send(AppEvent::Store(crate::event::StoreEvent {
+                            let _ = event_tx.send(AppEvent::Store(crate::app::event::StoreEvent {
                                 store: store.clone(),
                                 epoch,
                                 payload: crate::app::store::StorePayload::Failed(message.clone()),
@@ -1104,7 +1104,7 @@ impl ClientSession {
                 if let Err(e) = protocol::write_bincode(&mut write_half, &init).await {
                     if !ever_received_data {
                         let message = format!("subscription init failed: {}", e);
-                        let _ = event_tx.send(AppEvent::Store(crate::event::StoreEvent {
+                        let _ = event_tx.send(AppEvent::Store(crate::app::event::StoreEvent {
                             store: store.clone(),
                             epoch,
                             payload: crate::app::store::StorePayload::Failed(message.clone()),
@@ -1152,7 +1152,7 @@ impl ClientSession {
                             consecutive_errors = 0;
                             last_flashed_error = None;
                             retry_backoff = std::time::Duration::from_secs(2);
-                            AppEvent::Store(crate::event::StoreEvent {
+                            AppEvent::Store(crate::app::event::StoreEvent {
                                 store: store.clone(),
                                 epoch,
                                 payload: crate::app::store::StorePayload::Baseline(baseline),
@@ -1162,7 +1162,7 @@ impl ClientSession {
                             consecutive_errors = 0;
                             last_flashed_error = None;
                             retry_backoff = std::time::Duration::from_secs(2);
-                            AppEvent::Store(crate::event::StoreEvent {
+                            AppEvent::Store(crate::app::event::StoreEvent {
                                 store: store.clone(),
                                 epoch,
                                 payload: crate::app::store::StorePayload::Delta(delta),
@@ -1193,7 +1193,7 @@ impl ClientSession {
                             // `Resolved`) it does not clear the error ceiling.
                             // Reconnecting the substream would not help.
                             retry_backoff = std::time::Duration::from_secs(2);
-                            AppEvent::Store(crate::event::StoreEvent {
+                            AppEvent::Store(crate::app::event::StoreEvent {
                                 store: store.clone(),
                                 epoch,
                                 payload: crate::app::store::StorePayload::Stale(reason),
@@ -1203,7 +1203,7 @@ impl ClientSession {
                             consecutive_errors = 0;
                             last_flashed_error = None;
                             retry_backoff = std::time::Duration::from_secs(2);
-                            AppEvent::Store(crate::event::StoreEvent {
+                            AppEvent::Store(crate::app::event::StoreEvent {
                                 store: store.clone(),
                                 epoch,
                                 payload: crate::app::store::StorePayload::Live,
@@ -1226,7 +1226,7 @@ impl ClientSession {
                                 let message = format!(
                                     "{msg} (stopped retrying after {consecutive_errors} failures — press Ctrl-R to retry)"
                                 );
-                                let _ = event_tx.send(AppEvent::Store(crate::event::StoreEvent {
+                                let _ = event_tx.send(AppEvent::Store(crate::app::event::StoreEvent {
                                     store: store.clone(),
                                     epoch,
                                     payload: crate::app::store::StorePayload::Failed(message.clone()),
@@ -1246,7 +1246,7 @@ impl ClientSession {
                             last_flashed_error = Some(msg.clone());
                             // The element's state flips through its OWN store
                             // (epoch-gated); the flash below is display-only.
-                            let _ = event_tx.send(AppEvent::Store(crate::event::StoreEvent {
+                            let _ = event_tx.send(AppEvent::Store(crate::app::event::StoreEvent {
                                 store: store.clone(),
                                 epoch,
                                 payload: crate::app::store::StorePayload::Failed(msg.clone()),
@@ -1264,7 +1264,7 @@ impl ClientSession {
 
                 if !ever_received_data {
                     let message = String::from("substream closed before any data");
-                    let _ = event_tx.send(AppEvent::Store(crate::event::StoreEvent {
+                    let _ = event_tx.send(AppEvent::Store(crate::app::event::StoreEvent {
                         store: store.clone(),
                         epoch,
                         payload: crate::app::store::StorePayload::Failed(message.clone()),
@@ -1455,5 +1455,5 @@ fn convert_session_event(event: SessionEvent, current_context: &crate::kube::pro
 }
 
 #[cfg(test)]
-#[path = "../tests/kube/client_session.rs"]
+#[path = "../tests/app/client.rs"]
 mod stream_liveness_tests_mirror;

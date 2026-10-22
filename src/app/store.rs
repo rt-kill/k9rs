@@ -41,7 +41,7 @@ use crate::kube::protocol::{
     MetricsUsage, NodeName, ObjectKey, ResourceId, RowChange, TableBaseline, TableDelta,
 };
 use crate::kube::resources::row::{CellValue, QuantityUnit, ResourceRow, RowHealth};
-use crate::kube::resources::KubeResource;
+use crate::kube::resources::row::KubeResource;
 use crate::util::SearchPattern;
 
 /// Stable identity of a row — the key marks, flash, and removes are

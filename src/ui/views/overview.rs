@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::app::App;
 use crate::ui::header;
-use crate::ui::theme::Theme;
+use crate::theme::Theme;
 
 /// Draw the cluster overview landing page.
 ///

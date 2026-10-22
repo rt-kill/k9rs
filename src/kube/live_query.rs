@@ -1005,7 +1005,7 @@ impl DrivenWatcher {
     /// Take the next baseline ask, failing the test if none arrives. Receiving
     /// one is also the proof that the bridge has attached and pinned its
     /// broadcast cursor — i.e. that `delta_tx.send` will now reach it.
-    pub async fn next_ask(&mut self) -> BaselineAsk {
+    pub(crate) async fn next_ask(&mut self) -> BaselineAsk {
         tokio::time::timeout(std::time::Duration::from_secs(2), self.ask_rx.recv())
             .await
             .expect("the bridge should ask for a baseline")
@@ -1014,7 +1014,7 @@ impl DrivenWatcher {
 
     /// Push a message onto the fanout, failing if nobody is listening — a
     /// silent `Err` here would make every downstream assertion vacuous.
-    pub fn push(&self, msg: WatcherMsg) {
+    pub(crate) fn push(&self, msg: WatcherMsg) {
         self.delta_tx.send(Arc::new(msg)).expect("a bridge should be attached");
     }
 }

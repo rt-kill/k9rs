@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::store::StoredLine;
 use crate::kube::protocol::Role;
-use crate::ui::theme::Theme;
+use crate::theme::Theme;
 
 /// Display width of one grapheme cluster, measured the way ratatui measures
 /// it at the moment it writes it into a cell.
@@ -485,7 +485,7 @@ impl StatefulWidget for LogViewer<'_> {
             // 3. Body: ANSI colors preserved, filter highlights overlaid.
             //    Always parse ANSI first. If filters active, find match
             //    ranges on stripped text and apply highlight to matching spans.
-            let ansi_spans = crate::util::parse_ansi_line(body, theme.log_text);
+            let ansi_spans = crate::ui::ansi::parse_ansi_line(body, theme.log_text);
             if !compiled.is_empty() {
                 // Match in the ONE visible-text space, which is where the
                 // filter decided this line was a hit — and which equals the

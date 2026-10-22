@@ -70,7 +70,7 @@ pub struct ContextLocals {
     /// — it would only keep kubectl children alive pointlessly).
     ///
     /// The deadline-based behaviour this slice used to spell out by hand now
-    /// lives in [`GraceGate`] and is shared by every kept-alive object.
+    /// lives in [`crate::kube::GraceGate`] and is shared by every kept-alive object.
     grace: Option<crate::kube::GraceGate>,
 }
 

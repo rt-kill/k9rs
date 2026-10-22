@@ -1,6 +1,7 @@
 //! What lands on the clipboard when rows are marked.
 
 use super::*;
+use crate::app::actions::Action;
 use crate::app::store::StorePayload;
 use crate::kube::protocol::{ObjectKey, TableBaseline};
 use crate::kube::resources::row::{CellValue, ResourceRow};
@@ -460,4 +461,107 @@ fn a_cluster_scoped_subject_omits_the_namespace_clause() {
         sel.to_wire(),
         "involvedObject.kind=Node,involvedObject.name=ip-10-0-1-5",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Batch capture and the one-batch-at-a-time rule
+//
+// These two lived in `event/handler_tests.rs` and were the whole of the
+// `event -> session` edge: they probe `session::actions`, not key handling.
+// Here they reach their subject through `super::*` like every other mirror,
+// so the qualified path goes away too.
+// ---------------------------------------------------------------------------
+
+/// Batch targets are captured as marks ∩ PRESENT rows. During the Ctrl-R
+/// window (marks survive `clear()`, rows unknown/Initializing) capture is
+/// honestly empty — nothing can operate on an identity the store cannot
+/// vouch for. The recovery baseline re-anchors and capture works again.
+#[test]
+fn test_batch_capture_is_empty_during_refresh_window() {
+    use crate::app::store::StorePayload;
+    use crate::kube::protocol::{ObjectKey, TableBaseline};
+    use crate::kube::resources::row::{CellValue, ResourceRow};
+
+    let row = |name: &str| ResourceRow {
+        cells: vec![CellValue::Text(name.into())],
+        name: name.into(),
+        namespace: Some("ns".into()),
+        ..Default::default()
+    };
+    let baseline = |rows: Vec<ResourceRow>| {
+        StorePayload::Baseline(TableBaseline {
+            resource: rid(crate::kube::resource_def::BuiltInKind::Pod),
+            headers: vec!["NAME".into()],
+            rows,
+        })
+    };
+
+    let app = App::new_for_test();
+    let store = std::sync::Arc::clone(app.nav.top().data_store().unwrap());
+    store.apply(1, baseline(vec![row("a"), row("b")]));
+    store.toggle_mark(&ObjectKey::new("ns".to_string(), "a".to_string()));
+
+    let captured = get_marked_resource_infos(&app);
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].name, "a");
+
+    // Ctrl-R: rows drop, marks survive — capture must go empty, and the
+    // app is STILL in select mode (the title says so; batch keys flash).
+    store.clear();
+    assert!(app.select_mode());
+    assert!(get_marked_resource_infos(&app).is_empty());
+
+    // Recovery baseline re-anchors the surviving mark.
+    store.apply(2, baseline(vec![row("a")]));
+    let captured = get_marked_resource_infos(&app);
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].name, "a");
+}
+
+/// ONE batch at a time: while a tracker is outstanding, a second batch
+/// dispatch is refused (a silent tracker replacement would duplicate the
+/// sends and let the first batch's late results clobber the second's
+/// summary).
+#[test]
+fn test_second_batch_refused_while_one_outstanding() {
+    use crate::app::store::StorePayload;
+    use crate::kube::protocol::{ObjectKey, TableBaseline};
+    use crate::kube::resources::row::{CellValue, ResourceRow};
+
+    let row = |name: &str| ResourceRow {
+        cells: vec![CellValue::Text(name.into())],
+        name: name.into(),
+        namespace: Some("ns".into()),
+        ..Default::default()
+    };
+    let mut app = App::new_for_test();
+    let store = std::sync::Arc::clone(app.nav.top().data_store().unwrap());
+    store.apply(1, StorePayload::Baseline(TableBaseline {
+        resource: rid(crate::kube::resource_def::BuiltInKind::Pod),
+        headers: vec!["NAME".into()],
+        rows: vec![row("a")],
+    }));
+    store.toggle_mark(&ObjectKey::new("ns".to_string(), "a".to_string()));
+
+    // Outstanding tracker → refuse, no dialog, selection untouched.
+    let t = crate::kube::protocol::ObjectRef::new(
+        rid(crate::kube::resource_def::BuiltInKind::Pod),
+        "a".to_string(),
+        crate::kube::protocol::Namespace::from_row("ns"),
+    );
+    app.pending_batch = Some(crate::app::BatchTracker::new(
+        "Deleted", "pod".to_string(),
+        rid(crate::kube::resource_def::BuiltInKind::Pod),
+        std::slice::from_ref(&t), 0, std::sync::Weak::new(),
+        crate::kube::protocol::OperationKind::Delete,
+    ));
+    handle_batch_op(&mut app, Action::BatchDelete);
+    assert!(!matches!(app.nav.top(), crate::app::element::Element::Confirm(_)));
+    assert!(app.ui.flash.as_ref().is_some_and(|f| f.message.contains("in flight")));
+    assert!(app.nav.top().has_marks(), "refusal leaves the selection untouched");
+
+    // Tracker cleared → the same dispatch opens the confirm dialog.
+    app.pending_batch = None;
+    handle_batch_op(&mut app, Action::BatchDelete);
+    assert!(matches!(app.nav.top(), crate::app::element::Element::Confirm(_)));
 }

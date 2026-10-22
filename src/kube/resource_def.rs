@@ -7,7 +7,7 @@
 //! The `BuiltInKind` enum and `Gvr` struct are used on BOTH client and
 //! server side — `ResourceId::BuiltIn(kind)` carries them over the wire.
 //! Capability gating happens server-side; the client receives
-//! [`ResourceCapabilities`] and [`DrillTarget`] and doesn't reach into
+//! [`crate::kube::protocol::ResourceCapabilities`] and [`crate::kube::resources::row::DrillTarget`] and doesn't reach into
 //! the trait hierarchy.
 
 use serde::{Deserialize, Serialize};
@@ -192,7 +192,7 @@ built_in_kinds! {
     /// Closed enum of every built-in resource type the daemon knows about.
     ///
     /// The canonical typed identity for built-ins — [`ResourceId::BuiltIn`] wraps it,
-    /// and [`ResourceRegistry`](crate::kube::resource_defs::ResourceRegistry)
+    /// and [`ResourceRegistry`](crate::kube::resource_defs::registry::ResourceRegistry)
     /// indexes defs by it.
     ///
     /// Declared through [`built_in_kinds!`] so that [`BuiltInKind::ALL`] is
@@ -300,7 +300,7 @@ pub struct Gvr {
 /// Object-safe so it can be stored as `dyn ResourceDef` in the registry.
 pub trait ResourceDef: Send + Sync + 'static {
     /// Typed kind discriminant — the closed enum variant that identifies
-    /// this def inside [`crate::kube::resource_defs::ResourceRegistry`]. The
+    /// this def inside [`crate::kube::resource_defs::registry::ResourceRegistry`]. The
     /// registry's `kind_table_complete` test enforces a 1:1 mapping between
     /// `BuiltInKind` variants and registered defs.
     fn kind(&self) -> BuiltInKind;

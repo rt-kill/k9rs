@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Widget},
 };
 
-use crate::ui::theme::Theme;
+use crate::theme::Theme;
 
 /// Filter input widget: bordered box with `/` prefix,
 /// visible block cursor, and match count.

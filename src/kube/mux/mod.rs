@@ -43,9 +43,9 @@
 //! channel. The driver task processes those alongside the inbound flow.
 //!
 //! Drop semantics:
-//! - [`MuxedConnection::drop`] aborts the driver task → the underlying
+//! - [`MuxedConnection`]'s `Drop` aborts the driver task → the underlying
 //!   socket closes → the peer sees EOF.
-//! - [`MuxedStream::drop`] (via `tokio_yamux::StreamHandle`'s own Drop)
+//! - [`MuxedStream`]'s `Drop` (via `tokio_yamux::StreamHandle`'s own Drop)
 //!   sends an RST frame → the peer's read returns EOF / `BrokenPipe`.
 //!
 //! [`accept`]: MuxedConnection::accept

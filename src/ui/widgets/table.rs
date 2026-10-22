@@ -8,7 +8,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::ui::theme::Theme;
+use crate::theme::Theme;
 
 /// State for the ResourceTable widget.
 pub struct ResourceTableState {

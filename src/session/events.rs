@@ -1,6 +1,6 @@
 use crate::app::App;
 
-use crate::event::{AppEvent, ResourceUpdate};
+use crate::app::event::{AppEvent, ResourceUpdate};
 
 /// Handle a single AppEvent (resource update, error, or flash).
 pub(crate) fn apply_event(
@@ -83,8 +83,8 @@ pub(crate) fn apply_event(
         AppEvent::Log(ev) => {
             // Destination rides the event — apply into the line store.
             match ev.payload {
-                crate::event::LogPayload::Line(line) => ev.store.push(ev.epoch, line),
-                crate::event::LogPayload::Ended => ev.store.mark_ended(ev.epoch),
+                crate::app::event::LogPayload::Line(line) => ev.store.push(ev.epoch, line),
+                crate::app::event::LogPayload::Ended => ev.store.mark_ended(ev.epoch),
             }
         }
         AppEvent::ExecData(bytes) => {
@@ -463,5 +463,5 @@ fn write_edit_temp_file(
 }
 
 #[cfg(test)]
-#[path = "../tests/kube/session_events.rs"]
+#[path = "../tests/session/events.rs"]
 mod tests;

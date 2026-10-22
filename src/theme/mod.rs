@@ -1,6 +1,20 @@
+//! Colours, and detecting which way round they go.
+//!
+//! This lived in `ui/`, which put the resolved `Theme` that `UiState` HOLDS
+//! above the module that holds it — `app -> ui` for eight of its sixteen
+//! references. It is not a renderer: it is the palette plus the terminal's
+//! own answer about its background, and both `app` and `ui` read it. So it
+//! sits below both.
+//!
+//! It does depend on ratatui (`Style`, `Color`) and crossterm, which is why
+//! "theme as data in the config layer" is not what this is — there is no
+//! data/style seam inside the file to cut along.
+
+pub mod term_bg;
+
 use std::path::Path;
 
-use crate::ui::term_bg::Appearance;
+use crate::theme::term_bg::Appearance;
 
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
@@ -117,7 +131,7 @@ const LIGHT: Palette = Palette {
 #[serde(rename_all = "lowercase")]
 pub enum ThemeMode {
     /// Ask the terminal for its background color and pick to match; falls
-    /// back to `Dark` when it doesn't answer. See [`crate::ui::term_bg`].
+    /// back to `Dark` when it doesn't answer. See [`crate::theme::term_bg`].
     #[default]
     Auto,
     Dark,
@@ -132,7 +146,7 @@ impl ThemeMode {
         match self {
             ThemeMode::Dark => Appearance::Dark,
             ThemeMode::Light => Appearance::Light,
-            ThemeMode::Auto => crate::ui::term_bg::detect(),
+            ThemeMode::Auto => crate::theme::term_bg::detect(),
         }
     }
 }
@@ -581,7 +595,9 @@ pub struct Theme {
     /// Opaque fill for dialog interiors. Not a `Style` and not
     /// skin-overridable on purpose: dialogs paint it under everything so a
     /// skin's `dialog.bgColor: default` can't render them invisible against
-    /// the terminal background. See [`crate::ui::fill_dialog_bg`].
+    /// the terminal background — the renderer's `fill_dialog_bg` applies it.
+    /// (Named, not linked: `theme` sits below `ui`, so the link would only
+    /// resolve while they share a crate.)
     pub dialog_fill: Color,
     pub dialog_button_active: Style,
     pub dialog_button_inactive: Style,
@@ -861,5 +877,5 @@ impl Theme {
 }
 
 #[cfg(test)]
-#[path = "../tests/ui/theme.rs"]
+#[path = "../tests/theme.rs"]
 mod mirror_tests;

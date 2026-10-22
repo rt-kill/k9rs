@@ -69,7 +69,7 @@ fn top_log_marker(term: &Terminal<TestBackend>) -> String {
 /// Push the help element, exactly as `Action::Help` does.
 fn push_help(app: &mut App) {
     app.conn.established();
-    let class = crate::event::keymap::ViewClass::of(app.nav.top());
+    let class = crate::app::keymap::ViewClass::of(app.nav.top());
     let caps = Some(app.current_capabilities());
     let markable = app.nav.top().markable();
     let store = app.core.seed_keybindings(caps, app.config.keys, class, markable);
@@ -328,7 +328,7 @@ fn the_contexts_view_paints_as_an_ordinary_table() {
     // one thing that is genuinely its own (rows from disk, not a stream)
     // still paints with no daemon connected at all.
     let mut app = App::new_for_test();
-    crate::kube::session_events::apply_event(&mut app, crate::event::AppEvent::KubeconfigLoaded {
+    crate::session::events::apply_event(&mut app, crate::app::event::AppEvent::KubeconfigLoaded {
         contexts: vec![
             crate::app::KubeContext {
                 name: crate::kube::protocol::ContextName::new("canary-ctx").unwrap(),
@@ -341,7 +341,7 @@ fn the_contexts_view_paints_as_an_ordinary_table() {
         current_context: None,
         current_identity: crate::kube::protocol::ClusterIdentity::default(),
     });
-    crate::kube::session_events::apply_event(&mut app, crate::event::AppEvent::NoContextConfigured);
+    crate::session::events::apply_event(&mut app, crate::app::event::AppEvent::NoContextConfigured);
 
     let mut t = term();
     let painted = paint(&mut t, &mut app);
@@ -359,7 +359,7 @@ fn a_context_with_no_user_says_so_instead_of_showing_a_blank_cell() {
     // same field, said "n/a". `Option` + `CellValue::Placeholder` make the
     // omission unwritable.
     let mut app = App::new_for_test();
-    crate::kube::session_events::apply_event(&mut app, crate::event::AppEvent::KubeconfigLoaded {
+    crate::session::events::apply_event(&mut app, crate::app::event::AppEvent::KubeconfigLoaded {
         contexts: vec![crate::app::KubeContext {
             name: crate::kube::protocol::ContextName::new("userless-ctx").unwrap(),
             // Exactly what kube-rs hands back for `user:`-less entry:
@@ -373,7 +373,7 @@ fn a_context_with_no_user_says_so_instead_of_showing_a_blank_cell() {
         current_context: None,
         current_identity: crate::kube::protocol::ClusterIdentity::default(),
     });
-    crate::kube::session_events::apply_event(&mut app, crate::event::AppEvent::NoContextConfigured);
+    crate::session::events::apply_event(&mut app, crate::app::event::AppEvent::NoContextConfigured);
 
     let mut t = term();
     let painted = paint(&mut t, &mut app);
@@ -513,7 +513,7 @@ fn the_light_palette_actually_reaches_the_screen() {
     use ratatui::style::Color;
     let mut app = App::new_for_test();
     app.conn.established();
-    app.ui.theme = crate::ui::theme::Theme::light();
+    app.ui.theme = crate::theme::Theme::light();
     app.ui.open(crate::app::Modal::Takeover(TakeoverOp::Edit {
             target: crate::kube::protocol::ObjectRef::new(
                 crate::app::nav::rid(crate::kube::resource_def::BuiltInKind::Pod),
@@ -525,7 +525,7 @@ fn the_light_palette_actually_reaches_the_screen() {
 
     let mut t = term();
     paint(&mut t, &mut app);
-    let fill = crate::ui::theme::Theme::light().dialog_fill;
+    let fill = crate::theme::Theme::light().dialog_fill;
     let painted_fill = t
         .backend()
         .buffer()
@@ -652,7 +652,7 @@ fn help_documents_the_view_you_pressed_it_in() {
     // the point (you grep it), but makes "does this key appear" a question
     // about the data, not the pixels.
     fn help_rows(app: &mut App) -> Vec<String> {
-        let class = crate::event::keymap::ViewClass::of(app.nav.top());
+        let class = crate::app::keymap::ViewClass::of(app.nav.top());
         let caps = Some(app.current_capabilities());
         let store = app.core.seed_keybindings(
             caps,
@@ -1018,7 +1018,7 @@ fn a_confirm_dialog_floats_over_the_view_that_raised_it() {
     // Every key is the dialog's, globals included.
     use crossterm::event::KeyCode;
     for key in [KeyCode::Char(':'), KeyCode::Char('?'), KeyCode::Char('q')] {
-        let action = crate::event::handler::handle_key_event(
+        let action = crate::app::handler::handle_key_event(
             &app,
             crossterm::event::KeyEvent::new(key, crossterm::event::KeyModifiers::NONE),
         );
@@ -1248,7 +1248,7 @@ fn only_a_grouping_column_collapses_its_repeats() {
     use ratatui::layout::Rect;
     use ratatui::widgets::StatefulWidget;
 
-    let theme = crate::ui::theme::Theme::dark();
+    let theme = crate::theme::Theme::dark();
     // Three rows sharing a value in column 0, as a rollout's pods share an age.
     let rows: Vec<Vec<String>> = [["All", "?", "aaa"], ["All", ":", "bbb"], ["View", "d", "ccc"]]
         .iter()
@@ -1894,7 +1894,7 @@ fn the_header_keeps_the_telling_end_of_an_arn() {
 /// three. Pinned as the RELATIONSHIP, so the numbers cannot drift apart.
 #[test]
 fn a_dialogs_box_reserves_exactly_the_chrome_its_widget_spends() {
-    let (mw, mh) = crate::ui::widgets::DIALOG_MARGIN;
+    let (mw, mh) = crate::app::geometry::DIALOG_MARGIN;
     let mut app = App::new_for_test();
     app.conn.established();
     seed_row(&app, "canary-row-marker");
@@ -1920,7 +1920,7 @@ fn a_dialogs_box_reserves_exactly_the_chrome_its_widget_spends() {
         panic!("a confirm floats")
     };
     let crate::app::element::Element::Confirm(d) = app.nav.top() else { panic!() };
-    let (cw, ch) = crate::ui::widgets::confirm_dialog_size(d);
+    let (cw, ch) = crate::app::geometry::confirm_dialog_size(d);
     assert_eq!(
         (width, height),
         (cw + mw, ch + mh),
@@ -2128,10 +2128,10 @@ fn help_section_still_collapses_after_the_narrowing() {
 
     // Help opens sorted on SECTION, and `Everywhere` has many rows — so if
     // it collapses, the label appears far fewer times than its row count.
-    let (_, rows) = crate::ui::widgets::HelpContent::rows(
+    let (_, rows) = crate::app::help::HelpContent::rows(
         Some(app.current_capabilities()),
         app.config.keys,
-        crate::event::keymap::ViewClass::Table,
+        crate::app::keymap::ViewClass::Table,
         app.nav.top().markable(),
     );
     let everywhere_rows = rows

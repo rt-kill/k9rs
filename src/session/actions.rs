@@ -2,13 +2,13 @@ use tokio::sync::mpsc;
 
 use crate::app::App;
 use crate::app::nav::rid;
-use crate::event::AppEvent;
-use crate::kube::client_session::ClientSession;
+use crate::app::event::AppEvent;
+use crate::app::client::ClientSession;
 use crate::kube::protocol::{self, ObjectRef};
 use crate::kube::resource_def::BuiltInKind;
 use crate::app::element::Element;
 use crate::app::store::RowPredicate;
-use crate::kube::session::{ds_try, ActionResult};
+use crate::session::{ds_try, ActionResult};
 
 
 // ---------------------------------------------------------------------------
@@ -56,7 +56,7 @@ pub(crate) fn handle_action(
             if app.nav.top().is_keybindings_view() {
                 app.nav.pop();
             } else {
-                let class = crate::event::keymap::ViewClass::of(app.nav.top());
+                let class = crate::app::keymap::ViewClass::of(app.nav.top());
                 let caps = Some(app.current_capabilities());
                 let markable = app.nav.top().markable();
                 let store =
@@ -386,7 +386,7 @@ fn handle_resource_op(
                         if let crate::kube::protocol::Namespace::Named(ns) = &origin.namespace {
                             return ActionResult::Exec {
                                 op: crate::kube::protocol::OperationKind::Shell,
-                                target: crate::kube::session::ExecTarget::Pod {
+                                target: crate::session::ExecTarget::Pod {
                                     pod: origin.name.clone(),
                                     namespace: ns.clone(),
                                     container: item.name.clone(),
@@ -428,7 +428,7 @@ fn handle_resource_op(
                         })));
                     } else {
                         let container = containers.first().map(|c| c.name.clone()).unwrap_or_default();
-                        return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget::Pod {
+                        return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::session::ExecTarget::Pod {
                             pod: pod_name,
                             namespace: pod_ns,
                             container,
@@ -1270,7 +1270,7 @@ fn handle_drill(
                 let node = row.name.clone();
                 return ActionResult::Exec {
                     op: crate::kube::protocol::OperationKind::NodeShell,
-                    target: crate::kube::session::ExecTarget::Node { node },
+                    target: crate::session::ExecTarget::Node { node },
                 };
             }
         }
@@ -1477,7 +1477,7 @@ fn handle_refresh(app: &mut App, data_source: &mut ClientSession) {
     app.ui.flash = Some(crate::app::FlashMessage::info("Refreshed"));
 }
 
-fn handle_show_aliases(app: &mut App, data_source: &crate::kube::client_session::ClientSession) {
+fn handle_show_aliases(app: &mut App, data_source: &crate::app::client::ClientSession) {
     // The same ROOT element `:alias` resolves to, through the same
     // client-owned routing — `Ctrl-a` is a shortcut for the command, not a
     // second way of building the view. Resets rather than pushes, for the
@@ -1553,7 +1553,7 @@ pub(crate) fn handle_enter(
                 ));
                 return ActionResult::None;
             };
-            return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::kube::session::ExecTarget::Pod {
+            return ActionResult::Exec { op: crate::kube::protocol::OperationKind::Shell, target: crate::session::ExecTarget::Pod {
                 pod: target.name,
                 namespace: pod_ns_str,
                 container,
@@ -2356,5 +2356,5 @@ pub(crate) fn do_switch_namespace(
 }
 
 #[cfg(test)]
-#[path = "../tests/kube/session_actions.rs"]
+#[path = "../tests/session/actions.rs"]
 mod dump_tests;

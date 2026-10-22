@@ -5,22 +5,8 @@ use ratatui::{
     widgets::{Block, Clear, Padding, Widget},
 };
 
-use crate::ui::theme::Theme;
+use crate::theme::Theme;
 
-/// The columns and rows a `ModalOverlay` spends on its own OUTER margin,
-/// before the border — the gap that makes a dialog read as a sheet laid over
-/// the view rather than a panel welded to it.
-///
-/// A free constant rather than an associated one so it can be named without
-/// a turbofish: `ModalOverlay` is generic over its content closure.
-///
-/// The element that sizes a dialog's box has to add exactly this much, and it
-/// used to add it as a bare `+ 4` / `+ 2` in three separate match arms,
-/// paired with the `saturating_sub(4)` / `saturating_sub(2)` in this file.
-/// The two numbers cancelling was the only thing keeping the dialogs the
-/// right size, and nothing said so — changing one would have silently
-/// mis-sized all three, in a different crate module.
-pub const DIALOG_MARGIN: (u16, u16) = (4, 2);
 
 /// Requested dialog dimensions (clamped to the available area).
 pub struct DialogSize {
@@ -79,7 +65,7 @@ where
     F: FnOnce(Rect, &mut Buffer),
 {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let (mw, mh) = DIALOG_MARGIN;
+        let (mw, mh) = crate::app::geometry::DIALOG_MARGIN;
         let w = self.size.width.min(area.width.saturating_sub(mw));
         let h = self.size.height.min(area.height.saturating_sub(mh));
 

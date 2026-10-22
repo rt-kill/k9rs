@@ -42,6 +42,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::actions::Action;
+use crate::app::KeyCombo;
+use crate::kube::protocol::OperationKind;
 use crate::app::element::Element;
 
 /// The key-dispatch equivalence classes. These are not the eight `Element`
@@ -343,5 +345,57 @@ pub fn bar_hints(class: ViewClass) -> Vec<(String, &'static str)> {
 }
 
 #[cfg(test)]
-#[path = "../tests/event/keymap.rs"]
+#[path = "../tests/app/keymap.rs"]
 mod tests;
+
+// ---------------------------------------------------------------------------
+// Structural chords
+// ---------------------------------------------------------------------------
+
+/// The fixed chord that reaches an operation when it has no descriptor
+/// default key — `None` for everything that does.
+///
+/// Three operations are structural: `Delete`, `ForceKill` and `PortForward`
+/// are destructive or modal enough that they are NOT on a bare letter. Their
+/// chords were written as the strings `"Ctrl-d"`, `"Ctrl-k"` and `"Shift-F"`
+/// in two places in `help.rs` AND matched separately in `super::handler` —
+/// three copies of one fact, none of them the authority, and `Shift-F` was
+/// the one the handler did not gate on the resource declaring the operation
+/// at all.
+///
+/// Returns a [`KeyCombo`] rather than a string so the handler can compare
+/// against a key event and help can print it, from the same declaration.
+///
+/// It lived as `OperationKind::structural_chord` in `kube::protocol` — the
+/// WIRE module — which made that module depend on `app::KeyCombo` and was the
+/// last upward reference out of `kube`. It is here rather than `KeyCombo`
+/// being pushed down because every caller was already in `ui` or `event`, and
+/// a chord is a keybinding fact, not a wire fact. This file is where keys are
+/// declared, which is what its own doc already claimed.
+///
+/// The match stays EXHAUSTIVE over `OperationKind`, and exhaustiveness is
+/// checked wherever the match is written — so a new operation still has to
+/// say which kind of key reaches it, exactly as before the move.
+pub fn structural_chord(op: &OperationKind) -> Option<KeyCombo> {
+    match op {
+        OperationKind::Delete => Some(KeyCombo { ctrl: true, ch: 'd' }),
+        OperationKind::ForceKill => Some(KeyCombo { ctrl: true, ch: 'k' }),
+        OperationKind::PortForward => Some(KeyCombo::plain('F')),
+        // Everything else is reached by its descriptor's default key, or by a
+        // chord the user configured.
+        OperationKind::Describe
+        | OperationKind::Yaml
+        | OperationKind::Scale
+        | OperationKind::StreamLogs
+        | OperationKind::PreviousLogs
+        | OperationKind::Shell
+        | OperationKind::Restart
+        | OperationKind::ShowNode
+        | OperationKind::NodeShell
+        | OperationKind::DecodeSecret
+        | OperationKind::TriggerCronJob
+        | OperationKind::ToggleSuspendCronJob
+        | OperationKind::Apply
+        | OperationKind::Custom(_) => None,
+    }
+}

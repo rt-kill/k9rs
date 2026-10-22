@@ -87,7 +87,7 @@ pub enum Action {
     ToggleLogWrap,
     /// Toggle log timestamps display.
     /// Cycle how much per-line chrome the log view shows (`t`) — see
-    /// `ui::widgets::Role::SHED_ORDER`. One action for the whole cycle, so a
+    /// `kube::protocol::Role::SHED_ORDER`. One action for the whole cycle, so a
     /// new role joins it without a new binding.
     ToggleLogTimestamps,
     /// Clear the log buffer.

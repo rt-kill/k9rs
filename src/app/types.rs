@@ -26,7 +26,7 @@ pub struct UiState {
     /// convention. See [`Modal`].
     modal: Modal,
     pub show_header: bool,
-    pub theme: crate::ui::theme::Theme,
+    pub theme: crate::theme::Theme,
     pub tick_count: usize,
     pub column_level: crate::kube::resource_def::ColumnLevel,
     /// Self-contained animation clock for loading spinners — owns its phase,
@@ -119,7 +119,7 @@ impl UiState {
     /// Fresh UI state with nothing modal. A constructor rather than a
     /// struct literal so `modal` can stay private — which is what stops a
     /// fifth modal slot from being bolted on beside it later.
-    pub fn new(theme: crate::ui::theme::Theme) -> Self {
+    pub fn new(theme: crate::theme::Theme) -> Self {
         Self {
             flash: None,
             modal: Modal::None,
@@ -640,7 +640,7 @@ pub struct UiConfig {
     /// Base palette: `auto` (detect the terminal background), `dark` or
     /// `light`. A skin, if any, layers on top of whichever is chosen.
     #[serde(default)]
-    pub theme: crate::ui::theme::ThemeMode,
+    pub theme: crate::theme::ThemeMode,
     pub max_column_width: u16,
     pub search_context_lines: usize,
     pub command_history_size: usize,
@@ -654,7 +654,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             skin: None,
-            theme: crate::ui::theme::ThemeMode::default(),
+            theme: crate::theme::ThemeMode::default(),
             max_column_width: 64,
             search_context_lines: 10,
             command_history_size: 50,
@@ -696,7 +696,7 @@ pub struct LogConfig {
     pub default_fields: LogFields,
 }
 
-/// A point on the field cycle — see `ui::widgets::Role::SHED_ORDER`, which
+/// A point on the field cycle — see `kube::protocol::Role::SHED_ORDER`, which
 /// defines the order fields are shed in.
 ///
 /// One variant per level, and `log_fields_covers_every_shed_level` pins that,
@@ -765,11 +765,11 @@ impl Default for LogConfig {
 /// of `context_switch_pending: bool` + `pending_context_switch: Option<String>`
 /// with a single source of truth:
 ///
-/// - [`Stable`] — no switch in flight, new switches allowed.
-/// - [`Requested`] — user asked to switch; the session main loop will
+/// - [`Self::Stable`] — no switch in flight, new switches allowed.
+/// - [`Self::Requested`] — user asked to switch; the session main loop will
 ///   pick it up at the top of its next iteration and drop the current
 ///   `ClientSession`.
-/// - [`InFlight`] — main loop has taken the request and is bringing up
+/// - [`Self::InFlight`] — main loop has taken the request and is bringing up
 ///   the new connection; it carries the target so the state fully
 ///   describes the switch in progress. Blocks further switches until the
 ///   connection *resolves*, either way.
@@ -795,13 +795,13 @@ impl ContextSwitchState {
         matches!(self, Self::Stable)
     }
 
-    /// The context this switch is aiming at. `Some` for both [`Requested`]
-    /// and [`InFlight`], `None` for [`Stable`] — the RECONNECT path uses it
+    /// The context this switch is aiming at. `Some` for both [`Self::Requested`]
+    /// and [`Self::InFlight`], `None` for [`Self::Stable`] — the RECONNECT path uses it
     /// ("keep aiming at the switch target across a mid-switch daemon blip"),
     /// which genuinely wants both states.
     ///
     /// CAUTION for connection-OUTCOME edges (`ConnectionEstablished` /
-    /// `ConnectionFailed`): those must match [`InFlight`] explicitly, never
+    /// `ConnectionFailed`): those must match [`Self::InFlight`] explicitly, never
     /// this method. `Requested` means the switch's session hasn't been built
     /// yet, so an outcome arriving in that state belongs to a PRIOR attempt
     /// — reading it as the switch's outcome tears down the wrong world (or
@@ -813,8 +813,8 @@ impl ContextSwitchState {
         }
     }
 
-    /// If the state is [`Requested`], take the target name and
-    /// transition to [`InFlight`], which keeps the target for the duration
+    /// If the state is [`Self::Requested`], take the target name and
+    /// transition to [`Self::InFlight`], which keeps the target for the duration
     /// of the connection attempt. Returns `None` in any other state and
     /// leaves the state alone. Used by the main loop to atomically consume
     /// a pending request without racing a second call.
@@ -829,7 +829,7 @@ impl ContextSwitchState {
         Some(name)
     }
 
-    /// Resolve an in-flight switch back to [`Stable`], so the next switch is
+    /// Resolve an in-flight switch back to [`Self::Stable`], so the next switch is
     /// accepted. This is the closing edge of the cycle and fires on EITHER
     /// outcome: `ConnectionEstablished` (the new session is up) or
     /// `ConnectionFailed` (the target was unreachable). Idempotent — a no-op
@@ -1139,7 +1139,7 @@ pub type CrdInfo = crate::kube::protocol::CrdRef;
 /// A dialogue or operation layered over the current view. NOT navigation:
 /// views live on the nav stack ([`crate::app::element::Element`]); an
 /// overlay has no history, no data handle, no self-definition — Esc
-/// closes it (dropping its RAII: [`crate::kube::client_session::ExecStream`],
+/// closes it (dropping its RAII: [`crate::app::client::ExecStream`],
 /// [`TempFile`]) and the view underneath was never displaced.
 pub enum TakeoverOp {
     // The `?` help sheet used to live here. It is a nav ELEMENT now
@@ -1181,11 +1181,11 @@ impl TakeoverOp {
     /// `FullFrame`, which meant one question had two answers and the
     /// takeover's `Dialog` could not say how big it was — so its renderer
     /// centred itself, a second geometry authority beside the float path's.
-    /// Now `Dialog` carries a size here too and [`crate::ui::dialog_box`]
+    /// Now `Dialog` carries a size here too and the renderer's `dialog_box`
     /// places both.
     ///
     /// EXHAUSTIVE: a new operation must choose, and the central erase in
-    /// [`crate::ui::draw`] reads the answer rather than each renderer
+    /// the draw entry point reads the answer rather than each renderer
     /// re-remembering it.
     pub fn extent(&self, frame: ratatui::layout::Rect) -> crate::app::element::ViewExtent {
         use crate::app::element::ViewExtent;
@@ -1260,7 +1260,7 @@ pub enum ShellConnectState {
 /// daemon→stdout — with no parsing. The vt100 crate is not involved.
 pub struct ShellState {
     pub title: String,
-    pub stream: Option<crate::kube::client_session::ExecStream>,
+    pub stream: Option<crate::app::client::ExecStream>,
     pub connect_state: ShellConnectState,
     /// Bytes received before the bridge loop starts. Written to stdout
     /// on attach so the initial prompt isn't lost.
@@ -1276,8 +1276,9 @@ impl std::fmt::Debug for ShellState {
     }
 }
 
-/// What the user is going to do with the container picked from
-/// [`Route::ContainerSelect`]. Each variant names one intent so call
+/// What the user is going to do with the container picked from the
+/// container picker ([`crate::app::element::Element::Picker`]). Each variant
+/// names one intent so call
 /// sites don't have to thread a separate boolean (e.g. `previous`)
 /// alongside a `for_shell` flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

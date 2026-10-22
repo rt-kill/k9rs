@@ -1211,7 +1211,7 @@ fn restarting_a_range_resets_the_greps_over_it() {
 #[test]
 fn help_opens_on_the_section_for_the_view_you_came_from() {
     let mut app = crate::app::App::new_for_test();
-    let class = crate::event::keymap::ViewClass::of(app.nav.top());
+    let class = crate::app::keymap::ViewClass::of(app.nav.top());
     let store = app.core.seed_keybindings(
         Some(app.current_capabilities()),
         app.config.keys,
@@ -1463,8 +1463,8 @@ fn help_documents_select_mode_exactly_where_marking_works() {
     let section = "Select mode (while rows are marked)";
 
     let documents_select_mode = |el: &crate::app::element::Element| -> bool {
-        let class = crate::event::keymap::ViewClass::of(el);
-        let (_, rows) = crate::ui::widgets::HelpContent::rows(
+        let class = crate::app::keymap::ViewClass::of(el);
+        let (_, rows) = crate::app::help::HelpContent::rows(
             Some(el.capabilities()),
             app.config.keys,
             class,
@@ -1489,8 +1489,8 @@ fn help_documents_select_mode_exactly_where_marking_works() {
 
     // The reported case: a table you cannot mark.
     assert_eq!(
-        crate::event::keymap::ViewClass::of(&contexts),
-        crate::event::keymap::ViewClass::Table,
+        crate::app::keymap::ViewClass::of(&contexts),
+        crate::app::keymap::ViewClass::Table,
         "contexts IS a table — gating on the class could never have excluded it",
     );
     assert!(!contexts.markable(), "a context feeds no batch operation");
@@ -1533,8 +1533,8 @@ fn the_aliases_view_is_a_table_of_what_the_prompt_accepts() {
     // A table: so grep, sort, column movement and copy come for free.
     assert_eq!(el.class(), crate::app::element::ElementClass::Table);
     assert_eq!(
-        crate::event::keymap::ViewClass::of(&el),
-        crate::event::keymap::ViewClass::Table,
+        crate::app::keymap::ViewClass::of(&el),
+        crate::app::keymap::ViewClass::Table,
     );
 
     let cells = |r: &crate::kube::resources::row::ResourceRow| -> Vec<String> {
@@ -1574,7 +1574,7 @@ fn the_aliases_view_is_a_table_of_what_the_prompt_accepts() {
     );
 
     // The command words, from the declaration the parser is tested against.
-    for doc in crate::kube::session_commands::COMMAND_WORDS {
+    for doc in crate::app::commands::COMMAND_WORDS {
         assert!(
             rows.iter().any(|r| r[0] == "command" && r[1] == doc.display()),
             "`{}` is a documented command word but is not in the view",
@@ -1609,10 +1609,10 @@ fn rebinding_delete_does_not_hide_the_chord_that_still_deletes() {
     );
 
     let keys_of = |cfg: crate::app::KeysConfig| -> Vec<String> {
-        let (_, rows) = crate::ui::widgets::HelpContent::rows(
+        let (_, rows) = crate::app::help::HelpContent::rows(
             caps.clone(),
             cfg,
-            crate::event::keymap::ViewClass::Table,
+            crate::app::keymap::ViewClass::Table,
             app.nav.top().markable(),
         );
         rows.iter()
@@ -1672,7 +1672,7 @@ fn completion_offers_every_word_something_else_declares() {
     }
 
     // Every static command word, from `COMMAND_WORDS`.
-    for doc in crate::kube::session_commands::COMMAND_WORDS {
+    for doc in crate::app::commands::COMMAND_WORDS {
         for word in doc.words {
             let hits = complete(&mut app, word);
             assert!(
@@ -1708,10 +1708,10 @@ fn help_repeats_a_key_only_to_say_something_new_about_it() {
     use crate::kube::resources::row::CellValue;
 
     let app = crate::app::App::new_for_test();
-    let (_, rows) = crate::ui::widgets::HelpContent::rows(
+    let (_, rows) = crate::app::help::HelpContent::rows(
         Some(app.current_capabilities()),
         app.config.keys,
-        crate::event::keymap::ViewClass::Table,
+        crate::app::keymap::ViewClass::Table,
         app.nav.top().markable(),
     );
     let text = |c: &CellValue| match c {
@@ -1755,16 +1755,16 @@ fn a_structural_chord_fires_only_where_its_operation_is_declared() {
 
     // The declaration, and nothing else, decides the chord.
     assert_eq!(
-        OperationKind::PortForward.structural_chord().map(|c| c.label()),
+        crate::app::keymap::structural_chord(&OperationKind::PortForward).map(|c| c.label()),
         Some("Shift-f".to_string()),
     );
     assert_eq!(
-        OperationKind::Delete.structural_chord().map(|c| c.label()),
+        crate::app::keymap::structural_chord(&OperationKind::Delete).map(|c| c.label()),
         Some("Ctrl-d".to_string()),
     );
     // An operation WITH a descriptor default has no structural chord: it is
     // reached by that key, and by whatever the user rebound it to.
-    assert_eq!(OperationKind::Describe.structural_chord(), None);
+    assert_eq!(crate::app::keymap::structural_chord(&OperationKind::Describe), None);
     assert!(OperationKind::Describe.descriptor().default_key.is_some());
 
     // Pods declare port-forward, so `F` reaches it.
@@ -1776,7 +1776,7 @@ fn a_structural_chord_fires_only_where_its_operation_is_declared() {
     );
     assert!(
         matches!(
-            crate::event::handler::handle_key_event(&app, shift_f),
+            crate::app::handler::handle_key_event(&app, shift_f),
             Some(crate::app::actions::Action::PortForward)
         ),
         "where the resource declares it, the chord works",
@@ -1796,7 +1796,7 @@ fn a_structural_chord_fires_only_where_its_operation_is_declared() {
     assert!(app.current_capabilities().operations.is_empty());
     assert!(
         !matches!(
-            crate::event::handler::handle_key_event(&app, shift_f),
+            crate::app::handler::handle_key_event(&app, shift_f),
             Some(crate::app::actions::Action::PortForward)
         ),
         "where it is not declared, the chord is inert — it used to fire anyway",
@@ -2017,7 +2017,7 @@ fn esc_peels_one_grep_off_the_chain() {
 
     // BOTH keys the log class documents reach `Back`, which is what pops.
     for key in [KeyCode::Esc, KeyCode::Char('q')] {
-        let action = crate::event::handler::handle_key_event(
+        let action = crate::app::handler::handle_key_event(
             &app,
             KeyEvent::new(key, KeyModifiers::NONE),
         );

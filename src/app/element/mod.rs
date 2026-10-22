@@ -32,7 +32,7 @@ use crate::app::table::TableDataState;
 use crate::app::types::ItemCounts;
 use crate::app::view::DerivedViewKind;
 use crate::app::ColumnLevel;
-use crate::kube::client_session::{ClientSession, LogStream, SubscriptionStream};
+use crate::app::client::{ClientSession, LogStream, SubscriptionStream};
 use crate::kube::overlay::ColumnRenderRules;
 use crate::kube::protocol::{Namespace, ObjectKey, ObjectRef, ResourceId, SubscriptionFilter};
 use crate::kube::resources::row::ResourceRow;
@@ -309,7 +309,7 @@ impl LiveQuery {
         let store = RowStore::new(spec.rid.plural());
         let stream = session.subscribe_stream(
             // Fresh store, fresh element — nothing to retire.
-            crate::kube::client_session::Supersedes::Nothing,
+            crate::app::client::Supersedes::Nothing,
             spec.rid.clone(),
             spec.namespace.clone(),
             spec.filter.clone(),
@@ -389,7 +389,7 @@ impl LiveQuery {
         // Initializing so the stale rows hide behind the loading screen.
         self.store.mark_reinitializing();
         self.origin = QueryOrigin::Daemon(session.subscribe_stream(
-            crate::kube::client_session::Supersedes::Stream(stream),
+            crate::app::client::Supersedes::Stream(stream),
             self.spec.rid.clone(),
             self.spec.namespace.clone(),
             self.spec.filter.clone(),
@@ -409,7 +409,7 @@ impl LiveQuery {
         let QueryOrigin::Daemon(stream) = &self.origin else { return };
         self.store.clear();
         self.origin = QueryOrigin::Daemon(session.subscribe_stream(
-            crate::kube::client_session::Supersedes::Stream(stream),
+            crate::app::client::Supersedes::Stream(stream),
             self.spec.rid.clone(),
             self.spec.namespace.clone(),
             self.spec.filter.clone(),
@@ -695,7 +695,7 @@ pub enum DeriveError {
 ///
 /// A `Dialog` is drawn in a centered box over whatever is beneath it (which
 /// is rendered first, exactly as it would be if it were on top), placed by
-/// [`crate::ui::dialog_box`]. `Full` claims the frame, and the one path that
+/// the renderer's `dialog_box`. `Full` claims the frame, and the one path that
 /// paints OVER a live view erases it first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewExtent {
@@ -767,7 +767,7 @@ pub struct LogInteraction {
     pub pan: crate::app::viewport::Pan,
     pub wrap: bool,
     /// How many chrome roles are hidden — see
-    /// [`crate::ui::widgets::Role::SHED_ORDER`]. ONE number rather than a
+    /// [`crate::kube::protocol::Role::SHED_ORDER`]. ONE number rather than a
     /// boolean per role: two booleans are four states for three meaningful
     /// ones, and the unreachable fourth (time without attribution) was a
     /// state the keys could never produce anyway.
@@ -982,7 +982,7 @@ impl LogSession {
         let store = LineStore::new(cfg.max_lines);
         let stream = session.stream_log_substream(
             // A newly opened log session has no predecessor.
-            crate::kube::client_session::Supersedes::Nothing,
+            crate::app::client::Supersedes::Nothing,
             spec.clone(),
             Arc::clone(&store),
         );
@@ -1047,7 +1047,7 @@ impl LogSession {
         self.view.viewport = self.view.viewport.restarted();
         self.view.initial_load = true;
         self.stream = session.stream_log_substream(
-            crate::kube::client_session::Supersedes::LogStream(&self.stream),
+            crate::app::client::Supersedes::LogStream(&self.stream),
             self.spec.clone(),
             Arc::clone(&self.store),
         );
@@ -1955,7 +1955,7 @@ impl Element {
         // asked of the widget rather than written as `+ 4` here, so the two
         // halves of that arithmetic cannot drift apart in different files.
         let margin = |w: u16, h: u16| {
-            let (mw, mh) = crate::ui::widgets::DIALOG_MARGIN;
+            let (mw, mh) = crate::app::geometry::DIALOG_MARGIN;
             (w + mw, h + mh)
         };
         match self {
@@ -1974,7 +1974,7 @@ impl Element {
                 // do not disagree about where the dialog is. A batch confirm
                 // lists its targets on extra lines and the box grows with
                 // them — seeing what the batch will hit is the whole point.
-                let (w, h) = crate::ui::widgets::confirm_dialog_size(d);
+                let (w, h) = crate::app::geometry::confirm_dialog_size(d);
                 // The float reserves the OUTER box; the widget still owns
                 // the inside of it, and spends `MARGIN` of the box on its own
                 // outer gap — so a box sized to the dialog exactly would
@@ -1984,11 +1984,11 @@ impl Element {
                 fit(margin(w, h), (frame.width, frame.height))
             }
             Element::Form(d) => {
-                let (w, h) = crate::ui::widgets::form_dialog_size(d);
+                let (w, h) = crate::app::geometry::form_dialog_size(d);
                 fit(margin(w, h), (frame.width, frame.height))
             }
             Element::Picker(p) => {
-                let (w, h) = crate::ui::widgets::container_picker_size(p);
+                let (w, h) = crate::app::geometry::container_picker_size(p);
                 fit(margin(w, h), (frame.width, frame.height))
             }
             Element::ResourceList(_)

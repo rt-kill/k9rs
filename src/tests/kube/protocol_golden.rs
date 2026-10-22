@@ -85,7 +85,7 @@ fn resourcerow_wire_layout_golden() {
 
 #[test]
 fn describeline_wire_layout_golden() {
-    // The describe wire type added in PROTOCOL_VERSION 6.
+    // The describe wire type added in wire revision 6.
     let lines = vec![
         DescribeLine { text: "Name: x".into(), kind: DescribeLineKind::Field { key_end: 4 } },
         DescribeLine { text: "Spec:".into(), kind: DescribeLineKind::Section },
@@ -99,7 +99,7 @@ fn describeline_wire_layout_golden() {
 
 #[test]
 fn logline_wire_layout_golden() {
-    // The log-stream wire type added in PROTOCOL_VERSION 7. Field order is
+    // The log-stream wire type added in wire revision 7. Field order is
     // `source` (Option — 1-byte bincode tag, then the String if Some), then
     // `timestamp` (same shape, added v16), then `content`. A multi-source
     // stream rides the tagged shape; every single-source line rides the

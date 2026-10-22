@@ -122,11 +122,11 @@ fn ui_theme_parses_through_the_real_config() {
         serde_yaml::from_str("k9s:\n  ui:\n    theme: light\n")
             .or_else(|_| serde_yaml::from_str::<crate::app::AppConfig>("ui:\n  theme: light\n"))
             .expect("ui.theme is accepted by the strict loader");
-    assert_eq!(cfg.ui.theme, crate::ui::theme::ThemeMode::Light);
+    assert_eq!(cfg.ui.theme, crate::theme::ThemeMode::Light);
 
     // Omitted → auto, and every other ui setting keeps its default.
     let bare: crate::app::AppConfig = serde_yaml::from_str("ui:\n  skin: nord\n").unwrap();
-    assert_eq!(bare.ui.theme, crate::ui::theme::ThemeMode::Auto);
+    assert_eq!(bare.ui.theme, crate::theme::ThemeMode::Auto);
 }
 
 /// `Auto` must not be constructible as a rendered palette: resolving it does
@@ -135,7 +135,7 @@ fn ui_theme_parses_through_the_real_config() {
 /// `Appearance`, which has no `Auto`.
 #[test]
 fn resolution_happens_before_the_theme_is_built() {
-    use crate::ui::term_bg::Appearance;
+    use crate::theme::term_bg::Appearance;
     assert_eq!(ThemeMode::Dark.resolve(), Appearance::Dark);
     assert_eq!(ThemeMode::Light.resolve(), Appearance::Light);
     // A test-constructed App is pinned dark and never touches a terminal.

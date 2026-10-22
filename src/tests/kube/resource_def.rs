@@ -22,7 +22,7 @@ fn all_resources_have_base_operations() {
 /// every existing row on the wire. `ordered` MUST be in declaration order —
 /// the test asserts each variant serializes to its position, so a reorder
 /// fails here and an append trips the count assert (extend the slice and
-/// bump `PROTOCOL_VERSION`).
+/// bump `WIRE_FORMAT_REVISION`).
 #[test]
 fn builtin_kind_wire_tags_are_stable() {
     use super::BuiltInKind::*;

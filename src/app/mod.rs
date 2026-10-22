@@ -5,6 +5,25 @@ pub mod form;
 pub mod kubectl_cache;
 pub mod derived;
 pub mod element;
+// The client half of the daemon wire. It lived under `kube/` but is written
+// in app vocabulary — it hands out `RowStore`/`LineStore` handles and builds
+// `AppEvent`s — so it is the app's data source, not Kubernetes access.
+pub mod client;
+pub mod commands;
+// The event vocabulary, the keymap and the key handler. `AppEvent` is
+// DEFINED over `app::store` types and `ViewClass::of` takes an `app::Element`,
+// so `event` was never a layer below app — it was app's own event half, kept
+// in a sibling module, and the two were the last cycle in the tree.
+pub mod event;
+pub mod geometry;
+pub mod handler;
+pub mod keymap;
+// Help's CONTENT, which is a data projection and not a widget — its own first
+// line said "NOT a widget — it renders nothing", and it returns
+// `(Vec<String>, Vec<ResourceRow>)` with no ratatui in sight. It sat in
+// `ui::widgets`, so `app` had to reach up into the renderer to build the help
+// element's rows.
+pub mod help;
 pub mod liveness;
 pub mod nav;
 pub mod select_gate;
@@ -16,13 +35,33 @@ pub mod viewport;
 pub mod view;
 
 pub use actions::SortTarget;
-pub use batch::*;
-pub use form::*;
-pub use kubectl_cache::*;
+// The app's surface, named.
+//
+// These were six `pub use <mod>::*;` globs, so the public API was defined by
+// `*` and nothing could say which names were intended — `types.rs` alone
+// published 32 items that way. After the crate split this list IS
+// `k9rs-app`'s API, so adding a name here should be a deliberate act.
+//
+// The list is not a guess: the globs were deleted and the compiler was asked
+// what the tree actually needs, iterated until clean against `--all-targets`
+// (the test mirrors need names the bin alone does not). 29 of `types.rs`'s 32
+// top-level `pub` items cross; `view` exports nothing anyone reaches through
+// `app::`, so it has no entry at all.
+pub use batch::BatchTracker;
+pub use form::{
+    ContentViewState, FormDialog, FormFieldKind, FormFieldState, FormFocus, FormSubmit,
+    SelectOption,
+};
+pub use kubectl_cache::{ContentKind, KubectlCache};
 pub use liveness::Liveness;
-pub use table::*;
-pub use types::*;
-pub use view::*;
+pub use table::TableDataState;
+pub use types::{
+    handle_search_key, AppConfig, ConfirmDialog, Connection, ContainerAction, ContainerChoice,
+    ContainerPicker, ContextSwitchState, CrdInfo, EditState, FlashLevel, FlashMessage, ItemCounts,
+    KeyCombo, KeysConfig, KubeState, LinkState, LogConfig, LogFields, Modal, PendingAction,
+    SearchInputResult, ShellConnectState, ShellState, SingleOp, TakeoverOp, TempFile, TextKey,
+    UiState,
+};
 
 use std::time::Duration;
 
@@ -55,7 +94,7 @@ pub struct KubeContext {
 /// Two sections, in the order you reach for them: the resources (whose
 /// aliases are declared by the registry and by `LocalResourceKind`, which is
 /// already their single source) and the static command words (declared by
-/// [`crate::kube::session_commands::COMMAND_WORDS`], which this module's
+/// [`crate::app::commands::COMMAND_WORDS`], which this module's
 /// agreement test probes against the parser).
 ///
 /// `Ctrl-a` used to format this as a plain-text DOCUMENT, so it could not be
@@ -93,7 +132,7 @@ fn seed_aliases(store: &store::RowStore) {
         }
         push("resource", aliases.join(" / "), kind.kind_str().to_string());
     }
-    for doc in crate::kube::session_commands::COMMAND_WORDS {
+    for doc in crate::app::commands::COMMAND_WORDS {
         push("command", doc.display(), doc.label.to_string());
     }
     store.apply(
@@ -115,7 +154,7 @@ pub fn context_headers() -> Vec<String> {
 }
 
 /// Project the kubeconfig's contexts into rows. Enter rides on the row as a
-/// [`DrillTarget`], so switching needs no special case in the key handler.
+/// [`crate::kube::resources::row::DrillTarget`], so switching needs no special case in the key handler.
 pub fn context_rows(contexts: &[KubeContext]) -> Vec<crate::kube::resources::row::ResourceRow> {
     use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
     contexts
@@ -187,7 +226,7 @@ pub struct CoreData {
     /// The always-on subscriptions feeding the stores above. Replaced
     /// wholesale on (re)connect — the old streams drop, RSTing their
     /// substreams.
-    streams: Vec<crate::kube::client_session::SubscriptionStream>,
+    streams: Vec<crate::app::client::SubscriptionStream>,
     /// The previous context's core stores, kept so switching back is not a
     /// cold load. See [`CoreData::switch_context`].
     parked: Option<(crate::kube::protocol::ContextName, ParkedCore)>,
@@ -263,7 +302,7 @@ impl CoreData {
 
     /// Open the always-on subscriptions (namespaces + nodes) into the
     /// core stores. Called on (re)connect; previous streams drop.
-    pub fn open_streams(&mut self, session: &crate::kube::client_session::ClientSession) {
+    pub fn open_streams(&mut self, session: &crate::app::client::ClientSession) {
         self.streams.clear();
         for def in crate::kube::resource_defs::REGISTRY.all() {
             if !def.is_core() {
@@ -277,7 +316,7 @@ impl CoreData {
                 // `clear()` above already dropped every predecessor, and
                 // `SubscriptionStream::Drop` aborts — so they are retired
                 // before any epoch below is minted.
-                crate::kube::client_session::Supersedes::Nothing,
+                crate::app::client::Supersedes::Nothing,
                 rid,
                 crate::kube::protocol::Namespace::All,
                 None,
@@ -366,7 +405,7 @@ impl CoreData {
         &self,
         caps: Option<crate::kube::protocol::ResourceCapabilities>,
         keys: crate::app::KeysConfig,
-        class: crate::event::keymap::ViewClass,
+        class: crate::app::keymap::ViewClass,
         markable: bool,
     ) -> std::sync::Arc<store::RowStore> {
         // A FRESH store per press, not one shared field.
@@ -379,7 +418,7 @@ impl CoreData {
         // breadcrumb. Contextual content and shared storage cannot both be
         // true.
         let store = store::RowStore::client("keybindings");
-        let (headers, rows) = crate::ui::widgets::HelpContent::rows(caps, keys, class, markable);
+        let (headers, rows) = crate::app::help::HelpContent::rows(caps, keys, class, markable);
         store.apply(
             Self::SEED_EPOCH,
             store::StorePayload::Baseline(crate::kube::protocol::TableBaseline {
@@ -535,10 +574,10 @@ impl App {
     /// itself, so tests are hermetic by construction and a config error
     /// is a visible startup failure, not a silent default fallback.
     pub fn new(
-        appearance: crate::ui::term_bg::Appearance,
+        appearance: crate::theme::term_bg::Appearance,
         context: Option<crate::kube::protocol::ContextName>,
         namespace: crate::kube::protocol::Namespace,
-        session: &crate::kube::client_session::ClientSession,
+        session: &crate::app::client::ClientSession,
         config: AppConfig,
     ) -> Self {
         let _ = session; // the Overview root opens no subscription
@@ -556,6 +595,21 @@ impl App {
     /// user's key rebindings (or any other setting) must not change
     /// what the tests assert. Hermetic by construction: the config is a
     /// parameter, so no test path can open the file.
+    ///
+    /// `config.yaml` was only HALF of it. The machine's
+    /// `~/.config/k9rs/overlays/*.yaml` reached the suite too, through a
+    /// `LazyLock` that read `$HOME` on first access — and overlays carry key
+    /// bindings (`event::handler::lookup_overlay_key`) and column levels
+    /// (`element::ResourceList::level_for`), so a developer's own overlay
+    /// really did change what these tests saw. That one is closed the same
+    /// way, by ownership rather than by a parameter: `main` loads overlays
+    /// and a test binary never does. See `kube::overlay::OVERLAYS`.
+    ///
+    /// Theme is the remaining `$HOME` read on this path — `App::new` calls
+    /// `ui::theme::Theme::load`, which reads `$HOME/.config/k9rs/skins`. It
+    /// is inert here only because the default skin name is empty and `load`
+    /// early-returns on that, which is a fact about the default rather than
+    /// about construction. Not yet fixed; do not read this doc as covering it.
     #[cfg(test)]
     pub(crate) fn new_for_test() -> Self {
         let namespace = crate::kube::protocol::Namespace::All;
@@ -576,7 +630,7 @@ impl App {
             metrics,
             root,
             AppConfig::default(),
-            crate::ui::term_bg::Appearance::Dark,
+            crate::theme::term_bg::Appearance::Dark,
         )
     }
 
@@ -589,7 +643,7 @@ impl App {
         // RESOLVED, never `ThemeMode::Auto`: resolving queries the terminal,
         // and this constructor must stay free of I/O — `new_for_test` would
         // otherwise open `/dev/tty` from the test suite.
-        appearance: crate::ui::term_bg::Appearance,
+        appearance: crate::theme::term_bg::Appearance,
     ) -> Self {
         let cache_capacity = config.ui.cache_capacity;
         let skin_name = config.ui.skin.clone();
@@ -605,7 +659,7 @@ impl App {
             conn: Connection::new(),
             pending_batch: None,
             config,
-            ui: UiState::new(crate::ui::theme::Theme::load(skin_name.as_deref(), appearance)),
+            ui: UiState::new(crate::theme::Theme::load(skin_name.as_deref(), appearance)),
             kube: KubeState {
                 context,
                 connecting: None,
@@ -645,7 +699,7 @@ impl App {
     /// store the app already holds and opens no subscription, so it works
     /// with no daemon at all; everything else subscribes as usual.
     pub fn root_list_element(
-        session: &crate::kube::client_session::ClientSession,
+        session: &crate::app::client::ClientSession,
         metrics: &std::sync::Arc<store::MetricsHub>,
         core: &CoreData,
         rid: ResourceId,
@@ -667,7 +721,7 @@ impl App {
     /// replaced or covered.
     pub fn list_element_from_top(
         &self,
-        session: &crate::kube::client_session::ClientSession,
+        session: &crate::app::client::ClientSession,
         rid: ResourceId,
         namespace: crate::kube::protocol::Namespace,
         filter: Option<crate::kube::protocol::SubscriptionFilter>,
@@ -1018,7 +1072,7 @@ fn complete_command(
     // the registry, so those three were duplicated, and `namespace` was
     // missing entirely: `:names…` completed to nothing while `:ns` worked.
     all_commands.extend(
-        crate::kube::session_commands::COMMAND_WORDS
+        crate::app::commands::COMMAND_WORDS
             .iter()
             .flat_map(|doc| doc.words.iter().copied()),
     );
@@ -1064,9 +1118,9 @@ pub(crate) mod test_support {
     /// socket, no daemon, no cluster. (Table queries no longer need one —
     /// `LiveQuery::for_test` uses the real `QueryOrigin::Client`, which
     /// carries no stream at all.)
-    pub(crate) fn parked_log_stream() -> crate::kube::client_session::LogStream {
+    pub(crate) fn parked_log_stream() -> crate::app::client::LogStream {
         let handle = RT.handle().spawn(std::future::pending::<()>());
-        crate::kube::client_session::LogStream::from_abort_handle(handle.abort_handle())
+        crate::app::client::LogStream::from_abort_handle(handle.abort_handle())
     }
 
     /// A log stream whose bridge task has ALREADY finished — what
@@ -1074,10 +1128,10 @@ pub(crate) mod test_support {
     /// done, because `AbortHandle::abort` only requests it: right after an
     /// `abort()` the task is still unfinished, so a synchronous test that
     /// aborts a parked stream is testing nothing.
-    pub(crate) fn finished_log_stream() -> crate::kube::client_session::LogStream {
+    pub(crate) fn finished_log_stream() -> crate::app::client::LogStream {
         let handle = RT.handle().spawn(std::future::ready(()));
         let abort = handle.abort_handle();
         RT.handle().block_on(handle).expect("the task completes");
-        crate::kube::client_session::LogStream::from_abort_handle(abort)
+        crate::app::client::LogStream::from_abort_handle(abort)
     }
 }

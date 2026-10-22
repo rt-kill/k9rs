@@ -526,7 +526,7 @@ impl ConvertToRow<Pod> for PodDef {
         node,
         health,
         drill_target: Some(crate::kube::resources::row::DrillTarget::Derived(
-            crate::app::view::DerivedViewKind::Containers,
+            crate::kube::resources::row::DerivedViewKind::Containers,
         )),
         cpu_request: if has_cpu_req { Some(cpu_req_milli) } else { None },
         cpu_limit: if has_cpu_lim { Some(cpu_lim_milli) } else { None },

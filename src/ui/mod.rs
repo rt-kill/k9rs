@@ -1,7 +1,6 @@
 pub mod header;
-pub mod term_bg;
-pub mod theme;
 pub mod views;
+pub mod ansi;
 pub mod widgets;
 
 /// Header panel height in rows (context/cluster/user + logo).
@@ -9,7 +8,7 @@ pub const HEADER_HEIGHT: u16 = 5;
 
 
 /// Fill a rectangular area with the theme's dialog background
-/// ([`theme::Theme::dialog_fill`]). Applied after Clear + Block: the fill is
+/// ([`crate::theme::Theme::dialog_fill`]). Applied after Clear + Block: the fill is
 /// opaque and deliberately NOT skin-overridable, so a skin setting
 /// `dialog_bg: default` can't render dialogs invisible against the terminal.
 /// It follows the palette rather than being a const, so a light theme gets a
@@ -17,7 +16,7 @@ pub const HEADER_HEIGHT: u16 = 5;
 pub fn fill_dialog_bg(
     buf: &mut ratatui::buffer::Buffer,
     area: ratatui::layout::Rect,
-    theme: &theme::Theme,
+    theme: &crate::theme::Theme,
 ) {
     let style = ratatui::style::Style::default().bg(theme.dialog_fill);
     for row in area.y..area.y + area.height {
@@ -221,7 +220,7 @@ pub(crate) fn dialog_box(
     frame: ratatui::layout::Rect,
     width: u16,
     height: u16,
-    theme: &crate::ui::theme::Theme,
+    theme: &crate::theme::Theme,
 ) -> ratatui::layout::Rect {
     let box_area = centered_rect(frame, width, height);
     f.render_widget(Clear, box_area);
@@ -276,7 +275,7 @@ fn draw_takeover_label(
     f: &mut Frame,
     label: &str,
     rect: ratatui::layout::Rect,
-    theme: &crate::ui::theme::Theme,
+    theme: &crate::theme::Theme,
 ) {
     if rect.height == 0 || rect.width == 0 {
         return;

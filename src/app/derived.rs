@@ -1,9 +1,9 @@
 //! Projection functions for derived views.
 //!
-//! Each [`DerivedViewKind`] variant has a corresponding `project_*` function
+//! Each [`crate::kube::resources::row::DerivedViewKind`] variant has a corresponding `project_*` function
 //! that converts a parent [`ResourceRow`] into child rows for the derived
 //! table. Adding a new derived view means adding a function here and a
-//! match arm in [`DerivedViewKind::project`].
+//! match arm in [`DerivedViewKind::project`](crate::app::view::DerivedViewKind::project).
 
 use crate::kube::resources::row::{CellValue, ResourceRow};
 

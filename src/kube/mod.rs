@@ -1,5 +1,4 @@
 pub mod cache;
-pub mod client_session;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -203,9 +202,5 @@ pub mod resource_def;
 pub mod resource_defs;
 pub mod resources;
 pub mod server_session;
-pub mod session;
 pub mod session_env;
-pub mod session_actions;
-pub mod session_commands;
-pub mod session_events;
 pub mod shared_poller;

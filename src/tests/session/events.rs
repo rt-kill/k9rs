@@ -1,7 +1,7 @@
 use super::*;
 use crate::app::element::{ContentPhase, ContentSpec, ContentView, Element};
 use crate::app::App;
-use crate::event::ResourceUpdate;
+use crate::app::event::ResourceUpdate;
 use crate::kube::protocol::{Namespace, ObjectRef};
 
 fn pod_target() -> ObjectRef {
@@ -312,7 +312,7 @@ fn every_context_switch_lands_on_home_immediately() {
             // A deep-ish stack belonging to the outgoing context.
             assert!(app.nav.depth() >= 1);
         }
-        crate::kube::session_actions::begin_context_switch(
+        crate::session::actions::begin_context_switch(
             &mut app,
             &ContextName::new("staging").unwrap(),
         );
@@ -413,7 +413,7 @@ fn an_unconfirmed_context_never_becomes_the_confirmed_one() {
 
     // Pick `prod` — the real path: the picker's Enter, then the main loop
     // taking the request and building a session for it.
-    crate::kube::session_actions::begin_context_switch(
+    crate::session::actions::begin_context_switch(
         &mut app,
         &ContextName::new("prod").unwrap(),
     );
@@ -461,7 +461,7 @@ fn the_identity_never_describes_the_context_being_left() {
         namespaces: vec![],
     });
     // Switch away: link down, candidate announced by the new session.
-    crate::kube::session_actions::begin_context_switch(
+    crate::session::actions::begin_context_switch(
         &mut app,
         &ContextName::new("staging").unwrap(),
     );
@@ -533,14 +533,14 @@ fn a_text_key_types_into_the_filter_and_the_command_bar() {
 
     let mut app = App::new_for_test();
     app.nav.top_mut().filter_input_mut().expect("table takes a filter").start();
-    assert!(crate::kube::session_commands::handle_filter_key(&mut app, text('c')));
+    assert!(crate::session::commands::handle_filter_key(&mut app, text('c')));
     assert_eq!(app.nav.top().filter_input().text(), "c");
 
     let mut app = App::new_for_test();
     app.ui.open(crate::app::Modal::Command { input: crate::app::text_input::TextInput::new(), history_index: None });
     assert!(matches!(
-        crate::kube::session_commands::edit_command_key(&mut app, text('g')),
-        crate::kube::session_commands::CommandKey::Consumed,
+        crate::session::commands::edit_command_key(&mut app, text('g')),
+        crate::session::commands::CommandKey::Consumed,
     ));
     assert_eq!(app.ui.command_input().map(|(i, _)| i.to_string()), Some("g".to_string()));
 }
@@ -569,7 +569,7 @@ fn the_contexts_picker_offers_only_what_it_supports() {
     let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
     assert!(
         !matches!(
-            crate::event::handler::handle_key_event(&app, ctrl_d),
+            crate::app::handler::handle_key_event(&app, ctrl_d),
             Some(crate::app::actions::Action::Delete)
         ),
         "delete is not a thing you can do to a kubeconfig context",

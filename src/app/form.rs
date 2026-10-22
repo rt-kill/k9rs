@@ -44,7 +44,7 @@ pub struct FormFieldState {
 }
 
 /// Field type discriminator. Owned client-side — there is no wire-level
-/// equivalent (the daemon only sends a list of [`OperationKind`] and the
+/// equivalent (the daemon only sends a list of [`crate::kube::protocol::OperationKind`] and the
 /// client builds the form shape from row context).
 #[derive(Debug, Clone)]
 pub enum FormFieldKind {
@@ -294,8 +294,11 @@ impl FormFieldState {
     }
 }
 
-/// Shared state for YAML and Describe content views (previously duplicated as
-/// `YamlState` and `DescribeState`).
+/// Shared state for YAML and Describe content views — one type, because the
+/// two views differ in what they fetch, not in what they hold. (They were two
+/// duplicated structs, then two `pub type` aliases kept "for backward
+/// compatibility" in a binary that has no external consumers. Nothing named
+/// them, and `pub` meant `dead_code` never said so.)
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContentViewState {
     /// PRIVATE, with `describe_lines` and `line_count`, because the three are
@@ -401,11 +404,6 @@ impl ContentViewState {
         self.search_input.clear();
     }
 }
-
-/// Type alias for backward compatibility.
-pub type YamlState = ContentViewState;
-/// Type alias for backward compatibility.
-pub type DescribeState = ContentViewState;
 
 #[cfg(test)]
 #[path = "../tests/app/form.rs"]

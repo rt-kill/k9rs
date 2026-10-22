@@ -316,7 +316,7 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Keybinding bar
     // Projected from the ONE keymap declaration — see `event::keymap`.
-    let hints = crate::event::keymap::bar_hints(crate::event::keymap::ViewClass::Log);
+    let hints = crate::app::keymap::bar_hints(crate::app::keymap::ViewClass::Log);
 
     crate::ui::fill_line_bg(f, bar_area, theme.status_bar);
 

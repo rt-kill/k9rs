@@ -7,7 +7,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{FlashLevel, FlashMessage};
-use crate::ui::theme::Theme;
+use crate::theme::Theme;
 
 /// Flash message widget.
 /// info=lawngreen bold, warn=darkorange bold, error=orangered bold.

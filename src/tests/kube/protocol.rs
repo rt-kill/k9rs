@@ -130,7 +130,7 @@ fn test_stream_event_baseline_delta_roundtrip() {
 
 /// Envelope wire-tag stability (bincode u32 LE declaration-index) for
 /// the enums the wire depends on. RULE: any change to these goldens is
-/// a protocol break — bump PROTOCOL_VERSION in the same change.
+/// a protocol break — bump WIRE_FORMAT_REVISION in the same change.
 /// Appending variants is safe; reordering or mid-enum inserts are not.
 /// COMPLETE pins for both envelopes: partial head-pins would let a
 /// swap of two adjacent UNPINNED variants (DescribeResult↔YamlResult)
@@ -339,7 +339,7 @@ fn stream_event_ref_tags_match() {
 /// declaration-index). Appending is safe; reorder/insert is a break.
 #[test]
 fn stream_wire_tags_are_stable() {
-    assert_eq!(PROTOCOL_VERSION, 16);
+    assert_eq!(WIRE_FORMAT_REVISION, 16);
     let b = bincode::serialize(&StreamEvent::Error("x".into())).unwrap();
     assert_eq!(&b[..4], 2u32.to_le_bytes()); // Baseline=0, Delta=1, Error=2
     // Stale/Live APPENDED for v11 — Resolved=3 keeps its tag.
@@ -369,7 +369,9 @@ fn stream_wire_tags_are_stable() {
             .unwrap()[..4],
         3u32.to_le_bytes(),
     );
-    // Handshake preamble bytes are pinned: magic then version, BE.
+    // Handshake preamble: magic then `build_id`, BE. The magic is pinned
+    // because it doubles as a poison frame-length for a peer that speaks no
+    // preamble; the id deliberately is NOT pinned, because it is derived.
     assert_eq!(PROTOCOL_MAGIC.to_be_bytes(), [0x4B, 0x39, 0x52, 0x53]);
 }
 
@@ -532,7 +534,7 @@ fn remaining_wire_enum_tags_are_stable() {
 /// category comments — which invites inserting a new kind IN-category.
 /// That silently re-tags every later kind while all same-build tests stay
 /// green. This pin makes the mistake loud: new kinds append at the END
-/// (or you bump PROTOCOL_VERSION as a conscious break).
+/// (or you bump WIRE_FORMAT_REVISION as a conscious break).
 #[test]
 fn builtinkind_tags_are_stable() {
     use crate::kube::resource_def::BuiltInKind as K;
@@ -692,5 +694,68 @@ fn the_wire_refuses_an_empty_context_name() {
     assert_eq!(
         bincode::serialize(&ContextName::new("prod").unwrap()).unwrap(),
         bincode::serialize(&"prod".to_string()).unwrap(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The handshake refuses a different build, and nobody maintains a number
+// ---------------------------------------------------------------------------
+
+/// `build_id` is an identity, so it has to be the same every time this
+/// process asks. It is cached in a `OnceLock` precisely so a binary replaced
+/// mid-run cannot make one connection disagree with the next.
+#[test]
+fn build_id_is_stable_within_a_process() {
+    let a = build_id();
+    assert_eq!(a, build_id());
+    assert_eq!(a, build_id(), "cached, not re-stat'ed per call");
+}
+
+/// Two ends of the SAME build accept each other. This is the case that must
+/// not regress: the identity is derived, so if the derivation were unstable
+/// (hashing something that varies per process, say) every connection would
+/// fail and the TUI would never reach a daemon at all.
+#[tokio::test]
+async fn a_matching_build_completes_the_handshake() {
+    let (mut a, mut b) = tokio::io::duplex(64);
+    write_handshake(&mut a).await.expect("write");
+    read_handshake(&mut b).await.expect("same build must be accepted");
+}
+
+/// A peer that speaks no preamble is distinguished from one that is merely a
+/// different build — the two need different advice, and the magic is what
+/// tells them apart. (It also doubles as a poison frame-length: a peer that
+/// reads these four bytes as a length sees ~1.26 GB and bails.)
+#[tokio::test]
+async fn a_peer_with_no_preamble_is_named_as_such() {
+    use tokio::io::AsyncWriteExt;
+    let (mut a, mut b) = tokio::io::duplex(64);
+    a.write_all(&[0u8; 12]).await.expect("write");
+    let err = read_handshake(&mut b).await.expect_err("must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("no protocol handshake"), "got: {msg}");
+}
+
+/// THE point of the change: a stale daemon is refused, and the error says
+/// what to do rather than naming two numbers.
+///
+/// This used to be a hand-maintained `PROTOCOL_VERSION` you had to remember
+/// to bump — and forgetting was SILENT, because bincode is positional, so an
+/// old peer decodes new bytes into the wrong variant rather than erroring.
+#[tokio::test]
+async fn a_different_build_is_refused() {
+    use tokio::io::AsyncWriteExt;
+    let (mut a, mut b) = tokio::io::duplex(64);
+    a.write_all(&PROTOCOL_MAGIC.to_be_bytes()).await.expect("magic");
+    // Any id but ours. `wrapping_add(1)` rather than a constant, so this
+    // cannot accidentally equal a real build id.
+    a.write_all(&build_id().wrapping_add(1).to_be_bytes()).await.expect("id");
+    let err = read_handshake(&mut b).await.expect_err("must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("different build"), "got: {msg}");
+    assert!(
+        !msg.contains("version"),
+        "the advice must not talk about versions — there is no ordering \
+         between two build ids: {msg}",
     );
 }

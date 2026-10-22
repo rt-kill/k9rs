@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
-use crate::ui::theme::Theme;
+use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
 // k9rs ASCII art logo (rendered in orange)

@@ -176,7 +176,7 @@ impl ConvertToRow<Node> for NodeDef {
         let sh_gpu_cap = capacity.get("nvidia.com/gpu.shared").and_then(|q| q.0.parse::<i64>().ok()).unwrap_or(0);
 
         let drill_target = Some(DrillTarget::PodsByField(
-            crate::app::nav::K8sFieldSelector::SpecNodeName(meta.name.clone()),
+            crate::kube::resources::row::K8sFieldSelector::SpecNodeName(meta.name.clone()),
         ));
 
         // CPU, %CPU, MEM, %MEM are Placeholder here — the metrics overlay

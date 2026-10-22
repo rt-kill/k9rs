@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, StatefulWidget, Widget},
 };
 
-use crate::ui::theme::Theme;
+use crate::theme::Theme;
 
 /// State for the YAML viewer widget. Pure data — the authoritative state
 /// lives in [`crate::app::ContentViewState`] (inside `Route::ContentView`); this

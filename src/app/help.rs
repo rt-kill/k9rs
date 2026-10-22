@@ -28,7 +28,7 @@ pub struct HelpContent {
     /// Which view the user pressed `?` in. Help is CONTEXTUAL now: a
     /// context-free dump had to describe `s` and `Ctrl-d` without saying
     /// which view it meant, so it was wrong in at least one of them.
-    class: crate::event::keymap::ViewClass,
+    class: crate::app::keymap::ViewClass,
     /// Whether the element `?` was pressed in has markable rows — the SAME
     /// answer `Element::markable` gives the select gate, handed in rather
     /// than re-derived from the capability manifest, so the screen and the
@@ -45,7 +45,7 @@ impl HelpContent {
     /// detail, DELETE in a table) with no indication of which view they meant,
     /// omitted `J`/`U`/`~` entirely, and advertised a `Ctrl-l` feature that had
     /// been deleted. Now help shows the keys for the view you are actually in,
-    /// and [`crate::event::keymap`]'s agreement test makes each one true.
+    /// and [`crate::app::keymap`]'s agreement test makes each one true.
     /// The help content as TABLE ROWS — the projection that lets help be an
     /// ordinary resource instead of a bespoke overlay.
     ///
@@ -58,7 +58,7 @@ impl HelpContent {
     pub fn rows(
         caps: Option<crate::kube::protocol::ResourceCapabilities>,
         keys: crate::app::KeysConfig,
-        class: crate::event::keymap::ViewClass,
+        class: crate::app::keymap::ViewClass,
         markable: bool,
     ) -> (Vec<String>, Vec<crate::kube::resources::row::ResourceRow>) {
         use crate::kube::resources::row::{CellValue, ResourceRow};
@@ -93,7 +93,7 @@ impl HelpContent {
     }
 
     fn sections(&self) -> Vec<HelpSection> {
-        use crate::event::keymap;
+        use crate::app::keymap;
 
         let to_entries = |bindings: Vec<keymap::Binding>| -> Vec<HelpEntry> {
             bindings
@@ -218,7 +218,7 @@ impl HelpContent {
                 let key = self
                     .keys
                     .op_key(op)
-                    .or_else(|| op.structural_chord())
+                    .or_else(|| crate::app::keymap::structural_chord(op))
                     .map(|c| c.label())
                     .unwrap_or_default();
                 let label = op.descriptor().label;
@@ -278,7 +278,7 @@ impl HelpContent {
             // destructive key is the worse one — and it made Delete
             // inconsistent with the two siblings below, which were right.
             for op in &caps.operations {
-                if let Some(chord) = op.structural_chord() {
+                if let Some(chord) = crate::app::keymap::structural_chord(op) {
                     entries.push(HelpEntry {
                         key: chord.label(),
                         description: op.descriptor().label.into(),

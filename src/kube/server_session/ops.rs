@@ -292,7 +292,7 @@ impl ServerSession {
     }
 
     /// Capability gate: extracts the target's [`BuiltInKind`] and asserts
-    /// it supports the given [`OperationKind`]. On failure, emits a typed
+    /// it supports the given [`crate::kube::protocol::OperationKind`]. On failure, emits a typed
     /// rejection and returns `None` so the caller can `return` cleanly.
     /// Shared between scale/restart/decode-secret/trigger/toggle handlers.
     pub(super) fn require_capability(

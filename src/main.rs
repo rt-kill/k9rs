@@ -1,7 +1,21 @@
+// A doc link that names a path is a CHECKABLE claim, so let the compiler
+// check it. Four doc comments pointed at `ui::widgets::Role::SHED_ORDER`,
+// a path that has never existed — `Role` is in `kube::protocol` — and the
+// warning was there all along with nothing denying it. Doc rot is the same
+// class as a doc asserting a guarantee nothing enforces, and this is the one
+// part of that class a lint can hold.
+#![deny(rustdoc::broken_intra_doc_links)]
+
 pub mod app;
 pub mod cli;
-pub mod event;
 pub mod kube;
+// The TUI's session layer: the event loop, the action dispatch, the command
+// bar and the daemon-event apply. It lived under `kube/` and is not Kubernetes
+// access at all — it is written against `&mut App` and calls `ui::draw`, which
+// is why `kube -> app` read 330 references with 306 of them in these four
+// files. Moving them is the single largest cycle collapse in the split.
+pub mod session;
+pub mod theme;
 pub mod ui;
 pub mod util;
 
@@ -21,7 +35,7 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
-use crate::event::AppEvent;
+use crate::app::event::AppEvent;
 
 #[derive(Parser, Debug)]
 #[command(name = "k9rs", version, about = "A fast Kubernetes TUI")]
@@ -30,7 +44,7 @@ struct Cli {
     /// Color scheme: auto (detect the terminal background), dark, or light.
     /// Overrides `ui.theme` from the config file for this run.
     #[arg(long, value_name = "MODE")]
-    theme: Option<crate::ui::theme::ThemeMode>,
+    theme: Option<crate::theme::ThemeMode>,
 
     /// Kubernetes context to use
     #[arg(long)]
@@ -60,7 +74,7 @@ struct Cli {
     #[arg(long)]
     readonly: bool,
 
-    /// Navigation path: resource [filter] [resource [filter]] ...
+    /// Navigation path: resource \[filter\] \[resource \[filter\]\] ...
     ///
     /// Each arg that matches a known resource (pods, deploy, svc, ...) starts
     /// a new nav level. Unrecognized args become grep filters for the current
@@ -97,6 +111,13 @@ impl Drop for TerminalGuard {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Overlays come from the process entry point, not from whoever reads them
+    // first. BEFORE the dispatch below, so the daemon, the TUI and any
+    // subcommand added later all get them from one site — and so the only
+    // processes without them are the ones that never run `main`, i.e. the test
+    // binaries. See `kube::overlay::OVERLAYS`.
+    crate::kube::overlay::load_from_home();
 
     // Subcommand dispatch: daemon, ctl, contexts
     if let Some(subcmd) = cli.subcmd {
@@ -149,9 +170,9 @@ async fn main() -> Result<()> {
     let startup_segments = parse_startup_segments(&cli);
 
     let (event_tx, event_rx) =
-        mpsc::channel::<AppEvent>(crate::kube::session::EVENT_CHANNEL_CAP);
+        mpsc::channel::<AppEvent>(crate::session::EVENT_CHANNEL_CAP);
 
-    use crate::kube::client_session::ClientSession;
+    use crate::app::client::ClientSession;
 
     // Load + validate the user config BEFORE any TUI setup: a config
     // error prints to a normal, visible stderr and exits. The strict
@@ -183,7 +204,7 @@ async fn main() -> Result<()> {
     // inside `subscribe_stream` await the MuxHandle, so subscribes fire
     // as soon as the connection is up.
     let data_source = ClientSession::new(
-        crate::kube::client_session::ConnectionParams {
+        crate::app::client::ConnectionParams {
             context: cli_context.clone(),
             namespace: namespace.clone(),
             readonly: cli.readonly,
@@ -417,14 +438,14 @@ async fn main() -> Result<()> {
 
     // Run the TUI event loop.
     // TerminalGuard ensures cleanup even if this returns Err.
-    let exit_reason = crate::kube::session::session_main(
+    let exit_reason = crate::session::session_main(
         app,
         data_source,
         terminal,
         event_tx,
         event_rx,
         tick_rate,
-        crate::kube::session::InputChannels {
+        crate::session::InputChannels {
             input_rx,
             suspend_tx,
             suspend_ack_rx,
@@ -511,7 +532,7 @@ fn parse_startup_segments(cli: &Cli) -> Vec<StartupSegment> {
 
 fn apply_startup_nav(
     app: &mut App,
-    data_source: &crate::kube::client_session::ClientSession,
+    data_source: &crate::app::client::ClientSession,
     segments: &[StartupSegment],
 ) {
     if segments.is_empty() {

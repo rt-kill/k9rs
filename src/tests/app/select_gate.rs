@@ -153,7 +153,7 @@ fn esc_clears_the_selection_before_it_pops_the_stack() {
 fn esc_reaches_the_gate_even_at_an_undrilled_root() {
     let app = seeded_app(&["a"]);
     assert!(!app.nav.is_drilled(), "the case that used to swallow the key");
-    let action = crate::event::handler::handle_key_event(
+    let action = crate::app::handler::handle_key_event(
         &app,
         crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Esc,

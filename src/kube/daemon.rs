@@ -17,6 +17,38 @@ use super::protocol::{self, DaemonStatus, SessionCommand, SessionEvent};
 use super::server_session::{ServerSession, SessionSharedState};
 
 // ---------------------------------------------------------------------------
+// Binary identity — why this daemon stops when the binary moves
+// ---------------------------------------------------------------------------
+
+/// How often the daemon checks whether its own binary was replaced.
+///
+/// Only a ceiling on how long a stale daemon can keep refusing clients; the
+/// cost is one `stat` per tick.
+const EXE_WATCH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The file currently at `path`, as (device, inode, size, mtime).
+///
+/// The path is a PARAMETER, captured once at startup, and that is the whole
+/// trick. `std::env::current_exe()` reads `/proc/self/exe`, which resolves to
+/// the running INODE — so once cargo replaces the binary by rename, the old
+/// inode is unlinked and `current_exe()` answers `"…/k9rs (deleted)"`, which
+/// stats to nothing. Re-asking it each tick therefore reports "cannot tell"
+/// at exactly the moment there is something to tell. (Written that way first;
+/// the self-exit silently never fired, which is why the test below exists.)
+///
+/// Stat'ing the remembered path instead sees whatever is at that path NOW —
+/// the new file — and the difference is the signal.
+///
+/// `None` when it cannot be stat'ed. An unreadable binary is NOT "changed":
+/// the answer to "did someone rebuild" has to be yes-or-no, and an error is
+/// neither, so the caller acts only on a definite difference.
+fn exe_identity(path: &std::path::Path) -> Option<(u64, u64, u64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.dev(), m.ino(), m.size(), m.mtime()))
+}
+
+// ---------------------------------------------------------------------------
 // Socket path
 // ---------------------------------------------------------------------------
 
@@ -111,6 +143,15 @@ pub async fn run_daemon() -> anyhow::Result<()> {
     }
     info!(socket = ?path, "daemon listening");
 
+    // What this daemon was started FROM. Compared against the same path
+    // periodically below: when the binary is replaced, this daemon is the
+    // stale half of every future handshake, so it stops being the daemon
+    // rather than making each new client print "pkill k9rs".
+    // Captured ONCE, while the binary is still the one we are running.
+    let exe_path = std::env::current_exe().ok();
+    let started_from = exe_path.as_deref().and_then(exe_identity);
+    let mut exe_watch = tokio::time::interval(EXE_WATCH_INTERVAL);
+
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
     )?;
@@ -169,6 +210,17 @@ pub async fn run_daemon() -> anyhow::Result<()> {
                 let removed = state.session_shared.discovery_cache.sweep_stale(DISCOVERY_CACHE_TTL);
                 if removed > 0 {
                     debug!("discovery cache: swept {removed} idle context(s)");
+                }
+            }
+            // The binary on disk changed, so a newer build exists and this
+            // process can only ever be the stale peer. Exiting lets the next
+            // client start a daemon from the new binary — which is what
+            // `pkill k9rs` was doing by hand after every rebuild.
+            _ = exe_watch.tick() => {
+                let now = exe_path.as_deref().and_then(exe_identity);
+                if now.is_some() && started_from.is_some() && now != started_from {
+                    info!("shutting down (the k9rs binary was replaced)");
+                    break;
                 }
             }
             _ = sigterm.recv() => {
@@ -376,3 +428,7 @@ impl DaemonClient {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/kube/daemon.rs"]
+mod tests;

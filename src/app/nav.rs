@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use crate::app::element::Element;
-use crate::kube::client_session::ClientSession;
+use crate::app::client::ClientSession;
 use crate::kube::protocol::ResourceId;
 use crate::util::SearchPattern;
 

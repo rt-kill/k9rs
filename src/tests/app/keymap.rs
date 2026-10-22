@@ -7,7 +7,7 @@
 use super::*;
 use crate::app::element::{Element, LogSession};
 use crate::app::App;
-use crate::event::handler::handle_key_event;
+use crate::app::handler::handle_key_event;
 use crate::kube::protocol::LogContainer;
 
 /// Put the app into a state whose top element has the given class.
@@ -240,7 +240,7 @@ fn a_hint_bar_is_a_subset_of_what_help_shows() {
 /// for every class at every width, including the ones nobody has measured.
 #[test]
 fn a_hint_bar_fits_or_admits_it() {
-    let theme = crate::ui::theme::Theme::dark();
+    let theme = crate::theme::Theme::dark();
     for class in CLASSES {
         let hints = bar_hints(class);
         if hints.is_empty() {

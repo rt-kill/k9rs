@@ -119,8 +119,8 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
         // Keybinding bar
         // Projected from the ONE keymap declaration, so this bar cannot
         // advertise a key the dispatcher doesn't have (or miss one it does).
-        let hints = crate::event::keymap::bar_hints(
-            crate::event::keymap::ViewClass::Detail,
+        let hints = crate::app::keymap::bar_hints(
+            crate::app::keymap::ViewClass::Detail,
         );
         let line = crate::ui::header::render_keybinding_bar(&hints, bar_area.width, theme);
         f.render_widget(line, bar_area);

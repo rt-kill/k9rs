@@ -2,7 +2,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::Block;
 
 use crate::app::ShellState;
-use crate::ui::theme::Theme;
+use crate::theme::Theme;
 
 /// Render the shell overlay. Only visible during the Connecting phase —
 /// once the daemon confirms the connection, the session loop suspends

@@ -1095,47 +1095,15 @@ impl OperationKind {
 
     // NOTE: the OperationKind → client `Action` mapping deliberately does
     // NOT live here — it's `impl From<&OperationKind> for Action` in
-    // `app::actions`, so this wire module never depends on client types.
-
-    /// The fixed chord that reaches this operation when it has no
-    /// descriptor default key — `None` for everything that does.
-    ///
-    /// Three operations are structural: `Delete`, `ForceKill` and
-    /// `PortForward` are destructive or modal enough that they are NOT on a
-    /// bare letter. Their chords were written as the strings `"Ctrl-d"`,
-    /// `"Ctrl-k"` and `"Shift-F"` in two places in `help.rs` AND matched
-    /// separately in `event::handler` — three copies of one fact, none of
-    /// them the authority, and `Shift-F` was the one the handler did not
-    /// gate on the resource declaring the operation at all.
-    ///
-    /// Returned as a [`KeyCombo`](crate::app::KeyCombo) rather than a
-    /// string so the handler can compare against a key event and help can
-    /// print it, from the same declaration.
-    pub fn structural_chord(&self) -> Option<crate::app::KeyCombo> {
-        use crate::app::KeyCombo;
-        match self {
-            OperationKind::Delete => Some(KeyCombo { ctrl: true, ch: 'd' }),
-            OperationKind::ForceKill => Some(KeyCombo { ctrl: true, ch: 'k' }),
-            OperationKind::PortForward => Some(KeyCombo::plain('F')),
-            // Everything else is reached by its descriptor's default key, or
-            // by a chord the user configured. EXHAUSTIVE deliberately: a new
-            // operation has to say which it is.
-            OperationKind::Describe
-            | OperationKind::Yaml
-            | OperationKind::Scale
-            | OperationKind::StreamLogs
-            | OperationKind::PreviousLogs
-            | OperationKind::Shell
-            | OperationKind::Restart
-            | OperationKind::ShowNode
-            | OperationKind::NodeShell
-            | OperationKind::DecodeSecret
-            | OperationKind::TriggerCronJob
-            | OperationKind::ToggleSuspendCronJob
-            | OperationKind::Apply
-            | OperationKind::Custom(_) => None,
-        }
-    }
+    // `app::actions`.
+    //
+    // That used to end "…so this wire module never depends on client types",
+    // which was false sixteen lines below: `structural_chord` returns
+    // `app::KeyCombo`. One dependency was moved out and a different one added
+    // underneath the claim. The honest statement is that this module has
+    // exactly ONE client dependency and it is the next function down;
+    // `KeyCombo` is a two-field POD and belongs below this module, which is
+    // what would make the claim true rather than aspirational.
 
     /// Batch stance: whether this operation may act on the MARKED SET
     /// (select mode) or is inherently single-target. Static manifest like
@@ -1579,12 +1547,29 @@ pub struct LogInit {
 // narrowed to one-shot request/response commands + global events)
 // ---------------------------------------------------------------------------
 
-/// Protocol version for the TUI↔daemon wire format. Bump this whenever
-/// `ResourceRow`, `SessionCommand`, `SessionEvent`, or any serialized type
-/// changes in a bincode-incompatible way (new fields, reordering, etc.).
-/// Exchanged in the raw [`write_handshake`]/[`read_handshake`] preamble
-/// BEFORE any framed message, so a version mismatch can never mis-parse an
-/// enum — stale peers fail fast with a readable error.
+/// Wire-format revision — a MARKER FOR HUMANS AND TESTS, read by nothing at
+/// runtime.
+///
+/// It used to be the handshake's identity, and that was the debt: a number
+/// you had to remember to bump, whose failure mode when you forgot was
+/// SILENT. bincode is positional, so a new client against an old daemon does
+/// not error — it decodes bytes into the wrong variant. A discipline standing
+/// in for a mechanism, which is the same shape as a doc claiming a guarantee
+/// nothing enforces.
+///
+/// The handshake now exchanges [`build_id`], which is derived and therefore
+/// cannot be forgotten. This number stays for the two jobs it is actually
+/// good at, neither of which is gating a connection:
+///
+/// 1. The history below — why the wire changed, in order. That is
+///    documentation, and deriving an identity does not write it for you.
+/// 2. A deliberate-break tripwire the golden tests hang off
+///    (`stream_wire_tags_are_stable` asserts this value, so a conscious wire
+///    break forces a re-read of the pinned bincode tags). A derived
+///    fingerprint cannot do this — it changes when a comment changes, so
+///    nothing can assert on it.
+///
+/// Forgetting to bump it now fails a test instead of corrupting a decode.
 ///
 /// v9: `SessionEvent::OpResult` — mutating-operation results carry their
 /// originating `ObjectRef` (per-item batch correlation; target-gated edit
@@ -1644,7 +1629,48 @@ pub struct LogInit {
 /// `--timestamps` / `timestamps: true` and splits the kubelet's stamp off
 /// itself, because the renderer's heuristic was scoring application text and
 /// deleting it from the body when timestamps were toggled off.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const WIRE_FORMAT_REVISION: u32 = 16;
+
+/// This build's identity — what the handshake actually compares.
+///
+/// The daemon and the TUI are the SAME binary (`k9rs daemon` is a
+/// subcommand), so skew here never comes from distribution; it comes from
+/// PROCESS LIFETIME. A daemon started at 12:41 is still serving when you
+/// rebuild at 14:34, and that is the only way the two ends can disagree.
+/// So the honest question is not "which protocol version do you speak" but
+/// "are you running my executable", and that is answerable without anyone
+/// maintaining anything.
+///
+/// Derived from the running executable's identity on disk — device, inode,
+/// size and mtime. Cheap (one `stat`, cached), and it moves whenever the
+/// binary does. When cargo replaces the file, a running daemon keeps the old
+/// inode open while a fresh client stats the new one, so the two compute
+/// different ids and the mismatch is caught in the preamble.
+///
+/// Hashing is safe here precisely because both ends are one build: the value
+/// never has to be stable across rustc versions or machines, only within a
+/// single executable's own lifetime.
+///
+/// Falls back to [`WIRE_FORMAT_REVISION`] if the executable cannot be
+/// stat'ed, which keeps the handshake meaningful rather than making every
+/// peer look identical.
+pub fn build_id() -> u64 {
+    static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = std::env::current_exe().and_then(std::fs::metadata) else {
+            return u64::from(WIRE_FORMAT_REVISION);
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        meta.dev().hash(&mut h);
+        meta.ino().hash(&mut h);
+        meta.size().hash(&mut h);
+        meta.mtime().hash(&mut h);
+        meta.mtime_nsec().hash(&mut h);
+        h.finish()
+    })
+}
 
 /// Handshake magic — "K9RS" as a big-endian u32. Doubles as a poison
 /// length: a pre-8 daemon reads these 4 bytes as a frame-length prefix of
@@ -1653,42 +1679,49 @@ pub const PROTOCOL_VERSION: u32 = 16;
 /// length where the magic should be and reports the mismatch.
 pub const PROTOCOL_MAGIC: u32 = 0x4B39_5253;
 
-/// Write the 8-byte connection preamble: MAGIC then PROTOCOL_VERSION, both
+/// Write the 12-byte connection preamble: MAGIC then [`build_id`], both
 /// big-endian (matching the hand-rolled frame-length convention). The
 /// client writes first; the server replies with its own preamble.
 pub async fn write_handshake<W: AsyncWriteExt + Unpin>(writer: &mut W) -> anyhow::Result<()> {
     writer.write_all(&PROTOCOL_MAGIC.to_be_bytes()).await?;
-    writer.write_all(&PROTOCOL_VERSION.to_be_bytes()).await?;
+    writer.write_all(&build_id().to_be_bytes()).await?;
     writer.flush().await?;
     Ok(())
 }
 
-/// Read and validate the peer's 8-byte preamble. Errors distinguish a
-/// pre-handshake peer (no magic) from a version mismatch, so the caller
-/// can surface an actionable message ("restart the daemon: pkill k9rs").
+/// Read and validate the peer's 12-byte preamble. Errors distinguish a peer
+/// that speaks no preamble at all from one that is simply a different build,
+/// so the caller can surface an actionable message.
 pub async fn read_handshake<R: AsyncReadExt + Unpin>(reader: &mut R) -> anyhow::Result<()> {
-    let mut buf = [0u8; 8];
+    let mut buf = [0u8; 12];
     reader.read_exact(&mut buf).await?;
     let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let version = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let peer = u64::from_be_bytes([
+        buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+    ]);
     if magic != PROTOCOL_MAGIC {
         anyhow::bail!(
-            "incompatible peer (no protocol handshake — pre-v8 binary?). \
-             Restart the daemon: pkill k9rs"
+            "incompatible peer (no protocol handshake). Restart the daemon: pkill k9rs"
         );
     }
-    if version != PROTOCOL_VERSION {
+    if peer != build_id() {
+        // Not "which version" — the two ends are the same binary, so a
+        // mismatch means one of them is a stale PROCESS, not an old release.
+        // The daemon exits by itself when its binary is replaced (see
+        // `daemon::exe_identity`), so reaching here means that has not
+        // happened yet; say what to do rather than naming two numbers that
+        // cannot be compared for age.
         anyhow::bail!(
-            "protocol version mismatch: peer speaks v{version}, this binary speaks v{}. \
-             Restart the daemon: pkill k9rs",
-            PROTOCOL_VERSION
+            "the running daemon is a different build of k9rs than this client \
+             (it was started from an older binary). It will exit on its own \
+             shortly; to not wait: pkill k9rs"
         );
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Subscription stream payloads (see PROTOCOL_VERSION)
+// Subscription stream payloads (see WIRE_FORMAT_REVISION)
 // ---------------------------------------------------------------------------
 
 /// Full authoritative state of one subscribed resource. Reset semantics:
@@ -2206,11 +2239,15 @@ mod tests;
 /// they pass even if a `CellValue` variant is reordered or a `ResourceRow`
 /// field is inserted/removed — a daemon and a TUI built from different revisions
 /// would then silently misread each other's frames (bincode is positional;
-/// nothing self-describing is on the wire, only the `PROTOCOL_VERSION` gate).
+/// nothing self-describing is on the wire — the only thing standing between
+/// that and a corrupt decode is the [`build_id`] preamble, which refuses the
+/// connection outright).
 ///
 /// These tests freeze the exact bytes. If one fails you changed an on-wire
-/// shape: that is a breaking change — bump [`PROTOCOL_VERSION`], update the
-/// golden here, and ship daemon + TUI together.
+/// shape: that is a breaking change — bump [`WIRE_FORMAT_REVISION`] (the
+/// marker, so this test's tripwire fires), update the golden here, and ship
+/// daemon + TUI together. The runtime refusal is automatic; the bump is for
+/// the humans and the tripwire.
 #[cfg(test)]
 #[path = "../tests/kube/protocol_golden.rs"]
 mod wire_layout_golden;

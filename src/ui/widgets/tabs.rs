@@ -7,7 +7,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::kube::protocol::ResourceId;
-use crate::ui::theme::Theme;
+use crate::theme::Theme;
 
 /// Breadcrumb bar showing the current resource type and namespace.
 ///

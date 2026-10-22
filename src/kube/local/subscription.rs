@@ -3,7 +3,7 @@
 //! Parallel to [`crate::kube::live_query::Subscription`] and uses the same
 //! ownership model: the subscription holds a strong `Arc` to the
 //! `LocalResourceSource`, and on `Drop` it spawns a grace-period task that
-//! holds the `Arc` for [`GRACE_PERIOD_SECS`](crate::kube::GRACE_PERIOD_SECS)
+//! holds the `Arc` for `DEFAULT_LOCALS_GRACE_SECS`
 //! before releasing it.
 //!
 //! This subscription-level grace matters only for **demand-scoped** sources
@@ -36,7 +36,7 @@ pub struct LocalSubscription {
     pub snapshot_rx: watch::Receiver<TableBaseline>,
     /// Strong handle to the underlying source. Keeps the source alive for
     /// as long as the subscription exists; on `Drop` the grace period
-    /// extends that lifetime by [`GRACE_PERIOD_SECS`](crate::kube::GRACE_PERIOD_SECS) more seconds.
+    /// extends that lifetime by `DEFAULT_LOCALS_GRACE_SECS` more seconds.
     _keepalive: SharedLocalSource,
 }
 

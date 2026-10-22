@@ -1,3 +1,15 @@
+//! The TUI's session layer: the event loop, the per-key action dispatch, the
+//! command bar, and the apply path for daemon events.
+//!
+//! These four files lived under `kube/` and are not Kubernetes access — they
+//! are written against `&mut App` and `session::mod` calls `ui::draw`
+//! outright. That misfiling was the whole of the `kube -> app` cycle: 306 of
+//! its 330 references were here.
+
+pub mod actions;
+pub mod commands;
+pub mod events;
+
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
@@ -11,8 +23,8 @@ use crossterm::{
 use tokio::sync::mpsc;
 
 use crate::app::App;
-use crate::event::AppEvent;
-use crate::kube::client_session::ClientSession;
+use crate::app::event::AppEvent;
+use crate::app::client::ClientSession;
 use crate::kube::repaint::Repaint;
 
 struct RawFd(std::os::unix::io::RawFd);
@@ -20,9 +32,9 @@ impl AsRawFd for RawFd {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd { self.0 }
 }
 
-use crate::kube::session_actions::handle_action;
-use crate::kube::session_events::apply_event;
-use crate::kube::session_commands::{
+use crate::session::actions::handle_action;
+use crate::session::events::apply_event;
+use crate::session::commands::{
     run_interactive_local,
     handle_command_key, handle_form_dialog_key, handle_filter_key,
 };
@@ -100,7 +112,7 @@ pub(crate) async fn open_exec_overlay(
     data_source: &ClientSession,
     exec_init: crate::kube::protocol::ExecInit,
     title: String,
-    event_tx: &tokio::sync::mpsc::Sender<crate::event::AppEvent>,
+    event_tx: &tokio::sync::mpsc::Sender<crate::app::event::AppEvent>,
 ) -> Result<()> {
     let stream = data_source.open_exec_stream(exec_init.clone(), event_tx.clone()).await?;
 
@@ -270,7 +282,7 @@ impl<B: ratatui::backend::Backend + std::io::Write> Drop for SuspendGuard<'_, B>
 /// races them; settle over a few short passes instead.
 ///
 /// CONTENT-aware, not a blanket drop: only events matching the shredded-
-/// response shape (see [`is_resume_debris`]) are discarded. Real type-ahead
+/// response shape (see `is_resume_debris`) are discarded. Real type-ahead
 /// keyed during the ~45ms window is KEPT — returned in arrival order for the
 /// caller to replay — honoring the input arm's "keys are never dropped"
 /// contract, which the old drain-everything version quietly violated.
@@ -472,7 +484,7 @@ async fn handle_one_key(
     }
 
     repaint.on_input();
-    let Some(action) = crate::event::handler::handle_key_event(app, key) else {
+    let Some(action) = crate::app::handler::handle_key_event(app, key) else {
         return KeyDrain::Continue;
     };
     // Select-mode gate: THE single choke point — every key→Action route
@@ -551,7 +563,7 @@ async fn run_editor_flow(
     let exit_status = match run_interactive_local(
         app, event_rx,
         terminal, &editor, &args,
-        crate::kube::session_commands::InteractiveKind::Editor,
+        crate::session::commands::InteractiveKind::Editor,
         input_suspend, input_suspend_ack, input_rx, replay,
     ).await {
         Ok(s) => s,
@@ -1264,7 +1276,7 @@ pub async fn session_main(
             event_tx = new_tx;
             event_rx = new_rx;
             data_source = ClientSession::new(
-                crate::kube::client_session::ConnectionParams {
+                crate::app::client::ConnectionParams {
                     context: ctx,
                     namespace: app.kube.selected_ns.clone(),
                     readonly: app.read_only,
@@ -1555,5 +1567,5 @@ pub async fn session_main(
 }
 
 #[cfg(test)]
-#[path = "../tests/kube/session.rs"]
+#[path = "../tests/session.rs"]
 mod tests;

@@ -67,7 +67,7 @@
 //! 5. Answer [`LocalResourceSource::describe`] and
 //!    [`LocalResourceSource::yaml`] if the rows have detail worth a `d`/`y`.
 //!    Both return `Option`, and `None` is a real answer — the dispatcher
-//!    turns it into "describe is not supported on <plural>", so there is
+//!    turns it into "describe is not supported on `<plural>`", so there is
 //!    nothing to register and nothing a new kind can forget.
 //!
 //! Nothing else needs touching: capabilities come from the typed

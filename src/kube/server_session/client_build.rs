@@ -261,7 +261,7 @@ fn exec_env_entry(name: &str, value: &str) -> HashMap<String, String> {
 /// perturb the hash and needlessly split a watcher equal-credential sessions
 /// should share.
 ///
-/// Cross-session sharing is also coupled to [`crate::kube::client_session`]'s
+/// Cross-session sharing is also coupled to the client session's
 /// `collect_env_vars` staying a *small, auth-scoped allowlist*: the injected
 /// `exec.env` is part of this hash, so forwarding volatile vars (PWD, TERM, …)
 /// there would split otherwise-shareable sessions.
