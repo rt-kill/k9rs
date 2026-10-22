@@ -458,7 +458,7 @@ fn handle_resource_op(
             }
             if let Some(info) = require_selected(app) {
                 ds_try!(app, data_source.yaml(&info));
-                app.ui.close_modal();
+                // ONE call — see the note in `session::open_shell`.
                 app.ui.close_modal();
                 app.ui.open(crate::app::Modal::Takeover(crate::app::TakeoverOp::Edit {
                     target: info,

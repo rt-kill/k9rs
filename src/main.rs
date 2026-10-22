@@ -281,26 +281,92 @@ async fn main() -> Result<()> {
         enum Wake {
             Suspend(Result<(), tokio::sync::watch::error::RecvError>),
             Input(Option<Result<crossterm::event::Event, std::io::Error>>),
+            /// The terminal is gone, and only a direct poll of fd 0 says so.
+            HungUp,
         }
 
-        let mut event_stream = Some(EventStream::new());
+        /// Why there is no `EventStream` right now.
+        ///
+        /// This was an `Option`, which conflated two OPPOSITE situations:
+        /// suspended (a subprocess owns the terminal — wait for the resume
+        /// edge and touch nothing) and broken (rebuild promptly). Conflated,
+        /// only one of them could be served: the no-stream branch waited for
+        /// a resume, so a stream that FAILED would have waited for a resume
+        /// edge that was never coming.
+        enum Input {
+            /// Reading stdin.
+            Live(EventStream),
+            /// Released for a subprocess; resumes on the suspend edge.
+            Suspended,
+            /// Failed; rebuild after a short pause.
+            Rearm,
+        }
+
+        /// Consecutive stream failures tolerated before the bridge gives up.
+        ///
+        /// `EventStream::poll_next` polls with a ZERO-second internal
+        /// timeout, so a sticky stdin error (a hung-up pty) resolves
+        /// `Ready(Some(Err))` immediately and forever. The old
+        /// `Some(Err(_)) => continue` was therefore a hot loop burning a
+        /// core, not a retry. Bounded as well as paced, because a source
+        /// that cannot be rebuilt five times running is not coming back, and
+        /// the session should say so rather than paint on, deaf, for ever.
+        const MAX_INPUT_FAILURES: u32 = 5;
+        const REARM_DELAY: Duration = Duration::from_millis(50);
+        /// How often to ask fd 0 whether it has hung up. Only a ceiling on
+        /// how long a dead terminal goes unnoticed — the cost is one
+        /// non-blocking `poll(2)` per tick.
+        const HUP_POLL: Duration = Duration::from_millis(500);
+
+        let mut input = Input::Live(EventStream::new());
+        let mut failures: u32 = 0;
         loop {
-            let Some(stream) = event_stream.as_mut() else {
-                // Suspended: no stream, so nothing is reading stdin. Wait for
-                // the resume edge and build a fresh one.
-                if suspend_rx.changed().await.is_err() {
-                    break;
+            let stream = match &mut input {
+                Input::Live(s) => s,
+                Input::Suspended => {
+                    // Nothing is reading stdin. Wait for the resume edge and
+                    // build a fresh stream.
+                    if suspend_rx.changed().await.is_err() {
+                        break;
+                    }
+                    if !*suspend_rx.borrow() {
+                        input = Input::Live(EventStream::new());
+                    }
+                    continue;
                 }
-                if !*suspend_rx.borrow() {
-                    event_stream = Some(EventStream::new());
+                Input::Rearm => {
+                    tokio::time::sleep(REARM_DELAY).await;
+                    // A suspend may have landed while we paused; it wins —
+                    // rebuilding now would read stdin out from under whatever
+                    // the user is talking to.
+                    input = if *suspend_rx.borrow() {
+                        Input::Suspended
+                    } else {
+                        Input::Live(EventStream::new())
+                    };
+                    continue;
                 }
-                continue;
             };
 
             let wake = tokio::select! {
                 biased;
                 res = suspend_rx.changed() => Wake::Suspend(res),
                 ev = stream.next() => Wake::Input(ev),
+                // The hangup crossterm will not report. On a pty whose master
+                // has closed, `poll_next` returns PENDING, not `Err`: the fd
+                // is permanently ready-with-HUP, so crossterm's helper thread
+                // spins in `loop { if let Ok(true) = poll_internal(None, ..) }`
+                // burning a core, and the stream above simply never resolves.
+                // Measured: ~100% CPU until something else happened to fail.
+                // The failure arms below cannot fire, because nothing is
+                // reported — so the bridge has to ask the fd directly.
+                () = tokio::time::sleep(HUP_POLL) => {
+                    if stdin_hung_up() {
+                        Wake::HungUp
+                    } else {
+                        continue;
+                    }
+                }
             };
 
             match wake {
@@ -312,17 +378,37 @@ async fn main() -> Result<()> {
                     if *suspend_rx.borrow() {
                         // Release stdin BEFORE acking: the ack is what the
                         // suspend guard takes as "the terminal is yours".
-                        event_stream = None;
+                        input = Input::Suspended;
                         let _ = suspend_ack_tx.send(()).await;
                     }
                 }
                 Wake::Input(Some(Ok(ev))) => {
+                    failures = 0;
                     if input_tx.send(ev).await.is_err() {
                         break;
                     }
                 }
-                Wake::Input(Some(Err(_))) => continue,
-                Wake::Input(None) => break,
+                // Both halves of "the stream stopped producing events",
+                // handled the same way because the response is the same.
+                // `None` is unreachable with crossterm 0.28 — every
+                // `poll_next` path returns `Some(Ok)`, `Some(Err)` or
+                // `Pending` — but it is representable, and it used to be a
+                // bare `break`: the ONE arm that silently killed input for
+                // the rest of the session was the one that could not happen,
+                // while the one that does happen spun.
+                // Not a failure to retry: the terminal is gone for good, so
+                // re-arming would only start another spinning reader. Drop
+                // `input_tx` and let the session exit with a reason.
+                Wake::HungUp => break,
+                Wake::Input(Some(Err(_)) | None) => {
+                    failures += 1;
+                    if failures >= MAX_INPUT_FAILURES {
+                        // Dropping `input_tx` is what the session reads as
+                        // "input is gone"; it exits with a reason.
+                        break;
+                    }
+                    input = Input::Rearm;
+                }
             }
         }
     });
@@ -366,6 +452,32 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Has stdin hung up? A non-blocking `poll(2)` for `POLLHUP`/`POLLERR`/
+/// `POLLNVAL` on fd 0.
+///
+/// This exists because crossterm cannot tell us. Its `EventStream` reports a
+/// hung-up pty as `Pending` for ever (verified in crossterm 0.28: every
+/// `poll_next` path is `Some(Ok)`, `Some(Err)` or `Pending`), while its
+/// helper thread spins on the permanently-ready fd. So the one condition
+/// that means "no key will ever arrive again" is the one the stream will
+/// never mention.
+///
+/// `poll` is non-destructive — it consumes no bytes, so it cannot steal a
+/// keystroke from the reader thread polling the same fd.
+///
+/// Returns false on anything ambiguous: this gates an EXIT, so a transient
+/// `EINTR` must not be read as a dead terminal.
+fn stdin_hung_up() -> bool {
+    // SAFETY: `poll` with a 1-element array we own and a zero timeout; it
+    // reads `fds` and writes `revents`, touching nothing else.
+    let mut fds = libc::pollfd { fd: libc::STDIN_FILENO, events: 0, revents: 0 };
+    let rc = unsafe { libc::poll(&mut fds, 1, 0) };
+    if rc < 0 {
+        return false; // EINTR or EAGAIN — ask again next tick.
+    }
+    fds.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
 // ---------------------------------------------------------------------------

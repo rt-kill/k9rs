@@ -3,8 +3,14 @@ use k8s_openapi::api::batch::v1::Job;
 
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
+use crate::kube::resources::k8s_const::STATUS_TRUE;
 use crate::kube::resources::{CommonMeta, WorkloadContainers};
 use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
+
+/// Job condition type meaning "the controller has stopped retrying". Local
+/// to this file because only Jobs have it — the shared constants module in
+/// `resources::mod` is for values two or more converters need.
+const COND_FAILED: &str = "Failed";
 
 // ---------------------------------------------------------------------------
 // JobDef — ResourceDef + ConvertToRow
@@ -73,7 +79,24 @@ impl ConvertToRow<Job> for JobDef {
             Some(DrillTarget::PodsByNameGrep(meta.name.clone()))
         };
 
-        let health = if succeeded >= desired_completions { RowHealth::Normal }
+        // A Job that has GIVEN UP is a fault; a Job still retrying is not.
+        // The authoritative signal is the `Failed` condition, which the Job
+        // controller sets once `backoffLimit` is exhausted (or
+        // `activeDeadlineSeconds` passes) — not `status.failed`, which counts
+        // individual pod attempts and is nonzero on any retrying Job.
+        //
+        // This read nothing but `succeeded`, so a Job that had permanently
+        // failed showed `Pending` — yellow, "in progress" — for ever.
+        //
+        // k9s flags `completions unmet && status.failed > 0` (`render/job.go`
+        // → its VALID column → red), which paints a Job red on its FIRST
+        // transient pod failure while it is still happily retrying. That is a
+        // colour saying something untrue, so we key on the condition instead.
+        let gave_up = status_obj.conditions.iter().flatten().any(|c| {
+            c.type_ == COND_FAILED && c.status == STATUS_TRUE
+        });
+        let health = if gave_up { RowHealth::Failed }
+            else if succeeded >= desired_completions { RowHealth::Normal }
             else { RowHealth::Pending };
 
         let cells: Vec<CellValue> = vec![
@@ -96,3 +119,7 @@ impl ConvertToRow<Job> for JobDef {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/kube/resources/jobs.rs"]
+mod tests;

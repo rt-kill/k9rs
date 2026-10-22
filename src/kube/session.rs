@@ -104,7 +104,9 @@ pub(crate) async fn open_exec_overlay(
 ) -> Result<()> {
     let stream = data_source.open_exec_stream(exec_init.clone(), event_tx.clone()).await?;
 
-    app.ui.close_modal();
+    // ONE call: a modal is one field, so opening or clearing it displaces
+    // whatever was there (see `Modal`). This was written twice — a fossil of
+    // the four-slot era, when every opener had to clear the other three.
     app.ui.close_modal();
     app.ui.open(crate::app::Modal::Takeover(crate::app::TakeoverOp::Shell(Box::new(crate::app::ShellState {
         title,
@@ -138,6 +140,27 @@ fn strip_leading_comments(s: &str) -> &str {
         }
     }
     &s[pos.min(s.len())..]
+}
+
+/// The signals that mean "shut down", as ONE future.
+///
+/// Two `select!` arms doing the same thing is how one of them ends up with a
+/// different body; the shutdown decision is the same whichever signal
+/// arrives, so it is written once. See the installation site for why SIGINT
+/// is here and SIGHUP is not.
+struct ShutdownSignal {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignal {
+    /// Resolves when either signal arrives.
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.term.recv() => {}
+            _ = self.int.recv() => {}
+        }
+    }
 }
 
 /// RAII guard for a suspended TUI. Creation suspends the input bridge and
@@ -1112,13 +1135,32 @@ pub async fn session_main(
     let mut tick_interval = tokio::time::interval(tick_rate);
     let mut last_tick = std::time::Instant::now();
 
-    // Listen for SIGTERM so `pkill k9rs` triggers a clean shutdown instead
-    // of killing the process without running TerminalGuard::drop. The
-    // handler sets should_quit, and the normal exit path restores the
-    // terminal (disable raw mode, leave alternate screen, show cursor).
-    let mut sigterm = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    ).expect("failed to install SIGTERM handler");
+    // Listen for SIGTERM *and* SIGINT so `pkill k9rs` / `kill -INT` trigger a
+    // clean shutdown instead of killing the process without running
+    // TerminalGuard::drop. The handler sets should_quit, and the normal exit
+    // path restores the terminal (disable raw mode, leave alternate screen,
+    // show cursor).
+    //
+    // SIGINT matters because Ctrl-C is NOT a signal here: raw mode clears
+    // `ISIG`, so Ctrl-C arrives as byte 0x03 and is handled as a KEY (see
+    // `handler::handle_global_keys`). Every way out of the TUI therefore rode
+    // the key path, and when that path is not being serviced there was no
+    // escape hatch at all — the daemon installed both signals, the client
+    // only one. This arm does not make terminal Ctrl-C work while the key
+    // path is wedged (nothing can: the terminal never sends a signal), but it
+    // makes `kill -INT` exit gracefully from another shell, with the terminal
+    // restored.
+    //
+    // SIGHUP is deliberately left at its default (terminate): it means the
+    // terminal is already gone, so there is nothing left to restore, and
+    // trying to redraw into a hung-up pty only turns a clean death into an
+    // error exit.
+    let mut shutdown_signal = {
+        use tokio::signal::unix::{signal, SignalKind};
+        let term = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let int = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+        ShutdownSignal { term, int }
+    };
 
     // Main event loop. Input paints immediately; data-driven paints
     // coalesce to the frame budget (`tick_rate`) so a busy cluster's stream
@@ -1209,8 +1251,7 @@ pub async fn session_main(
             // Failed, WHEREVER it sits in the stack (the old top-only
             // reset left covered views wedged in an eternal spinner), so
             // it renders an honest error with the retry hint.
-            app.ui.close_modal();
-            app.ui.close_modal();
+            // ONE call, not three — see the note in `session::open_shell`.
             app.ui.close_modal();
             app.nav.for_each_content_view(|cv| {
                 if cv.phase == crate::app::element::ContentPhase::Fetching {
@@ -1375,7 +1416,25 @@ pub async fn session_main(
             // autoscroll) takes effect before processing queued data events.
             biased;
 
-            Some(ct_event) = input.input_rx.recv() => {
+            ct_event = input.input_rx.recv() => {
+                // Binding the whole `Option` is load-bearing. As
+                // `Some(ct_event) = ..`, a `None` — the input bridge gone,
+                // so no key can ever arrive again — made the pattern fail to
+                // match, which DISABLES the arm: the loop went on ticking and
+                // painting a perfectly healthy-looking TUI that ignored every
+                // key, Ctrl-C included (which is a key, not a signal, once
+                // raw mode clears ISIG). A freeze with no diagnosis and no
+                // way out. Named, it becomes an exit with a reason.
+                let Some(ct_event) = ct_event else {
+                    app.exit_reason = Some(crate::app::ExitReason::Error(
+                        "terminal input stopped and could not be re-established — exiting rather than ignoring every key".to_string(),
+                    ));
+                    app.should_quit = true;
+                    // `break`, not `continue`: `continue` would skip the
+                    // quit check below and re-enter the select, where
+                    // `recv()` resolves `None` again at once — a hot loop.
+                    break;
+                };
                 match ct_event {
                     CtEvent::Key(key) => {
                         // Handle this key, then DRAIN the rest of an SSH-batched
@@ -1466,7 +1525,7 @@ pub async fn session_main(
                     repaint.on_data(std::time::Instant::now(), tick_rate);
                 }
             }
-            _ = sigterm.recv() => {
+            () = shutdown_signal.recv() => {
                 app.exit_reason = Some(crate::app::ExitReason::UserQuit);
                 app.should_quit = true;
             }
@@ -1477,13 +1536,19 @@ pub async fn session_main(
         }
     }
 
-    disable_raw_mode()?;
-    execute!(
+    // Teardown is BEST-EFFORT, and `TerminalGuard::drop` is the backstop that
+    // retries it. These used to be `?`: when the terminal had already gone
+    // away — which is one of the reasons we exit — every call failed with
+    // EIO/ENXIO and the error propagated INSTEAD of `app.exit_reason`, so the
+    // user got "Input/output error" where the diagnosis should have been.
+    // Failing to restore a terminal that no longer exists is not the news.
+    let _ = disable_raw_mode();
+    let _ = execute!(
         terminal.backend_mut(),
         SetCursorStyle::DefaultUserShape,
         LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
+    );
+    let _ = terminal.show_cursor();
 
     // Return the exit reason so main.rs can print a message after terminal restore.
     Ok(app.exit_reason)

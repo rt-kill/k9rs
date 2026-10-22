@@ -3,7 +3,7 @@ use k8s_openapi::api::apps::v1::Deployment;
 
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
-use crate::kube::resources::{CommonMeta, WorkloadContainers, WorkloadTally};
+use crate::kube::resources::{AtZero, CommonMeta, WorkloadContainers, WorkloadTally};
 use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 
 // ---------------------------------------------------------------------------
@@ -79,6 +79,7 @@ impl ConvertToRow<Deployment> for DeploymentDef {
             ready,
             total: status.replicas.unwrap_or(0),
             up_to_date: Some(up_to_date),
+            at_zero: AtZero::Parked,
         }.health();
 
         let cells: Vec<CellValue> = vec![

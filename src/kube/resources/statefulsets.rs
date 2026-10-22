@@ -3,7 +3,7 @@ use k8s_openapi::api::apps::v1::StatefulSet;
 
 use crate::kube::protocol::{OperationKind, ResourceScope};
 use crate::kube::resource_def::*;
-use crate::kube::resources::{CommonMeta, WorkloadContainers, WorkloadTally};
+use crate::kube::resources::{AtZero, CommonMeta, WorkloadContainers, WorkloadTally};
 use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 
 // ---------------------------------------------------------------------------
@@ -66,6 +66,7 @@ impl ConvertToRow<StatefulSet> for StatefulSetDef {
             ready: ready_replicas,
             total: status.replicas,
             up_to_date: None,
+            at_zero: AtZero::Parked,
         }.health();
 
         let cells: Vec<CellValue> = vec![

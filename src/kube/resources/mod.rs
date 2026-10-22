@@ -190,6 +190,29 @@ pub(crate) struct WorkloadTally {
     /// for one whose table shows no column that would explain the verdict —
     /// see [`WorkloadTally::rollout_in_flight`].
     pub up_to_date: Option<i32>,
+    /// What `desired == 0` means for this kind — see [`AtZero`].
+    pub at_zero: AtZero,
+}
+
+/// What a scale target of zero MEANS, which differs by workload kind and is
+/// not recoverable from the numbers.
+///
+/// It used to be one rule for all four: `desired == 0` → `Pending`. For a
+/// Deployment that is right — someone scaled it down, and a parked workload
+/// is worth marking. For a ReplicaSet it is wrong: a Deployment keeps its old
+/// ReplicaSets at zero per `revisionHistoryLimit`, so `:rs` in any real
+/// cluster is mostly retired ones and the whole view went yellow — diluting
+/// the yellow that now means "a rollout is in flight".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtZero {
+    /// Someone scaled it to zero. Parked, not broken, and worth saying so.
+    /// k9s agrees for Deployments, keying `PendingColor` on READY's
+    /// denominator being `0` (`render/dp.go`).
+    Parked,
+    /// The controller left it behind — history, not a state anyone needs
+    /// flagged. k9s shows these normal too: its ReplicaSet check is
+    /// `status.replicas != status.readyReplicas`, and `0 != 0` is false.
+    Retired,
 }
 
 impl WorkloadTally {
@@ -209,9 +232,9 @@ impl WorkloadTally {
 
     /// The row's health, in precedence order:
     ///
-    /// 1. **Scaled to zero** → `Pending`. Nothing to judge; parked, not
-    ///    broken. k9s agrees, keyed on READY's denominator being `0`
-    ///    (`render/dp.go`'s `ColorerFunc`).
+    /// 1. **Scaled to zero** → whatever zero means for this kind
+    ///    ([`AtZero`]): `Pending` for a parked workload, `Normal` for a
+    ///    retired ReplicaSet.
     /// 2. **Fewer ready pods than asked for** → `Failed`. Less serving
     ///    capacity than requested, *whatever the reason*. A rollout being the
     ///    cause does not make the shortfall untrue, and a rollout wedged at
@@ -231,7 +254,10 @@ impl WorkloadTally {
     pub(crate) fn health(&self) -> row::RowHealth {
         use row::RowHealth;
         if self.desired == 0 {
-            RowHealth::Pending
+            match self.at_zero {
+                AtZero::Parked => RowHealth::Pending,
+                AtZero::Retired => RowHealth::Normal,
+            }
         } else if self.ready < self.desired {
             RowHealth::Failed
         } else if self.rollout_in_flight() {
