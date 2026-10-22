@@ -3,8 +3,10 @@
 //! Each [`crate::kube::resources::row::DerivedViewKind`] variant has a corresponding `project_*` function
 //! that converts a parent [`ResourceRow`] into child rows for the derived
 //! table. Adding a new derived view means adding a function here and a
-//! match arm in [`DerivedViewKind::project`](crate::app::view::DerivedViewKind::project).
+//! match arm in [`project`], which is a free function here rather than a
+//! method because the enum is a wire type in `k9rs-proto`.
 
+use crate::kube::resources::row::DerivedViewKind;
 use crate::kube::resources::row::{CellValue, ResourceRow};
 
 /// Project a pod's containers into individual table rows.
@@ -35,4 +37,15 @@ pub(crate) fn project_containers(parent: &ResourceRow) -> Vec<ResourceRow> {
             ..Default::default()
         }
     }).collect()
+}
+
+/// Project a parent row into derived child rows. Each variant knows
+/// how to extract and reshape the parent's data. Implementation
+/// functions live in this module, which is why this is a free function
+/// here rather than a method on the enum: the enum is a wire type in
+/// `k9rs-proto` and an inherent impl has to live with its type.
+pub fn project(kind: &DerivedViewKind, parent: &ResourceRow) -> Vec<ResourceRow> {
+    match kind {
+        DerivedViewKind::Containers => project_containers(parent),
+    }
 }

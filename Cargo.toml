@@ -1,3 +1,42 @@
+[workspace]
+members = ["crates/k9rs-proto", "crates/k9rs-util"]
+
+# One place per dependency. A member crate writes `dep.workspace = true`, so a
+# version bump is a single edit and two crates cannot drift onto different
+# versions of the same library.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+libc = "0.2"
+regex = "1"
+tokio = { version = "1", features = ["full"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
+anyhow = "1"
+bincode = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_yaml = "0.9"
+tracing = "0.1"
+k9rs-proto = { path = "crates/k9rs-proto" }
+k9rs-util = { path = "crates/k9rs-util" }
+
+# One lint config for every member. `unreachable_pub` is the one that makes
+# the facade doctrine structural instead of a count: it is noise in a binary
+# (where nothing is reachable from outside) and exactly right in a library,
+# which is why it found only 21 items while this was one bin crate. As each
+# crate comes out, it starts reporting the `pub` items that are not actually
+# API — and `pub` is what suppresses `dead_code`, the way five dead items have
+# already hidden from clippy here.
+[workspace.lints.rust]
+unreachable_pub = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "warn"
+
 [package]
 name = "k9rs"
 version = "0.1.0"
@@ -47,6 +86,11 @@ unicode-segmentation = "1"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 libc = "0.2"
 dashmap = "6"
+
+# The first extracted crate. `main.rs` re-exports it as `util`, so the ~33
+# existing `crate::util::…` paths keep resolving and nothing else changed.
+k9rs-proto = { workspace = true }
+k9rs-util = { workspace = true }
 
 # Multiplexer: per-subscription substreams over the single Unix socket
 # between TUI and daemon. We hide this behind `src/kube/mux/` so swapping

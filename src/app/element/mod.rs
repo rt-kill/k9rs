@@ -2313,7 +2313,7 @@ impl Element {
                         .rows
                         .iter()
                         .find(|r| crate::app::store::row_matches_key(r, &e.key))
-                        .map(|r| e.kind.project(r))
+                        .map(|r| crate::app::derived::project(&e.kind, r))
                         .unwrap_or_default()
                 });
                 let draft = compile_draft(&e.interaction.filter_input);
@@ -2441,7 +2441,7 @@ impl Element {
                         .rows
                         .iter()
                         .find(|r| crate::app::store::row_matches_key(r, &e.key))
-                        .map(|r| e.kind.project(r))
+                        .map(|r| crate::app::derived::project(&e.kind, r))
                         .unwrap_or_default()
                 });
                 {
@@ -2482,7 +2482,7 @@ impl Element {
                     .rows
                     .iter()
                     .find(|r| crate::app::store::row_matches_key(r, &e.key))
-                    .map(|parent| e.kind.project(parent))
+                    .map(|parent| crate::app::derived::project(&e.kind, parent))
                     .and_then(|rows| {
                         rows.into_iter().find(|r| crate::app::store::row_matches_key(r, &key))
                     })
@@ -2644,8 +2644,7 @@ impl Element {
                 .iter()
                 .find(|r| crate::app::store::row_matches_key(r, &e.key))
                 .map(|parent| {
-                    e.kind
-                        .project(parent)
+                    crate::app::derived::project(&e.kind, parent)
                         .iter()
                         .map(crate::app::store::row_key)
                         .collect()

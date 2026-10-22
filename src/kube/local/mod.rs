@@ -85,7 +85,7 @@ pub mod port_forward;
 pub mod registry;
 pub mod subscription;
 pub mod supervise;
-pub mod types;
+pub use k9rs_proto::local_types as types;
 
 pub use context_locals::{ContextKeepalive, ContextLocals};
 pub use registry::LocalRegistry;

@@ -17,7 +17,11 @@ pub mod kube;
 pub mod session;
 pub mod theme;
 pub mod ui;
-pub mod util;
+// The first crate boundary. Re-exported under its old name so every
+// `crate::util::…` path in the tree keeps resolving — the extraction does not
+// get to rewrite 33 call sites as well. The shim goes away in a final sweep,
+// once every crate is out.
+pub use k9rs_util as util;
 
 use std::io;
 use std::time::Duration;

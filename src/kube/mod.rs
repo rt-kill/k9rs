@@ -195,10 +195,13 @@ pub mod live_query_dynamic;
 pub mod local;
 pub mod metrics;
 pub mod ops;
-pub mod overlay;
-pub mod protocol;
+// Extracted crates, re-exported under their old paths so the hundreds of
+// existing `crate::kube::protocol::…` / `::overlay::…` / `::resource_def::…`
+// call sites keep resolving. Deleted in a final sweep once every crate is out.
+pub use k9rs_proto::protocol;
+pub use k9rs_proto::overlay;
+pub use k9rs_proto::resource_def;
 pub mod repaint;
-pub mod resource_def;
 pub mod resource_defs;
 pub mod resources;
 pub mod server_session;

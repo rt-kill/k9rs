@@ -1161,6 +1161,8 @@ dependencies = [
  "futures",
  "http",
  "k8s-openapi",
+ "k9rs-proto",
+ "k9rs-util",
  "kube",
  "libc",
  "ratatui",
@@ -1174,6 +1176,32 @@ dependencies = [
  "tokio-yamux",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "k9rs-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "chrono",
+ "k9rs-util",
+ "serde",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "k9rs-util"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "libc",
+ "regex",
+ "tokio",
  "unicode-segmentation",
  "unicode-width 0.2.0",
 ]

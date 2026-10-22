@@ -476,13 +476,8 @@ fn an_overlay_rule_outranks_the_built_in_threshold() {
     // for THIS column beats the type's default.
     let rules = vec![
         crate::kube::overlay::ColumnRenderRules::default(),
-        crate::kube::overlay::ColumnRenderRules {
-            rules: vec![crate::kube::overlay::RenderRule {
-                predicate: crate::kube::overlay::RenderPredicate::parse_when(">= 50")
-                    .expect("a well-formed `when`"),
-                style: RowHealth::Pending,
-            }],
-        },
+        crate::kube::overlay::ColumnRenderRules::from_when_pairs(&[(">= 50", RowHealth::Pending)])
+            .expect("a well-formed `when`"),
     ];
     let view = derive_view(&[row], &rules, None, &spec);
     assert_eq!(

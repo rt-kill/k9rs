@@ -39,7 +39,7 @@ pub(crate) mod k8s_const {
     pub(crate) const ADDR_EXTERNAL_IP: &str = "ExternalIP";
 }
 
-pub mod row;
+pub use k9rs_proto::row;
 pub mod pods;
 pub mod deployments;
 pub mod services;

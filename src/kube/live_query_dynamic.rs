@@ -13,7 +13,7 @@ use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::Client;
 use tracing::warn;
 
-use crate::kube::cache::{CachedCrd, DiscoveryCache, PrinterColumn};
+use crate::kube::cache::{DiscoveryCache, PrinterColumn};
 use crate::kube::protocol::{ContextId, ResourceScope};
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
@@ -117,7 +117,7 @@ async fn resolve_printer_columns(
         format!("{plural}.{group}")
     };
     match api.get(&name).await {
-        Ok(crd) => match CachedCrd::from_k8s(&crd) {
+        Ok(crd) => match crate::kube::cache::cached_crd_from_k8s(&crd) {
             Some(cached) => {
                 let cols = cached.printer_columns.clone();
                 discovery.merge_crd(context.clone(), cached);

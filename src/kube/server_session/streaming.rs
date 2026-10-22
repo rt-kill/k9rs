@@ -321,7 +321,7 @@ async fn run_discovery_poll(
         .await
     {
         Ok(list) => {
-            let crds: Vec<CachedCrd> = list.items.iter().filter_map(CachedCrd::from_k8s).collect();
+            let crds: Vec<CachedCrd> = list.items.iter().filter_map(crate::kube::cache::cached_crd_from_k8s).collect();
             shared.discovery_cache.set_crds(context.clone(), crds.clone());
             crds
         }

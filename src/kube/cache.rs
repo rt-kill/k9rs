@@ -5,128 +5,53 @@
 //! No disk persistence — cache is tied to the daemon process lifetime.
 
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
 
-use crate::kube::protocol::{ContextId, ContextName, CrdRef, ResourceScope};
+use crate::kube::protocol::{ContextId, ContextName, CrdRef};
+
+// The wire half of this module moved to `k9rs-proto`; re-exported here so the
+// existing `crate::kube::cache::CachedCrd` paths keep resolving. What stayed
+// is the daemon's own cache plus `cached_crd_from_k8s`, the only part that
+// needed the Kubernetes client.
+pub use k9rs_proto::crd_cache::{CachedCrd, PrinterColumn, PrinterColumnType};
 use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
 
-/// A printer column from a CRD's additionalPrinterColumns spec.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrinterColumn {
-    pub name: String,
-    /// JSONPath expression into the object (e.g., ".spec.nodeClassRef.name").
-    pub json_path: String,
-    /// Column type. Typed enum so the dynamic-watcher rendering path
-    /// can `match` instead of `if col.column_type == "date"` — the
-    /// boundary parse from K8s schema strings happens once at
-    /// discovery time.
-    pub column_type: PrinterColumnType,
-}
-
-/// Closed enum of the K8s `additionalPrinterColumns.type` values we know
-/// how to render. K8s defines a small set; unknown types fall through to
-/// `Other(String)` so we don't lose information at the wire boundary, but
-/// every render branch checks the typed variant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PrinterColumnType {
-    /// `date` — RFC3339 timestamps rendered as age strings.
-    Date,
-    /// `string` — plain text. The default for K8s printer columns.
-    String,
-    /// `integer` / `number` — numeric, currently rendered as plain text.
-    Integer,
-    Number,
-    /// `boolean` — true/false, rendered as plain text.
-    Boolean,
-    /// Anything K8s might add later — preserved verbatim, treated like
-    /// String at render time.
-    Other(String),
-}
-
-impl PrinterColumnType {
-    /// Parse the raw K8s schema string into the typed variant.
-    pub fn from_k8s(s: &str) -> Self {
-        match s {
-            "date" => PrinterColumnType::Date,
-            "string" => PrinterColumnType::String,
-            "integer" => PrinterColumnType::Integer,
-            "number" => PrinterColumnType::Number,
-            "boolean" => PrinterColumnType::Boolean,
-            other => PrinterColumnType::Other(other.to_string()),
-        }
-    }
-
-    /// True if this column should be formatted as an age string at render
-    /// time. The dynamic watcher branches on this instead of comparing
-    /// against the literal `"date"`.
-    pub fn is_date(&self) -> bool {
-        matches!(self, PrinterColumnType::Date)
-    }
-}
-
-/// Serializable representation of a CRD for the discovery cache. Carries
-/// the typed [`CrdRef`] for identity (group/version/kind/plural/scope) and
-/// the printer-column list separately. The previous layout duplicated the
-/// GVR fields and stored `scope` as a free-text string parsed back via a
-/// `from_scope_str(_)` helper — both gone now.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CachedCrd {
-    pub name: String,
-    /// Typed GVR + scope. Identity (Hash/Eq) is `(group, version, plural)`.
-    pub gvr: CrdRef,
-    /// Columns from the CRD's additionalPrinterColumns — defines what to show.
-    #[serde(default)]
-    pub printer_columns: Vec<PrinterColumn>,
-}
-
-impl CachedCrd {
-    /// Parse a live `CustomResourceDefinition` into cache form. THE single
-    /// parser for CRD presentation metadata — the bulk discovery poll and
-    /// the on-demand per-watcher resolution both go through here, so the
-    /// two paths can never disagree about how a recipe is read.
-    pub fn from_k8s(
-        crd: &k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
-    ) -> Option<Self> {
-        let name = crd.metadata.name.clone()?;
-        let spec = &crd.spec;
-        let served = spec.versions.iter().find(|v| v.served).or(spec.versions.first());
-        let version = served.map(|v| v.name.clone()).unwrap_or_default();
-        let printer_columns: Vec<PrinterColumn> = served
-            .and_then(|v| v.additional_printer_columns.as_ref())
-            .map(|cols| {
-                cols.iter()
-                    .map(|c| PrinterColumn {
-                        name: c.name.clone(),
-                        json_path: c.json_path.clone(),
-                        column_type: PrinterColumnType::from_k8s(&c.type_),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let scope = crate::kube::protocol::ResourceScope::from_k8s_spec(&spec.scope);
-        Some(Self {
-            name,
-            gvr: CrdRef::new(
-                spec.group.clone(),
-                version,
-                spec.names.kind.clone(),
-                spec.names.plural.clone(),
-                scope,
-            ),
-            printer_columns,
+/// Parse a live `CustomResourceDefinition` into cache form. THE single
+/// parser for CRD presentation metadata — the bulk discovery poll and
+/// the on-demand per-watcher resolution both go through here, so the
+/// two paths can never disagree about how a recipe is read.
+pub fn cached_crd_from_k8s(
+    crd: &k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
+) -> Option<CachedCrd> {
+    let name = crd.metadata.name.clone()?;
+    let spec = &crd.spec;
+    let served = spec.versions.iter().find(|v| v.served).or(spec.versions.first());
+    let version = served.map(|v| v.name.clone()).unwrap_or_default();
+    let printer_columns: Vec<PrinterColumn> = served
+        .and_then(|v| v.additional_printer_columns.as_ref())
+        .map(|cols| {
+            cols.iter()
+                .map(|c| PrinterColumn {
+                    name: c.name.clone(),
+                    json_path: c.json_path.clone(),
+                    column_type: PrinterColumnType::from_k8s(&c.type_),
+                })
+                .collect()
         })
-    }
-
-    /// Convenience accessors for callers that just want one field — keeps
-    /// the call sites short without exposing `c.gvr.kind` everywhere.
-    pub fn group(&self) -> &str { &self.gvr.group }
-    pub fn version(&self) -> &str { &self.gvr.version }
-    pub fn kind(&self) -> &str { &self.gvr.kind }
-    pub fn plural(&self) -> &str { &self.gvr.plural }
-    pub fn scope(&self) -> ResourceScope { self.gvr.scope }
+        .unwrap_or_default();
+    let scope = crate::kube::protocol::ResourceScope::from_k8s_spec(&spec.scope);
+    Some(CachedCrd {
+        name,
+        gvr: CrdRef::new(
+            spec.group.clone(),
+            version,
+            spec.names.kind.clone(),
+            spec.names.plural.clone(),
+            scope,
+        ),
+        printer_columns,
+    })
 }
 
-/// Convert cached CRDs to unified ResourceRow structs with extra metadata.
 pub fn cached_crds_to_rows(cached: &[CachedCrd]) -> Vec<ResourceRow> {
     cached
         .iter()

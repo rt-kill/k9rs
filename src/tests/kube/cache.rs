@@ -1,4 +1,5 @@
 use super::*;
+use crate::kube::protocol::ResourceScope;
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
     CustomResourceColumnDefinition, CustomResourceDefinition, CustomResourceDefinitionNames,
     CustomResourceDefinitionSpec, CustomResourceDefinitionVersion,
@@ -59,7 +60,7 @@ fn crd(name: &str, served_cols: Vec<(&str, &str, &str)>) -> CustomResourceDefini
 
 #[test]
 fn from_k8s_reads_the_served_versions_recipe() {
-    let parsed = CachedCrd::from_k8s(&crd(
+    let parsed = crate::kube::cache::cached_crd_from_k8s(&crd(
         "nodeclaims.karpenter.sh",
         vec![("TYPE", ".spec.type", "string"), ("READY", ".status.ready", "string")],
     ))
@@ -76,7 +77,7 @@ fn from_k8s_reads_the_served_versions_recipe() {
 fn from_k8s_accepts_a_recipe_free_crd() {
     // CRDs may declare no printer columns — that is knowledge, and it
     // parses to an EMPTY recipe (metadata columns), not a failure.
-    let parsed = CachedCrd::from_k8s(&crd("nodeclaims.karpenter.sh", vec![])).unwrap();
+    let parsed = crate::kube::cache::cached_crd_from_k8s(&crd("nodeclaims.karpenter.sh", vec![])).unwrap();
     assert!(parsed.printer_columns.is_empty());
 }
 
@@ -86,7 +87,7 @@ fn merge_crd_replaces_or_appends_atomically() {
     let ctx = ContextId::new(ContextName::new("ctx-a").unwrap(), "https://test.example".into(), 1);
 
     // Merge into an EMPTY cache (the cold-subscribe path).
-    let first = CachedCrd::from_k8s(&crd(
+    let first = crate::kube::cache::cached_crd_from_k8s(&crd(
         "nodeclaims.karpenter.sh",
         vec![("TYPE", ".spec.type", "string")],
     ))
@@ -104,7 +105,7 @@ fn merge_crd_replaces_or_appends_atomically() {
     let old_snapshot = cache.crds(&ctx).unwrap();
 
     // Merging the same (group, plural) REPLACES, not duplicates.
-    let updated = CachedCrd::from_k8s(&crd(
+    let updated = crate::kube::cache::cached_crd_from_k8s(&crd(
         "nodeclaims.karpenter.sh",
         vec![("TYPE", ".spec.type", "string"), ("READY", ".status.ready", "string")],
     ))
