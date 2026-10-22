@@ -1,7 +1,8 @@
 use k8s_openapi::api::core::v1::Endpoints;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::endpoints::EndpointsDef;
+
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
@@ -9,24 +10,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 // EndpointsDef
 // ---------------------------------------------------------------------------
 
-pub struct EndpointsDef;
-
-impl ResourceDef for EndpointsDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::Endpoints }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "", version: "v1", kind: "Endpoints",
-            plural: "endpoints", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["ep", "endpoints"] }
-    fn short_label(&self) -> &str { "EP" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "ENDPOINTS", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-}
 
 impl ConvertToRow<Endpoints> for EndpointsDef {
     fn convert(ep: Endpoints) -> ResourceRow {

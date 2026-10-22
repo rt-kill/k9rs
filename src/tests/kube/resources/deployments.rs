@@ -2,7 +2,7 @@ use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use std::collections::BTreeMap;
 
-use crate::kube::resource_def::ConvertToRow;
+use crate::kube::resources::ConvertToRow;
 use crate::kube::resources::deployments::DeploymentDef;
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 

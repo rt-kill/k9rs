@@ -1,7 +1,8 @@
 use k8s_openapi::api::networking::v1::Ingress;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::ingresses::IngressDef;
+
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, ResourceRow};
 
@@ -9,24 +10,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow};
 // IngressDef
 // ---------------------------------------------------------------------------
 
-pub struct IngressDef;
-
-impl ResourceDef for IngressDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::Ingress }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "networking.k8s.io", version: "v1", kind: "Ingress",
-            plural: "ingresses", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["ing", "ingress", "ingresses"] }
-    fn short_label(&self) -> &str { "Ing" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "CLASS", "HOSTS", "ADDRESS", "PORTS", "LABELS", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-}
 
 impl ConvertToRow<Ingress> for IngressDef {
     fn convert(ing: Ingress) -> ResourceRow {

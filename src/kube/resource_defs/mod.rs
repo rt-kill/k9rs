@@ -37,43 +37,43 @@ pub static REGISTRY: LazyLock<ResourceRegistry> = LazyLock::new(build_registry);
 
 fn build_registry() -> ResourceRegistry {
     // Workload defs (in crate::kube::resources::*)
-    use crate::kube::resources::pods::PodDef;
-    use crate::kube::resources::deployments::DeploymentDef;
-    use crate::kube::resources::statefulsets::StatefulSetDef;
-    use crate::kube::resources::daemonsets::DaemonSetDef;
-    use crate::kube::resources::replicasets::ReplicaSetDef;
-    use crate::kube::resources::jobs::JobDef;
-    use crate::kube::resources::cronjobs::CronJobDef;
+    use crate::kube::resource_def::pods::PodDef;
+    use crate::kube::resource_def::deployments::DeploymentDef;
+    use crate::kube::resource_def::statefulsets::StatefulSetDef;
+    use crate::kube::resource_def::daemonsets::DaemonSetDef;
+    use crate::kube::resource_def::replicasets::ReplicaSetDef;
+    use crate::kube::resource_def::jobs::JobDef;
+    use crate::kube::resource_def::cronjobs::CronJobDef;
 
     // Cluster-scoped defs (moved from resource_defs/cluster.rs)
-    use crate::kube::resources::namespaces::NamespaceDef;
-    use crate::kube::resources::nodes::NodeDef;
-    use crate::kube::resources::pvs::PvDef;
-    use crate::kube::resources::storageclasses::StorageClassDef;
-    use crate::kube::resources::priorityclasses::PriorityClassDef;
-    use crate::kube::resources::clusterroles::ClusterRoleDef;
-    use crate::kube::resources::clusterrolebindings::ClusterRoleBindingDef;
-    use crate::kube::resources::webhooks::{ValidatingWebhookDef, MutatingWebhookDef};
-    use crate::kube::resources::crds::CrdDef;
-    use crate::kube::resources::roles::RoleDef;
-    use crate::kube::resources::rolebindings::RoleBindingDef;
+    use crate::kube::resource_def::namespaces::NamespaceDef;
+    use crate::kube::resource_def::nodes::NodeDef;
+    use crate::kube::resource_def::pvs::PvDef;
+    use crate::kube::resource_def::storageclasses::StorageClassDef;
+    use crate::kube::resource_def::priorityclasses::PriorityClassDef;
+    use crate::kube::resource_def::clusterroles::ClusterRoleDef;
+    use crate::kube::resource_def::clusterrolebindings::ClusterRoleBindingDef;
+    use crate::kube::resource_def::webhooks::{ValidatingWebhookDef, MutatingWebhookDef};
+    use crate::kube::resource_def::crds::CrdDef;
+    use crate::kube::resource_def::roles::RoleDef;
+    use crate::kube::resource_def::rolebindings::RoleBindingDef;
 
     // Core/networking defs (moved from resource_defs/core.rs)
-    use crate::kube::resources::services::ServiceDef;
-    use crate::kube::resources::configmaps::ConfigMapDef;
-    use crate::kube::resources::secrets::SecretDef;
-    use crate::kube::resources::serviceaccounts::ServiceAccountDef;
-    use crate::kube::resources::ingresses::IngressDef;
-    use crate::kube::resources::networkpolicies::NetworkPolicyDef;
-    use crate::kube::resources::hpa::HpaDef;
-    use crate::kube::resources::endpoints::EndpointsDef;
-    use crate::kube::resources::endpointslices::EndpointSliceDef;
-    use crate::kube::resources::limitranges::LimitRangeDef;
-    use crate::kube::resources::resourcequotas::ResourceQuotaDef;
-    use crate::kube::resources::pdb::PodDisruptionBudgetDef;
-    use crate::kube::resources::events::EventDef;
-    use crate::kube::resources::pvcs::PvcDef;
-    use crate::kube::resources::leases::LeaseDef;
+    use crate::kube::resource_def::services::ServiceDef;
+    use crate::kube::resource_def::configmaps::ConfigMapDef;
+    use crate::kube::resource_def::secrets::SecretDef;
+    use crate::kube::resource_def::serviceaccounts::ServiceAccountDef;
+    use crate::kube::resource_def::ingresses::IngressDef;
+    use crate::kube::resource_def::networkpolicies::NetworkPolicyDef;
+    use crate::kube::resource_def::hpa::HpaDef;
+    use crate::kube::resource_def::endpoints::EndpointsDef;
+    use crate::kube::resource_def::endpointslices::EndpointSliceDef;
+    use crate::kube::resource_def::limitranges::LimitRangeDef;
+    use crate::kube::resource_def::resourcequotas::ResourceQuotaDef;
+    use crate::kube::resource_def::pdb::PodDisruptionBudgetDef;
+    use crate::kube::resource_def::events::EventDef;
+    use crate::kube::resource_def::pvcs::PvcDef;
+    use crate::kube::resource_def::leases::LeaseDef;
 
     let mut r = ResourceRegistry::new();
 

@@ -1,7 +1,8 @@
 use k8s_openapi::api::core::v1::Namespace;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::namespaces::NamespaceDef;
+
 use crate::kube::resources::k8s_const::*;
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
@@ -10,25 +11,6 @@ use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth
 // NamespaceDef
 // ---------------------------------------------------------------------------
 
-pub struct NamespaceDef;
-
-impl ResourceDef for NamespaceDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::Namespace }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "", version: "v1", kind: "Namespace",
-            plural: "namespaces", scope: ResourceScope::Cluster,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["ns", "namespace", "namespaces"] }
-    fn short_label(&self) -> &str { "NS" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAME", "STATUS", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-    fn is_core(&self) -> bool { true }
-}
 
 impl ConvertToRow<Namespace> for NamespaceDef {
     fn convert(obj: Namespace) -> ResourceRow {

@@ -2,7 +2,7 @@ use k8s_openapi::api::batch::v1::{Job, JobCondition, JobSpec, JobStatus};
 use k8s_openapi::api::core::v1::PodTemplateSpec;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
-use crate::kube::resource_def::ConvertToRow;
+use crate::kube::resources::ConvertToRow;
 use crate::kube::resources::jobs::JobDef;
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 

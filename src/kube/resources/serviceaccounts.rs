@@ -1,7 +1,8 @@
 use k8s_openapi::api::core::v1::ServiceAccount;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::serviceaccounts::ServiceAccountDef;
+
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, ResourceRow};
 
@@ -9,24 +10,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow};
 // ServiceAccountDef
 // ---------------------------------------------------------------------------
 
-pub struct ServiceAccountDef;
-
-impl ResourceDef for ServiceAccountDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::ServiceAccount }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "", version: "v1", kind: "ServiceAccount",
-            plural: "serviceaccounts", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["sa", "serviceaccount", "serviceaccounts"] }
-    fn short_label(&self) -> &str { "SA" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "SECRETS", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-}
 
 impl ConvertToRow<ServiceAccount> for ServiceAccountDef {
     fn convert(sa: ServiceAccount) -> ResourceRow {

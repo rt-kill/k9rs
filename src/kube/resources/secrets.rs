@@ -1,7 +1,8 @@
 use k8s_openapi::api::core::v1::Secret;
 
-use crate::kube::protocol::{OperationKind, ResourceScope};
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::secrets::SecretDef;
+
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, ResourceRow};
 
@@ -9,29 +10,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow};
 // SecretDef
 // ---------------------------------------------------------------------------
 
-pub struct SecretDef;
-
-impl ResourceDef for SecretDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::Secret }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "", version: "v1", kind: "Secret",
-            plural: "secrets", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["sec", "secret", "secrets"] }
-    fn short_label(&self) -> &str { "Secrets" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "TYPE", "DATA", "LABELS", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-
-    fn operations(&self) -> Vec<OperationKind> {
-        use OperationKind::*;
-        vec![Describe, Yaml, Delete, DecodeSecret]
-    }
-}
 
 impl ConvertToRow<Secret> for SecretDef {
     fn convert(secret: Secret) -> ResourceRow {

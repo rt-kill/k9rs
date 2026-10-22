@@ -1,7 +1,8 @@
 use k8s_openapi::api::core::v1::ConfigMap;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::configmaps::ConfigMapDef;
+
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, ResourceRow};
 
@@ -9,24 +10,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow};
 // ConfigMapDef
 // ---------------------------------------------------------------------------
 
-pub struct ConfigMapDef;
-
-impl ResourceDef for ConfigMapDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::ConfigMap }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "", version: "v1", kind: "ConfigMap",
-            plural: "configmaps", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["cm", "configmap", "configmaps"] }
-    fn short_label(&self) -> &str { "CM" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "DATA", "LABELS", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-}
 
 impl ConvertToRow<ConfigMap> for ConfigMapDef {
     fn convert(cm: ConfigMap) -> ResourceRow {

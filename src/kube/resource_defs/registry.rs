@@ -14,7 +14,8 @@ use tokio::task::JoinHandle;
 
 use crate::kube::live_query::{BaselineAsk, WatcherMsg};
 use crate::kube::protocol::{Namespace, ResourceId, SubscriptionFilter};
-use crate::kube::resource_def::{BuiltInKind, ConvertToRow, ResourceDef};
+use crate::kube::resource_def::{BuiltInKind, ResourceDef};
+use crate::kube::resources::ConvertToRow;
 use crate::kube::resources::row::ResourceRow;
 
 // ---------------------------------------------------------------------------

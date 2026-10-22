@@ -1,5 +1,6 @@
 use super::*;
-use crate::kube::resource_def::{ConvertToRow, ResourceDef};
+use crate::kube::resource_def::ResourceDef;
+use crate::kube::resources::ConvertToRow;
 
 /// Pods are the highest-risk converter: 24 columns and a metrics overlay
 /// that writes cells *by index* derived from `column_defs()`. Guard that

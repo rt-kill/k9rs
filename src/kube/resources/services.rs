@@ -1,7 +1,8 @@
 use k8s_openapi::api::core::v1::Service;
 
-use crate::kube::protocol::{OperationKind, ResourceScope};
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::services::ServiceDef;
+
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 
@@ -9,40 +10,6 @@ use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 // ServiceDef
 // ---------------------------------------------------------------------------
 
-pub struct ServiceDef;
-
-impl ResourceDef for ServiceDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::Service }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "", version: "v1", kind: "Service",
-            plural: "services", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["svc", "service", "services"] }
-    fn short_label(&self) -> &str { "Svc" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "TYPE", "CLUSTER-IP", "EXTERNAL-IP", "SELECTOR",
-         "PORT(S)", "LABELS", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-
-    fn column_defs(&self) -> Vec<ColumnDef> {
-        use ColumnDef as C;
-        vec![
-            C::new("NAMESPACE"), C::new("NAME"), C::new("TYPE"),
-            C::new("CLUSTER-IP"), C::new("EXTERNAL-IP"),
-            C::extra("SELECTOR"), C::new("PORT(S)"),
-            C::extra("LABELS"), C::new("AGE"),
-        ]
-    }
-
-    fn operations(&self) -> Vec<OperationKind> {
-        use OperationKind::*;
-        vec![Describe, Yaml, Delete, PortForward]
-    }
-}
 
 impl ConvertToRow<Service> for ServiceDef {
     fn convert(svc: Service) -> ResourceRow {

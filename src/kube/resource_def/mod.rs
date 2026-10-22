@@ -13,7 +13,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::kube::protocol::{OperationKind, ResourceId, ResourceScope};
-use crate::kube::resources::row::ResourceRow;
 
 
 /// The flavor of metrics-server overlay a resource receives. Different
@@ -374,22 +373,43 @@ pub trait ResourceDef: Send + Sync + 'static {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Typed converter trait
-// ---------------------------------------------------------------------------
-
-/// Converts a strongly-typed K8s API object into a [`ResourceRow`].
-///
-/// NOT object-safe (generic over K), so it lives on the concrete ZST,
-/// not on `dyn ResourceDef`. The existing `*_to_row` free functions are
-/// the implementations — `ConvertToRow` just delegates to them.
-pub trait ConvertToRow<K> {
-    fn convert(obj: K) -> ResourceRow;
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "../tests/kube/resource_def.rs"]
+#[path = "../../tests/kube/resource_def.rs"]
 mod tests;
+
+pub mod namespaces;
+pub mod clusterrolebindings;
+pub mod clusterroles;
+pub mod configmaps;
+pub mod crds;
+pub mod cronjobs;
+pub mod daemonsets;
+pub mod deployments;
+pub mod endpoints;
+pub mod endpointslices;
+pub mod events;
+pub mod hpa;
+pub mod ingresses;
+pub mod jobs;
+pub mod leases;
+pub mod limitranges;
+pub mod networkpolicies;
+pub mod nodes;
+pub mod pdb;
+pub mod pods;
+pub mod priorityclasses;
+pub mod pvcs;
+pub mod pvs;
+pub mod replicasets;
+pub mod resourcequotas;
+pub mod rolebindings;
+pub mod roles;
+pub mod secrets;
+pub mod serviceaccounts;
+pub mod services;
+pub mod statefulsets;
+pub mod storageclasses;
+pub mod webhooks;

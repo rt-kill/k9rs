@@ -74,6 +74,24 @@ pub mod leases;
 pub mod priorityclasses;
 pub mod webhooks;
 
+/// Converts a strongly-typed K8s API object into a [`row::ResourceRow`].
+///
+/// NOT object-safe (generic over K), so it lives on the concrete ZST, not on
+/// `dyn ResourceDef`. Each resource module implements it beside the k8s type
+/// it converts.
+///
+/// It lived in `resource_def.rs` next to `ResourceDef`, which reads as the
+/// obvious place and is the one place it cannot go: `resource_def.rs` holds
+/// pure metadata and is destined for the lowest crate, while every
+/// `impl ConvertToRow<K8sType> for XDef` must be written where the k8s types
+/// are. Put the trait down there with the defs and those impls have NO local
+/// type — trait foreign, k8s type foreign, def foreign — which is an orphan
+/// violation. **The trait has to be the local one**, so it lives here, on the
+/// kube side, where a local trait may be implemented for any types.
+pub trait ConvertToRow<K> {
+    fn convert(obj: K) -> row::ResourceRow;
+}
+
 pub fn access_mode_short(mode: &str) -> &str {
     match mode {
         "ReadWriteOnce" => "RWO",

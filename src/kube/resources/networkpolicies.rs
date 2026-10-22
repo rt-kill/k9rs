@@ -1,7 +1,8 @@
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::networkpolicies::NetworkPolicyDef;
+
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, ResourceRow};
 
@@ -9,24 +10,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow};
 // NetworkPolicyDef
 // ---------------------------------------------------------------------------
 
-pub struct NetworkPolicyDef;
-
-impl ResourceDef for NetworkPolicyDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::NetworkPolicy }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "networking.k8s.io", version: "v1", kind: "NetworkPolicy",
-            plural: "networkpolicies", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["np", "networkpolicy", "networkpolicies"] }
-    fn short_label(&self) -> &str { "NetPol" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "POD-SELECTOR", "POLICY TYPES", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-}
 
 impl ConvertToRow<NetworkPolicy> for NetworkPolicyDef {
     fn convert(np: NetworkPolicy) -> ResourceRow {

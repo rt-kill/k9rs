@@ -1,7 +1,9 @@
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 
+use super::ConvertToRow;
+use crate::kube::resource_def::crds::CrdDef;
+
 use crate::kube::protocol::{CrdRef, ResourceScope};
-use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 
@@ -9,24 +11,6 @@ use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow};
 // CrdDef
 // ---------------------------------------------------------------------------
 
-pub struct CrdDef;
-
-impl ResourceDef for CrdDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::CustomResourceDefinition }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "apiextensions.k8s.io", version: "v1", kind: "CustomResourceDefinition",
-            plural: "customresourcedefinitions", scope: ResourceScope::Cluster,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["crd", "crds", "customresourcedefinition", "customresourcedefinitions"] }
-    fn short_label(&self) -> &str { "CRDs" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAME", "GROUP", "VERSION", "KIND", "SCOPE", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-}
 
 impl ConvertToRow<CustomResourceDefinition> for CrdDef {
     fn convert(crd: CustomResourceDefinition) -> ResourceRow {

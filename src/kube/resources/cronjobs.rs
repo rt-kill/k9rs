@@ -1,8 +1,10 @@
 
 use k8s_openapi::api::batch::v1::CronJob;
 
-use crate::kube::protocol::{OperationKind, ResourceScope};
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::cronjobs::CronJobDef;
+use crate::kube::resource_def::BuiltInKind;
+
 use crate::kube::resources::{CommonMeta, WorkloadContainers};
 use crate::kube::resources::row::{CellValue, ResourceRow};
 
@@ -10,30 +12,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow};
 // CronJobDef — ResourceDef + ConvertToRow
 // ---------------------------------------------------------------------------
 
-pub struct CronJobDef;
-
-impl ResourceDef for CronJobDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::CronJob }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "batch", version: "v1", kind: "CronJob",
-            plural: "cronjobs", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["cj", "cronjob", "cronjobs"] }
-    fn short_label(&self) -> &str { "CronJobs" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "SCHEDULE", "SUSPEND", "ACTIVE", "LAST SCHEDULE",
-         "CONTAINERS", "IMAGES", "LABELS", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-
-    fn operations(&self) -> Vec<OperationKind> {
-        use OperationKind::*;
-        vec![Describe, Yaml, Delete, StreamLogs, PreviousLogs, TriggerCronJob, ToggleSuspendCronJob]
-    }
-}
 
 impl ConvertToRow<CronJob> for CronJobDef {
     fn convert(cj: CronJob) -> ResourceRow {

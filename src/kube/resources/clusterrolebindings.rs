@@ -1,7 +1,8 @@
 use k8s_openapi::api::rbac::v1::ClusterRoleBinding;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::clusterrolebindings::ClusterRoleBindingDef;
+
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, ResourceRow};
 
@@ -9,24 +10,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow};
 // ClusterRoleBindingDef
 // ---------------------------------------------------------------------------
 
-pub struct ClusterRoleBindingDef;
-
-impl ResourceDef for ClusterRoleBindingDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::ClusterRoleBinding }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding",
-            plural: "clusterrolebindings", scope: ResourceScope::Cluster,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["crb", "clusterrolebinding", "clusterrolebindings"] }
-    fn short_label(&self) -> &str { "CRB" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAME", "ROLE", "SUBJECTS", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-}
 
 impl ConvertToRow<ClusterRoleBinding> for ClusterRoleBindingDef {
     fn convert(crb: ClusterRoleBinding) -> ResourceRow {

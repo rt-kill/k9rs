@@ -1,8 +1,10 @@
 
 use k8s_openapi::api::batch::v1::Job;
 
-use crate::kube::protocol::{OperationKind, ResourceScope};
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::jobs::JobDef;
+use crate::kube::resource_def::BuiltInKind;
+
 use crate::kube::resources::k8s_const::STATUS_TRUE;
 use crate::kube::resources::{CommonMeta, WorkloadContainers};
 use crate::kube::resources::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
@@ -16,29 +18,6 @@ const COND_FAILED: &str = "Failed";
 // JobDef — ResourceDef + ConvertToRow
 // ---------------------------------------------------------------------------
 
-pub struct JobDef;
-
-impl ResourceDef for JobDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::Job }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "batch", version: "v1", kind: "Job",
-            plural: "jobs", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["job", "jobs"] }
-    fn short_label(&self) -> &str { "Jobs" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "COMPLETIONS", "DURATION", "CONTAINERS", "IMAGES", "LABELS", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-
-    fn operations(&self) -> Vec<OperationKind> {
-        use OperationKind::*;
-        vec![Describe, Yaml, Delete, StreamLogs, PreviousLogs, PortForward]
-    }
-}
 
 impl ConvertToRow<Job> for JobDef {
     fn convert(job: Job) -> ResourceRow {

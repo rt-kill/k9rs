@@ -1,7 +1,8 @@
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::hpa::HpaDef;
+
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
@@ -9,24 +10,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 // HpaDef
 // ---------------------------------------------------------------------------
 
-pub struct HpaDef;
-
-impl ResourceDef for HpaDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::Hpa }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "autoscaling", version: "v2", kind: "HorizontalPodAutoscaler",
-            plural: "horizontalpodautoscalers", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["hpa", "horizontalpodautoscaler", "horizontalpodautoscalers"] }
-    fn short_label(&self) -> &str { "HPA" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "REFERENCE", "MIN", "MAX", "CURRENT", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-}
 
 impl ConvertToRow<HorizontalPodAutoscaler> for HpaDef {
     fn convert(hpa: HorizontalPodAutoscaler) -> ResourceRow {

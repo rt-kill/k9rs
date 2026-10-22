@@ -1,7 +1,8 @@
 use k8s_openapi::api::core::v1::PersistentVolume;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::pvs::PvDef;
+
 use crate::kube::resources::k8s_const::*;
 use crate::kube::resources::{CommonMeta, access_mode_short};
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
@@ -10,25 +11,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 // PvDef
 // ---------------------------------------------------------------------------
 
-pub struct PvDef;
-
-impl ResourceDef for PvDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::PersistentVolume }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "", version: "v1", kind: "PersistentVolume",
-            plural: "persistentvolumes", scope: ResourceScope::Cluster,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["pv", "persistentvolume", "persistentvolumes", "pvs"] }
-    fn short_label(&self) -> &str { "PV" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAME", "CAPACITY", "ACCESS MODES", "RECLAIM POLICY", "STATUS",
-         "CLAIM", "STORAGECLASS", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-}
 
 impl ConvertToRow<PersistentVolume> for PvDef {
     fn convert(pv: PersistentVolume) -> ResourceRow {

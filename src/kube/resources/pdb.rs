@@ -1,8 +1,9 @@
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+
+use super::ConvertToRow;
+use crate::kube::resource_def::pdb::PodDisruptionBudgetDef;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 
@@ -17,25 +18,6 @@ fn int_or_string_display(v: &IntOrString) -> String {
 // PodDisruptionBudgetDef
 // ---------------------------------------------------------------------------
 
-pub struct PodDisruptionBudgetDef;
-
-impl ResourceDef for PodDisruptionBudgetDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::PodDisruptionBudget }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "policy", version: "v1", kind: "PodDisruptionBudget",
-            plural: "poddisruptionbudgets", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["pdb", "poddisruptionbudget", "poddisruptionbudgets"] }
-    fn short_label(&self) -> &str { "PDB" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "MIN AVAILABLE", "MAX UNAVAILABLE",
-         "ALLOWED DISRUPTIONS", "CURRENT", "DESIRED", "EXPECTED", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-}
 
 impl ConvertToRow<PodDisruptionBudget> for PodDisruptionBudgetDef {
     fn convert(pdb: PodDisruptionBudget) -> ResourceRow {

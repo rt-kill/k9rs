@@ -1,7 +1,8 @@
 use k8s_openapi::api::core::v1::Event;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::events::EventDef;
+
 use crate::kube::resources::k8s_const::{EVENT_TYPE_NORMAL, EVENT_TYPE_WARNING};
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
@@ -10,33 +11,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow, RowHealth};
 // EventDef
 // ---------------------------------------------------------------------------
 
-pub struct EventDef;
-
-impl ResourceDef for EventDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::Event }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "", version: "v1", kind: "Event",
-            plural: "events", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["ev", "event", "events"] }
-    fn short_label(&self) -> &str { "Events" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "TYPE", "REASON", "OBJECT", "MESSAGE", "SOURCE", "COUNT", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-
-    fn column_defs(&self) -> Vec<ColumnDef> {
-        use ColumnDef as C;
-        vec![
-            C::new("NAMESPACE"), C::new("TYPE"), C::new("REASON"),
-            C::new("OBJECT"), C::new("MESSAGE"), C::extra("SOURCE"),
-            C::new("COUNT"), C::new("AGE"),
-        ]
-    }
-}
 
 impl ConvertToRow<Event> for EventDef {
     /// An Event's `name` is its own `metadata.name` — the ugly

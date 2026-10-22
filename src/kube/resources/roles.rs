@@ -1,7 +1,8 @@
 use k8s_openapi::api::rbac::v1::Role;
 
-use crate::kube::protocol::ResourceScope;
-use crate::kube::resource_def::*;
+use super::ConvertToRow;
+use crate::kube::resource_def::roles::RoleDef;
+
 use crate::kube::resources::CommonMeta;
 use crate::kube::resources::row::{CellValue, ResourceRow};
 
@@ -9,24 +10,6 @@ use crate::kube::resources::row::{CellValue, ResourceRow};
 // RoleDef
 // ---------------------------------------------------------------------------
 
-pub struct RoleDef;
-
-impl ResourceDef for RoleDef {
-    fn kind(&self) -> BuiltInKind { BuiltInKind::Role }
-    fn gvr(&self) -> &'static Gvr {
-        const G: Gvr = Gvr {
-            group: "rbac.authorization.k8s.io", version: "v1", kind: "Role",
-            plural: "roles", scope: ResourceScope::Namespaced,
-        };
-        &G
-    }
-    fn aliases(&self) -> &[&str] { &["role", "roles"] }
-    fn short_label(&self) -> &str { "Roles" }
-    fn default_headers(&self) -> Vec<String> {
-        ["NAMESPACE", "NAME", "RULES", "AGE"]
-            .into_iter().map(String::from).collect()
-    }
-}
 
 impl ConvertToRow<Role> for RoleDef {
     fn convert(role: Role) -> ResourceRow {

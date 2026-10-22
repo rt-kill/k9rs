@@ -1,5 +1,6 @@
 use super::*;
-use crate::kube::resource_def::{ConvertToRow, ResourceDef};
+use crate::kube::resource_def::ResourceDef;
+use crate::kube::resources::ConvertToRow;
 
 /// The three parallel lists — `default_headers`, `column_defs`, and the
 /// per-row `cells` vec — must stay positionally aligned. A drift silently
