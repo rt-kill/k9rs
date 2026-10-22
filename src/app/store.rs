@@ -687,7 +687,7 @@ impl MetricsBinding {
     /// are the single source for column positions.)
     pub fn for_rid(rid: &ResourceId, hub: &Arc<MetricsHub>) -> Option<Self> {
         use crate::kube::resource_def::{MetricsColumn as MC, MetricsKind};
-        let def = crate::kube::resource_defs::REGISTRY.by_kind(rid.built_in_kind()?);
+        let def = rid.built_in_kind()?.def();
         let kind = def.metrics_kind()?;
         let col = |tag: MC| def.column_defs().iter().position(|c| c.metrics == Some(tag));
         let cols = match kind {

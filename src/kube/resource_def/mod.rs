@@ -176,7 +176,7 @@ impl ColumnDef {
 /// disagree: adding a variant adds it to `ALL`, and `ALL` is what the
 /// registration guard walks.
 macro_rules! built_in_kinds {
-    ($(#[$m:meta])* pub enum $name:ident { $($variant:ident),* $(,)? }) => {
+    ($(#[$m:meta])* pub enum $name:ident { $($variant:ident => $def:path),* $(,)? }) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
         pub enum $name { $($variant),* }
@@ -184,15 +184,32 @@ macro_rules! built_in_kinds {
         impl $name {
             /// Every variant, generated from the enum's own declaration.
             pub const ALL: &'static [$name] = &[$($name::$variant),*];
+
+            /// This kind's definition — identity, aliases, columns, operations.
+            ///
+            /// Generated from the SAME declaration as the enum and `ALL`, so
+            /// the mapping cannot be partial: a new variant without a def is a
+            /// compile error in the generated match, not a gap some test has
+            /// to notice. That is what the registry could not offer — it was
+            /// built by 34 hand-written `register_*` calls, and a variant
+            /// nobody registered panicked in `by_kind` under a user's cursor
+            /// until `every_built_in_kind_is_registered` was added to catch it.
+            /// Here there is nothing left to catch.
+            ///
+            /// Returns `&'static` because every def is a unit struct, so the
+            /// reference is const-promoted — no registry, no `LazyLock`, no
+            /// allocation, and reachable without naming kube-rs.
+            pub fn def(self) -> &'static dyn ResourceDef {
+                match self { $($name::$variant => &$def),* }
+            }
         }
     };
 }
 built_in_kinds! {
     /// Closed enum of every built-in resource type the daemon knows about.
     ///
-    /// The canonical typed identity for built-ins — [`ResourceId::BuiltIn`] wraps it,
-    /// and [`ResourceRegistry`](crate::kube::resource_defs::registry::ResourceRegistry)
-    /// indexes defs by it.
+    /// The canonical typed identity for built-ins — [`ResourceId::BuiltIn`]
+    /// wraps it, and [`BuiltInKind::def`] maps it to its definition.
     ///
     /// Declared through [`built_in_kinds!`] so that [`BuiltInKind::ALL`] is
     /// generated FROM this list and cannot omit a variant. That is what makes
@@ -212,45 +229,103 @@ built_in_kinds! {
     /// `ResourceId` on the wire, so variants are APPENDED, never reordered.
     pub enum BuiltInKind {
     // Workloads
-    Pod,
-    Deployment,
-    StatefulSet,
-    DaemonSet,
-    ReplicaSet,
-    Job,
-    CronJob,
+    Pod => pods::PodDef,
+    Deployment => deployments::DeploymentDef,
+    StatefulSet => statefulsets::StatefulSetDef,
+    DaemonSet => daemonsets::DaemonSetDef,
+    ReplicaSet => replicasets::ReplicaSetDef,
+    Job => jobs::JobDef,
+    CronJob => cronjobs::CronJobDef,
 
     // Core / config / network
-    Service,
-    ConfigMap,
-    Secret,
-    ServiceAccount,
-    Ingress,
-    NetworkPolicy,
-    Hpa,
-    Endpoints,
-    EndpointSlice,
-    LimitRange,
-    ResourceQuota,
-    PodDisruptionBudget,
-    Event,
-    PersistentVolumeClaim,
-    Lease,
+    Service => services::ServiceDef,
+    ConfigMap => configmaps::ConfigMapDef,
+    Secret => secrets::SecretDef,
+    ServiceAccount => serviceaccounts::ServiceAccountDef,
+    Ingress => ingresses::IngressDef,
+    NetworkPolicy => networkpolicies::NetworkPolicyDef,
+    Hpa => hpa::HpaDef,
+    Endpoints => endpoints::EndpointsDef,
+    EndpointSlice => endpointslices::EndpointSliceDef,
+    LimitRange => limitranges::LimitRangeDef,
+    ResourceQuota => resourcequotas::ResourceQuotaDef,
+    PodDisruptionBudget => pdb::PodDisruptionBudgetDef,
+    Event => events::EventDef,
+    PersistentVolumeClaim => pvcs::PvcDef,
+    Lease => leases::LeaseDef,
 
     // Cluster
-    Namespace,
-    Node,
-    PersistentVolume,
-    StorageClass,
-    PriorityClass,
-    Role,
-    ClusterRole,
-    RoleBinding,
-    ClusterRoleBinding,
-    ValidatingWebhookConfiguration,
-    MutatingWebhookConfiguration,
-    CustomResourceDefinition,
+    Namespace => namespaces::NamespaceDef,
+    Node => nodes::NodeDef,
+    PersistentVolume => pvs::PvDef,
+    StorageClass => storageclasses::StorageClassDef,
+    PriorityClass => priorityclasses::PriorityClassDef,
+    Role => roles::RoleDef,
+    ClusterRole => clusterroles::ClusterRoleDef,
+    RoleBinding => rolebindings::RoleBindingDef,
+    ClusterRoleBinding => clusterrolebindings::ClusterRoleBindingDef,
+    ValidatingWebhookConfiguration => webhooks::ValidatingWebhookDef,
+    MutatingWebhookConfiguration => webhooks::MutatingWebhookDef,
+    CustomResourceDefinition => crds::CrdDef,
 }
+}
+
+// ---------------------------------------------------------------------------
+// The definition table — metadata lookup without the watcher registry
+// ---------------------------------------------------------------------------
+
+/// Every built-in definition, in declaration order.
+///
+/// `BuiltInKind::def` makes the per-kind lookup free, so this is the whole
+/// table: no registry object, no registration calls, and nothing here names
+/// kube-rs. The `ResourceRegistry` still exists, but only for what genuinely
+/// needs the k8s types — spawning a typed watcher.
+pub fn all_defs() -> impl Iterator<Item = &'static dyn ResourceDef> {
+    BuiltInKind::ALL.iter().map(|k| k.def())
+}
+
+/// Lowercased alias → kind, and plural → kind.
+///
+/// Indexed rather than scanned, because a scan over a `HashMap`'s values
+/// resolved the first alias collision differently on each launch. Built once;
+/// a duplicate alias or plural PANICS here, which is where the registry used
+/// to reject it at registration time — the check moved with the data rather
+/// than being dropped along the way.
+/// The two string indexes over the definition table. Named rather than a
+/// tuple so the two maps cannot be confused at the use site.
+struct DefIndex {
+    /// Lowercased alias → kind.
+    by_alias: std::collections::HashMap<String, BuiltInKind>,
+    /// Plural name → kind.
+    by_plural: std::collections::HashMap<&'static str, BuiltInKind>,
+}
+
+static INDEX: std::sync::LazyLock<DefIndex> = std::sync::LazyLock::new(|| {
+    let mut aliases = std::collections::HashMap::new();
+    let mut plurals = std::collections::HashMap::new();
+    for &kind in BuiltInKind::ALL {
+        let def = kind.def();
+        for alias in def.aliases() {
+            let lower = alias.to_lowercase();
+            if let Some(owner) = aliases.insert(lower.clone(), kind) {
+                panic!("alias {lower:?} claimed by both {owner:?} and {kind:?}");
+            }
+        }
+        if let Some(owner) = plurals.insert(def.gvr().plural, kind) {
+            panic!("plural {:?} claimed by both {owner:?} and {kind:?}", def.gvr().plural);
+        }
+    }
+    DefIndex { by_alias: aliases, by_plural: plurals }
+});
+
+/// Look up a definition by any of its aliases (case-insensitive).
+pub fn def_by_alias(alias: &str) -> Option<&'static dyn ResourceDef> {
+    INDEX.by_alias.get(&alias.to_lowercase()).map(|k| k.def())
+}
+
+/// Look up a definition by its plural name.
+pub fn def_by_plural(plural: &str) -> Option<&'static dyn ResourceDef> {
+    INDEX.by_plural.get(plural).map(|k| k.def())
 }
 
 // `BuiltInKind::ALL` used to live here as a hand-maintained `&[BuiltInKind]`
@@ -263,7 +338,7 @@ built_in_kinds! {
 // 3. Iterating every kind is rare, and when needed, the registry itself
 //    is the authoritative source.
 //
-// Use `crate::kube::resource_defs::REGISTRY.all().map(|d| d.kind())` when
+// Use `crate::kube::resource_def::all_defs().map(|d| d.kind())` when
 // you need every kind — that's the real source of truth.
 
 // ---------------------------------------------------------------------------
@@ -298,10 +373,10 @@ pub struct Gvr {
 ///
 /// Object-safe so it can be stored as `dyn ResourceDef` in the registry.
 pub trait ResourceDef: Send + Sync + 'static {
-    /// Typed kind discriminant — the closed enum variant that identifies
-    /// this def inside [`crate::kube::resource_defs::registry::ResourceRegistry`]. The
-    /// registry's `kind_table_complete` test enforces a 1:1 mapping between
-    /// `BuiltInKind` variants and registered defs.
+    /// Typed kind discriminant — the closed enum variant this def belongs
+    /// to. The mapping back ([`BuiltInKind::def`]) is GENERATED from the
+    /// enum's declaration, so the 1:1 correspondence is a compile error to
+    /// break rather than something a test has to notice.
     fn kind(&self) -> BuiltInKind;
 
     /// Identity payload (group/version/kind/plural/scope) as a heap-free

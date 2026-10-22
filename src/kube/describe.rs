@@ -145,7 +145,7 @@ pub async fn api_resource_for(
 ) -> anyhow::Result<(ApiResource, ResourceScope)> {
     match rid {
         ResourceId::BuiltIn(kind) => {
-            let g = crate::kube::resource_defs::REGISTRY.by_kind(*kind).gvr();
+            let g = *kind.def().gvr();
             let gvk = GroupVersionKind::gvk(g.group, g.version, g.kind);
             Ok((ApiResource::from_gvk_with_plural(&gvk, g.plural), g.scope))
         }

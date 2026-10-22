@@ -250,8 +250,7 @@ coloring:
 /// through it, which is the only way to catch the mistake.
 #[test]
 fn a_real_resources_columns_come_from_its_headers() {
-    let deployments = crate::kube::resource_defs::REGISTRY
-        .by_alias("deployments")
+    let deployments = crate::kube::resource_def::def_by_alias("deployments")
         .expect("deployments is a built-in");
 
     let headers = deployments.default_headers();

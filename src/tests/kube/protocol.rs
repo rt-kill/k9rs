@@ -554,7 +554,7 @@ fn builtinkind_tags_are_stable() {
     // kinds swap undetected.
     assert_eq!(
         all.len(),
-        crate::kube::resource_defs::REGISTRY.all().count(),
+        crate::kube::resource_def::all_defs().count(),
         "a BuiltInKind exists that this pin does not cover — add it at the END of `all`",
     );
     for (i, kind) in all.iter().enumerate() {

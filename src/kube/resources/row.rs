@@ -521,7 +521,7 @@ pub enum DrillTarget {
         /// Parent kind, typed. Producers have a [`crate::kube::resource_def::BuiltInKind`] in hand
         /// already; stringifying and re-parsing on the client was extra
         /// motion. Breadcrumb display fetches the human string via
-        /// [`crate::kube::resource_defs::REGISTRY`].
+        /// the definition table (`BuiltInKind::def`).
         kind: crate::kube::resource_def::BuiltInKind,
         name: String,
     },

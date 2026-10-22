@@ -305,7 +305,7 @@ impl ServerSession {
             self.reject_async(required_op.clone(), target, format!("{} not supported on {}", action, target.resource.plural()));
             return None;
         };
-        let def = crate::kube::resource_defs::REGISTRY.by_kind(kind);
+        let def = kind.def();
         if !def.operations().contains(&required_op) {
             self.reject_async(required_op, target, format!("{} not supported on {}", action, def.gvr().plural));
             return None;
@@ -382,12 +382,12 @@ impl ServerSession {
         let n = target.name.clone();
         let namespace = target.namespace.clone();
         let target = target.clone();
-        let display = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().plural;
+        let display = kind.def().gvr().plural;
         self.track_task(async move {
             // Use the /scale subresource (same as kubectl scale / k9s).
             // This doesn't interact with SSA field management — no field
             // ownership is claimed on spec.replicas.
-            let gvr = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr();
+            let gvr = kind.def().gvr();
             let ar = kube::api::ApiResource {
                 group: gvr.group.to_string(),
                 version: gvr.version.to_string(),
@@ -472,7 +472,7 @@ impl ServerSession {
         let n = target.name.clone();
         let namespace = target.namespace.clone();
         let target = target.clone();
-        let display: &'static str = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().plural;
+        let display: &'static str = kind.def().gvr().plural;
         self.track_task(async move {
             use ::kube::api::{Patch, PatchParams};
             let api = dynamic_api_for_kind(&client, kind, &namespace);
@@ -507,7 +507,7 @@ impl ServerSession {
             });
             return;
         };
-        let def = crate::kube::resource_defs::REGISTRY.by_kind(kind);
+        let def = kind.def();
         if !def.operations().contains(&protocol::OperationKind::DecodeSecret) {
             let tx = self.event_tx.clone();
             let plural = def.gvr().plural;
@@ -682,7 +682,7 @@ fn reject(op: protocol::OperationKind, target: &protocol::ObjectRef, message: St
 fn built_in_api_resource(
     kind: crate::kube::resource_def::BuiltInKind,
 ) -> (kube::api::ApiResource, crate::kube::protocol::ResourceScope) {
-    let g = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr();
+    let g = kind.def().gvr();
     let gvk = kube::api::GroupVersionKind::gvk(g.group, g.version, g.kind);
     let ar = kube::api::ApiResource::from_gvk_with_plural(&gvk, g.plural);
     (ar, g.scope)

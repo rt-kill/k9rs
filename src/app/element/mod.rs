@@ -77,7 +77,7 @@ impl ColumnPolicy {
         };
         match rid {
             ResourceId::BuiltIn(k) => {
-                find(&crate::kube::resource_defs::REGISTRY.by_kind(*k).column_defs())
+                find(&k.def().column_defs())
             }
             ResourceId::Local(k) => find(k.column_defs()),
             // CRD columns are server-resolved printer columns; nothing

@@ -7,6 +7,7 @@ opinion. Run it before and after any re-filing step.
 
     python3 tools/coupling.py            # source only (src/, excluding src/tests/)
     python3 tools/coupling.py --tests    # test mirrors too, listed separately
+    python3 tools/coupling.py --proto    # can k9rs-proto be extracted yet?
 
 A cycle is any pair with references in both directions. Crate boundaries
 cannot be drawn through one, because Rust forbids circular crate
@@ -57,7 +58,61 @@ def scan(include_tests):
     return mods, edges, per_file
 
 
+# The prospective `k9rs-proto` file set: the wire contract plus the resource
+# DEFINITIONS. A crate boundary here is only real if nothing REACHABLE from
+# these files names kube-rs — a file-level grep misses that, because the
+# dependency used to run through a function call (`protocol.rs` -> `REGISTRY`).
+PROTO_SEED = [
+    "kube/protocol.rs", "kube/resource_def/mod.rs", "kube/resources/row.rs",
+    "kube/local/types.rs", "kube/overlay.rs",
+]
+HEAVY = ("kube", "k8s_openapi")
+
+
+def _targets(path):
+    """`crate::a::b::C` -> the file(s) that could define `a::b`."""
+    parts = path.split("::")
+    for n in range(len(parts), 0, -1):
+        base = "/".join(parts[:n])
+        hits = [c for c in (f"{base}.rs", f"{base}/mod.rs") if (ROOT / c).exists()]
+        if hits:
+            return hits
+    return []
+
+
+def proto_closure():
+    seed = list(PROTO_SEED) + [
+        f"kube/resource_def/{p.stem}.rs"
+        for p in (ROOT / "kube/resource_def").glob("*.rs") if p.stem != "mod"
+    ]
+    seen, frontier, heavy = set(seed), list(seed), {}
+    while frontier:
+        f = frontier.pop()
+        text = (ROOT / f).read_text()
+        code = "\n".join(l for l in text.splitlines()
+                         if not l.strip().startswith(("///", "//!", "//")))
+        for h in HEAVY:
+            if re.search(r"(?<![:a-z_])" + h + r"::", code):
+                heavy.setdefault(f, []).append(h)
+        for m in re.finditer(r"crate::([a-z_]+(?:::[a-z_]+)*)", code):
+            for cand in _targets(m.group(1)):
+                if cand not in seen:
+                    seen.add(cand)
+                    frontier.append(cand)
+    return seen, heavy
+
+
 def main():
+    if "--proto" in sys.argv:
+        seen, heavy = proto_closure()
+        print(f"=== k9rs-proto extractability: {len(seen)} files reachable from the seed ===")
+        if heavy:
+            print("BLOCKED — these reachable files name kube-rs / k8s-openapi:")
+            for f, hs in sorted(heavy.items()):
+                print(f"  {f}: {', '.join(hs)}")
+        else:
+            print("CLEAR — nothing reachable names kube-rs or k8s-openapi")
+        return
     include_tests = "--tests" in sys.argv
     mods, edges, per_file = scan(include_tests)
     label = "src + tests" if include_tests else "src only"

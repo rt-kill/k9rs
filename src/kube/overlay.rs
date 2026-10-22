@@ -365,8 +365,8 @@ pub fn load_overlays_from(
                         }
                     }
                     // Check column/jsonpath consistency.
-                    let is_builtin = crate::kube::resource_defs::REGISTRY
-                        .by_alias(&overlay.resource).is_some();
+                    let is_builtin =
+                        crate::kube::resource_def::def_by_alias(&overlay.resource).is_some();
                     for oc in &overlay.columns {
                         if is_builtin && oc.jsonpath.is_some() {
                             warn!(
@@ -396,8 +396,8 @@ pub fn load_overlays_from(
                     // Only checkable for BUILT-INS: a CRD's columns come from
                     // the cluster's printer columns plus this overlay's own
                     // `columns:`, neither of which is known here.
-                    if let Some(def) = crate::kube::resource_defs::REGISTRY
-                        .by_alias(&overlay.resource)
+                    if let Some(def) =
+                        crate::kube::resource_def::def_by_alias(&overlay.resource)
                     {
                         // `default_headers()` — the MANDATORY header list,
                         // which all 33 built-ins implement. This read

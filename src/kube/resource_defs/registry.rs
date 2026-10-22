@@ -49,7 +49,6 @@ type WatcherSpawner = Box<dyn Fn(WatcherArgs) -> JoinHandle<()> + Send + Sync>;
 type ConvertDefaultFn = Box<dyn Fn() -> ResourceRow + Send + Sync>;
 
 struct RegistryEntry {
-    def: Box<dyn ResourceDef>,
     spawner: WatcherSpawner,
     /// Read only by the alignment test; always populated so the guard can run.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -62,21 +61,16 @@ struct RegistryEntry {
 
 /// Central registry of all known built-in resource types.
 pub struct ResourceRegistry {
-    /// Typed primary index — owns the entries. Every registered def lives
-    /// here keyed by its [`BuiltInKind`]. Closed-enum dispatch (`by_kind`,
-    /// `spawn_watcher_for_kind`) reads straight from this map with no
-    /// string indirection between a typed key and the entry it points at.
+    /// Typed index of watcher factories, keyed by [`BuiltInKind`].
+    ///
+    /// It used to own the `ResourceDef` trait objects too, and the plural,
+    /// alias and ordering indexes over them. All of that moved to
+    /// `resource_def`, where `BuiltInKind::def` is generated from the enum's
+    /// own declaration — so the metadata table is now reachable without
+    /// naming kube-rs, which is the whole reason this split exists. What is
+    /// left here is the half that genuinely needs the k8s types: a typed
+    /// watcher factory per kind.
     by_kind: HashMap<BuiltInKind, RegistryEntry>,
-    /// Plural-name lookup indirection for the few string-keyed callers
-    /// (`by_plural`, the `registry_consistency` test). Points at the
-    /// typed kind; the entry itself lives in `by_kind`.
-    by_plural: HashMap<&'static str, BuiltInKind>,
-    /// Insertion-order list of kinds, for deterministic iteration
-    /// (tab cycling, alias listing).
-    ordered: Vec<BuiltInKind>,
-    /// Lowercased alias → kind. An index rather than a scan, so lookup is
-    /// deterministic and a collision is rejected at registration.
-    by_alias: HashMap<String, BuiltInKind>,
 }
 
 impl Default for ResourceRegistry {
@@ -89,9 +83,6 @@ impl ResourceRegistry {
     pub fn new() -> Self {
         Self {
             by_kind: HashMap::new(),
-            by_plural: HashMap::new(),
-            ordered: Vec::new(),
-            by_alias: HashMap::new(),
         }
     }
 
@@ -156,6 +147,12 @@ impl ResourceRegistry {
         self.insert(def, spawner, Box::new(move || convert_fn(K::default())));
     }
 
+    /// Record a kind's watcher factory.
+    ///
+    /// The alias, plural and ordering bookkeeping that used to live here —
+    /// including the duplicate-alias panic — moved to `resource_def`'s
+    /// `INDEX`, built from `BuiltInKind::ALL`. It had to move WITH the data:
+    /// a check beside a table it no longer indexes is a check of nothing.
     fn insert(
         &mut self,
         def: impl ResourceDef + 'static,
@@ -163,72 +160,16 @@ impl ResourceRegistry {
         convert_default: ConvertDefaultFn,
     ) {
         let kind = def.kind();
-        let plural_static: &'static str = def.gvr().plural;
-        // A duplicate ALIAS is as much a conflict as a duplicate kind or
-        // plural, and it used to be the one of the three that registered
-        // silently — `by_alias` would then resolve it to whichever entry the
-        // HashMap happened to yield first, differently on each launch.
-        for alias in def.aliases() {
-            let lower = alias.to_lowercase();
-            if let Some(owner) = self.by_alias.insert(lower.clone(), kind) {
-                panic!(
-                    "ResourceRegistry: alias {:?} registered for both {:?} and {:?}",
-                    lower, owner, kind,
-                );
-            }
-        }
-        self.ordered.push(kind);
-        if self.by_kind.insert(kind, RegistryEntry { def: Box::new(def), spawner, convert_default }).is_some() {
-            panic!("ResourceRegistry: duplicate registration for {:?}", kind);
-        }
-        if self.by_plural.insert(plural_static, kind).is_some() {
-            panic!("ResourceRegistry: duplicate plural registration: {:?}", plural_static);
+        if self.by_kind.insert(kind, RegistryEntry { spawner, convert_default }).is_some() {
+            panic!("ResourceRegistry: duplicate watcher registration for {:?}", kind);
         }
     }
 
     // -- Lookup ---------------------------------------------------------------
 
-    /// Look up by plural name. Test-only — production dispatch goes through
-    /// `by_kind(BuiltInKind)` / `by_alias(&str)`. Kept alive for the
-    /// `registry_consistency` drift guard, which verifies the `by_plural`
-    /// indirection round-trips to the correct `BuiltInKind` entry.
-    #[cfg(test)]
-    fn by_plural(&self, plural: &str) -> Option<&dyn ResourceDef> {
-        let kind = self.by_plural.get(plural)?;
-        self.by_kind.get(kind).map(|e| &*e.def)
-    }
 
-    /// Typed lookup by [`BuiltInKind`] — infallible in correct code, panics
-    /// if called with an unregistered variant (adding an enum variant
-    /// without a corresponding `register_*` call in `build_registry` is the
-    /// only way this can happen, and `every_built_in_kind_is_registered`
-    /// walks `BuiltInKind::ALL` — generated from the enum's declaration — so
-    /// it now fails at test time rather than panicking under a user's
-    /// cursor). Returns `&'static dyn ResourceDef`
-    /// because the registry lives in a `LazyLock` for the process lifetime.
-    pub fn by_kind(&'static self, kind: BuiltInKind) -> &'static dyn ResourceDef {
-        let entry = self.by_kind.get(&kind)
-            .unwrap_or_else(|| panic!("ResourceRegistry: missing entry for {:?}", kind));
-        &*entry.def
-    }
 
-    /// Look up by any alias (case-insensitive).
-    ///
-    /// Indexed, not scanned. The scan iterated `by_kind.values()` — a
-    /// `HashMap` with the default randomized hasher — so the FIRST alias
-    /// collision anyone introduced would have resolved to a different
-    /// resource on different launches of the same binary. It is an index now,
-    /// and `insert` rejects a collision outright, so there is nothing left to
-    /// resolve ambiguously.
-    pub fn by_alias(&self, alias: &str) -> Option<&dyn ResourceDef> {
-        let kind = self.by_alias.get(&alias.to_lowercase())?;
-        self.by_kind.get(kind).map(|e| &*e.def)
-    }
 
-    /// Iterate all registered resource definitions in registration order.
-    pub fn all(&self) -> impl Iterator<Item = &dyn ResourceDef> {
-        self.ordered.iter().filter_map(|k| self.by_kind.get(k).map(|e| &*e.def))
-    }
 
     /// Build the `convert(K::default())` row for `kind`. Test-only — feeds the
     /// `default_cells_align_with_headers` alignment guard.
@@ -236,6 +177,21 @@ impl ResourceRegistry {
     pub(crate) fn default_row(&self, kind: BuiltInKind) -> ResourceRow {
         let entry = self.by_kind.get(&kind).expect("registered kind");
         (entry.convert_default)()
+    }
+
+    /// Whether a watcher factory is registered for `kind`.
+    ///
+    /// Test-only: it exists so `every_built_in_kind_has_a_watcher` can ask
+    /// without tripping the panic it is checking for.
+    #[cfg(test)]
+    pub(crate) fn has_watcher(&self, kind: BuiltInKind) -> bool {
+        self.by_kind.contains_key(&kind)
+    }
+
+    /// How many kinds have a watcher. Test-only, same guard.
+    #[cfg(test)]
+    pub(crate) fn watcher_count(&self) -> usize {
+        self.by_kind.len()
     }
 
     // -- Watcher spawning -----------------------------------------------------

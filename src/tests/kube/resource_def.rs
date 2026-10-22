@@ -1,10 +1,9 @@
-use crate::kube::resource_defs::REGISTRY;
 use crate::kube::protocol::OperationKind;
 
 /// Every resource must include the base operations (Describe, Yaml, Delete).
 #[test]
 fn all_resources_have_base_operations() {
-    for def in REGISTRY.all() {
+    for def in crate::kube::resource_def::all_defs() {
         let ops = def.operations();
         for base in [OperationKind::Describe, OperationKind::Yaml, OperationKind::Delete] {
             assert!(

@@ -262,9 +262,9 @@ impl ResourceId {
     }
 
     /// Look up a resource by any alias (e.g., "po", "deploy", "svc", "namespaces", "pf").
-    /// Consults the trait-based REGISTRY and the local table.
+    /// Consults the definition table (`BuiltInKind::def`) and the local one.
     pub fn from_alias(alias: &str) -> Option<Self> {
-        if let Some(def) = crate::kube::resource_defs::REGISTRY.by_alias(alias) {
+        if let Some(def) = crate::kube::resource_def::def_by_alias(alias) {
             return Some(ResourceId::BuiltIn(def.kind()));
         }
         if let Some(kind) = crate::kube::local::find_by_alias(alias) {
@@ -301,7 +301,7 @@ impl ResourceId {
     pub fn identity(&self) -> IdentityData<'_> {
         match self {
             ResourceId::BuiltIn(k) => {
-                let def = crate::kube::resource_defs::REGISTRY.by_kind(*k);
+                let def = k.def();
                 let g = def.gvr();
                 IdentityData {
                     group: g.group,
@@ -378,7 +378,7 @@ impl ResourceId {
     pub fn capabilities(&self) -> ResourceCapabilities {
         let ops: Vec<OperationKind> = match self {
             ResourceId::BuiltIn(k) => {
-                crate::kube::resource_defs::REGISTRY.by_kind(*k).operations()
+                k.def().operations()
             }
             ResourceId::Local(k) => k.operations(),
             ResourceId::Crd(_) | ResourceId::CrdUnresolved(_) => {

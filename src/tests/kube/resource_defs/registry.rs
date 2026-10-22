@@ -8,11 +8,11 @@ use crate::kube::resource_defs::REGISTRY;
 /// check kick in as soon as the def exists.
 #[test]
 fn registry_consistency() {
-    for def in REGISTRY.all() {
+    for def in crate::kube::resource_def::all_defs() {
         let kind = def.kind();
-        let by_kind_def = REGISTRY.by_kind(kind);
+        let by_kind_def = kind.def();
         assert_eq!(by_kind_def.gvr().plural, def.gvr().plural);
-        let by_plural_def = REGISTRY.by_plural(def.gvr().plural).expect("registered");
+        let by_plural_def = crate::kube::resource_def::def_by_plural(def.gvr().plural).expect("registered");
         assert_eq!(by_plural_def.kind(), kind);
     }
 }
@@ -28,7 +28,7 @@ fn registry_consistency() {
 /// resource, so it's checked per-converter; see e.g. `nodes`/`pods`.)
 #[test]
 fn column_defs_align_with_headers() {
-    for def in REGISTRY.all() {
+    for def in crate::kube::resource_def::all_defs() {
         let cols = def.column_defs();
         if cols.is_empty() {
             continue; // no explicit tagging — headers are used directly
@@ -57,7 +57,7 @@ fn column_defs_align_with_headers() {
 /// column past the drift point under the wrong header).
 #[test]
 fn default_cells_align_with_headers() {
-    for def in REGISTRY.all() {
+    for def in crate::kube::resource_def::all_defs() {
         let row = REGISTRY.default_row(def.kind());
         let headers = def.default_headers();
         assert_eq!(
@@ -79,10 +79,9 @@ fn default_cells_align_with_headers() {
 /// this walks the live registry to prove the index is total and faithful.
 #[test]
 fn every_alias_resolves_to_its_own_resource() {
-    for def in REGISTRY.all() {
+    for def in crate::kube::resource_def::all_defs() {
         for alias in def.aliases() {
-            let found = REGISTRY
-                .by_alias(alias)
+            let found = crate::kube::resource_def::def_by_alias(alias)
                 .unwrap_or_else(|| panic!("alias {alias:?} of {:?} resolves to nothing", def.kind()));
             assert_eq!(
                 found.kind(),
@@ -93,7 +92,7 @@ fn every_alias_resolves_to_its_own_resource() {
             );
             let shouty = alias.to_uppercase();
             assert_eq!(
-                REGISTRY.by_alias(&shouty).map(|d| d.kind()),
+                crate::kube::resource_def::def_by_alias(&shouty).map(|d| d.kind()),
                 Some(def.kind()),
                 "alias lookup is case-insensitive ({shouty})",
             );
@@ -122,18 +121,52 @@ fn every_built_in_kind_is_registered() {
         // Panics with "missing entry for {kind}" if unregistered — here,
         // where it is a test failure naming the variant, instead of under a
         // user's cursor.
-        let def = REGISTRY.by_kind(kind);
+        let def = kind.def();
         assert_eq!(def.kind(), kind, "{kind:?} is registered under its own kind");
         // And reachable the way every caller reaches it.
         assert!(
-            REGISTRY.by_plural(def.gvr().plural).is_some(),
+            crate::kube::resource_def::def_by_plural(def.gvr().plural).is_some(),
             "{kind:?} is reachable by plural, which is how the command bar finds it",
         );
     }
     // The two indexes agree in size: no kind registered twice, none lost.
     assert_eq!(
-        REGISTRY.all().count(),
+        crate::kube::resource_def::all_defs().count(),
         BuiltInKind::ALL.len(),
         "the registry holds exactly the enum's kinds",
+    );
+}
+
+/// Every kind has a WATCHER, which is the half the compiler cannot hold.
+///
+/// `BuiltInKind::def` is generated from the enum's declaration, so a variant
+/// without a definition no longer compiles. The spawner table is still built
+/// by hand — 34 `register_*` calls — so a variant nobody registered has a def,
+/// answers every metadata question, and then panics the first time a user
+/// navigates to it and a watcher is spawned.
+///
+/// This is the guard that used to come bundled with the def check, back when
+/// one registry held both. Splitting them split it, and a check that is not
+/// re-written is a check that was deleted.
+#[test]
+fn every_built_in_kind_has_a_watcher() {
+    use crate::kube::resource_def::BuiltInKind;
+
+    assert_eq!(
+        BuiltInKind::ALL.len(),
+        crate::kube::resource_def::all_defs().count(),
+        "the generated list and the generated table are the same length",
+    );
+    for &kind in BuiltInKind::ALL {
+        assert!(
+            REGISTRY.has_watcher(kind),
+            "{kind:?} has a definition but no registered watcher — it would \
+             answer every metadata question and then panic on first subscribe",
+        );
+    }
+    assert_eq!(
+        REGISTRY.watcher_count(),
+        BuiltInKind::ALL.len(),
+        "no kind registered twice, none left over",
     );
 }

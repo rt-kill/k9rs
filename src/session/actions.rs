@@ -1644,7 +1644,7 @@ pub(crate) fn handle_enter(
             drill_to_pods_by_grep(app, data_source, &name);
         }
         Some(DrillTarget::JobsByOwner { uid, kind, name }) => {
-            let kind_str = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().kind;
+            let kind_str = kind.def().gvr().kind;
             let kind_lower = kind_str.to_lowercase();
             // Scope to the SOURCE object's namespace — its jobs live there.
             let source_ns = protocol::Namespace::from_row(row.namespace.as_deref().unwrap_or(""));
@@ -2210,7 +2210,7 @@ pub(crate) fn drill_to_pods_by_owner(
     name: &str,
     namespace: crate::kube::protocol::Namespace,
 ) {
-    let kind_str = crate::kube::resource_defs::REGISTRY.by_kind(kind).gvr().kind;
+    let kind_str = kind.def().gvr().kind;
     let el = app.list_element_from_top(
         data_source,
         rid(BuiltInKind::Pod),

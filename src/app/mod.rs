@@ -74,10 +74,10 @@ pub use crate::kube::resource_def::{ColumnDef, ColumnLevel, MetricsColumn};
 // ---------------------------------------------------------------------------
 
 /// The default ordered list of pinned resources for Tab/BackTab cycling.
-/// Uses registration order from the trait-based REGISTRY.
+/// Uses declaration order from `BuiltInKind`, which is where the resource
+/// table now lives — the watcher registry no longer holds the defs.
 pub fn default_pinned_resources() -> Vec<ResourceId> {
-    crate::kube::resource_defs::REGISTRY
-        .all()
+    crate::kube::resource_def::all_defs()
         .map(|def| def.resource_id())
         .collect()
 }
@@ -119,7 +119,7 @@ fn seed_aliases(store: &store::RowStore) {
             ..Default::default()
         });
     };
-    for def in crate::kube::resource_defs::REGISTRY.all() {
+    for def in crate::kube::resource_def::all_defs() {
         push("resource", def.aliases().join(" / "), def.gvr().kind.to_string());
     }
     for kind in crate::kube::local::LocalResourceKind::all() {
@@ -289,7 +289,7 @@ impl CoreData {
         rows: Vec<crate::kube::resources::row::ResourceRow>,
     ) {
         let Some(target) = self.store_for(kind) else { return };
-        let def = crate::kube::resource_defs::REGISTRY.by_kind(kind);
+        let def = kind.def();
         target.apply(
             Self::SEED_EPOCH,
             store::StorePayload::Baseline(crate::kube::protocol::TableBaseline {
@@ -304,7 +304,7 @@ impl CoreData {
     /// core stores. Called on (re)connect; previous streams drop.
     pub fn open_streams(&mut self, session: &crate::app::client::ClientSession) {
         self.streams.clear();
-        for def in crate::kube::resource_defs::REGISTRY.all() {
+        for def in crate::kube::resource_def::all_defs() {
             if !def.is_core() {
                 continue;
             }
@@ -921,7 +921,7 @@ impl App {
     pub fn core_resource_stats(&self) -> Vec<(&'static str, usize, usize)> {
         use crate::kube::resources::row::RowHealth;
         let mut stats = Vec::new();
-        for def in crate::kube::resource_defs::REGISTRY.all() {
+        for def in crate::kube::resource_def::all_defs() {
             if !def.is_core() {
                 continue;
             }
@@ -974,8 +974,7 @@ impl App {
 
 /// All known resource command aliases, derived from the registry.
 fn resource_commands() -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = crate::kube::resource_defs::REGISTRY
-        .all()
+    let mut v: Vec<&'static str> = crate::kube::resource_def::all_defs()
         .flat_map(|def| def.aliases().iter().copied())
         .collect();
     for kind in &crate::kube::local::LocalResourceKind::all() {
