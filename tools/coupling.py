@@ -62,9 +62,9 @@ def scan(include_tests):
 # through a function call (`protocol.rs` -> `REGISTRY` -> 34 converters ->
 # k8s-openapi) and no file-level grep could see it.
 #
-# It is gone because `k9rs-proto` is a crate now and CARGO holds that
+# It is gone because `k9rs_proto` is a crate now and CARGO holds that
 # invariant: its source cannot name `kube::` without a manifest dependency
-# that is not there. `cargo tree -p k9rs-proto` is the authority. A check the
+# that is not there. `cargo tree -p k9rs_proto` is the authority. A check the
 # compiler took over is a check to delete, not to maintain.
 
 def main():

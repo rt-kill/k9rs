@@ -1,0 +1,24 @@
+[package]
+name = "k9rs_util"
+version.workspace = true
+edition.workspace = true
+description = "k9rs: text, width and concurrency helpers with no k9rs dependencies"
+
+# The bottom of the tree. It depends on nothing of ours, and deliberately not
+# on ratatui — `parse_ansi_line` lived here and dragged the TUI's rendering
+# library toward the daemon, so it moved to `ui::ansi`. The escape tokenizer
+# stayed, because every text consumer needs it.
+[dependencies]
+chrono.workspace = true
+libc.workspace = true
+regex.workspace = true
+tokio.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+# `start_paused` for the grace/timeout tests; not part of tokio's `full`.
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -1446,6 +1446,12 @@ pub struct ConfirmDialog {
 #[path = "../tests/app/types.rs"]
 mod mirror_tests;
 
+// A second mirror for this file: `AppConfig`'s strict-parse tests, which came
+// back from `k9rs_kube`'s `daemon_config` mirror when that became a crate.
+#[cfg(test)]
+#[path = "../tests/app/config.rs"]
+mod config_tests;
+
 /// "Which container?" — a pick-one list floating over the view that asked.
 ///
 /// Captures its choices at construction: self-contained, so no table lookup

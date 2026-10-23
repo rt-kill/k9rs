@@ -1161,8 +1161,11 @@ dependencies = [
  "futures",
  "http",
  "k8s-openapi",
- "k9rs-proto",
- "k9rs-util",
+ "k9rs_daemon",
+ "k9rs_kube",
+ "k9rs_mux",
+ "k9rs_proto",
+ "k9rs_util",
  "kube",
  "libc",
  "ratatui",
@@ -1181,13 +1184,65 @@ dependencies = [
 ]
 
 [[package]]
-name = "k9rs-proto"
+name = "k9rs_daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures",
+ "k8s-openapi",
+ "k9rs_kube",
+ "k9rs_mux",
+ "k9rs_proto",
+ "k9rs_util",
+ "kube",
+ "libc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "k9rs_kube"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dashmap",
+ "futures",
+ "k8s-openapi",
+ "k9rs_proto",
+ "k9rs_util",
+ "kube",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "k9rs_mux"
+version = "0.1.0"
+dependencies = [
+ "k9rs_util",
+ "tokio",
+ "tokio-stream",
+ "tokio-yamux",
+ "tracing",
+]
+
+[[package]]
+name = "k9rs_proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
  "chrono",
- "k9rs-util",
+ "k9rs_util",
  "serde",
  "serde_yaml",
  "tokio",
@@ -1195,7 +1250,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "k9rs-util"
+name = "k9rs_util"
 version = "0.1.0"
 dependencies = [
  "chrono",

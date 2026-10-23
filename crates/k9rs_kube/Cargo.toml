@@ -1,0 +1,42 @@
+[package]
+name = "k9rs_kube"
+version.workspace = true
+edition.workspace = true
+description = "k9rs: Kubernetes client, watchers and typed row converters"
+
+# The ONLY crate that depends on kube-rs, k8s-openapi or serde_json. See
+# lib.rs: that is the boundary, not a coincidence.
+[features]
+# Exposes the driven-watcher harness so the DAEMON's tests can feed a watcher
+# by hand. Enabled only through the root package's `[dev-dependencies]`, and
+# VERIFIED not to reach a normal build: with a `compile_error!` gated on it,
+# `cargo build --release` compiled clean while `cargo test` failed. So this is
+# not a hatch in the shipped binary — it is absent unless someone asks for it
+# by name (`--all-features` would, which is a deliberate act).
+#
+# The alternative was making `DrivenWatcher` and `WatcherCache::seed_driven`
+# unconditionally `pub`, which would hand production code a way to mint a
+# watcher nothing is driving.
+testing = []
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+k8s-openapi.workspace = true
+k9rs_proto.workspace = true
+k9rs_util.workspace = true
+kube.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tokio-stream.workspace = true
+
+[lints]
+workspace = true

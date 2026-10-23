@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/k9rs-proto", "crates/k9rs-util"]
+members = ["crates/k9rs_daemon", "crates/k9rs_kube", "crates/k9rs_mux", "crates/k9rs_proto", "crates/k9rs_util"]
 
 # One place per dependency. A member crate writes `dep.workspace = true`, so a
 # version bump is a single edit and two crates cannot drift onto different
@@ -20,8 +20,18 @@ bincode = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_yaml = "0.9"
 tracing = "0.1"
-k9rs-proto = { path = "crates/k9rs-proto" }
-k9rs-util = { path = "crates/k9rs-util" }
+tokio-stream = "0.1"
+tokio-yamux = "0.3"
+dashmap = "6"
+futures = "0.3"
+k8s-openapi = { version = "0.24", features = ["latest"] }
+kube = { version = "0.98", features = ["client", "runtime", "derive", "ws"] }
+serde_json = "1"
+k9rs_daemon = { path = "crates/k9rs_daemon" }
+k9rs_kube = { path = "crates/k9rs_kube" }
+k9rs_mux = { path = "crates/k9rs_mux" }
+k9rs_proto = { path = "crates/k9rs_proto" }
+k9rs_util = { path = "crates/k9rs_util" }
 
 # One lint config for every member. `unreachable_pub` is the one that makes
 # the facade doctrine structural instead of a count: it is noise in a binary
@@ -89,8 +99,11 @@ dashmap = "6"
 
 # The first extracted crate. `main.rs` re-exports it as `util`, so the ~33
 # existing `crate::util::…` paths keep resolving and nothing else changed.
-k9rs-proto = { workspace = true }
-k9rs-util = { workspace = true }
+k9rs_daemon = { workspace = true }
+k9rs_kube = { workspace = true }
+k9rs_mux = { workspace = true }
+k9rs_proto = { workspace = true }
+k9rs_util = { workspace = true }
 
 # Multiplexer: per-subscription substreams over the single Unix socket
 # between TUI and daemon. We hide this behind `src/kube/mux/` so swapping
@@ -99,6 +112,7 @@ k9rs-util = { workspace = true }
 tokio-yamux = "0.3"
 
 [dev-dependencies]
+k9rs_kube = { workspace = true, features = ["testing"] }
 # `test-util` is deliberately NOT part of tokio's `full`, and it is what
 # provides `#[tokio::test(start_paused = true)]`. One test asserts a path
 # whose backstop IS a two-second timeout; without a pausable clock, waiting

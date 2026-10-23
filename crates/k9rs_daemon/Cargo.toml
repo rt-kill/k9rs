@@ -1,0 +1,31 @@
+[package]
+name = "k9rs_daemon"
+version.workspace = true
+edition.workspace = true
+description = "k9rs: the per-machine daemon that holds watchers and live streams"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+futures.workspace = true
+k8s-openapi.workspace = true
+k9rs_kube.workspace = true
+k9rs_mux.workspace = true
+k9rs_proto.workspace = true
+k9rs_util.workspace = true
+kube.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The driven-watcher harness: this crate's bridge tests feed a watcher by
+# hand. Off in any normal build — see k9rs_kube's `[features]`.
+k9rs_kube = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

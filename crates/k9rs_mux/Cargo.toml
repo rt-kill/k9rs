@@ -1,0 +1,20 @@
+[package]
+name = "k9rs_mux"
+version.workspace = true
+edition.workspace = true
+description = "k9rs: per-subscription substreams over one Unix socket"
+
+# Deliberately thin, and deliberately its OWN crate rather than part of the
+# daemon: both ends of the socket need it, so folding it into `k9rs_daemon`
+# would make the TUI depend on the daemon for a transport detail. The root
+# manifest already said this module exists so that swapping implementations
+# touches one place — a crate boundary is that statement with teeth.
+[dependencies]
+k9rs_util.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-yamux.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

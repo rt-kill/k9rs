@@ -796,3 +796,23 @@ fn the_two_column_spaces_convert_in_one_place() {
     assert_eq!(empty.data_col(0), None);
     assert_eq!(empty.visible_col(0), None);
 }
+
+/// How a tagged log line EXPORTS: the source becomes a `[tag] ` prefix, and
+/// an untagged line gets none.
+///
+/// These two assertions were in `k9rs_daemon`'s `server_session` mirror,
+/// bundled with the tests for the TAGGING. Tagging is the daemon's job and
+/// rendering is `StoredLine`'s, so the daemon's tests were reaching one crate
+/// up — which costs `cargo test -p k9rs_daemon` the entire TUI.
+#[test]
+fn a_tagged_line_exports_with_its_source_as_a_prefix() {
+    use crate::kube::protocol::LogLine;
+    let untagged = LogLine { source: None, timestamp: None, content: "hello".to_string() };
+    assert_eq!(StoredLine::from(untagged).flat_text(), "hello");
+    let tagged = LogLine {
+        source: Some("pod-b".to_string()),
+        timestamp: None,
+        content: "hello".to_string(),
+    };
+    assert_eq!(StoredLine::from(tagged).flat_text(), "[pod-b] hello");
+}
