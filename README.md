@@ -23,6 +23,28 @@ k9rs uses a client/daemon architecture:
 
 The TUI never talks to the Kubernetes cluster directly. All data flows through the daemon via a binary protocol (length-prefixed bincode over yamux-multiplexed Unix socket).
 
+### Crates
+
+One binary, ten library crates, each depending only on the ones below it. The
+order is enforced by Cargo, so the layering is not a convention that erodes —
+a call in the wrong direction does not compile.
+
+| Crate | What it owns |
+| --- | --- |
+| `k9rs_util` | Text, width, escape tokenizing, concurrency helpers. Depends on nothing of ours. |
+| `k9rs_proto` | The TUI↔daemon contract: commands, events, framing, the typed row/cell vocabulary, and the 34 resource definitions. **Names no Kubernetes crate.** |
+| `k9rs_mux` | Per-subscription substreams over the single Unix socket. |
+| `k9rs_theme` | Colours, skins, and asking the terminal which way round they go. |
+| `k9rs_kube` | Kubernetes access: the typed client, the watchers, the row converters, the kubeconfig reader. |
+| `k9rs_daemon` | The server: session handling, client construction, the socket. |
+| `k9rs_app` | The TUI's model — state, navigation stack, stores, keymap, and the client session. Cannot name kube-rs. |
+| `k9rs_ui` | The renderer. Reads `&App`, writes to a `Frame`, decides nothing. No tokio, no client, no daemon. |
+| `k9rs_session` | The loop: event select, key dispatch, command bar, terminal handover. |
+| `k9rs_cli` | `k9rs daemon`, `k9rs ctl …`, `k9rs contexts` — a sibling of the TUI, not a layer under it. |
+
+`src/main.rs` holds only what cannot live in a library: `main`, the clap
+definition, and the terminal setup that brackets the process.
+
 ## Installation
 
 ```bash

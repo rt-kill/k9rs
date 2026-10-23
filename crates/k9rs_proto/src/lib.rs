@@ -16,7 +16,9 @@
 //! types — so the wire module transitively depended on the Kubernetes client
 //! it exists to avoid. `BuiltInKind::def` is generated from the enum's own
 //! declaration now, and the definitions live in files that import no k8s
-//! types at all. `tools/coupling.py --proto` walks the closure and checks it.
+//! types at all. `cargo tree -p k9rs_proto` is what checks it — the manifest
+//! below names no Kubernetes crate, so the transitive dependency cannot come
+//! back without an edit here that says so out loud.
 
 pub mod crd_cache;
 pub mod local_types;

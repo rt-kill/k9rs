@@ -1,0 +1,20 @@
+[package]
+name = "k9rs_theme"
+version.workspace = true
+edition.workspace = true
+description = "k9rs: colours, and asking the terminal which way round they go"
+
+# A leaf, and deliberately NOT part of the config layer: it depends on ratatui
+# (`Style`, `Color`) and on crossterm's tty handling, so "theme as data" is not
+# available — there is no data/style seam inside the file to cut along. It sits
+# below both `app` (whose `UiState` holds the resolved `Theme`) and `ui`.
+[dependencies]
+# `ThemeMode` is a `--theme` CLI value, so it derives `clap::ValueEnum`.
+clap.workspace = true
+libc.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+
+[lints]
+workspace = true

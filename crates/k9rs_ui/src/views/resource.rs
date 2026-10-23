@@ -1,0 +1,391 @@
+
+use ratatui::{
+    layout::{Constraint, Layout, Rect},
+    style::Modifier,
+    text::{Line, Span},
+    widgets::Block,
+    Frame,
+};
+
+use unicode_width::UnicodeWidthStr;
+
+use k9rs_app::App;
+
+use crate::header;
+use k9rs_theme::Theme;
+use crate::widgets::{FilterBar, ResourceTable, ResourceTableState};
+
+// ---------------------------------------------------------------------------
+// Key hints (displayed in header center panel)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Render a generic resource table given headers and row data.
+// ---------------------------------------------------------------------------
+
+/// Snapshot of table state extracted before the mutable borrow for rendering.
+/// Groups the 15+ parameters that `draw_unified_table` passes to the widget,
+/// avoiding the 17-arg function that was here before.
+struct TableSnapshot<'a> {
+    headers: Vec<&'a str>,
+    rows: &'a [Vec<String>],
+    selected: usize,
+    offset: usize,
+    selected_col: usize,
+    col_offset: u16,
+    sort_ascending: bool,
+    display_sort_col: Option<usize>,
+    /// The visible column whose consecutive equal values collapse, if the
+    /// sorted column declares that it groups. Separate from
+    /// `display_sort_col` because being sorted is not a reason to hide a
+    /// value — see [`k9rs_app::ColumnDef::groups`].
+    group_col: Option<usize>,
+    namespace: &'a str,
+    marked: &'a std::collections::HashSet<k9rs_proto::protocol::ObjectKey>,
+    changed_rows: &'a std::collections::HashMap<k9rs_proto::protocol::ObjectKey, std::time::Instant>,
+    row_keys: &'a [k9rs_proto::protocol::ObjectKey],
+    row_health: &'a [k9rs_proto::row::RowHealth],
+    cell_style: &'a [Vec<Option<k9rs_proto::row::RowHealth>>],
+    /// Pre-computed per-column display widths, carried from the memoized
+    /// [`k9rs_app::store::PreparedView`] so the widget doesn't re-scan rows each frame.
+    col_widths: &'a [u16],
+    search_patterns: &'a [k9rs_util::SearchPattern],
+    /// Non-live rows are still painted, but never silently — see
+    /// [`k9rs_app::Liveness::warning`].
+    warning: Option<&'a str>,
+}
+
+/// Render a resource table from a pre-built snapshot. Returns the new
+/// `(offset, page_size, col_offset)` for the caller to write back.
+fn draw_resource_table(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    snap: &TableSnapshot<'_>,
+    theme: &Theme,
+) -> (usize, usize, u16) {
+    let rt = ResourceTable::new(snap.headers.clone(), snap.rows, title, theme)
+        .sort(snap.display_sort_col, snap.sort_ascending)
+        .group_col(snap.group_col)
+        .namespace(snap.namespace)
+        .marked(snap.marked)
+        .changed_rows(snap.changed_rows)
+        .row_keys(snap.row_keys)
+        .row_health(snap.row_health)
+        .cell_style(snap.cell_style)
+        .col_widths(snap.col_widths)
+        .search_patterns(snap.search_patterns)
+        .warning(snap.warning);
+
+    let mut state = ResourceTableState {
+        selected: snap.selected,
+        offset: snap.offset,
+        selected_col: snap.selected_col,
+        col_offset: snap.col_offset,
+        filtered_count: 0,
+        visible_height: 0,
+    };
+
+    f.render_stateful_widget(rt, area, &mut state);
+
+    // The widget measured the true data-row height from the real Rect and wrote
+    // it into `state.visible_height`; return THAT, not a re-derived `area - 3`.
+    (state.offset, state.visible_height, state.col_offset)
+}
+
+
+// ---------------------------------------------------------------------------
+// Main entry point: draw_resources
+// ---------------------------------------------------------------------------
+
+/// Draw the main resource browser view:
+///
+/// ```text
+/// +--header (7 lines)------------------------------------------+
+/// | cluster info  |  key hints  |  k9rs logo                   |
+/// +--command prompt (3 lines, optional)-------------------------+
+/// | :pods                                                       |
+/// +--filter (3 lines, optional)---------------------------------+
+/// | /filter_text                                                |
+/// +--table (fills remaining)------------------------------------+
+/// | pods(default)[42]  </:filter>                               |
+/// | NAMESPACE  NAME  ...                                        |
+/// +--breadcrumbs (1 line)--------------------------------------+
+/// +--flash (1 line)--------------------------------------------+
+/// ```
+pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = &app.ui.theme;
+
+    // A FLOATING element renders its content only: the cluster header, the
+    // breadcrumb and the flash line are the FRAME's chrome, and drawing them
+    // again inside an 80%-wide box gave two header panels, two breadcrumbs,
+    // two `? help` hints, and a flash row that blanked the parent's border
+    // across the width of the box.
+    let floating = app.nav.top().floats();
+
+    // Determine dynamic section heights
+    let header_height: u16 =
+        if app.ui.show_header && !floating { crate::HEADER_HEIGHT } else { 0 };
+    let command_height: u16 = if app.ui.command_input().is_some() { 3 } else { 0 };
+    // Only show the filter bar box while actively typing; when committed
+    // (inactive but text non-empty), the table title shows `</:filter_text>`.
+    let filter_visible = app.nav.top().filter_input().active();
+    let filter_height: u16 = if filter_visible { 3 } else { 0 };
+
+    let chunks = Layout::vertical([
+        Constraint::Length(header_height),      // header
+        Constraint::Length(command_height),     // command prompt
+        Constraint::Length(filter_height),      // filter
+        Constraint::Fill(1),                   // table
+        Constraint::Length(u16::from(!floating)), // breadcrumbs
+        Constraint::Length(u16::from(!floating)), // flash
+    ])
+    .split(area);
+
+    let header_area = chunks[0];
+    let command_area = chunks[1];
+    let filter_area = chunks[2];
+    let table_area = chunks[3];
+    let breadcrumb_area = chunks[4];
+    let flash_area = chunks[5];
+
+    // 1. Header section (cluster info + logo; key hints live in ? help)
+    if app.ui.show_header {
+        header::draw_header(f, app, header_area, theme);
+    }
+
+    // 2. Command prompt (only when command mode active)
+    if app.ui.command_input().is_some() {
+        draw_command_prompt(f, app, command_area, theme);
+    }
+
+    // Materialize the TOP element's view ONCE up front. The filter bar's
+    // match count must reflect THIS frame's filter — reading the memo
+    // (`counts()`) before deriving showed the PREVIOUS frame's count, so
+    // on quiet data the bar lagged a keystroke behind the table forever.
+    // The Arc is owned, so the mut borrow ends here and the blocks below
+    // re-borrow freely.
+    let level = app.ui.column_level;
+    let max_col_width = app.config.ui.max_column_width;
+    let view = {
+        let element = app.nav.top_mut();
+        let v = element.view(level, max_col_width);
+        // Record what this frame SHOWS the user (select mode or not) on
+        // the element — the select-mode gate refuses batch keys that
+        // arrive after an async prune flipped the mode out from under the
+        // painted frame.
+        let select_mode = element.has_marks();
+        if let Some(it) = element.table_interaction_mut() {
+            it.rendered_select_mode = select_mode;
+        }
+        v
+    };
+
+    // 3. Filter prompt — counts from THIS frame's view.
+    if filter_visible {
+        let filtered = view.keys.len();
+        let total = view.total_rows;
+        let fi = app.nav.top().filter_input();
+        let fallback = app.nav.top().grep_fallback();
+        let match_count = if fi.text().is_empty() && !app.nav.is_drilled() {
+            total
+        } else {
+            filtered
+        };
+        let filter_bar = FilterBar::new(fi.active(), fi.text(), match_count, total, theme)
+            .fallback(fallback.as_deref());
+        f.render_widget(filter_bar, filter_area);
+    }
+
+    // 4. Resource table — element-owned: query + predicates, columns
+    // (NAMESPACE membership fixed at construction), title, scope label,
+    // cursor. Nothing reads ambient state; nothing reaches below the top.
+    //
+    // Whether these rows may be painted is NOT decided here: it's one
+    // question about both hops (client↔daemon and daemon↔cluster), and every
+    // view that answered it locally answered it slightly differently. Ask
+    // the authority instead.
+    let liveness = app.nav.top().liveness(&app.conn);
+    let element = app.nav.top_mut();
+    if !liveness.shows_data() || view.total_rows == 0 {
+        // Nothing paintable (connecting / loading), or genuinely empty:
+        // bordered block with a centered status line.
+        let text = liveness.status_text(&app.ui.anim, || format!("No {} found.", element.title()));
+        let status_line = Line::from(Span::styled(text, theme.info_value));
+        let scope = element.scope_label();
+        // The selected-count indicator renders HERE too: this branch is
+        // exactly what shows during the Ctrl-R window, where marks
+        // survive the cleared rows — select mode must not visually
+        // vanish at the one moment its honesty matters most.
+        let marked_count = element.marked_count();
+        let sel_suffix = if marked_count > 0 {
+            format!("[{} selected]", marked_count)
+        } else {
+            String::new()
+        };
+        let title_str = if scope.is_empty() {
+            format!(" {}[0]{}", element.title(), sel_suffix)
+        } else {
+            format!(" {}({})[0]{}", element.title(), scope, sel_suffix)
+        };
+        let block = Block::bordered()
+            .title(Span::styled(title_str, theme.title))
+            .border_style(theme.border);
+        let inner = block.inner(table_area);
+        f.render_widget(block, table_area);
+        if inner.height > 0 && inner.width > 0 {
+            let center_y = inner.y + inner.height / 2;
+            let center_x = inner.x + inner.width.saturating_sub(status_line.width() as u16) / 2;
+            f.render_widget(status_line, Rect::new(center_x, center_y, inner.width, 1));
+        }
+    } else {
+        // Rows that are resident but not live (a dead cluster-side watch, a
+        // terminal subscription error) still paint — the link is up, so every
+        // operation on them still works and blanking the table would throw
+        // away the cursor, the marks and the scroll position. What must never
+        // happen is painting them SILENTLY, which is what a `Failed` store
+        // with surviving rows used to do.
+        let warning = liveness.warning();
+        let marked = element.marked_snapshot();
+        let changed = element.changed_snapshot();
+        let patterns = element.grep_patterns();
+        let title = element.title().to_string();
+        let Some(it) = element.table_interaction() else { return };
+        let headers: Vec<&str> = view.headers.iter().map(String::as_str).collect();
+        // `sort.col` is a DATA index; the widget wants a VISIBLE one. Named
+        // conversion rather than a hand-rolled `position`, so which space is
+        // which is readable here — see `PreparedView::visible_cols`.
+        let display_sort_col = view.visible_col(it.sort.col);
+        // Collapsing repeats is the COLUMN's call, not "it happens to be
+        // sorted". Sorting by AGE put a ReplicaSet's identically-aged pods
+        // adjacent and blanked eighteen of them, which read as missing data.
+        let group_col = display_sort_col.filter(|&v| {
+            view.headers.get(v).is_some_and(|h| element.column_policy().groups(h))
+        });
+        let snap = TableSnapshot {
+            headers,
+            rows: &view.rows,
+            selected: it.selected.min(view.keys.len().saturating_sub(1)),
+            offset: it.viewport.offset(),
+            selected_col: it.selected_col.min(view.visible_cols.len().saturating_sub(1)),
+            col_offset: it.col_offset,
+            sort_ascending: it.sort.ascending,
+            display_sort_col,
+            group_col,
+            namespace: element.scope_label(),
+            marked: &marked,
+            changed_rows: &changed,
+            row_keys: &view.keys,
+            row_health: &view.health,
+            cell_style: &view.cell_style,
+            col_widths: &view.col_widths,
+            search_patterns: &patterns,
+            warning: warning.as_deref(),
+        };
+        let (new_offset, new_viewport_rows, new_col_offset) =
+            draw_resource_table(f, table_area, &title, &snap, theme);
+        if let Some(it) = element.table_interaction_mut() {
+            it.viewport.apply_render(new_offset, view.rows.len(), new_viewport_rows);
+            it.col_offset = new_col_offset;
+        }
+    }
+
+    // 5. Breadcrumb bar — nav path on left, ? help hint on right
+    //
+    // The path is elided from the LEFT, which is the opposite of every other
+    // bar on screen and the only correct direction here: the last crumb is
+    // where you ARE, and the first is a resource name you typed yourself.
+    // It used to be an unbounded `Line` with the right-aligned hint STAMPED
+    // over it afterwards, so a deep drill lost its tail underneath `? help`
+    // with nothing to say so.
+    let hint = " ? help ";
+    let suffix_w: u16 = if app.nav.is_drilled() { 9 } else { 0 }; // " | Esc back"
+    let budget = breadcrumb_area
+        .width
+        .saturating_sub(hint.len() as u16)
+        .saturating_sub(suffix_w)
+        .saturating_sub(2); // the spaces either side of the path
+    let bc = app.nav.breadcrumb();
+    let bc = k9rs_util::truncate_left(&bc, budget as usize);
+    let mut spans = Vec::new();
+    spans.push(Span::styled(format!(" {} ", bc), theme.title));
+    if app.nav.is_drilled() {
+        spans.push(Span::styled("| ", theme.info_label));
+        spans.push(Span::styled("Esc", theme.title_filter_indicator));
+        spans.push(Span::styled(" back", theme.info_label));
+    }
+    let left = Line::from(spans);
+    f.render_widget(left, breadcrumb_area);
+    // Right-aligned help hint. The left side is budgeted around it now, so
+    // this no longer overwrites anything.
+    let hint_x = breadcrumb_area.x + breadcrumb_area.width.saturating_sub(hint.len() as u16);
+    f.buffer_mut().set_string(hint_x, breadcrumb_area.y, hint, theme.info_label);
+
+    // 6. Flash message area (handled by ui/mod.rs overlay, but we reserve the line)
+    // Draw a subtle flash area background
+    if flash_area.width > 0 && flash_area.height > 0 {
+        let empty = Line::raw("");
+        f.render_widget(empty, flash_area);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command prompt
+// ---------------------------------------------------------------------------
+
+pub fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    if area.height < 3 || area.width == 0 {
+        return;
+    }
+
+    let block = Block::bordered()
+        .border_style(theme.border_focused);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let input = app.ui.command_input().map_or("", |(i, _)| i);
+    let ghost: String = app.best_completion()
+        .and_then(|c| c.strip_prefix(input).map(str::to_string))
+        .unwrap_or_default();
+
+    // Fish-style rendering: typed text (bright) followed immediately by ghost
+    // text (dim/italic) with no block cursor in between. The terminal cursor
+    // is placed right after the typed text via set_cursor_position.
+    let prefix = app.ui.command_prompt();
+    let prefix_len: u16 = prefix.width() as u16;
+
+    // WINDOWED around the caret — same rule, same reason as
+    // `ui::draw_command_overlay`, which this is the inline twin of.
+    let avail = (inner.width as usize).saturating_sub(prefix_len as usize);
+    let (shown, caret_col) = match app.ui.command_text() {
+        Some(t) => t.window(avail),
+        None => (input, input.width()),
+    };
+
+    let mut spans = vec![
+        Span::styled(prefix, theme.command.add_modifier(Modifier::BOLD)),
+        Span::styled(shown.to_string(), theme.command),
+    ];
+
+    // The ghost takes only what the input left over: a hint must never push
+    // the caret off its own line.
+    let left = avail.saturating_sub(shown.width());
+    if !ghost.is_empty() && left > 0 {
+        spans.push(Span::styled(
+            k9rs_util::truncate(&ghost, left),
+            theme.command_suggestion.add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ));
+    }
+
+    let line = Line::from(spans);
+    f.render_widget(line, inner);
+
+    // The real terminal cursor (thin line / blinking bar, per the user's
+    // emulator). Inside the window by construction, so nothing to guard.
+    f.set_cursor_position((inner.x + prefix_len + caret_col as u16, inner.y));
+}
+

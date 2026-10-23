@@ -77,6 +77,17 @@
 //! [`LocalResourceKind::Context`], and it says why on the variant: its rows
 //! are a fact about the CLIENT's kubeconfig, so it has no daemon-side source
 //! at all.
+//!
+//! `LocalResourceKind` is declared in `k9rs_proto`, not here — it rides
+//! `ResourceId` on the wire. The links below name it there rather than
+//! through a re-export, because a `pub use` whose only reader is a doc link
+//! is a public item nothing checks: `pub` suppresses `dead_code`, so the one
+//! that used to sit here went unflagged after its last real caller left.
+//!
+//! [`find_by_alias`]: k9rs_proto::local_types::find_by_alias
+//! [`LocalResourceKind`]: k9rs_proto::local_types::LocalResourceKind
+//! [`LocalResourceKind::all`]: k9rs_proto::local_types::LocalResourceKind::all
+//! [`LocalResourceKind::Context`]: k9rs_proto::local_types::LocalResourceKind::Context
 
 pub mod context_locals;
 pub mod exec_source;
@@ -90,7 +101,6 @@ pub use k9rs_proto::local_types as types;
 pub use context_locals::{ContextKeepalive, ContextLocals};
 pub use registry::LocalRegistry;
 pub use subscription::LocalSubscription;
-pub use types::{find_by_alias, LocalResourceKind};
 
 use std::sync::Arc;
 use tokio::sync::watch;

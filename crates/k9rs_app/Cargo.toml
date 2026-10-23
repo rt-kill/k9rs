@@ -1,0 +1,61 @@
+[package]
+name = "k9rs_app"
+version.workspace = true
+edition.workspace = true
+description = "k9rs: the TUI's model — state, navigation, stores, keymap and the client session"
+
+# The model, and the client that feeds it. It knows nothing about rendering:
+# `ratatui` is here only for `Style`/`Span`, which `Theme` and the row
+# vocabulary are expressed in, and there is no `Frame` and no widget. `ui`
+# depends on this crate; this crate must never depend on `ui`.
+#
+# Neither kube-rs nor k8s-openapi is in the list below, so neither can be
+# named here: everything Kubernetes arrives as `k9rs_proto` types. They are
+# still in the dependency closure, because `k9rs_kube` and `k9rs_daemon` are
+# — `k9rs_daemon` for the in-process `--no-daemon` mode, which runs the
+# server inside the TUI. Not being able to NAME a crate is the invariant that
+# holds; `cargo tree` is not it.
+#
+# `k9rs_kube` is here for three things and no more: the discovery `cache`, the
+# `kubeconfig` reader and `daemon_config`. The row and local-kind vocabulary
+# comes straight from `k9rs_proto`, which is where it is declared.
+[features]
+# The test-only constructors (`App::new_for_test`, `LogSession::for_test` and
+# the parked streams behind them), for tests that live ABOVE this crate — the
+# renderer's paint tests and the session loop's. A crate built as a dependency
+# of another crate's tests has no `cfg(test)` of its own, so `#[cfg(test)]`
+# cannot express "available to tests anywhere"; this is the same mechanism as
+# `k9rs_kube`'s `testing`, and the same reasoning: the alternative is making
+# the constructors unconditionally `pub`, which hands production code an `App`
+# with no daemon behind it and a parked log stream.
+#
+# Enabled only through `k9rs_ui`'s and `k9rs_session`'s `[dev-dependencies]`,
+# and VERIFIED not to reach a normal build: with a `compile_error!` gated on
+# it at the top of `lib.rs`, both `cargo build --release` and
+# `cargo build --release --workspace` compiled clean, while
+# `cargo test --workspace`, `cargo test -p k9rs_ui` and
+# `cargo test -p k9rs_session` all failed on it. So it is absent from the
+# shipped binary unless someone asks for it by name (`--all-features` would,
+# which is a deliberate act).
+testing = []
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+k9rs_daemon.workspace = true
+k9rs_kube.workspace = true
+k9rs_mux.workspace = true
+k9rs_proto.workspace = true
+k9rs_theme.workspace = true
+k9rs_util.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true

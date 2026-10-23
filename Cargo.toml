@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/k9rs_daemon", "crates/k9rs_kube", "crates/k9rs_mux", "crates/k9rs_proto", "crates/k9rs_util"]
+members = ["crates/k9rs_app", "crates/k9rs_cli", "crates/k9rs_daemon", "crates/k9rs_theme", "crates/k9rs_ui", "crates/k9rs_kube", "crates/k9rs_mux", "crates/k9rs_proto", "crates/k9rs_session", "crates/k9rs_util"]
 
 # One place per dependency. A member crate writes `dep.workspace = true`, so a
 # version bump is a single edit and two crates cannot drift onto different
@@ -20,6 +20,7 @@ bincode = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_yaml = "0.9"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-stream = "0.1"
 tokio-yamux = "0.3"
 dashmap = "6"
@@ -27,10 +28,18 @@ futures = "0.3"
 k8s-openapi = { version = "0.24", features = ["latest"] }
 kube = { version = "0.98", features = ["client", "runtime", "derive", "ws"] }
 serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream", "serde"] }
+ratatui = "0.29"
+k9rs_app = { path = "crates/k9rs_app" }
+k9rs_cli = { path = "crates/k9rs_cli" }
 k9rs_daemon = { path = "crates/k9rs_daemon" }
+k9rs_theme = { path = "crates/k9rs_theme" }
+k9rs_ui = { path = "crates/k9rs_ui" }
 k9rs_kube = { path = "crates/k9rs_kube" }
 k9rs_mux = { path = "crates/k9rs_mux" }
 k9rs_proto = { path = "crates/k9rs_proto" }
+k9rs_session = { path = "crates/k9rs_session" }
 k9rs_util = { path = "crates/k9rs_util" }
 
 # One lint config for every member. `unreachable_pub` is the one that makes
@@ -54,72 +63,39 @@ edition = "2021"
 description = "A fast Kubernetes TUI, inspired by k9s, built in Rust"
 
 [dependencies]
-# TUI
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream", "serde"] }
+# The binary's own dependencies, and nothing else. Every library this used to
+# list — kube-rs, k8s-openapi, http, serde, serde_json, bincode, tokio-stream,
+# tokio-yamux, dashmap, chrono, regex, the unicode crates, tracing — now
+# belongs to whichever crate actually uses it, so `cargo tree -p <crate>` is
+# an honest statement about that layer. (`syntect` was listed here and used
+# nowhere at all; it is gone.)
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+# `poll(POLLHUP)` on stdin: the pty-hangup check in `stdin_hung_up`.
+libc.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
 
-# Kubernetes
-# `ws` for the native websocket port-forward (Api::portforward) — no kubectl
-# subprocess in the forward path.
-kube = { version = "0.98", features = ["client", "runtime", "derive", "ws"] }
-k8s-openapi = { version = "0.24", features = ["latest"] }
-http = "1"
-
-# Async
-tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
-futures = "0.3"
-
-# Serialization
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
-serde_yaml = "0.9"
-bincode = "1"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# Error handling
-anyhow = "1"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Misc
-chrono = { version = "0.4", features = ["serde"] }
-regex = "1"
-unicode-width = "0.2"
-# Same segmentation ratatui uses to decide what occupies a cell — see
-# `ui::widgets::log_view::cluster_width`.
-unicode-segmentation = "1"
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-libc = "0.2"
-dashmap = "6"
-
-# The first extracted crate. `main.rs` re-exports it as `util`, so the ~33
-# existing `crate::util::…` paths keep resolving and nothing else changed.
-k9rs_daemon = { workspace = true }
-k9rs_kube = { workspace = true }
-k9rs_mux = { workspace = true }
+# The layering, bottom to top. `main` names only what it touches directly:
+# the ones it does not (`k9rs_daemon`, `k9rs_kube`, `k9rs_mux`) arrive
+# transitively through the crates that do.
+k9rs_app = { workspace = true }
+k9rs_cli = { workspace = true }
 k9rs_proto = { workspace = true }
+k9rs_session = { workspace = true }
+k9rs_theme = { workspace = true }
+k9rs_ui = { workspace = true }
 k9rs_util = { workspace = true }
 
-# Multiplexer: per-subscription substreams over the single Unix socket
-# between TUI and daemon. We hide this behind `src/kube/mux/` so swapping
-# implementations later (libp2p/yamux, hand-rolled, etc.) touches only that
-# module — the rest of the codebase only sees `MuxedConnection`/`MuxedStream`.
-tokio-yamux = "0.3"
-
-[dev-dependencies]
-k9rs_kube = { workspace = true, features = ["testing"] }
-# `test-util` is deliberately NOT part of tokio's `full`, and it is what
-# provides `#[tokio::test(start_paused = true)]`. One test asserts a path
-# whose backstop IS a two-second timeout; without a pausable clock, waiting
-# that out puts a two-second floor under the entire suite. Dev-only, so
-# `cargo build` never sees it, and enabling it changes nothing unless a test
-# actually pauses the clock.
-tokio = { version = "1", features = ["full", "test-util"] }
+# No `[dev-dependencies]`. There is nothing to test in `src/main.rs` — the
+# `testing` features and tokio's `test-util` are declared by the crates whose
+# tests actually use them. They lived here while this was one package, and
+# leaving them would have kept feature unification switching `test-util` on
+# for the whole workspace, so `cargo test -p k9rs_kube` would pass for a
+# reason that had nothing to do with `k9rs_kube`.
 
 [profile.release]
 opt-level = 3

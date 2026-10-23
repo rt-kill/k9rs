@@ -1,27 +1,18 @@
-// A doc link that names a path is a CHECKABLE claim, so let the compiler
-// check it. Four doc comments pointed at `ui::widgets::Role::SHED_ORDER`,
-// a path that has never existed — `Role` is in `kube::protocol` — and the
-// warning was there all along with nothing denying it. Doc rot is the same
-// class as a doc asserting a guarantee nothing enforces, and this is the one
-// part of that class a lint can hold.
-#![deny(rustdoc::broken_intra_doc_links)]
-
-pub mod app;
-pub mod cli;
-pub mod kube;
-// The TUI's session layer: the event loop, the action dispatch, the command
-// bar and the daemon-event apply. It lived under `kube/` and is not Kubernetes
-// access at all — it is written against `&mut App` and calls `ui::draw`, which
-// is why `kube -> app` read 330 references with 306 of them in these four
-// files. Moving them is the single largest cycle collapse in the split.
-pub mod session;
-pub mod theme;
-pub mod ui;
-// The first crate boundary. Re-exported under its old name so every
-// `crate::util::…` path in the tree keeps resolving — the extraction does not
-// get to rewrite 33 call sites as well. The shim goes away in a final sweep,
-// once every crate is out.
-pub use k9rs_util as util;
+//! The binary: parse the command line, set up the terminal, and hand off.
+//!
+//! Everything else is a library crate. This file holds only what cannot live
+//! in one — the `main` entry point, the clap definition, and the terminal
+//! setup/teardown that must bracket the whole process — which is why there is
+//! no `mod` declaration left in it. The crates it names are the layering,
+//! bottom to top: `k9rs_util`, `k9rs_proto`, `k9rs_mux`, `k9rs_theme`,
+//! `k9rs_kube`, `k9rs_daemon`, `k9rs_app`, `k9rs_ui`, `k9rs_session`, and
+//! `k9rs_cli` off to the side. Cargo holds that order; nothing here can
+//! reintroduce a cycle, because a cycle no longer compiles.
+//!
+//! `broken_intra_doc_links` is denied workspace-wide (see the root
+//! `Cargo.toml`): a doc link that names a path is a CHECKABLE claim, and four
+//! doc comments once pointed at `ui::widgets::Role::SHED_ORDER`, a path that
+//! has never existed.
 
 use std::io;
 use std::time::Duration;
@@ -38,8 +29,8 @@ use ratatui::prelude::*;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::App;
-use crate::app::event::AppEvent;
+use k9rs_app::App;
+use k9rs_app::event::AppEvent;
 
 #[derive(Parser, Debug)]
 #[command(name = "k9rs", version, about = "A fast Kubernetes TUI")]
@@ -48,7 +39,7 @@ struct Cli {
     /// Color scheme: auto (detect the terminal background), dark, or light.
     /// Overrides `ui.theme` from the config file for this run.
     #[arg(long, value_name = "MODE")]
-    theme: Option<crate::theme::ThemeMode>,
+    theme: Option<k9rs_theme::ThemeMode>,
 
     /// Kubernetes context to use
     #[arg(long)]
@@ -89,7 +80,7 @@ struct Cli {
     nav_path: Vec<String>,
 
     #[command(subcommand)]
-    subcmd: Option<crate::cli::Command>,
+    subcmd: Option<k9rs_cli::Command>,
 }
 
 /// RAII guard that restores the terminal on drop.
@@ -121,11 +112,11 @@ async fn main() -> Result<()> {
     // subcommand added later all get them from one site — and so the only
     // processes without them are the ones that never run `main`, i.e. the test
     // binaries. See `kube::overlay::OVERLAYS`.
-    crate::kube::overlay::load_from_home();
+    k9rs_proto::overlay::load_from_home();
 
     // Subcommand dispatch: daemon, ctl, contexts
     if let Some(subcmd) = cli.subcmd {
-        return crate::cli::dispatch(subcmd).await;
+        return k9rs_cli::dispatch(subcmd).await;
     }
 
     // Setup logging
@@ -156,13 +147,13 @@ async fn main() -> Result<()> {
     // "connecting…" placeholders until the connection manager publishes the
     // resolved values via `AppEvent::KubeconfigLoaded` (fast, from disk) and
     // then `AppEvent::ConnectionEstablished` (authoritative, from the daemon).
-    let namespace = crate::kube::protocol::Namespace::from_user_command(
+    let namespace = k9rs_proto::protocol::Namespace::from_user_command(
         cli.namespace.as_deref().unwrap_or("all"),
     );
     // `--context ""` is a typo, not a request: reject it loudly here rather
     // than letting a nameless context reach the daemon.
-    let cli_context: Option<crate::kube::protocol::ContextName> =
-        match cli.context.as_deref().map(crate::kube::protocol::ContextName::try_from).transpose() {
+    let cli_context: Option<k9rs_proto::protocol::ContextName> =
+        match cli.context.as_deref().map(k9rs_proto::protocol::ContextName::try_from).transpose() {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("k9rs: --context: {e}");
@@ -174,9 +165,9 @@ async fn main() -> Result<()> {
     let startup_segments = parse_startup_segments(&cli);
 
     let (event_tx, event_rx) =
-        mpsc::channel::<AppEvent>(crate::session::EVENT_CHANNEL_CAP);
+        mpsc::channel::<AppEvent>(k9rs_session::EVENT_CHANNEL_CAP);
 
-    use crate::app::client::ClientSession;
+    use k9rs_app::client::ClientSession;
 
     // Load + validate the user config BEFORE any TUI setup: a config
     // error prints to a normal, visible stderr and exits. The strict
@@ -208,7 +199,7 @@ async fn main() -> Result<()> {
     // inside `subscribe_stream` await the MuxHandle, so subscribes fire
     // as soon as the connection is up.
     let data_source = ClientSession::new(
-        crate::app::client::ConnectionParams {
+        k9rs_app::client::ConnectionParams {
             context: cli_context.clone(),
             namespace: namespace.clone(),
             readonly: cli.readonly,
@@ -229,10 +220,10 @@ async fn main() -> Result<()> {
     // passed `--log-file`. A typo'd column, an unknown capability, a bad
     // jsonpath and a YAML parse error all looked identical to "working". Say
     // the first one out loud; the count tells them there are more to fix.
-    let overlay_problems = crate::kube::overlay::overlay_diagnostics();
+    let overlay_problems = k9rs_proto::overlay::overlay_diagnostics();
     if let Some(first) = overlay_problems.first() {
         let more = overlay_problems.len() - 1;
-        app.ui.flash = Some(crate::app::FlashMessage::warn(if more == 0 {
+        app.ui.flash = Some(k9rs_app::FlashMessage::warn(if more == 0 {
             first.clone()
         } else {
             format!("{first} (+{more} more overlay problem{})", if more == 1 { "" } else { "s" })
@@ -258,7 +249,7 @@ async fn main() -> Result<()> {
     // Reclaims `/tmp/k9rs-<pid>/` on the way out, including the `?` paths —
     // the same reason `TerminalGuard` exists one line up. Removes the
     // directory only when empty, so anything the user asked us to save stays.
-    let _temp_dir_guard = crate::util::TempDirGuard;
+    let _temp_dir_guard = k9rs_util::TempDirGuard;
 
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
@@ -267,7 +258,7 @@ async fn main() -> Result<()> {
     terminal.clear()?;
 
     // Draw first frame immediately so the TUI appears instantly.
-    terminal.draw(|f| crate::ui::draw(f, &mut app))?;
+    terminal.draw(|f| k9rs_ui::draw(f, &mut app))?;
 
     // Apply startup navigation (positional args or -c). Each element
     // opens its own subscription at construction; core stores are wired
@@ -442,14 +433,14 @@ async fn main() -> Result<()> {
 
     // Run the TUI event loop.
     // TerminalGuard ensures cleanup even if this returns Err.
-    let exit_reason = crate::session::session_main(
+    let exit_reason = k9rs_session::session_main(
         app,
         data_source,
         terminal,
         event_tx,
         event_rx,
         tick_rate,
-        crate::session::InputChannels {
+        k9rs_session::InputChannels {
             input_rx,
             suspend_tx,
             suspend_ack_rx,
@@ -468,11 +459,11 @@ async fn main() -> Result<()> {
     drop(_terminal_guard);
 
     match exit_reason {
-        Some(crate::app::ExitReason::Error(msg)) => {
+        Some(k9rs_app::ExitReason::Error(msg)) => {
             eprintln!("k9rs: {}", msg);
             std::process::exit(1);
         }
-        Some(crate::app::ExitReason::UserQuit) | None => {
+        Some(k9rs_app::ExitReason::UserQuit) | None => {
             // Normal exit — no message needed.
             Ok(())
         }
@@ -509,7 +500,7 @@ fn stdin_hung_up() -> bool {
 // Startup navigation — positional args → nav stack
 // ---------------------------------------------------------------------------
 
-use crate::kube::protocol::ResourceId;
+use k9rs_proto::protocol::ResourceId;
 
 enum StartupSegment {
     Resource(ResourceId),
@@ -536,7 +527,7 @@ fn parse_startup_segments(cli: &Cli) -> Vec<StartupSegment> {
 
 fn apply_startup_nav(
     app: &mut App,
-    data_source: &crate::app::client::ClientSession,
+    data_source: &k9rs_app::client::ClientSession,
     segments: &[StartupSegment],
 ) {
     if segments.is_empty() {
@@ -547,7 +538,7 @@ fn apply_startup_nav(
     let first_rid = match &segments[0] {
         StartupSegment::Resource(rid) => rid.clone(),
         StartupSegment::Filter(text) => {
-            app.ui.flash = Some(crate::app::FlashMessage::warn(
+            app.ui.flash = Some(k9rs_app::FlashMessage::warn(
                 format!("Unknown resource: {}", text),
             ));
             return;
@@ -566,11 +557,11 @@ fn apply_startup_nav(
     for seg in &segments[1..] {
         match seg {
             StartupSegment::Filter(pattern) => {
-                let predicate = crate::app::store::RowPredicate::Grep(
-                    crate::app::nav::CompiledGrep::new(pattern),
+                let predicate = k9rs_app::store::RowPredicate::Grep(
+                    k9rs_app::nav::CompiledGrep::new(pattern),
                 );
                 if let Ok(el) =
-                    crate::app::element::Element::derive_filter(app.nav.top(), predicate)
+                    k9rs_app::element::Element::derive_filter(app.nav.top(), predicate)
                 {
                     app.nav.push(el);
                 }

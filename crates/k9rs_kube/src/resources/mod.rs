@@ -39,7 +39,6 @@ pub(crate) mod k8s_const {
     pub(crate) const ADDR_EXTERNAL_IP: &str = "ExternalIP";
 }
 
-pub use k9rs_proto::row;
 pub mod pods;
 pub mod deployments;
 pub mod services;
@@ -74,7 +73,7 @@ pub mod leases;
 pub mod priorityclasses;
 pub mod webhooks;
 
-/// Converts a strongly-typed K8s API object into a [`row::ResourceRow`].
+/// Converts a strongly-typed K8s API object into a [`k9rs_proto::row::ResourceRow`].
 ///
 /// NOT object-safe (generic over K), so it lives on the concrete ZST, not on
 /// `dyn ResourceDef`. Each resource module implements it beside the k8s type
@@ -89,7 +88,7 @@ pub mod webhooks;
 /// violation. **The trait has to be the local one**, so it lives here, on the
 /// kube side, where a local trait may be implemented for any types.
 pub trait ConvertToRow<K> {
-    fn convert(obj: K) -> row::ResourceRow;
+    fn convert(obj: K) -> k9rs_proto::row::ResourceRow;
 }
 
 pub fn access_mode_short(mode: &str) -> &str {
@@ -256,8 +255,8 @@ impl WorkloadTally {
     /// has been created but is not yet ready: at one replica `READY` still
     /// reads `1/1` and `UP-TO-DATE` still reads `1`. Colouring that window is
     /// the point — it is the state no number in the row can carry.
-    pub(crate) fn health(&self) -> row::RowHealth {
-        use row::RowHealth;
+    pub(crate) fn health(&self) -> k9rs_proto::row::RowHealth {
+        use k9rs_proto::row::RowHealth;
         if self.desired == 0 {
             match self.at_zero {
                 AtZero::Parked => RowHealth::Pending,

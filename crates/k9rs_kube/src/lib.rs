@@ -1,10 +1,13 @@
 //! Kubernetes access: the typed client, the watchers, and the converters.
 //!
-//! This is the only crate that names kube-rs and k8s-openapi, and the only
-//! one that parses JSON. Everything above it — the client session, the app
-//! state, the renderer — sees `k9rs_proto` types and nothing else, which is
-//! what makes "JSON only at external API boundaries" a dependency fact
-//! rather than a convention.
+//! Two crates name kube-rs, k8s-openapi and serde_json: this one and
+//! `k9rs_daemon`, which builds a client from a kubeconfig and serves it.
+//! Nothing ABOVE them does — the client session, the app state, the renderer
+//! and the `ctl` CLI see `k9rs_proto` types and nothing else, which is what
+//! makes "JSON only at external API boundaries" a dependency fact rather
+//! than a convention. `cargo tree` is the authority; the last two holes were
+//! two calls to `kube::config::Kubeconfig::read()`, which is why
+//! [`kubeconfig`] exists.
 //!
 //! The split that made this possible was inside each resource file: an
 //! `impl ResourceDef` is pure metadata and lives in `k9rs_proto`, while the
@@ -17,6 +20,7 @@ pub mod cache;
 pub mod daemon_config;
 pub mod describe;
 pub mod grace;
+pub mod kubeconfig;
 pub mod live_query;
 pub mod live_query_dynamic;
 pub mod local;

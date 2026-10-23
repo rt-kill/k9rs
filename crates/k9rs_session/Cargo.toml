@@ -1,0 +1,29 @@
+[package]
+name = "k9rs_session"
+version.workspace = true
+edition.workspace = true
+description = "k9rs: the TUI's loop — event select, key dispatch, command bar, terminal handover"
+
+# The top of the TUI stack: it owns the tokio loop, the terminal, the pty and
+# the spawned editor, and it is the only crate that may call both `k9rs_app`'s
+# transitions and `k9rs_ui`'s draw. Everything here needs the runtime —
+# whatever did not went down to `app` (see `k9rs_app::event`).
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+crossterm.workspace = true
+k9rs_app.workspace = true
+k9rs_kube.workspace = true
+k9rs_proto.workspace = true
+k9rs_ui.workspace = true
+k9rs_util.workspace = true
+libc.workspace = true
+ratatui.workspace = true
+regex.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+k9rs_app = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

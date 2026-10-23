@@ -1,0 +1,38 @@
+[package]
+name = "k9rs_ui"
+version.workspace = true
+edition.workspace = true
+description = "k9rs: the renderer — every widget, view and piece of chrome"
+
+# Reads `&App`, writes to a `Frame`, and decides nothing. If a view needs a
+# fact it does not have, the fact belongs in the model, not in a lookup from
+# here — and there is nothing to look it up WITH. The list below is the whole
+# of it: no tokio, no client, no daemon, no `k9rs_kube`. A crate absent from
+# `[dependencies]` cannot be named at all, so no file here can write `tokio::`
+# or `kube::` however much it wants to. (They are still in the dependency
+# CLOSURE, under `k9rs_app`, which owns the client — `cargo tree` shows them.
+# Nameability is the invariant; the closure is not.)
+#
+# `k9rs_kube` was here until its only two uses turned out to be `pub use`
+# hops: `resources::row` and `local::LocalResourceKind` are re-exports of
+# `k9rs_proto`, so the renderer was reaching for the WIRE row type through
+# the Kubernetes client.
+[dependencies]
+k9rs_app.workspace = true
+k9rs_proto.workspace = true
+k9rs_theme.workspace = true
+k9rs_util.workspace = true
+ratatui.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+# Dev-only, and that is the point: one paint test also feeds a key event to
+# `app::handler` to prove a dialog consumes the globals drawn under it. The
+# renderer itself never reads input, so crossterm is absent from the library.
+crossterm.workspace = true
+# The paint tests build an `App` and a parked log session.
+k9rs_app = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true
