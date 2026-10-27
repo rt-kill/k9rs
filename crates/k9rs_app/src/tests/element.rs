@@ -1,4 +1,5 @@
 use super::*;
+use crate::store::MetricsHub;
 use crate::store::StorePayload;
 use k9rs_proto::protocol::{RowChange, TableBaseline, TableDelta};
 use k9rs_proto::resource_def::BuiltInKind;
@@ -2044,3 +2045,4 @@ fn esc_peels_one_grep_off_the_chain() {
         "…and that IS the session, not something popped too far",
     );
 }
+
