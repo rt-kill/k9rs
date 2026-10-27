@@ -4,7 +4,7 @@
 //! unit with its own vocabulary, and it was only ever in `types.rs`
 //! because that file was where types went.
 
-use crate::types::FlashMessage;
+use crate::state::FlashMessage;
 use k9rs_proto::protocol::{ObjectKey, ObjectRef};
 
 // ---------------------------------------------------------------------------

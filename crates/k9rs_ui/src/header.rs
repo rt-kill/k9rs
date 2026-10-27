@@ -7,7 +7,7 @@ use ratatui::{
 
 use unicode_width::UnicodeWidthStr;
 
-use k9rs_app::App;
+use k9rs_app::{App, Attachment};
 use k9rs_theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -33,65 +33,27 @@ pub const LOGO: &[&str] = &[
 /// used to work it out separately — which is how the picker came to say
 /// "connecting…" while nothing was connecting.
 ///
-/// A context name only means something together with the link state, and
-/// there are three distinct stories the field has to tell:
-/// - **No context at all.** Nothing is being attempted and nothing will be
-///   until the user picks one. Saying "connecting…" here is the same lie the
-///   connecting screen exists to stop telling.
-/// - **A switch in flight.** `kube.context` is the LAST-CONFIRMED context,
-///   kept deliberately so a failed switch can fall back to it — but right
-///   now we are attached to neither it nor the target. Naming it reads as
-///   "you are on prod" when prod is precisely what you just left, so name
-///   the TARGET instead: that is what the screen is waiting for.
-/// - **Otherwise** the confirmed context, marked while the link is down.
-pub fn context_label(app: &App) -> String {
-    use k9rs_app::Liveness;
-    let connecting_to = |name: &dyn std::fmt::Display| format!("{} (connecting…)", name);
-    match Liveness::of_link(&app.conn) {
-        Liveness::NoContext => "none — press Enter to select".to_string(),
-        live if live.shows_data() => match &app.kube.context {
-            Some(c) => c.to_string(),
-            // Linked but nothing confirmed yet: the initial handshake.
-            None => "connecting...".to_string(),
-        },
-        // Link down. What we are AIMING at outranks what we last confirmed:
-        // a switch target first, then the session's candidate from disk, and
-        // only then the last-confirmed name.
-        _ => match (
-            app.kube.context_switch.target(),
-            app.kube.connecting.as_ref(),
-            &app.kube.context,
-        ) {
-            (Some(target), _, _) => connecting_to(target),
-            (None, Some((candidate, _)), _) => connecting_to(candidate),
-            (None, None, Some(c)) => connecting_to(c),
-            (None, None, None) => "connecting...".to_string(),
-        },
+/// It no longer decides WHICH context that is. That is
+/// [`Attachment`]'s job, in the model, because the
+/// identity drawn beneath this string has to describe the same context and
+/// used to be derived independently. All that is left here is the wording.
+pub fn context_label(at: &Attachment) -> String {
+    match at {
+        // Nothing is being attempted and nothing will be until the user picks
+        // one. Saying "connecting…" here is the same lie the connecting screen
+        // exists to stop telling.
+        Attachment::NoContext => "none — press Enter to select".to_string(),
+        Attachment::Live { context, .. } => context.to_string(),
+        Attachment::Connecting { context, .. } => format!("{} (connecting…)", context),
+        Attachment::Opening => "connecting...".to_string(),
     }
 }
 
-/// The cluster/user/version to display beside [`context_label`].
-///
-/// While the link is down, `kube.identity` still describes the context we are
-/// LEAVING — so pairing it with the target's name reads as "you are on
-/// staging" above prod's cluster and user. The candidate carries the
-/// kubeconfig's own view of the target, which is the honest thing to show
-/// until the daemon confirms.
 /// How an unknown [`ClusterIdentity`](k9rs_proto::protocol::ClusterIdentity)
 /// field reads. Same word the table side uses — `CellValue::Placeholder`
 /// renders exactly this — so a context with no `user:` says the same thing
 /// wherever you look at it.
 pub const UNKNOWN_FIELD: &str = "n/a";
-
-pub fn display_identity(app: &App) -> &k9rs_proto::protocol::ClusterIdentity {
-    match (
-        k9rs_app::Liveness::of_link(&app.conn).shows_data(),
-        app.kube.connecting.as_ref(),
-    ) {
-        (false, Some((_, identity))) => identity,
-        _ => &app.kube.identity,
-    }
-}
 
 /// k9rs logo on the right. No key hints — those live in the ? help dialog.
 pub fn draw_header(
@@ -104,8 +66,11 @@ pub fn draw_header(
         return;
     }
 
-    let ctx = context_label(app);
-    let id = display_identity(app);
+    // ONE resolution, so the name and the three lines beneath it cannot come
+    // from different arms of different matches.
+    let at = app.attachment();
+    let ctx = context_label(&at);
+    let id = at.identity();
     let cluster = id.cluster().unwrap_or(UNKNOWN_FIELD);
     let user = id.user().unwrap_or(UNKNOWN_FIELD);
     let k8s_ver = id.k8s_version().unwrap_or(UNKNOWN_FIELD);
@@ -128,7 +93,7 @@ pub fn draw_header(
     // prefix — same reasoning as the nav breadcrumb, which is also a path.
     let label_w = " Context: ".width();
     let value_w = (cols[0].width as usize).saturating_sub(label_w);
-    let elide = |v: &str| k9rs_util::truncate_left(v, value_w).into_owned();
+    let elide = |v: &str| k9rs_util::width::truncate_left(v, value_w).into_owned();
     let info = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(" Context: ", theme.info_label),

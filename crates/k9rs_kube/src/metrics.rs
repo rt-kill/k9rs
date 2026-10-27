@@ -90,8 +90,8 @@ pub fn parse_pod_metrics_usage(data: &serde_json::Value) -> k9rs_proto::protocol
     }
 
     let cpu_milli = total_cpu_nano / 1_000_000;
-    let cpu = k9rs_util::format_cpu(&format!("{}n", total_cpu_nano));
-    let mem = k9rs_util::format_mem(&total_mem_bytes.to_string());
+    let cpu = k9rs_util::units::format_cpu(&format!("{}n", total_cpu_nano));
+    let mem = k9rs_util::units::format_mem(&total_mem_bytes.to_string());
     k9rs_proto::protocol::MetricsUsage { cpu, mem, cpu_milli, mem_bytes: total_mem_bytes }
 }
 
@@ -101,12 +101,12 @@ pub fn parse_node_metrics_usage(data: &serde_json::Value) -> k9rs_proto::protoco
 
     let cpu = metrics.usage.cpu
         .as_deref()
-        .map(k9rs_util::format_cpu)
+        .map(k9rs_util::units::format_cpu)
         .unwrap_or_else(|| "n/a".to_string());
 
     let mem = metrics.usage.memory
         .as_deref()
-        .map(k9rs_util::format_mem)
+        .map(k9rs_util::units::format_mem)
         .unwrap_or_else(|| "n/a".to_string());
 
     let cpu_milli = metrics.usage.cpu.as_deref()

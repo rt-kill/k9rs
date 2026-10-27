@@ -1,6 +1,6 @@
-use k9rs_app::element::{Element, LogSession};
-use k9rs_app::store::StorePayload;
-use k9rs_app::element::ViewExtent;
+use k9rs_app::{Element, LogSession};
+use k9rs_app::StorePayload;
+use k9rs_app::ViewExtent;
 use k9rs_app::{App, ShellState, TakeoverOp};
 use k9rs_proto::protocol::{LogContainer, LogLine, TableBaseline};
 use k9rs_proto::resource_def::BuiltInKind;
@@ -69,13 +69,13 @@ fn top_log_marker(term: &Terminal<TestBackend>) -> String {
 /// Push the help element, exactly as `Action::Help` does.
 fn push_help(app: &mut App) {
     app.conn.established();
-    let class = k9rs_app::keymap::ViewClass::of(app.nav.top());
+    let class = k9rs_app::ViewClass::of(app.nav.top());
     let caps = Some(app.current_capabilities());
     let markable = app.nav.top().markable();
     let store = app.core.seed_keybindings(caps, app.config.keys, class, markable);
     let rid = k9rs_proto::local_types::LocalResourceKind::Keybinding.to_resource_id();
-    app.nav.push(Element::ResourceList(k9rs_app::element::ResourceList::client(
-        k9rs_app::element::QuerySpec {
+    app.nav.push(Element::ResourceList(k9rs_app::ResourceList::client(
+        k9rs_app::QuerySpec {
             rid,
             namespace: k9rs_proto::protocol::Namespace::All,
             filter: None,
@@ -93,7 +93,7 @@ fn seed_row(app: &App, name: &str) {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(BuiltInKind::Pod),
+            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "STATUS".into()],
             rows: vec![ResourceRow {
                 name: name.into(),
@@ -151,7 +151,7 @@ fn a_dialog_overlay_keeps_the_live_view_around_it() {
     let mut t = term();
     app.ui.open(k9rs_app::Modal::Takeover(TakeoverOp::Edit {
             target: k9rs_proto::protocol::ObjectRef::new(
-                k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+                k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
                 "p".to_string(),
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             ),
@@ -179,7 +179,7 @@ fn overlay_extents_are_declared_not_improvised() {
     assert_eq!(
         TakeoverOp::Edit {
             target: k9rs_proto::protocol::ObjectRef {
-                resource: k9rs_app::nav::rid(BuiltInKind::Pod),
+                resource: BuiltInKind::Pod.to_resource_id(),
                 namespace: k9rs_proto::protocol::Namespace::Named("default".into()),
                 name: "p".into(),
             },
@@ -328,7 +328,7 @@ fn the_contexts_view_paints_as_an_ordinary_table() {
     // one thing that is genuinely its own (rows from disk, not a stream)
     // still paints with no daemon connected at all.
     let mut app = App::new_for_test();
-    k9rs_app::event::apply_event(&mut app, k9rs_app::event::AppEvent::KubeconfigLoaded {
+    k9rs_app::apply_event(&mut app, k9rs_app::AppEvent::KubeconfigLoaded {
         contexts: vec![
             k9rs_app::KubeContext {
                 name: k9rs_proto::protocol::ContextName::new("canary-ctx").unwrap(),
@@ -341,7 +341,7 @@ fn the_contexts_view_paints_as_an_ordinary_table() {
         current_context: None,
         current_identity: k9rs_proto::protocol::ClusterIdentity::default(),
     });
-    k9rs_app::event::apply_event(&mut app, k9rs_app::event::AppEvent::NoContextConfigured);
+    k9rs_app::apply_event(&mut app, k9rs_app::AppEvent::NoContextConfigured);
 
     let mut t = term();
     let painted = paint(&mut t, &mut app);
@@ -359,7 +359,7 @@ fn a_context_with_no_user_says_so_instead_of_showing_a_blank_cell() {
     // same field, said "n/a". `Option` + `CellValue::Placeholder` make the
     // omission unwritable.
     let mut app = App::new_for_test();
-    k9rs_app::event::apply_event(&mut app, k9rs_app::event::AppEvent::KubeconfigLoaded {
+    k9rs_app::apply_event(&mut app, k9rs_app::AppEvent::KubeconfigLoaded {
         contexts: vec![k9rs_app::KubeContext {
             name: k9rs_proto::protocol::ContextName::new("userless-ctx").unwrap(),
             // Exactly what kube-rs hands back for `user:`-less entry:
@@ -373,7 +373,7 @@ fn a_context_with_no_user_says_so_instead_of_showing_a_blank_cell() {
         current_context: None,
         current_identity: k9rs_proto::protocol::ClusterIdentity::default(),
     });
-    k9rs_app::event::apply_event(&mut app, k9rs_app::event::AppEvent::NoContextConfigured);
+    k9rs_app::apply_event(&mut app, k9rs_app::AppEvent::NoContextConfigured);
 
     let mut t = term();
     let painted = paint(&mut t, &mut app);
@@ -404,7 +404,7 @@ fn horizontal_scroll_never_lands_inside_a_column() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(BuiltInKind::Pod),
+            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "B".into(), "C".into(), "D".into(), "E".into()],
             rows: vec![ResourceRow {
                 name: "row".into(),
@@ -495,7 +495,7 @@ fn cached_overview_counters_say_they_are_from_a_previous_visit() {
     app.core.switch_context(Some(b), &a);
 
     // The counters live on the Overview, which is where every switch lands.
-    app.nav.reset(Element::Overview(k9rs_app::element::Overview));
+    app.nav.reset(Element::Overview(k9rs_app::Overview));
     let mut t = term();
     let painted = paint(&mut t, &mut app);
     assert!(
@@ -516,7 +516,7 @@ fn the_light_palette_actually_reaches_the_screen() {
     app.ui.theme = k9rs_theme::Theme::light();
     app.ui.open(k9rs_app::Modal::Takeover(TakeoverOp::Edit {
             target: k9rs_proto::protocol::ObjectRef::new(
-                k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+                k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
                 "p".to_string(),
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             ),
@@ -569,7 +569,7 @@ fn a_grep_that_matches_nothing_still_shows_its_pattern() {
     app.conn.established();
     app.nav.push(log_session_with(&["hello world"]));
     app.nav.top_mut().log_view_mut().expect("log view").draft =
-        Some(k9rs_app::text_input::TextInput::seeded("zzz-no-such-line"));
+        Some(k9rs_app::TextInput::seeded("zzz-no-such-line"));
 
     let mut t = term();
     let painted = paint(&mut t, &mut app);
@@ -593,8 +593,8 @@ fn a_committed_grep_that_matches_nothing_still_shows_its_chain() {
     let session = log_session_with(&["hello world"]);
     let filter = Element::derive_log_filter(
         &session,
-        k9rs_app::nav::CompiledGrep::new("zzz-no-such-line"),
-            k9rs_app::element::Sense::Keep,
+        k9rs_util::CompiledGrep::new("zzz-no-such-line"),
+            k9rs_app::Sense::Keep,
     )
     .expect("log session yields a line output");
     app.nav.push(session);
@@ -625,7 +625,7 @@ fn the_grep_bar_does_not_cover_the_last_log_line() {
     let lines: Vec<String> = (0..200).map(|i| format!("line-{i} keep")).collect();
     let session = log_session_with(&lines.iter().map(String::as_str).collect::<Vec<_>>());
     let filter =
-        Element::derive_log_filter(&session, k9rs_app::nav::CompiledGrep::new("keep"), k9rs_app::element::Sense::Keep)
+        Element::derive_log_filter(&session, k9rs_util::CompiledGrep::new("keep"), k9rs_app::Sense::Keep)
             .expect("log session yields a line output");
     app.nav.push(session);
     app.nav.push(filter);
@@ -652,7 +652,7 @@ fn help_documents_the_view_you_pressed_it_in() {
     // the point (you grep it), but makes "does this key appear" a question
     // about the data, not the pixels.
     fn help_rows(app: &mut App) -> Vec<String> {
-        let class = k9rs_app::keymap::ViewClass::of(app.nav.top());
+        let class = k9rs_app::ViewClass::of(app.nav.top());
         let caps = Some(app.current_capabilities());
         let store = app.core.seed_keybindings(
             caps,
@@ -888,7 +888,7 @@ fn a_grep_that_momentarily_matches_nothing_keeps_your_scroll_position() {
     // One keystroke of a grep that matches nothing → the "No matching lines."
     // status screen, which renders no content.
     app.nav.top_mut().log_view_mut().expect("log view").draft =
-        Some(k9rs_app::text_input::TextInput::seeded("zzz-no-such-line"));
+        Some(k9rs_app::TextInput::seeded("zzz-no-such-line"));
     let painted = paint(&mut t, &mut app);
     assert!(painted.contains("No matching lines."), "the status screen is up:\n{painted}");
 
@@ -916,13 +916,13 @@ fn a_degraded_grep_explains_itself_instead_of_showing_a_zero() {
 
     // `\zs` compiles in Rust as the end-of-text anchor followed by `s`: a
     // valid regex that can never match. It is now refused by name.
-    app.nav.top_mut().log_view_mut().unwrap().draft = Some(k9rs_app::text_input::TextInput::seeded(r"\zsaab"));
+    app.nav.top_mut().log_view_mut().unwrap().draft = Some(k9rs_app::TextInput::seeded(r"\zsaab"));
     let painted = paint(&mut term(), &mut app);
     assert!(painted.contains("literal"), "the bar must name the degradation:\n{painted}");
     assert!(painted.contains("zs"), "and say which atom caused it:\n{painted}");
 
     // A pattern that DOES compile keeps the ordinary count.
-    app.nav.top_mut().log_view_mut().unwrap().draft = Some(k9rs_app::text_input::TextInput::seeded(r"aa\|xy"));
+    app.nav.top_mut().log_view_mut().unwrap().draft = Some(k9rs_app::TextInput::seeded(r"aa\|xy"));
     let painted = paint(&mut term(), &mut app);
     assert!(!painted.contains("literal"), "a working regex says nothing:\n{painted}");
     assert!(painted.contains("visible"), "{painted}");
@@ -955,12 +955,12 @@ fn a_case_sensitive_grep_says_so() {
     let mut t = term();
 
     // All-lowercase: smartcase is off, the search is insensitive, no note.
-    app.nav.top_mut().log_view_mut().unwrap().draft = Some(k9rs_app::text_input::TextInput::seeded("client"));
+    app.nav.top_mut().log_view_mut().unwrap().draft = Some(k9rs_app::TextInput::seeded("client"));
     let painted = paint(&mut t, &mut app);
     assert!(!painted.contains("case-sensitive"), "no capital, nothing to say:\n{painted}");
 
     // One capital flips it — and the bar now says why the view emptied.
-    app.nav.top_mut().log_view_mut().unwrap().draft = Some(k9rs_app::text_input::TextInput::seeded("Client"));
+    app.nav.top_mut().log_view_mut().unwrap().draft = Some(k9rs_app::TextInput::seeded("Client"));
     let painted = paint(&mut t, &mut app);
     assert!(
         painted.contains("case-sensitive"),
@@ -978,7 +978,7 @@ fn a_case_sensitive_grep_says_so() {
 /// keystroke dismisses it rather than being swallowed — was dead.
 #[test]
 fn a_confirm_dialog_floats_over_the_view_that_raised_it() {
-    use k9rs_app::element::ViewExtent;
+    use k9rs_app::ViewExtent;
     let mut app = App::new_for_test();
     app.conn.established();
     seed_row(&app, "canary-row-marker");
@@ -991,7 +991,7 @@ fn a_confirm_dialog_floats_over_the_view_that_raised_it() {
         pending: k9rs_app::PendingAction::Single {
             op: k9rs_app::SingleOp::Delete,
             target: k9rs_proto::protocol::ObjectRef::new(
-                k9rs_app::nav::rid(BuiltInKind::Pod),
+                BuiltInKind::Pod.to_resource_id(),
                 "canary-row-marker".to_string(),
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             ),
@@ -1018,13 +1018,13 @@ fn a_confirm_dialog_floats_over_the_view_that_raised_it() {
     // Every key is the dialog's, globals included.
     use crossterm::event::KeyCode;
     for key in [KeyCode::Char(':'), KeyCode::Char('?'), KeyCode::Char('q')] {
-        let action = k9rs_app::handler::handle_key_event(
+        let action = k9rs_app::handle_key_event(
             &app,
             crossterm::event::KeyEvent::new(key, crossterm::event::KeyModifiers::NONE),
         );
         assert_eq!(
             action,
-            Some(k9rs_app::actions::Action::Cancel),
+            Some(k9rs_app::Action::Cancel),
             "{key:?} must be answered by the dialog, not leak to the view under it",
         );
     }
@@ -1039,7 +1039,7 @@ fn a_confirm_dialog_floats_over_the_view_that_raised_it() {
 /// element like every other dialog — one class, one modality rule, one pop.
 #[test]
 fn the_container_picker_is_a_floating_element() {
-    use k9rs_app::element::ViewExtent;
+    use k9rs_app::ViewExtent;
     let mut app = App::new_for_test();
     app.conn.established();
     seed_row(&app, "canary-row-marker");
@@ -1047,7 +1047,7 @@ fn the_container_picker_is_a_floating_element() {
 
     app.nav.push(Element::Picker(Box::new(k9rs_app::ContainerPicker {
         target: k9rs_proto::protocol::ObjectRef::new(
-            k9rs_app::nav::rid(BuiltInKind::Pod),
+            BuiltInKind::Pod.to_resource_id(),
             "canary-row-marker".to_string(),
             k9rs_proto::protocol::Namespace::Named("default".to_string()),
         ),
@@ -1080,7 +1080,7 @@ fn the_container_picker_is_a_floating_element() {
     );
 
     // Both dialogs share one class, so they share the modality rule.
-    assert_eq!(app.nav.top().class(), k9rs_app::element::ElementClass::Dialog);
+    assert_eq!(app.nav.top().class(), k9rs_app::ElementClass::Dialog);
     assert!(app.nav.top().captures_all_input());
 }
 
@@ -1093,7 +1093,7 @@ fn every_dialog_kind_paints_itself_over_its_parent() {
     app.conn.established();
     seed_row(&app, "canary-row-marker");
     let target = k9rs_proto::protocol::ObjectRef::new(
-        k9rs_app::nav::rid(BuiltInKind::Pod),
+        BuiltInKind::Pod.to_resource_id(),
         "canary-row-marker".to_string(),
         k9rs_proto::protocol::Namespace::Named("default".to_string()),
     );
@@ -1136,7 +1136,7 @@ fn every_dialog_kind_paints_itself_over_its_parent() {
                     name: "replicas".to_string(),
                     label: "Replicas".to_string(),
                     kind: k9rs_app::FormFieldKind::Number { min: 0, max: 100 },
-                    value: k9rs_app::text_input::TextInput::seeded("3"),
+                    value: k9rs_app::TextInput::seeded("3"),
                 }],
                 focused: k9rs_app::FormFocus::Field(0),
             })),
@@ -1151,7 +1151,7 @@ fn every_dialog_kind_paints_itself_over_its_parent() {
             app.nav.top().floats(),
             "{label}: must declare a Dialog extent",
         );
-        assert_eq!(app.nav.top().class(), k9rs_app::element::ElementClass::Dialog);
+        assert_eq!(app.nav.top().class(), k9rs_app::ElementClass::Dialog);
         assert!(app.nav.top().captures_all_input(), "{label}: a dialog owns every key");
 
         let painted = paint(&mut t, &mut app);
@@ -1192,7 +1192,7 @@ fn a_full_frame_takeover_erases_the_frame_not_the_float_over_it() {
         pending: k9rs_app::PendingAction::Single {
             op: k9rs_app::SingleOp::Delete,
             target: k9rs_proto::protocol::ObjectRef::new(
-                k9rs_app::nav::rid(BuiltInKind::Pod),
+                BuiltInKind::Pod.to_resource_id(),
                 "canary-row-marker".to_string(),
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             ),
@@ -1356,7 +1356,7 @@ fn the_aliases_view_paints_what_the_prompt_accepts() {
     );
     // And it is a NAVIGABLE table, not a document: `/` and sort belong to it
     // because it is an ordinary element.
-    assert_eq!(app.nav.top().class(), k9rs_app::element::ElementClass::Table);
+    assert_eq!(app.nav.top().class(), k9rs_app::ElementClass::Table);
     assert!(!app.nav.top().markable(), "nothing to batch on a reference row");
 }
 
@@ -1420,7 +1420,7 @@ fn a_dialog_fits_its_content_at_every_terminal_width() {
         // Measured the way the renderer measures: the memo's own widths.
         let mut t = Terminal::new(TestBackend::new(400, 120)).expect("wide terminal");
         let _ = paint(&mut t, &mut app);
-        let k9rs_app::element::ViewExtent::Dialog { width, .. } =
+        let k9rs_app::ViewExtent::Dialog { width, .. } =
             app.nav.top().extent(ratatui::layout::Rect::new(0, 0, 400, 120))
         else {
             panic!("help floats")
@@ -1439,7 +1439,7 @@ fn a_dialog_fits_its_content_at_every_terminal_width() {
         let _ = paint(&mut t, &mut app);
 
         let frame = ratatui::layout::Rect::new(0, 0, term_w, term_h);
-        let k9rs_app::element::ViewExtent::Dialog { width, .. } = app.nav.top().extent(frame)
+        let k9rs_app::ViewExtent::Dialog { width, .. } = app.nav.top().extent(frame)
         else {
             panic!("help floats")
         };
@@ -1487,7 +1487,7 @@ fn a_table_says_when_its_columns_do_not_fit() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(BuiltInKind::Pod),
+            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "NODE".into(), "AGE".into()],
             rows: vec![ResourceRow {
                 name: "canary-row-marker".into(),
@@ -1616,7 +1616,7 @@ fn a_crowded_title_keeps_the_warning_and_drops_the_hint() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(BuiltInKind::Pod),
+            resource: BuiltInKind::Pod.to_resource_id(),
             // Six node-name columns: ~270 wide, so clipped at every width a
             // terminal actually has — the pod table's real shape.
             headers: vec![
@@ -1699,7 +1699,7 @@ fn a_table_longer_than_its_window_says_where_you_are() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(BuiltInKind::Pod),
+            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "STATUS".into()],
             rows,
         }),
@@ -1753,10 +1753,10 @@ fn a_deep_breadcrumb_keeps_its_tail_and_clears_the_hint() {
     seed_row(&app, "a-pod-with-quite-a-long-name");
     // Drill: each level lengthens the path from the left.
     for pat in ["a", "pod", "with", "quite", "long", "name"] {
-        let predicate = k9rs_app::store::RowPredicate::Grep(
-            k9rs_app::nav::CompiledGrep::new(pat),
+        let predicate = k9rs_app::RowPredicate::Grep(
+            k9rs_util::CompiledGrep::new(pat),
         );
-        if let Ok(el) = k9rs_app::element::Element::derive_filter(app.nav.top(), predicate) {
+        if let Ok(el) = k9rs_app::Element::derive_filter(app.nav.top(), predicate) {
             app.nav.push(el);
         }
     }
@@ -1801,7 +1801,7 @@ fn a_long_input_keeps_its_caret_and_its_tail_on_screen() {
     seed_row(&app, "a-row");
     let typed = "clickhouseinstallations some-extremely-long-namespace-name-here";
     app.ui.open(k9rs_app::Modal::Command {
-        input: k9rs_app::text_input::TextInput::seeded(typed),
+        input: k9rs_app::TextInput::seeded(typed),
         history_index: None,
     });
 
@@ -1828,10 +1828,10 @@ fn a_long_input_keeps_its_caret_and_its_tail_on_screen() {
         LogContainer::Named("app".to_string()),
     ))));
     for pat in ["alpha", "bravo", "charlie"] {
-        if let Ok(el) = k9rs_app::element::Element::derive_log_filter(
+        if let Ok(el) = k9rs_app::Element::derive_log_filter(
             app.nav.top(),
-            k9rs_app::nav::CompiledGrep::new(pat),
-            k9rs_app::element::Sense::Keep,
+            k9rs_util::CompiledGrep::new(pat),
+            k9rs_app::Sense::Keep,
         ) {
             app.nav.push(el);
         }
@@ -1839,7 +1839,7 @@ fn a_long_input_keeps_its_caret_and_its_tail_on_screen() {
     let draft = "a-very-long-pattern-being-typed-right-now";
     // The log bar reads the element's own `draft`, not the table filter.
     app.nav.top_mut().log_view_mut().expect("a log element").draft =
-        Some(k9rs_app::text_input::TextInput::seeded(draft));
+        Some(k9rs_app::TextInput::seeded(draft));
     let mut t = Terminal::new(TestBackend::new(60, 16)).expect("terminal");
     let painted = paint(&mut t, &mut app);
     let tail = &draft[draft.len() - 10..];
@@ -1894,12 +1894,12 @@ fn the_header_keeps_the_telling_end_of_an_arn() {
 /// three. Pinned as the RELATIONSHIP, so the numbers cannot drift apart.
 #[test]
 fn a_dialogs_box_reserves_exactly_the_chrome_its_widget_spends() {
-    let (mw, mh) = k9rs_app::geometry::DIALOG_MARGIN;
+    let (mw, mh) = k9rs_app::DIALOG_MARGIN;
     let mut app = App::new_for_test();
     app.conn.established();
     seed_row(&app, "canary-row-marker");
     let target = k9rs_proto::protocol::ObjectRef::new(
-        k9rs_app::nav::rid(BuiltInKind::Pod),
+        BuiltInKind::Pod.to_resource_id(),
         "canary-row-marker".to_string(),
         k9rs_proto::protocol::Namespace::Named("default".to_string()),
     );
@@ -1914,13 +1914,13 @@ fn a_dialogs_box_reserves_exactly_the_chrome_its_widget_spends() {
         action_focused: false,
     })));
 
-    let k9rs_app::element::ViewExtent::Dialog { width, height } =
+    let k9rs_app::ViewExtent::Dialog { width, height } =
         app.nav.top().extent(ratatui::layout::Rect::new(0, 0, 200, 60))
     else {
         panic!("a confirm floats")
     };
-    let k9rs_app::element::Element::Confirm(d) = app.nav.top() else { panic!() };
-    let (cw, ch) = k9rs_app::geometry::confirm_dialog_size(d);
+    let k9rs_app::Element::Confirm(d) = app.nav.top() else { panic!() };
+    let (cw, ch) = k9rs_app::confirm_dialog_size(d);
     assert_eq!(
         (width, height),
         (cw + mw, ch + mh),
@@ -1961,12 +1961,12 @@ fn the_grep_bar_counts_every_step_of_the_chain() {
 
     // Two steps: the first keeps 2 of 3, the second keeps none of those.
     for (pat, sense) in [
-        ("alpha", k9rs_app::element::Sense::Keep),
-        ("zzz", k9rs_app::element::Sense::Keep),
+        ("alpha", k9rs_app::Sense::Keep),
+        ("zzz", k9rs_app::Sense::Keep),
     ] {
-        let el = k9rs_app::element::Element::derive_log_filter(
+        let el = k9rs_app::Element::derive_log_filter(
             app.nav.top(),
-            k9rs_app::nav::CompiledGrep::new(pat),
+            k9rs_util::CompiledGrep::new(pat),
             sense,
         )
         .expect("a log can be filtered");
@@ -2020,7 +2020,7 @@ fn a_pod_list_sorted_by_age_shows_every_age() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(BuiltInKind::Pod),
+            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "AGE".into()],
             rows,
         }),
@@ -2081,7 +2081,7 @@ fn no_resource_column_collapses_whichever_one_is_sorted() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(BuiltInKind::Pod),
+            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "STATUS".into(), "NODE".into(), "AGE".into()],
             rows,
         }),
@@ -2128,10 +2128,10 @@ fn help_section_still_collapses_after_the_narrowing() {
 
     // Help opens sorted on SECTION, and `Everywhere` has many rows — so if
     // it collapses, the label appears far fewer times than its row count.
-    let (_, rows) = k9rs_app::help::HelpContent::rows(
+    let (_, rows) = k9rs_app::HelpContent::rows(
         Some(app.current_capabilities()),
         app.config.keys,
-        k9rs_app::keymap::ViewClass::Table,
+        k9rs_app::ViewClass::Table,
         app.nav.top().markable(),
     );
     let everywhere_rows = rows
@@ -2171,14 +2171,14 @@ fn g_on_a_freshly_opened_describe_reaches_the_bottom_at_once() {
     // More lines than fit, each identifiable, so "which window is drawn" is
     // readable off the frame.
     state.set_content((0..200).map(|i| format!("line-{i:03}")).collect::<Vec<_>>().join("\n"));
-    app.nav.push(Element::ContentView(k9rs_app::element::ContentView::new(
-        k9rs_app::element::ContentSpec::Describe(k9rs_proto::protocol::ObjectRef::new(
-            k9rs_app::nav::rid(BuiltInKind::Pod),
+    app.nav.push(Element::ContentView(k9rs_app::ContentView::new(
+        k9rs_app::ContentSpec::Describe(k9rs_proto::protocol::ObjectRef::new(
+            BuiltInKind::Pod.to_resource_id(),
             "canary".to_string(),
             k9rs_proto::protocol::Namespace::Named("default".to_string()),
         )),
         state,
-        k9rs_app::element::ContentPhase::Ready,
+        k9rs_app::ContentPhase::Ready,
     )));
 
     let mut t = Terminal::new(TestBackend::new(60, 14)).expect("terminal");

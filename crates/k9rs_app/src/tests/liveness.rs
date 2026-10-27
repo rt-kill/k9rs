@@ -1,5 +1,5 @@
 use crate::table::TableDataState;
-use crate::types::Connection;
+use crate::connection::Connection;
 use crate::Liveness;
 
 fn live_conn() -> Connection {

@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use k9rs_app::store::StoredLine;
+use k9rs_app::StoredLine;
 use k9rs_proto::protocol::Role;
 use k9rs_theme::Theme;
 
@@ -42,7 +42,7 @@ fn cluster_width(g: &str) -> usize {
 }
 
 /// The grapheme clusters of `text`, skipping ANSI escapes when `ansi` and
-/// dropping the non-tab control characters `k9rs_util::sanitize_terminal`
+/// dropping the non-tab control characters `k9rs_util::text::sanitize_terminal`
 /// removes on the render path — so the measurement sees exactly the clusters
 /// that will be drawn.
 /// THE one enumeration of a text run into drawable units.
@@ -123,7 +123,7 @@ fn clean(text: &str) -> std::borrow::Cow<'_, str> {
             if i >= bytes.len() {
                 break false;
             }
-            if k9rs_util::skip_ansi_escape(bytes, i).is_some() {
+            if k9rs_util::text::skip_ansi_escape(bytes, i).is_some() {
                 break true;
             }
             let c = text[i..].chars().next().unwrap();
@@ -139,7 +139,7 @@ fn clean(text: &str) -> std::borrow::Cow<'_, str> {
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
     while i < bytes.len() {
-        if let Some(next) = k9rs_util::skip_ansi_escape(bytes, i) {
+        if let Some(next) = k9rs_util::text::skip_ansi_escape(bytes, i) {
             i = next;
             continue;
         }
@@ -153,7 +153,7 @@ fn clean(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Feed a text run into a running `(col, rows)` wrap accumulator at width
-/// `w`. When `ansi`, escapes are skipped via [`k9rs_util::skip_ansi_escape`]
+/// `w`. When `ansi`, escapes are skipped via [`k9rs_util::text::skip_ansi_escape`]
 /// — the SAME tokenizer `parse_ansi_line` (the renderer) uses — so the counted
 /// width cannot drift from the rendered width. Raw runs (container prefix,
 /// timestamp) pass `ansi = false` and count every byte, matching how the
@@ -318,7 +318,7 @@ fn source_color(name: &str, sources: &[String]) -> Color {
 /// It carries only what CONTENT rendering needs. Chrome — the bordered block,
 /// the title indicators, the grep bar — belongs to the view, which draws it in
 /// every state including the ones where there is no content at all.
-pub struct LogViewState {
+pub(crate) struct LogViewState {
     /// Physical (wrap-expanded) row offset — from the element's Viewport on
     /// the way in, and WRITTEN BACK on the way out with the offset actually
     /// used (see `follow`).
@@ -380,7 +380,7 @@ pub struct LogViewState {
 }
 
 // `LogViewState` is pure data — the authoritative state lives in the nav
-// element ([`k9rs_app::element::LogInteraction`], reached via
+// element ([`k9rs_app::LogInteraction`], reached via
 // `Element::log_view`). The view function snapshots into this struct by
 // literal each draw, so impl methods on this type would never be called.
 
@@ -390,7 +390,7 @@ pub struct LogViewState {
 /// It owns no chrome. The view draws the bordered block and the grep bar
 /// around it, because those must also appear in the states this widget is
 /// never constructed for — connecting, no logs yet, nothing matched the grep.
-pub struct LogViewer<'a> {
+pub(crate) struct LogViewer<'a> {
     /// Visible window of typed log lines. Each carries `content` plus an
     /// optional `source` — daemon-tagged whenever the stream has more than
     /// one source (`--all-containers`, or a multi-pod fan-out). The renderer
@@ -400,7 +400,7 @@ pub struct LogViewer<'a> {
 }
 
 impl<'a> LogViewer<'a> {
-    pub fn new(lines: &'a [&'a StoredLine], theme: &'a Theme) -> Self {
+    pub(crate) fn new(lines: &'a [&'a StoredLine], theme: &'a Theme) -> Self {
         Self { lines, theme }
     }
 

@@ -16,6 +16,13 @@
 //! moving by `char` would leave the caret between a letter and its combining
 //! accent — visibly wrong and, for anything that then slices, fatal. Every
 //! mutator below preserves it, so no caller can construct a bad one.
+//!
+//! `TextKey`, `SearchInputResult` and `handle_search_key` sat in
+//! `types.rs` while this file held `TextInput` alone — and
+//! `handle_search_key` reached back across that gap by qualified path to
+//! take a `&mut crate::text_input::TextInput`. The gate on what counts as
+//! text, the outcome of a keystroke, and the buffer it lands in are one
+//! concern.
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -60,12 +67,12 @@ impl TextInput {
     /// The slice visible in `width` columns, and the caret's column within
     /// it — a one-line viewport over the value, anchored on the caret.
     ///
-    /// The algorithm is [`k9rs_util::window_around`], which the filter bar
+    /// The algorithm is [`k9rs_util::width::window_around`], which the filter bar
     /// also uses (it is handed a `&str` and a column, not an input). This is
     /// the typed entry point: the caret it passes is this type's invariant,
     /// so no caller can window around a position that does not exist.
     pub fn window(&self, width: usize) -> (&str, usize) {
-        k9rs_util::window_around(&self.value, self.cursor_col(), width)
+        k9rs_util::width::window_around(&self.value, self.cursor_col(), width)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -142,6 +149,110 @@ impl TextInput {
 impl<T: Into<String>> From<T> for TextInput {
     fn from(value: T) -> Self {
         Self::seeded(value)
+    }
+}
+
+/// Result of processing a search input keystroke.
+pub enum SearchInputResult {
+    /// Key was consumed, input updated (Char, Backspace).
+    Updated,
+    /// User pressed Esc — cancel search.
+    Cancelled,
+    /// User pressed Enter — commit search with this term (empty = clear).
+    Committed(String),
+}
+
+/// Process a keystroke against a search input buffer.
+/// Returns what happened so the caller can apply view-specific logic.
+/// Callers gate on their own "search active" state before dispatching.
+/// A keystroke that is TEXT.
+///
+/// Every text sink — the `:` command bar, form fields, the resource filter,
+/// the log grep draft, the yaml/describe search — matched on `key.code` alone,
+/// so a Ctrl chord typed its bare character instead of falling through to the
+/// global handler. Three of the five were fixed one at a time across two
+/// separate bug reports; `handle_search_key` could not be fixed at its call
+/// site at all, because it took a `KeyCode` and the modifier was already gone.
+///
+/// So the guard became a TYPE. A sink takes a `TextKey`, which can only be
+/// built by [`TextKey::new`], which refuses Ctrl chords — "forgot the guard"
+/// is no longer something you can write.
+///
+/// Concretely this is not hypothetical: `BEL` terminates an OSC reply and
+/// crossterm delivers `0x07` as Ctrl-G, so a terminal colour response leaking
+/// into a resume window typed a stray `g` into whichever text box was open.
+#[derive(Debug, Clone, Copy)]
+pub struct TextKey(crossterm::event::KeyEvent);
+
+impl TextKey {
+    /// `None` for a Ctrl chord — that is a command, not text, and belongs to
+    /// the global handler. Alt chords are likewise not text (an Alt-modified
+    /// key is a different chord, not its bare character — the same rule
+    /// `combo_of` follows).
+    pub fn new(key: crossterm::event::KeyEvent) -> Option<Self> {
+        use crossterm::event::KeyModifiers;
+        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            return None;
+        }
+        Some(Self(key))
+    }
+
+    pub fn code(&self) -> crossterm::event::KeyCode {
+        self.0.code
+    }
+
+    /// The character this key types, if it types one.
+    pub fn char(&self) -> Option<char> {
+        match self.0.code {
+            crossterm::event::KeyCode::Char(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+pub fn handle_search_key(
+    input: &mut TextInput,
+    key: TextKey,
+) -> SearchInputResult {
+    use crossterm::event::KeyCode;
+    match key.code() {
+        KeyCode::Esc => {
+            input.clear();
+            SearchInputResult::Cancelled
+        }
+        KeyCode::Enter => SearchInputResult::Committed(input.take()),
+        // Editing and caret motion are the input's, not this function's —
+        // the fifth and last place that used to keep its own `String` and
+        // reimplement backspace.
+        KeyCode::Backspace => {
+            input.backspace();
+            SearchInputResult::Updated
+        }
+        KeyCode::Delete => {
+            input.delete();
+            SearchInputResult::Updated
+        }
+        KeyCode::Left => {
+            input.left();
+            SearchInputResult::Updated
+        }
+        KeyCode::Right => {
+            input.right();
+            SearchInputResult::Updated
+        }
+        KeyCode::Home => {
+            input.home();
+            SearchInputResult::Updated
+        }
+        KeyCode::End => {
+            input.end();
+            SearchInputResult::Updated
+        }
+        KeyCode::Char(c) => {
+            input.insert(c);
+            SearchInputResult::Updated
+        }
+        _ => SearchInputResult::Updated,
     }
 }
 

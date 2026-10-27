@@ -12,7 +12,7 @@
 //! and that test keeps working because it reaches DOWN to the tokenizer from
 //! here rather than up.
 
-use k9rs_util::{sanitize_terminal, skip_ansi_escape};
+use k9rs_util::text::{sanitize_terminal, skip_ansi_escape};
 
 /// Push a text run as a Span, dropping non-tab control characters. Zero-
 /// copy (borrowed slice) in the common no-control case; allocates a

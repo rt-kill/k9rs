@@ -501,7 +501,7 @@ impl ServerSession {
             // The API server's version string is attacker-influenceable
             // (compromised/hostile apiserver) and renders in the header
             // through the Paragraph path — sanitize control chars.
-            identity.set_k8s_version(k9rs_util::sanitize_terminal(&info.git_version));
+            identity.set_k8s_version(k9rs_util::text::sanitize_terminal(&info.git_version));
             parse_k8s_minor(&info.git_version).is_some_and(|minor| minor >= 32)
         } else {
             false
@@ -1535,7 +1535,7 @@ async fn resubscribe(
     let rid_label = match resub {
         ResubInfo::BuiltIn { key, .. } | ResubInfo::Dynamic { key, .. } => key.resource.plural(),
     };
-    let jitter_factor = k9rs_util::retry_jitter(rid_label.as_bytes(), retry_backoff.as_millis() as u64);
+    let jitter_factor = k9rs_util::task::retry_jitter(rid_label.as_bytes(), retry_backoff.as_millis() as u64);
     let jittered = retry_backoff.mul_f64(jitter_factor);
     tracing::info!(session = session_id,
         "watcher died for {}, retrying in {:?}: {}", rid_label, jittered, detail);

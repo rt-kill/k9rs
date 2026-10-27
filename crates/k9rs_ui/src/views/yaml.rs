@@ -13,7 +13,7 @@ use crate::widgets::{YamlViewer, YamlViewState};
 /// Layout:
 /// - YAML content with line numbers and syntax highlighting
 /// - Bottom bar with keybindings (or search input)
-pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
+pub(crate) fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.ui.theme;
 
     let chunks = Layout::vertical([
@@ -28,7 +28,7 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
     // Publish the (non-wrapping) extent to the viewport BEFORE reading the
     // offset — the render owns geometry, the action layer never guesses it.
     let inner_rows = content_area.height.saturating_sub(2) as usize;
-    if let k9rs_app::element::Element::ContentView(cv) = app.nav.top_mut() {
+    if let k9rs_app::Element::ContentView(cv) = app.nav.top_mut() {
         let lc = cv.state.line_count();
         // `follow` is honoured here, not hardcoded `false`. `G` on a
         // freshly-loaded view set `follow` and moved to `max_scroll()` — but
@@ -43,7 +43,7 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // The top element IS the view.
-    use k9rs_app::element::{ContentSpec, Element};
+    use k9rs_app::{ContentSpec, Element};
     let Element::ContentView(cv) = app.nav.top() else { return };
     let (resource_type, resource_name) = match &cv.kind {
         ContentSpec::Yaml(target)
@@ -60,7 +60,7 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
     // says so (static, with the retry hint), and Ready renders whatever
     // arrived.
     match &cv.phase {
-        k9rs_app::element::ContentPhase::Fetching => {
+        k9rs_app::ContentPhase::Fetching => {
             let block = ratatui::widgets::Block::bordered()
                 .title(format!(" {} ", yaml_title))
                 .title_style(theme.title)
@@ -69,7 +69,7 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
             f.render_widget(block, content_area);
             crate::draw_centered_loading(f, inner, "Loading...", theme.status_pending, &app.ui.anim);
         }
-        k9rs_app::element::ContentPhase::Failed(reason) => {
+        k9rs_app::ContentPhase::Failed(reason) => {
             let block = ratatui::widgets::Block::bordered()
                 .title(format!(" {} ", yaml_title))
                 .title_style(theme.title)
@@ -83,7 +83,7 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
                 theme.status_failed,
             );
         }
-        k9rs_app::element::ContentPhase::Ready => {
+        k9rs_app::ContentPhase::Ready => {
             let viewer = YamlViewer::new(
                 yaml.content(),
                 &yaml_title,
@@ -119,8 +119,8 @@ pub fn draw_yaml(f: &mut Frame, app: &mut App, area: Rect) {
         // Keybinding bar
         // Projected from the ONE keymap declaration, so this bar cannot
         // advertise a key the dispatcher doesn't have (or miss one it does).
-        let hints = k9rs_app::keymap::bar_hints(
-            k9rs_app::keymap::ViewClass::Detail,
+        let hints = k9rs_app::bar_hints(
+            k9rs_app::ViewClass::Detail,
         );
         let line = crate::header::render_keybinding_bar(&hints, bar_area.width, theme);
         f.render_widget(line, bar_area);

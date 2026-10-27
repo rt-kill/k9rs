@@ -1,98 +1,7 @@
+//! Where vim magic and the Rust regex engine disagree, and what a pattern
+//! that cannot be a regex says instead.
+
 use super::*;
-use chrono::Duration;
-
-#[test]
-fn sanitize_terminal_drops_escapes_keeps_tab() {
-    // The OSC 52 clipboard payload and a cursor-report both vanish.
-    assert_eq!(sanitize_terminal("a\x1b]52;c;Zm9v\x07b"), "a]52;c;Zm9vb");
-    assert_eq!(sanitize_terminal("x\x1b[6ny"), "x[6ny");
-    // Tab survives; CR/BEL/DEL/C1 do not.
-    assert_eq!(sanitize_terminal("a\tb\r\x07\x7f\u{0090}c"), "a\tbc");
-    // Plain text is unchanged.
-    assert_eq!(sanitize_terminal("pod-1 Running"), "pod-1 Running");
-}
-
-#[test]
-fn test_format_age_none() {
-    assert_eq!(format_age(None), "<unknown>");
-}
-
-#[test]
-fn test_format_age_seconds() {
-    let ts = Utc::now() - Duration::seconds(30);
-    assert_eq!(format_age(Some(ts)), "30s");
-}
-
-#[test]
-fn test_format_age_minutes() {
-    let ts = Utc::now() - Duration::minutes(5) - Duration::seconds(10);
-    assert_eq!(format_age(Some(ts)), "5m10s");
-}
-
-#[test]
-fn test_format_age_hours() {
-    let ts = Utc::now() - Duration::hours(3) - Duration::minutes(15);
-    assert_eq!(format_age(Some(ts)), "3h15m");
-}
-
-#[test]
-fn test_format_age_days() {
-    let ts = Utc::now() - Duration::days(2) - Duration::hours(5);
-    assert_eq!(format_age(Some(ts)), "2d5h");
-}
-
-#[test]
-fn test_format_cpu_nanocores() {
-    assert_eq!(format_cpu("250000000n"), "250m");
-}
-
-#[test]
-fn test_format_cpu_millicores() {
-    assert_eq!(format_cpu("500m"), "500m");
-}
-
-#[test]
-fn test_format_cpu_whole_cores() {
-    assert_eq!(format_cpu("2"), "2");
-}
-
-#[test]
-fn test_format_mem_ki() {
-    assert_eq!(format_mem("131072Ki"), "128Mi");
-}
-
-#[test]
-fn test_format_mem_mi() {
-    assert_eq!(format_mem("256Mi"), "256Mi");
-}
-
-#[test]
-fn test_format_mem_gi() {
-    assert_eq!(format_mem("2Gi"), "2Gi");
-}
-
-#[test]
-fn test_truncate_short() {
-    assert_eq!(truncate("hello", 10), "hello");
-}
-
-#[test]
-fn test_truncate_exact() {
-    assert_eq!(truncate("hello", 5), "hello");
-}
-
-#[test]
-fn test_truncate_long() {
-    let result = truncate("hello world", 8);
-    assert_eq!(result, "hello w\u{2026}");
-}
-
-#[test]
-fn test_truncate_zero() {
-    assert_eq!(truncate("hello", 0), "");
-}
-
-// -- vim magic mode tests -------------------------------------------------
 
 #[test]
 fn vim_magic_literal_dash() {
@@ -205,35 +114,6 @@ fn vim_magic_smartcase() {
     let upper = SearchPattern::new("Nginx");
     assert!(!upper.is_match("nginx")); // case-sensitive
     assert!(upper.is_match("Nginx"));
-}
-
-// ---------------------------------------------------------------------------
-// Foreign resources Drop has to reach for (2026-09 audit)
-// ---------------------------------------------------------------------------
-
-/// The process temp directory is reclaimed — but only when it holds nothing.
-///
-/// `TempFile::drop` removed a FILE; nothing owned the DIRECTORY, so every run
-/// that edited a resource left a `k9rs-<pid>/` behind forever. The cleanup
-/// must not be recursive: `SaveTable` and `SaveLogs` write there on purpose
-/// and tell the user the path.
-#[test]
-fn the_temp_dir_is_reclaimed_only_when_empty() {
-    let base = std::env::temp_dir().join(format!("k9rs-reclaim-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir(&base).expect("scratch dir");
-
-    // Something the user asked us to save → left alone.
-    let saved = base.join("pods-20260914.txt");
-    std::fs::write(&saved, b"rows").expect("write");
-    super::reclaim_if_empty(&base);
-    assert!(base.exists(), "a directory with saved output survives");
-    assert!(saved.exists(), "…and so does the file in it");
-
-    // Once nothing of ours is left, the directory goes too.
-    std::fs::remove_file(&saved).expect("remove");
-    super::reclaim_if_empty(&base);
-    assert!(!base.exists(), "an empty temp directory is reclaimed");
 }
 
 // ---------------------------------------------------------------------------
@@ -627,46 +507,11 @@ fn a_pattern_can_span_a_colour_boundary() {
         "\u{1b}[32mworkers\u{1b}[0m=\u{1b}[1m0\u{1b}[0m",
         "\u{1b}[2mts\u{1b}[0m \u{1b}[32mINFO\u{1b}[0m depth=1, workers=0",
     ] {
-        let seen = crate::visible_text(raw);
+        let seen = crate::text::visible_text(raw);
         assert!(seen.contains("workers="), "sanity: {seen:?} should read workers=");
         assert!(
             pat.is_match(&seen),
             "a pattern the user can SEE must match: {raw:?} reads {seen:?}",
         );
-    }
-}
-
-/// The mirror of `truncate`, for the surfaces where the TAIL is the answer.
-#[test]
-fn truncate_left_keeps_the_end_and_marks_the_cut() {
-    use crate::truncate_left;
-
-    // Fits: untouched, and borrowed.
-    assert_eq!(truncate_left("pods", 10), std::borrow::Cow::Borrowed("pods"));
-
-    // Does not fit: the END survives, with a leading ellipsis.
-    // 12 columns in ALL: eleven of tail plus the mark, not twelve plus.
-    assert_eq!(truncate_left("pods > /api > describe(web)", 12), "\u{2026}scribe(web)");
-    assert_eq!(truncate_left("abcdef", 3), "\u{2026}ef");
-
-    // Degenerate budgets are answers, not panics.
-    assert_eq!(truncate_left("abcdef", 1), "\u{2026}");
-    assert_eq!(truncate_left("abcdef", 0), "");
-
-    // Never wider than asked, for anything — including wide glyphs and
-    // clusters a byte slice would split down the middle.
-    for s in [
-        "pods > /api > describe(web-7f9c)",
-        "日本語のリソース > ポッド",
-        "a\u{1F469}\u{200D}\u{1F467}b",
-        "\u{26a0}\u{FE0F} warning",
-    ] {
-        for max in 0..24usize {
-            let out = truncate_left(s, max);
-            assert!(
-                unicode_width::UnicodeWidthStr::width(out.as_ref()) <= max,
-                "truncate_left({s:?}, {max}) = {out:?} is wider than {max}",
-            );
-        }
     }
 }

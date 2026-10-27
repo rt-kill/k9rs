@@ -14,7 +14,7 @@ use k9rs_theme::Theme;
 ///
 /// Uses the same layout as the resource view (header, content, tab bar, flash)
 /// so it feels like a natural part of the app. No heavy resource subscriptions.
-pub fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
+pub(crate) fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.ui.theme;
 
     let header_height: u16 = if app.ui.show_header { crate::HEADER_HEIGHT } else { 0 };
@@ -76,13 +76,14 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         Line::from(""),
     ];
 
-    // Cluster info — centered, one field per line. The context label comes
-    // from the same place the header's does; two derivations of it is how
-    // "connecting…" ended up on a screen where nothing was connecting.
-    let ctx_label = header::context_label(app);
-    // Same helper as the header: the identity must not describe the context
-    // we are leaving while the name describes the one we are going to.
-    let id = header::display_identity(app);
+    // Cluster info — centered, one field per line. One `Attachment`, exactly
+    // as the header does it: two derivations of the context label is how
+    // "connecting…" ended up on a screen where nothing was connecting, and
+    // two derivations of the identity is how the name came to describe the
+    // context we were going to while the fields described the one we left.
+    let at = app.attachment();
+    let ctx_label = header::context_label(&at);
+    let id = at.identity();
     let info_fields: &[(&str, &str)] = &[
         ("Context: ", ctx_label.as_str()),
         ("Cluster: ", id.cluster().unwrap_or(header::UNKNOWN_FIELD)),

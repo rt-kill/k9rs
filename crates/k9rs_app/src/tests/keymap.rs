@@ -32,7 +32,7 @@ fn app_in(class: ViewClass) -> App {
                 pending: crate::PendingAction::Single {
                     op: crate::SingleOp::Delete,
                     target: k9rs_proto::protocol::ObjectRef::new(
-                        crate::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+                        k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
                         "canary".to_string(),
                         k9rs_proto::protocol::Namespace::Named("default".to_string()),
                     ),
@@ -44,7 +44,7 @@ fn app_in(class: ViewClass) -> App {
             app.nav.push(Element::ContentView(
                 crate::element::ContentView::new(
                     crate::element::ContentSpec::Describe(k9rs_proto::protocol::ObjectRef::new(
-                    crate::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+                    k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
                     "some-pod".to_string(),
                     k9rs_proto::protocol::Namespace::Named("default".to_string()),
                 )),

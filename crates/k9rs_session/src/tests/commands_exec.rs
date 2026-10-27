@@ -90,9 +90,7 @@ fn a_builtin_alias_is_not_shadowed_by_an_exec_name() {
     let app = app_with_exec(&["pods"]);
     assert_eq!(
         parse_in(&app, "pods"),
-        ParsedCommand::Resource(k9rs_app::nav::rid(
-            k9rs_proto::resource_def::BuiltInKind::Pod
-        )),
+        ParsedCommand::Resource(k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id()),
         "rule 4 (built-in aliases) runs first, so the registry keeps priority",
     );
 }

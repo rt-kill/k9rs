@@ -1,67 +1,97 @@
-pub mod actions;
-pub mod anim;
-pub mod batch;
-pub mod form;
-pub mod kubectl_cache;
-pub mod derived;
-pub mod element;
+pub(crate) mod actions;
+pub(crate) mod anim;
+pub(crate) mod attachment;
+pub(crate) mod batch;
+pub(crate) mod config;
+pub(crate) mod connection;
+pub(crate) mod form;
+pub(crate) mod kubectl_cache;
+pub(crate) mod derived;
+pub(crate) mod element;
 // The client half of the daemon wire. It lived under `kube/` but is written
 // in app vocabulary — it hands out `RowStore`/`LineStore` handles and builds
 // `AppEvent`s — so it is the app's data source, not Kubernetes access.
-pub mod client;
-pub mod commands;
+pub(crate) mod client;
+pub(crate) mod commands;
 // The event vocabulary, the keymap and the key handler. `AppEvent` is
 // DEFINED over `app::store` types and `ViewClass::of` takes an `app::Element`,
 // so `event` was never a layer below app — it was app's own event half, kept
 // in a sibling module, and the two were the last cycle in the tree.
-pub mod event;
-pub mod geometry;
-pub mod handler;
-pub mod keymap;
+pub(crate) mod event;
+pub(crate) mod geometry;
+pub(crate) mod handler;
+pub(crate) mod keymap;
 // Help's CONTENT, which is a data projection and not a widget — its own first
 // line said "NOT a widget — it renders nothing", and it returns
 // `(Vec<String>, Vec<ResourceRow>)` with no ratatui in sight. It sat in
 // `ui::widgets`, so `app` had to reach up into the renderer to build the help
 // element's rows.
-pub mod help;
-pub mod liveness;
-pub mod nav;
-pub mod select_gate;
-pub mod store;
-pub mod text_input;
-pub mod table;
-pub mod types;
-pub mod viewport;
-pub mod view;
+pub(crate) mod help;
+pub(crate) mod liveness;
+pub(crate) mod nav;
+pub(crate) mod select_gate;
+pub(crate) mod state;
+pub(crate) mod store;
+pub(crate) mod text_input;
+pub(crate) mod table;
+pub(crate) mod takeover;
+pub(crate) mod viewport;
+pub(crate) mod view;
 
-pub use actions::SortTarget;
-// The app's surface, named.
+// ---------------------------------------------------------------------------
+// THE API
+// ---------------------------------------------------------------------------
 //
-// These were six `pub use <mod>::*;` globs, so the public API was defined by
-// `*` and nothing could say which names were intended — `types.rs` alone
-// published 32 items that way. After the crate split this list IS
-// `k9rs-app`'s API, so adding a name here should be a deliberate act.
+// Every module above is `pub(crate)`. This list is the whole of what `k9rs_ui`,
+// `k9rs_session` and the binary can see, so adding a name here is a deliberate
+// act rather than a side effect of declaring a module.
 //
-// The list is not a guess: the globs were deleted and the compiler was asked
-// what the tree actually needs, iterated until clean against `--all-targets`
-// (the test mirrors need names the bin alone does not). 29 of `types.rs`'s 32
-// top-level `pub` items cross; `view` exports nothing anyone reaches through
-// `app::`, so it has no entry at all.
+// It started as six `pub use <mod>::*;` globs — the API was defined by `*` and
+// nothing could say which names were intended. Deleting the globs and asking
+// the compiler what the tree actually needs got the list; narrowing the modules
+// is what stops it drifting back, because a `pub` item in a `pub(crate)` module
+// that nothing re-exports is now an `unreachable_pub` warning. That lint
+// reported ZERO while the modules were public, and found a dead 102-line widget
+// the moment they were not.
+//
+// Flat rather than module-qualified because these are 40 distinctly-named types
+// and functions; where a module name supplies a missing noun instead, as in
+// `k9rs_util::width::truncate`, the module stays in the path.
+pub use actions::{Action, LogRange, SortTarget};
+pub use anim::{Anim, FRAME_INTERVAL};
+pub use attachment::Attachment;
 pub use batch::BatchTracker;
+pub use client::{ClientSession, ConnectionParams};
+pub use commands::{ParsedCommand, COMMAND_WORDS};
+pub use config::{load as load_config, AppConfig, KeyCombo, KeysConfig, LogConfig, LogFields};
+pub use connection::{Connection, ContextSwitchState, LinkState};
+pub use element::{
+    sense_of, ContentPhase, ContentSpec, ContentView, Element, ElementClass, LogInteraction,
+    LogSession, MarkOutcome, Overview, QuerySpec, ResourceList, Sense, SpanOutcome, ViewExtent,
+};
+pub use event::{apply_event, AppEvent};
 pub use form::{
     ContentViewState, FormDialog, FormFieldKind, FormFieldState, FormFocus, FormSubmit,
     SelectOption,
 };
+pub use geometry::{confirm_dialog_size, DIALOG_MARGIN};
+pub use handler::handle_key_event;
+pub use help::HelpContent;
+pub use keymap::{bar_hints, ViewClass};
 pub use kubectl_cache::{ContentKind, KubectlCache};
 pub use liveness::Liveness;
+pub use nav::{K8sFieldSelector, RootSpec};
+pub use select_gate::{gate_action, Gated};
+pub use state::{CrdInfo, FlashLevel, FlashMessage, ItemCounts, KubeState, UiState};
+pub use store::{row_key, PreparedView, RowPredicate, StorePayload, StoredLine};
 pub use table::TableDataState;
-pub use types::{
-    handle_search_key, AppConfig, ConfirmDialog, Connection, ContainerAction, ContainerChoice,
-    ContainerPicker, ContextSwitchState, CrdInfo, EditState, FlashLevel, FlashMessage, ItemCounts,
-    KeyCombo, KeysConfig, KubeState, LinkState, LogConfig, LogFields, Modal, PendingAction,
-    SearchInputResult, ShellConnectState, ShellState, SingleOp, TakeoverOp, TempFile, TextKey,
-    UiState,
+pub use takeover::{
+    ConfirmDialog, ContainerAction, ContainerChoice, ContainerPicker, EditState, Modal,
+    PendingAction, ShellConnectState, ShellState, SingleOp, TakeoverOp, TempFile,
 };
+pub use text_input::{handle_search_key, SearchInputResult, TextInput, TextKey};
+pub use view::DerivedViewKind;
+pub use viewport::{LineAnchor, Viewport};
 
 use std::time::Duration;
 
@@ -215,7 +245,7 @@ pub struct CoreData {
     /// command completion reads it and the `:ctx` view points at it, so it
     /// must outlive any single element — but seeded from DISK rather than
     /// watched, and deliberately NOT in `streams`: there is nothing to
-    /// subscribe to. See [`crate::element::LiveQuery::client`].
+    /// subscribe to. See `LiveQuery::client`.
     pub contexts: std::sync::Arc<store::RowStore>,
     /// What you can type at the `:` prompt. Client-owned like `contexts`:
     /// the rows are a fact about this binary's registry and command grammar.
@@ -566,6 +596,68 @@ pub struct App {
 }
 
 impl App {
+    /// What the chrome is describing: the confirmed context while the link is
+    /// up, otherwise whatever this session is aiming at — paired with the
+    /// identity of THAT context.
+    ///
+    /// THE answer. The renderer used to derive the name and the identity
+    /// separately and they could disagree; see [`Attachment`] for the
+    /// bug and why one value fixes it. Distinct from
+    /// [`KubeState::reconnect_target`], which answers a different question —
+    /// what the NEXT session should aim at — and deliberately ignores the
+    /// kubeconfig candidate, since that candidate is produced BY the session
+    /// build it would be feeding.
+    pub fn attachment(&self) -> Attachment {
+        match Liveness::of_link(&self.conn) {
+            Liveness::NoContext => Attachment::NoContext,
+            live if live.shows_data() => match &self.kube.context {
+                Some(context) => Attachment::Live {
+                    context: context.clone(),
+                    identity: self.kube.identity.clone(),
+                },
+                // Linked but nothing confirmed yet: the initial handshake.
+                None => Attachment::Opening,
+            },
+            // Link down. What we are AIMING at outranks what we last
+            // confirmed: `kube.context` is kept so a failed switch can fall
+            // back to it, but right now we are attached to neither it nor the
+            // target, and naming it reads as "you are on prod" when prod is
+            // what you just left.
+            _ => match (
+                self.kube.context_switch.target(),
+                self.kube.connecting.as_ref(),
+                &self.kube.context,
+            ) {
+                // A switch target. Its identity is the kubeconfig candidate's
+                // ONLY when the candidate is that same context — the `filter`
+                // is the whole fix. Before it, a target with no candidate yet
+                // fell through to `kube.identity`, which describes the context
+                // being LEFT; and an A→B→C switch would have shown B's
+                // cluster under C's name.
+                (Some(target), candidate, _) => Attachment::Connecting {
+                    identity: candidate
+                        .filter(|(name, _)| name == target)
+                        .map(|(_, identity)| identity.clone())
+                        .unwrap_or_default(),
+                    context: target.clone(),
+                },
+                // The session's own candidate from disk: name and identity
+                // come from the same kubeconfig entry, so they agree.
+                (None, Some((context, identity)), _) => Attachment::Connecting {
+                    context: context.clone(),
+                    identity: identity.clone(),
+                },
+                // Reconnecting to the last-confirmed context: its identity is
+                // the confirmed one, which is the same context.
+                (None, None, Some(context)) => Attachment::Connecting {
+                    context: context.clone(),
+                    identity: self.kube.identity.clone(),
+                },
+                (None, None, None) => Attachment::Opening,
+            },
+        }
+    }
+
     /// `config` is loaded (and validated, loudly) by `main` BEFORE any
     /// TUI setup and threaded in — the App never reads the config file
     /// itself, so tests are hermetic by construction and a config error
@@ -613,7 +705,7 @@ impl App {
         let metrics = store::MetricsHub::new();
         let root = element::Element::ResourceList(element::ResourceList::open_for_test(
             element::QuerySpec {
-                rid: nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+                rid: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
                 namespace: namespace.clone(),
                 filter: None,
             },
@@ -733,21 +825,6 @@ impl App {
         ))
     }
 
-    /// Load and VALIDATE settings from `~/.config/k9rs/config.yaml`.
-    /// Missing file/section → defaults; a present-but-invalid file (YAML
-    /// error, unknown field, malformed chord, reserved-key collision) →
-    /// `Err` with the full story. Called by `main` BEFORE the alternate
-    /// screen so the error lands on a visible stderr and the process
-    /// exits — never a silent fallback to defaults.
-    pub fn load_config() -> Result<AppConfig, String> {
-        // The top-level k9rs section deserializes directly into AppConfig
-        // because AppConfig uses `#[serde(rename_all = "camelCase", default)]`.
-        let config = k9rs_kube::daemon_config::load_section::<AppConfig>("")?
-            .unwrap_or_default();
-        config.keys.validate()?;
-        Ok(config)
-    }
-
     // -- Element dispatch -------------------------------------------------------
     //
     // The TUI drives exactly one element: the TOP of the nav stack. The
@@ -756,7 +833,7 @@ impl App {
     pub fn next_tab(&mut self) -> ResourceId {
         let pinned = &self.pinned_resources;
         if pinned.is_empty() {
-            return nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod);
+            return k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id();
         }
         let current = self.nav.resource_id();
         let idx = pinned.iter().position(|r| Some(r) == current).unwrap_or(0);
@@ -766,7 +843,7 @@ impl App {
     pub fn prev_tab(&mut self) -> ResourceId {
         let pinned = &self.pinned_resources;
         if pinned.is_empty() {
-            return nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod);
+            return k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id();
         }
         let current = self.nav.resource_id();
         let idx = pinned.iter().position(|r| Some(r) == current).unwrap_or(0);
@@ -807,7 +884,6 @@ impl App {
     pub fn go_end(&mut self) {
         self.nav.top_mut().go_end();
     }
-
 
     /// Toggle mark on the row under the cursor.
     pub fn toggle_mark(&mut self) -> element::MarkOutcome {
@@ -934,7 +1010,6 @@ impl App {
         }
         stats
     }
-
 
     /// Find a discovered CRD by its kind name (case-insensitive), from
     /// the app-level CRD store (Discovery-fed).

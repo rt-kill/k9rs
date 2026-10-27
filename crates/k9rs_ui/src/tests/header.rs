@@ -1,7 +1,7 @@
 //! What the header renders.
 
 use super::*;
-use k9rs_app::keymap::{bar_hints, ViewClass};
+use k9rs_app::{bar_hints, ViewClass};
 use k9rs_theme::Theme;
 
 /// A bar that does not fit says so, and never silently loses its tail.

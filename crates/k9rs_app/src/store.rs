@@ -1,6 +1,6 @@
 //! Shared row data sources — the DATA half of the scope/view split.
 //!
-//! One [`RowStore`] per live subscription. The store holds protocol truth
+//! One `RowStore` per live subscription. The store holds protocol truth
 //! (rows in **wire order**, headers, the stream-epoch floor) plus
 //! data-keyed annotations (marks, change-flash) — and nothing
 //! presentational. Everything the user actually sees is derived per frame
@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, MutexGuard};
 
 use crate::table::TableDataState;
-use crate::types::DeltaTracker;
+use crate::state::DeltaTracker;
 use k9rs_proto::overlay::ColumnRenderRules;
 use k9rs_proto::protocol::{
     MetricsUsage, NodeName, ObjectKey, ResourceId, RowChange, TableBaseline, TableDelta,
@@ -72,11 +72,11 @@ fn rows_same_identity(a: &ResourceRow, b: &ResourceRow) -> bool {
 #[derive(Debug)]
 pub enum RowPredicate {
     /// Text grep across all columns (`/`).
-    Grep(crate::nav::CompiledGrep),
+    Grep(k9rs_util::CompiledGrep),
     /// Grep restricted to one DATA column (`~`). `header` is captured at
     /// creation so the crumb reads `~STATUS:x`, not a raw index.
     ColumnGrep {
-        pattern: crate::nav::CompiledGrep,
+        pattern: k9rs_util::CompiledGrep,
         col: usize,
         header: String,
     },
@@ -717,7 +717,7 @@ impl MetricsBinding {
     }
 
     /// Lock the relevant hub map for one derive. Same single-task
-    /// convention as [`RowStore`]: never contended, never held across
+    /// convention as `RowStore`: never contended, never held across
     /// anything that could re-enter.
     pub fn lens(&self) -> MetricsLens<'_> {
         match self.cols {
@@ -835,7 +835,7 @@ impl Default for SortSpec {
 
 /// Everything a derive needs beyond the store contents. All borrowed from
 /// the element — the derive is pure over (store, metrics, this).
-pub struct DeriveSpec<'a> {
+pub(crate) struct DeriveSpec<'a> {
     pub predicates: &'a [Arc<RowPredicate>],
     /// Uncommitted filter-input text, compiled by the caller (changes per
     /// keystroke; caching would churn).
@@ -929,7 +929,7 @@ impl PreparedView {
 /// Takes `rows` + `column_rules` rather than a whole [`RowStoreInner`] so
 /// live projections (a derived view's projected child rows) share the
 /// exact same pipeline as store-backed views.
-pub fn derive_view(
+pub(crate) fn derive_view(
     rows_in: &[ResourceRow],
     column_rules: &[ColumnRenderRules],
     metrics: Option<&MetricsLens<'_>>,
@@ -1130,7 +1130,7 @@ fn filter_and_sort(
 /// columns: the visible set is now an input, and the caller passes the level
 /// the last derive used (`TableInteraction::derived_level`) so this still
 /// resolves exactly what the next paint will.
-pub fn derive_key_order(
+pub(crate) fn derive_key_order(
     rows_in: &[ResourceRow],
     metrics: Option<&MetricsLens<'_>>,
     predicates: &[Arc<RowPredicate>],
@@ -1216,7 +1216,7 @@ impl std::ops::Deref for StoredLine {
 
 impl From<k9rs_proto::protocol::LogLine> for StoredLine {
     fn from(line: k9rs_proto::protocol::LogLine) -> Self {
-        let visible = match k9rs_util::visible_text(&line.content) {
+        let visible = match k9rs_util::text::visible_text(&line.content) {
             // The raw content already IS its visible text.
             std::borrow::Cow::Borrowed(_) => None,
             std::borrow::Cow::Owned(cleaned) => Some(cleaned),
@@ -1229,7 +1229,7 @@ impl StoredLine {
     /// What the screen shows for the body — and therefore the offset space a
     /// pattern matches in and a highlight indexes. Equals the concatenation
     /// of the renderer's spans by construction; see
-    /// [`k9rs_util::visible_text`].
+    /// [`k9rs_util::text::visible_text`].
     pub fn visible(&self) -> &str {
         self.visible.as_deref().unwrap_or(&self.line.content)
     }
@@ -1289,7 +1289,7 @@ impl StoredLine {
 
 /// One live log stream's line buffer. Owned strongly by the `LogSession`
 /// element; shared (via `Arc`) with `LogFilter` children and queued
-/// events. Same single-writer/lock discipline as [`RowStore`]; same
+/// events. Same single-writer/lock discipline as `RowStore`; same
 /// epoch-floor succession rule (a `since`-range restart replaces the
 /// stream but reuses the store — the floor keeps the dead stream's
 /// queued lines out).

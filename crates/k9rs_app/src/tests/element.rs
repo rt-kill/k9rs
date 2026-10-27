@@ -576,7 +576,7 @@ fn one_of_every_kind() -> Vec<crate::element::Element> {
     use k9rs_proto::protocol::{LogContainer, Namespace};
 
     let hub = std::sync::Arc::new(crate::store::MetricsHub::default());
-    let rid = crate::nav::rid(BuiltInKind::Pod);
+    let rid = BuiltInKind::Pod.to_resource_id();
     let table = Element::ResourceList(crate::element::ResourceList::client(
         crate::element::QuerySpec { rid: rid.clone(), namespace: Namespace::All, filter: None },
         crate::store::RowStore::client("pods"),
@@ -585,18 +585,18 @@ fn one_of_every_kind() -> Vec<crate::element::Element> {
     ));
     let filtered = Element::derive_filter(
         &table,
-        RowPredicate::Grep(crate::nav::CompiledGrep::new("x")),
+        RowPredicate::Grep(k9rs_util::CompiledGrep::new("x")),
     )
     .expect("a table can be filtered");
 
     let log = Element::LogSession(Box::new(LogSession::for_test(k9rs_proto::protocol::LogTarget::One("pod".to_string()), LogContainer::Default)));
     let log_filtered =
-        Element::derive_log_filter(&log, crate::nav::CompiledGrep::new("y"), crate::element::Sense::Keep)
+        Element::derive_log_filter(&log, k9rs_util::CompiledGrep::new("y"), crate::element::Sense::Keep)
             .expect("a log can be filtered");
 
     let content = Element::ContentView(ContentView::new(
         ContentSpec::Describe(k9rs_proto::protocol::ObjectRef::new(
-                crate::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+                k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
                 "some-pod".to_string(),
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             )),
@@ -1028,7 +1028,7 @@ fn the_tail_load_latch_clears_on_buried_log_views_too() {
     // A filter on top; the session is now buried.
     let filter = Element::derive_log_filter(
         app.nav.top(),
-        crate::nav::CompiledGrep::new("err"),
+        k9rs_util::CompiledGrep::new("err"),
             crate::element::Sense::Keep,
     )
     .expect("a log session yields a line output");
@@ -1360,7 +1360,7 @@ fn a_bare_grep_scans_only_the_displayed_columns() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: crate::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             // Only the first two are shown at the default level; the test
             // rows put the needle in the third.
             headers: vec!["NAME".into(), "READY".into(), "IMAGES".into()],
@@ -1954,7 +1954,7 @@ fn a_new_element_kind_must_declare_liveness_and_stream_ownership() {
     // owns nothing to abort. Both are deliberate, not defaults.
     let filter = crate::element::Element::derive_filter(
         app.nav.top(),
-        crate::store::RowPredicate::Grep(crate::nav::CompiledGrep::new("x")),
+        crate::store::RowPredicate::Grep(k9rs_util::CompiledGrep::new("x")),
     )
     .expect("a table can be filtered");
     assert!(filter.is_live(), "a filter's liveness is its ancestor's");
@@ -1969,7 +1969,7 @@ fn a_new_element_kind_must_declare_liveness_and_stream_ownership() {
         pending: crate::PendingAction::Single {
             op: crate::SingleOp::Delete,
             target: k9rs_proto::protocol::ObjectRef::new(
-                crate::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+                k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
                 "p".to_string(),
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             ),

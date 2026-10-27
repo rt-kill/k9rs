@@ -1,13 +1,12 @@
 use tokio::sync::mpsc;
 
 use k9rs_app::App;
-use k9rs_app::nav::rid;
-use k9rs_app::event::AppEvent;
-use k9rs_app::client::ClientSession;
+use k9rs_app::AppEvent;
+use k9rs_app::ClientSession;
 use k9rs_proto::protocol::{self, ObjectRef};
 use k9rs_proto::resource_def::BuiltInKind;
-use k9rs_app::element::Element;
-use k9rs_app::store::RowPredicate;
+use k9rs_app::Element;
+use k9rs_app::RowPredicate;
 use crate::{ds_try, ActionResult};
 
 
@@ -17,11 +16,11 @@ use crate::{ds_try, ActionResult};
 
 pub(crate) fn handle_action(
     app: &mut App,
-    action: k9rs_app::actions::Action,
+    action: k9rs_app::Action,
     event_tx: &mpsc::Sender<AppEvent>,
     data_source: &mut ClientSession,
 ) -> ActionResult {
-    use k9rs_app::actions::Action;
+    use k9rs_app::Action;
 
     // Optimization, not a correctness gate: selection reads are total
     // (cold cache → fresh order derive inside `selected_key`), but warming
@@ -56,15 +55,15 @@ pub(crate) fn handle_action(
             if app.nav.top().is_keybindings_view() {
                 app.nav.pop();
             } else {
-                let class = k9rs_app::keymap::ViewClass::of(app.nav.top());
+                let class = k9rs_app::ViewClass::of(app.nav.top());
                 let caps = Some(app.current_capabilities());
                 let markable = app.nav.top().markable();
                 let store =
                     app.core.seed_keybindings(caps, app.config.keys, class, markable);
                 let rid = k9rs_proto::local_types::LocalResourceKind::Keybinding.to_resource_id();
-                app.nav.push(k9rs_app::element::Element::ResourceList(
-                    k9rs_app::element::ResourceList::client(
-                        k9rs_app::element::QuerySpec {
+                app.nav.push(k9rs_app::Element::ResourceList(
+                    k9rs_app::ResourceList::client(
+                        k9rs_app::QuerySpec {
                             rid,
                             namespace: k9rs_proto::protocol::Namespace::All,
                             filter: None,
@@ -143,12 +142,12 @@ pub(crate) fn handle_action(
         Action::Confirm => return handle_confirm_action(app, data_source),
         // Cancel is the ordinary pop now — the dialog is on the stack.
         Action::Cancel => {
-            if matches!(app.nav.top(), k9rs_app::element::Element::Confirm(_)) {
+            if matches!(app.nav.top(), k9rs_app::Element::Confirm(_)) {
                 app.nav.pop();
             }
         }
         Action::ToggleDialogButton => {
-            if let k9rs_app::element::Element::Confirm(d) = app.nav.top_mut() {
+            if let k9rs_app::Element::Confirm(d) = app.nav.top_mut() {
                 d.action_focused = !d.action_focused;
             }
         }
@@ -182,7 +181,7 @@ pub(crate) fn handle_action(
         Action::SwitchNamespace(ns) => do_switch_namespace(app, data_source, ns),
         Action::SwitchContext(ctx) => begin_context_switch(app, &ctx),
         Action::CommandMode => {
-            app.ui.open(k9rs_app::Modal::Command { input: k9rs_app::text_input::TextInput::new(), history_index: None });
+            app.ui.open(k9rs_app::Modal::Command { input: k9rs_app::TextInput::new(), history_index: None });
         }
         Action::Sort(target) => app.sort_by(target),
         Action::ToggleSortDirection => app.toggle_sort_direction(),
@@ -194,26 +193,26 @@ pub(crate) fn handle_action(
             ));
         }
         Action::ToggleMark => match app.toggle_mark() {
-            k9rs_app::element::MarkOutcome::Toggled => {}
-            k9rs_app::element::MarkOutcome::RowGone => {
+            k9rs_app::MarkOutcome::Toggled => {}
+            k9rs_app::MarkOutcome::RowGone => {
                 app.ui.flash = Some(k9rs_app::FlashMessage::warn(
                     "No row under the cursor".to_string(),
                 ));
             }
-            k9rs_app::element::MarkOutcome::Unsupported => {
+            k9rs_app::MarkOutcome::Unsupported => {
                 app.ui.flash = Some(k9rs_app::FlashMessage::info(
                     "Marking isn't available in this view".to_string(),
                 ));
             }
         },
         Action::SpanMark => match app.span_mark() {
-            k9rs_app::element::SpanOutcome::Applied => {}
-            k9rs_app::element::SpanOutcome::NoAnchor => {
+            k9rs_app::SpanOutcome::Applied => {}
+            k9rs_app::SpanOutcome::NoAnchor => {
                 app.ui.flash = Some(k9rs_app::FlashMessage::info(
                     "No visible mark to span from — Space marks the row".to_string(),
                 ));
             }
-            k9rs_app::element::SpanOutcome::Unsupported => {
+            k9rs_app::SpanOutcome::Unsupported => {
                 app.ui.flash = Some(k9rs_app::FlashMessage::info(
                     "Marking isn't available in this view".to_string(),
                 ));
@@ -227,7 +226,7 @@ pub(crate) fn handle_action(
             }
         }
         Action::ToggleLastView => {
-            if let Some(k9rs_app::nav::RootSpec::Resource(last_rid)) = app.nav.prev_root().cloned() {
+            if let Some(k9rs_app::RootSpec::Resource(last_rid)) = app.nav.prev_root().cloned() {
                 let root = App::root_list_element(
                     data_source, &app.kube.metrics,
                 &app.core, last_rid, app.kube.selected_ns.clone(),
@@ -245,7 +244,7 @@ pub(crate) fn handle_action(
             let headers = app.nav.top().headers_snapshot();
             if let Some(info) = get_selected_resource_info(app) {
                 if let Some(dialog) = build_form_from_schema(schema, k9rs_proto::protocol::OperationKind::PortForward, info, row.as_ref(), &headers) {
-                    app.nav.push(k9rs_app::element::Element::Form(Box::new(dialog)));
+                    app.nav.push(k9rs_app::Element::Form(Box::new(dialog)));
                 } else {
                     app.ui.flash = Some(k9rs_app::FlashMessage::error(
                         "No target found for port-forward".to_string()
@@ -270,9 +269,9 @@ pub(crate) fn handle_action(
 // Scroll / in-view navigation
 // ---------------------------------------------------------------------------
 
-fn handle_scroll(app: &mut App, action: k9rs_app::actions::Action) {
-    use k9rs_app::actions::Action;
-    use k9rs_app::element::Element;
+fn handle_scroll(app: &mut App, action: k9rs_app::Action) {
+    use k9rs_app::Action;
+    use k9rs_app::Element;
 
     // Overlays capture scroll keys first (help sheet, container picker).
     // The one overlay that still takes scroll keys. `if let` rather than a
@@ -357,10 +356,10 @@ fn handle_scroll(app: &mut App, action: k9rs_app::actions::Action) {
 
 fn handle_resource_op(
     app: &mut App,
-    action: k9rs_app::actions::Action,
+    action: k9rs_app::Action,
     data_source: &mut ClientSession,
 ) -> ActionResult {
-    use k9rs_app::actions::Action;
+    use k9rs_app::Action;
 
     // Derived views (container table, etc.) only support Shell — all other
     // mutating operations (delete, edit, scale, restart) don't apply to
@@ -420,7 +419,7 @@ fn handle_resource_op(
                     if containers.len() > 1 {
                         app.ui.close_modal();
                         let action = k9rs_app::ContainerAction::Shell;
-                        app.nav.push(k9rs_app::element::Element::Picker(Box::new(k9rs_app::ContainerPicker {
+                        app.nav.push(k9rs_app::Element::Picker(Box::new(k9rs_app::ContainerPicker {
                             target,
                             choices: k9rs_app::ContainerChoice::list(action, containers),
                             selected: 0,
@@ -443,7 +442,7 @@ fn handle_resource_op(
         // semantics (or, stale-frame-wise, single semantics).
         Action::Delete => {
             if let Some(info) = require_selected(app) {
-                app.nav.push(k9rs_app::element::Element::Confirm(Box::new(k9rs_app::ConfirmDialog {
+                app.nav.push(k9rs_app::Element::Confirm(Box::new(k9rs_app::ConfirmDialog {
                     message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Delete".to_string(),
                     pending: k9rs_app::PendingAction::Single { op: k9rs_app::SingleOp::Delete, target: info },
@@ -472,13 +471,13 @@ fn handle_resource_op(
                 let row = app.nav.top().selected_row();
                 let headers = app.nav.top().headers_snapshot();
                 if let Some(dialog) = build_form_from_schema(schema, k9rs_proto::protocol::OperationKind::Scale, info, row.as_ref(), &headers) {
-                    app.nav.push(k9rs_app::element::Element::Form(Box::new(dialog)));
+                    app.nav.push(k9rs_app::Element::Form(Box::new(dialog)));
                 }
             }
         }
         Action::Restart => {
             if let Some(info) = require_selected(app) {
-                app.nav.push(k9rs_app::element::Element::Confirm(Box::new(k9rs_app::ConfirmDialog {
+                app.nav.push(k9rs_app::Element::Confirm(Box::new(k9rs_app::ConfirmDialog {
                     message: format!("Restart {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Restart".to_string(),
                     pending: k9rs_app::PendingAction::Single { op: k9rs_app::SingleOp::Restart, target: info },
@@ -488,7 +487,7 @@ fn handle_resource_op(
         }
         Action::ForceKill => {
             if let Some(info) = require_selected(app) {
-                app.nav.push(k9rs_app::element::Element::Confirm(Box::new(k9rs_app::ConfirmDialog {
+                app.nav.push(k9rs_app::Element::Confirm(Box::new(k9rs_app::ConfirmDialog {
                     message: format!("Force-kill {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Force Kill".to_string(),
                     pending: k9rs_app::PendingAction::Single { op: k9rs_app::SingleOp::ForceKill, target: info },
@@ -503,11 +502,11 @@ fn handle_resource_op(
                 // never land in the describe cache, and Ctrl-R must
                 // re-decode. Fetching → the honest spinner (the old version
                 // painted fake "Decoding..." text as if it were content).
-                let el = k9rs_app::element::Element::ContentView(
-                    k9rs_app::element::ContentView::new(
-                        k9rs_app::element::ContentSpec::DecodedSecret(info),
+                let el = k9rs_app::Element::ContentView(
+                    k9rs_app::ContentView::new(
+                        k9rs_app::ContentSpec::DecodedSecret(info),
                         k9rs_app::ContentViewState::default(),
-                        k9rs_app::element::ContentPhase::Fetching,
+                        k9rs_app::ContentPhase::Fetching,
                     ),
                 );
                 app.nav.push(el);
@@ -539,8 +538,8 @@ fn handle_resource_op(
 /// intersects at read). During the refresh window — marks survive
 /// `clear()`, rows unknown — that capture is honestly empty and we
 /// refuse instead of operating on unverifiable identities.
-pub(crate) fn handle_batch_op(app: &mut App, action: k9rs_app::actions::Action) {
-    use k9rs_app::actions::Action;
+pub(crate) fn handle_batch_op(app: &mut App, action: k9rs_app::Action) {
+    use k9rs_app::Action;
 
     // ONE batch at a time. The tracker is cleared the moment its last
     // result lands (or is taken on disconnect/context-switch), so
@@ -581,7 +580,7 @@ pub(crate) fn handle_batch_op(app: &mut App, action: k9rs_app::actions::Action) 
         _ => return,
     };
 
-    app.nav.push(k9rs_app::element::Element::Confirm(Box::new(k9rs_app::ConfirmDialog {
+    app.nav.push(k9rs_app::Element::Confirm(Box::new(k9rs_app::ConfirmDialog {
         message: batch_confirm_message(verb, &targets),
         action_label: label.to_string(),
         pending,
@@ -648,7 +647,7 @@ pub(crate) fn batch_log_spec(app: &App, tail: u64) -> Result<protocol::LogInit, 
     // silently inheriting the parent store's marks.
     if let Some(kind) = app.nav.top().derived_kind() {
         return match kind {
-            k9rs_app::view::DerivedViewKind::Containers => {
+            k9rs_app::DerivedViewKind::Containers => {
                 batch_container_log_spec(app, tail)
             }
         };
@@ -668,7 +667,7 @@ pub(crate) fn batch_log_spec(app: &App, tail: u64) -> Result<protocol::LogInit, 
         inner
             .rows
             .iter()
-            .filter(|row| inner.marked().contains(&k9rs_app::store::row_key(row)))
+            .filter(|row| inner.marked().contains(&k9rs_app::row_key(row)))
             .cloned()
             .collect()
     });
@@ -830,8 +829,8 @@ fn handle_confirm_action(
     // taking it off the stack is what "answered" means. It also means the
     // operation dispatches against the view the question was asked from.
     let dialog = match app.nav.top() {
-        k9rs_app::element::Element::Confirm(_) => match app.nav.pop() {
-            Some(k9rs_app::element::Element::Confirm(d)) => Some(*d),
+        k9rs_app::Element::Confirm(_) => match app.nav.pop() {
+            Some(k9rs_app::Element::Confirm(d)) => Some(*d),
             _ => None,
         },
         _ => None,
@@ -879,15 +878,15 @@ fn handle_confirm_action(
 
 fn handle_filter_search(
     app: &mut App,
-    action: k9rs_app::actions::Action,
+    action: k9rs_app::Action,
     data_source: &mut ClientSession,
 ) {
-    use k9rs_app::actions::Action;
+    use k9rs_app::Action;
 
     match action {
         Action::Filter(_) => {
             if let Some(view) = app.nav.top_mut().log_view_mut() {
-                view.draft = Some(k9rs_app::text_input::TextInput::new());
+                view.draft = Some(k9rs_app::TextInput::new());
             } else if let Some(fi) = app.nav.top_mut().filter_input_mut() {
                 fi.start();
             }
@@ -947,19 +946,19 @@ fn handle_filter_search(
         }
         Action::SearchStart => {
             match app.nav.top_mut() {
-                k9rs_app::element::Element::ContentView(cv) => {
+                k9rs_app::Element::ContentView(cv) => {
                     cv.state.search_input_active = true;
                     cv.state.search_input.clear();
                 }
                 el => {
                     if let Some(view) = el.log_view_mut() {
-                        view.draft = Some(k9rs_app::text_input::TextInput::new());
+                        view.draft = Some(k9rs_app::TextInput::new());
                     }
                 }
             }
         }
         Action::SearchExec(term) => {
-            if let k9rs_app::element::Element::ContentView(cv) = app.nav.top_mut() {
+            if let k9rs_app::Element::ContentView(cv) = app.nav.top_mut() {
                 cv.state.search = Some(term.clone());
                 cv.state.update_search();
             }
@@ -969,18 +968,18 @@ fn handle_filter_search(
             // their `/` grep IS the filter — and the old log branch compared a
             // logical line index against a PHYSICAL wrap-offset (broken under
             // wrap, and already muddled with filters); n/N is unbound in logs.
-            if let k9rs_app::element::Element::ContentView(cv) = app.nav.top_mut() {
+            if let k9rs_app::Element::ContentView(cv) = app.nav.top_mut() {
                 cv.state.next_match();
             }
         }
         Action::SearchPrev => {
             // Detail views only — see SearchNext. The log n/N branch was removed.
-            if let k9rs_app::element::Element::ContentView(cv) = app.nav.top_mut() {
+            if let k9rs_app::Element::ContentView(cv) = app.nav.top_mut() {
                 cv.state.prev_match();
             }
         }
         Action::SearchClear => {
-            if let k9rs_app::element::Element::ContentView(cv) = app.nav.top_mut() {
+            if let k9rs_app::Element::ContentView(cv) = app.nav.top_mut() {
                 cv.state.clear_search();
             }
             // Log views: committed filters are elements — cleared via Esc.
@@ -995,11 +994,11 @@ fn handle_filter_search(
 
 fn handle_log_action(
     app: &mut App,
-    action: k9rs_app::actions::Action,
+    action: k9rs_app::Action,
     data_source: &mut ClientSession,
 ) {
-    use k9rs_app::actions::Action;
-    use k9rs_app::element::Element;
+    use k9rs_app::Action;
+    use k9rs_app::Element;
 
     match action {
         Action::ToggleLogFollow => {
@@ -1055,7 +1054,7 @@ fn handle_log_action(
         }
 
         Action::LogRange(ref range) => {
-            use k9rs_app::actions::LogRange;
+            use k9rs_app::LogRange;
             // Range keys re-run the OWNING session's spec. Under a filter,
             // the owner is found by store pointer identity — the same
             // named-walk discipline as subscription revival.
@@ -1115,7 +1114,7 @@ fn save_visible_logs(app: &mut App) {
 }
 
 fn write_log_file(app: &mut App, filename: &str, content: &str) {
-    match k9rs_util::safe_write_temp(filename, content.as_bytes()) {
+    match k9rs_util::temp::safe_write_temp(filename, content.as_bytes()) {
         Ok(path) => {
             let count = content.lines().count();
             app.ui.flash = Some(k9rs_app::FlashMessage::info(
@@ -1136,10 +1135,10 @@ fn write_log_file(app: &mut App, filename: &str, content: &str) {
 
 fn handle_drill(
     app: &mut App,
-    action: k9rs_app::actions::Action,
+    action: k9rs_app::Action,
     data_source: &mut ClientSession,
 ) -> ActionResult {
-    use k9rs_app::actions::Action;
+    use k9rs_app::Action;
 
     match action {
         Action::ShowNode => {
@@ -1150,10 +1149,10 @@ fn handle_drill(
                         // "The node with the ip of this pod": the row's node
                         // IS the whole definition — nodes are cluster-scoped,
                         // so nothing namespace-ish enters construction.
-                        let selector = k9rs_app::nav::K8sFieldSelector::MetadataName(node.clone());
+                        let selector = k9rs_app::K8sFieldSelector::MetadataName(node.clone());
                         let el = app.list_element_from_top(
                             data_source,
-                            rid(BuiltInKind::Node),
+                            BuiltInKind::Node.to_resource_id(),
                             protocol::Namespace::All,
                             Some(protocol::SubscriptionFilter::Field(selector.to_wire())),
                             format!("Nodes/{}", node),
@@ -1186,7 +1185,7 @@ fn handle_drill(
                 // subject exactly. Narrowing twice would only lose events.
                 let el = app.list_element_from_top(
                     data_source,
-                    rid(BuiltInKind::Event),
+                    BuiltInKind::Event.to_resource_id(),
                     protocol::Namespace::All,
                     Some(protocol::SubscriptionFilter::Field(selector.to_wire())),
                     format!("events({breadcrumb})"),
@@ -1225,7 +1224,7 @@ fn handle_drill(
                 let label = format!("{}/{}", info.resource.plural(), info.name);
                 let el = app.list_element_from_top(
                     data_source,
-                    rid(BuiltInKind::Pod),
+                    BuiltInKind::Pod.to_resource_id(),
                     info.namespace.clone(),
                     Some(protocol::SubscriptionFilter::References {
                         kind,
@@ -1248,7 +1247,7 @@ fn handle_drill(
                         .unwrap_or_else(|| {
                             k9rs_proto::protocol::ResourceId::CrdUnresolved(owner_kind.to_lowercase())
                         });
-                    let selector = k9rs_app::nav::K8sFieldSelector::MetadataName(owner_name.clone());
+                    let selector = k9rs_app::K8sFieldSelector::MetadataName(owner_name.clone());
                     let el = app.list_element_from_top(
                         data_source,
                         owner_rid.clone(),
@@ -1290,7 +1289,7 @@ fn handle_drill(
                         row.cells.get(col_idx).map(|c| c.to_string())
                     });
                     if let Some(value) = filter_value.filter(|v| !v.is_empty()) {
-                        let selector = k9rs_app::nav::K8sFieldSelector::MetadataName(value.clone());
+                        let selector = k9rs_app::K8sFieldSelector::MetadataName(value.clone());
                         let el = app.list_element_from_top(
                             data_source,
                             target_rid,
@@ -1326,15 +1325,15 @@ fn handle_drill(
 
 fn handle_io(
     app: &mut App,
-    action: k9rs_app::actions::Action,
+    action: k9rs_app::Action,
     event_tx: &mpsc::Sender<AppEvent>,
     data_source: &mut ClientSession,
 ) {
-    use k9rs_app::actions::Action;
+    use k9rs_app::Action;
 
     match action {
         Action::Copy => {
-            use k9rs_app::element::Element;
+            use k9rs_app::Element;
             let (text, label) = match app.nav.top_mut() {
                 Element::ContentView(cv) => {
                     if cv.state.content().is_empty() {
@@ -1399,7 +1398,7 @@ fn handle_io(
             let tx = event_tx.clone();
             data_source.track_task(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    k9rs_util::safe_write_temp(&filename, content.as_bytes())
+                    k9rs_util::temp::safe_write_temp(&filename, content.as_bytes())
                 }).await;
                 match result {
                     Ok(Ok(path)) => {
@@ -1434,7 +1433,7 @@ fn handle_show_port_forwards(app: &mut App, data_source: &mut ClientSession) {
 }
 
 fn handle_refresh(app: &mut App, data_source: &mut ClientSession) {
-    use k9rs_app::element::{ContentSpec, Element};
+    use k9rs_app::{ContentSpec, Element};
 
     // Inside a content element: re-issue ITS OWN fetch directly — each
     // kind re-runs its own operation (a decoded secret re-DECODES; the old
@@ -1452,7 +1451,7 @@ fn handle_refresh(app: &mut App, data_source: &mut ClientSession) {
                 Ok(()) => {
                     if let Element::ContentView(cv) = app.nav.top_mut() {
                         cv.state = k9rs_app::ContentViewState::default();
-                        cv.phase = k9rs_app::element::ContentPhase::Fetching;
+                        cv.phase = k9rs_app::ContentPhase::Fetching;
                     }
                     app.ui.flash = Some(k9rs_app::FlashMessage::info("Refreshing..."));
                 }
@@ -1477,7 +1476,7 @@ fn handle_refresh(app: &mut App, data_source: &mut ClientSession) {
     app.ui.flash = Some(k9rs_app::FlashMessage::info("Refreshed"));
 }
 
-fn handle_show_aliases(app: &mut App, data_source: &k9rs_app::client::ClientSession) {
+fn handle_show_aliases(app: &mut App, data_source: &k9rs_app::ClientSession) {
     // The same ROOT element `:alias` resolves to, through the same
     // client-owned routing — `Ctrl-a` is a shortcut for the command, not a
     // second way of building the view. Resets rather than pushes, for the
@@ -1627,12 +1626,12 @@ pub(crate) fn handle_enter(
             // the cluster-wide view shows NAMESPACE regardless of the
             // ambient selector.
             let ns = match &selector {
-                k9rs_app::nav::K8sFieldSelector::SpecNodeName(_) => protocol::Namespace::All,
+                k9rs_app::K8sFieldSelector::SpecNodeName(_) => protocol::Namespace::All,
                 _ => app.kube.selected_ns.clone(),
             };
             let el = app.list_element_from_top(
                 data_source,
-                rid(BuiltInKind::Pod),
+                BuiltInKind::Pod.to_resource_id(),
                 ns,
                 Some(protocol::SubscriptionFilter::Field(selector.to_wire())),
                 breadcrumb.clone(),
@@ -1650,7 +1649,7 @@ pub(crate) fn handle_enter(
             let source_ns = protocol::Namespace::from_row(row.namespace.as_deref().unwrap_or(""));
             let el = app.list_element_from_top(
                 data_source,
-                rid(BuiltInKind::Job),
+                BuiltInKind::Job.to_resource_id(),
                 source_ns,
                 Some(protocol::SubscriptionFilter::OwnerUid(uid)),
                 format!("{}/{}", kind_str, name),
@@ -1678,7 +1677,7 @@ pub(crate) fn handle_describe(
     app: &mut App,
     data_source: &mut ClientSession,
 ) {
-    use k9rs_app::element::{ContentPhase, ContentSpec, ContentView, Element};
+    use k9rs_app::{ContentPhase, ContentSpec, ContentView, Element};
     if let Some(info) = require_selected(app) {
         if let Some(lines) = app.kube.kubectl_cache.get_describe_lines(&info) {
             let mut state = k9rs_app::ContentViewState::default();
@@ -1704,7 +1703,7 @@ pub(crate) fn handle_yaml(
     app: &mut App,
     data_source: &mut ClientSession,
 ) {
-    use k9rs_app::element::{ContentPhase, ContentSpec, ContentView, Element};
+    use k9rs_app::{ContentPhase, ContentSpec, ContentView, Element};
     if let Some(info) = require_selected(app) {
         if let Some(cached) = app.kube.kubectl_cache.get(&info, k9rs_app::ContentKind::Yaml) {
             let mut state = k9rs_app::ContentViewState::default();
@@ -1747,8 +1746,8 @@ fn push_log_session(
     data_source: &mut ClientSession,
     spec: protocol::LogInit,
 ) {
-    let el = k9rs_app::element::Element::LogSession(Box::new(
-        k9rs_app::element::LogSession::open(data_source, spec, &app.config.ui.logs),
+    let el = k9rs_app::Element::LogSession(Box::new(
+        k9rs_app::LogSession::open(data_source, spec, &app.config.ui.logs),
     ));
     app.nav.push(el);
 }
@@ -1781,7 +1780,7 @@ fn open_logs(
             k9rs_app::ContainerAction::Logs
         };
         app.ui.close_modal();
-        app.nav.push(k9rs_app::element::Element::Picker(Box::new(k9rs_app::ContainerPicker {
+        app.nav.push(k9rs_app::Element::Picker(Box::new(k9rs_app::ContainerPicker {
             target: info.clone(),
             choices: k9rs_app::ContainerChoice::list(action, &containers),
             selected: 0,
@@ -1919,7 +1918,7 @@ fn send_to_clipboard(
     let tx = event_tx.clone();
     data_source.track_task(async move {
         let ok = tokio::task::spawn_blocking(move || {
-            k9rs_util::try_copy_to_clipboard(&text)
+            k9rs_util::clipboard::try_copy_to_clipboard(&text)
         })
         .await
         .unwrap_or(false);
@@ -2022,7 +2021,7 @@ pub(crate) fn build_form_from_schema(
                     name: field_schema.name.into(),
                     label: field_schema.label.into(),
                     kind: FormFieldKind::Number { min: *min, max: *max },
-                    value: k9rs_app::text_input::TextInput::seeded(default_value),
+                    value: k9rs_app::TextInput::seeded(default_value),
                 }
             }
             FormFieldSchemaKind::Port => {
@@ -2033,7 +2032,7 @@ pub(crate) fn build_form_from_schema(
                     name: field_schema.name.into(),
                     label: field_schema.label.into(),
                     kind: FormFieldKind::Port,
-                    value: k9rs_app::text_input::TextInput::seeded(default_port.to_string()),
+                    value: k9rs_app::TextInput::seeded(default_port.to_string()),
                 }
             }
             FormFieldSchemaKind::DynamicSelect { fallback } => {
@@ -2046,7 +2045,7 @@ pub(crate) fn build_form_from_schema(
                         name: field_schema.name.into(),
                         label: field_schema.label.into(),
                         kind: FormFieldKind::Port,
-                        value: k9rs_app::text_input::TextInput::seeded(default_port.to_string()),
+                        value: k9rs_app::TextInput::seeded(default_port.to_string()),
                     }
                 } else {
                     let options: Vec<k9rs_app::SelectOption> = ports
@@ -2057,7 +2056,7 @@ pub(crate) fn build_form_from_schema(
                         name: field_schema.name.into(),
                         label: field_schema.label.into(),
                         kind: FormFieldKind::Select { options, selected: 0 },
-                        value: k9rs_app::text_input::TextInput::new(),
+                        value: k9rs_app::TextInput::new(),
                     }
                 }
             }
@@ -2139,7 +2138,7 @@ pub(crate) fn get_marked_resource_infos(app: &App) -> Vec<ObjectRef> {
         inner
             .rows
             .iter()
-            .map(k9rs_app::store::row_key)
+            .map(k9rs_app::row_key)
             .filter(|k| inner.marked().contains(k))
             .map(|key| {
                 ObjectRef::new(
@@ -2168,7 +2167,7 @@ pub(crate) fn drill_to_pods_by_labels(
 ) {
     let el = app.list_element_from_top(
         data_source,
-        rid(BuiltInKind::Pod),
+        BuiltInKind::Pod.to_resource_id(),
         namespace,
         Some(protocol::SubscriptionFilter::Labels(labels)),
         description.to_string(),
@@ -2184,10 +2183,10 @@ pub(crate) fn drill_to_pods_by_grep(
     data_source: &mut ClientSession,
     name: &str,
 ) {
-    use k9rs_app::nav::CompiledGrep;
+    use k9rs_util::CompiledGrep;
     let el = app.list_element_from_top(
         data_source,
-        rid(BuiltInKind::Pod),
+        BuiltInKind::Pod.to_resource_id(),
         app.kube.selected_ns.clone(),
         None,
         "pods".to_string(),
@@ -2213,7 +2212,7 @@ pub(crate) fn drill_to_pods_by_owner(
     let kind_str = kind.def().gvr().kind;
     let el = app.list_element_from_top(
         data_source,
-        rid(BuiltInKind::Pod),
+        BuiltInKind::Pod.to_resource_id(),
         namespace,
         Some(protocol::SubscriptionFilter::OwnerUid(uid.to_string())),
         format!("{}/{}", kind_str, name),
@@ -2247,7 +2246,7 @@ pub(crate) fn drill_to_pods_in_namespace(
 
     let el = app.list_element_from_top(
         data_source,
-        rid(BuiltInKind::Pod),
+        BuiltInKind::Pod.to_resource_id(),
         ns.clone(),
         None,
         "pods".to_string(),
@@ -2296,8 +2295,8 @@ pub(crate) fn begin_context_switch(
     // charged for it on every switch. `core.clear()` and the namespace reset
     // still wait for confirmation (see `dispatch_app_event`), because unlike
     // the nav stack they would blank chrome the fallback still needs.
-    app.nav.reset(k9rs_app::element::Element::Overview(
-        k9rs_app::element::Overview,
+    app.nav.reset(k9rs_app::Element::Overview(
+        k9rs_app::Overview,
     ));
     app.kube.kubectl_cache.clear();
     app.ui.close_modal();
@@ -2342,8 +2341,8 @@ pub(crate) fn do_switch_namespace(
     // the old namespace's rows drop with the old stack (no cache to
     // scrub, no tracker to reset).
     let root_rid = match app.nav.root_spec() {
-        Some(k9rs_app::nav::RootSpec::Resource(r)) => r,
-        None => rid(BuiltInKind::Pod),
+        Some(k9rs_app::RootSpec::Resource(r)) => r,
+        None => BuiltInKind::Pod.to_resource_id(),
     };
     let root = App::root_list_element(data_source, &app.kube.metrics,
                 &app.core, root_rid, ns.clone());

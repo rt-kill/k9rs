@@ -2,30 +2,60 @@
 //!
 //! The daemon reads the `k9rs.daemon` section for K8s API tuning
 //! parameters. The TUI ignores this section — clean boundary.
+//!
+//! The load is EXPLICIT, from one call in `main`, and not a `LazyLock` that
+//! reads `$HOME` on first touch. It was the latter, and that made the test
+//! suite depend on the developer's config file: `watcher_grace()`,
+//! `locals_grace()` and five `live_query` tuning values all read through
+//! here, so the same `cargo test` produced `watcher_grace=60s,
+//! page_size=1000` on one machine and `999s, 7` on another with a `daemon:`
+//! section. Proven by pointing `HOME` at a fixture, not reasoned about.
+//!
+//! This is the second instance of that bug class — `overlay::OVERLAYS` was
+//! the first, and was fixed in exactly this shape without the pattern being
+//! swept for. The pin below asserts the MECHANISM (nothing has loaded under
+//! test), not a value, because a value-based pin passes on a machine whose
+//! config happens to match the defaults.
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use serde::Deserialize;
 
-/// Global daemon config, loaded once at startup. LENIENT on invalid
-/// config (warn + defaults): the TUI is the loud gate — it refuses to
-/// start on the same file's errors before ever spawning a daemon, so a
-/// long-running daemon whose config went bad after launch degrades
+/// The process's daemon config, set once by [`load_from_home`].
+static CONFIG: OnceLock<DaemonConfig> = OnceLock::new();
+
+/// What every reader sees until — and if — a load happens. Built in-process
+/// from compile-time constants, so a test, a `--no-daemon` TUI and a
+/// subcommand all agree without touching a filesystem.
+static DEFAULTS: LazyLock<DaemonConfig> = LazyLock::new(DaemonConfig::default);
+
+/// Read the `k9rs.daemon` section from `~/.config/k9rs/config.yaml`.
+///
+/// Called from exactly ONE place — `main`, before the subcommand dispatch —
+/// so the daemon, the in-process `--no-daemon` TUI and any subcommand added
+/// later all get it, and nothing else in the tree decides where this config
+/// comes from. Idempotent: a second call is ignored, because the first reader
+/// may already hold a `&'static` borrow.
+///
+/// LENIENT on invalid config (warn + defaults): the TUI is the loud gate — it
+/// refuses to start on the same file's errors before ever spawning a daemon,
+/// so a long-running daemon whose config went bad after launch degrades
 /// rather than dying mid-flight.
-static CONFIG: LazyLock<DaemonConfig> = LazyLock::new(|| {
-    match load_section::<DaemonConfig>("daemon") {
+pub fn load_from_home() {
+    let _ = CONFIG.set(match k9rs_config::load_section::<DaemonConfig>("daemon") {
         Ok(Some(c)) => c,
         Ok(None) => DaemonConfig::default(),
         Err(e) => {
             tracing::warn!("config: {e} — daemon using defaults");
             DaemonConfig::default()
         }
-    }
-});
+    });
+}
 
-/// Access the daemon config.
+/// Access the daemon config — the loaded one, or the defaults when nothing
+/// has been loaded.
 pub fn daemon_config() -> &'static DaemonConfig {
-    &CONFIG
+    CONFIG.get().unwrap_or(&DEFAULTS)
 }
 
 /// Daemon-side tuning parameters.
@@ -88,54 +118,6 @@ impl Default for BackoffConfig {
             initial_ms: 300,
             max_ms: 30_000,
             max_elapsed_ms: 120_000,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Shared config file loader
-// ---------------------------------------------------------------------------
-
-/// Read `~/.config/k9rs/config.yaml` and deserialize the `k9rs` root section
-/// (or a sub-section) into `T`.
-///
-/// - `Ok(None)` — the file, the `k9rs` root, or the requested section is
-///   ABSENT. Expected; callers use their defaults.
-/// - `Err` — the file EXISTS but is invalid (unreadable, YAML syntax
-///   error, or strict deserialization failed). The user wrote something
-///   and it is being rejected — callers must never silently collapse
-///   this into "use defaults": a one-letter typo in `keys:` would revert
-///   the whole config (`readOnly` included) with zero feedback, since
-///   the TUI's tracing writes to a sink without `--log-file`.
-///
-/// - `load_section::<AppConfig>("")` → deserializes the `k9rs` key
-/// - `load_section::<DaemonConfig>("daemon")` → deserializes `k9rs.daemon`
-pub fn load_section<T: serde::de::DeserializeOwned>(
-    section: &str,
-) -> Result<Option<T>, String> {
-    let Ok(home) = std::env::var("HOME") else { return Ok(None) };
-    let path = std::path::Path::new(&home).join(".config/k9rs/config.yaml");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("cannot read {}: {}", path.display(), e)),
-    };
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&content)
-        .map_err(|e| format!("{}: YAML syntax error: {}", path.display(), e))?;
-    let Some(root) = yaml.get("k9rs") else { return Ok(None) };
-    let val = if section.is_empty() {
-        root.clone()
-    } else {
-        match root.get(section) {
-            Some(v) => v.clone(),
-            None => return Ok(None),
-        }
-    };
-    match serde_yaml::from_value(val) {
-        Ok(v) => Ok(Some(v)),
-        Err(e) => {
-            let label = if section.is_empty() { "k9rs" } else { section };
-            Err(format!("{}: invalid '{}' section: {}", path.display(), label, e))
         }
     }
 }

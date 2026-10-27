@@ -45,7 +45,7 @@ impl HelpContent {
     /// detail, DELETE in a table) with no indication of which view they meant,
     /// omitted `J`/`U`/`~` entirely, and advertised a `Ctrl-l` feature that had
     /// been deleted. Now help shows the keys for the view you are actually in,
-    /// and [`crate::keymap`]'s agreement test makes each one true.
+    /// and `keymap`'s agreement test makes each one true.
     /// The help content as TABLE ROWS — the projection that lets help be an
     /// ordinary resource instead of a bespoke overlay.
     ///

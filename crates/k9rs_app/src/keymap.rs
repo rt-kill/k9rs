@@ -126,13 +126,29 @@ impl ViewClass {
 }
 
 /// One documented key.
-pub struct Binding {
+pub(crate) struct Binding {
     /// What to print, e.g. `"j / ↓"`. Several chords may share one row.
     pub keys: &'static str,
     pub label: &'static str,
     /// The chord the agreement test probes, and the action it must yield.
     /// `None` for keys whose action depends on runtime state — documented,
     /// deliberately not probed.
+    ///
+    /// Read only by the keymap agreement tests — it exists to hold the
+    /// declaration and the dispatcher together, which is a test's job, so it
+    /// is dead in a release build by design. Same shape as
+    /// [`crate::commands::CommandDoc`]'s `probe`; the warning only appeared
+    /// once `keymap` became `pub(crate)` and `dead_code` could finally see
+    /// this struct's fields at all.
+    ///
+    /// The condition is `not(test)` and NOT `not(any(test, feature =
+    /// "testing"))`. `allow(dead_code)` suppresses a warning; it does not make
+    /// anything readable. With the feature on but `cfg(test)` off — which is
+    /// exactly how this crate builds as a dependency of `k9rs_ui`'s and
+    /// `k9rs_session`'s tests — the readers are still behind `#[cfg(test)]`, so
+    /// the field IS unread and the allow has to apply. Including the feature
+    /// turned the suppression off in the one build that needs it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub probe: Option<(KeyEvent, Action)>,
     /// Short label for the one-line hint bar at the bottom of a view, or
     /// `None` to keep this key out of the bar. Separate from `label` because
@@ -148,7 +164,7 @@ pub struct Binding {
 
 impl Binding {
     /// What to print for this binding under the given config.
-    pub fn display_keys(&self, keys: &crate::KeysConfig) -> String {
+    pub(crate) fn display_keys(&self, keys: &crate::KeysConfig) -> String {
         match self.effective_label {
             Some(f) => f(keys),
             None => self.keys.to_string(),
@@ -200,7 +216,7 @@ fn doc(keys: &'static str, label: &'static str) -> Binding {
 }
 
 /// Keys that work in every view, from `handle_global_keys`.
-pub fn global() -> Vec<Binding> {
+pub(crate) fn global() -> Vec<Binding> {
     vec![
         b(":", "Command mode", plain(':'), Action::CommandMode),
         b("/", "Filter (search in detail/log)", plain('/'), Action::Filter(String::new())),
@@ -222,7 +238,7 @@ pub fn global() -> Vec<Binding> {
 }
 
 /// Keys for one view class, from that class's dispatch function.
-pub fn for_class(class: ViewClass) -> Vec<Binding> {
+pub(crate) fn for_class(class: ViewClass) -> Vec<Binding> {
     match class {
         ViewClass::Overview => vec![
             b("Tab / S-Tab", "Next / prev resource view", code(KeyCode::Tab), Action::NextTab),
@@ -398,7 +414,7 @@ mod tests;
 /// The match stays EXHAUSTIVE over `OperationKind`, and exhaustiveness is
 /// checked wherever the match is written — so a new operation still has to
 /// say which kind of key reaches it, exactly as before the move.
-pub fn structural_chord(op: &OperationKind) -> Option<KeyCombo> {
+pub(crate) fn structural_chord(op: &OperationKind) -> Option<KeyCombo> {
     match op {
         OperationKind::Delete => Some(KeyCombo { ctrl: true, ch: 'd' }),
         OperationKind::ForceKill => Some(KeyCombo { ctrl: true, ch: 'k' }),

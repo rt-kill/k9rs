@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 /// List available contexts from kubeconfig.
-pub fn run() -> Result<()> {
+pub(crate) fn run() -> Result<()> {
     // Through the shared reader, not `kube::config::Kubeconfig::read()`: this
     // was the second of the two calls that kept kube-rs in the layers above
     // `k9rs_kube`, and the projection it does (drop nameless entries, collapse

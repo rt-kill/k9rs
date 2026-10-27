@@ -44,7 +44,7 @@ pub(crate) fn project_containers(parent: &ResourceRow) -> Vec<ResourceRow> {
 /// functions live in this module, which is why this is a free function
 /// here rather than a method on the enum: the enum is a wire type in
 /// `k9rs_proto` and an inherent impl has to live with its type.
-pub fn project(kind: &DerivedViewKind, parent: &ResourceRow) -> Vec<ResourceRow> {
+pub(crate) fn project(kind: &DerivedViewKind, parent: &ResourceRow) -> Vec<ResourceRow> {
     match kind {
         DerivedViewKind::Containers => project_containers(parent),
     }

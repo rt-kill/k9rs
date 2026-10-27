@@ -1,9 +1,9 @@
 //! What lands on the clipboard when rows are marked.
 
 use super::*;
-use k9rs_app::actions::Action;
-use k9rs_app::event::{apply_event, AppEvent};
-use k9rs_app::store::StorePayload;
+use k9rs_app::Action;
+use k9rs_app::{apply_event, AppEvent};
+use k9rs_app::StorePayload;
 use k9rs_proto::protocol::{ObjectKey, TableBaseline};
 use k9rs_proto::row::{CellValue, ResourceRow};
 
@@ -23,7 +23,7 @@ fn seeded_app(marked: &[&str]) -> App {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "STATUS".into()],
             rows: vec![row("a"), row("b"), row("c")],
         }),
@@ -107,7 +107,7 @@ fn app_with_row(row: ResourceRow) -> App {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![row],
         }),
@@ -178,7 +178,7 @@ fn a_marked_selection_logs_exactly_those_pods() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![pod_row("a", "ns", 1), pod_row("b", "ns", 1), pod_row("c", "ns", 1)],
         }),
@@ -212,7 +212,7 @@ fn the_container_stance_follows_the_marked_pods() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![pod_row("solo", "ns", 1), pod_row("sidecar", "ns", 2)],
         }),
@@ -252,7 +252,7 @@ fn a_marked_set_of_workloads_unions_their_pod_sources() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Deployment),
+            resource: k9rs_proto::resource_def::BuiltInKind::Deployment.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![workload("api", "api"), workload("web", "web")],
         }),
@@ -283,7 +283,7 @@ fn a_marked_set_of_workloads_unions_their_pod_sources() {
 /// homogeneous.
 #[test]
 fn a_mixed_selection_carries_each_rows_own_shape() {
-    let rid = k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Deployment);
+    let rid = k9rs_proto::resource_def::BuiltInKind::Deployment.to_resource_id();
 
     // A pod: it lists containers, so it is its own target.
     let pod = pod_row("api-7d9f", "ns", 1);
@@ -302,7 +302,7 @@ fn a_mixed_selection_carries_each_rows_own_shape() {
     );
 
     // A row with no logs at all earns no place in the union.
-    let ns_rid = k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Namespace);
+    let ns_rid = k9rs_proto::resource_def::BuiltInKind::Namespace.to_resource_id();
     assert_eq!(row_log_target(&pod_row("kube-system", "", 0), &ns_rid), None);
 }
 
@@ -316,7 +316,7 @@ fn a_selection_spanning_namespaces_is_refused() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![pod_row("here", "ns-a", 1), pod_row("there", "ns-b", 1)],
         }),
@@ -390,8 +390,8 @@ fn the_shell_picker_offers_no_such_thing_as_all() {
 /// pod, which is precisely what you said no to by marking three of the eight.
 #[test]
 fn a_marked_set_of_containers_streams_exactly_those() {
-    use k9rs_app::element::Element;
-    use k9rs_app::view::DerivedViewKind;
+    use k9rs_app::Element;
+    use k9rs_app::DerivedViewKind;
 
     let mut app = App::new_for_test();
     let store = std::sync::Arc::clone(app.nav.top().data_store().unwrap());
@@ -399,7 +399,7 @@ fn a_marked_set_of_containers_streams_exactly_those() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![pod.clone()],
         }),
@@ -479,7 +479,7 @@ fn a_cluster_scoped_subject_omits_the_namespace_clause() {
 /// vouch for. The recovery baseline re-anchors and capture works again.
 #[test]
 fn test_batch_capture_is_empty_during_refresh_window() {
-    use k9rs_app::store::StorePayload;
+    use k9rs_app::StorePayload;
     use k9rs_proto::protocol::{ObjectKey, TableBaseline};
     use k9rs_proto::row::{CellValue, ResourceRow};
 
@@ -491,7 +491,7 @@ fn test_batch_capture_is_empty_during_refresh_window() {
     };
     let baseline = |rows: Vec<ResourceRow>| {
         StorePayload::Baseline(TableBaseline {
-            resource: rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows,
         })
@@ -525,7 +525,7 @@ fn test_batch_capture_is_empty_during_refresh_window() {
 /// summary).
 #[test]
 fn test_second_batch_refused_while_one_outstanding() {
-    use k9rs_app::store::StorePayload;
+    use k9rs_app::StorePayload;
     use k9rs_proto::protocol::{ObjectKey, TableBaseline};
     use k9rs_proto::row::{CellValue, ResourceRow};
 
@@ -538,7 +538,7 @@ fn test_second_batch_refused_while_one_outstanding() {
     let mut app = App::new_for_test();
     let store = std::sync::Arc::clone(app.nav.top().data_store().unwrap());
     store.apply(1, StorePayload::Baseline(TableBaseline {
-        resource: rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+        resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
         headers: vec!["NAME".into()],
         rows: vec![row("a")],
     }));
@@ -546,25 +546,25 @@ fn test_second_batch_refused_while_one_outstanding() {
 
     // Outstanding tracker → refuse, no dialog, selection untouched.
     let t = k9rs_proto::protocol::ObjectRef::new(
-        rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+        k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
         "a".to_string(),
         k9rs_proto::protocol::Namespace::from_row("ns"),
     );
     app.pending_batch = Some(k9rs_app::BatchTracker::new(
         "Deleted", "pod".to_string(),
-        rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+        k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
         std::slice::from_ref(&t), 0, std::sync::Weak::new(),
         k9rs_proto::protocol::OperationKind::Delete,
     ));
     handle_batch_op(&mut app, Action::BatchDelete);
-    assert!(!matches!(app.nav.top(), k9rs_app::element::Element::Confirm(_)));
+    assert!(!matches!(app.nav.top(), k9rs_app::Element::Confirm(_)));
     assert!(app.ui.flash.as_ref().is_some_and(|f| f.message.contains("in flight")));
     assert!(app.nav.top().has_marks(), "refusal leaves the selection untouched");
 
     // Tracker cleared → the same dispatch opens the confirm dialog.
     app.pending_batch = None;
     handle_batch_op(&mut app, Action::BatchDelete);
-    assert!(matches!(app.nav.top(), k9rs_app::element::Element::Confirm(_)));
+    assert!(matches!(app.nav.top(), k9rs_app::Element::Confirm(_)));
 }
 
 #[test]
@@ -658,20 +658,36 @@ fn the_identity_never_describes_the_context_being_left() {
         identity: ClusterIdentity::new("prod-eks".into(), "prod-admin".into()),
         namespaces: vec![],
     });
-    // Switch away: link down, candidate announced by the new session.
+    // Switch away. This goes through the REAL `begin_context_switch`, which is
+    // what `k9rs_app`'s own attachment tests can only simulate — they set
+    // `switch_requested()` + `Requested(..)` by hand and claim that is what
+    // this function does. This is where that claim is checked.
     begin_context_switch(
         &mut app,
         &ContextName::new("staging").unwrap(),
     );
+
+    // BEFORE the new session reports. The window the bug lived in: the label
+    // already names staging, so the identity must not still be prod's.
+    let at = app.attachment();
+    let label = k9rs_ui::header::context_label(&at);
+    assert!(label.contains("staging"), "names what we're connecting to: {label}");
+    assert_eq!(
+        at.identity().cluster(),
+        None,
+        "nothing is known about staging yet, and prod's cluster is not a stand-in: {label}",
+    );
+
+    // Then the candidate arrives and fills it in, consistently.
     apply_event(&mut app, AppEvent::KubeconfigLoaded {
         contexts: vec![],
         current_context: Some(ContextName::new("staging").unwrap()),
         current_identity: ClusterIdentity::new("staging-eks".into(), "staging-admin".into()),
     });
-
-    let label = k9rs_ui::header::context_label(&app);
-    let id = k9rs_ui::header::display_identity(&app);
-    assert!(label.contains("staging"), "names what we're connecting to: {label}");
-    assert_eq!(id.cluster(), Some("staging-eks"), "…and the cluster line agrees with it");
-    assert_eq!(id.user(), Some("staging-admin"));
+    let at = app.attachment();
+    let label = k9rs_ui::header::context_label(&at);
+    assert!(label.contains("staging"), "still names the target: {label}");
+    assert_eq!(at.identity().cluster(), Some("staging-eks"), "…and the cluster line agrees");
+    assert_eq!(at.identity().user(), Some("staging-admin"));
 }
+

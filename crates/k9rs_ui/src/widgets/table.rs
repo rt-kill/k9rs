@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 use k9rs_theme::Theme;
 
 /// State for the ResourceTable widget.
-pub struct ResourceTableState {
+pub(crate) struct ResourceTableState {
     pub selected: usize,
     pub offset: usize,
     pub selected_col: usize,
@@ -130,7 +130,7 @@ impl ColumnLayout {
     }
 }
 
-pub struct ResourceTable<'a> {
+pub(crate) struct ResourceTable<'a> {
     headers: Vec<&'a str>,
     rows: &'a [Vec<String>],
     /// Pre-computed per-column display widths (from `PreparedView`). Empty ⇒
@@ -176,7 +176,7 @@ struct RowPaint {
     repeated: Option<usize>,
 }
 impl<'a> ResourceTable<'a> {
-    pub fn new(
+    pub(crate) fn new(
         headers: Vec<&'a str>,
         rows: &'a [Vec<String>],
         title: &'a str,
@@ -197,19 +197,19 @@ impl<'a> ResourceTable<'a> {
         }
     }
 
-    pub fn col_widths(mut self, widths: &'a [u16]) -> Self { self.col_widths = widths; self }
+    pub(crate) fn col_widths(mut self, widths: &'a [u16]) -> Self { self.col_widths = widths; self }
 
-    pub fn row_keys(mut self, keys: &'a [k9rs_proto::protocol::ObjectKey]) -> Self { self.row_keys = keys; self }
-    pub fn row_health(mut self, health: &'a [k9rs_proto::row::RowHealth]) -> Self { self.row_health = health; self }
-    pub fn cell_style(mut self, ch: &'a [Vec<Option<k9rs_proto::row::RowHealth>>]) -> Self { self.cell_style = ch; self }
-    pub fn marked(mut self, marked: &'a std::collections::HashSet<k9rs_proto::protocol::ObjectKey>) -> Self { self.marked = marked; self }
-    pub fn sort(mut self, col: Option<usize>, ascending: bool) -> Self { self.sort_col = col; self.sort_asc = ascending; self }
+    pub(crate) fn row_keys(mut self, keys: &'a [k9rs_proto::protocol::ObjectKey]) -> Self { self.row_keys = keys; self }
+    pub(crate) fn row_health(mut self, health: &'a [k9rs_proto::row::RowHealth]) -> Self { self.row_health = health; self }
+    pub(crate) fn cell_style(mut self, ch: &'a [Vec<Option<k9rs_proto::row::RowHealth>>]) -> Self { self.cell_style = ch; self }
+    pub(crate) fn marked(mut self, marked: &'a std::collections::HashSet<k9rs_proto::protocol::ObjectKey>) -> Self { self.marked = marked; self }
+    pub(crate) fn sort(mut self, col: Option<usize>, ascending: bool) -> Self { self.sort_col = col; self.sort_asc = ascending; self }
     /// The column whose consecutive equal values collapse, if any declares it.
-    pub fn group_col(mut self, col: Option<usize>) -> Self { self.group_col = col; self }
-    pub fn namespace(mut self, ns: &'a str) -> Self { self.namespace = ns; self }
-    pub fn changed_rows(mut self, changed: &'a std::collections::HashMap<k9rs_proto::protocol::ObjectKey, std::time::Instant>) -> Self { self.changed_rows = changed; self }
-    pub fn search_patterns(mut self, pats: &'a [k9rs_util::SearchPattern]) -> Self { self.search_patterns = pats; self }
-    pub fn warning(mut self, w: Option<&'a str>) -> Self { self.warning = w; self }
+    pub(crate) fn group_col(mut self, col: Option<usize>) -> Self { self.group_col = col; self }
+    pub(crate) fn namespace(mut self, ns: &'a str) -> Self { self.namespace = ns; self }
+    pub(crate) fn changed_rows(mut self, changed: &'a std::collections::HashMap<k9rs_proto::protocol::ObjectKey, std::time::Instant>) -> Self { self.changed_rows = changed; self }
+    pub(crate) fn search_patterns(mut self, pats: &'a [k9rs_util::SearchPattern]) -> Self { self.search_patterns = pats; self }
+    pub(crate) fn warning(mut self, w: Option<&'a str>) -> Self { self.warning = w; self }
 
     fn health_at(&self, idx: usize) -> k9rs_proto::row::RowHealth {
         self.row_health.get(idx).copied().unwrap_or_default()

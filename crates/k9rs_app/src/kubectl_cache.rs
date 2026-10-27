@@ -22,13 +22,13 @@ pub enum ContentKind {
 /// Key for the kubectl output cache. Typed end-to-end: keyed on the full
 /// `ObjectRef` so two CRDs sharing a Kind name across groups never collide.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CacheKey {
+pub(crate) struct CacheKey {
     pub target: ObjectRef,
     pub kind: ContentKind,
 }
 
 impl CacheKey {
-    pub fn new(target: ObjectRef, kind: ContentKind) -> Self {
+    pub(crate) fn new(target: ObjectRef, kind: ContentKind) -> Self {
         Self { target, kind }
     }
 }

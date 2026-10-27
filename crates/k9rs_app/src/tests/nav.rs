@@ -1,4 +1,5 @@
 use super::*;
+use k9rs_util::CompiledGrep;
 use crate::element::{ContentSpec, ContentView, Element, QuerySpec, ResourceList};
 use crate::store::{MetricsHub, RowPredicate};
 use k9rs_proto::protocol::Namespace;
@@ -69,7 +70,7 @@ fn breadcrumb_is_a_label_fold() {
     );
     stack.push(Element::ContentView(ContentView::new(
         ContentSpec::Describe(k9rs_proto::protocol::ObjectRef::new(
-                crate::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+                k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
                 "some-pod".to_string(),
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             )),

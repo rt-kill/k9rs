@@ -11,13 +11,13 @@ use k9rs_theme::Theme;
 
 /// Flash message widget.
 /// info=lawngreen bold, warn=darkorange bold, error=orangered bold.
-pub struct FlashWidget<'a> {
+pub(crate) struct FlashWidget<'a> {
     message: &'a FlashMessage,
     theme: &'a Theme,
 }
 
 impl<'a> FlashWidget<'a> {
-    pub fn new(message: &'a FlashMessage, theme: &'a Theme) -> Self {
+    pub(crate) fn new(message: &'a FlashMessage, theme: &'a Theme) -> Self {
         Self { message, theme }
     }
 }
@@ -51,7 +51,7 @@ impl Widget for FlashWidget<'_> {
             let pad = area.width.saturating_sub(content.width() as u16) / 2;
             (content, area.x + pad)
         } else {
-            (k9rs_util::truncate(&content, width), area.x)
+            (k9rs_util::width::truncate(&content, width), area.x)
         };
 
         let line = Line::from(Span::styled(content, style));

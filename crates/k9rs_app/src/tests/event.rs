@@ -20,7 +20,7 @@ fn pod_target() -> ObjectRef {
 /// FOR something and the cover has to be a real one.
 fn other_target() -> k9rs_proto::protocol::ObjectRef {
     k9rs_proto::protocol::ObjectRef::new(
-        crate::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+        k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
         "other".to_string(),
         Namespace::Named("ns".to_string()),
     )
@@ -459,7 +459,7 @@ fn a_daemon_backed_view_cannot_be_opened_without_a_context() {
     let mut app = App::new_for_test();
     apply_event(&mut app, AppEvent::NoContextConfigured);
 
-    let pods = crate::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod);
+    let pods = k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id();
     assert!(
         !app.can_open_resource_view(&pods),
         "a daemon-backed view has no session to subscribe against",

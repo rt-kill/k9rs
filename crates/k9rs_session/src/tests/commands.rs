@@ -2,7 +2,7 @@
 //! sitting in `$EDITOR`.
 
 use super::*;
-use k9rs_app::event::AppEvent;
+use k9rs_app::AppEvent;
 
 /// Events that arrive while a subprocess is running must be APPLIED, not
 /// queued behind a loop that isn't running.
@@ -89,7 +89,7 @@ async fn a_closed_event_channel_does_not_strand_the_subprocess() {
     /// keymap has: documentation beside a check that it is true.
     #[test]
     fn every_documented_command_word_is_one_the_parser_accepts() {
-        for doc in k9rs_app::commands::COMMAND_WORDS {
+        for doc in k9rs_app::COMMAND_WORDS {
             let parsed = parse(doc.probe);
             assert!(
                 (doc.accepts)(&parsed),
@@ -257,7 +257,7 @@ fn a_text_key_types_into_the_filter_and_the_command_bar() {
     assert_eq!(app.nav.top().filter_input().text(), "c");
 
     let mut app = App::new_for_test();
-    app.ui.open(k9rs_app::Modal::Command { input: k9rs_app::text_input::TextInput::new(), history_index: None });
+    app.ui.open(k9rs_app::Modal::Command { input: k9rs_app::TextInput::new(), history_index: None });
     assert!(matches!(
         edit_command_key(&mut app, text('g')),
         CommandKey::Consumed,

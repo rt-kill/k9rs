@@ -39,13 +39,23 @@ pub enum Appearance {
 /// Upper bound on how long startup may block waiting for the terminal.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// The one query, remembered.
+///
+/// Module-level rather than function-local so the test mirror can assert it
+/// is still EMPTY — this function opens `/dev/tty` and writes an OSC 11
+/// escape, so a test that reached it would both take its answer from the
+/// developer's terminal theme and write escape bytes into the terminal
+/// running the suite. Two sibling statics (`overlay::OVERLAYS`,
+/// `daemon_config::CONFIG`) were exactly this bug before being made explicit,
+/// and the second was found only because the first was not swept for.
+static CACHED: OnceLock<Appearance> = OnceLock::new();
+
 /// Detect the terminal's appearance, defaulting to [`Appearance::Dark`].
 ///
 /// The terminal is queried at most once per process: the answer can't
 /// change under us mid-session in any way we'd act on, and the query costs
 /// a tty round-trip.
 pub fn detect() -> Appearance {
-    static CACHED: OnceLock<Appearance> = OnceLock::new();
     *CACHED.get_or_init(|| {
         query_osc11()
             .or_else(|| std::env::var("COLORFGBG").ok().and_then(|v| classify_colorfgbg(&v)))

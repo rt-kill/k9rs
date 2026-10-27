@@ -347,7 +347,7 @@ pub enum Supersedes<'a> {
 /// A store that gates events on a stream-epoch floor. Exists so
 /// `Supersedes::retire_and_mint` can serve both the row and line stores;
 /// they have the same succession rule and differ only in what they hold.
-pub trait EpochFloor {
+pub(crate) trait EpochFloor {
     fn expect_epoch(&self, epoch: u64);
 }
 
@@ -1032,7 +1032,7 @@ impl ClientSession {
                             return;
                         }
                         tracing::warn!("subscription bridge reopen failed for {}: {}", rid.plural(), e);
-                        let jitter = k9rs_util::retry_jitter(rid.plural().as_bytes(), retry_backoff.as_millis() as u64);
+                        let jitter = k9rs_util::task::retry_jitter(rid.plural().as_bytes(), retry_backoff.as_millis() as u64);
                         let jittered = retry_backoff.mul_f64(jitter);
                         tokio::time::sleep(jittered).await;
                         retry_backoff = (retry_backoff * 2).min(std::time::Duration::from_secs(30));
@@ -1135,7 +1135,7 @@ impl ClientSession {
                             // verbatim; only `Buffer::set_string`/`set_line`
                             // filter. Sanitising at the boundary means a new
                             // render sink can't reintroduce the hole.
-                            let reason = k9rs_util::sanitize_terminal(&reason);
+                            let reason = k9rs_util::text::sanitize_terminal(&reason);
                             // The CLUSTER hop broke, not this one: the
                             // substream is healthy and delivered this frame,
                             // so it is progress for backoff — but it is the
@@ -1161,7 +1161,7 @@ impl ClientSession {
                         }
                         protocol::StreamEvent::Error(msg) => {
                             // Same boundary rule as `Stale` above.
-                            let msg = k9rs_util::sanitize_terminal(&msg);
+                            let msg = k9rs_util::text::sanitize_terminal(&msg);
                             // Server-side subscription error (RBAC denied, CRD
                             // missing, ...). The bridge re-probes on retry, so it
                             // self-heals once the cause is fixed — but a PERMANENT
@@ -1229,7 +1229,7 @@ impl ClientSession {
                 // Transient failure after prior success — retry with
                 // jittered backoff. Session death naturally exits on the
                 // next open() or event_tx.send().
-                let jitter = k9rs_util::retry_jitter(rid.plural().as_bytes(), retry_backoff.as_millis() as u64);
+                let jitter = k9rs_util::task::retry_jitter(rid.plural().as_bytes(), retry_backoff.as_millis() as u64);
                 let jittered = retry_backoff.mul_f64(jitter);
                 tracing::info!("subscription bridge retrying for {} in {:?}", rid.plural(), jittered);
                 tokio::time::sleep(jittered).await;
@@ -1339,8 +1339,8 @@ async fn reader_loop(
 /// an apiserver `Status.message` can arrive on either.
 fn sanitize_result(result: Result<String, String>) -> Result<String, String> {
     match result {
-        Ok(m) => Ok(k9rs_util::sanitize_terminal(&m)),
-        Err(m) => Err(k9rs_util::sanitize_terminal(&m)),
+        Ok(m) => Ok(k9rs_util::text::sanitize_terminal(&m)),
+        Err(m) => Err(k9rs_util::text::sanitize_terminal(&m)),
     }
 }
 
@@ -1393,7 +1393,7 @@ fn convert_session_event(event: SessionEvent, current_context: &k9rs_proto::prot
         }
 
         SessionEvent::SessionError(message) => {
-            vec![AppEvent::Flash(FlashMessage::error(k9rs_util::sanitize_terminal(&message)))]
+            vec![AppEvent::Flash(FlashMessage::error(k9rs_util::text::sanitize_terminal(&message)))]
         }
 
         // Ready and DaemonStatus are handled during handshake / by ctl, not in the reader loop.

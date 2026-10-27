@@ -5,7 +5,7 @@
 //! provides lookup by plural name or alias, and stores a type-erased
 //! watcher spawner per resource for dispatch without string matching.
 
-pub mod registry;
+pub(crate) mod registry;
 
 use std::sync::LazyLock;
 
@@ -33,7 +33,7 @@ use registry::ResourceRegistry;
 /// Global registry of all built-in resource types. Built once at first
 /// access. Stores both `dyn ResourceDef` metadata and type-erased watcher
 /// spawners -- the single source of truth for resource dispatch.
-pub static REGISTRY: LazyLock<ResourceRegistry> = LazyLock::new(build_registry);
+pub(crate) static REGISTRY: LazyLock<ResourceRegistry> = LazyLock::new(build_registry);
 
 fn build_registry() -> ResourceRegistry {
     // Workload defs (in crate::resources::*)

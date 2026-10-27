@@ -13,7 +13,7 @@ use k9rs_theme::Theme;
 /// struct is just the per-frame snapshot that satisfies
 /// `StatefulWidget::State`. The view function builds it via struct literal
 /// each draw, so impl methods would be dead weight.
-pub struct YamlViewState {
+pub(crate) struct YamlViewState {
     pub scroll: usize,
     pub search: Option<String>,
     pub search_matches: Vec<usize>,
@@ -25,14 +25,14 @@ pub struct YamlViewState {
 /// Supports scrolling, line numbers, and search-within-YAML highlighting.
 /// Uses simple regex-based highlighting for YAML keys, strings, and numbers
 /// rather than requiring syntect at render time.
-pub struct YamlViewer<'a> {
+pub(crate) struct YamlViewer<'a> {
     content: &'a str,
     title: &'a str,
     theme: &'a Theme,
 }
 
 impl<'a> YamlViewer<'a> {
-    pub fn new(content: &'a str, title: &'a str, theme: &'a Theme) -> Self {
+    pub(crate) fn new(content: &'a str, title: &'a str, theme: &'a Theme) -> Self {
         Self {
             content,
             title,

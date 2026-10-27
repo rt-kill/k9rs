@@ -207,3 +207,24 @@ fn colorfgbg_uses_the_last_field_and_declines_politely() {
     fn partial_color_reply_keeps_waiting() {
         assert_eq!(drive(b"\x1b]11;rgb:2e2e/3434/40").0, ReplyState::NeedMore);
     }
+
+/// Nothing in the suite may resolve `ThemeMode::Auto`.
+///
+/// `detect()` opens `/dev/tty` and writes `ESC ] 11 ; ? ST`. Under `cargo
+/// test` that means taking the answer from whichever terminal is running the
+/// suite — and writing escape bytes into it. `ThemeMode::Auto` currently only
+/// ever appears in tests as a value to compare, never one to `resolve()`;
+/// this is what keeps that true.
+///
+/// The MECHANISM, not the outcome: asserting `detect() == Dark` would pass on
+/// a dark-themed terminal, which is most of them.
+#[test]
+fn a_test_run_never_asks_the_terminal_anything() {
+    assert!(
+        CACHED.get().is_none(),
+        "something resolved ThemeMode::Auto during the test run — it queried \
+         the developer's terminal and wrote an OSC escape into the suite's \
+         output; pin the appearance instead (`App::new_for_test` does)",
+    );
+}
+

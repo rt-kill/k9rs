@@ -24,7 +24,7 @@ pub enum CtlCommand {
     },
 }
 
-pub async fn run(cmd: CtlCommand, json: bool) -> Result<()> {
+pub(crate) async fn run(cmd: CtlCommand, json: bool) -> Result<()> {
     match cmd {
         CtlCommand::Status => cmd_status(json).await,
         CtlCommand::Ping => cmd_ping(json).await,

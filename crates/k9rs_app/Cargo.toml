@@ -43,6 +43,7 @@ testing = []
 anyhow.workspace = true
 crossterm.workspace = true
 futures.workspace = true
+k9rs_config.workspace = true
 k9rs_daemon.workspace = true
 k9rs_kube.workspace = true
 k9rs_mux.workspace = true

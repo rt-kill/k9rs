@@ -102,7 +102,7 @@ pub fn describe_lines_from_text(text: &str) -> Vec<DescribeLine> {
 /// The owning `into_owned` is free here: `DescribeLine.text` is a `String`,
 /// so the `&str` callers were allocating anyway.
 fn classified(text: &str) -> DescribeLine {
-    let text = k9rs_util::visible_text(text).into_owned();
+    let text = k9rs_util::text::visible_text(text).into_owned();
     let kind = classify_describe_line(&text);
     DescribeLine { text, kind }
 }
@@ -290,7 +290,7 @@ fn format_describe(obj: &kube::api::DynamicObject) -> Vec<DescribeLine> {
                 // Char-boundary-safe truncation: annotation values are arbitrary
                 // UTF-8, so a byte-index slice (`&v[..77]`) would panic mid-codepoint
                 // and crash this describe task daemon-side.
-                let display_v = k9rs_util::truncate(v, 80);
+                let display_v = k9rs_util::width::truncate(v, 80);
                 if i == 0 {
                     lines.push(field_line(format!("Annotations:  {}={}", k, display_v)));
                 } else {

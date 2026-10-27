@@ -60,7 +60,7 @@ struct RegistryEntry {
 // ---------------------------------------------------------------------------
 
 /// Central registry of all known built-in resource types.
-pub struct ResourceRegistry {
+pub(crate) struct ResourceRegistry {
     /// Typed index of watcher factories, keyed by [`BuiltInKind`].
     ///
     /// It used to own the `ResourceDef` trait objects too, and the plural,
@@ -80,7 +80,7 @@ impl Default for ResourceRegistry {
 }
 
 impl ResourceRegistry {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             by_kind: HashMap::new(),
         }
@@ -93,7 +93,7 @@ impl ResourceRegistry {
     /// The `K` type parameter is the k8s-openapi struct (e.g. `Pod`,
     /// `Deployment`). It must be `NamespaceResourceScope` so the spawner
     /// can create `Api::namespaced` when a specific namespace is selected.
-    pub fn register_namespaced<D, K>(&mut self, def: D)
+    pub(crate) fn register_namespaced<D, K>(&mut self, def: D)
     where
         D: ResourceDef + ConvertToRow<K> + 'static,
         K: kube::Resource<DynamicType = (), Scope = k8s_openapi::NamespaceResourceScope>
@@ -123,7 +123,7 @@ impl ResourceRegistry {
     /// Register a **cluster-scoped** resource type with its typed watcher factory.
     ///
     /// Cluster resources always use `Api::all` regardless of namespace selection.
-    pub fn register_cluster<D, K>(&mut self, def: D)
+    pub(crate) fn register_cluster<D, K>(&mut self, def: D)
     where
         D: ResourceDef + ConvertToRow<K> + 'static,
         K: kube::Resource<DynamicType = ()>

@@ -1,5 +1,5 @@
 use super::{line_phys_rows, wrap_line, LogViewState, LogViewer};
-use k9rs_app::store::StoredLine;
+use k9rs_app::StoredLine;
 use k9rs_proto::protocol::LogLine;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -568,7 +568,7 @@ fn measuring_and_rendering_agree_on_every_run() {
 ///   indicator approximate, to save milliseconds in the one case that is
 ///   already inside frame budget.
 /// - *Let a relative scroll intent keep the anchor and carry a row delta.*
-///   This contradicts [`k9rs_app::viewport::Viewport`]'s own invariant,
+///   This contradicts [`k9rs_app::Viewport`]'s own invariant,
 ///   stated on its `anchor` field: it is `None` "on any viewport whose
 ///   offset has been moved since the record was written, which is exactly
 ///   when it would be a lie". A delta beside a live anchor is that lie, plus

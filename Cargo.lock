@@ -1098,6 +1098,8 @@ dependencies = [
  "futures",
  "k9rs_app",
  "k9rs_cli",
+ "k9rs_config",
+ "k9rs_kube",
  "k9rs_proto",
  "k9rs_session",
  "k9rs_theme",
@@ -1116,6 +1118,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "futures",
+ "k9rs_config",
  "k9rs_daemon",
  "k9rs_kube",
  "k9rs_mux",
@@ -1144,6 +1147,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "k9rs_config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -1176,6 +1187,7 @@ dependencies = [
  "dashmap",
  "futures",
  "k8s-openapi",
+ "k9rs_config",
  "k9rs_proto",
  "k9rs_util",
  "kube",

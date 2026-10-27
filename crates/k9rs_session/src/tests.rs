@@ -279,7 +279,7 @@ fn a_modal_with_a_key_handler_is_not_swallowed_before_reaching_it() {
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     let target = k9rs_proto::protocol::ObjectRef::new(
-        k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+        k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
         "p".to_string(),
         k9rs_proto::protocol::Namespace::Named("default".to_string()),
     );
@@ -290,7 +290,7 @@ fn a_modal_with_a_key_handler_is_not_swallowed_before_reaching_it() {
             "help",
             Modal::Takeover(TakeoverOp::Edit {
             target: k9rs_proto::protocol::ObjectRef::new(
-                k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+                k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
                 "p".to_string(),
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             ),
@@ -301,7 +301,7 @@ fn a_modal_with_a_key_handler_is_not_swallowed_before_reaching_it() {
             "container picker",
             Modal::Takeover(TakeoverOp::Edit {
             target: k9rs_proto::protocol::ObjectRef::new(
-                k9rs_app::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+                k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
                 "p".to_string(),
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             ),
@@ -336,7 +336,7 @@ fn a_modal_with_a_key_handler_is_not_swallowed_before_reaching_it() {
 
         // Downstream HAS an answer for Esc…
         assert!(
-            k9rs_app::handler::handle_key_event(&app, esc).is_some(),
+            k9rs_app::handle_key_event(&app, esc).is_some(),
             "{name}: handle_key_event must answer Esc",
         );
 
@@ -350,7 +350,7 @@ fn a_modal_with_a_key_handler_is_not_swallowed_before_reaching_it() {
         assert!(!super::handle_log_filter_key(&mut app, tk), "{name}");
         let tk = TextKey::new(esc).unwrap();
         assert!(!super::handle_content_search_key(&mut app, tk), "{name}");
-        assert!(!matches!(app.nav.top(), k9rs_app::element::Element::Form(_)), "{name}");
+        assert!(!matches!(app.nav.top(), k9rs_app::Element::Form(_)), "{name}");
 
         assert!(
             !app.ui.modal_without_key_handler(),

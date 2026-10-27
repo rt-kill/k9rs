@@ -8,11 +8,11 @@
 //!
 //! What is left here all needs the runtime: a tokio task, the client socket,
 //! a pty, a spawned editor. The apply path for daemon events was here too and
-//! needed none of them, so it went to [`k9rs_app::event`] — see that
+//! needed none of them, so it went to [`k9rs_app::apply_event`] — see its
 //! module's doc for why.
 
-pub mod actions;
-pub mod commands;
+pub(crate) mod actions;
+pub(crate) mod commands;
 
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
@@ -27,8 +27,8 @@ use crossterm::{
 use tokio::sync::mpsc;
 
 use k9rs_app::App;
-use k9rs_app::event::{apply_event, AppEvent};
-use k9rs_app::client::ClientSession;
+use k9rs_app::{apply_event, AppEvent};
+use k9rs_app::ClientSession;
 use k9rs_kube::repaint::Repaint;
 
 struct RawFd(std::os::unix::io::RawFd);
@@ -115,7 +115,7 @@ pub(crate) async fn open_exec_overlay(
     data_source: &ClientSession,
     exec_init: k9rs_proto::protocol::ExecInit,
     title: String,
-    event_tx: &tokio::sync::mpsc::Sender<k9rs_app::event::AppEvent>,
+    event_tx: &tokio::sync::mpsc::Sender<k9rs_app::AppEvent>,
 ) -> Result<()> {
     let stream = data_source.open_exec_stream(exec_init.clone(), event_tx.clone()).await?;
 
@@ -487,16 +487,16 @@ async fn handle_one_key(
     }
 
     repaint.on_input();
-    let Some(action) = k9rs_app::handler::handle_key_event(app, key) else {
+    let Some(action) = k9rs_app::handle_key_event(app, key) else {
         return KeyDrain::Continue;
     };
     // Select-mode gate: THE single choke point — every key→Action route
     // funnels through here, transforming batch-capable ops into their Batch*
     // variants and killing single-target actions while marks are active. Runs
     // BEFORE the readonly check so readonly sees the batch variant.
-    let action = match k9rs_app::select_gate::gate_action(app, action) {
-        k9rs_app::select_gate::Gated::Pass(a) => a,
-        k9rs_app::select_gate::Gated::Blocked(msg) => {
+    let action = match k9rs_app::gate_action(app, action) {
+        k9rs_app::Gated::Pass(a) => a,
+        k9rs_app::Gated::Blocked(msg) => {
             app.ui.flash = Some(k9rs_app::FlashMessage::warn(msg.to_string()));
             return KeyDrain::Continue;
         }
@@ -1054,11 +1054,11 @@ fn handle_log_filter_key(app: &mut App, key: k9rs_app::TextKey) -> bool {
             if let Some(text) = draft {
                 // `!pat` excludes — the sense comes off the front before the
                 // pattern is compiled, so the vim translator never sees it.
-                let (sense, pattern) = k9rs_app::element::sense_of(&text);
+                let (sense, pattern) = k9rs_app::sense_of(&text);
                 if !pattern.is_empty() {
-                    if let Ok(el) = k9rs_app::element::Element::derive_log_filter(
+                    if let Ok(el) = k9rs_app::Element::derive_log_filter(
                         app.nav.top(),
-                        k9rs_app::nav::CompiledGrep::new(pattern),
+                        k9rs_util::CompiledGrep::new(pattern),
                         sense,
                     ) {
                         app.nav.push(el);
@@ -1094,7 +1094,7 @@ fn handle_content_search_key(app: &mut App, key: k9rs_app::TextKey) -> bool {
     use k9rs_app::SearchInputResult;
     let search_context_lines = app.config.ui.search_context_lines;
     let state = match app.nav.top_mut() {
-        k9rs_app::element::Element::ContentView(cv) if cv.state.search_input_active => {
+        k9rs_app::Element::ContentView(cv) if cv.state.search_input_active => {
             &mut cv.state
         }
         _ => return false,
@@ -1216,18 +1216,11 @@ pub async fn session_main(
             // A fresh switch request (Requested → InFlight): connect to it.
             Some(Some(new_ctx))
         } else if reconnect_due {
-            // A reconnect fired. If a switch is STILL in flight (InFlight — its
-            // target was already taken above on a prior turn), keep aiming at
-            // the SWITCH target, not the previous context: a mid-switch daemon
-            // blip must not silently abandon the switch and strand the user on
-            // the old context. Otherwise reconnect to the last-confirmed context.
-            let target = app
-                .kube
-                .context_switch
-                .target()
-                .cloned()
-                .or_else(|| app.kube.context.clone());
-            Some(target)
+            // A reconnect fired. `reconnect_target` is where the choice lives
+            // — it was an inline match here, and it was the third independent
+            // answer to "which context are we aiming at" (see
+            // `k9rs_app::attachment`).
+            Some(app.kube.reconnect_target())
         } else {
             None
         };
@@ -1269,8 +1262,8 @@ pub async fn session_main(
             // ONE call, not three — see the note in `session::open_shell`.
             app.ui.close_modal();
             app.nav.for_each_content_view(|cv| {
-                if cv.phase == k9rs_app::element::ContentPhase::Fetching {
-                    cv.phase = k9rs_app::element::ContentPhase::Failed(
+                if cv.phase == k9rs_app::ContentPhase::Fetching {
+                    cv.phase = k9rs_app::ContentPhase::Failed(
                         "fetch interrupted by reconnect".to_string(),
                     );
                 }
@@ -1279,7 +1272,7 @@ pub async fn session_main(
             event_tx = new_tx;
             event_rx = new_rx;
             data_source = ClientSession::new(
-                k9rs_app::client::ConnectionParams {
+                k9rs_app::ConnectionParams {
                     context: ctx,
                     namespace: app.kube.selected_ns.clone(),
                     readonly: app.read_only,
@@ -1323,7 +1316,7 @@ pub async fn session_main(
 
             // Set cursor style based on input mode: bar for text input, block otherwise
             let view_has_text_input = match app.nav.top() {
-                k9rs_app::element::Element::ContentView(c) => c.state.search_input_active,
+                k9rs_app::Element::ContentView(c) => c.state.search_input_active,
                 el => el.log_view().is_some_and(|v| v.is_filtering()),
             };
             let in_input_mode = app.ui.command_input().is_some()
@@ -1347,7 +1340,7 @@ pub async fn session_main(
             // to animate.
             if app.ui.anim.is_animating() {
                 next_anim.get_or_insert_with(|| {
-                    std::time::Instant::now() + k9rs_app::anim::FRAME_INTERVAL
+                    std::time::Instant::now() + k9rs_app::FRAME_INTERVAL
                 });
             } else {
                 next_anim = None;

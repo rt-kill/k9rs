@@ -9,7 +9,7 @@ use k9rs_theme::Theme;
 
 
 /// Requested dialog dimensions (clamped to the available area).
-pub struct DialogSize {
+pub(crate) struct DialogSize {
     pub width: u16,
     pub height: u16,
 }
@@ -24,7 +24,7 @@ pub struct DialogSize {
 ///
 /// Adding a new dialog type is ~20 lines of content rendering — zero
 /// centering/clear/block/fill/hint boilerplate.
-pub struct ModalOverlay<'a, F>
+pub(crate) struct ModalOverlay<'a, F>
 where
     F: FnOnce(Rect, &mut Buffer),
 {
@@ -39,7 +39,7 @@ impl<'a, F> ModalOverlay<'a, F>
 where
     F: FnOnce(Rect, &mut Buffer),
 {
-    pub fn new(theme: &'a Theme, size: DialogSize, render_content: F) -> Self {
+    pub(crate) fn new(theme: &'a Theme, size: DialogSize, render_content: F) -> Self {
         Self {
             title: "",
             size,
@@ -49,12 +49,12 @@ where
         }
     }
 
-    pub fn title(mut self, title: &'a str) -> Self {
+    pub(crate) fn title(mut self, title: &'a str) -> Self {
         self.title = title;
         self
     }
 
-    pub fn hints(mut self, hints: Line<'a>) -> Self {
+    pub(crate) fn hints(mut self, hints: Line<'a>) -> Self {
         self.hints = Some(hints);
         self
     }
@@ -65,7 +65,7 @@ where
     F: FnOnce(Rect, &mut Buffer),
 {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let (mw, mh) = k9rs_app::geometry::DIALOG_MARGIN;
+        let (mw, mh) = k9rs_app::DIALOG_MARGIN;
         let w = self.size.width.min(area.width.saturating_sub(mw));
         let h = self.size.height.min(area.height.saturating_sub(mh));
 

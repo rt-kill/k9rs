@@ -96,3 +96,34 @@ execResources:
         .expect("a non-zero interval parses");
         assert_eq!(ok.exec_resources[0].poll_interval_secs.get(), 15);
     }
+
+/// A process that never calls `load_from_home` reads the DEFAULTS, so the
+/// suite's results cannot depend on the developer's config file.
+///
+/// This was not true. `CONFIG` was a `LazyLock` that read `$HOME` on first
+/// touch, and first touch happens deep inside `grace::watcher_grace()` and
+/// five `live_query` tuning reads. Pointing `HOME` at a fixture containing
+/// `watcherGraceSecs: 999, watcherPageSize: 7` changed the SAME
+/// `cargo test -p k9rs_kube` run from `60s / 1000` to `999s / 7`.
+///
+/// The assertion is on the MECHANISM, not the values: `watcher_page_size ==
+/// 1000` alone passes vacuously on a machine with no `daemon:` section — and
+/// that is precisely the machine where this bug is invisible. Checking the
+/// slot is empty holds everywhere, and is reachable only because this mirror
+/// is a child module of `daemon_config` and can see a private static.
+///
+/// Second instance of this class; `overlay::OVERLAYS` was the first, and was
+/// fixed in this exact shape without anyone sweeping for siblings.
+#[test]
+fn a_process_that_never_loads_its_config_uses_defaults() {
+    assert!(
+        CONFIG.get().is_none(),
+        "something loaded the real config file during the test run — the \
+         suite is no longer hermetic, and whichever test did it now depends \
+         on whatever is in the developer's ~/.config/k9rs/config.yaml",
+    );
+    // And the reader agrees, so a future `get_or_init` cannot quietly make
+    // the slot non-empty while still answering with defaults.
+    assert_eq!(daemon_config().watcher_page_size, DaemonConfig::default().watcher_page_size);
+}
+

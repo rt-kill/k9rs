@@ -1,0 +1,16 @@
+[package]
+name = "k9rs_config"
+version.workspace = true
+edition.workspace = true
+description = "k9rs: which file configuration comes from, and what a missing section means"
+
+# A leaf, deliberately. It holds the FILE, not any interpretation of it: the
+# TUI's section is `k9rs_app::config` and the daemon's is
+# `k9rs_kube::daemon_config`, and both are above this. Nothing here knows what
+# a key means.
+[dependencies]
+serde.workspace = true
+serde_yaml.workspace = true
+
+[lints]
+workspace = true

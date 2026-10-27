@@ -90,3 +90,4 @@ fn a_gate_can_be_built_and_claimed_with_no_runtime() {
     gate.release();
     assert!(gate.bump_and_claim(), "and re-claimed");
 }
+

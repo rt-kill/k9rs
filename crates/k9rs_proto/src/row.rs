@@ -6,7 +6,7 @@ use std::fmt;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use k9rs_util::{format_age_secs, format_cpu, format_mem};
+use k9rs_util::units::{format_age_secs, format_cpu, format_mem};
 
 /// Row health indicator, computed server-side by each converter.
 /// The client reads this for row coloring — no resource-type-specific

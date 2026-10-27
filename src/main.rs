@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 use k9rs_app::App;
-use k9rs_app::event::AppEvent;
+use k9rs_app::AppEvent;
 
 #[derive(Parser, Debug)]
 #[command(name = "k9rs", version, about = "A fast Kubernetes TUI")]
@@ -107,12 +107,15 @@ impl Drop for TerminalGuard {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Overlays come from the process entry point, not from whoever reads them
-    // first. BEFORE the dispatch below, so the daemon, the TUI and any
-    // subcommand added later all get them from one site — and so the only
-    // processes without them are the ones that never run `main`, i.e. the test
-    // binaries. See `kube::overlay::OVERLAYS`.
+    // Everything read from `$HOME` is read HERE, at the process entry point,
+    // not by whoever touches it first. BEFORE the dispatch below, so the
+    // daemon, the TUI and any subcommand added later all get it from one
+    // site — and so the only processes without it are the ones that never run
+    // `main`, i.e. the test binaries. That last part is the point: both of
+    // these were `LazyLock`s that read `$HOME` on first touch, which made the
+    // suite's results depend on the developer's own config.
     k9rs_proto::overlay::load_from_home();
+    k9rs_kube::daemon_config::load_from_home();
 
     // Subcommand dispatch: daemon, ctl, contexts
     if let Some(subcmd) = cli.subcmd {
@@ -167,14 +170,14 @@ async fn main() -> Result<()> {
     let (event_tx, event_rx) =
         mpsc::channel::<AppEvent>(k9rs_session::EVENT_CHANNEL_CAP);
 
-    use k9rs_app::client::ClientSession;
+    use k9rs_app::ClientSession;
 
     // Load + validate the user config BEFORE any TUI setup: a config
     // error prints to a normal, visible stderr and exits. The strict
     // validation (unknown fields, malformed/reserved key chords) is
     // only worth anything if its rejection reaches the user — a silent
     // fallback to defaults would quietly drop settings like readOnly.
-    let mut config = match App::load_config() {
+    let mut config = match k9rs_app::load_config() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("k9rs: config error: {e}");
@@ -199,7 +202,7 @@ async fn main() -> Result<()> {
     // inside `subscribe_stream` await the MuxHandle, so subscribes fire
     // as soon as the connection is up.
     let data_source = ClientSession::new(
-        k9rs_app::client::ConnectionParams {
+        k9rs_app::ConnectionParams {
             context: cli_context.clone(),
             namespace: namespace.clone(),
             readonly: cli.readonly,
@@ -527,7 +530,7 @@ fn parse_startup_segments(cli: &Cli) -> Vec<StartupSegment> {
 
 fn apply_startup_nav(
     app: &mut App,
-    data_source: &k9rs_app::client::ClientSession,
+    data_source: &k9rs_app::ClientSession,
     segments: &[StartupSegment],
 ) {
     if segments.is_empty() {
@@ -557,11 +560,11 @@ fn apply_startup_nav(
     for seg in &segments[1..] {
         match seg {
             StartupSegment::Filter(pattern) => {
-                let predicate = k9rs_app::store::RowPredicate::Grep(
-                    k9rs_app::nav::CompiledGrep::new(pattern),
+                let predicate = k9rs_app::RowPredicate::Grep(
+                    k9rs_util::CompiledGrep::new(pattern),
                 );
                 if let Ok(el) =
-                    k9rs_app::element::Element::derive_filter(app.nav.top(), predicate)
+                    k9rs_app::Element::derive_filter(app.nav.top(), predicate)
                 {
                     app.nav.push(el);
                 }

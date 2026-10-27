@@ -185,6 +185,19 @@ macro_rules! built_in_kinds {
             /// Every variant, generated from the enum's own declaration.
             pub const ALL: &'static [$name] = &[$($name::$variant),*];
 
+            /// This kind as a [`ResourceId`].
+            ///
+            /// Symmetric with
+            /// [`LocalResourceKind::to_resource_id`](crate::local_types::LocalResourceKind::to_resource_id),
+            /// which had it and this did not — so the TUI grew a
+            /// `nav::rid(kind)` helper three crates up, in the navigation
+            /// module, duplicating the `From` impl below. A missing method on
+            /// one of two sibling enums is how a constructor ends up filed
+            /// under something unrelated.
+            pub fn to_resource_id(self) -> ResourceId {
+                ResourceId::from(self)
+            }
+
             /// This kind's definition — identity, aliases, columns, operations.
             ///
             /// Generated from the SAME declaration as the enum and `ALL`, so

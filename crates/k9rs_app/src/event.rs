@@ -562,7 +562,7 @@ fn apply_resource_update(
             // injection) onto the screen.
             for line in &mut lines {
                 if line.text.chars().any(|c| c.is_control() && c != '\t') {
-                    line.text = k9rs_util::sanitize_terminal(&line.text);
+                    line.text = k9rs_util::text::sanitize_terminal(&line.text);
                 }
             }
             // Delivery walk, same shape as Yaml above. `DecodedSecret`
@@ -615,7 +615,7 @@ fn apply_resource_update(
 
 
 /// Write the YAML returned by the server to a temp file the editor can
-/// open. Goes through [`k9rs_util::safe_write_temp`] which puts the file
+/// open. Goes through [`k9rs_util::temp::safe_write_temp`] which puts the file
 /// in our per-process `0700` dir and uses `O_CREAT | O_EXCL` so a planted
 /// symlink can't divert the write to an attacker-chosen location. The
 /// filename still embeds the resource type + name so editors that show
@@ -635,7 +635,7 @@ fn write_edit_temp_file(
         safe(&target.name),
         n,
     );
-    k9rs_util::safe_write_temp(&filename, yaml.as_bytes())
+    k9rs_util::temp::safe_write_temp(&filename, yaml.as_bytes())
 }
 
 #[cfg(test)]

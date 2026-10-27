@@ -6,8 +6,8 @@
 //! `app`, `ui` or `session`. `main.rs` dispatches to whichever side the
 //! command line asked for.
 
-pub mod contexts;
-pub mod ctl;
+pub(crate) mod contexts;
+pub(crate) mod ctl;
 
 use anyhow::Result;
 use clap::Subcommand;

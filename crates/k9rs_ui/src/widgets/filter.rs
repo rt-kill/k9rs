@@ -10,20 +10,20 @@ use k9rs_theme::Theme;
 
 /// Filter input widget: bordered box with `/` prefix,
 /// visible block cursor, and match count.
-pub struct FilterBar<'a> {
+pub(crate) struct FilterBar<'a> {
     active: bool,
     text: &'a str,
     match_count: usize,
     total_count: usize,
     /// Why the pattern isn't running as a regex, if it isn't
-    /// ([`k9rs_app::element::Element::grep_fallback`]). Rendered because
+    /// ([`k9rs_app::Element::grep_fallback`]). Rendered because
     /// the alternative is a `[0/47]` the user has no way to explain.
     fallback: Option<&'a str>,
     theme: &'a Theme,
 }
 
 impl<'a> FilterBar<'a> {
-    pub fn new(
+    pub(crate) fn new(
         active: bool,
         text: &'a str,
         match_count: usize,
@@ -40,7 +40,7 @@ impl<'a> FilterBar<'a> {
         }
     }
 
-    pub fn fallback(mut self, why: Option<&'a str>) -> Self {
+    pub(crate) fn fallback(mut self, why: Option<&'a str>) -> Self {
         self.fallback = why;
         self
     }
@@ -72,7 +72,7 @@ impl<'a> FilterBar<'a> {
 /// Chrome that explains why the content is empty cannot be owned by the
 /// content. (It also stopped covering the last log row, which it used to paint
 /// over while the Viewport still counted that row as visible.)
-pub struct LogFilterBar<'a> {
+pub(crate) struct LogFilterBar<'a> {
     /// Whether the draft input is open — `/` pressed, not yet committed.
     active: bool,
     /// Text being typed. Empty unless `active`.
@@ -92,7 +92,7 @@ pub struct LogFilterBar<'a> {
 }
 
 impl<'a> LogFilterBar<'a> {
-    pub fn new(
+    pub(crate) fn new(
         active: bool,
         draft: &'a str,
         caret_col: usize,
@@ -103,14 +103,14 @@ impl<'a> LogFilterBar<'a> {
         Self { active, draft, caret_col, committed, visible_count, fallback: None, theme }
     }
 
-    pub fn fallback(mut self, why: Option<&'a str>) -> Self {
+    pub(crate) fn fallback(mut self, why: Option<&'a str>) -> Self {
         self.fallback = why;
         self
     }
 
     /// Whether this bar has anything to say. The view asks BEFORE laying out,
     /// so an idle bar costs no row — and the row it does claim is never blank.
-    pub fn wants_row(&self) -> bool {
+    pub(crate) fn wants_row(&self) -> bool {
         self.active || !self.committed.is_empty()
     }
 }
@@ -164,7 +164,7 @@ impl Widget for LogFilterBar<'_> {
             // `- 1` for the caret block itself.
             let avail = (area.width as usize).saturating_sub(used).saturating_sub(1);
             let (draft, caret_col) =
-                k9rs_util::window_around(self.draft, self.caret_col, avail);
+                k9rs_util::width::window_around(self.draft, self.caret_col, avail);
             let mut col = 0usize;
             let mut at = draft.len();
             for (i, g) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(draft, true) {

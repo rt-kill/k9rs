@@ -9,16 +9,16 @@ use k9rs_theme::Theme;
 /// the TUI and enters raw bridge mode (this code is never reached).
 ///
 /// Claims the whole frame, so it declares
-/// [`k9rs_app::element::ViewExtent::Full`] and `ui::draw` erases the frame
+/// [`k9rs_app::ViewExtent::Full`] and `ui::draw` erases the frame
 /// first: the block below paints a border and one centered line, and every
 /// interior cell it never writes would otherwise still hold the view
 /// underneath.
-pub fn draw_shell(
+pub(crate) fn draw_shell(
     f: &mut Frame,
     shell: &ShellState,
     area: Rect,
     theme: &Theme,
-    anim: &k9rs_app::anim::Anim,
+    anim: &k9rs_app::Anim,
 ) {
     let block = Block::bordered()
         .title(Span::styled(

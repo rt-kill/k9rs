@@ -51,6 +51,20 @@ const DISCOVERY_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Run the cache daemon. Stays alive until killed (Ctrl-C / SIGTERM).
 pub async fn run_daemon() -> anyhow::Result<()> {
+    // Idempotent, and deliberately duplicated with `main`'s call. The daemon's
+    // tuning used to arrive via a `LazyLock` that read `$HOME` the first time
+    // anything deep inside `grace`/`live_query` asked — which made the test
+    // suite depend on the developer's config file. Making it explicit fixed
+    // that and introduced a new way to be wrong: a future entry point that
+    // forgets the call gets a daemon silently running on defaults. There are
+    // only two entries today (`k9rs daemon` and the in-process `--no-daemon`
+    // TUI) and both go through `main`, but this one no longer has to.
+    //
+    // Safe to call here precisely because no test calls `run_daemon` — it
+    // binds a real socket. The hermeticity pin in `daemon_config`'s mirror is
+    // what would catch it if one ever did.
+    k9rs_kube::daemon_config::load_from_home();
+
     let path = socket_path();
 
     if let Some(parent) = path.parent() {

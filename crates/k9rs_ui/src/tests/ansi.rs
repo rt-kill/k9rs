@@ -52,7 +52,7 @@ fn visible_text_matches_the_spans() {
             .map(|s| s.content.to_string())
             .collect();
         assert_eq!(
-            k9rs_util::visible_text(raw).as_ref(),
+            k9rs_util::text::visible_text(raw).as_ref(),
             spans,
             "visible_text disagrees with the rendered spans for {raw:?}",
         );

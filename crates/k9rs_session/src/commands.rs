@@ -1,4 +1,4 @@
-use k9rs_app::commands::ParsedCommand;
+use k9rs_app::ParsedCommand;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
@@ -22,7 +22,7 @@ pub(crate) enum InteractiveKind {
 /// disables its branch and `work` still runs to completion.
 async fn draining<F>(
     app: &mut App,
-    event_rx: &mut mpsc::Receiver<k9rs_app::event::AppEvent>,
+    event_rx: &mut mpsc::Receiver<k9rs_app::AppEvent>,
     work: F,
 ) -> F::Output
 where
@@ -33,7 +33,7 @@ where
         tokio::select! {
             done = &mut work => return done,
             Some(event) = event_rx.recv() => {
-                k9rs_app::event::apply_event(app, event);
+                k9rs_app::apply_event(app, event);
             }
         }
     }
@@ -62,7 +62,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_interactive_local(
     app: &mut App,
-    event_rx: &mut mpsc::Receiver<k9rs_app::event::AppEvent>,
+    event_rx: &mut mpsc::Receiver<k9rs_app::AppEvent>,
     terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
     command: &str,
     args: &[String],
@@ -325,7 +325,7 @@ fn parse_crd_in_namespace(cmd: &str, app: &App) -> Option<(k9rs_app::CrdInfo, k9
 
 use crossterm::event::KeyCode;
 
-use k9rs_app::client::ClientSession;
+use k9rs_app::ClientSession;
 use crate::ds_try;
 use crate::actions::do_switch_namespace;
 
@@ -446,7 +446,7 @@ pub(crate) fn handle_command_key(
     app: &mut App,
     key: k9rs_app::TextKey,
     data_source: &mut ClientSession,
-    event_tx: &tokio::sync::mpsc::Sender<k9rs_app::event::AppEvent>,
+    event_tx: &tokio::sync::mpsc::Sender<k9rs_app::AppEvent>,
 ) -> bool {
     match edit_command_key(app, key) {
         CommandKey::NotMine => false,
@@ -469,7 +469,7 @@ fn handle_command_submit(
     raw_cmd: &str,
     cmd: &str,
     data_source: &mut ClientSession,
-    event_tx: &tokio::sync::mpsc::Sender<k9rs_app::event::AppEvent>,
+    event_tx: &tokio::sync::mpsc::Sender<k9rs_app::AppEvent>,
 ) {
     use crate::actions::handle_action;
     use crate::actions::begin_context_switch;
@@ -486,11 +486,11 @@ fn handle_command_submit(
         ParsedCommand::Help => {
             // `:help` and `?` are the same thing, so they go through the same
             // action rather than each constructing the view themselves.
-            handle_action(app, k9rs_app::actions::Action::Help, event_tx, data_source);
+            handle_action(app, k9rs_app::Action::Help, event_tx, data_source);
         }
         ParsedCommand::Overview => {
-            app.nav.reset(k9rs_app::element::Element::Overview(
-                k9rs_app::element::Overview,
+            app.nav.reset(k9rs_app::Element::Overview(
+                k9rs_app::Overview,
             ));
         }
         ParsedCommand::ContextSwitch(ctx_name) => {
@@ -525,10 +525,10 @@ fn handle_command_submit(
                 &app.core, rid, app.kube.selected_ns.clone(),
             );
             app.nav.reset(root);
-            let predicate = k9rs_app::store::RowPredicate::Grep(
-                k9rs_app::nav::CompiledGrep::new(filter),
+            let predicate = k9rs_app::RowPredicate::Grep(
+                k9rs_util::CompiledGrep::new(filter),
             );
-            if let Ok(el) = k9rs_app::element::Element::derive_filter(app.nav.top(), predicate) {
+            if let Ok(el) = k9rs_app::Element::derive_filter(app.nav.top(), predicate) {
                 app.nav.push(el);
             }
         }
@@ -614,7 +614,7 @@ pub(crate) fn handle_form_dialog_key(
     // The form is an ELEMENT now; its typing still runs here because a
     // keystroke that edits text has to mutate, and `handle_key_event` only
     // names actions. Every other text surface is handled the same way.
-    if !matches!(app.nav.top(), k9rs_app::element::Element::Form(_)) {
+    if !matches!(app.nav.top(), k9rs_app::Element::Form(_)) {
         return false;
     }
     match key.code() {
@@ -642,7 +642,7 @@ pub(crate) fn handle_form_dialog_key(
                 return false;
             }
             if d.ok_focused() {
-                if let Some(k9rs_app::element::Element::Form(dialog)) = app.nav.pop() {
+                if let Some(k9rs_app::Element::Form(dialog)) = app.nav.pop() {
                     let dialog = *dialog;
                     dispatch_form_submit(app, data_source, dialog);
                 }

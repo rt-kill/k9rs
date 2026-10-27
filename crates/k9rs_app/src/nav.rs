@@ -29,47 +29,12 @@ use std::sync::Arc;
 use crate::element::Element;
 use crate::client::ClientSession;
 use k9rs_proto::protocol::ResourceId;
-use k9rs_util::SearchPattern;
 
 /// Typed K8s field selector. Defined in [`k9rs_proto::row`]
 /// because it rides the wire inside `DrillTarget` (WIRE-FROZEN there);
 /// re-exported here because drill construction is its main client-side
 /// consumer.
 pub use k9rs_proto::row::K8sFieldSelector;
-
-// ---------------------------------------------------------------------------
-// CompiledGrep — a pattern compiled exactly once
-// ---------------------------------------------------------------------------
-
-/// A grep pattern compiled exactly once, at predicate construction.
-/// Carries both the source text (for crumbs and completion round-trips)
-/// and the compiled [`SearchPattern`] so per-frame derives never
-/// recompile.
-#[derive(Debug, Clone)]
-pub struct CompiledGrep {
-    source: String,
-    pattern: SearchPattern,
-}
-
-impl CompiledGrep {
-    /// Compile from raw user text. Smartcase rules live inside
-    /// [`SearchPattern::new`].
-    pub fn new(source: impl Into<String>) -> Self {
-        let source = source.into();
-        let pattern = SearchPattern::new(&source);
-        Self { source, pattern }
-    }
-
-    /// The original pattern text (crumb rendering, debug output).
-    pub fn source(&self) -> &str {
-        &self.source
-    }
-
-    /// The compiled pattern — no allocation, no recompile in hot paths.
-    pub fn pattern(&self) -> &SearchPattern {
-        &self.pattern
-    }
-}
 
 // ---------------------------------------------------------------------------
 // RootSpec — the recipe for reconstructing a root (NOT a live element)
@@ -464,13 +429,6 @@ impl Drop for NavStack {
 
 fn root_spec_of(root: &Element) -> Option<RootSpec> {
     root.rid().cloned().map(RootSpec::Resource)
-}
-
-/// Convenience helper: build a built-in `ResourceId` from a typed
-/// [`BuiltInKind`](k9rs_proto::resource_def::BuiltInKind). Compile-time
-/// checked: typos become E0599, not runtime panics.
-pub fn rid(kind: k9rs_proto::resource_def::BuiltInKind) -> ResourceId {
-    ResourceId::BuiltIn(kind)
 }
 
 // ---------------------------------------------------------------------------

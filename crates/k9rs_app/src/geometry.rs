@@ -48,14 +48,14 @@ pub fn confirm_dialog_size(dialog: &crate::ConfirmDialog) -> (u16, u16) {
 
 /// The box a container picker needs, in cells — the same computation the
 /// renderer uses, so the float and the drawing agree on one rect.
-pub fn container_picker_size(p: &crate::ContainerPicker) -> (u16, u16) {
+pub(crate) fn container_picker_size(p: &crate::ContainerPicker) -> (u16, u16) {
     let widest = p.choices.iter().map(|c| c.label.len()).max().unwrap_or(10) as u16;
     ((widest + 6).clamp(30, 60), p.choices.len() as u16 + 4)
 }
 
 /// The box a form needs, in cells — one computation for the widget that
 /// draws it and the extent that reserves space for it.
-pub fn form_dialog_size(dialog: &crate::FormDialog) -> (u16, u16) {
+pub(crate) fn form_dialog_size(dialog: &crate::FormDialog) -> (u16, u16) {
     let label_w = dialog.fields.iter().map(|f| f.label.width() as u16).max().unwrap_or(0);
     let has_select = dialog.fields.iter().any(|f| matches!(f.kind, FormFieldKind::Select { .. }));
     // Mirrors the hint line the widget builds below; the arrow hints only

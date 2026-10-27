@@ -47,7 +47,7 @@ struct TableSnapshot<'a> {
     row_health: &'a [k9rs_proto::row::RowHealth],
     cell_style: &'a [Vec<Option<k9rs_proto::row::RowHealth>>],
     /// Pre-computed per-column display widths, carried from the memoized
-    /// [`k9rs_app::store::PreparedView`] so the widget doesn't re-scan rows each frame.
+    /// [`k9rs_app::PreparedView`] so the widget doesn't re-scan rows each frame.
     col_widths: &'a [u16],
     search_patterns: &'a [k9rs_util::SearchPattern],
     /// Non-live rows are still painted, but never silently — see
@@ -113,7 +113,7 @@ fn draw_resource_table(
 /// +--breadcrumbs (1 line)--------------------------------------+
 /// +--flash (1 line)--------------------------------------------+
 /// ```
-pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
+pub(crate) fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.ui.theme;
 
     // A FLOATING element renders its content only: the cluster header, the
@@ -306,7 +306,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         .saturating_sub(suffix_w)
         .saturating_sub(2); // the spaces either side of the path
     let bc = app.nav.breadcrumb();
-    let bc = k9rs_util::truncate_left(&bc, budget as usize);
+    let bc = k9rs_util::width::truncate_left(&bc, budget as usize);
     let mut spans = Vec::new();
     spans.push(Span::styled(format!(" {} ", bc), theme.title));
     if app.nav.is_drilled() {
@@ -333,7 +333,7 @@ pub fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
 // Command prompt
 // ---------------------------------------------------------------------------
 
-pub fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+pub(crate) fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     if area.height < 3 || area.width == 0 {
         return;
     }
@@ -376,7 +376,7 @@ pub fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &Theme) 
     let left = avail.saturating_sub(shown.width());
     if !ghost.is_empty() && left > 0 {
         spans.push(Span::styled(
-            k9rs_util::truncate(&ghost, left),
+            k9rs_util::width::truncate(&ghost, left),
             theme.command_suggestion.add_modifier(Modifier::DIM | Modifier::ITALIC),
         ));
     }

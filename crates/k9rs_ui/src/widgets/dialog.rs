@@ -12,13 +12,13 @@ use k9rs_theme::Theme;
 use crate::widgets::modal::{ModalOverlay, DialogSize};
 
 /// Confirmation dialog — centered modal with Cancel / Action buttons.
-pub struct ConfirmDialogWidget<'a> {
+pub(crate) struct ConfirmDialogWidget<'a> {
     dialog: &'a ConfirmDialog,
     theme: &'a Theme,
 }
 
 impl<'a> ConfirmDialogWidget<'a> {
-    pub fn new(dialog: &'a ConfirmDialog, theme: &'a Theme) -> Self {
+    pub(crate) fn new(dialog: &'a ConfirmDialog, theme: &'a Theme) -> Self {
         Self { dialog, theme }
     }
 }
@@ -31,7 +31,7 @@ impl Widget for ConfirmDialogWidget<'_> {
         let msg_lines: Vec<&str> = self.dialog.message.lines().collect();
         let cancel_text = " Cancel ".to_string();
         let action_text = format!(" {} ", self.dialog.action_label);
-        let (w, h) = k9rs_app::geometry::confirm_dialog_size(self.dialog);
+        let (w, h) = k9rs_app::confirm_dialog_size(self.dialog);
 
         let hints = Line::from(vec![
             Span::styled("<\u{2190}/\u{2192}>", self.theme.status_bar_key),
@@ -95,13 +95,13 @@ impl Widget for ConfirmDialogWidget<'_> {
 // (see `FormDialog::focused`), which left OK as the only way out of a form
 // you had opened by mistake.
 
-pub struct FormDialogWidget<'a> {
+pub(crate) struct FormDialogWidget<'a> {
     dialog: &'a FormDialog,
     theme: &'a Theme,
 }
 
 impl<'a> FormDialogWidget<'a> {
-    pub fn new(dialog: &'a FormDialog, theme: &'a Theme) -> Self {
+    pub(crate) fn new(dialog: &'a FormDialog, theme: &'a Theme) -> Self {
         Self { dialog, theme }
     }
 }

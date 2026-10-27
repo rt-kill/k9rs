@@ -25,6 +25,7 @@ chrono.workspace = true
 dashmap.workspace = true
 futures.workspace = true
 k8s-openapi.workspace = true
+k9rs_config.workspace = true
 k9rs_proto.workspace = true
 k9rs_util.workspace = true
 kube.workspace = true

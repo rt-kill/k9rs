@@ -3,8 +3,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::actions::{Action, LogRange};
 use crate::{App, TakeoverOp};
 use crate::element::Element;
-#[cfg(test)]
-use crate::nav::rid;
 use super::keymap::ViewClass;
 
 /// The chord of a key event, if it is a character key (Ctrl tracked,

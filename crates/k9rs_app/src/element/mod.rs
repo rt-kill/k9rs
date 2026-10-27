@@ -23,13 +23,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::nav::{CompiledGrep, FilterInputState};
+use crate::nav::FilterInputState;
+use k9rs_util::CompiledGrep;
 use crate::store::{
     derive_view, DeriveSpec, LineStore, MetricsBinding, MetricsHub, PreparedView, RowPredicate,
     RowSource, RowStore, SortSpec,
 };
 use crate::table::TableDataState;
-use crate::types::ItemCounts;
+use crate::state::ItemCounts;
 use crate::view::DerivedViewKind;
 use crate::ColumnLevel;
 use crate::client::{ClientSession, LogStream, SubscriptionStream};
@@ -752,7 +753,7 @@ pub enum SpanOutcome {
 /// display toggles, the draft filter being typed). The visible-line set is
 /// the ephemeral view: derived on read, memoized, droppable.
 ///
-/// Named for what it is, and to pair with [`TableInteraction`]: it used to be
+/// Named for what it is, and to pair with `TableInteraction`: it used to be
 /// `LogViewState`, which is also the name of the log WIDGET's per-draw
 /// parameter block (`ui::widgets::LogViewState`) — two different things one
 /// `use` away from each other.
@@ -763,7 +764,7 @@ pub struct LogInteraction {
     /// the follow/autoscroll flag too.
     pub viewport: crate::viewport::Viewport,
     /// Horizontal panning, in display columns. Its own type because it is the
-    /// other axis, not another viewport — see [`crate::viewport::Pan`].
+    /// other axis, not another viewport — see `viewport::Pan`.
     pub pan: crate::viewport::Pan,
     pub wrap: bool,
     /// How many chrome roles are hidden — see
@@ -858,7 +859,7 @@ pub enum Sense {
 
 /// One step of the committed grep chain: a pattern and what to do with it.
 #[derive(Debug, Clone)]
-pub struct Narrowing {
+pub(crate) struct Narrowing {
     pattern: Arc<CompiledGrep>,
     sense: Sense,
 }
@@ -868,7 +869,7 @@ impl Narrowing {
     /// whether the line matches a pattern. The tester is the caller's,
     /// because WHICH parts of a line a grep sees is `Role::searchable`'s to
     /// say and not this type's.
-    pub fn admits(&self, matches: impl Fn(&k9rs_util::SearchPattern) -> bool) -> bool {
+    pub(crate) fn admits(&self, matches: impl Fn(&k9rs_util::SearchPattern) -> bool) -> bool {
         let hit = matches(self.pattern.pattern());
         match self.sense {
             Sense::Keep => hit,
@@ -878,13 +879,13 @@ impl Narrowing {
 
     /// Why this step's pattern is matching literally rather than as a
     /// regex, if it is — the `[literal: …]` chip's input.
-    pub fn fallback_reason(&self) -> Option<&str> {
+    pub(crate) fn fallback_reason(&self) -> Option<&str> {
         self.pattern.pattern().fallback_reason()
     }
 
     /// As the user typed it, `!` included — what the grep bar and the
     /// breadcrumb label themselves with.
-    pub fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self.sense {
             Sense::Keep => self.pattern.source().to_string(),
             Sense::Drop => format!("!{}", self.pattern.source()),
@@ -895,7 +896,7 @@ impl Narrowing {
     /// is visible. A `Drop` step has none: every line it had anything to say
     /// about is gone, so highlighting its matches would paint the one thing
     /// that is certainly not on screen.
-    pub fn highlight(&self) -> Option<&str> {
+    pub(crate) fn highlight(&self) -> Option<&str> {
         match self.sense {
             Sense::Keep => Some(self.pattern.source()),
             Sense::Drop => None,
@@ -928,7 +929,7 @@ pub fn sense_of(draft: &str) -> (Sense, &str) {
 /// A composable line source: the backing [`LineStore`] plus the
 /// accumulated committed grep chain — the log analogue of [`RowSource`].
 #[derive(Debug, Clone)]
-pub struct LineSource {
+pub(crate) struct LineSource {
     store: Arc<LineStore>,
     patterns: Vec<Narrowing>,
 }
@@ -944,7 +945,7 @@ impl LineSource {
         child
     }
 
-    pub fn store(&self) -> &Arc<LineStore> {
+    pub(crate) fn store(&self) -> &Arc<LineStore> {
         &self.store
     }
 }
@@ -1407,7 +1408,7 @@ pub struct Overview;
 /// what the element's accessors actually return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ElementClass {
-    /// Rows in a [`RowStore`]: cursor, sort, grep, column filter, marks.
+    /// Rows in a `RowStore`: cursor, sort, grep, column filter, marks.
     Table,
     /// A log stream: line store plus a log view.
     Log,
@@ -2177,7 +2178,7 @@ impl Element {
     /// CLIENT-owned query the connection is irrelevant, and consulting it
     /// would blank the contexts list exactly when the daemon is unreachable
     /// and you need to pick a different context.
-    pub fn liveness(&self, conn: &crate::types::Connection) -> crate::Liveness {
+    pub fn liveness(&self, conn: &crate::connection::Connection) -> crate::Liveness {
         if self.is_client_owned() {
             crate::Liveness::of_store(self.data_state())
         } else {
@@ -3041,7 +3042,7 @@ fn compile_draft(input: &FilterInputState) -> Option<SearchPattern> {
 }
 
 /// Build the committed predicate for the filter input's current state.
-pub fn predicate_for_commit(text: String, column: Option<(usize, String)>) -> RowPredicate {
+pub(crate) fn predicate_for_commit(text: String, column: Option<(usize, String)>) -> RowPredicate {
     match column {
         Some((col, header)) => RowPredicate::ColumnGrep {
             pattern: CompiledGrep::new(text),

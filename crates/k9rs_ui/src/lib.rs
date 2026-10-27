@@ -1,7 +1,7 @@
 pub mod header;
-pub mod views;
+pub(crate) mod views;
 pub mod ansi;
-pub mod widgets;
+pub(crate) mod widgets;
 
 /// Header panel height in rows (context/cluster/user + logo).
 pub const HEADER_HEIGHT: u16 = 5;
@@ -45,7 +45,7 @@ pub fn draw_centered_loading(
     area: ratatui::layout::Rect,
     message: &str,
     style: ratatui::style::Style,
-    anim: &k9rs_app::anim::Anim,
+    anim: &k9rs_app::Anim,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -94,7 +94,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Widget};
 use ratatui::Frame;
 
-use k9rs_app::element::Element;
+use k9rs_app::Element;
 use k9rs_app::{App, TakeoverOp};
 use crate::widgets::{ConfirmDialogWidget, FormDialogWidget, FilterBar, FlashWidget};
 
@@ -127,8 +127,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .top_mut()
         .ensure_view_cached(app.ui.column_level, app.config.ui.max_column_width);
     let top_area = match app.nav.top().extent(frame) {
-        k9rs_app::element::ViewExtent::Full => frame,
-        k9rs_app::element::ViewExtent::Dialog { width, height } => {
+        k9rs_app::ViewExtent::Full => frame,
+        k9rs_app::ViewExtent::Dialog { width, height } => {
             if let Some(float) = app.nav.lift_top_for_render() {
                 draw_top_element(f, app, frame);
                 app.nav.replace_lifted(float);
@@ -150,11 +150,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // being re-remembered per renderer.
     let takeover_area = match app.ui.takeover().map(|op| op.extent(frame)) {
         None => frame,
-        Some(k9rs_app::element::ViewExtent::Full) => {
+        Some(k9rs_app::ViewExtent::Full) => {
             f.render_widget(Clear, frame);
             frame
         }
-        Some(k9rs_app::element::ViewExtent::Dialog { width, height }) => {
+        Some(k9rs_app::ViewExtent::Dialog { width, height }) => {
             dialog_box(f, frame, width, height, &app.ui.theme)
         }
     };
@@ -240,7 +240,7 @@ fn draw_top_element(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             views::resource::draw_resources(f, app, area);
         }
         Element::ContentView(cv) => match cv.kind {
-            k9rs_app::element::ContentSpec::Yaml(_) => views::yaml::draw_yaml(f, app, area),
+            k9rs_app::ContentSpec::Yaml(_) => views::yaml::draw_yaml(f, app, area),
             _ => views::describe::draw_describe(f, app, area),
         },
         Element::LogSession(_) | Element::LogFilter(_) => {
@@ -444,7 +444,7 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
     let left = avail.saturating_sub(shown.width());
     if !ghost.is_empty() && left > 0 {
         spans.push(Span::styled(
-            k9rs_util::truncate(&ghost, left),
+            k9rs_util::width::truncate(&ghost, left),
             theme.command_suggestion.add_modifier(Modifier::DIM | Modifier::ITALIC),
         ));
     }

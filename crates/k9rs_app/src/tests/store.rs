@@ -1,10 +1,10 @@
 use super::*;
-use crate::nav::CompiledGrep;
+use k9rs_util::CompiledGrep;
 use k9rs_proto::protocol::{LogLine, TableBaseline, TableDelta};
 use k9rs_proto::resource_def::BuiltInKind;
 
 fn rid() -> ResourceId {
-    ResourceId::BuiltIn(BuiltInKind::Pod)
+    BuiltInKind::Pod.to_resource_id()
 }
 
 fn row(name: &str, ns: &str, cells: &[&str]) -> ResourceRow {
@@ -581,7 +581,7 @@ fn the_committed_grep_also_scans_only_visible_columns() {
     };
     let cells: Vec<String> =
         row.cells.iter().map(|c| c.to_string()).collect();
-    let grep = RowPredicate::Grep(crate::nav::CompiledGrep::new("pimp"));
+    let grep = RowPredicate::Grep(k9rs_util::CompiledGrep::new("pimp"));
 
     assert!(
         !grep.matches(&row, &cells, &[0, 1]),
@@ -595,7 +595,7 @@ fn the_committed_grep_also_scans_only_visible_columns() {
     // A column-restricted grep (`~`) indexes ABSOLUTE data columns, so it is
     // unaffected by which happen to be on screen.
     let col = RowPredicate::ColumnGrep {
-        pattern: crate::nav::CompiledGrep::new("pimp"),
+        pattern: k9rs_util::CompiledGrep::new("pimp"),
         col: 2,
         header: "IMAGES".into(),
     };
@@ -685,7 +685,7 @@ fn a_stored_line_derives_its_visible_text_once() {
     let line = stored(Some("2026-09-18T20:29:40.6Z"), Some("web"), coloured);
 
     // The one definition, not a second copy of its rules.
-    assert_eq!(line.visible(), k9rs_util::visible_text(coloured).as_ref());
+    assert_eq!(line.visible(), k9rs_util::text::visible_text(coloured).as_ref());
     assert_eq!(line.visible(), "ts  INFO workers=0");
     // `Deref`: the RAW content is still there, because the renderer's colour
     // comes from it. Both forms, one line, no third view.

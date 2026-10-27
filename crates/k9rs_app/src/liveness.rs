@@ -27,7 +27,7 @@
 //! here, where every surface picks it up at once.
 
 use crate::table::TableDataState;
-use crate::types::Connection;
+use crate::connection::Connection;
 
 /// How much a view may claim about the data it is about to paint.
 ///
@@ -64,9 +64,9 @@ impl Liveness {
     /// header chrome, the overview's aggregate counters).
     pub fn of_link(conn: &Connection) -> Self {
         match conn.link() {
-            crate::types::LinkState::Live => Liveness::Live,
-            crate::types::LinkState::Connecting => Liveness::Connecting,
-            crate::types::LinkState::NoContext => Liveness::NoContext,
+            crate::connection::LinkState::Live => Liveness::Live,
+            crate::connection::LinkState::Connecting => Liveness::Connecting,
+            crate::connection::LinkState::NoContext => Liveness::NoContext,
         }
     }
 
@@ -86,7 +86,7 @@ impl Liveness {
 
     /// Liveness from the STORE alone, for rows that do not come over the
     /// connection at all — a client-owned query (see
-    /// [`crate::element::LiveQuery::client`]). Asking `of` here would
+    /// `LiveQuery::client`). Asking `of` here would
     /// let a dead daemon hide the kubeconfig's own contexts, which is
     /// precisely the screen you need when the daemon can't be reached.
     pub fn of_store(state: TableDataState) -> Self {
@@ -128,7 +128,7 @@ impl Liveness {
     /// cleans it too, but this is the last line and the one that travels with
     /// the string.
     pub fn warning(&self) -> Option<String> {
-        use k9rs_util::sanitize_terminal as clean;
+        use k9rs_util::text::sanitize_terminal as clean;
         match self {
             Liveness::Stale(reason) => Some(format!("⚠ STALE — {}", clean(reason))),
             Liveness::Failed(err) => Some(format!("✗ ERROR — {}", clean(err))),
@@ -150,8 +150,8 @@ impl Liveness {
             Liveness::Connecting => anim.bar("Connecting..."),
             Liveness::Loading => anim.bar("Loading..."),
             // Cluster-controlled; see `warning` above.
-            Liveness::Failed(err) => format!("Error: {}", k9rs_util::sanitize_terminal(err)),
-            Liveness::Stale(reason) => format!("Stale: {}", k9rs_util::sanitize_terminal(reason)),
+            Liveness::Failed(err) => format!("Error: {}", k9rs_util::text::sanitize_terminal(err)),
+            Liveness::Stale(reason) => format!("Stale: {}", k9rs_util::text::sanitize_terminal(reason)),
             Liveness::Live => empty_label(),
         }
     }

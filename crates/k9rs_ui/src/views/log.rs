@@ -5,7 +5,7 @@ use ratatui::{
 };
 
 use k9rs_app::App;
-use k9rs_app::store::StoredLine;
+use k9rs_app::StoredLine;
 use crate::widgets::{LogFilterBar, LogViewer};
 
 /// Draw the log streaming view for the TOP element (LogSession or a
@@ -24,7 +24,7 @@ use crate::widgets::{LogFilterBar, LogViewer};
 /// +--indicator bar (1 line)-------------------------------------+
 /// +--keybinding bar (1 line)------------------------------------+
 /// ```
-pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
+pub(crate) fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     // Same authority as every other data view. `of_link` rather than `of`
     // because a log stream has no cluster-side stream state to consult: the
     // store can't self-report either — its `live` flag stays true across a
@@ -147,7 +147,7 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     // log. The connecting path was guarded against exactly this by hand; the
     // other three were not, and a bool would have let the next one be missed
     // too.
-    let mut measured: Option<(usize, usize, usize, k9rs_app::viewport::LineAnchor)> = None;
+    let mut measured: Option<(usize, usize, usize, k9rs_app::LineAnchor)> = None;
     if link_connecting {
         crate::draw_centered_loading(f, content_area, "Connecting...", theme.status_pending, anim);
     } else {
@@ -196,7 +196,7 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
                         view_state.offset,
                         view_state.content_rows,
                         view_state.widest,
-                        k9rs_app::viewport::LineAnchor {
+                        k9rs_app::LineAnchor {
                             seq: inner.evicted + i as u64,
                             skip: top_skip,
                         },
@@ -316,7 +316,7 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Keybinding bar
     // Projected from the ONE keymap declaration — see `event::keymap`.
-    let hints = k9rs_app::keymap::bar_hints(k9rs_app::keymap::ViewClass::Log);
+    let hints = k9rs_app::bar_hints(k9rs_app::ViewClass::Log);
 
     crate::fill_line_bg(f, bar_area, theme.status_bar);
 

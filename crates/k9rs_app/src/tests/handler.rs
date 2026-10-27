@@ -14,7 +14,7 @@ fn make_key(code: KeyCode) -> KeyEvent {
 /// Reset the nav stack to a test-only root list element for `kind`
 /// (parked stream — no session, no daemon).
 fn reset_to_kind(app: &mut App, kind: k9rs_proto::resource_def::BuiltInKind) {
-    reset_to_rid(app, rid(kind));
+    reset_to_rid(app, kind.to_resource_id());
 }
 
 fn reset_to_rid(app: &mut App, resource: k9rs_proto::protocol::ResourceId) {
@@ -483,7 +483,7 @@ fn test_q_goes_back_in_container_select() {
     app.nav.push(crate::element::Element::Picker(Box::new(
         crate::ContainerPicker {
             target: k9rs_proto::protocol::ObjectRef::new(
-                crate::nav::rid(k9rs_proto::resource_def::BuiltInKind::Pod),
+                k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
                 "p".to_string(),
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             ),

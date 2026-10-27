@@ -31,8 +31,8 @@ pub enum SortTarget {
 }
 
 /// Canonical header names the semantic sort keys resolve against.
-pub const COL_NAME: &str = "NAME";
-pub const COL_AGE: &str = "AGE";
+pub(crate) const COL_NAME: &str = "NAME";
+pub(crate) const COL_AGE: &str = "AGE";
 
 /// Represents every discrete user action that the application can handle.
 /// Actions are produced by the event handler (keystroke → Action mapping;

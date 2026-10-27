@@ -648,7 +648,7 @@ fn parse_pf_row_name(name: &str) -> Result<u64, String> {
 fn format_describe(entry: &PortForwardEntry) -> String {
     let mut out = String::new();
     let row_name = format!("pf-{}", entry.id);
-    let age = k9rs_util::format_age_duration(entry.started_at.elapsed());
+    let age = k9rs_util::units::format_age_duration(entry.started_at.elapsed());
     let ns_display = if entry.namespace.is_empty() { "-" } else { entry.namespace.as_str() };
     let ctx_display = entry.context.as_str();
     let msg_display = if entry.last_message.is_empty() { "-" } else { entry.last_message.as_str() };
@@ -678,7 +678,7 @@ fn format_yaml(entry: &PortForwardEntry) -> Result<String, String> {
     }
     let view = Yaml {
         entry,
-        age: k9rs_util::format_age_duration(entry.started_at.elapsed()),
+        age: k9rs_util::units::format_age_duration(entry.started_at.elapsed()),
     };
     serde_yaml::to_string(&view).map_err(|e| format!("yaml serialize error: {e}"))
 }
@@ -699,7 +699,7 @@ pub fn headers() -> Vec<String> {
 
 /// Convert a [`PortForwardEntry`] to a [`ResourceRow`]. Pure function, easy to test.
 pub fn pf_to_row(entry: &PortForwardEntry) -> ResourceRow {
-    let age = k9rs_util::format_age_duration(entry.started_at.elapsed());
+    let age = k9rs_util::units::format_age_duration(entry.started_at.elapsed());
     let row_name = format!("pf-{}", entry.id);
     // Exhaustive on purpose (no `_` arm): adding a `PortForwardState`
     // variant must force a decision here, same closed-enum discipline as

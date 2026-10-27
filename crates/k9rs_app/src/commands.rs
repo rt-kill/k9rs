@@ -69,9 +69,9 @@ pub struct CommandDoc {
     /// Read only by `every_documented_command_word_is_one_the_parser_accepts`
     /// — it exists to hold the declaration and the grammar together, which is
     /// a test's job, so it is dead in a release build by design.
-    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub probe: &'static str,
-    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub accepts: fn(&ParsedCommand) -> bool,
 }
 
