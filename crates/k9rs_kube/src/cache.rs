@@ -123,7 +123,7 @@ fn now_secs() -> u64 {
 /// of the inner Vec).
 #[derive(Default)]
 pub struct PerContext {
-    pub namespaces: AtomicOption<Arc<Vec<String>>>,
+    pub namespaces: AtomicOption<Arc<[String]>>,
     /// CRD list. A `Mutex` (not the lock-free `AtomicOption`) because
     /// `merge_crd` is a read-modify-write: the lock-free peek can return a
     /// SPURIOUS `None` under reader contention, which the old merge mapped
@@ -132,7 +132,7 @@ pub struct PerContext {
     /// no spurious empty); readers still clone the inner `Arc` out under
     /// the (rarely contended) lock, so a holder keeps its snapshot alive
     /// lock-free after the read.
-    pub crds: std::sync::Mutex<Option<Arc<Vec<CachedCrd>>>>,
+    pub crds: std::sync::Mutex<Option<Arc<[CachedCrd]>>>,
     /// Coarse last-access time (seconds since [`CACHE_EPOCH`]), bumped on every
     /// read and write. A [`DiscoveryCache::sweep_stale`] pass evicts entries
     /// idle past the TTL, so the map stays bounded by *active* contexts rather
@@ -141,11 +141,11 @@ pub struct PerContext {
 }
 
 /// Lock the CRD list, recovering from a poisoned lock (the guarded data is
-/// a plain `Option<Arc<Vec<..>>>` — a panic while held leaves it in a valid
+/// a plain `Option<Arc<[..]>>` — a panic while held leaves it in a valid
 /// state, so poisoning carries no torn invariant to honor).
 fn lock_crds(
-    m: &std::sync::Mutex<Option<Arc<Vec<CachedCrd>>>>,
-) -> std::sync::MutexGuard<'_, Option<Arc<Vec<CachedCrd>>>> {
+    m: &std::sync::Mutex<Option<Arc<[CachedCrd]>>>,
+) -> std::sync::MutexGuard<'_, Option<Arc<[CachedCrd]>>> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -212,12 +212,12 @@ impl DiscoveryCache {
     pub fn set_namespaces(&self, ctx: ContextId, namespaces: Vec<String>) {
         self.entry_for(&ctx)
             .namespaces
-            .store(Some(Arc::new(namespaces)), std::sync::atomic::Ordering::AcqRel);
+            .store(Some(namespaces.into()));
     }
 
     /// Swap in a new CRD list. Same contract as `set_namespaces`.
     pub fn set_crds(&self, ctx: ContextId, crds: Vec<CachedCrd>) {
-        *lock_crds(&self.entry_for(&ctx).crds) = Some(Arc::new(crds));
+        *lock_crds(&self.entry_for(&ctx).crds) = Some(crds.into());
     }
 
     /// Merge ONE freshly-resolved CRD into the cached list (replace by
@@ -231,7 +231,7 @@ impl DiscoveryCache {
         // interleave (lost update), and the read can't spuriously see an
         // empty list and clobber it.
         let mut guard = lock_crds(&entry.crds);
-        let mut crds: Vec<CachedCrd> = guard.as_ref().map(|arc| (**arc).clone()).unwrap_or_default();
+        let mut crds: Vec<CachedCrd> = guard.as_ref().map(|arc| arc.to_vec()).unwrap_or_default();
         match crds
             .iter_mut()
             .find(|c| c.gvr.group == crd.gvr.group && c.gvr.plural == crd.gvr.plural)
@@ -239,14 +239,14 @@ impl DiscoveryCache {
             Some(slot) => *slot = crd,
             None => crds.push(crd),
         }
-        *guard = Some(Arc::new(crds));
+        *guard = Some(crds.into());
     }
 
     /// Read the cached namespace list (cloned), if any.
     pub fn namespaces(&self, ctx: &ContextId) -> Option<Vec<String>> {
         let entry = self.entries.get(ctx)?;
         entry.touch();
-        entry.namespaces.load_cloned().map(|arc| (*arc).clone())
+        entry.namespaces.load_cloned().map(|arc| arc.to_vec())
     }
 
     /// Read the cached CRD list (cloned), if any.
@@ -256,7 +256,7 @@ impl DiscoveryCache {
         // Clone the Arc out under the lock, then deep-clone lock-free so the
         // guard (and the DashMap ref) release before the Vec clone.
         let arc = lock_crds(&entry.crds).clone()?;
-        Some((*arc).clone())
+        Some(arc.to_vec())
     }
 
     /// Find the printer-columns list for a specific CRD under a context.

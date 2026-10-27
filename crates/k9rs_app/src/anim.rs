@@ -23,7 +23,7 @@
 //!     of the data coalescing budget, so retuning data batching can never make
 //!     the spinner jumpy again.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 use std::time::Duration;
 
 /// The spinner's own frame interval (~15 fps), decoupled from the data-repaint
@@ -37,10 +37,17 @@ pub struct Anim {
     frame: u64,
     /// Set by [`Anim::mark`] whenever a spinner draws in the current frame; the
     /// loop reads it after painting to decide whether to schedule the next
-    /// frame, then clears it with [`Anim::begin_frame`]. Atomic so the
-    /// immutable-`&App` draw paths (yaml / describe) can declare liveness
-    /// without needing a `&mut`.
-    animating: AtomicBool,
+    /// frame, then clears it with [`Anim::begin_frame`].
+    ///
+    /// A `Cell` because the immutable-`&App` draw paths (yaml / describe) must
+    /// be able to declare liveness without a `&mut` — interior mutability on
+    /// ONE task, which is what `Cell` means and what this is. It was an
+    /// `AtomicBool`, whose own doc gave this same `&self` reason: a type that
+    /// says "shared between threads" about something only the TUI loop ever
+    /// touches, and with no lock here for a lock-free read to be avoiding.
+    /// Compare `store::RowStore`, where the aliasing really is through an
+    /// `Arc` and `k9rs_util::one_task::OneTask` says so in the type.
+    animating: Cell<bool>,
 }
 
 impl Anim {
@@ -62,19 +69,19 @@ impl Anim {
 
     /// Declare that a spinner painted this frame. Called only by [`Anim::bar`].
     fn mark(&self) {
-        self.animating.store(true, Ordering::Relaxed);
+        self.animating.set(true);
     }
 
     /// Did a spinner draw in the frame just painted? Read by the event loop
     /// after each paint to decide whether to schedule the next animation frame.
     pub fn is_animating(&self) -> bool {
-        self.animating.load(Ordering::Relaxed)
+        self.animating.get()
     }
 
     /// Clear the per-frame liveness flag. The loop calls this before painting a
     /// new frame, so `is_animating()` reflects only THIS frame's spinners.
     pub fn begin_frame(&self) {
-        self.animating.store(false, Ordering::Relaxed);
+        self.animating.set(false);
     }
 
     /// Advance to the next animation phase. The loop calls this once per

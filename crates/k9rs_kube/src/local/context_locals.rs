@@ -41,10 +41,9 @@
 //! now lives in [`GraceGate`](crate::grace::GraceGate) and is shared by every
 //! kept-alive object in the daemon.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
 
 use k9rs_proto::protocol::{ContextId, ResourceId};
 
@@ -62,8 +61,8 @@ pub struct ContextLocals {
     port_forwards: Arc<PortForwardSource>,
     /// `Weak`: derived views are demand-driven within the context bound.
     /// Same shape the registry itself used before this type existed.
-    exec_resources: DashMap<String, Weak<ExecSource>>,
-    exec_configs: Arc<Vec<ExecSourceConfig>>,
+    exec_resources: crate::weak_registry::WeakRegistry<String, ExecSource>,
+    exec_configs: Arc<[ExecSourceConfig]>,
     /// Keep-alive window after the last session detaches. `None` = drop
     /// immediately (`--no-daemon`: the registry lives inside a single
     /// connection, so a post-session grace window could never be recovered
@@ -77,14 +76,14 @@ pub struct ContextLocals {
 impl ContextLocals {
     pub(super) fn new(
         context: ContextId,
-        exec_configs: Arc<Vec<ExecSourceConfig>>,
+        exec_configs: Arc<[ExecSourceConfig]>,
         grace: Option<Duration>,
     ) -> Arc<Self> {
         let port_forwards = PortForwardSource::for_context();
         Arc::new(Self {
             context,
             port_forwards,
-            exec_resources: DashMap::new(),
+            exec_resources: crate::weak_registry::WeakRegistry::new(),
             exec_configs,
             grace: grace.map(crate::grace::GraceGate::new),
         })
@@ -138,29 +137,15 @@ impl ContextLocals {
     fn exec_source_for(&self, name: &str) -> Option<Arc<ExecSource>> {
         let config = self.exec_configs.iter().find(|c| c.name == name)?.clone();
 
-        self.exec_resources.retain(|_, weak| weak.strong_count() > 0);
-
-        if let Some(weak) = self.exec_resources.get(name) {
-            if let Some(arc) = weak.upgrade() {
-                return Some(arc);
-            }
-        }
-        match self.exec_resources.entry(name.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                if let Some(arc) = e.get().upgrade() {
-                    Some(arc)
-                } else {
-                    let arc = ExecSource::for_context(config);
-                    e.insert(Arc::downgrade(&arc));
-                    Some(arc)
-                }
-            }
-            dashmap::mapref::entry::Entry::Vacant(e) => {
-                let arc = ExecSource::for_context(config);
-                e.insert(Arc::downgrade(&arc));
-                Some(arc)
-            }
-        }
+        // `|_| true`: an `ExecSource`'s poll loop is restarted by the
+        // supervisor rather than self-terminating, so it cannot be alive-but-
+        // useless the way a finished watcher task can. Upgrading IS liveness.
+        let (arc, _) = self.exec_resources.get_or_create(
+            name.to_string(),
+            |_| true,
+            move |_| ExecSource::for_context(config),
+        );
+        Some(arc)
     }
 
 }

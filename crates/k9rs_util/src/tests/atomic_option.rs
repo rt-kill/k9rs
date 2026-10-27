@@ -14,19 +14,19 @@ fn new_some_and_none() {
 #[test]
 fn swap_returns_old_value() {
     let a = AtomicOption::some(1u32);
-    let old = a.swap(Some(2), Ordering::AcqRel);
+    let old = a.swap(Some(2));
     assert_eq!(old, Some(1));
-    assert_eq!(a.take(Ordering::AcqRel), Some(2));
+    assert_eq!(a.take(), Some(2));
     assert!(a.is_none(Ordering::Acquire));
 }
 
 #[test]
 fn take_then_store_roundtrips() {
     let a = AtomicOption::some(7u32);
-    assert_eq!(a.take(Ordering::AcqRel), Some(7));
-    assert_eq!(a.take(Ordering::AcqRel), None);
-    a.store(Some(9), Ordering::AcqRel);
-    assert_eq!(a.take(Ordering::AcqRel), Some(9));
+    assert_eq!(a.take(), Some(7));
+    assert_eq!(a.take(), None);
+    a.store(Some(9));
+    assert_eq!(a.take(), Some(9));
 }
 
 #[test]
@@ -35,7 +35,7 @@ fn works_for_align_one_values() {
     let a = AtomicOption::some(0xABu8);
     assert!(a.is_some(Ordering::Acquire));
     assert_eq!(a.load_cloned(), Some(0xAB));
-    assert_eq!(a.take(Ordering::AcqRel), Some(0xAB));
+    assert_eq!(a.take(), Some(0xAB));
     assert!(a.is_none(Ordering::Acquire));
 }
 
@@ -60,7 +60,7 @@ fn load_cloned_returns_none_on_empty() {
 #[test]
 fn load_cloned_sees_latest_write() {
     let a: AtomicOption<Arc<Vec<u32>>> = AtomicOption::some(Arc::new(vec![1]));
-    a.store(Some(Arc::new(vec![9, 9, 9])), Ordering::AcqRel);
+    a.store(Some(Arc::new(vec![9, 9, 9])));
     let snap = a.load_cloned().unwrap();
     assert_eq!(&*snap, &[9, 9, 9]);
 }
@@ -131,7 +131,7 @@ fn concurrent_readers_never_resurrect_a_stale_write() {
             let c = Arc::clone(&cell);
             handles.push(thread::spawn(move || {
                 for v in (base + 1)..=last {
-                    c.store(Some(Arc::new(v)), Ordering::AcqRel);
+                    c.store(Some(Arc::new(v)));
                 }
             }));
         }

@@ -31,3 +31,4 @@ pub(crate) mod resource_defs;
 pub mod resources;
 pub mod session_env;
 pub mod shared_poller;
+pub(crate) mod weak_registry;

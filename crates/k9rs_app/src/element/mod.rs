@@ -780,7 +780,7 @@ pub struct LogInteraction {
     /// Draft filter text; `Some` = the filter bar is open. Editable with a
     /// caret — see [`crate::text_input::TextInput`].
     pub draft: Option<crate::text_input::TextInput>,
-    cache: Option<(LogDeriveKey, Arc<Vec<usize>>)>,
+    cache: Option<(LogDeriveKey, Arc<[usize]>)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1826,7 +1826,7 @@ impl Element {
     /// ONE accessor because they are only meaningful as a pair — asking for
     /// them separately forced callers to match on a kind, get an `Option`
     /// back anyway, and unwrap it.
-    pub fn log_lines(&mut self) -> Option<(Arc<Vec<usize>>, Arc<LineStore>)> {
+    pub fn log_lines(&mut self) -> Option<(Arc<[usize]>, Arc<LineStore>)> {
         let store = match self {
             Element::LogSession(e) => Arc::clone(&e.store),
             Element::LogFilter(e) => Arc::clone(&e.retained),
@@ -2039,7 +2039,7 @@ impl Element {
     /// eviction COUNT — a logical number applied to a physical row offset, so
     /// under wrap it under-corrected (the view crept toward the tail) and
     /// under a filter it over-corrected by the match rate.
-    pub fn log_visible(&mut self) -> Option<Arc<Vec<usize>>> {
+    pub fn log_visible(&mut self) -> Option<Arc<[usize]>> {
         // Store, patterns AND view come out of ONE destructure. Fetching the
         // view separately meant asking a question this match had already
         // answered and unwrapping the reply — the Option-as-deferred-lookup
@@ -2088,7 +2088,7 @@ impl Element {
                     .collect(),
             }
         });
-        let indices = Arc::new(indices);
+        let indices: Arc<[usize]> = indices.into();
         view.cache = Some((key, Arc::clone(&indices)));
         Some(indices)
     }

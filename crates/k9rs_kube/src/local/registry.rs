@@ -10,11 +10,9 @@
 //! including why port-forwards are strong *inside* the slice while exec
 //! sources stay demand-driven.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 
 use k9rs_proto::protocol::ContextId;
 
@@ -23,10 +21,10 @@ use super::exec_source::ExecSourceConfig;
 
 /// Daemon-wide directory of per-context local-resource slices.
 pub struct LocalRegistry {
-    contexts: DashMap<ContextId, Weak<ContextLocals>>,
+    contexts: crate::weak_registry::WeakRegistry<ContextId, ContextLocals>,
     /// Exec resource configs loaded from daemon config at startup, shared
     /// into every slice.
-    exec_configs: Arc<Vec<ExecSourceConfig>>,
+    exec_configs: Arc<[ExecSourceConfig]>,
     /// Grace window a slice survives after its last keepalive drops.
     /// `None` = tear down immediately (`--no-daemon`, where the registry
     /// lives inside a single connection and recovery is impossible).
@@ -73,8 +71,8 @@ impl LocalRegistry {
             })
             .collect();
         Self {
-            contexts: DashMap::new(),
-            exec_configs: Arc::new(valid_configs),
+            contexts: crate::weak_registry::WeakRegistry::new(),
+            exec_configs: valid_configs.into(),
             grace,
         }
     }
@@ -94,54 +92,28 @@ impl LocalRegistry {
     /// reports on.
     pub fn stats(&self) -> Vec<k9rs_proto::protocol::ContextStat> {
         self.contexts
-            .iter()
-            .filter_map(|e| {
-                let holders = e.value().strong_count();
-                let locals = e.value().upgrade()?;
-                Some(k9rs_proto::protocol::ContextStat {
-                    context: e.key().name.clone(),
-                    server_url: e.key().server_url.clone(),
-                    port_forwards: locals.port_forwards().live_count(),
-                    holders,
-                })
+            .live()
+            .into_iter()
+            .map(|(key, locals, holders)| k9rs_proto::protocol::ContextStat {
+                context: key.name.clone(),
+                server_url: key.server_url.clone(),
+                port_forwards: locals.port_forwards().live_count(),
+                holders,
             })
             .collect()
     }
 
     pub fn attach(&self, context: &ContextId) -> ContextKeepalive {
-        // Opportunistic sweep so entries for long-expired contexts don't
-        // accumulate (bounded by distinct contexts ever visited either way).
-        self.contexts.retain(|_, weak| weak.strong_count() > 0);
-
-        if let Some(weak) = self.contexts.get(context) {
-            if let Some(arc) = weak.upgrade() {
-                return ContextKeepalive(arc);
-            }
-        }
-        match self.contexts.entry(context.clone()) {
-            Entry::Occupied(mut e) => {
-                if let Some(arc) = e.get().upgrade() {
-                    ContextKeepalive(arc)
-                } else {
-                    let arc = ContextLocals::new(
-                        context.clone(),
-                        Arc::clone(&self.exec_configs),
-                        self.grace,
-                    );
-                    e.insert(Arc::downgrade(&arc));
-                    ContextKeepalive(arc)
-                }
-            }
-            Entry::Vacant(e) => {
-                let arc = ContextLocals::new(
-                    context.clone(),
-                    Arc::clone(&self.exec_configs),
-                    self.grace,
-                );
-                e.insert(Arc::downgrade(&arc));
-                ContextKeepalive(arc)
-            }
-        }
+        let configs = Arc::clone(&self.exec_configs);
+        let grace = self.grace;
+        // `|_| true`: a `ContextLocals` cannot die while anything holds it —
+        // it owns no task that self-terminates — so upgrading IS liveness.
+        let (arc, _) = self.contexts.get_or_create(
+            context.clone(),
+            |_| true,
+            move |ctx| ContextLocals::new(ctx.clone(), configs, grace),
+        );
+        ContextKeepalive(arc)
     }
 }
 

@@ -4,19 +4,20 @@
 //! loops, so N sessions on the same cluster polled the API server N times for
 //! identical data — asymmetric with watcher sharing, which already dedups via
 //! [`crate::live_query::WatcherCache`]. This module factors the *same*
-//! ownership model (a `DashMap<ContextId, Weak<_>>` cache, an `Arc` keepalive
-//! per subscriber, `watch`-channel fan-out, and [`crate::grace::spawn_grace`]
-//! reaping on last-drop) into one generic skeleton so a cluster is polled once
-//! regardless of how many sessions watch it.
+//! ownership model (a `weak_registry::WeakRegistry`, an `Arc`
+//! keepalive per subscriber, `watch`-channel fan-out, and
+//! [`crate::grace::spawn_grace`] reaping on last-drop) into one generic
+//! skeleton so a cluster is polled once regardless of how many sessions watch
+//! it. The registry itself is now shared with `WatcherCache` and the two
+//! `local` registries, which is where the `Weak`-map dance lives.
 //!
 //! It deliberately does NOT generalize `WatcherCache` itself (a kube watch
 //! stream is a different producer than an interval poller); it's a parallel,
 //! concrete mirror that the two pollers — both born here, both
 //! latest-snapshot producers — share via the snapshot type parameter `S`.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
-use dashmap::DashMap;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -84,12 +85,12 @@ impl<S: Clone + Send + Sync + 'static> Drop for PollerSub<S> {
 /// [`ContextId`]. Stores `Weak` references so a poller dies (after grace) once
 /// no session holds a [`PollerSub`].
 pub struct PollerCache<S: Clone + Send + Sync + 'static> {
-    entries: DashMap<ContextId, Weak<SharedPoller<S>>>,
+    entries: crate::weak_registry::WeakRegistry<ContextId, SharedPoller<S>>,
 }
 
 impl<S: Clone + Send + Sync + 'static> Default for PollerCache<S> {
     fn default() -> Self {
-        Self { entries: DashMap::new() }
+        Self { entries: crate::weak_registry::WeakRegistry::new() }
     }
 }
 
@@ -112,38 +113,35 @@ impl<S: Clone + Send + Sync + 'static> PollerCache<S> {
     where
         F: FnOnce(watch::Sender<S>) -> JoinHandle<()>,
     {
-        use dashmap::mapref::entry::Entry;
-
-        self.reap_dead();
-
-        if let Some(weak) = self.entries.get(&ctx) {
-            if let Some(arc) = weak.upgrade() {
-                // `is_finished` is always false for poll tasks — they never
-                // self-terminate — so reuse-vs-recreate turns purely on whether
-                // the `Weak` still upgrades. The guard is kept for parity with
-                // the watcher path, where a self-finished task must be replaced.
-                if !arc.task.is_finished() {
-                    return Self::reuse(arc);
-                }
-            }
-        }
-
-        match self.entries.entry(ctx) {
-            Entry::Occupied(mut e) => {
-                if let Some(arc) = e.get().upgrade() {
-                    if !arc.task.is_finished() {
-                        return Self::reuse(arc);
-                    }
-                }
+        // The receiver rides OUT of the closure rather than being re-derived
+        // from the poller afterwards, and that is not a style choice.
+        // `SharedPoller` has no `_keep_rx` field — its siblings `ExecSource`
+        // and `PortForwardSource` both do — so the receiver handed to the
+        // first subscriber is the ONLY thing holding this channel open.
+        // Measured, not assumed: `watch::Sender::send` with zero receivers
+        // returns `Err` and does not publish, every poll task sends with
+        // `let _ = tx.send(..)`, and a later `subscribe()` lands on the stale
+        // seed. So dropping this receiver to re-subscribe would open a window
+        // in which the first real poll is silently thrown away.
+        let mut created_rx = None;
+        // `is_finished` is always false for poll tasks — they never
+        // self-terminate — so reuse-vs-recreate turns purely on whether the
+        // `Weak` still upgrades. The predicate is passed anyway, for parity
+        // with the watcher path where a self-finished task MUST be replaced:
+        // the difference between the two registries is now a declared
+        // argument rather than a line one of them happens to omit.
+        let (poller, _) = self.entries.get_or_create(
+            ctx,
+            |arc| !arc.task.is_finished(),
+            |_| {
                 let (poller, rx) = Self::create(initial, spawn);
-                e.insert(Arc::downgrade(&poller));
-                PollerSub { snapshot_rx: rx, _keepalive: poller }
-            }
-            Entry::Vacant(e) => {
-                let (poller, rx) = Self::create(initial, spawn);
-                e.insert(Arc::downgrade(&poller));
-                PollerSub { snapshot_rx: rx, _keepalive: poller }
-            }
+                created_rx = Some(rx);
+                poller
+            },
+        );
+        match created_rx {
+            Some(snapshot_rx) => PollerSub { snapshot_rx, _keepalive: poller },
+            None => Self::reuse(poller),
         }
     }
 
@@ -170,14 +168,9 @@ impl<S: Clone + Send + Sync + 'static> PollerCache<S> {
     /// Live pollers, for `ctl status`. Skips dead `Weak`s without reaping —
     /// reporting must not mutate what it reports on.
     pub fn live_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.value().strong_count() > 0).count()
+        self.entries.live().len()
     }
 
-    /// Drop `Weak` slots whose poller is gone, so a long-lived daemon churning
-    /// through many clusters doesn't accumulate dead entries.
-    fn reap_dead(&self) {
-        self.entries.retain(|_, weak| weak.strong_count() > 0);
-    }
 }
 
 #[cfg(test)]

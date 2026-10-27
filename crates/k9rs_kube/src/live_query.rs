@@ -16,9 +16,8 @@
 //! go through `subscribe_dynamic` and `run_dynamic_live_watcher`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
-use dashmap::DashMap;
 
 use futures::{StreamExt, TryStreamExt};
 use kube::api::GroupVersionKind;
@@ -126,6 +125,20 @@ pub struct BaselineAsk {
 fn fanout_ring() -> usize {
     crate::daemon_config::daemon_config().fanout_ring.max(1)
 }
+
+/// How many un-answered [`BaselineAsk`]s the watcher's inbox holds.
+///
+/// One ask per joining or resubscribing bridge, answered from the watcher's
+/// own store, so the queue only grows while the watcher is busy — mid-LIST, or
+/// asleep in its retry backoff. 16 is "more sessions than will ever pile onto
+/// one watcher in that window"; past it, `ask()` applies backpressure and
+/// waits, which is deliberate (see [`Subscription::request_baseline`] on why
+/// dropping an ask would be mis-read as watcher death).
+///
+/// Named because the number was written three times — at both real
+/// constructors and at the test seeder — and three spellings of one capacity
+/// is three places to disagree about what it means.
+const ASK_QUEUE: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Watcher-internal state — ListPhase + PendingChanges
@@ -372,7 +385,7 @@ impl Subscription {
 /// Per-process cache of live queries. Stores `Weak` references so watchers
 /// die naturally when no one holds a `Subscription`.
 pub struct WatcherCache {
-    entries: DashMap<QueryKey, Weak<LiveQuery>>,
+    entries: crate::weak_registry::WeakRegistry<QueryKey, LiveQuery>,
 }
 
 impl Default for WatcherCache {
@@ -384,7 +397,7 @@ impl Default for WatcherCache {
 impl WatcherCache {
     pub fn new() -> Self {
         Self {
-            entries: DashMap::new(),
+            entries: crate::weak_registry::WeakRegistry::new(),
         }
     }
 
@@ -423,46 +436,33 @@ impl WatcherCache {
     where
         F: FnOnce(&QueryKey) -> Arc<LiveQuery>,
     {
-        use dashmap::mapref::entry::Entry;
-
         let label = if matches!(&key.resource, k9rs_proto::protocol::ResourceId::Crd(_) | k9rs_proto::protocol::ResourceId::CrdUnresolved(_)) {
             "dynamic"
         } else {
             "typed"
         };
 
-        self.reap_dead();
-
-        if let Some(weak) = self.entries.get(&key) {
-            if let Some(arc) = weak.upgrade() {
-                if !arc.task.is_finished() {
-                    tracing::debug!("WatcherCache: reusing existing {} watcher for {:?}", label, key);
-                    return Subscription::attach(key, arc);
-                }
-                tracing::debug!("WatcherCache: existing {} watcher is dead, replacing for {:?}", label, key);
+        // The liveness predicate is the whole of what makes this registry
+        // different from the three others: a watcher's task can self-finish
+        // while its `Arc` is still held, and handing that out gives the
+        // caller a corpse. The other registries pass `|_| true`.
+        let (live_query, outcome) = self.entries.get_or_create(
+            key.clone(),
+            |arc| !arc.task.is_finished(),
+            create,
+        );
+        match outcome {
+            crate::weak_registry::Outcome::Reused => {
+                tracing::debug!("WatcherCache: reusing existing {} watcher for {:?}", label, key);
+            }
+            crate::weak_registry::Outcome::ReplacedDead => {
+                tracing::debug!("WatcherCache: existing {} watcher was dead, replaced for {:?}", label, key);
+            }
+            crate::weak_registry::Outcome::Created => {
+                tracing::debug!("WatcherCache: creating new {} watcher for {:?}", label, key);
             }
         }
-
-        match self.entries.entry(key.clone()) {
-            Entry::Occupied(mut e) => {
-                if let Some(arc) = e.get().upgrade() {
-                    if !arc.task.is_finished() {
-                        tracing::debug!("WatcherCache: reusing {} watcher (race winner) for {:?}", label, key);
-                        return Subscription::attach(key, arc);
-                    }
-                }
-                tracing::debug!("WatcherCache: creating new {} watcher for {:?}", label, key);
-                let live_query = create(&key);
-                e.insert(Arc::downgrade(&live_query));
-                Subscription::attach(key, live_query)
-            }
-            Entry::Vacant(e) => {
-                tracing::debug!("WatcherCache: creating new {} watcher for {:?}", label, key);
-                let live_query = create(&key);
-                e.insert(Arc::downgrade(&live_query));
-                Subscription::attach(key, live_query)
-            }
-        }
+        Subscription::attach(key, live_query)
     }
 
     /// Internal: spawn a watcher task and return the LiveQuery + initial receiver.
@@ -480,7 +480,7 @@ impl WatcherCache {
         streaming_lists: bool,
     ) -> Arc<LiveQuery> {
         let (delta_tx, _) = broadcast::channel(fanout_ring());
-        let (ask_tx, ask_rx) = mpsc::channel(16);
+        let (ask_tx, ask_rx) = mpsc::channel(ASK_QUEUE);
 
         let args = crate::resource_defs::registry::WatcherArgs {
             client: client.clone(),
@@ -505,7 +505,7 @@ impl WatcherCache {
     /// Remove the cache entry for a key. Used by `handle_refresh` for dynamic
     /// resources so the next `subscribe_dynamic` creates a fresh watcher.
     pub fn remove(&self, key: &QueryKey) {
-        self.entries.remove(key);
+        self.entries.forget(key);
     }
 
     /// Cache slots, live or not. Test-only: the difference between this and
@@ -513,27 +513,21 @@ impl WatcherCache {
     /// that reporting doesn't reap.
     #[cfg(test)]
     pub(crate) fn entry_count(&self) -> usize {
-        self.entries.len()
+        self.entries.slot_count()
     }
 
     /// Every LIVE watcher, for `ctl status`. Dead `Weak`s are skipped rather
     /// than reaped — reporting must not mutate what it reports on.
     pub fn stats(&self) -> Vec<k9rs_proto::protocol::WatcherStat> {
         self.entries
-            .iter()
-            .filter_map(|e| {
-                let holders = e.value().strong_count();
-                if holders == 0 {
-                    return None;
-                }
-                let key = e.key();
-                Some(k9rs_proto::protocol::WatcherStat {
-                    context: key.context.name.clone(),
-                    namespace: key.namespace.display().to_string(),
-                    resource: key.resource.plural().to_string(),
-                    filter: key.filter.as_ref().map(|f| format!("{f:?}")),
-                    holders,
-                })
+            .live()
+            .into_iter()
+            .map(|(key, _lq, holders)| k9rs_proto::protocol::WatcherStat {
+                context: key.context.name.clone(),
+                namespace: key.namespace.display().to_string(),
+                resource: key.resource.plural().to_string(),
+                filter: key.filter.as_ref().map(|f| format!("{f:?}")),
+                holders,
             })
             .collect()
     }
@@ -552,7 +546,7 @@ impl WatcherCache {
     #[cfg(any(test, feature = "testing"))]
     pub fn seed_driven(&self, key: QueryKey) -> (Arc<LiveQuery>, DrivenWatcher) {
         let (delta_tx, _initial_rx) = broadcast::channel(fanout_ring());
-        let (ask_tx, ask_rx) = mpsc::channel(16);
+        let (ask_tx, ask_rx) = mpsc::channel(ASK_QUEUE);
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         // A task that parks until the test ends it. `LiveQuery` needs one
         // because `task.is_finished()` is how the rest of the system asks
@@ -568,17 +562,8 @@ impl WatcherCache {
             key: key.clone(),
             grace: crate::grace::GraceGate::new(crate::grace::watcher_grace()),
         });
-        self.entries.insert(key, Arc::downgrade(&lq));
+        self.entries.insert(key, &lq);
         (lq, DrivenWatcher { delta_tx, ask_rx, stop: Some(stop_tx) })
-    }
-
-    /// Reap dead `Weak` entries from the cache. Called opportunistically
-    /// from `subscribe`/`subscribe_force` so a long-running daemon that
-    /// churns through many distinct subscriptions doesn't accumulate
-    /// dead-weak slots forever (each slot is a `QueryKey` clone +
-    /// pointer + counter, ~100 B; not catastrophic but unbounded).
-    fn reap_dead(&self) {
-        self.entries.retain(|_, weak| weak.strong_count() > 0);
     }
 
     /// Force-subscribe: removes any existing Weak entry for the key and creates
@@ -596,20 +581,15 @@ impl WatcherCache {
         client: &Client,
         streaming_lists: bool,
     ) -> Subscription {
-        use dashmap::mapref::entry::Entry;
-        self.reap_dead();
-
-        let live_query = Self::create_watcher(&key, kind, client, streaming_lists);
-        let weak = Arc::downgrade(&live_query);
-        // Replace UNDER the entry lock — the same claim `subscribe` uses —
-        // so a concurrent normal subscribe's check-and-insert is
-        // serialized with this replace, rather than the two bare inserts
-        // interleaving and stranding a just-created watcher unreachable in
-        // the map (a second live watcher for one key).
-        match self.entries.entry(key.clone()) {
-            Entry::Occupied(mut e) => { e.insert(weak); }
-            Entry::Vacant(e) => { e.insert(weak); }
-        }
+        self.entries.reap();
+        // `replace` puts the new watcher in UNDER the entry lock — the same
+        // claim `get_or_create` takes — so a concurrent normal subscribe's
+        // check-and-insert is serialized with this rather than the two
+        // insertions interleaving and stranding a just-created watcher
+        // unreachable in the map (a second live watcher for one key).
+        let live_query = self.entries.replace(key.clone(), |k| {
+            Self::create_watcher(k, kind, client, streaming_lists)
+        });
 
         Subscription::attach(key, live_query)
     }
@@ -655,7 +635,7 @@ impl WatcherCache {
         streaming_lists: bool,
     ) -> Arc<LiveQuery> {
         let (delta_tx, _) = broadcast::channel(fanout_ring());
-        let (ask_tx, ask_rx) = mpsc::channel(16);
+        let (ask_tx, ask_rx) = mpsc::channel(ASK_QUEUE);
         let task_client = client.clone();
         let task_ns = key.namespace.clone();
         let task_tx = delta_tx.clone();

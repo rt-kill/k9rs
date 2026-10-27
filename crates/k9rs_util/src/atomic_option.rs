@@ -115,32 +115,49 @@ impl<T> AtomicOption<T> {
     }
 
     /// Atomically swap the slot, returning the previous value.
-    pub fn swap(&self, value: Option<T>, ordering: Ordering) -> Option<T> {
+    ///
+    /// `AcqRel` is not a parameter, and must not become one. This publishes a
+    /// `Box` pointer and reclaims the one it displaced, so both halves of the
+    /// fence carry the pointee: `Release` so a reader that acquires the
+    /// pointer also sees the value written through it, `Acquire` so the
+    /// reclaim here sees the initialisation done by whoever stored it.
+    /// `Relaxed` would compile and would be undefined behaviour — a reader's
+    /// `Acquire` load does not synchronise-with a `Relaxed` store, so it could
+    /// observe the pointer without the pointee. An ordering the caller cannot
+    /// weaken is the only form of that rule this type can enforce, and
+    /// [`load_cloned`](Self::load_cloned) already hardcoded its own.
+    pub fn swap(&self, value: Option<T>) -> Option<T> {
         let new_word = match value {
             Some(v) => Box::into_raw(Box::new(Slot2(v))),
             None => self.mint_empty(),
         };
-        let old = self.slot.swap(new_word, ordering);
+        let old = self.slot.swap(new_word, Ordering::AcqRel);
         // Safety: `old` was just removed from the slot, so we own it.
         unsafe { Self::reclaim(old) }
     }
 
     /// Store `value`, dropping whatever was there.
-    pub fn store(&self, value: Option<T>, ordering: Ordering) {
-        let _ = self.swap(value, ordering);
+    pub fn store(&self, value: Option<T>) {
+        let _ = self.swap(value);
     }
 
     /// Take the value, leaving an empty slot behind.
-    pub fn take(&self, ordering: Ordering) -> Option<T> {
-        self.swap(None, ordering)
+    pub fn take(&self) -> Option<T> {
+        self.swap(None)
     }
 
     /// True if the slot currently holds `Some`.
+    ///
+    /// Takes an `ordering` where the three above do not: this reads the tag
+    /// bit and never dereferences, so there is no pointee to publish and no
+    /// choice here can be unsound. A caller polling for emptiness may
+    /// legitimately want `Relaxed`.
     pub fn is_some(&self, ordering: Ordering) -> bool {
         !is_empty_word(self.slot.load(ordering))
     }
 
-    /// True if the slot currently holds `None`.
+    /// True if the slot currently holds `None`. See [`is_some`](Self::is_some)
+    /// on why this one keeps its `ordering`.
     pub fn is_none(&self, ordering: Ordering) -> bool {
         is_empty_word(self.slot.load(ordering))
     }

@@ -93,3 +93,4 @@ async fn changed_first_never_observes_the_seed() {
     assert!(sub.changed().await.is_ok());
     assert_eq!(sub.current(), 7, "changed-first must skip the seed and land on the real poll");
 }
+

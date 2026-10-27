@@ -6,7 +6,7 @@ fn ctx(n: &str) -> ContextId {
 }
 
 fn locals(grace: Option<Duration>) -> ContextKeepalive {
-    ContextKeepalive(ContextLocals::new(ctx("t"), Arc::new(Vec::new()), grace))
+    ContextKeepalive(ContextLocals::new(ctx("t"), Arc::from(Vec::new()), grace))
 }
 
 #[tokio::test]
