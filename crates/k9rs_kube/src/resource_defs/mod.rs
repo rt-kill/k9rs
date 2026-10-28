@@ -1,9 +1,13 @@
 //! Trait-based resource type definitions.
 //!
 //! Each K8s resource is a zero-sized struct implementing [`k9rs_proto::resource_def::ResourceDef`]
-//! and relevant capability marker traits. The [`REGISTRY`] static
-//! provides lookup by plural name or alias, and stores a type-erased
-//! watcher spawner per resource for dispatch without string matching.
+//! and relevant capability marker traits. The [`REGISTRY`] static stores a
+//! type-erased watcher spawner per resource, keyed by `BuiltInKind`, so
+//! dispatch needs no string matching.
+//!
+//! It does NOT provide lookup by plural name or alias — this said it did,
+//! and `ResourceRegistry` holds only `by_kind`. Those indexes live in
+//! `k9rs_proto::resource_def`; the registry here is the watcher half.
 
 pub(crate) mod registry;
 
@@ -31,8 +35,10 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomRe
 use registry::ResourceRegistry;
 
 /// Global registry of all built-in resource types. Built once at first
-/// access. Stores both `dyn ResourceDef` metadata and type-erased watcher
-/// spawners -- the single source of truth for resource dispatch.
+/// access. Stores `dyn ResourceDef` metadata and type-erased watcher
+/// spawners, keyed by `BuiltInKind` — the single source of truth for which
+/// WATCHER a resource gets. Name and alias resolution is
+/// `k9rs_proto::resource_def`'s.
 pub(crate) static REGISTRY: LazyLock<ResourceRegistry> = LazyLock::new(build_registry);
 
 fn build_registry() -> ResourceRegistry {

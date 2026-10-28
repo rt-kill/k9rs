@@ -31,6 +31,23 @@ pub struct SharedPoller<S: Clone + Send + Sync + 'static> {
     /// Held so new subscribers can `.subscribe()` a fresh receiver; the poll
     /// task publishes through a clone of this.
     snapshot_tx: watch::Sender<S>,
+    /// The channel's floor receiver, held for as long as the poller lives.
+    ///
+    /// `watch::Sender::send` with ZERO receivers returns `Err` and does not
+    /// publish — measured, not assumed. Without this field the only receiver
+    /// was the subscriber's, so the grace window (60s, during which the task
+    /// keeps polling because keeping it warm is the entire point) was a
+    /// window with no receiver at all: every poll was discarded, and a
+    /// session reusing the poller inside grace got whatever was last
+    /// published while somebody was still listening. For metrics — which has
+    /// no eager one-shot — a `PollerSub` dropped before the first poll even
+    /// landed left the *seed* in the channel, so the reuse forwarded a
+    /// default snapshot and showed blank CPU/MEM for up to 30s, on exactly
+    /// the navigate-away-and-back that grace exists to serve.
+    ///
+    /// Both sibling registries hold one of these (`ExecSource`,
+    /// `PortForwardSource`); this was the one that did not.
+    _keep_rx: watch::Receiver<S>,
     task: JoinHandle<()>,
     /// Keep-warm window after the last `PollerSub` drops — same discipline
     /// as [`crate::live_query::LiveQuery`].
@@ -113,36 +130,24 @@ impl<S: Clone + Send + Sync + 'static> PollerCache<S> {
     where
         F: FnOnce(watch::Sender<S>) -> JoinHandle<()>,
     {
-        // The receiver rides OUT of the closure rather than being re-derived
-        // from the poller afterwards, and that is not a style choice.
-        // `SharedPoller` has no `_keep_rx` field — its siblings `ExecSource`
-        // and `PortForwardSource` both do — so the receiver handed to the
-        // first subscriber is the ONLY thing holding this channel open.
-        // Measured, not assumed: `watch::Sender::send` with zero receivers
-        // returns `Err` and does not publish, every poll task sends with
-        // `let _ = tx.send(..)`, and a later `subscribe()` lands on the stale
-        // seed. So dropping this receiver to re-subscribe would open a window
-        // in which the first real poll is silently thrown away.
-        let mut created_rx = None;
         // `is_finished` is always false for poll tasks — they never
         // self-terminate — so reuse-vs-recreate turns purely on whether the
         // `Weak` still upgrades. The predicate is passed anyway, for parity
         // with the watcher path where a self-finished task MUST be replaced:
         // the difference between the two registries is now a declared
         // argument rather than a line one of them happens to omit.
+        //
+        // ONE path out, whether this call created the poller or found it:
+        // the poller holds the channel's floor receiver (`_keep_rx`), so
+        // `subscribe()` is safe at any moment in its life and there is no
+        // first-subscriber receiver to thread out of the closure. That
+        // threading existed precisely BECAUSE there was no floor receiver.
         let (poller, _) = self.entries.get_or_create(
             ctx,
             |arc| !arc.task.is_finished(),
-            |_| {
-                let (poller, rx) = Self::create(initial, spawn);
-                created_rx = Some(rx);
-                poller
-            },
+            |_| Self::create(initial, spawn),
         );
-        match created_rx {
-            Some(snapshot_rx) => PollerSub { snapshot_rx, _keepalive: poller },
-            None => Self::reuse(poller),
-        }
+        Self::reuse(poller)
     }
 
     /// Hand out a fresh subscription backed by an existing live poller.
@@ -151,18 +156,20 @@ impl<S: Clone + Send + Sync + 'static> PollerCache<S> {
     }
 
     /// Spawn a new poller's task and wrap it in an `Arc`.
-    fn create<F>(initial: S, spawn: F) -> (Arc<SharedPoller<S>>, watch::Receiver<S>)
+    fn create<F>(initial: S, spawn: F) -> Arc<SharedPoller<S>>
     where
         F: FnOnce(watch::Sender<S>) -> JoinHandle<()>,
     {
         let (snapshot_tx, snapshot_rx) = watch::channel(initial);
         let task = spawn(snapshot_tx.clone());
-        let poller = Arc::new(SharedPoller {
+        Arc::new(SharedPoller {
             snapshot_tx,
+            // The poller keeps the channel open for its own lifetime; see
+            // the field.
+            _keep_rx: snapshot_rx,
             task,
             grace: crate::grace::GraceGate::new(crate::grace::watcher_grace()),
-        });
-        (poller, snapshot_rx)
+        })
     }
 
     /// Live pollers, for `ctl status`. Skips dead `Weak`s without reaping —

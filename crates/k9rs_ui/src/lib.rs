@@ -38,6 +38,29 @@ pub fn centered_rect(area: ratatui::layout::Rect, width: u16, height: u16) -> ra
     horiz[1]
 }
 
+/// Draw `line` centred on one row in the middle of `area`.
+///
+/// ONE centring. There were six hand-written copies, measuring the text in
+/// FOUR different units: display cells (four of them), `chars().count()`
+/// (the takeover label) and `str::len()` bytes (the log view's "No logs."
+/// / "No matching lines."). Chars and bytes both part company with cells the
+/// moment the text is not ASCII, and a mis-measured width OFFSETS the line
+/// rather than clipping it — so the symptom is a message that is simply not
+/// in the middle, which reads as a layout bug rather than a measurement one.
+pub fn draw_centered_line(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    line: ratatui::text::Line<'_>,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let w = line.width() as u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height / 2;
+    f.render_widget(line, ratatui::layout::Rect::new(x, y, area.width, 1));
+}
+
 /// Render a centered loading spinner+text inside an area. Used by yaml,
 /// describe, resource, and log views when awaiting initial data.
 pub fn draw_centered_loading(
@@ -47,15 +70,12 @@ pub fn draw_centered_loading(
     style: ratatui::style::Style,
     anim: &k9rs_app::Anim,
 ) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
     let text = anim.bar(message);
-    let text_len = UnicodeWidthStr::width(text.as_str()) as u16;
-    let line = ratatui::text::Line::from(ratatui::text::Span::styled(text, style));
-    let center_y = area.y + area.height / 2;
-    let center_x = area.x + area.width.saturating_sub(text_len) / 2;
-    f.render_widget(line, ratatui::layout::Rect::new(center_x, center_y, area.width, 1));
+    draw_centered_line(
+        f,
+        area,
+        ratatui::text::Line::from(ratatui::text::Span::styled(text, style)),
+    );
 }
 
 /// Static counterpart of [`draw_centered_loading`]: one centered message,
@@ -68,14 +88,11 @@ pub fn draw_centered_message(
     message: &str,
     style: ratatui::style::Style,
 ) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let text_len = UnicodeWidthStr::width(message) as u16;
-    let line = ratatui::text::Line::from(ratatui::text::Span::styled(message.to_string(), style));
-    let center_y = area.y + area.height / 2;
-    let center_x = area.x + area.width.saturating_sub(text_len) / 2;
-    f.render_widget(line, ratatui::layout::Rect::new(center_x, center_y, area.width, 1));
+    draw_centered_line(
+        f,
+        area,
+        ratatui::text::Line::from(ratatui::text::Span::styled(message.to_string(), style)),
+    );
 }
 
 /// Fill a single-row area with a background style without allocating a string.
@@ -285,12 +302,13 @@ fn draw_takeover_label(
         .style(theme.dialog_bg);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
-    if inner.height > 0 && inner.width > 0 {
-        let len = label.chars().count() as u16;
-        let line = Line::from(Span::styled(label.to_string(), theme.info_value));
-        let lx = inner.x + inner.width.saturating_sub(len) / 2;
-        f.render_widget(line, ratatui::layout::Rect::new(lx, inner.y, inner.width, 1));
-    }
+    // The label sits on the box's FIRST row, not its middle, so the area
+    // handed over is one row tall.
+    draw_centered_line(
+        f,
+        ratatui::layout::Rect { height: inner.height.min(1), ..inner },
+        Line::from(Span::styled(label.to_string(), theme.info_value)),
+    );
 }
 
 /// Draw flash messages at the bottom of the screen.
@@ -319,13 +337,16 @@ fn draw_flash(f: &mut Frame, app: &App) {
     }
 }
 
-/// Draw the container selection overlay for multi-container pods. The
-/// container list was captured on the route at construction — the dialog
-/// is self-contained.
 /// Draw the picker into the box the float path already sized for it.
 ///
-/// `area` IS the dialog — it no longer centres itself, because the frame
-/// owns geometry (`Element::extent`) and the widget owns content.
+/// Through `ModalOverlay`, like the confirm box and the form. It used to
+/// hand-roll the clear, the border, the background fill and the hint row —
+/// and, because `ModalOverlay::render` is where `DIALOG_MARGIN` is SPENT,
+/// using `area` directly meant the picker drew into the gap its two
+/// siblings leave around themselves: `Element::extent` adds the margin for
+/// all three, so the picker's box came out four columns and two rows larger
+/// than `container_picker_size` said, making its documented
+/// `clamp(30, 60)` a 34..64 box.
 fn draw_container_select(
     f: &mut Frame,
     app: &App,
@@ -334,61 +355,51 @@ fn draw_container_select(
     selected_idx: usize,
     area: ratatui::layout::Rect,
 ) {
+    use crate::widgets::modal::{DialogSize, ModalOverlay};
+    use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::text::{Line, Span};
-    use ratatui::widgets::{Block, Clear};
+    use ratatui::widgets::Widget;
 
     let theme = &app.ui.theme;
-    let dialog_area = area;
+    let (w, h) = (area.width, area.height);
+    let title = format!(" Select Container ({}) ", target.name);
+    // From `geometry::picker_hints`, which is also what sized the box — one
+    // declaration, so the hints cannot outgrow the room reserved for them.
+    let hints = Line::from(
+        k9rs_app::picker_hints()
+            .into_iter()
+            .flat_map(|(key, label)| {
+                [
+                    Span::styled(key, theme.status_bar_key),
+                    Span::styled(label, theme.help_desc),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
 
-    Clear.render(dialog_area, f.buffer_mut());
-
-    let block = Block::bordered()
-        .title(Span::styled(
-            format!(" Select Container ({}) ", target.name),
-            theme.title,
-        ))
-        .border_style(theme.dialog_border)
-        .style(theme.dialog_bg);
-
-    let inner = block.inner(dialog_area);
-    f.render_widget(block, dialog_area);
-
-    if inner.height == 0 || inner.width == 0 {
-        return;
-    }
-
-    fill_dialog_bg(f.buffer_mut(), inner, theme);
-
-    // Render container list
-    for (i, container) in containers.iter().enumerate() {
-        if i as u16 >= inner.height.saturating_sub(1) {
-            break;
-        }
-        let y = inner.y + i as u16;
-        let is_selected = i == selected_idx;
-        let style = if is_selected { theme.selected } else { theme.row_normal };
-
-        // Fill background for selected item
-        if is_selected {
-            for dx in 0..inner.width {
-                f.buffer_mut().set_string(inner.x + dx, y, " ", theme.selected);
+    ModalOverlay::new(theme, DialogSize { width: w, height: h }, |content: Rect, buf: &mut Buffer| {
+        for (i, name) in containers.iter().enumerate() {
+            if i as u16 >= content.height {
+                break;
             }
+            let y = content.y + i as u16;
+            let selected = i == selected_idx;
+            let style = if selected { theme.selected } else { theme.row_normal };
+            if selected {
+                // Edge to edge, so the cursor reads as a row and not as a
+                // highlighted word.
+                for dx in 0..content.width {
+                    buf.set_string(content.x + dx, y, " ", theme.selected);
+                }
+            }
+            Line::from(Span::styled(name.clone(), style))
+                .render(Rect::new(content.x, y, content.width, 1), buf);
         }
-
-        let line = Line::from(Span::styled(format!("  {}", container), style));
-        f.render_widget(line, Rect::new(inner.x, y, inner.width, 1));
-    }
-
-    // Hint at bottom
-    let hint_y = inner.y + inner.height.saturating_sub(1);
-    let hint = Line::from(vec![
-        Span::styled(" <Enter>", theme.status_bar_key),
-        Span::styled(" select  ", theme.help_desc),
-        Span::styled("<Esc>", theme.status_bar_key),
-        Span::styled(" back", theme.help_desc),
-    ]);
-    f.render_widget(hint, Rect::new(inner.x, hint_y, inner.width, 1));
+    })
+    .title(&title)
+    .hints(hints)
+    .render(area, f.buffer_mut());
 }
 
 
@@ -477,6 +488,7 @@ fn draw_filter_overlay(f: &mut Frame, app: &App) {
     let filter_bar = FilterBar::new(
         app.nav.top().filter_input().active(),
         app.nav.top().filter_input().text(),
+        app.nav.top().filter_input().caret_col(),
         match_count,
         counts.total,
         theme,

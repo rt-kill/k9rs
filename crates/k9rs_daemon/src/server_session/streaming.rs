@@ -120,10 +120,17 @@ impl ServerSession {
 /// The shared metrics poll loop: lists pod + node usage from metrics-server and
 /// republishes a [`MetricsSnapshot`] on the `watch` channel. A failed sub-fetch
 /// keeps that map's prior value (last-known), so a metrics-server blip never
-/// blanks one half of the display. Publishes even with zero receivers (the
-/// watch retains the value for the next subscriber) and never self-terminates —
-/// the task's lifetime is owned by the [`k9rs_kube::shared_poller::SharedPoller`]
-/// drop, not by any one session's channel.
+/// blanks one half of the display.
+///
+/// Never self-terminates — the task's lifetime is owned by the
+/// [`k9rs_kube::shared_poller::SharedPoller`] drop, not by any one session's
+/// channel. What makes that safe is the poller's floor receiver: this doc
+/// used to say "publishes even with zero receivers (the watch retains the
+/// value for the next subscriber)", which is the opposite of what tokio
+/// does — `send` with no receivers returns `Err` and never reaches
+/// `send_replace`, so during the keep-warm window every poll here was
+/// thrown away and a rejoining session was served whatever was last
+/// published while somebody happened to be listening.
 fn spawn_metrics_task(client: Client, snapshot_tx: watch::Sender<MetricsSnapshot>) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Brief stagger so metrics don't pile onto the connect burst (discovery
@@ -227,7 +234,7 @@ impl ConsecutiveFails {
 /// Sleep interval between metrics polls. 30s when everything's healthy;
 /// exponential growth up to 5 minutes while the API is rejecting us, so a
 /// cluster without metrics-server doesn't get pummeled every 30s forever.
-fn metrics_backoff(consecutive_fails: u32) -> Duration {
+pub(super) fn metrics_backoff(consecutive_fails: u32) -> Duration {
     match consecutive_fails {
         0 => Duration::from_secs(30),
         1 => Duration::from_secs(60),
@@ -333,3 +340,7 @@ async fn run_discovery_poll(
 
     DiscoverySnapshot { namespaces, crds }
 }
+
+#[cfg(test)]
+#[path = "../tests/streaming.rs"]
+mod tests;

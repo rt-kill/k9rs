@@ -201,11 +201,16 @@ async fn main() -> Result<()> {
     // root nav element opens its subscription against it. Bridge tasks
     // inside `subscribe_stream` await the MuxHandle, so subscribes fire
     // as soon as the connection is up.
+    // ONE answer, feeding both gates: the client's `App::read_only` and the
+    // daemon's `ConnectionParams::readonly`. This was `cli.readonly` while
+    // `App` took `cli || config`, so `readOnly: true` in the config armed
+    // only the client half.
+    let read_only = k9rs_app::ConnectionParams::read_only(cli.readonly, &config);
     let data_source = ClientSession::new(
         k9rs_app::ConnectionParams {
             context: cli_context.clone(),
             namespace: namespace.clone(),
-            readonly: cli.readonly,
+            readonly: read_only,
             no_daemon: cli.no_daemon,
         },
         event_tx.clone(),
@@ -214,9 +219,9 @@ async fn main() -> Result<()> {
     // `None`: no context is confirmed until the daemon says so (or, with
     // nothing to connect to, until the user picks one in the contexts view).
     let mut app = App::new(appearance, None, namespace, &data_source, config);
-    if cli.readonly {
-        app.read_only = true;
-    }
+    // `App::new` resolves the CONFIG half; the flag is the other half of the
+    // same answer, and both gates now carry the same `read_only`.
+    app.read_only = read_only;
 
     // Overlays are the one user-facing extension point, and until now every
     // complaint they had went to `warn!` — i.e. to `io::sink` unless the user

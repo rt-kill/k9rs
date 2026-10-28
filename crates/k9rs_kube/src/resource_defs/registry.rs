@@ -165,11 +165,6 @@ impl ResourceRegistry {
         }
     }
 
-    // -- Lookup ---------------------------------------------------------------
-
-
-
-
 
     /// Build the `convert(K::default())` row for `kind`. Test-only — feeds the
     /// `default_cells_align_with_headers` alignment guard.

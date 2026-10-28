@@ -174,3 +174,92 @@ volumes:
 fn a_pod_that_names_nothing_has_no_references() {
     assert!(refs_of("containers:\n  - name: app\n    image: app\n").is_empty());
 }
+
+/// Every kind `pod_references` can emit is declared by
+/// `referenceable_kinds`, and nothing else is.
+///
+/// `referenceable_kinds` is what `U` gates on: a kind missing from it opens
+/// a view titled "Pods that reference …" containing nothing, which reports a
+/// miss as an answer — the exact failure the reverse lookup replaced. The
+/// comment above the list said the two were "declared NEXT to it so the two
+/// cannot drift", and proximity is not a mechanism: a fifth `push(…)` in
+/// `pod_references` would compile, pass every test, and be invisible to `U`.
+/// This is the mechanism.
+///
+/// The fixture is maximal on purpose — one of every place a pod can name
+/// another object — so the emitted set is the whole emittable set.
+#[test]
+fn every_emittable_reference_kind_is_declared() {
+    let refs = refs_of(
+        r#"
+serviceAccountName: api-sa
+imagePullSecrets:
+  - name: registry-creds
+volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: data-pvc
+  - name: tls
+    secret:
+      secretName: tls-secret
+  - name: settings
+    configMap:
+      name: app-config
+  - name: bundle
+    projected:
+      sources:
+        - secret:
+            name: projected-secret
+        - configMap:
+            name: projected-config
+containers:
+  - name: app
+    image: app
+    envFrom:
+      - secretRef:
+          name: env-secret
+      - configMapRef:
+          name: env-config
+    env:
+      - name: A
+        valueFrom:
+          secretKeyRef:
+            name: keyed-secret
+            key: a
+      - name: B
+        valueFrom:
+          configMapKeyRef:
+            name: keyed-config
+            key: b
+initContainers:
+  - name: init
+    image: init
+    envFrom:
+      - secretRef:
+          name: init-secret
+"#,
+    );
+    assert!(refs.len() >= 8, "sanity: the fixture names several objects: {refs:?}");
+
+    let declared = super::referenceable_kinds();
+    let mut emitted: Vec<BuiltInKind> = refs.iter().map(|r| r.kind).collect();
+    emitted.sort_by_key(|k| format!("{k:?}"));
+    emitted.dedup();
+
+    for kind in &emitted {
+        assert!(
+            declared.contains(kind),
+            "`pod_references` emits {kind:?}, which `referenceable_kinds` does \
+             not declare — `U` on it would open an empty view: declared {declared:?}",
+        );
+    }
+    // And the other direction: a declared kind this fixture cannot produce is
+    // a kind `U` offers and the converter never fills.
+    for kind in declared {
+        assert!(
+            emitted.contains(kind),
+            "`referenceable_kinds` declares {kind:?}, which a maximal pod spec \
+             never emits: emitted {emitted:?}",
+        );
+    }
+}

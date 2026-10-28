@@ -50,12 +50,19 @@ use crate::element::Element;
 /// [`ViewClass::ALL`] all come out of the same list.
 ///
 /// `ALL` used to be a hand-written `[ViewClass; 5]` in a test mirror, and
-/// nothing forced it to stay exhaustive. A sixth class would break [`of`]
-/// and [`title`] — both exhaustive matches — but drop silently out of every
-/// keymap agreement test, which is `BuiltInKind::ALL`'s failure verbatim one
-/// layer up: a list that claims totality because someone wrote it that way
-/// once.
+/// nothing forced it to stay exhaustive. A sixth class would drop silently
+/// out of every keymap agreement test, which is `BuiltInKind::ALL`'s failure
+/// verbatim one layer up: a list that claims totality because someone wrote
+/// it that way once.
 ///
+/// What a sixth class actually breaks is [`for_class`] and the per-class
+/// dispatcher in [`crate::handler`] — both exhaustive over this enum. It is
+/// NOT [`of`] and [`title`], which this doc used to name: `title` is
+/// macro-generated from the same list and so cannot drift, and `of` matches
+/// on `ElementClass`, so a new `ViewClass` variant never touches it. Naming
+/// the wrong two is the same mistake this file's header is about.
+///
+/// [`for_class`]: self::for_class
 /// [`of`]: ViewClass::of
 /// [`title`]: ViewClass::title
 macro_rules! view_classes {
@@ -92,8 +99,12 @@ view_classes! {
         Detail => "This view (YAML / describe)",
         /// A log stream or a grep over one.
         Log => "This view (logs)",
-        /// A yes/no dialog floating over the view that raised it.
-        Dialog => "This dialog",
+        /// A yes/no box floating over the view that raised it.
+        Confirm => "This dialog",
+        /// A field form — port-forward, scale.
+        Form => "This form",
+        /// A pick-one list — which container.
+        Picker => "This picker",
     }
 }
 
@@ -120,10 +131,49 @@ impl ViewClass {
             crate::element::ElementClass::Log => ViewClass::Log,
             crate::element::ElementClass::Content => ViewClass::Detail,
             crate::element::ElementClass::Chrome => ViewClass::Overview,
-            crate::element::ElementClass::Dialog => ViewClass::Dialog,
+            // `ElementClass::Dialog` is ONE data shape and THREE keymaps,
+            // so this is the one arm that has to look at the element and not
+            // just its class. It used to collapse all three into a single
+            // `ViewClass::Dialog` whose rows — `y`, `n / Esc`, `Tab`,
+            // `Enter` — are the confirm box's: in a picker those do nothing
+            // of the sort, and in a form `Tab` belongs to the typing path.
+            // So `?` help described one of three dialogs and was wrong about
+            // the other two.
+            crate::element::ElementClass::Dialog => match top {
+                Element::Form(_) => ViewClass::Form,
+                Element::Picker(_) => ViewClass::Picker,
+                Element::Confirm(_) => ViewClass::Confirm,
+                // Named rather than wildcarded, which is the one thing this
+                // inner match has to get right: `_ => ViewClass::Confirm`
+                // would hand a FOURTH dialog kind the confirm box's keymap
+                // — y/n and a dismiss-on-any-key safety net — silently.
+                // That is the `handle_dialog_keys` defect this split
+                // deleted, and it would have come straight back here.
+                //
+                // These seven are not `ElementClass::Dialog`, so
+                // `Element::class` cannot route them here; the arm exists to
+                // make a new element kind a compile error at this site.
+                Element::Overview(_)
+                | Element::ResourceList(_)
+                | Element::RowFilter(_)
+                | Element::DerivedRows(_)
+                | Element::ContentView(_)
+                | Element::LogSession(_)
+                | Element::LogFilter(_) => ViewClass::Confirm,
+            },
         }
     }
 }
+
+/// The display string for a class that answers EVERY remaining key.
+///
+/// A real declaration, not a placeholder: it says in `?` help that any key
+/// dismisses the box, which is what a user staring at an unexpected modal
+/// wants to know. The reverse pin
+/// (`every_key_the_dispatcher_answers_is_documented`) reads it as "this
+/// class is allowed to answer anything", so declaring it is a deliberate
+/// act and only one class does.
+pub(crate) const ANY_OTHER_KEY: &str = "any other key";
 
 /// One documented key.
 pub(crate) struct Binding {
@@ -172,12 +222,37 @@ impl Binding {
     }
 }
 
-/// Column-cursor movement: the arrows, plus the user's configured chords when
-/// both are bound.
+/// Column-cursor movement: the arrows, plus whichever of the user's chords
+/// are bound.
+///
+/// Each side is named independently. It was `(Some(l), Some(r))` with a
+/// `_ =>` falling back to the bare arrows, so binding ONE of the pair —
+/// `colRight: l` and nothing else, which validates and works — left help
+/// showing only the arrows and the chord undocumented. A half-bound pair is
+/// the case a two-armed match cannot say.
 fn col_move_label(keys: &crate::KeysConfig) -> String {
+    let arrows = "\u{2190} / \u{2192}";
     match (keys.col_left, keys.col_right) {
-        (Some(l), Some(r)) => format!("{} / {} (or \u{2190}/\u{2192})", l.label(), r.label()),
-        _ => "\u{2190} / \u{2192}".to_string(),
+        (None, None) => arrows.to_string(),
+        (Some(l), Some(r)) => format!("{} / {} (or {arrows})", l.label(), r.label()),
+        (Some(l), None) => format!("{} / \u{2192} (or \u{2190})", l.label()),
+        (None, Some(r)) => format!("\u{2190} / {} (or \u{2192})", r.label()),
+    }
+}
+
+/// The first/last-column jump, which has NO structural key in a table — it
+/// is reachable only through `colFirst` / `colLast`, so without this row
+/// help never mentioned that the action exists.
+///
+/// The unbound display carries `<…>`, which marks it as prose rather than a
+/// chord for the reverse pin; a `doc` row is unprobed, which is the other
+/// half of saying "this is not a key today".
+fn col_jump_label(keys: &crate::KeysConfig) -> String {
+    match (keys.col_first, keys.col_last) {
+        (None, None) => "<bind colFirst / colLast>".to_string(),
+        (Some(f), Some(l)) => format!("{} / {}", f.label(), l.label()),
+        (Some(f), None) => format!("{} / <bind colLast>", f.label()),
+        (None, Some(l)) => format!("<bind colFirst> / {}", l.label()),
     }
 }
 
@@ -255,6 +330,10 @@ pub(crate) fn for_class(class: ViewClass) -> Vec<Binding> {
                 effective_label: Some(col_move_label),
                 ..b("\u{2190} / \u{2192}", "Column cursor left / right", code(KeyCode::Left), Action::ColLeft)
             },
+            Binding {
+                effective_label: Some(col_jump_label),
+                ..doc("<bind colFirst / colLast>", "Jump to the first / last column")
+            },
             b("Enter", "Drill down", code(KeyCode::Enter), Action::Enter),
             doc("q / Esc", "Back / clear filter"),
             b("Tab / S-Tab", "Next / prev resource view", code(KeyCode::Tab), Action::NextTab),
@@ -283,31 +362,87 @@ pub(crate) fn for_class(class: ViewClass) -> Vec<Binding> {
         ],
 
         ViewClass::Detail => vec![
-            bar("j / k", "Scroll down / up", "scroll", plain('j'), Action::NextItem),
+            // The arrow and Home/End aliases are spelled out for the same
+            // reason the Table rows spell theirs: the dispatcher answers
+            // them, so a row that names only `j / k` is a row that is
+            // missing keys. `every_key_the_dispatcher_answers_is_documented`
+            // is what noticed.
+            bar("j / \u{2193}", "Scroll down", "scroll", plain('j'), Action::NextItem),
+            b("k / \u{2191}", "Scroll up", plain('k'), Action::PrevItem),
             b("PgDn / PgUp", "Page down / up", code(KeyCode::PageDown), Action::PageDown),
             b("Ctrl-d / Ctrl-u", "Half-page down / up", ctrl('d'), Action::PageDown),
-            b("g / G", "Top / bottom", plain('g'), Action::Home),
+            b("g / Home", "Top", plain('g'), Action::Home),
+            b("G / End", "Bottom", plain('G'), Action::End),
             bar("/", "Search", "search", plain('/'), Action::SearchStart),
             bar("n / N", "Next / prev match", "next/prev", plain('n'), Action::SearchNext),
             bar("c", "Copy", "copy", plain('c'), Action::Copy),
-            bar("q", "Back", "back", plain('q'), Action::Back),
+            // Esc was answered here and documented NOWHERE, while both
+            // sibling classes document theirs — so `?` help and the hint bar
+            // showed `q` alone for a view you could also leave with Esc.
+            bar("q / Esc", "Back", "back", plain('q'), Action::Back),
         ],
 
-        ViewClass::Dialog => vec![
-            bar("y", "Confirm", "yes", plain('y'), Action::Confirm),
-            bar("n / Esc", "Cancel", "no", plain('n'), Action::Cancel),
+        // No `bar_label` on any dialog row: `bar_hints` is read only by the
+        // yaml, describe and log views, so a short label declared here is
+        // "the label nothing renders" that this file's own note warns
+        // against — and `k9rs_ui`'s header test was measuring its width.
+        ViewClass::Confirm => vec![
+            b("y", "Confirm", plain('y'), Action::Confirm),
+            b("n / Esc", "Cancel", plain('n'), Action::Cancel),
             b("\u{2190} / \u{2192} / Tab", "Switch button", code(KeyCode::Tab), Action::ToggleDialogButton),
-            b("Enter", "Activate the focused button", code(KeyCode::Enter), Action::Cancel),
+            // State-dependent: Enter activates whichever button has focus,
+            // so it is documented and deliberately not probed.
+            doc("Enter", "Activate the focused button"),
+            // The safety net, declared. Cancel is always the safe direction,
+            // so a stray keystroke — a stale terminal response misparsed as
+            // a key after an alt-screen transition, say — can never trap the
+            // user behind a modal. It is CONFIRM-only: a form would lose a
+            // half-typed field and a picker is not a question with a safe
+            // answer, which is why this row is here and not on all three.
+            doc(ANY_OTHER_KEY, "Dismiss"),
         ],
 
-        ViewClass::Log => vec![
-            b("j / k", "Scroll down / up", plain('j'), Action::ScrollDown(1)),
+        ViewClass::Form => vec![
+            b("Esc", "Cancel", code(KeyCode::Esc), Action::Back),
+            // Both state-dependent: Enter submits or cancels by focus, and
+            // typing / Tab are mutations handled by the form's own input
+            // path rather than by the key dispatcher.
+            doc("Enter", "Submit, or cancel when Cancel has focus"),
+            doc("Tab / S-Tab", "Next / previous field"),
+        ],
+
+        ViewClass::Picker => vec![
+            b("j / \u{2193} / Tab", "Next", plain('j'), Action::NextItem),
+            b("k / \u{2191} / S-Tab", "Previous", plain('k'), Action::PrevItem),
+            b("Enter", "Choose", code(KeyCode::Enter), Action::Enter),
+            b("q / Esc", "Back", plain('q'), Action::Back),
+        ],
+
+        ViewClass::Log => {
+            // THE statement that every log window has a key: a seventh
+            // window added to `LogSince::ALL` fails the build HERE until it
+            // is given one, which indexing alone would not do — `ALL[6]`
+            // would simply never be read. `handler.rs` indexes the same list
+            // and leans on this assert plus the agreement test below.
+            const SINCE: &[k9rs_proto::protocol::LogSince] =
+                k9rs_proto::protocol::LogSince::ALL;
+            const _: () = assert!(
+                SINCE.len() == 6,
+                "a log window has no number key — add one in keymap.rs and handler.rs",
+            );
+            vec![
+            b("j / \u{2193}", "Scroll down", plain('j'), Action::ScrollDown(1)),
+            b("k / \u{2191}", "Scroll up", plain('k'), Action::ScrollUp(1)),
             b("PgDn / PgUp", "Page down / up", code(KeyCode::PageDown), Action::PageDown),
-            b("g / G", "Top / bottom", plain('g'), Action::Home),
+            b("g / Home", "Top", plain('g'), Action::Home),
+            b("G / End", "Bottom", plain('G'), Action::End),
             bar("s", "Toggle follow", "follow", plain('s'), Action::ToggleLogFollow),
             bar("w", "Toggle wrap", "wrap", plain('w'), Action::ToggleLogWrap),
             bar("t", "Cycle shown fields", "fields", plain('t'), Action::ToggleLogTimestamps),
-            b("h / l", "Pan one column left / right", plain('h'), Action::ColLeft),
+            // The arrows pan here too — `handle_log_view_keys` answers
+            // `Left`/`Right` as `ColLeft`/`ColRight`, and this row named
+            // only `h / l`.
+            b("h / l / \u{2190} / \u{2192}", "Pan one column left / right", plain('h'), Action::ColLeft),
             b("H / L", "Pan a stride left / right", plain('H'), Action::PageLeft),
             b("^ / $", "Pan to the left margin / far edge", plain('^'), Action::ColFirst),
             b("Shift-C", "Clear logs", KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT), Action::ClearLogs),
@@ -320,12 +455,18 @@ pub(crate) fn for_class(class: ViewClass) -> Vec<Binding> {
             bar("c", "Copy", "copy", plain('c'), Action::Copy),
             b("Ctrl-s", "Save logs to a file", ctrl('s'), Action::SaveLogs),
             bar("0", "Tail", "range", plain('0'), Action::LogRange(crate::actions::LogRange::Tail)),
-            bar("1", "1m", "range", plain('1'), Action::LogRange(crate::actions::LogRange::Since("1m".into()))),
-            bar("2", "5m", "range", plain('2'), Action::LogRange(crate::actions::LogRange::Since("5m".into()))),
-            bar("3", "15m", "range", plain('3'), Action::LogRange(crate::actions::LogRange::Since("15m".into()))),
-            bar("4", "30m", "range", plain('4'), Action::LogRange(crate::actions::LogRange::Since("30m".into()))),
-            bar("5", "1h", "range", plain('5'), Action::LogRange(crate::actions::LogRange::Since("1h".into()))),
-            bar("6", "24h", "range", plain('6'), Action::LogRange(crate::actions::LogRange::Since("24h".into()))),
+            // The windows the number keys bind, in `LogSince::ALL`'s order.
+            // Each row's LABEL and the window it asks for now come from the
+            // same value, so the bar cannot say `15m` and ask for something
+            // else; they used to be two string literals per row. That the
+            // handler's copy of this ladder agrees is pinned by
+            // `every_documented_view_key_dispatches_to_the_action_it_claims`.
+            bar("1", SINCE[0].label(), "range", plain('1'), Action::LogRange(crate::actions::LogRange::Since(SINCE[0]))),
+            bar("2", SINCE[1].label(), "range", plain('2'), Action::LogRange(crate::actions::LogRange::Since(SINCE[1]))),
+            bar("3", SINCE[2].label(), "range", plain('3'), Action::LogRange(crate::actions::LogRange::Since(SINCE[2]))),
+            bar("4", SINCE[3].label(), "range", plain('4'), Action::LogRange(crate::actions::LogRange::Since(SINCE[3]))),
+            bar("5", SINCE[4].label(), "range", plain('5'), Action::LogRange(crate::actions::LogRange::Since(SINCE[4]))),
+            bar("6", SINCE[5].label(), "range", plain('6'), Action::LogRange(crate::actions::LogRange::Since(SINCE[5]))),
             // The end of the ladder. Documented as its own row because "from
             // the beginning" is not a duration — which is exactly why the
             // old `Option<String>` payload could not express it, and why the
@@ -343,7 +484,8 @@ pub(crate) fn for_class(class: ViewClass) -> Vec<Binding> {
             // The bar still shows just `<q> back`: the label is the display
             // string, `bar_label` is the bar's.
             bar("q / Esc", "Back — pops one grep off the chain", "back", plain('q'), Action::Back),
-        ],
+            ]
+        }
     }
 }
 
@@ -416,8 +558,8 @@ mod tests;
 /// say which kind of key reaches it, exactly as before the move.
 pub(crate) fn structural_chord(op: &OperationKind) -> Option<KeyCombo> {
     match op {
-        OperationKind::Delete => Some(KeyCombo { ctrl: true, ch: 'd' }),
-        OperationKind::ForceKill => Some(KeyCombo { ctrl: true, ch: 'k' }),
+        OperationKind::Delete => Some(KeyCombo::ctrl('d')),
+        OperationKind::ForceKill => Some(KeyCombo::ctrl('k')),
         OperationKind::PortForward => Some(KeyCombo::plain('F')),
         // Everything else is reached by its descriptor's default key, or by a
         // chord the user configured.

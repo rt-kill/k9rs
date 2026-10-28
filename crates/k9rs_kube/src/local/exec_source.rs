@@ -100,6 +100,47 @@ pub struct ExecSource {
     poll_guard: OnceLock<OperatorGuard>,
 }
 
+/// How much stdout one exec poll may produce. Generous for a table's worth
+/// of JSON; small enough that a runaway command cannot grow the daemon.
+///
+/// Overflow is a FAILED poll, not a truncated parse: half a JSON document is
+/// not a shorter table, it is a parse error, and reporting it as one is the
+/// honest outcome (last-known rows are kept, and the next tick tries again).
+const MAX_EXEC_STDOUT: usize = 8 * 1024 * 1024;
+
+/// `Command::output()` with a cap on stdout.
+///
+/// Reads through `Take`, so an over-long stream stops costing memory at the
+/// limit rather than after it. stderr is read too — it is what explains a
+/// non-zero exit.
+async fn capped_output(
+    child: std::io::Result<tokio::process::Child>,
+) -> std::io::Result<std::process::Output> {
+    use tokio::io::AsyncReadExt;
+    let mut child = child?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(pipe) = child.stdout.take() {
+        // One byte past the cap, so "exactly at the limit" is still an
+        // overflow rather than a document that happens to end there.
+        pipe.take(MAX_EXEC_STDOUT as u64 + 1).read_to_end(&mut stdout).await?;
+    }
+    if let Some(pipe) = child.stderr.take() {
+        pipe.take(64 * 1024).read_to_end(&mut stderr).await?;
+    }
+    if stdout.len() > MAX_EXEC_STDOUT {
+        // Stop the child rather than letting it keep writing into a pipe
+        // nobody is draining.
+        let _ = child.kill().await;
+        return Err(std::io::Error::other(format!(
+            "exec command produced more than {} bytes of stdout",
+            MAX_EXEC_STDOUT
+        )));
+    }
+    let status = child.wait().await?;
+    Ok(std::process::Output { status, stdout, stderr })
+}
+
 impl ExecSource {
     /// Construct a new exec source and start its supervised polling
     /// operator. The operator holds only a `Weak<Self>` so the source can
@@ -158,10 +199,15 @@ impl ExecSource {
         };
 
         if !output.status.success() {
+            // With stderr: it is the only thing that explains the exit, and
+            // it used to go to /dev/null.
+            let why = String::from_utf8_lossy(&output.stderr);
+            let why = why.trim();
             tracing::warn!(
-                "exec source: `{}` exited with {}",
+                "exec source: `{}` exited with {}{}",
                 self.config.command,
-                output.status
+                output.status,
+                if why.is_empty() { String::new() } else { format!(": {why}") },
             );
             return;
         }
@@ -286,13 +332,25 @@ impl LocalOperator for ExecPollOp {
         // the poller forever, so cap it at the poll interval: a command
         // that can't finish within its own cadence is treated as a failed
         // poll (keep last-known rows, try again next tick).
+        // Output is CAPPED, and stderr is kept.
+        //
+        // `Command::output()` buffers the whole of stdout with no bound:
+        // `kubectl get -o json` on a big cluster, or a runaway script, was
+        // held entire and then copied twice more (`String::from_utf8`, then
+        // `serde_json::from_str`) inside a long-lived daemon shared by every
+        // session on the context. The only limit was the timeout, which does
+        // not bound memory — a command can emit fast.
+        //
+        // And stderr went to /dev/null, so a non-zero exit was reported as
+        // bare `status` with nothing saying why. It is the one thing that
+        // would have explained the failure.
         let child = tokio::process::Command::new(&command)
             .args(&args)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .output();
-        let result = match tokio::time::timeout(interval, child).await {
+            .spawn();
+        let result = match tokio::time::timeout(interval, capped_output(child)).await {
             Ok(r) => r,
             Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -380,3 +438,7 @@ fn entry_to_row(entry: &ExecEntry) -> ResourceRow {
         ..Default::default()
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/local/exec_source.rs"]
+mod tests;

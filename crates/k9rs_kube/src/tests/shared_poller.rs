@@ -94,3 +94,63 @@ async fn changed_first_never_observes_the_seed() {
     assert_eq!(sub.current(), 7, "changed-first must skip the seed and land on the real poll");
 }
 
+/// A poll that lands while nobody is subscribed is still published, so a
+/// session rejoining inside the keep-warm window gets the latest snapshot.
+///
+/// `watch::Sender::send` with ZERO receivers returns `Err` and never reaches
+/// `send_replace` — so until the poller held a receiver of its own, the
+/// entire grace window was a window with no receiver: the task kept polling
+/// (keeping it warm being the whole point) and every snapshot was discarded.
+/// A rejoining session then got whatever had last been published while
+/// somebody happened to be listening.
+///
+/// The worst case is the one asserted second: metrics has no eager one-shot,
+/// and its task sleeps before its first poll, so a subscriber that came and
+/// went before that poll left the channel holding its SEED — and the rejoin
+/// was served a default snapshot, i.e. blank CPU/MEM, for up to a full poll
+/// interval.
+#[tokio::test]
+async fn a_poll_with_no_subscribers_is_still_published() {
+    let cache: PollerCache<u32> = PollerCache::new();
+    let go = Arc::new(tokio::sync::Notify::new());
+
+    let g = go.clone();
+    let sub = cache.subscribe(ctx(1), 0, move |tx| {
+        tokio::spawn(async move {
+            g.notified().await;
+            // The publish that used to be thrown away: by now the only
+            // subscriber is gone and grace is holding the poller.
+            let _ = tx.send(99);
+            std::future::pending::<()>().await;
+        })
+    });
+
+    // The last subscriber leaves. Grace keeps the poller (and its task)
+    // alive — that is what it is for.
+    drop(sub);
+
+    go.notify_one();
+    // Let the task's send actually run.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Rejoin inside the window: the same poller, and it must carry the poll
+    // that landed while nobody was listening.
+    let spawned_again = Arc::new(AtomicUsize::new(0));
+    let s = spawned_again.clone();
+    let mut rejoined = cache.subscribe(ctx(1), 0, move |_| {
+        s.fetch_add(1, Ordering::SeqCst);
+        forever()
+    });
+    assert_eq!(
+        spawned_again.load(Ordering::SeqCst),
+        0,
+        "sanity: grace kept the poller, so this is the REUSE path",
+    );
+    assert_eq!(
+        rejoined.current(),
+        99,
+        "the poll that landed with no subscribers must still be the current \
+         snapshot — a zero-receiver `send` publishes nothing",
+    );
+}

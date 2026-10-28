@@ -99,6 +99,33 @@ pub struct PortForwardEntry {
 }
 
 /// Arguments for creating a new forward.
+/// A namespace that is definitely ONE namespace.
+///
+/// A port-forward resolves one pod in one namespace, so `Namespace::All` is
+/// not something it can mean. This field used to be a plain `Namespace` with
+/// a doc saying `All` was "rejected at create time", and it was not: `create`
+/// flattened it with `.unwrap_or("")` and returned an id, so the row existed
+/// first and displayed its namespace as `-` until the operator's first
+/// attempt failed it. The real refusals were at the two CALL SITES, and the
+/// one inside `run_once` was a third copy that nothing could reach.
+///
+/// Now the question is asked once, by whoever builds the request, before
+/// anything is created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodNamespace(String);
+
+impl PodNamespace {
+    /// `None` for `Namespace::All`. The caller has to say what that means for
+    /// it, which is the point — there is no sensible default to fall into.
+    pub fn of(ns: &Namespace) -> Option<Self> {
+        ns.as_option().map(|s| PodNamespace(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 pub struct PortForwardRequest {
     pub target: ObjectRef,
     pub kubectl_target: String,
@@ -113,10 +140,8 @@ pub struct PortForwardRequest {
     /// `PortForwardEntry` is `Serialize` — so that wrong name was on the
     /// describe/yaml view of forwards created from the other context.
     pub context: k9rs_proto::protocol::ContextName,
-    /// The namespace the target lives in. Typed [`Namespace`] —
-    /// `Namespace::All` is rejected at create time because port-forward
-    /// has no meaning across all namespaces.
-    pub namespace: Namespace,
+    /// The namespace the target lives in — see [`PodNamespace`].
+    pub namespace: PodNamespace,
     pub local_port: u16,
     pub remote_port: u16,
     /// The creating session's `kube::Client`, used for target resolution
@@ -233,9 +258,9 @@ impl PortForwardSource {
     /// `context` name (display metadata for this entry).
     pub fn create(self: &Arc<Self>, req: PortForwardRequest) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        // Stored as a String (serialized into the YAML describe view).
-        // The typed Namespace gets flattened here at the boundary.
-        let ns_string = req.namespace.as_option().unwrap_or("").to_string();
+        // Stored as a String (serialized into the YAML describe view). Never
+        // empty: `PodNamespace` cannot be built from `Namespace::All`.
+        let ns_string = req.namespace.as_str().to_string();
         let entry = PortForwardEntry {
             id,
             target: req.target.clone(),
@@ -356,12 +381,10 @@ struct PortForwardOp {
 
 impl LocalOperator for PortForwardOp {
     async fn run_once(&self, attempt: AttemptHandle) -> OperatorExit {
-        // Typed `Namespace` — `Namespace::All` is rejected upstream because
-        // port-forward against "all namespaces" is meaningless; a request
-        // that somehow carries it is a construction bug, not a transient.
-        let Some(ns) = self.req.namespace.as_option() else {
-            return OperatorExit::Fatal("port-forward requires a namespace".into());
-        };
+        // No namespace check: `PodNamespace` cannot hold "all namespaces",
+        // so there is nothing here to refuse. This was a `Fatal` branch that
+        // nothing could reach, and it was the third copy of the rule.
+        let ns = self.req.namespace.as_str();
 
         // 1. Resolve the target to a concrete (pod, port). Re-runs every
         // attempt, so a reconnect after pod death lands on a healthy
@@ -605,13 +628,12 @@ impl LocalResourceSource for PortForwardSource {
             return Ok(format!("pf-{id} unchanged"));
         }
 
-        // Refuse edits that would produce an empty namespace — a
-        // port-forward against "all namespaces" is meaningless (kubectl
-        // just drops the `-n` flag and the forward either fails or
-        // silently targets the default namespace).
-        if edit.namespace.is_empty() {
-            return Err("namespace field is required for port-forward".into());
-        }
+        // Resolve the edited namespace BEFORE tearing anything down: a
+        // blanked field must leave the working forward alone, and this is
+        // the one place the rule is stated now (`PodNamespace` carries it
+        // from here on).
+        let namespace = PodNamespace::of(&Namespace::from_row(&edit.namespace))
+            .ok_or("namespace field is required for port-forward")?;
 
         // Reconcile by stop + recreate. The new entry gets a fresh id; the
         // old row disappears from the next snapshot. `create` requires
@@ -626,7 +648,7 @@ impl LocalResourceSource for PortForwardSource {
             // an edit does not move a forward to whoever is editing it.
             context: current.context,
             kubectl_target: edit.kubectl_target,
-            namespace: Namespace::Named(edit.namespace),
+            namespace,
             local_port: edit.local_port,
             remote_port: edit.remote_port,
             client: current_client,
@@ -649,7 +671,10 @@ fn format_describe(entry: &PortForwardEntry) -> String {
     let mut out = String::new();
     let row_name = format!("pf-{}", entry.id);
     let age = k9rs_util::units::format_age_duration(entry.started_at.elapsed());
-    let ns_display = if entry.namespace.is_empty() { "-" } else { entry.namespace.as_str() };
+    // Always populated: the entry was built from a `PodNamespace`. The `-`
+    // placeholder this used to carry conflated "no namespace" with a
+    // cluster-scoped row, and neither is reachable here.
+    let ns_display = entry.namespace.as_str();
     let ctx_display = entry.context.as_str();
     let msg_display = if entry.last_message.is_empty() { "-" } else { entry.last_message.as_str() };
 
@@ -715,13 +740,16 @@ pub fn pf_to_row(entry: &PortForwardEntry) -> ResourceRow {
     let cells: Vec<CellValue> = vec![
         CellValue::Text(row_name.clone()),
         CellValue::Text(entry.kubectl_target.clone()),
-        CellValue::Text(if entry.namespace.is_empty() { "-".into() } else { entry.namespace.clone() }),
+        // Always populated — see `format_describe`.
+        CellValue::Text(entry.namespace.clone()),
         CellValue::Count(entry.local_port as i64),
         CellValue::Count(entry.remote_port as i64),
         CellValue::Status { text: entry.state.as_str().to_string(), health },
         CellValue::Text(age),
         CellValue::Text(entry.last_message.clone()),
-    ];    ResourceRow {
+    ];
+
+    ResourceRow {
         name: row_name,
         namespace: Some(entry.namespace.clone()),
         containers: Vec::new(),

@@ -1,37 +1,28 @@
-//! Live query system for watching Kubernetes resources.
+//! The watcher task: what it publishes, and the loop that produces it.
 //!
-//! A `LiveQuery` is a running watcher for one resource type. The k8s watch
-//! stream already IS a delta stream — the watcher task keeps a store of
-//! converted [`ResourceRow`]s and, every flush tick, broadcasts only the
-//! rows that actually changed ([`WatcherMsg::Delta`]). Full state
-//! ([`TableBaseline`]) is built on demand via an actor-ask, only when a
-//! subscriber joins, lags, or a bridge resubscribes. Nothing diffs: the
-//! only set arithmetic anywhere is the relist tombstone (`store − seen`).
+//! Split out of the 1088-line `live_query` module on a measured seam — this
+//! half names the cache half ZERO times in code. See the module doc for the
+//! direction of the edge.
 //!
-//! `WatcherCache` manages a per-process cache of live queries using `Weak`
-//! references so watchers die naturally when no `Subscription` holds them.
-//!
-//! Watcher dispatch uses the trait-based registry: each built-in resource
-//! has a type-erased `WatcherSpawner` closure captured at startup. CRDs
-//! go through `subscribe_dynamic` and `run_dynamic_live_watcher`.
+//! The loop is where liveness is decided: `first_failure` is the clock both
+//! the "rows are frozen" and the "give up" rules read, and the comment on it
+//! is the record of what happens when an event that is not progress resets
+//! it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 
 use futures::{StreamExt, TryStreamExt};
-use kube::api::GroupVersionKind;
 use kube::runtime::watcher::{self, Event as WatcherEvent};
-use kube::{Api, Client, Resource};
+use kube::{Api, Resource};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use k9rs_proto::protocol::{
-    ObjectKey, ResourceScope, RowChange, TableBaseline, TableDelta,
+    ObjectKey, RowChange, TableBaseline, TableDelta,
 };
 use k9rs_proto::row::ResourceRow;
-
 // ---------------------------------------------------------------------------
 // Fanout types — lossless-with-signal deltas + on-demand baselines
 // ---------------------------------------------------------------------------
@@ -82,7 +73,11 @@ impl WatchHealth {
     /// `stuck_for` is time since the watch last made progress — not time
     /// since the error — because that is what actually decides whether the
     /// rows on screen have gone cold.
-    fn after_error(&self, stuck_for: std::time::Duration, err: &str) -> Option<WatchHealth> {
+    /// `pub(crate)` since the split: the test mirror now hangs off
+    /// `live_query/mod.rs` rather than off this file, so a private method
+    /// is no longer reachable from it. The decision it makes is the one
+    /// `a_relist_that_keeps_failing_is_reported_stale` is about.
+    pub(crate) fn after_error(&self, stuck_for: std::time::Duration, err: &str) -> Option<WatchHealth> {
         match self {
             WatchHealth::Degraded(_) => None,
             WatchHealth::Feeding if stuck_for > DEGRADE_AFTER => {
@@ -122,7 +117,7 @@ pub struct BaselineAsk {
 /// tolerance for a stalled consumer before it must re-baseline. See
 /// [`crate::daemon_config::DaemonConfig::fanout_ring`] for the
 /// memory-vs-lag-tolerance tradeoff.
-fn fanout_ring() -> usize {
+pub(super) fn fanout_ring() -> usize {
     crate::daemon_config::daemon_config().fanout_ring.max(1)
 }
 
@@ -132,13 +127,14 @@ fn fanout_ring() -> usize {
 /// own store, so the queue only grows while the watcher is busy — mid-LIST, or
 /// asleep in its retry backoff. 16 is "more sessions than will ever pile onto
 /// one watcher in that window"; past it, `ask()` applies backpressure and
-/// waits, which is deliberate (see [`Subscription::request_baseline`] on why
+/// waits, which is deliberate (see `Subscription::request_baseline` in the
+/// `cache` half, on why
 /// dropping an ask would be mis-read as watcher death).
 ///
 /// Named because the number was written three times — at both real
 /// constructors and at the test seeder — and three spellings of one capacity
 /// is three places to disagree about what it means.
-const ASK_QUEUE: usize = 16;
+pub(super) const ASK_QUEUE: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Watcher-internal state — ListPhase + PendingChanges
@@ -200,88 +196,6 @@ impl PendingChanges {
     }
 }
 
-// ---------------------------------------------------------------------------
-// QueryKey
-// ---------------------------------------------------------------------------
-
-/// Key for looking up a live query in the cache.
-/// Uses `ContextId` so watchers are shared by actual cluster endpoint,
-/// not by context name (which can collide across kubeconfig files).
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct QueryKey {
-    pub context: k9rs_proto::protocol::ContextId,
-    pub namespace: k9rs_proto::protocol::Namespace,
-    pub resource: k9rs_proto::protocol::ResourceId,
-    /// Server-side filter. A filtered subscription creates a separate watcher
-    /// from an unfiltered one (different API queries to K8s).
-    pub filter: Option<k9rs_proto::protocol::SubscriptionFilter>,
-}
-
-// ---------------------------------------------------------------------------
-// LiveQuery
-// ---------------------------------------------------------------------------
-
-/// A running watcher that broadcasts delta batches and answers baseline
-/// asks. When all `Subscription` handles are dropped and the `Arc` strong
-/// count reaches zero, the watcher task is aborted via the `Drop` impl.
-pub struct LiveQuery {
-    /// Delta fanout — see [`WatcherMsg`]. Subscribing (`.subscribe()`)
-    /// pins a cursor; dropping the receiver is deregistration.
-    delta_tx: broadcast::Sender<Arc<WatcherMsg>>,
-    /// Baseline actor-ask into the watcher task (the store's sole owner).
-    ask_tx: mpsc::Sender<BaselineAsk>,
-    /// The watcher task handle — aborted on drop.
-    task: JoinHandle<()>,
-    /// What this query watches.
-    pub key: QueryKey,
-    /// Keep-warm window after the last `Subscription` drops. See
-    /// [`crate::grace::GraceGate`] — it coalesces to at most one grace task
-    /// AND measures the window from the last dropper, so a second session
-    /// leaving doesn't inherit the first one's nearly-expired timer.
-    grace: crate::grace::GraceGate,
-}
-
-impl Drop for LiveQuery {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Subscription
-// ---------------------------------------------------------------------------
-
-/// What callers hold. The watcher stays alive as long as any Subscription
-/// exists (Arc refcount > 0). The broadcast cursor is pinned at
-/// construction — BEFORE any baseline can be asked — which is what makes
-/// baseline-vs-buffered-deltas overlap-only (never gap).
-pub struct Subscription {
-    /// The query key identifying which resource stream this subscription is for.
-    pub key: QueryKey,
-    /// Delta stream cursor (see [`WatcherMsg`] for lag semantics).
-    rx: broadcast::Receiver<Arc<WatcherMsg>>,
-    /// Baseline ask channel into the watcher task.
-    ask: mpsc::Sender<BaselineAsk>,
-    /// Prevents the LiveQuery from being dropped.
-    _keepalive: Arc<LiveQuery>,
-}
-
-impl Subscription {
-    /// Build a subscription from a live watcher handle. Cursor pinned here.
-    fn attach(key: QueryKey, lq: Arc<LiveQuery>) -> Self {
-        Self {
-            key,
-            rx: lq.delta_tx.subscribe(),
-            ask: lq.ask_tx.clone(),
-            _keepalive: lq,
-        }
-    }
-}
-
-/// Page size for the initial LIST request. Each page is a single HTTP response;
-/// too large and the connection drops mid-transfer, too small and continue tokens
-/// expire before all pages are fetched. 1000 items ≈ 3MB per page.
-/// Watcher page size — loaded from daemon config at runtime.
 pub(crate) fn watcher_page_size() -> u32 {
     crate::daemon_config::daemon_config().watcher_page_size
 }
@@ -321,336 +235,6 @@ pub(crate) fn max_backoff_ms() -> u64 {
 }
 pub(crate) fn max_elapsed_ms() -> u64 {
     crate::daemon_config::daemon_config().backoff.max_elapsed_ms
-}
-
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        // Shared grace dance (see `crate::grace::spawn_grace`). A *dead*
-        // watcher (self-terminated task) skips grace so its cache entry is
-        // reclaimed and the next subscribe builds a fresh watcher; a live one
-        // is kept warm for the window.
-        crate::grace::spawn_grace(
-            self._keepalive.clone(),
-            |lq| lq.task.is_finished(),
-            |lq| Some(&lq.grace),
-        );
-    }
-}
-
-impl Subscription {
-    /// Ask the watcher for a full baseline. `Some(rx)` = the ask is
-    /// enqueued; the oneshot resolves when the (possibly deferred) reply
-    /// arrives, or errors if the watcher dies after taking it. `None` =
-    /// the ask channel is CLOSED, i.e. the watcher task is truly gone.
-    ///
-    /// Backpressure (`send().await`) rather than `try_send`: if the ask
-    /// channel is momentarily full — the watcher is sleeping in its
-    /// inline retry backoff — we WAIT for it to drain instead of dropping
-    /// the ask and mis-reading that drop as watcher death (which used to
-    /// send a live watcher's bridge into a permanent wedge). The send is
-    /// awaited to completion before the caller `select!`s on the reply,
-    /// so there is no borrow conflict.
-    pub async fn request_baseline(
-        &self,
-        after_initial_list: bool,
-    ) -> Option<oneshot::Receiver<BaselineReply>> {
-        let (reply, rx) = oneshot::channel();
-        match self.ask.send(BaselineAsk { after_initial_list, reply }).await {
-            Ok(()) => Some(rx),
-            Err(_) => None,
-        }
-    }
-
-    /// Whether the watcher task behind this subscription has exited. Used
-    /// to bound death-reason draining — the `Subscription` keeps the
-    /// broadcast `Sender` alive, so the channel's own `Closed` signal can
-    /// never fire.
-    pub fn watcher_finished(&self) -> bool {
-        self._keepalive.task.is_finished()
-    }
-
-    /// Receive the next delta batch (or terminal `Dead`). `Err(Lagged)` =
-    /// this subscriber fell behind the ring: recover by re-asking for a
-    /// baseline and continuing — overlap with buffered batches is
-    /// idempotent. `Err(Closed)` = the watcher task exited.
-    pub async fn recv(&mut self) -> Result<Arc<WatcherMsg>, broadcast::error::RecvError> {
-        self.rx.recv().await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WatcherCache
-// ---------------------------------------------------------------------------
-
-/// Per-process cache of live queries. Stores `Weak` references so watchers
-/// die naturally when no one holds a `Subscription`.
-pub struct WatcherCache {
-    entries: crate::weak_registry::WeakRegistry<QueryKey, LiveQuery>,
-}
-
-impl Default for WatcherCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WatcherCache {
-    pub fn new() -> Self {
-        Self {
-            entries: crate::weak_registry::WeakRegistry::new(),
-        }
-    }
-
-    /// Subscribe to a built-in resource type. Reuses an existing watcher if
-    /// the Weak upgrades, otherwise creates a new one via the typed registry
-    /// path. `kind` is taken explicitly so the caller (who's already
-    /// pattern-matched on `ResourceId::BuiltIn(kind)`) hands the discriminant
-    /// in — no runtime `.expect()` required downstream.
-    pub fn subscribe(
-        &self,
-        key: QueryKey,
-        kind: k9rs_proto::resource_def::BuiltInKind,
-        make_client: impl FnOnce() -> Client,
-        streaming_lists: bool,
-    ) -> Subscription {
-        self.subscribe_with(key, move |k| Self::create_watcher(k, kind, &make_client(), streaming_lists))
-    }
-
-    /// Shared cache lookup + insert scaffolding for both `subscribe` and
-    /// `subscribe_dynamic`. The `create` closure runs only when no live
-    /// watcher exists for `key`.
-    ///
-    /// Sequence:
-    ///   1. Reap dead `Weak` entries (cheap O(n)).
-    ///   2. Fast path: opportunistic `get()` — if a live Arc upgrades, return
-    ///      a fresh subscription handle backed by it.
-    ///   3. Slow path: take the `entry()` lock for atomic check-and-insert
-    ///      (a concurrent caller may have raced past our fast-path read), and
-    ///      either reuse the race winner's watcher or call `create` to spawn
-    ///      a new one and store its `Weak` in the map.
-    ///
-    /// The trace label ("typed" vs "dynamic") is derived from the key's
-    /// `ResourceId` discriminant so callers don't need to pass a magic
-    /// string in.
-    fn subscribe_with<F>(&self, key: QueryKey, create: F) -> Subscription
-    where
-        F: FnOnce(&QueryKey) -> Arc<LiveQuery>,
-    {
-        let label = if matches!(&key.resource, k9rs_proto::protocol::ResourceId::Crd(_) | k9rs_proto::protocol::ResourceId::CrdUnresolved(_)) {
-            "dynamic"
-        } else {
-            "typed"
-        };
-
-        // The liveness predicate is the whole of what makes this registry
-        // different from the three others: a watcher's task can self-finish
-        // while its `Arc` is still held, and handing that out gives the
-        // caller a corpse. The other registries pass `|_| true`.
-        let (live_query, outcome) = self.entries.get_or_create(
-            key.clone(),
-            |arc| !arc.task.is_finished(),
-            create,
-        );
-        match outcome {
-            crate::weak_registry::Outcome::Reused => {
-                tracing::debug!("WatcherCache: reusing existing {} watcher for {:?}", label, key);
-            }
-            crate::weak_registry::Outcome::ReplacedDead => {
-                tracing::debug!("WatcherCache: existing {} watcher was dead, replaced for {:?}", label, key);
-            }
-            crate::weak_registry::Outcome::Created => {
-                tracing::debug!("WatcherCache: creating new {} watcher for {:?}", label, key);
-            }
-        }
-        Subscription::attach(key, live_query)
-    }
-
-    /// Internal: spawn a watcher task and return the LiveQuery + initial receiver.
-    ///
-    /// Only built-in resources reach this path — CRDs go through
-    /// `create_dynamic_watcher`, and locals never touch `WatcherCache` at
-    /// all. The typed `kind: BuiltInKind` is passed in explicitly by the
-    /// caller (who has already destructured `ResourceId::BuiltIn(kind)`),
-    /// so the dispatch is compile-time-checked and there's nothing to
-    /// `.expect()`.
-    fn create_watcher(
-        key: &QueryKey,
-        kind: k9rs_proto::resource_def::BuiltInKind,
-        client: &Client,
-        streaming_lists: bool,
-    ) -> Arc<LiveQuery> {
-        let (delta_tx, _) = broadcast::channel(fanout_ring());
-        let (ask_tx, ask_rx) = mpsc::channel(ASK_QUEUE);
-
-        let args = crate::resource_defs::registry::WatcherArgs {
-            client: client.clone(),
-            namespace: key.namespace.clone(),
-            delta_tx: delta_tx.clone(),
-            ask_rx,
-            filter: key.filter.clone(),
-            streaming_lists,
-        };
-
-        let task = crate::resource_defs::REGISTRY.spawn_watcher_for_kind(kind, args);
-
-        Arc::new(LiveQuery {
-            delta_tx,
-            ask_tx,
-            task,
-            key: key.clone(),
-            grace: crate::grace::GraceGate::new(crate::grace::watcher_grace()),
-        })
-    }
-
-    /// Remove the cache entry for a key. Used by `handle_refresh` for dynamic
-    /// resources so the next `subscribe_dynamic` creates a fresh watcher.
-    pub fn remove(&self, key: &QueryKey) {
-        self.entries.forget(key);
-    }
-
-    /// Cache slots, live or not. Test-only: the difference between this and
-    /// `stats().len()` is exactly the dead-slot backlog, which is what pins
-    /// that reporting doesn't reap.
-    #[cfg(test)]
-    pub(crate) fn entry_count(&self) -> usize {
-        self.entries.slot_count()
-    }
-
-    /// Every LIVE watcher, for `ctl status`. Dead `Weak`s are skipped rather
-    /// than reaped — reporting must not mutate what it reports on.
-    pub fn stats(&self) -> Vec<k9rs_proto::protocol::WatcherStat> {
-        self.entries
-            .live()
-            .into_iter()
-            .map(|(key, _lq, holders)| k9rs_proto::protocol::WatcherStat {
-                context: key.context.name.clone(),
-                namespace: key.namespace.display().to_string(),
-                resource: key.resource.plural().to_string(),
-                filter: key.filter.as_ref().map(|f| format!("{f:?}")),
-                holders,
-            })
-            .collect()
-    }
-
-    /// TEST SEAM: seed the cache with a watcher the TEST drives.
-    ///
-    /// The subscription bridge obtains its `Subscription` from this cache, so
-    /// this is the one place a test can stand in for a cluster without
-    /// touching the bridge's own code: the next `subscribe` for `key` takes
-    /// the ordinary reuse path, finds this entry live, and attaches. The
-    /// client factory is never called, no watcher task is spawned, and every
-    /// line of the bridge under test is the production one.
-    ///
-    /// Returns the `Arc` keepalive alongside the driver — the cache holds only
-    /// a `Weak`, so dropping the `Arc` is how a test makes the watcher vanish.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn seed_driven(&self, key: QueryKey) -> (Arc<LiveQuery>, DrivenWatcher) {
-        let (delta_tx, _initial_rx) = broadcast::channel(fanout_ring());
-        let (ask_tx, ask_rx) = mpsc::channel(ASK_QUEUE);
-        let (stop_tx, stop_rx) = oneshot::channel::<()>();
-        // A task that parks until the test ends it. `LiveQuery` needs one
-        // because `task.is_finished()` is how the rest of the system asks
-        // "is this watcher dead?" — bounding the bridge's death drain and
-        // deciding whether a dropped Subscription gets a grace window.
-        let task = tokio::spawn(async move {
-            let _ = stop_rx.await;
-        });
-        let lq = Arc::new(LiveQuery {
-            delta_tx: delta_tx.clone(),
-            ask_tx,
-            task,
-            key: key.clone(),
-            grace: crate::grace::GraceGate::new(crate::grace::watcher_grace()),
-        });
-        self.entries.insert(key, &lq);
-        (lq, DrivenWatcher { delta_tx, ask_rx, stop: Some(stop_tx) })
-    }
-
-    /// Force-subscribe: removes any existing Weak entry for the key and creates
-    /// a new watcher unconditionally. The displaced watcher lives as long as
-    /// any OTHER session's `Subscription` holds it — grace only starts once
-    /// the last one drops — so on a shared daemon one client's Ctrl-R can
-    /// leave two watchers (two apiserver watches, two row stores) for one key
-    /// until those subscribers go away. Bounded and self-resolving, but not
-    /// the 60s the word "grace" suggests. The cache
-    /// now points to the new watcher.
-    pub fn subscribe_force(
-        &self,
-        key: QueryKey,
-        kind: k9rs_proto::resource_def::BuiltInKind,
-        client: &Client,
-        streaming_lists: bool,
-    ) -> Subscription {
-        self.entries.reap();
-        // `replace` puts the new watcher in UNDER the entry lock — the same
-        // claim `get_or_create` takes — so a concurrent normal subscribe's
-        // check-and-insert is serialized with this rather than the two
-        // insertions interleaving and stranding a just-created watcher
-        // unreachable in the map (a second live watcher for one key).
-        let live_query = self.entries.replace(key.clone(), |k| {
-            Self::create_watcher(k, kind, client, streaming_lists)
-        });
-
-        Subscription::attach(key, live_query)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Dynamic CRD instance watcher
-// ---------------------------------------------------------------------------
-
-impl WatcherCache {
-    /// Subscribe to a dynamic CRD resource type. Reuses an existing watcher if
-    /// the Weak upgrades, otherwise creates a new one via the dynamic-object
-    /// watcher path.
-    // The args are the dynamic-resource descriptor (gvk/plural/scope) plus
-    // the discovery handle (the watcher resolves its own printer columns
-    // at birth), the client factory, and the streaming flag — all
-    // intrinsic to opening a watcher. Kept flat rather than threaded
-    // through a struct in this hot path.
-    #[allow(clippy::too_many_arguments)]
-    pub fn subscribe_dynamic(
-        &self,
-        key: QueryKey,
-        make_client: impl FnOnce() -> Client,
-        gvk: GroupVersionKind,
-        plural: String,
-        scope: ResourceScope,
-        discovery: Arc<crate::cache::DiscoveryCache>,
-        streaming_lists: bool,
-    ) -> Subscription {
-        self.subscribe_with(key, move |k| {
-            Self::create_dynamic_watcher(k, &make_client(), gvk, plural, scope, discovery, streaming_lists)
-        })
-    }
-
-    /// Internal: spawn a dynamic watcher task and return the LiveQuery + initial receiver.
-    fn create_dynamic_watcher(
-        key: &QueryKey,
-        client: &Client,
-        gvk: GroupVersionKind,
-        plural: String,
-        scope: ResourceScope,
-        discovery: Arc<crate::cache::DiscoveryCache>,
-        streaming_lists: bool,
-    ) -> Arc<LiveQuery> {
-        let (delta_tx, _) = broadcast::channel(fanout_ring());
-        let (ask_tx, ask_rx) = mpsc::channel(ASK_QUEUE);
-        let task_client = client.clone();
-        let task_ns = key.namespace.clone();
-        let task_tx = delta_tx.clone();
-        let task_context = key.context.clone();
-        let task = tokio::spawn(async move {
-            crate::live_query_dynamic::run_dynamic_live_watcher(task_client, task_ns, task_tx, ask_rx, gvk, plural, scope, discovery, task_context, streaming_lists).await;
-        });
-        Arc::new(LiveQuery {
-            delta_tx,
-            ask_tx,
-            task,
-            key: key.clone(),
-            grace: crate::grace::GraceGate::new(crate::grace::watcher_grace()),
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -744,7 +328,44 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
     let mut deferred_relist: Vec<oneshot::Sender<BaselineReply>> = Vec::new();
 
     let mut backoff_ms: u64 = initial_backoff_ms();
-    let mut backoff_start = std::time::Instant::now();
+    // When this watch started failing CONTINUOUSLY, or `None` while it is
+    // healthy. Both liveness decisions below read it: `DEGRADE_AFTER` to
+    // call the rows frozen, `max_elapsed_ms` to give up and report `Dead`.
+    //
+    // This was an `Instant` reset by `Init` as well as by real progress,
+    // and `Init` is not progress: kube-runtime yields `Ok(Event::Init)`
+    // BEFORE it issues the list (`watcher.rs` `State::Empty`) and returns
+    // to `State::Empty` when the list fails, so **every retry re-emitted
+    // it**. Two opposite failures came out of that one line:
+    //
+    //   - a permanently failing relist (RBAC revoked, CRD deleted, API
+    //     group gone) cycled `Init` → list fails → `Err`, so the clock only
+    //     ever measured one list request. It never reached `DEGRADE_AFTER`
+    //     and never reached `max_elapsed_ms`: the watcher span at maximum
+    //     backoff forever, never `Degraded`, never `Dead`, rows frozen on
+    //     screen with no banner — the liveness-gate class this file's
+    //     health signal exists for.
+    //   - and a resource quiet for over two minutes — configmaps, secrets,
+    //     nodes, roles, storageclasses, most of the list — had last reset
+    //     the clock at its `InitDone`, so its FIRST transient error was
+    //     already "two minutes of failures" and killed the watcher. The
+    //     bridge then resubscribed with a full re-LIST and a full baseline
+    //     resend, which is the cost the delta machinery exists to avoid,
+    //     on an ordinary watch blip.
+    //
+    // An `Option` rather than an always-set `Instant` because "not failing"
+    // is a different state from "failing since now", and the old type could
+    // not tell them apart. Cleared by `InitDone` (the relist completed, the
+    // store is authoritative again) and by `Apply`/`Delete` (steady-state
+    // progress) — not by `InitApply`, since a relist that always dies on
+    // page two would otherwise reset the clock on page one of every cycle
+    // and resurrect the first failure above.
+    // The RUNTIME clock, like `retry_at` below and for the same reason: the
+    // two are read together (a retry deadline and how long retries have been
+    // failing), and a decision driven by a clock no test can advance is a
+    // decision no test can reach. `Instant::elapsed` yields a
+    // `std::time::Duration` either way, so `after_error` is unchanged.
+    let mut first_failure: Option<tokio::time::Instant> = None;
     // When the watch may be polled again after an error. A DEADLINE rather
     // than an inline sleep: `select!` only cancels branch *futures*, so a
     // `sleep().await` inside a branch HANDLER suspends the whole loop —
@@ -795,7 +416,6 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                                     }
                                     ListPhase::Listing { seen, .. } => seen.clear(),
                                 }
-                                backoff_start = std::time::Instant::now();
                                 debug!(resource = %rt, namespace = %ns_label, "listing");
                             }
                             WatcherEvent::InitApply(obj) => {
@@ -814,7 +434,7 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                             }
                             WatcherEvent::InitDone => {
                                 backoff_ms = initial_backoff_ms();
-                                backoff_start = std::time::Instant::now();
+                                first_failure = None;
                                 // The relist finished: the store is
                                 // authoritative again. Announce recovery
                                 // BEFORE the flush and the deferred replies
@@ -849,7 +469,7 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                             }
                             WatcherEvent::Apply(obj) => {
                                 backoff_ms = initial_backoff_ms();
-                                backoff_start = std::time::Instant::now();
+                                first_failure = None;
                                 let key = obj_key(&obj);
                                 let row = convert(obj);
                                 // Same upsert-if-changed rule: heartbeat /
@@ -861,7 +481,7 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                             }
                             WatcherEvent::Delete(obj) => {
                                 backoff_ms = initial_backoff_ms();
-                                backoff_start = std::time::Instant::now();
+                                first_failure = None;
                                 let key = obj_key(&obj);
                                 if store.remove(&key).is_some() {
                                     pending.remove(key);
@@ -884,15 +504,18 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                             exit_reason = Some(format!("{}", e));
                             break;
                         }
-                        if backoff_start.elapsed().as_millis() as u64 > max_elapsed_ms() {
+                        // One clock, read at two thresholds. Started HERE,
+                        // on the first failure of a run, so it measures how
+                        // long this watch has been failing continuously —
+                        // which is what both rules want and what `Init`
+                        // resetting it made impossible. See `first_failure`.
+                        let failing_for =
+                            first_failure.get_or_insert_with(tokio::time::Instant::now).elapsed();
+                        if failing_for.as_millis() as u64 > max_elapsed_ms() {
                             warn!(resource = %rt, "giving up after 2 minutes of failures: {e}");
                             exit_reason = Some(format!("{}", e));
                             break;
                         }
-                        // `backoff_start` is reset only by actual PROGRESS
-                        // (Init / InitDone / Apply / Delete), so it measures
-                        // exactly what the rule wants: how long the store has
-                        // been frozen. See `WatchHealth::after_error`.
                         // The log level follows the SAME threshold as the
                         // staleness decision, for the same reason: kube-rs
                         // surfaces routine watch restarts as errors, so a
@@ -900,7 +523,7 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
                         // ONCE, when the failure has outlived a restart and
                         // we start telling clients their rows are frozen;
                         // every retry before and after that stays at debug.
-                        match health.after_error(backoff_start.elapsed(), &format!("{}", e)) {
+                        match health.after_error(failing_for, &format!("{}", e)) {
                             Some(next) => {
                                 warn!(resource = %rt, "watch stalled, rows are frozen: {e}");
                                 health = next;
@@ -985,6 +608,8 @@ impl DrivenWatcher {
     /// Take the next baseline ask, failing the test if none arrives. Receiving
     /// one is also the proof that the bridge has attached and pinned its
     /// broadcast cursor — i.e. that `delta_tx.send` will now reach it.
+    /// Test-only: the harness drives a watcher by answering its asks.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn next_ask(&mut self) -> BaselineAsk {
         tokio::time::timeout(std::time::Duration::from_secs(2), self.ask_rx.recv())
             .await
@@ -998,12 +623,3 @@ impl DrivenWatcher {
         self.delta_tx.send(Arc::new(msg)).expect("a bridge should be attached");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Watcher-loop tests — the injected stream lets these drive raw
-// WatcherEvents and assert the delta/baseline contract without a cluster.
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-#[path = "tests/live_query.rs"]
-mod cache_tests;

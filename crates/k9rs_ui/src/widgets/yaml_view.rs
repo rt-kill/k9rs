@@ -185,7 +185,17 @@ impl StatefulWidget for YamlViewer<'_> {
         let line_num_width = format!("{}", total_lines).len() as u16 + 1; // +1 for padding
 
         let content_x = inner.x + line_num_width + 1; // +1 for separator
-        let content_width = inner.width.saturating_sub(line_num_width + 1);
+        // The scrollbar column is RESERVED, not shared — the same rule
+        // `log_view` states, for the same reason and after the same bug.
+        // This subtracted only the gutter and its separator while the
+        // scrollbar painted at `inner.width - 1` AFTER the text, so the last
+        // column of every long line was silently overwritten the moment a
+        // document grew past one screen. Reserving it unconditionally also
+        // keeps the width independent of whether a scrollbar is needed.
+        let content_width = inner
+            .width
+            .saturating_sub(line_num_width + 1)
+            .saturating_sub(1);
 
         // Render visible lines
         let end = (state.scroll + visible_height).min(total_lines);
@@ -212,19 +222,26 @@ impl StatefulWidget for YamlViewer<'_> {
                 && state.current_match < state.search_matches.len()
                 && state.search_matches[state.current_match] == line_idx;
 
-            if is_current_match {
-                // Highlight the entire line for the current match
-                buf.set_string(content_x, y, line, self.theme.search_match);
+            // All three branches clip at `content_width`. The two highlight
+            // branches used `set_string`, which clips at the BUFFER edge and
+            // not at the area's — so a long matched line painted straight
+            // across the right border and over the scrollbar, while the
+            // same line one keystroke earlier (unmatched) was clipped
+            // correctly. One cell, painted by three branches that disagreed
+            // about where it ends.
+            let style = if is_current_match {
+                Some(self.theme.search_match)
             } else if is_match {
-                // Dim highlight for other matches
-                let match_style = self.theme.filter;
-                buf.set_string(content_x, y, line, match_style);
+                Some(self.theme.filter)
             } else {
-                // Syntax-highlighted YAML
-                let spans = Self::style_yaml_line(line, self.theme);
-                let styled_line = Line::from(spans);
-                buf.set_line(content_x, y, &styled_line, content_width);
-            }
+                None
+            };
+            let styled_line = match style {
+                Some(style) => Line::from(Span::styled(line, style)),
+                // Syntax-highlighted YAML.
+                None => Line::from(Self::style_yaml_line(line, self.theme)),
+            };
+            buf.set_line(content_x, y, &styled_line, content_width);
         }
 
         // Scrollbar indicator (right-edge marks)

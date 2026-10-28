@@ -9,7 +9,6 @@ description = "k9rs: text, width and concurrency helpers with no k9rs dependenci
 # library toward the daemon, so it moved to `ui::ansi`. The escape tokenizer
 # stayed, because every text consumer needs it.
 [dependencies]
-chrono.workspace = true
 libc.workspace = true
 regex.workspace = true
 tokio.workspace = true

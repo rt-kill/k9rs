@@ -434,12 +434,51 @@ impl ResourceScope {
 
 /// Namespace selection — either all namespaces or a specific one.
 /// Replaces the pattern of using String with magic values "all" and "".
+///
+/// `Named("")` is NOT a valid value: the empty selection is [`Namespace::All`],
+/// which is what both constructors here map an empty string to. It could
+/// still arrive off the WIRE, where the derived `Deserialize` accepted it —
+/// and that mattered, because the daemon's guard on a mutating operation
+/// refuses `All` and so sailed straight past `Named("")`, after which
+/// [`Namespace::as_option`] answers `Some("")` and that goes into the
+/// request path. Decoding now refuses it; see `NamespaceWire` below.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "NamespaceWire")]
 pub enum Namespace {
     /// All namespaces (cross-namespace view).
     All,
-    /// A specific namespace.
+    /// A specific namespace. Never empty — see the type's own doc.
     Named(String),
+}
+
+/// The wire form of [`Namespace`]: the same two variants in the same order,
+/// so the bincode tags and payloads are byte-identical, existing only so
+/// that decoding can REFUSE `Named("")` instead of admitting a namespace
+/// selection that names nothing.
+///
+/// A separate type rather than a hand-written `Deserialize` for `Namespace`,
+/// because hand-writing one for an enum is where a wire layout quietly
+/// changes. `Serialize` stays derived on `Namespace` itself.
+#[derive(Deserialize)]
+enum NamespaceWire {
+    All,
+    Named(String),
+}
+
+impl TryFrom<NamespaceWire> for Namespace {
+    type Error = String;
+
+    fn try_from(wire: NamespaceWire) -> Result<Self, Self::Error> {
+        match wire {
+            NamespaceWire::All => Ok(Namespace::All),
+            NamespaceWire::Named(s) if s.is_empty() => Err(
+                "namespace selection Named(\"\") names nothing; the empty \
+                 selection is Namespace::All"
+                    .to_string(),
+            ),
+            NamespaceWire::Named(s) => Ok(Namespace::Named(s)),
+        }
+    }
 }
 
 impl Namespace {
@@ -778,48 +817,119 @@ pub struct MetricsUsage {
 // etc.). The schema describes how to *gather* the values for that command;
 // it doesn't dispatch generically.
 
-/// One specific operation the user might want to perform on a row. Each kind
-/// corresponds to either a `SessionCommand` variant or a purely client-side
-/// action that nonetheless requires server-known facts (like "this row is a
-/// pod, you can `kubectl exec` into it").
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum OperationKind {
-    // Always-on (the server can satisfy these for any K8s row, plus locals
-    // that opt in).
-    Describe,
-    Yaml,
-    Delete,
+/// Declare [`OperationKind`] and generate `BUILT_IN` from the same list.
+///
+/// `BUILT_IN` is "every operation the app itself defines", and it used to be
+/// a second hand-written array beside the enum. Nothing asserted it was
+/// complete — and nothing could, because iterating a list can only check
+/// the entries it has. A variant missing from it still compiled arms in
+/// `descriptor`, `config_key`, `op_override`, `batch_support`,
+/// `structural_chord` and `From<&OperationKind> for Action`, so it looked
+/// thoroughly handled while escaping every check that derives its universe
+/// from `BUILT_IN`: the reserved-chord check and the duplicate-chord check
+/// in `KeysConfig::validate` (whose stated purpose is "a startup error, not
+/// a mystery"), the stale guard, and the batch-support manifest.
+///
+/// Why a token muncher rather than two groups: the declaration ORDER is the
+/// wire's tag order, and `Custom` sits between `ToggleSuspendCronJob` and
+/// `Apply`. Emitting the unit variants and then the payload one would swap
+/// two tags, which is a protocol break for a cosmetic gain. So the entries
+/// are consumed one at a time, in order, and only the unit ones are
+/// collected into the list.
+///
+/// Same intent as `built_in_kinds!` and `view_classes!`; this is the third
+/// list in this codebase that Rust cannot enumerate for itself.
+macro_rules! operation_kinds {
+    ($(#[$m:meta])* pub enum $name:ident { $($entries:tt)* }) => {
+        operation_kinds!(@collect $name [$(#[$m])*] [] [] $($entries)*);
+    };
 
-    // Workload operations.
-    Restart,
-    Scale,
-    StreamLogs,
-    PreviousLogs,
-    PortForward,
+    // A variant WITH a payload: declared, but not a member of `BUILT_IN` —
+    // it is overlay-declared and unbounded, so there is no list to put it in.
+    // Matched before the unit arm because it is the more specific shape.
+    (@collect $name:ident [$($m:tt)*] [$($decl:tt)*] [$($list:tt)*]
+        $(#[$vm:meta])* $v:ident ( $t:ty ) , $($rest:tt)*
+    ) => {
+        operation_kinds!(@collect $name [$($m)*]
+            [$($decl)* $(#[$vm])* $v($t),]
+            [$($list)*]
+            $($rest)*);
+    };
 
-    // Pod-specific.
-    Shell,
-    ShowNode,
-    ForceKill,
+    // A unit variant: declared AND listed.
+    (@collect $name:ident [$($m:tt)*] [$($decl:tt)*] [$($list:tt)*]
+        $(#[$vm:meta])* $v:ident , $($rest:tt)*
+    ) => {
+        operation_kinds!(@collect $name [$($m)*]
+            [$($decl)* $(#[$vm])* $v,]
+            [$($list)* $name::$v,]
+            $($rest)*);
+    };
 
-    // Node-specific.
-    NodeShell,
+    (@collect $name:ident [$($m:tt)*] [$($decl:tt)*] [$($list:tt)*]) => {
+        $($m)*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum $name { $($decl)* }
 
-    // Special-purpose K8s resources.
-    DecodeSecret,
-    TriggerCronJob,
-    ToggleSuspendCronJob,
+        // The enum takes its allow from the invocation's attributes; this
+        // block cannot, so the allow lives here. It is inert for the real
+        // `OperationKind` (`pub` in a `pub` module with cross-crate
+        // callers) and load-bearing for the toy enum the macro's own test
+        // declares inside a test module.
+        #[allow(unreachable_pub)]
+        impl $name {
+            /// Every operation the app itself defines, in wire-tag order.
+            /// Generated from the enum's own declaration, so it cannot be
+            /// missing one. `Custom` is absent because it carries a payload
+            /// — see the macro's doc.
+            pub const BUILT_IN: &'static [$name] = &[$($list)*];
+        }
+    };
+}
 
-    /// User-defined operation from overlay config.
-    Custom(String),
+operation_kinds! {
+    /// One specific operation the user might want to perform on a row. Each kind
+    /// corresponds to either a `SessionCommand` variant or a purely client-side
+    /// action that nonetheless requires server-known facts (like "this row is a
+    /// pod, you can `kubectl exec` into it").
+    pub enum OperationKind {
+        // Always-on (the server can satisfy these for any K8s row, plus locals
+        // that opt in).
+        Describe,
+        Yaml,
+        Delete,
 
-    /// The edit flow's server-side apply. NOT user-invocable from a
-    /// capability list (the edit overlay drives it) — the variant exists so
-    /// `SessionEvent::OpResult` can name its operation: without it, an
-    /// apply result and e.g. a concurrent batch-restart result for the
-    /// same target were indistinguishable and could claim each other.
-    /// Appended last (wire-tag discipline).
-    Apply,
+        // Workload operations.
+        Restart,
+        Scale,
+        StreamLogs,
+        PreviousLogs,
+        PortForward,
+
+        // Pod-specific.
+        Shell,
+        ShowNode,
+        ForceKill,
+
+        // Node-specific.
+        NodeShell,
+
+        // Special-purpose K8s resources.
+        DecodeSecret,
+        TriggerCronJob,
+        ToggleSuspendCronJob,
+
+        /// User-defined operation from overlay config.
+        Custom(String),
+
+        /// The edit flow's server-side apply. NOT user-invocable from a
+        /// capability list (the edit overlay drives it) — the variant exists so
+        /// `SessionEvent::OpResult` can name its operation: without it, an
+        /// apply result and e.g. a concurrent batch-restart result for the
+        /// same target were indistinguishable and could claim each other.
+        /// Appended last (wire-tag discipline).
+        Apply,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -859,7 +969,7 @@ impl FormSchema {
     pub const SCALE: FormSchema = FormSchema {
     title_template: "Scale: {{kind}}/{{name}}",
     fields: &[FormFieldSchema {
-        name: "replicas",
+        name: form_field_name::REPLICAS,
         label: "Replicas",
         kind: FormFieldSchemaKind::Number {
             min: 0, max: 1_000_000,
@@ -873,14 +983,14 @@ impl FormSchema {
     title_template: "Port forward: {{kind}}/{{name}}",
     fields: &[
         FormFieldSchema {
-            name: "container_port",
+            name: form_field_name::CONTAINER_PORT,
             label: "Container port",
             kind: FormFieldSchemaKind::DynamicSelect {
                 fallback: DynamicSelectFallback::Port,
             },
         },
         FormFieldSchema {
-            name: "local_port",
+            name: form_field_name::LOCAL_PORT,
             label: "Local port",
             kind: FormFieldSchemaKind::Port,
         },
@@ -896,9 +1006,10 @@ impl OperationKind {
     /// to decide, which is the whole reason these manifests are written as
     /// closed matches.
     ///
-    /// Call sites that already KNOW the kind should use [`FormSchema::SCALE`]
-    /// / [`FormSchema::PORT_FORWARD`] directly rather than asking here and
-    /// unwrapping — the guarantee is theirs to have statically.
+    /// THE op→schema pairing. Call sites used to name both halves — a
+    /// `&FormSchema::SCALE` beside an `OperationKind::Scale` — on this doc's
+    /// own advice, which left the pairing restated per site and this match
+    /// with no caller but a test. `build_form_for` asks here now.
     pub fn form_schema(&self) -> Option<&'static FormSchema> {
         match self {
             OperationKind::Scale => Some(&FormSchema::SCALE),
@@ -951,7 +1062,24 @@ pub enum ExecPlaceholder {
 static SHELL_TEMPLATE: ExecTemplate = ExecTemplate {
     args: &[
         ExecArg::Literal("exec"), ExecArg::Literal("-it"),
-        ExecArg::Literal("-n"), ExecArg::Placeholder(ExecPlaceholder::Namespace),
+        // `ConditionalPair`, not a bare `Literal` beside a `Placeholder`.
+        // It is the one flag/value pair in either template that was not
+        // using the variant built for exactly this, and it went wrong two
+        // different ways:
+        //
+        //   - with a POD target, `resolve_placeholder` answers
+        //     `Some(namespace)` even when the namespace is empty, so the
+        //     invocation became `exec -it -n "" <pod> -- sh …` — an empty
+        //     `--namespace` passed explicitly rather than omitted.
+        //   - with a MISMATCHED target (a `Node` under the shell template)
+        //     it answers `None`, `build_exec_init` skips the placeholder and
+        //     keeps the literal, and the dangling `-n` then takes the next
+        //     argument as its value and shifts everything after it.
+        //
+        // The second needs an op paired with the wrong target variant, which
+        // nothing constructs today — which is why it is worth a type and a
+        // test rather than a reading.
+        ExecArg::ConditionalPair("-n", ExecPlaceholder::Namespace),
         ExecArg::Placeholder(ExecPlaceholder::PodName),
         ExecArg::ConditionalPair("-c", ExecPlaceholder::Container),
         // k9s pattern: start sh, try to upgrade to bash, fall back to sh.
@@ -1002,31 +1130,6 @@ impl OperationKind {
             | OperationKind::Apply => None,
         }
     }
-
-    /// Every operation the app itself defines. `Custom` is excluded: it is
-    /// overlay-declared and unbounded, so there is no list to put it in.
-    ///
-    /// ONE list, so the four hand-written copies that used to appear in the
-    /// agreement tests and in `KeysConfig::entries` cannot disagree about
-    /// which operations exist.
-    pub const BUILT_IN: &'static [OperationKind] = &[
-        OperationKind::Describe,
-        OperationKind::Yaml,
-        OperationKind::Delete,
-        OperationKind::Restart,
-        OperationKind::Scale,
-        OperationKind::StreamLogs,
-        OperationKind::PreviousLogs,
-        OperationKind::PortForward,
-        OperationKind::Shell,
-        OperationKind::ShowNode,
-        OperationKind::ForceKill,
-        OperationKind::NodeShell,
-        OperationKind::DecodeSecret,
-        OperationKind::TriggerCronJob,
-        OperationKind::ToggleSuspendCronJob,
-        OperationKind::Apply,
-    ];
 
     /// The `keys.*` config field name that overrides this operation's chord,
     /// or `None` for the ones that aren't user-bindable.
@@ -1152,16 +1255,28 @@ pub enum BatchSupport {
 }
 
 /// Single source of truth for client-side form-field name strings.
-/// Form construction (`session_handlers::build_*_form`) and submit
-/// dispatch (`session_commands::handle_form_submit`) both reach for these
-/// — drift becomes a compile error rather than a silent "field not found"
-/// lookup miss at submit time. Not part of the wire protocol; the daemon
-/// never sees field names.
+///
+/// The declarative schemas above (`SCALE_FORM`, `PORT_FORWARD_FORM`) and the
+/// submit dispatcher (`k9rs_app::form`'s `build_command`) both spell their
+/// field names with these, so renaming one is a compile error rather than a
+/// silent "field not found" at the moment the user presses OK.
+///
+/// That was prose until 2026-10-27: the schemas held bare literals, so the
+/// two sides agreed by eye. Not part of the wire protocol; the daemon never
+/// sees field names.
 pub mod form_field_name {
     pub const REPLICAS: &str = "replicas";
     pub const CONTAINER_PORT: &str = "container_port";
     pub const LOCAL_PORT: &str = "local_port";
 }
+
+// The schemas above now spell their `name` with these constants, which is
+// what makes the shared-source claim true. They were bare literals —
+// `name: "container_port"` — against a doc saying "drift becomes a compile
+// error rather than a silent 'field not found' lookup miss at submit time".
+// Renaming a schema field compiled fine and `build_command` answered
+// `Err("Missing field: container_port")` when the user pressed OK, which is
+// exactly the outcome the doc called impossible.
 
 /// The full set of operations a resource type supports. Sent from the server
 /// to the TUI after a successful subscription. Empty `operations` means the
@@ -1187,13 +1302,44 @@ impl ResourceCapabilities {
 /// legitimate message is a `TableBaseline` for a busy
 /// cluster. 64 MiB gives headroom for very large clusters while still
 /// rejecting outrageous allocations from a corrupted frame.
-const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
+///
+/// `pub` because it has a RELATIONSHIP that only holds if both ends can see
+/// it: `k9rs_mux::MAX_STREAM_WINDOW` must be at least this, or a legitimate
+/// message of exactly this size stalls behind flow control instead of
+/// moving. Both are 64 MiB today and neither imports the other —
+/// `k9rs_mux` has no protocol dependency on purpose, which is the point of
+/// its being a separate crate — so the relationship is asserted from
+/// `k9rs_daemon`, which depends on both
+/// (`the_mux_window_admits_a_max_size_message`).
+pub const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Buffer capacity for BufReader/BufWriter on session connections.
 pub const IO_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Buffer size for the in-memory duplex stream (--no-daemon mode).
 pub const DUPLEX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+/// How long a freshly accepted connection has to say what it is.
+///
+/// Every door into the daemon begins with a fixed exchange the peer must
+/// start: the connection-type byte, then the version preamble, then (for a
+/// session) the control substream. All three were unbounded waits, so a
+/// peer that connected and then said nothing held a task and a file
+/// descriptor for as long as the daemon lived — no error, no log line, and
+/// nothing to see but the fd count. It is the same shape as a half-open
+/// socket, and the fix is the same: the handshake is the one part of the
+/// conversation whose timing we get to insist on, because nothing about it
+/// waits on a cluster.
+///
+/// Deliberately generous. This is not a latency budget — a handshake is a
+/// few bytes over a Unix socket on the same machine — it is the line
+/// between "slow" and "never", and it has to sit far enough above a
+/// loaded machine's scheduling jitter that no real client can trip it.
+///
+/// It bounds only the handshake. Once a session is established its
+/// substreams are as long-lived as the user's views, and a `logs -f`
+/// stream is idle by design.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Binary framing helpers
@@ -1363,6 +1509,29 @@ impl SubscriptionFilter {
     /// Convert a label map to the K8s API label selector string format.
     pub fn labels_to_selector(labels: &BTreeMap<String, String>) -> String {
         labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",")
+    }
+
+    /// Whether this filter is applied by the DAEMON, against each converted
+    /// row, rather than pushed into the watch's selector.
+    ///
+    /// Exhaustive, and here rather than at the asking end, for the same
+    /// reason [`SessionCommand::is_mutating`] is: a new variant must declare
+    /// which it is or it does not compile. The daemon used to answer this
+    /// with a `matches!` over the two post-filtered variants, which is a
+    /// wildcard in disguise — a new variant that the apiserver cannot
+    /// select on would have answered `false`, and `false` here means two
+    /// things at once: split the watcher by this filter, and do not filter
+    /// the rows. So the new filter would both cost its own apiserver watch
+    /// AND show every row, which is the "an ignored filter shows MORE rows
+    /// than asked for" failure that the row-filter's own doc claims to have
+    /// made impossible.
+    pub fn is_post_filter(&self) -> bool {
+        match self {
+            // The apiserver has no selector for an ownerReference, nor for a
+            // spec's references.
+            Self::OwnerUid(_) | Self::References { .. } => true,
+            Self::Labels(_) | Self::Field(_) => false,
+        }
     }
 }
 
@@ -1538,8 +1707,83 @@ pub struct LogInit {
     pub container: LogContainer,
     pub follow: bool,
     pub tail: Option<u64>,
-    pub since: Option<String>,
+    /// How far back to reach, or `None` for "as far as there is" — see
+    /// [`LogSince`]. `None` with `tail: None` is the whole history, which is
+    /// a state a duration cannot express and the reason this is not just a
+    /// number.
+    pub since: Option<LogSince>,
     pub previous: bool,
+}
+
+/// Declare [`LogSince`], its complete `ALL`, and both projections from ONE
+/// list of `Variant => ("label", seconds)`.
+///
+/// The same shape as [`crate::resource_def::BuiltInKind`]'s declaration and
+/// `ViewClass`'s, and for the same reason: Rust cannot enumerate an enum's
+/// variants, so a hand-written "every window" list is a second copy by
+/// construction. Here it buys something extra — a window's LABEL and its
+/// DURATION are written on one line, side by side, so the two cannot
+/// disagree. That disagreement is the whole subject of this type: the field
+/// used to be a string, and a label that said one thing while the stream
+/// showed another was expressible.
+macro_rules! log_windows {
+    ($(#[$m:meta])* pub enum $name:ident {
+        $($variant:ident => ($label:literal, $secs:expr)),* $(,)?
+    }) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        pub enum $name { $($variant),* }
+
+        impl $name {
+            /// Every window, generated from the declaration, in the order the
+            /// number keys bind them.
+            pub const ALL: &'static [$name] = &[$($name::$variant),*];
+
+            /// What the user sees, and what `kubectl --since` would accept
+            /// verbatim.
+            pub fn label(self) -> &'static str {
+                match self { $($name::$variant => $label),* }
+            }
+
+            /// The window as a count of seconds — the one grammar both
+            /// backends share, and what each is given rather than a string
+            /// to re-parse.
+            pub fn seconds(self) -> u32 {
+                match self { $($name::$variant => $secs),* }
+            }
+        }
+    };
+}
+
+log_windows! {
+    /// How far back a log stream reaches: one of the windows the UI offers.
+    ///
+    /// A closed set, on the wire, because this field has TWO readers with
+    /// different parsers. It used to be an `Option<String>`, passed raw to
+    /// `kubectl --since` on one path and run through the daemon's own
+    /// `parse_since_to_seconds` on the other — and that parser DROPPED the value
+    /// when it did not understand it, leaving the API path with no window at all.
+    /// So `since: "1h30m"` meant ninety minutes through kubectl and the entire
+    /// history through the apiserver, with nothing on screen to say which
+    /// backend had served (the API is tried first, kubectl is the fallback).
+    /// The same `LogInit` meaning two different things depending on who read it
+    /// is exactly what the namespace field's doc two screens up says the wire
+    /// type must not be able to express.
+    ///
+    /// It was dormant only by luck: the producers were six string literals, all
+    /// of them inside the parser's grammar. The grammar lived in no type, so
+    /// nothing kept the seventh literal honest.
+    ///
+    /// Each variant carries its own label, so the hint bar's text and the window
+    /// it asks for cannot disagree either.
+    pub enum LogSince {
+        OneMinute => ("1m", 60),
+        FiveMinutes => ("5m", 5 * 60),
+        FifteenMinutes => ("15m", 15 * 60),
+        ThirtyMinutes => ("30m", 30 * 60),
+        OneHour => ("1h", 60 * 60),
+        OneDay => ("24h", 24 * 60 * 60),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1607,10 +1851,12 @@ pub struct LogInit {
 ///
 /// v14: both of a log stream's axes become sets, so that a MARKED SELECTION
 /// of anything can be one merged stream.
-/// - `LogTarget::Many(Vec<String>)` → recursive `Union { targets, label }`.
+/// - `LogTarget::Many(Vec<String>)` → `Union { targets, label }`.
 ///   A selection is heterogeneous — two deployments and a bare pod are two
 ///   `Selector`s and a `One` — which a flat list of pod names could not say,
-///   so batch logs refused every non-pod row.
+///   so batch logs refused every non-pod row. (Shipped recursive; made flat
+///   over [`LogLeaf`] later, after the recursion proved to be an unbounded
+///   decode and nothing had ever nested a `Union`.)
 /// - `LogContainer` gains `Set(Vec<String>)`: the marked containers of one
 ///   pod, streamed one apiece and merged.
 ///
@@ -1629,7 +1875,23 @@ pub struct LogInit {
 /// `--timestamps` / `timestamps: true` and splits the kubelet's stamp off
 /// itself, because the renderer's heuristic was scoring application text and
 /// deleting it from the body when timestamps were toggled off.
-pub const WIRE_FORMAT_REVISION: u32 = 16;
+///
+/// v17: [`LogTarget`] loses its recursion. `Union`'s members become
+/// [`LogLeaf`], a three-variant enum that cannot hold a union, so
+/// `Union { targets: [Union { .. }] }` is no longer a sentence the wire can
+/// say. Nothing had ever built one; what the recursion did build was an
+/// unbounded decode — ~20 bytes per level under a 64 MiB
+/// [`MAX_MESSAGE_SIZE`], so 200 KB from any client overflowed the stack and
+/// aborted the daemon with every session on it. Tags move: `LogTarget` is
+/// `Leaf=0, Union=1` and `LogLeaf` is `One=0, Selector=1, Owner=2`.
+/// v18: [`LogInit::since`] becomes `Option<`[`LogSince`]`>`, a closed set,
+/// instead of `Option<String>`. The field had two readers with two parsers:
+/// `kubectl --since` took the string verbatim, while the apiserver path ran
+/// the daemon's own parser and DROPPED the window when it failed — so one
+/// `LogInit` could mean "the last ninety minutes" or "everything" depending
+/// on which backend served it, invisibly. Both paths now derive from
+/// [`LogSince::seconds`].
+pub const WIRE_FORMAT_REVISION: u32 = 18;
 
 /// This build's identity — what the handshake actually compares.
 ///
@@ -1674,7 +1936,7 @@ pub fn build_id() -> u64 {
 
 /// Handshake magic — "K9RS" as a big-endian u32. Doubles as a poison
 /// length: a pre-8 daemon reads these 4 bytes as a frame-length prefix of
-/// ~1.26 GB, trips `MAX_MESSAGE_SIZE`, and bails cleanly instead of
+/// ~1.26 GB, trips [`MAX_MESSAGE_SIZE`], and bails cleanly instead of
 /// mis-parsing; a v8 peer reading a pre-8 peer's first frame sees a small
 /// length where the magic should be and reports the mismatch.
 pub const PROTOCOL_MAGIC: u32 = 0x4B39_5253;
@@ -1888,6 +2150,54 @@ impl SessionCommand {
             SessionCommand::Status => "Status",
             SessionCommand::Shutdown => "Shutdown",
             SessionCommand::Clear { .. } => "Clear",
+        }
+    }
+
+    /// One line safe to write to a log file: the command's kind and its
+    /// SUBJECT, never its payload.
+    ///
+    /// An allowlist by inclusion — every arm names the fields it prints and
+    /// `..`-ignores the rest, so a new field is invisible here by default
+    /// and a new variant is a compile error. The daemon's session loop used
+    /// to do the opposite: special-case `Init` and `Apply` out and `{:?}`
+    /// everything else. That is an allowlist by EXCLUSION, where the next
+    /// variant carrying a body leaks by default, into a log file that
+    /// outlives the session and may be world-readable under a lax umask.
+    /// Today `Init` carries `kubeconfig_yaml` with inline `client-key-data`
+    /// plus the session's whole forwarded env, and `Apply` carries — for a
+    /// Secret — the decoded YAML. (The management door's post-mortem is the
+    /// same shape: a `{:?}` echoed a misdirected `Init` straight back to
+    /// the peer. It answers with [`Self::kind_name`], which is the kind
+    /// alone because the peer is being told what IT sent.)
+    ///
+    /// A resource's plural/name and a port number are not secrets, and they
+    /// are what makes a log worth reading.
+    pub fn log_summary(&self) -> String {
+        let kind = self.kind_name();
+        match self {
+            // Nothing beyond the name is safe or useful.
+            Self::Init { .. } | Self::GetDiscovery | Self::Ping | Self::Status
+            | Self::Shutdown => kind.to_string(),
+            Self::Clear { context } => match context {
+                Some(c) => format!("{kind} {}", c.as_str()),
+                None => format!("{kind} (all contexts)"),
+            },
+            Self::Describe(target)
+            | Self::Yaml(target)
+            | Self::Delete(target)
+            | Self::ForceKill(target)
+            | Self::Restart(target)
+            | Self::DecodeSecret(target)
+            | Self::TriggerCronJob(target)
+            | Self::ToggleSuspendCronJob(target)
+            | Self::Apply { target, .. } => format!("{kind} {}", target.kubectl_target()),
+            Self::Scale { target, replicas } => {
+                format!("{kind} {} to {replicas}", target.kubectl_target())
+            }
+            Self::PortForward { target, local_port, container_port } => format!(
+                "{kind} {} {local_port}:{container_port}",
+                target.kubectl_target(),
+            ),
         }
     }
 
@@ -2119,20 +2429,22 @@ impl LogLine {
 /// one epoch. That matters: the epoch floor is what rejects a superseded
 /// stream's stragglers, and it assumes one writer per store — N client-side
 /// substreams sharing a store would floor each other out.
+/// ONE log source, resolvable on its own.
+///
+/// Split out of [`LogTarget`] so that a union of unions is UNWRITABLE. The
+/// nesting bought nothing: a selection is heterogeneous because its members
+/// have different *shapes*, which a `Vec` of this three-variant enum already
+/// expresses — `Union` was never built holding another `Union`, by any path.
+/// What the recursion did buy was an unbounded decode: ~20 bytes of wire per
+/// level against a 64 MiB [`MAX_MESSAGE_SIZE`], so 200 KB from any client
+/// overflowed the stack and **aborted the whole daemon**, every other
+/// session with it. A depth counter would have been a policy to tune and
+/// forget; a non-recursive type cannot be made to recurse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LogTarget {
+pub enum LogLeaf {
     /// One pod, or a kubectl-style ref that resolves to one. Lines are
     /// untagged, exactly as before.
     One(String),
-    /// Everything these targets resolve to, merged — a marked selection.
-    ///
-    /// Recursive because a selection is heterogeneous: marking two
-    /// deployments and a bare pod is a `Selector`, a `Selector` and a `One`,
-    /// and the daemon resolving each in turn is the only place that can be
-    /// decided (the client may never have loaded any of their pods). The
-    /// daemon dedupes, so marking a deployment AND one of its pods streams
-    /// that pod once.
-    Union { targets: Vec<LogTarget>, label: String },
     /// Every pod matching this label selector — a workload. Resolved by the
     /// daemon at stream time, so a replica that appears later is included on
     /// the next restart rather than being invisible forever.
@@ -2144,16 +2456,53 @@ pub enum LogTarget {
     Owner { uid: String, label: String },
 }
 
-impl LogTarget {
-    /// A short human label for the view header ("3 pods", "deploy/api").
-    /// The indirect targets carry their own — a header reading
-    /// `app=api,tier=web` is the selector, not the thing you drilled into.
+impl LogLeaf {
+    /// A short human label for the view header. The indirect shapes carry
+    /// their own — a header reading `app=api,tier=web` is the selector, not
+    /// the thing you drilled into.
     pub fn display(&self) -> String {
         match self {
-            LogTarget::One(name) => name.clone(),
-            LogTarget::Union { label, .. }
-            | LogTarget::Selector { label, .. }
-            | LogTarget::Owner { label, .. } => label.clone(),
+            LogLeaf::One(name) => name.clone(),
+            LogLeaf::Selector { label, .. } | LogLeaf::Owner { label, .. } => label.clone(),
+        }
+    }
+
+    /// Whether this source can produce lines from more than one pod.
+    pub fn is_fanout(&self) -> bool {
+        match self {
+            LogLeaf::One(_) => false,
+            LogLeaf::Selector { .. } | LogLeaf::Owner { .. } => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogTarget {
+    /// One source — `Ctrl-L` on a row.
+    Leaf(LogLeaf),
+    /// Everything these sources resolve to, merged — a marked selection.
+    ///
+    /// Heterogeneous: marking two deployments and a bare pod is a `Selector`,
+    /// a `Selector` and a `One`, and the daemon resolving each in turn is the
+    /// only place that can be decided (the client may never have loaded any
+    /// of their pods). The daemon dedupes, so marking a deployment AND one of
+    /// its pods streams that pod once. Flat by type — see [`LogLeaf`].
+    Union { targets: Vec<LogLeaf>, label: String },
+}
+
+impl LogTarget {
+    /// One pod or kubectl-style ref, the common case — spelled short because
+    /// `LogTarget::Leaf(LogLeaf::One(..))` at a dozen call sites reads as
+    /// though the nesting mattered.
+    pub fn one(name: impl Into<String>) -> Self {
+        LogTarget::Leaf(LogLeaf::One(name.into()))
+    }
+
+    /// A short human label for the view header ("3 pods", "deploy/api").
+    pub fn display(&self) -> String {
+        match self {
+            LogTarget::Leaf(leaf) => leaf.display(),
+            LogTarget::Union { label, .. } => label.clone(),
         }
     }
 
@@ -2164,12 +2513,17 @@ impl LogTarget {
     /// replica has one source no matter what its shape promised.
     pub fn is_fanout(&self) -> bool {
         match self {
-            LogTarget::One(_) => false,
+            LogTarget::Leaf(leaf) => leaf.is_fanout(),
             LogTarget::Union { targets, .. } => {
-                targets.len() > 1 || targets.first().is_some_and(LogTarget::is_fanout)
+                targets.len() > 1 || targets.first().is_some_and(LogLeaf::is_fanout)
             }
-            LogTarget::Selector { .. } | LogTarget::Owner { .. } => true,
         }
+    }
+}
+
+impl From<LogLeaf> for LogTarget {
+    fn from(leaf: LogLeaf) -> Self {
+        LogTarget::Leaf(leaf)
     }
 }
 

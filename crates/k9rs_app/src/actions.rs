@@ -244,8 +244,9 @@ pub enum LogRange {
     /// Everything there is, oldest first, head-retained so a long history
     /// fills the ring from the START and stops rather than evicting itself.
     Head,
-    /// The last `d`, a kubectl duration (`15m`, `24h`).
-    Since(String),
+    /// One of the windows the UI offers — see [`k9rs_proto::protocol::LogSince`],
+    /// which carries both the duration and its label so they cannot disagree.
+    Since(k9rs_proto::protocol::LogSince),
 }
 
 impl From<&k9rs_proto::protocol::OperationKind> for Action {

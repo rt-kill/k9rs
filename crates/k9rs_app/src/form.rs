@@ -91,17 +91,46 @@ pub enum FormSubmit {
 }
 
 impl FormSubmit {
-    /// Map an `OperationKind` to the corresponding `FormSubmit` variant.
+    /// Map an `OperationKind` to the corresponding `FormSubmit` variant,
+    /// or `None` for the operations that need no form.
+    ///
+    /// Exhaustive, and that is the point: the doc above prescribes a
+    /// three-step checklist for adding a form-driven operation — variant,
+    /// `submit` arm, builder — and a `_ => None` here enforced none of it.
+    /// A new operation that needs a form would have compiled, answered
+    /// `None`, and produced no dialog at all; the keypress would simply do
+    /// nothing. Now it does not build until it has said which it is.
     pub fn from_operation(op: k9rs_proto::protocol::OperationKind) -> Option<Self> {
+        use k9rs_proto::protocol::OperationKind as Op;
         match op {
-            k9rs_proto::protocol::OperationKind::Scale => Some(FormSubmit::Scale),
-            k9rs_proto::protocol::OperationKind::PortForward => Some(FormSubmit::PortForward),
-            _ => None,
+            Op::Scale => Some(FormSubmit::Scale),
+            Op::PortForward => Some(FormSubmit::PortForward),
+            // Need no input: they act on the row as it stands, or they are
+            // answered by a confirm box, a picker, or a takeover.
+            Op::Describe
+            | Op::Yaml
+            | Op::Delete
+            | Op::Restart
+            | Op::StreamLogs
+            | Op::PreviousLogs
+            | Op::Shell
+            | Op::ShowNode
+            | Op::ForceKill
+            | Op::NodeShell
+            | Op::DecodeSecret
+            | Op::TriggerCronJob
+            | Op::ToggleSuspendCronJob
+            | Op::Apply
+            | Op::Custom(_) => None,
         }
     }
 
-    /// Human-readable label for flash messages.
-    pub fn from_operation_label(&self) -> &'static str {
+    /// Human-readable label for flash messages — "Scaling", not "Scale":
+    /// it names the operation in progress.
+    ///
+    /// Was `from_operation_label`, a name left over from when it took an
+    /// operation. It takes `&self`.
+    pub fn label(&self) -> &'static str {
         match self {
             FormSubmit::Scale => "Scaling",
             FormSubmit::PortForward => "Port-forwarding",

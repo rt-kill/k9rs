@@ -37,18 +37,13 @@ pub(crate) async fn run_dynamic_live_watcher(
     // First act: resolve the projection recipe from its authoritative
     // source. Every watcher RUN re-resolves (death-retry, Ctrl-R force,
     // cache eviction), so a failed or raced resolution can never stick.
+    // Cosmetic, and never fatal: a kind whose presentation metadata cannot
+    // be read is still a kind worth watching. This used to send
+    // `WatcherMsg::Dead` on any error but 403/404, on the stated grounds
+    // that the bridge would respawn — see `resolve_printer_columns`, which
+    // the bridge does not.
     let printer_columns =
-        match resolve_printer_columns(&client, &discovery, &context, &gvk.group, &plural).await {
-            Ok(cols) => cols,
-            Err(reason) => {
-                // Honest terminal death — the bridge surfaces the error
-                // and its backoff-retry respawns us (re-resolving).
-                let _ = delta_tx.send(std::sync::Arc::new(
-                    super::live_query::WatcherMsg::Dead(reason),
-                ));
-                return;
-            }
-        };
+        resolve_printer_columns(&client, &discovery, &context, &gvk.group, &plural).await;
 
     let ar = if plural.is_empty() {
         ApiResource::from_gvk(&gvk)
@@ -97,17 +92,27 @@ pub(crate) async fn run_dynamic_live_watcher(
 ///   the metadata plan IS the correct plan, a fact rather than a fallback;
 /// - 403 → `Ok(empty)` + warning — the recipe exists but is forbidden:
 ///   explicit, logged degradation;
-/// - anything else → `Err` — the watcher dies honestly and the bridge's
-///   retry machinery respawns (and re-resolves).
+/// - anything else → `empty` + warning. A failure to read a kind's
+///   PRESENTATION metadata is not a reason to stop watching the kind.
+///
+/// That last arm used to be `Err`, and the caller turned it into
+/// `WatcherMsg::Dead` "honestly, because the bridge's retry machinery
+/// respawns (and re-resolves)". The bridge does not: it gates resubscribe
+/// on `sent_any_data`, and this failure happens at watcher BIRTH, before
+/// any data — so the daemon writes `StreamEvent::Error` and returns, which
+/// its own comment names as the permanent case and a test pins. A transient
+/// 500, a timeout or a connection reset while fetching a CRD definition
+/// therefore killed the subscription for good. The columns are cosmetic;
+/// the rows are the point.
 async fn resolve_printer_columns(
     client: &Client,
     discovery: &DiscoveryCache,
     context: &ContextId,
     group: &str,
     plural: &str,
-) -> Result<Vec<PrinterColumn>, String> {
+) -> Vec<PrinterColumn> {
     if let Some(cols) = discovery.printer_columns_for(context, group, plural) {
-        return Ok(cols);
+        return cols;
     }
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
     let api: kube::Api<CustomResourceDefinition> = kube::Api::all(client.clone());
@@ -121,23 +126,28 @@ async fn resolve_printer_columns(
             Some(cached) => {
                 let cols = cached.printer_columns.clone();
                 discovery.merge_crd(context.clone(), cached);
-                Ok(cols)
+                cols
             }
             // A CRD object without a name can't exist server-side; treat
             // an unparseable one as declaring no columns.
-            None => Ok(Vec::new()),
+            None => Vec::new(),
         },
         Err(kube::Error::Api(ae)) if ae.code == 404 => {
             // Not a CRD at all (aggregated API server resource) — there
             // is no recipe to have; metadata columns are the truth.
             tracing::debug!("{name}: no CRD object (aggregated API?) — metadata columns");
-            Ok(Vec::new())
+            Vec::new()
         }
         Err(kube::Error::Api(ae)) if ae.code == 403 => {
             warn!("{name}: CRD definition read forbidden — printer columns unavailable, showing metadata columns");
-            Ok(Vec::new())
+            Vec::new()
         }
-        Err(e) => Err(format!("failed to resolve printer columns for {name}: {e}")),
+        Err(e) => {
+            // Was a terminal `Err`. A transient failure here costs the
+            // pretty columns for this run; the next one re-resolves.
+            warn!("{name}: could not resolve printer columns ({e}) — showing metadata columns");
+            Vec::new()
+        }
     }
 }
 
@@ -180,6 +190,19 @@ fn column_plan(
             let upper = oc.header.to_uppercase();
             let already_exists = all_columns.iter().any(|c| c.name.to_uppercase() == upper);
             if already_exists { continue; }
+            // Say so, once, at ingest. The column is still added — the
+            // overlay system warns and continues — but a `jsonpath:` this
+            // resolver cannot honour used to produce an all-empty column
+            // with nothing logged anywhere, which is indistinguishable from
+            // a field that is simply unset.
+            if let Some(why) = unsupported_json_path(jp) {
+                warn!(
+                    plural = %plural,
+                    column = %oc.header,
+                    jsonpath = %jp,
+                    "overlay column will be empty: {why}",
+                );
+            }
             all_columns.push(PrinterColumn {
                 name: oc.header.clone(),
                 json_path: jp.clone(),
@@ -274,6 +297,51 @@ fn convert_dynamic(mut obj: DynamicObject, columns: &[PrinterColumn]) -> Resourc
 /// `DynamicObject` that must be walked untyped. The value is local to
 /// this function and immediately collapsed to a cell string — no `Value`
 /// propagates into long-lived state.
+/// Why this resolver cannot honour `path`, if it cannot.
+///
+/// SYNTAX only — an absent field is a legitimate empty cell, not an error.
+/// The forms named here resolve to `""` for every object, for ever, and
+/// nothing was logged at any level: the column header appeared, every cell
+/// was blank, and there was no way to tell a typo from a field that is
+/// genuinely unset. A user's overlay `jsonpath:` went in with no parse, no
+/// validation and no diagnostic anywhere.
+///
+/// Warn-and-continue, like the rest of the overlay system: a column that
+/// cannot resolve is still shown, because dropping it silently is the same
+/// failure wearing a different hat.
+pub(crate) fn unsupported_json_path(path: &str) -> Option<String> {
+    if path.contains("['") || path.contains("[\"") {
+        return Some(
+            "bracket key access is not supported — escape the dots instead, \
+             as in `.metadata.labels.app\\.kubernetes\\.io/name`"
+                .to_string(),
+        );
+    }
+    if path.contains("&&") || path.contains("||") {
+        return Some("compound filter expressions (`&&`, `||`) are not supported".to_string());
+    }
+    if path.contains('*') {
+        return Some("wildcards are not supported".to_string());
+    }
+    let opens = path.matches("[?(").count();
+    if opens != path.matches(")]").count() {
+        return Some("an unterminated `[?(...)]` filter".to_string());
+    }
+    // Inside a filter, only `@.key == 'literal'` / `!=` are understood.
+    for seg in path.split("[?(").skip(1) {
+        let expr = seg.split(")]").next().unwrap_or(seg).trim();
+        if !expr.starts_with("@.") {
+            return Some(format!("filter `{expr}` does not start with `@.`"));
+        }
+        if !expr.contains("==") && !expr.contains("!=") {
+            return Some(format!(
+                "filter `{expr}` uses an operator other than `==` or `!=`"
+            ));
+        }
+    }
+    None
+}
+
 pub(crate) fn resolve_json_path(obj: &serde_json::Value, path: &str) -> String {
     let mut current: Option<&serde_json::Value> = Some(obj);
     let mut remaining = path.trim_start_matches('.');
@@ -360,19 +428,25 @@ fn apply_filter<'a>(val: &'a serde_json::Value, expr: &str) -> Option<&'a serde_
     let arr = val.as_array()?;
     let expr = expr.trim().strip_prefix("@.")?;
 
-    // Find op. Order matters: `!=` must be checked before `=` to avoid
-    // interpreting `!=` as `=` with a leading `!`.
-    let (key, op_len, negate) = if let Some(p) = expr.find("!=") {
-        (&expr[..p], 2, true)
-    } else if let Some(p) = expr.find("==") {
-        (&expr[..p], 2, false)
+    // Split ONCE, at the operator, so both halves are measured against the
+    // same string. The key was re-trimmed and then its length used to index
+    // back into the UNTRIMMED expression, so any whitespace before the
+    // operator shifted the literal by that much: `@.type == 'Ready'` sliced
+    // `"= 'Ready"` and matched nothing. Silently, and only for the spelling
+    // with spaces — which is the one kubectl's own documentation uses, and
+    // which a CRD's `additionalPrinterColumns` is free to write.
+    //
+    // Order matters: `!=` must be checked before `==` so that it is not read
+    // as `=` with a leading `!`.
+    let (raw_key, rest, negate) = if let Some((k, v)) = expr.split_once("!=") {
+        (k, v, true)
+    } else if let Some((k, v)) = expr.split_once("==") {
+        (k, v, false)
     } else {
         return None;
     };
-    let key = key.trim();
-    let literal = expr[key.len() + op_len..]
-        .trim()
-        .trim_matches(|c| c == '\'' || c == '"');
+    let key = raw_key.trim();
+    let literal = rest.trim().trim_matches(|c| c == '\'' || c == '"');
 
     arr.iter().find(|item| {
         let field_matches = match item.get(key) {

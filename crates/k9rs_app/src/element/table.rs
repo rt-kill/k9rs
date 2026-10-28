@@ -19,7 +19,7 @@ use crate::store::{
     derive_view, DeriveSpec, MetricsBinding, MetricsHub, PreparedView,
     RowSource, RowStore, SortSpec,
 };
-use crate::view::DerivedViewKind;
+use k9rs_proto::row::DerivedViewKind;
 use crate::ColumnLevel;
 use crate::client::{ClientSession, SubscriptionStream};
 use k9rs_proto::overlay::ColumnRenderRules;

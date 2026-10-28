@@ -19,7 +19,8 @@ fn request(context: &str, local_port: u16) -> PortForwardRequest {
         },
         context: ContextName::new(context).expect("non-empty"),
         kubectl_target: "pods/canarypod".into(),
-        namespace: Namespace::Named("default".into()),
+        namespace: PodNamespace::of(&Namespace::Named("default".into()))
+            .expect("a named namespace"),
         local_port,
         remote_port: 8080,
         client: offline_client(),

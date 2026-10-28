@@ -82,7 +82,6 @@ fn draw_resource_table(
         offset: snap.offset,
         selected_col: snap.selected_col,
         col_offset: snap.col_offset,
-        filtered_count: 0,
         visible_height: 0,
     };
 
@@ -192,7 +191,10 @@ pub(crate) fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             filtered
         };
-        let filter_bar = FilterBar::new(fi.active(), fi.text(), match_count, total, theme)
+        // `fi.caret_col()` — a `pub fn` whose doc reads "Caret position for
+        // the renderer, in columns" and which, until now, had no callers.
+        let filter_bar =
+            FilterBar::new(fi.active(), fi.text(), fi.caret_col(), match_count, total, theme)
             .fallback(fallback.as_deref());
         f.render_widget(filter_bar, filter_area);
     }
@@ -233,11 +235,7 @@ pub(crate) fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
             .border_style(theme.border);
         let inner = block.inner(table_area);
         f.render_widget(block, table_area);
-        if inner.height > 0 && inner.width > 0 {
-            let center_y = inner.y + inner.height / 2;
-            let center_x = inner.x + inner.width.saturating_sub(status_line.width() as u16) / 2;
-            f.render_widget(status_line, Rect::new(center_x, center_y, inner.width, 1));
-        }
+        crate::draw_centered_line(f, inner, status_line);
     } else {
         // Rows that are resident but not live (a dead cluster-side watch, a
         // terminal subscription error) still paint — the link is up, so every
@@ -298,28 +296,63 @@ pub(crate) fn draw_resources(f: &mut Frame, app: &mut App, area: Rect) {
     // It used to be an unbounded `Line` with the right-aligned hint STAMPED
     // over it afterwards, so a deep drill lost its tail underneath `? help`
     // with nothing to say so.
-    let hint = " ? help ";
-    let suffix_w: u16 = if app.nav.is_drilled() { 9 } else { 0 }; // " | Esc back"
-    let budget = breadcrumb_area
-        .width
-        .saturating_sub(hint.len() as u16)
-        .saturating_sub(suffix_w)
-        .saturating_sub(2); // the spaces either side of the path
-    let bc = app.nav.breadcrumb();
-    let bc = k9rs_util::width::truncate_left(&bc, budget as usize);
-    let mut spans = Vec::new();
-    spans.push(Span::styled(format!(" {} ", bc), theme.title));
-    if app.nav.is_drilled() {
-        spans.push(Span::styled("| ", theme.info_label));
-        spans.push(Span::styled("Esc", theme.title_filter_indicator));
-        spans.push(Span::styled(" back", theme.info_label));
+    //
+    // Everything on this row is now ONE line, so `render_widget` — which
+    // intersects with the area — is the only thing that touches the buffer.
+    // The hint was the last direct `set_string` here, and `set_string` clips
+    // at the BUFFER edge rather than the area's: when the element floats,
+    // this chunk is `Constraint::Length(0)` and ratatui puts its `y` at
+    // `area.bottom()`, one row PAST the box. Under a 7-row terminal that row
+    // is outside the buffer and `Buffer`'s index is a hard `panic!`, not a
+    // debug assert — so `?` killed the TUI; above it the hint was stamped
+    // onto the view underneath, which is the one thing a float must not do.
+    // A `Line` can do neither.
+    if breadcrumb_area.height > 0 && breadcrumb_area.width > 0 {
+        let hint = " ? help ";
+        let hint_w = UnicodeWidthStr::width(hint) as u16;
+        // Built BEFORE the path, so the path's budget is measured from the
+        // cells these spans actually spend. It was a `suffix_w = 9` written
+        // beside a comment reading `" | Esc back"` — the spans emit ten
+        // cells, and the final `k` of `back` was overwritten whenever the
+        // path filled its budget.
+        let suffix: Vec<Span> = if app.nav.is_drilled() {
+            vec![
+                Span::styled("| ", theme.info_label),
+                Span::styled("Esc", theme.title_filter_indicator),
+                Span::styled(" back", theme.info_label),
+            ]
+        } else {
+            Vec::new()
+        };
+        let suffix_w: u16 = suffix
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
+            .sum();
+        let budget = breadcrumb_area
+            .width
+            .saturating_sub(hint_w)
+            .saturating_sub(suffix_w)
+            .saturating_sub(2); // the spaces either side of the path
+        let bc = app.nav.breadcrumb();
+        let bc = k9rs_util::width::truncate_left(&bc, budget as usize);
+        let path = format!(" {} ", bc);
+        let used = UnicodeWidthStr::width(path.as_str()) as u16 + suffix_w;
+        let mut spans = vec![Span::styled(path, theme.title)];
+        spans.extend(suffix);
+        // Right-align by PADDING to the hint rather than writing over
+        // whatever is already there. `budget` is what makes this exact: the
+        // path can never eat the hint's cells, so `pad` cannot underflow to
+        // a clipped hint.
+        let pad = breadcrumb_area
+            .width
+            .saturating_sub(used)
+            .saturating_sub(hint_w);
+        if pad > 0 {
+            spans.push(Span::raw(" ".repeat(pad as usize)));
+        }
+        spans.push(Span::styled(hint, theme.info_label));
+        f.render_widget(Line::from(spans), breadcrumb_area);
     }
-    let left = Line::from(spans);
-    f.render_widget(left, breadcrumb_area);
-    // Right-aligned help hint. The left side is budgeted around it now, so
-    // this no longer overwrites anything.
-    let hint_x = breadcrumb_area.x + breadcrumb_area.width.saturating_sub(hint.len() as u16);
-    f.buffer_mut().set_string(hint_x, breadcrumb_area.y, hint, theme.info_label);
 
     // 6. Flash message area (handled by ui/mod.rs overlay, but we reserve the line)
     // Draw a subtle flash area background

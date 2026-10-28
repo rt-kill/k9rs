@@ -99,22 +99,64 @@ pub fn truncate_left(s: &str, max_width: usize) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("\u{2026}{}", &s[start..]))
 }
 
-/// Truncates a string to the given maximum number of characters.
-/// If truncated, appends an ellipsis character.
+/// Truncates `s` to at most `max` display COLUMNS, marking the cut with `…`.
+///
+/// Columns, not chars — the unit this module's header promises and the unit
+/// every caller passes it: a flash line's `area.width`, a completion ghost's
+/// remaining columns, a describe value's 80-column budget. It counted
+/// `s.chars()`, so a CJK or emoji string measured as much as half under its
+/// real width, came back UNCHANGED, and was then clipped by `set_line` with
+/// no `…` to say a cut had happened — which is precisely the silent tail
+/// loss the flash widget's own comment claims to have fixed, and flash text
+/// carries daemon and apiserver strings.
 pub fn truncate(s: &str, max: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
     if max == 0 {
         return String::new();
     }
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else if max <= 1 {
-        "\u{2026}".to_string()
-    } else {
-        let mut result: String = chars[..max - 1].iter().collect();
-        result.push('\u{2026}');
-        result
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
     }
+    if max == 1 {
+        return "\u{2026}".to_string();
+    }
+    // Cut on a grapheme boundary for the reason `window_around` does: a byte
+    // slice between a letter and its combining accent panics. A wide glyph
+    // that would straddle the budget is dropped whole rather than halved.
+    let budget = max - 1; // the ellipsis owns the last column
+    let mut out = String::new();
+    let mut w = 0usize;
+    for g in s.graphemes(true) {
+        let gw = UnicodeWidthStr::width(g);
+        if w + gw > budget {
+            break;
+        }
+        out.push_str(g);
+        w += gw;
+    }
+    out.push('\u{2026}');
+    out
+}
+
+/// Pads `s` on the right until it occupies exactly `cells` display columns.
+///
+/// `format!("{:<width$}")` pads to a CHAR count, which is a different number:
+/// a string built by measuring columns and then padded by char count
+/// overflows its budget by the difference. Measured —
+/// `format!(" {:<10} ", "日本語")` is 12 chars and **15 columns** against a
+/// 12-column cell, so a CJK or emoji value spilled into the next column;
+/// a value of combining marks under-filled and left the tail unwritten.
+///
+/// Wider than `cells` is returned unchanged: this pads, it does not cut —
+/// [`truncate`] does that, and a caller that needs both says so.
+pub fn pad_to_cells(s: &str, cells: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let w = UnicodeWidthStr::width(s);
+    let mut out = String::with_capacity(s.len() + cells.saturating_sub(w));
+    out.push_str(s);
+    out.extend(std::iter::repeat_n(' ', cells.saturating_sub(w)));
+    out
 }
 
 #[cfg(test)]

@@ -199,7 +199,7 @@ fn derived_projection_is_live() {
 fn log_filters_chain_and_own_their_lines() {
     use k9rs_proto::protocol::{LogContainer, LogLine};
     let mut session = Element::LogSession(Box::new(LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("pod-x".to_string()), LogContainer::Default,
+        k9rs_proto::protocol::LogTarget::one("pod-x".to_string()), LogContainer::Default,
     )));
     let store = Arc::clone(session.log_store().unwrap());
     for i in 0..10 {
@@ -590,7 +590,7 @@ fn one_of_every_kind() -> Vec<crate::element::Element> {
     )
     .expect("a table can be filtered");
 
-    let log = Element::LogSession(Box::new(LogSession::for_test(k9rs_proto::protocol::LogTarget::One("pod".to_string()), LogContainer::Default)));
+    let log = Element::LogSession(Box::new(LogSession::for_test(k9rs_proto::protocol::LogTarget::one("pod".to_string()), LogContainer::Default)));
     let log_filtered =
         Element::derive_log_filter(&log, k9rs_util::CompiledGrep::new("y"), crate::element::Sense::Keep)
             .expect("a log can be filtered");
@@ -646,7 +646,7 @@ fn one_of_every_kind() -> Vec<crate::element::Element> {
                     Namespace::Named("default".to_string()),
                 ),
             },
-            action_focused: false,
+            focused: crate::ConfirmFocus::Cancel,
         })),
         Element::Picker(Box::new(crate::ContainerPicker {
             target: k9rs_proto::protocol::ObjectRef::new(
@@ -1022,7 +1022,7 @@ fn the_tail_load_latch_clears_on_buried_log_views_too() {
     use k9rs_proto::protocol::{LogContainer, LogTarget};
 
     let mut app = crate::App::new_for_test();
-    let session = LogSession::for_test(LogTarget::One("web".into()), LogContainer::Default);
+    let session = LogSession::for_test(LogTarget::one("web"), LogContainer::Default);
     let store = std::sync::Arc::clone(session.store());
     app.nav.push(Element::LogSession(Box::new(session)));
 
@@ -1064,7 +1064,7 @@ fn a_buried_filter_keeps_collecting() {
     use k9rs_proto::protocol::{LogContainer, LogLine, LogTarget};
 
     let mut app = crate::App::new_for_test();
-    let session = LogSession::for_test(LogTarget::One("web".into()), LogContainer::Default);
+    let session = LogSession::for_test(LogTarget::one("web"), LogContainer::Default);
     let store = Arc::clone(session.store());
     app.nav.push(Element::LogSession(Box::new(session)));
 
@@ -1125,7 +1125,7 @@ fn a_buried_filter_keeps_collecting() {
 fn only_a_stream_that_died_is_revived() {
     use k9rs_proto::protocol::{LogContainer, LogLine};
     let mut session = LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("pod-x".to_string()),
+        k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
         LogContainer::Default,
     );
     for i in 0..20 {
@@ -1151,7 +1151,7 @@ fn only_a_stream_that_died_is_revived() {
     // And the deliberate stop: a full `Retain::Head` range is stopped ON
     // PURPOSE, so popping back into the view must not re-download it.
     let mut session = LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("pod-y".to_string()),
+        k9rs_proto::protocol::LogTarget::one("pod-y".to_string()),
         LogContainer::Default,
     );
     session.store().set_retain(crate::store::Retain::Head);
@@ -1172,7 +1172,7 @@ fn only_a_stream_that_died_is_revived() {
 fn restarting_a_range_resets_the_greps_over_it() {
     use k9rs_proto::protocol::{LogContainer, LogLine};
     let session = Element::LogSession(Box::new(LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("pod-x".to_string()),
+        k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
         LogContainer::Default,
     )));
     let store = Arc::clone(session.log_store().unwrap());
@@ -1262,7 +1262,7 @@ fn help_opens_on_the_section_for_the_view_you_came_from() {
 fn a_straggler_cannot_un_end_a_stopped_range() {
     use k9rs_proto::protocol::{LogContainer, LogLine};
     let mut session = LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("pod-x".to_string()),
+        k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
         LogContainer::Default,
     );
     session.store().set_retain(crate::store::Retain::Head);
@@ -1297,7 +1297,7 @@ fn a_straggler_cannot_un_end_a_stopped_range() {
 fn a_grep_searches_exactly_the_roles_that_declare_themselves_searchable() {
     use k9rs_proto::protocol::{LogContainer, LogLine, Role};
     let mut session = Element::LogSession(Box::new(LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("pod-x".to_string()),
+        k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
         LogContainer::Default,
     )));
     let store = Arc::clone(session.log_store().unwrap());
@@ -1412,7 +1412,7 @@ fn a_bare_grep_scans_only_the_displayed_columns() {
 fn a_grep_matches_across_a_colour_boundary() {
     use k9rs_proto::protocol::{LogContainer, LogLine};
     let mut session = Element::LogSession(Box::new(LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("pod-x".to_string()),
+        k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
         LogContainer::Default,
     )));
     let store = Arc::clone(session.log_store().unwrap());
@@ -1824,7 +1824,7 @@ fn a_chain_step_can_exclude_what_it_matches() {
     assert_eq!(sense_of("!"), (Sense::Drop, ""));
 
     let session = LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("pod-x".to_string()),
+        k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
         LogContainer::Default,
     );
     for text in ["GET /healthz 200", "worker started", "GET /healthz 200", "worker failed"] {
@@ -1891,7 +1891,7 @@ fn a_log_range_can_ask_for_everything_from_the_beginning() {
     use crate::actions::LogRange;
 
     let session = LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("pod-x".to_string()),
+        k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
         k9rs_proto::protocol::LogContainer::Default,
     );
     // A fresh stream is a tail: a bounded number of lines, newest kept.
@@ -1905,10 +1905,10 @@ fn a_log_range_can_ask_for_everything_from_the_beginning() {
     for range in [
         LogRange::Tail,
         LogRange::Head,
-        LogRange::Since("24h".to_string()),
+        LogRange::Since(k9rs_proto::protocol::LogSince::OneDay),
     ] {
         let mut s = LogSession::for_test(
-            k9rs_proto::protocol::LogTarget::One("pod-x".to_string()),
+            k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
             k9rs_proto::protocol::LogContainer::Default,
         );
         s.write_range(range.clone());
@@ -1917,11 +1917,15 @@ fn a_log_range_can_ask_for_everything_from_the_beginning() {
 
     // The header distinguishes all three, so you can tell a bounded tail
     // from an unbounded history at a glance.
-    let labels: Vec<String> = [LogRange::Tail, LogRange::Head, LogRange::Since("15m".into())]
+    let labels: Vec<String> = [
+        LogRange::Tail,
+        LogRange::Head,
+        LogRange::Since(k9rs_proto::protocol::LogSince::FifteenMinutes),
+    ]
         .into_iter()
         .map(|r| {
             let mut s = LogSession::for_test(
-                k9rs_proto::protocol::LogTarget::One("pod-x".to_string()),
+                k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
                 k9rs_proto::protocol::LogContainer::Default,
             );
             s.write_range(r);
@@ -1975,7 +1979,7 @@ fn a_new_element_kind_must_declare_liveness_and_stream_ownership() {
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             ),
         },
-        action_focused: false,
+        focused: crate::ConfirmFocus::Cancel,
     }));
     assert!(confirm.is_live());
     confirm.abort_data_stream();
@@ -1997,7 +2001,7 @@ fn esc_peels_one_grep_off_the_chain() {
 
     let mut app = crate::App::new_for_test();
     let session = LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("pod-x".to_string()),
+        k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
         LogContainer::Default,
     );
     for text in ["alpha beta", "alpha only", "beta only"] {
@@ -2046,3 +2050,155 @@ fn esc_peels_one_grep_off_the_chain() {
     );
 }
 
+/// What an excluding draft PREVIEWS is what committing it gives you.
+///
+/// `log_visible` compiled the raw draft text, so `!err` searched for the
+/// literal string `!err` — zero lines, always — while committing the same
+/// text dropped the matches and kept the other five. The preview of a
+/// `/!pattern` grep was therefore blank right up until you pressed Enter,
+/// and `\!urgent` was worse: the raw `\!` reaches the vim translator, which
+/// refuses that escape by name. One question with two answers, where only
+/// the commit path called `sense_of`.
+///
+/// Asserted as preview == commit rather than against a number, because the
+/// defect was exactly the two disagreeing.
+#[test]
+fn an_excluding_draft_previews_what_it_would_commit() {
+    use k9rs_proto::protocol::{LogContainer, LogLine};
+    let seed = || {
+        let session = Element::LogSession(Box::new(LogSession::for_test(
+            k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
+            LogContainer::Default,
+        )));
+        let store = Arc::clone(session.log_store().unwrap());
+        for i in 0..10 {
+            store.push(
+                1,
+                LogLine {
+                    timestamp: None,
+                    source: None,
+                    content: format!("line-{i} {}", if i % 2 == 0 { "err" } else { "ok" }),
+                },
+            );
+        }
+        session
+    };
+
+    // Drafting `!err`.
+    let mut drafted = seed();
+    drafted.log_view_mut().unwrap().draft =
+        Some(crate::text_input::TextInput::seeded("!err"));
+    let previewed = drafted.log_visible().unwrap().len();
+
+    // Committing the same keystrokes.
+    let committed = {
+        let session = seed();
+        let (sense, text) = crate::element::sense_of("!err");
+        assert_eq!((sense, text), (crate::element::Sense::Drop, "err"), "sanity");
+        let mut filter =
+            Element::derive_log_filter(&session, CompiledGrep::new(text), sense).unwrap();
+        filter.log_visible().unwrap().len()
+    };
+
+    assert_eq!(
+        (previewed, committed),
+        (5, 5),
+        "an excluding draft previews the five lines it keeps, and committing \
+         it keeps the same five",
+    );
+
+    // `\!pat` is a LITERAL `!pat`, and the preview must say so too — none of
+    // these lines contain one, so the honest preview is empty rather than
+    // the translator's refusal of `\!`.
+    let mut escaped = seed();
+    escaped.log_view_mut().unwrap().draft =
+        Some(crate::text_input::TextInput::seeded("\\!err"));
+    assert_eq!(
+        escaped.log_visible().unwrap().len(),
+        0,
+        "`\\!err` seeks the literal `!err`, which no line here has",
+    );
+
+    // A bare `!` is a sense with no pattern yet: the unfiltered view, not
+    // "drop everything".
+    let mut bare = seed();
+    bare.log_view_mut().unwrap().draft = Some(crate::text_input::TextInput::seeded("!"));
+    assert_eq!(
+        bare.log_visible().unwrap().len(),
+        10,
+        "`!` alone has nothing to exclude yet",
+    );
+}
+
+/// An escaped `\!literal` is a NARROWING filter, and the chain says so.
+///
+/// The grep bar picked its colour by re-reading the label's leading `!`, and
+/// the label cannot answer that question: `Narrowing::label` re-adds the `!`
+/// only for `Drop`, so a `Keep` filter for the literal `!foo` and a `Drop`
+/// filter for `foo` produce the SAME string. `/\!urgent` therefore committed
+/// a narrowing filter that the bar painted in the excluding colour, and no
+/// string the widget received could have told it otherwise.
+///
+/// The colour is load-bearing by the widget's own account — "the `!` alone
+/// is one glyph to miss in a chain of four" — so this is the chain carrying
+/// the sense rather than the renderer guessing it.
+#[test]
+fn an_escaped_literal_is_a_narrowing_step_in_the_chain() {
+    use k9rs_proto::protocol::{LogContainer, LogLine};
+
+    let session = Element::LogSession(Box::new(LogSession::for_test(
+        k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
+        LogContainer::Default,
+    )));
+    let store = Arc::clone(session.log_store().unwrap());
+    for (i, body) in ["plain", "!urgent now", "also plain"].iter().enumerate() {
+        store.push(
+            1,
+            LogLine { timestamp: None, source: None, content: format!("{i} {body}") },
+        );
+    }
+
+    // `\!urgent` — sense_of strips the backslash and KEEPS the `!`.
+    let (sense, text) = crate::element::sense_of("\\!urgent");
+    assert_eq!((sense, text), (crate::element::Sense::Keep, "!urgent"), "sanity");
+
+    let filter = Element::derive_log_filter(&session, CompiledGrep::new(text), sense)
+        .expect("a filter over the session");
+    let mut nav = crate::nav::NavStack::new(session);
+    nav.push(filter);
+    // A filter pulls from its parent on read, so the per-step count is 0
+    // until something asks what it shows.
+    let _ = nav.top_mut().log_visible();
+
+    let chain = nav.log_chain();
+    assert_eq!(chain.len(), 1, "one committed step");
+    assert_eq!(
+        chain[0].label, "!urgent",
+        "its LABEL is indistinguishable from an excluding filter for `urgent`",
+    );
+    assert_eq!(
+        chain[0].sense,
+        crate::element::Sense::Keep,
+        "...and its SENSE is what the renderer must read instead",
+    );
+    assert_eq!(chain[0].kept, 1, "it kept the one line holding `!urgent`");
+
+    // The excluding case, for contrast: same label shape, opposite sense.
+    let session2 = Element::LogSession(Box::new(LogSession::for_test(
+        k9rs_proto::protocol::LogTarget::one("pod-x".to_string()),
+        LogContainer::Default,
+    )));
+    let store2 = Arc::clone(session2.log_store().unwrap());
+    store2.push(1, LogLine { timestamp: None, source: None, content: "urgent".into() });
+    store2.push(1, LogLine { timestamp: None, source: None, content: "calm".into() });
+    let (sense2, text2) = crate::element::sense_of("!urgent");
+    assert_eq!(sense2, crate::element::Sense::Drop);
+    let excluding = Element::derive_log_filter(&session2, CompiledGrep::new(text2), sense2)
+        .expect("a filter");
+    let mut nav2 = crate::nav::NavStack::new(session2);
+    nav2.push(excluding);
+    let _ = nav2.top_mut().log_visible();
+    let chain2 = nav2.log_chain();
+    assert_eq!(chain2[0].label, "!urgent", "the same label...");
+    assert_eq!(chain2[0].sense, crate::element::Sense::Drop, "...the other sense");
+}

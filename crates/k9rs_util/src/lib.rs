@@ -13,8 +13,8 @@
 //!
 //! TYPES are re-exported, because a name like `SearchPattern` or
 //! `AbortOnDrop` already says what it is. FUNCTIONS are not: `truncate`,
-//! `format_age` and `sanitize_terminal` each need the module to supply the
-//! missing noun, so call sites say `width::truncate`, `units::format_age`,
+//! `format_age_secs` and `sanitize_terminal` each need the module to supply the
+//! missing noun, so call sites say `width::truncate`, `units::format_age_secs`,
 //! `text::sanitize_terminal`.
 
 pub(crate) mod atomic_option;

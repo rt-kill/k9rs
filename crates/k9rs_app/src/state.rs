@@ -2,9 +2,13 @@
 //!
 //! [`UiState`] is everything about presentation — the modal slot, the flash,
 //! the animation tick. [`KubeState`] is everything about the cluster we are
-//! pointed at. [`DeltaTracker`] sits between them: it remembers which rows
-//! changed so the renderer can highlight them, and clears on a context or
-//! namespace switch so a stale hash cannot flash a row in a new scope.
+//! pointed at. Two halves of `App`, and that is the whole of this file.
+//!
+//! `DeltaTracker` used to be here too, with a module doc saying it "sits
+//! between them". Measured, it sat between nothing: zero references in
+//! either direction, to or from `UiState` and `KubeState`. It is not `App`
+//! state at all — its only owner is `RowStoreInner::flash` — so it now lives
+//! in [`crate::store`] beside the rows it tracks.
 //!
 //! This file was `types.rs`, 1468 lines and six concerns. A file named
 //! `types` is a file named "stuff": config went to [`crate::config`], the
@@ -12,9 +16,7 @@
 //! [`crate::connection`] and the screen-takeover machinery to
 //! [`crate::takeover`]. What is left is the state itself, named for it.
 
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::connection::ContextSwitchState;
 use crate::kubectl_cache::KubectlCache;
@@ -208,6 +210,10 @@ impl UiState {
     /// run and left every overlay — help, the container picker, a delete
     /// confirmation, a hanging shell connect — with no working Esc. Use
     /// [`Self::modal_without_key_handler`] for routing.
+    /// Test-only. Production routes on [`Self::modal_without_key_handler`],
+    /// which names WHO handles what — a blanket `is_modal` was the
+    /// predicate that swallowed every dialog's Esc.
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_modal(&self) -> bool {
         !matches!(self.modal, Modal::None)
     }
@@ -241,131 +247,6 @@ impl UiState {
             // there, which is the guard that actually holds.
             Modal::Takeover(_) => false,
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DeltaTracker — atomic ownership of row-change detection state
-// ---------------------------------------------------------------------------
-
-/// Owns the two maps that must stay in sync for row-change flash
-/// highlights: per-row content hashes from the previous snapshot, and
-/// timestamps of recently-changed rows. The only mutation paths go through
-/// this struct's methods, so it's structurally impossible to update one
-/// map without the other or to forget to clear both on a context switch.
-///
-/// Replaces the prior pair of loose `prev_rows: HashMap<ObjectKey, u64>` +
-/// `changed_rows: HashMap<ObjectKey, Instant>` fields on `App`.
-#[derive(Debug)]
-pub struct DeltaTracker {
-    prev_hashes: HashMap<k9rs_proto::protocol::ObjectKey, u64>,
-    changed: HashMap<k9rs_proto::protocol::ObjectKey, Instant>,
-}
-
-impl Default for DeltaTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DeltaTracker {
-    pub fn new() -> Self {
-        Self {
-            prev_hashes: HashMap::new(),
-            changed: HashMap::new(),
-        }
-    }
-
-    /// Baseline apply: compare incoming rows against the previous hashes.
-    /// Rows whose content hash changed get a fresh timestamp in `changed`.
-    /// The old hash map is replaced wholesale — rows that disappeared are
-    /// implicitly forgotten. `prev_hashes` surviving across baselines is
-    /// what gives cross-recovery highlight continuity (rows that changed
-    /// while a watcher was down still flash after the recovery baseline)
-    /// without mass-highlighting unchanged rows.
-    pub fn rebaseline(&mut self, rows: &[k9rs_proto::row::ResourceRow]) {
-        use k9rs_proto::protocol::ObjectKey;
-        let now = Instant::now();
-        let mut new_prev = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let key = ObjectKey::new(
-                row.namespace.clone().unwrap_or_default(),
-                row.name.clone(),
-            );
-            let new_hash = Self::hash_cells(row);
-            if let Some(prev_hash) = self.prev_hashes.get(&key) {
-                if *prev_hash != new_hash {
-                    self.changed.insert(key.clone(), now);
-                }
-            }
-            new_prev.insert(key, new_hash);
-        }
-        self.prev_hashes = new_prev;
-        // Prune change highlights for rows that no longer exist so stale
-        // entries don't accumulate between expire() ticks.
-        self.changed.retain(|k, _| self.prev_hashes.contains_key(k));
-    }
-
-    /// Delta apply: O(batch), replacing the per-snapshot full-store hash
-    /// pass. The hash comparison stays — kube watches deliver metadata-only
-    /// churn (heartbeats, resourceVersion bumps) as upserts with identical
-    /// cells, and those must NOT flash. New keys don't flash (matches the
-    /// baseline path's insert semantics); removes clear their state in
-    /// O(1) (replacing the old O(n) retain).
-    pub fn apply_changes(&mut self, changes: &[k9rs_proto::protocol::RowChange]) {
-        use k9rs_proto::protocol::RowChange;
-        let now = Instant::now();
-        for change in changes {
-            match change {
-                RowChange::Upsert(row) => {
-                    let key = change.key();
-                    let new_hash = Self::hash_cells(row);
-                    match self.prev_hashes.insert(key.clone(), new_hash) {
-                        Some(prev) if prev != new_hash => {
-                            self.changed.insert(key, now);
-                        }
-                        Some(_) => {} // metadata-only churn: no flash
-                        None => {}    // insert: no flash (matches baseline)
-                    }
-                }
-                RowChange::Remove(key) => {
-                    self.prev_hashes.remove(key);
-                    self.changed.remove(key);
-                }
-            }
-        }
-    }
-
-    fn hash_cells(row: &k9rs_proto::row::ResourceRow) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        for cell in &row.cells {
-            cell.hash(&mut hasher);
-        }
-        hasher.finish()
-    }
-
-    /// Remove change highlights older than `max_age`. Returns `true` if
-    /// any entries were removed (signals the UI should redraw).
-    pub fn expire(&mut self, max_age: Duration) -> bool {
-        let now = Instant::now();
-        let before = self.changed.len();
-        self.changed.retain(|_, ts| now.duration_since(*ts) < max_age);
-        self.changed.len() != before
-    }
-
-    /// Clear all tracking state. Used on context and namespace switches
-    /// so stale hashes from the old scope can't produce false change
-    /// highlights in the new scope.
-    pub fn clear(&mut self) {
-        self.prev_hashes.clear();
-        self.changed.clear();
-    }
-
-    /// Borrow the changed-rows map for the table widget's flash-highlight
-    /// renderer. The map is keyed by `ObjectKey`; the widget looks up each
-    /// visible row to decide whether to apply the highlight style.
-    pub fn changed_rows(&self) -> &HashMap<k9rs_proto::protocol::ObjectKey, Instant> {
-        &self.changed
     }
 }
 
@@ -432,7 +313,3 @@ impl FlashMessage {
         self.created.elapsed().as_secs() >= lifetime_secs
     }
 }
-
-#[cfg(test)]
-#[path = "tests/state.rs"]
-mod tests;

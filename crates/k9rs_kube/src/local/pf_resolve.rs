@@ -48,23 +48,91 @@ pub async fn resolve(
     target: &str,
     remote_port: u16,
 ) -> Result<PodTarget, ResolveError> {
+    use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
+    use k8s_openapi::api::batch::v1::Job;
+    use k9rs_proto::resource_def::BuiltInKind;
+
     let (plural, name) = parse_target(target);
-    match plural {
+    let Some(kind) = k9rs_proto::resource_def::def_by_plural(plural).map(|d| d.kind()) else {
+        return Err(ResolveError::Fatal(format!(
+            "port-forward not supported for '{plural}'"
+        )));
+    };
+
+    // THE list of kinds a port-forward can resolve, and the only one.
+    //
+    // It was two lists of plural strings — this dispatch and a
+    // `workload_selector` whose arms had to agree with it — plus each def's
+    // `operations()` as a silent third, which is what `:pf` is actually
+    // gated on. They happened to agree; nothing checked it, and either
+    // string drifting yielded a `Fatal` that read like a user error. Keyed
+    // on `BuiltInKind` now, held against `operations()` by
+    // `every_port_forwardable_kind_is_resolvable`.
+    match kind {
         // Bare pod: existence and readiness surface at tunnel time (the
         // canary stream fails → retry), so no lookup here.
-        "pods" => Ok(PodTarget { pod: name.to_string(), port: remote_port }),
-        "services" => resolve_service(client, ns, name, remote_port).await,
-        "deployments" | "replicasets" | "statefulsets" | "daemonsets" | "jobs" => {
-            let selector = workload_selector(client, ns, plural, name).await?;
-            let sel_str = selector_to_string(&selector)
-                .map_err(ResolveError::Fatal)?;
-            let pod = pick_ready_pod_by_selector(client, ns, &sel_str).await?;
-            Ok(PodTarget { pod, port: remote_port })
+        BuiltInKind::Pod => Ok(PodTarget { pod: name.to_string(), port: remote_port }),
+        BuiltInKind::Service => resolve_service(client, ns, name, remote_port).await,
+        // Each workload names its pods by label selector; the only
+        // difference between these arms is which typed `Api` and where the
+        // selector sits in that kind's spec (`Job`'s is already optional).
+        BuiltInKind::Deployment => {
+            let api: Api<Deployment> = Api::namespaced(client.clone(), ns);
+            let obj = api.get(name).await.map_err(missing(plural, name))?;
+            let sel = obj.spec.map(|s| s.selector).ok_or_else(no_sel(plural, name))?;
+            pod_by_selector(client, ns, sel, remote_port).await
         }
-        other => Err(ResolveError::Fatal(format!(
-            "port-forward not supported for '{other}'"
+        BuiltInKind::ReplicaSet => {
+            let api: Api<ReplicaSet> = Api::namespaced(client.clone(), ns);
+            let obj = api.get(name).await.map_err(missing(plural, name))?;
+            let sel = obj.spec.map(|s| s.selector).ok_or_else(no_sel(plural, name))?;
+            pod_by_selector(client, ns, sel, remote_port).await
+        }
+        BuiltInKind::StatefulSet => {
+            let api: Api<StatefulSet> = Api::namespaced(client.clone(), ns);
+            let obj = api.get(name).await.map_err(missing(plural, name))?;
+            let sel = obj.spec.map(|s| s.selector).ok_or_else(no_sel(plural, name))?;
+            pod_by_selector(client, ns, sel, remote_port).await
+        }
+        BuiltInKind::DaemonSet => {
+            let api: Api<DaemonSet> = Api::namespaced(client.clone(), ns);
+            let obj = api.get(name).await.map_err(missing(plural, name))?;
+            let sel = obj.spec.map(|s| s.selector).ok_or_else(no_sel(plural, name))?;
+            pod_by_selector(client, ns, sel, remote_port).await
+        }
+        BuiltInKind::Job => {
+            let api: Api<Job> = Api::namespaced(client.clone(), ns);
+            let obj = api.get(name).await.map_err(missing(plural, name))?;
+            let sel = obj.spec.and_then(|s| s.selector).ok_or_else(no_sel(plural, name))?;
+            pod_by_selector(client, ns, sel, remote_port).await
+        }
+        _ => Err(ResolveError::Fatal(format!(
+            "port-forward not supported for '{plural}'"
         ))),
     }
+}
+
+/// Pick a ready pod matching `selector`.
+async fn pod_by_selector(
+    client: &kube::Client,
+    ns: &str,
+    selector: LabelSelector,
+    remote_port: u16,
+) -> Result<PodTarget, ResolveError> {
+    let sel_str = selector_to_string(&selector).map_err(ResolveError::Fatal)?;
+    let pod = pick_ready_pod_by_selector(client, ns, &sel_str).await?;
+    Ok(PodTarget { pod, port: remote_port })
+}
+
+/// The two error shapes the workload arms above share: a failed GET is
+/// worth retrying (the object may be appearing), a spec with no selector is
+/// not a transient.
+fn missing<'a>(plural: &'a str, name: &'a str) -> impl FnOnce(kube::Error) -> ResolveError + 'a {
+    move |e| ResolveError::Retry(format!("{plural}/{name}: {e}"))
+}
+
+fn no_sel<'a>(plural: &'a str, name: &'a str) -> impl FnOnce() -> ResolveError + 'a {
+    move || ResolveError::Retry(format!("{plural}/{name} has no selector"))
 }
 
 /// `plural/name`, with a bare name treated as a pod (kubectl-compatible).
@@ -144,52 +212,6 @@ fn named_container_port(pod: &Pod, name: &str) -> Option<u16> {
                 .flatten()
         })
     })
-}
-
-/// Fetch the workload's label selector (typed per kind — each is a
-/// one-field extraction, and the exhaustive match keeps "which kinds can
-/// port-forward" in one visible place).
-async fn workload_selector(
-    client: &kube::Client,
-    ns: &str,
-    plural: &str,
-    name: &str,
-) -> Result<LabelSelector, ResolveError> {
-    use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
-    use k8s_openapi::api::batch::v1::Job;
-
-    let missing = |e: kube::Error| ResolveError::Retry(format!("{plural}/{name}: {e}"));
-    let no_sel = || ResolveError::Retry(format!("{plural}/{name} has no selector"));
-    match plural {
-        "deployments" => {
-            let api: Api<Deployment> = Api::namespaced(client.clone(), ns);
-            api.get(name).await.map_err(missing)?.spec.map(|s| s.selector).ok_or_else(no_sel)
-        }
-        "replicasets" => {
-            let api: Api<ReplicaSet> = Api::namespaced(client.clone(), ns);
-            api.get(name).await.map_err(missing)?.spec.map(|s| s.selector).ok_or_else(no_sel)
-        }
-        "statefulsets" => {
-            let api: Api<StatefulSet> = Api::namespaced(client.clone(), ns);
-            api.get(name).await.map_err(missing)?.spec.map(|s| s.selector).ok_or_else(no_sel)
-        }
-        "daemonsets" => {
-            let api: Api<DaemonSet> = Api::namespaced(client.clone(), ns);
-            api.get(name).await.map_err(missing)?.spec.map(|s| s.selector).ok_or_else(no_sel)
-        }
-        "jobs" => {
-            let api: Api<Job> = Api::namespaced(client.clone(), ns);
-            api.get(name)
-                .await
-                .map_err(missing)?
-                .spec
-                .and_then(|s| s.selector)
-                .ok_or_else(no_sel)
-        }
-        other => Err(ResolveError::Fatal(format!(
-            "port-forward not supported for '{other}'"
-        ))),
-    }
 }
 
 /// Render a `LabelSelector` as the API's label-selector query string.

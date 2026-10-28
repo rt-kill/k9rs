@@ -148,7 +148,7 @@ pub(crate) fn handle_action(
         }
         Action::ToggleDialogButton => {
             if let k9rs_app::Element::Confirm(d) = app.nav.top_mut() {
-                d.action_focused = !d.action_focused;
+                d.focus_next();
             }
         }
 
@@ -239,11 +239,15 @@ pub(crate) fn handle_action(
             if !app.current_capabilities().supports(k9rs_proto::protocol::OperationKind::PortForward) {
                 return ActionResult::None;
             }
-            let schema = &k9rs_proto::protocol::FormSchema::PORT_FORWARD;
             let row = app.nav.top().selected_row();
             let headers = app.nav.top().headers_snapshot();
             if let Some(info) = get_selected_resource_info(app) {
-                if let Some(dialog) = build_form_from_schema(schema, k9rs_proto::protocol::OperationKind::PortForward, info, row.as_ref(), &headers) {
+                if let Some(dialog) = build_form_for(
+                    k9rs_proto::protocol::OperationKind::PortForward,
+                    info,
+                    row.as_ref(),
+                    &headers,
+                ) {
                     app.nav.push(k9rs_app::Element::Form(Box::new(dialog)));
                 } else {
                     app.ui.flash = Some(k9rs_app::FlashMessage::error(
@@ -446,7 +450,7 @@ fn handle_resource_op(
                     message: format!("Delete {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Delete".to_string(),
                     pending: k9rs_app::PendingAction::Single { op: k9rs_app::SingleOp::Delete, target: info },
-                    action_focused: false,
+                    focused: k9rs_app::ConfirmFocus::Cancel,
                 })));
             }
         }
@@ -456,21 +460,30 @@ fn handle_resource_op(
                 return ActionResult::None;
             }
             if let Some(info) = require_selected(app) {
-                ds_try!(app, data_source.yaml(&info));
-                // ONE call — see the note in `session::open_shell`.
-                app.ui.close_modal();
-                app.ui.open(k9rs_app::Modal::Takeover(k9rs_app::TakeoverOp::Edit {
-                    target: info,
-                    state: k9rs_app::EditState::AwaitingYaml,
-                }));
+                // The takeover's only exit from `AwaitingYaml` is the
+                // reply, so opening it on a send that failed is a modal
+                // nothing can close. `ds_try` has already flashed the
+                // reason; leaving the view up is the honest outcome.
+                if ds_try!(app, data_source.yaml(&info)) {
+                    // ONE call — see the note in `session::open_shell`.
+                    app.ui.close_modal();
+                    app.ui.open(k9rs_app::Modal::Takeover(k9rs_app::TakeoverOp::Edit {
+                        target: info,
+                        state: k9rs_app::EditState::AwaitingYaml,
+                    }));
+                }
             }
         }
         Action::Scale => {
             if let Some(info) = require_selected(app) {
-                let schema = &k9rs_proto::protocol::FormSchema::SCALE;
                 let row = app.nav.top().selected_row();
                 let headers = app.nav.top().headers_snapshot();
-                if let Some(dialog) = build_form_from_schema(schema, k9rs_proto::protocol::OperationKind::Scale, info, row.as_ref(), &headers) {
+                if let Some(dialog) = build_form_for(
+                    k9rs_proto::protocol::OperationKind::Scale,
+                    info,
+                    row.as_ref(),
+                    &headers,
+                ) {
                     app.nav.push(k9rs_app::Element::Form(Box::new(dialog)));
                 }
             }
@@ -481,7 +494,7 @@ fn handle_resource_op(
                     message: format!("Restart {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Restart".to_string(),
                     pending: k9rs_app::PendingAction::Single { op: k9rs_app::SingleOp::Restart, target: info },
-                    action_focused: false,
+                    focused: k9rs_app::ConfirmFocus::Cancel,
                 })));
             }
         }
@@ -491,22 +504,28 @@ fn handle_resource_op(
                     message: format!("Force-kill {}/{}?", info.resource.display_label(), info.name),
                     action_label: "Force Kill".to_string(),
                     pending: k9rs_app::PendingAction::Single { op: k9rs_app::SingleOp::ForceKill, target: info },
-                    action_focused: false,
+                    focused: k9rs_app::ConfirmFocus::Cancel,
                 })));
             }
         }
         Action::DecodeSecret => {
             if let Some(info) = require_selected(app) {
-                ds_try!(app, data_source.decode_secret(&info));
                 // Its OWN spec kind, not `Describe`: the decoded bytes must
                 // never land in the describe cache, and Ctrl-R must
                 // re-decode. Fetching → the honest spinner (the old version
-                // painted fake "Decoding..." text as if it were content).
+                // painted fake "Decoding..." text as if it were content) —
+                // and `Failed` when the ask never left, which is the other
+                // half of being honest about it.
+                let phase = if ds_try!(app, data_source.decode_secret(&info)) {
+                    k9rs_app::ContentPhase::Fetching
+                } else {
+                    k9rs_app::ContentPhase::Failed("could not reach the daemon".to_string())
+                };
                 let el = k9rs_app::Element::ContentView(
                     k9rs_app::ContentView::new(
                         k9rs_app::ContentSpec::DecodedSecret(info),
                         k9rs_app::ContentViewState::default(),
-                        k9rs_app::ContentPhase::Fetching,
+                        phase,
                     ),
                 );
                 app.nav.push(el);
@@ -515,8 +534,14 @@ fn handle_resource_op(
         Action::TriggerCronJob => {
             if let Some(info) = require_selected(app) {
                 let name = info.name.clone();
-                ds_try!(app, data_source.trigger_cronjob(&info));
-                app.ui.flash = Some(k9rs_app::FlashMessage::info(format!("Triggering CronJob: {}", name)));
+                // Gated: this used to say "Triggering CronJob: x" over the
+                // top of `ds_try`'s connection error, in the same one-slot
+                // flash, so a send that never happened read as one that had.
+                if ds_try!(app, data_source.trigger_cronjob(&info)) {
+                    app.ui.flash = Some(k9rs_app::FlashMessage::info(
+                        format!("Triggering CronJob: {}", name),
+                    ));
+                }
             }
         }
         Action::SuspendCronJob => {
@@ -584,7 +609,7 @@ pub(crate) fn handle_batch_op(app: &mut App, action: k9rs_app::Action) {
         message: batch_confirm_message(verb, &targets),
         action_label: label.to_string(),
         pending,
-        action_focused: false,
+        focused: k9rs_app::ConfirmFocus::Cancel,
     })));
 }
 
@@ -631,7 +656,7 @@ fn batch_confirm_message(verb: &str, targets: &[k9rs_proto::protocol::ObjectRef]
 /// - **Rows with no logs at all** — a namespace, a configmap. A row earns a
 ///   place in the union by knowing where its pods are, not by being a pod.
 fn handle_batch_logs(app: &mut App, data_source: &mut ClientSession) {
-    match batch_log_spec(app, app.config.ui.logs.tail_lines) {
+    match batch_log_spec(app) {
         Ok(spec) => push_log_session(app, data_source, spec),
         Err(why) => app.ui.flash = Some(k9rs_app::FlashMessage::warn(why)),
     }
@@ -640,7 +665,7 @@ fn handle_batch_logs(app: &mut App, data_source: &mut ClientSession) {
 /// The merged log stream a marked selection defines — or, as `Err`, the
 /// reason there isn't one. Separated from the handler so the decision is
 /// testable without a live session; the handler only pushes or flashes.
-pub(crate) fn batch_log_spec(app: &App, tail: u64) -> Result<protocol::LogInit, String> {
+pub(crate) fn batch_log_spec(app: &App) -> Result<protocol::LogInit, String> {
     // A projection's marked rows aren't resources in a store, so the store
     // path below cannot read them — and the match is exhaustive, so a new
     // projection kind has to decide what its marked rows mean rather than
@@ -648,7 +673,7 @@ pub(crate) fn batch_log_spec(app: &App, tail: u64) -> Result<protocol::LogInit, 
     if let Some(kind) = app.nav.top().derived_kind() {
         return match kind {
             k9rs_app::DerivedViewKind::Containers => {
-                batch_container_log_spec(app, tail)
+                batch_container_log_spec(app)
             }
         };
     }
@@ -720,8 +745,8 @@ pub(crate) fn batch_log_spec(app: &App, tail: u64) -> Result<protocol::LogInit, 
         target: protocol::LogTarget::Union { label, targets },
         namespace: protocol::Namespace::from_row(&ns),
         container,
-        follow: true,
-        tail: Some(tail),
+        follow: app.config.ui.logs.follows(false),
+        tail: Some(app.config.ui.logs.tail_lines),
         since: None,
         previous: false,
     })
@@ -734,7 +759,7 @@ pub(crate) fn batch_log_spec(app: &App, tail: u64) -> Result<protocol::LogInit, 
 /// grew a `Set`. `All` would not do: it is `--all-containers`, every
 /// container of the pod, which is precisely what you said no to by marking
 /// three of the eight.
-fn batch_container_log_spec(app: &App, tail: u64) -> Result<protocol::LogInit, String> {
+fn batch_container_log_spec(app: &App) -> Result<protocol::LogInit, String> {
     let Some(origin) = app.nav.top().origin().cloned() else {
         return Err("Nothing here to log".to_string());
     };
@@ -745,11 +770,11 @@ fn batch_container_log_spec(app: &App, tail: u64) -> Result<protocol::LogInit, S
         return Err("No marked containers present".to_string());
     }
     Ok(protocol::LogInit {
-        target: protocol::LogTarget::One(origin.name.clone()),
+        target: protocol::LogTarget::one(origin.name.clone()),
         namespace: origin.namespace.clone(),
         container: protocol::LogContainer::Set(names),
-        follow: true,
-        tail: Some(tail),
+        follow: app.config.ui.logs.follows(false),
+        tail: Some(app.config.ui.logs.tail_lines),
         since: None,
         previous: false,
     })
@@ -1062,7 +1087,7 @@ fn handle_log_action(
             let label = match range {
                 LogRange::Tail => "tail".to_string(),
                 LogRange::Head => "everything, oldest first".to_string(),
-                LogRange::Since(d) => d.clone(),
+                LogRange::Since(since) => since.label().to_string(),
             };
             app.ui.flash = Some(k9rs_app::FlashMessage::info(format!("Log range: {}", label)));
             app.nav.with_log_session_of(&store, |session_el| {
@@ -1564,10 +1589,10 @@ pub(crate) fn handle_enter(
             app,
             data_source,
             k9rs_proto::protocol::LogInit {
-                target: k9rs_proto::protocol::LogTarget::One(target.name.clone()),
+                target: k9rs_proto::protocol::LogTarget::one(target.name.clone()),
                 namespace: target.namespace.clone(),
                 container: picked.container,
-                follow: !previous,
+                follow: app.config.ui.logs.follows(previous),
                 tail: Some(app.config.ui.logs.tail_lines),
                 since: None,
                 previous,
@@ -1690,11 +1715,18 @@ pub(crate) fn handle_describe(
             return;
         }
 
-        ds_try!(app, data_source.describe(&info));
+        // `Fetching` means "a reply is coming". If the send did not go,
+        // no reply is coming and the view would spin on "Loading…" for
+        // ever; `Failed` says so and Ctrl-R re-issues.
+        let phase = if ds_try!(app, data_source.describe(&info)) {
+            ContentPhase::Fetching
+        } else {
+            ContentPhase::Failed("could not reach the daemon".to_string())
+        };
         app.nav.push(Element::ContentView(ContentView::new(
             ContentSpec::Describe(info),
             k9rs_app::ContentViewState::default(),
-            ContentPhase::Fetching,
+            phase,
         )));
     }
 }
@@ -1716,11 +1748,16 @@ pub(crate) fn handle_yaml(
             return;
         }
 
-        ds_try!(app, data_source.yaml(&info));
+        // See the describe path above: no send, no reply, no spinner.
+        let phase = if ds_try!(app, data_source.yaml(&info)) {
+            ContentPhase::Fetching
+        } else {
+            ContentPhase::Failed("could not reach the daemon".to_string())
+        };
         app.nav.push(Element::ContentView(ContentView::new(
             ContentSpec::Yaml(info),
             k9rs_app::ContentViewState::default(),
-            ContentPhase::Fetching,
+            phase,
         )));
     }
 }
@@ -1793,7 +1830,7 @@ fn open_logs(
         // The row IS a pod (it lists containers), with exactly one of them
         // after the multi-container branch above.
         let container = containers.first().map(|ci| ci.name.clone()).unwrap_or_default();
-        (protocol::LogTarget::One(name.clone()), log_container_from_str(&container))
+        (protocol::LogTarget::one(name.clone()), log_container_from_str(&container))
     } else {
         // Not a pod — a workload. Its logs are every pod it owns, found via
         // the SAME drill target Enter uses, so "logs of this deployment" and
@@ -1810,7 +1847,7 @@ fn open_logs(
             target,
             namespace: namespace_typed,
             container,
-            follow: !previous,
+            follow: app.config.ui.logs.follows(previous),
             tail: Some(app.config.ui.logs.tail_lines),
             since: None,
             previous,
@@ -1831,7 +1868,8 @@ pub(crate) fn workload_log_target(app: &App, info: &ObjectRef) -> protocol::LogT
         .top()
         .selected_row()
         .and_then(|row| row_log_target(&row, &rid))
-        .unwrap_or_else(|| protocol::LogTarget::One(info.kubectl_target()))
+        .map(protocol::LogTarget::from)
+        .unwrap_or_else(|| protocol::LogTarget::one(info.kubectl_target()))
 }
 
 /// What ONE row's logs are: itself if it is a pod, otherwise the pods its
@@ -1844,25 +1882,25 @@ pub(crate) fn workload_log_target(app: &App, info: &ObjectRef) -> protocol::LogT
 pub(crate) fn row_log_target(
     row: &k9rs_proto::row::ResourceRow,
     rid: &k9rs_proto::protocol::ResourceId,
-) -> Option<protocol::LogTarget> {
+) -> Option<protocol::LogLeaf> {
     use k9rs_proto::row::DrillTarget;
     let label = format!("{}/{}", rid.plural(), row.name);
     // Listing containers is what makes a row a pod.
     if !row.containers.is_empty() {
-        return Some(protocol::LogTarget::One(row.name.clone()));
+        return Some(protocol::LogLeaf::One(row.name.clone()));
     }
     match row.drill_target.clone() {
         Some(DrillTarget::PodsByLabels { labels, .. }) => {
-            Some(protocol::LogTarget::Selector { labels, label })
+            Some(protocol::LogLeaf::Selector { labels, label })
         }
         Some(DrillTarget::PodsByOwner { uid, .. }) => {
-            Some(protocol::LogTarget::Owner { uid, label })
+            Some(protocol::LogLeaf::Owner { uid, label })
         }
         // Nothing here resolves to a pod set, but the resource still
         // declares logs (a cronjob does) — hand the ref to kubectl, which is
         // exactly what happened before any of this existed.
         _ if rid.capabilities().supports(protocol::OperationKind::StreamLogs) => {
-            Some(protocol::LogTarget::One(label))
+            Some(protocol::LogLeaf::One(label))
         }
         _ => None,
     }
@@ -1887,10 +1925,10 @@ fn open_logs_from_derived(
         app,
         data_source,
         protocol::LogInit {
-            target: protocol::LogTarget::One(pod_name),
+            target: protocol::LogTarget::one(pod_name),
             namespace,
             container,
-            follow: !previous,
+            follow: app.config.ui.logs.follows(previous),
             tail: Some(app.config.ui.logs.tail_lines),
             since: None,
             previous,
@@ -1981,13 +2019,21 @@ fn table_dump(app: &App, only: Option<&std::collections::HashSet<k9rs_proto::pro
 ///
 /// Title is derived from `title_template` with `{{kind}}` and `{{name}}`
 /// substitutions. Subtitle comes from the target namespace.
-pub(crate) fn build_form_from_schema(
-    schema: &k9rs_proto::protocol::FormSchema,
+/// Build the form dialog `op` needs, or `None` if it needs none.
+///
+/// Takes the OPERATION and asks it for its schema, rather than taking a
+/// schema the caller looked up. The callers used to name both — `&SCALE`
+/// beside `OperationKind::Scale` — so the op→schema pairing was restated at
+/// every site while `OperationKind::form_schema`, the exhaustive mapping
+/// whose wildcard-free match exists to force that decision, had no caller
+/// outside a test.
+pub(crate) fn build_form_for(
     op: k9rs_proto::protocol::OperationKind,
     target: ObjectRef,
     row: Option<&k9rs_proto::row::ResourceRow>,
     headers: &[String],
 ) -> Option<k9rs_app::FormDialog> {
+    let schema = op.form_schema()?;
     use k9rs_app::{FormDialog, FormFieldKind, FormFieldState, FormSubmit};
     use k9rs_proto::protocol::{FormFieldSchemaKind, DynamicSelectFallback};
 

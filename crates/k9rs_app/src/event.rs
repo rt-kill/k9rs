@@ -248,11 +248,11 @@ pub fn apply_event(app: &mut App, event: AppEvent) {
             // live core stream.
             use k9rs_proto::resource_def::BuiltInKind;
             if !namespaces.is_empty() {
-                let rows = k9rs_kube::cache::cached_namespaces_to_rows(&namespaces);
+                let rows = k9rs_kube::resources::namespaces::cached_namespaces_to_rows(&namespaces);
                 app.core.seed(BuiltInKind::Namespace, rows);
             }
             if !crds.is_empty() {
-                let rows = k9rs_kube::cache::cached_crds_to_rows(&crds);
+                let rows = k9rs_kube::resources::crds::cached_crds_to_rows(&crds);
                 app.core.seed(BuiltInKind::CustomResourceDefinition, rows);
             }
         }
@@ -320,7 +320,7 @@ pub fn apply_event(app: &mut App, event: AppEvent) {
             // Confirmed — the candidate has served its purpose.
             app.kube.connecting = None;
             if !namespaces.is_empty() {
-                let ns_rows = k9rs_kube::cache::cached_namespaces_to_rows(&namespaces);
+                let ns_rows = k9rs_kube::resources::namespaces::cached_namespaces_to_rows(&namespaces);
                 app.core.seed(k9rs_proto::resource_def::BuiltInKind::Namespace, ns_rows);
             }
             // The connection is LIVE — the render gate stops showing the

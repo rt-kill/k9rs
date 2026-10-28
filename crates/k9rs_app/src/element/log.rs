@@ -204,8 +204,24 @@ pub fn sense_of(draft: &str) -> (Sense, &str) {
     }
 }
 
+/// One committed grep step, as the bar shows it.
+///
+/// A struct rather than a tuple because the third field is the one that was
+/// missing: the renderer used to get `(label, kept)` and work the sense out
+/// of the label, which cannot be done — see `LogFilter::own_sense`.
+#[derive(Debug, Clone)]
+pub struct ChainStep {
+    /// As the user typed it, `!` included.
+    pub label: String,
+    /// Lines surviving this step.
+    pub kept: usize,
+    /// Narrowing or excluding.
+    pub sense: Sense,
+}
+
 /// A composable line source: the backing [`LineStore`] plus the
-/// accumulated committed grep chain — the log analogue of [`RowSource`].
+/// accumulated committed grep chain — the log analogue of
+/// [`RowSource`](crate::store::RowSource).
 #[derive(Debug, Clone)]
 pub(crate) struct LineSource {
     pub(super) store: Arc<LineStore>,
@@ -284,7 +300,7 @@ impl LogSession {
             // Derived from the two wire fields rather than stored twice: the
             // spec IS what we asked the daemon for.
             match (&self.spec.since, &self.spec.tail) {
-                (Some(d), _) => d.clone(),
+                (Some(since), _) => since.label().to_string(),
                 (None, None) => "all".to_string(),
                 (None, Some(_)) => "tail".to_string(),
             },
@@ -390,7 +406,7 @@ impl LogSession {
     pub fn current_range(&self) -> crate::actions::LogRange {
         use crate::actions::LogRange;
         match (&self.spec.since, &self.spec.tail) {
-            (Some(d), _) => LogRange::Since(d.clone()),
+            (Some(since), _) => LogRange::Since(*since),
             (None, None) => LogRange::Head,
             (None, Some(_)) => LogRange::Tail,
         }
@@ -430,7 +446,7 @@ impl LogSession {
             // Both absent IS "everything" to the apiserver — the state
             // `Option<String>` could not express.
             LogRange::Head => (None, None),
-            LogRange::Since(d) => (Some(d.clone()), None),
+            LogRange::Since(since) => (Some(*since), None),
         };
         self.spec.since = since;
         self.spec.tail = tail;
@@ -476,6 +492,18 @@ impl LogSession {
 impl LogFilter {
     /// This step's OWN label — the last of the accumulated chain, since a
     /// filter carries every pattern above it as well.
+    /// Whether this step narrows or excludes.
+    ///
+    /// Carried rather than re-derived, because [`Narrowing::label`] CANNOT
+    /// answer it: `\!foo` is a `Keep` whose label is `!foo`, which is the
+    /// same string a `Drop` of `foo` produces. The grep bar re-read that
+    /// leading `!` to pick its colour and so painted an escaped literal in
+    /// the excluding colour, with no string it could have been given that
+    /// would say otherwise.
+    pub fn own_sense(&self) -> Sense {
+        self.source.patterns.last().map(|n| n.sense).unwrap_or(Sense::Keep)
+    }
+
     pub fn own_label(&self) -> String {
         self.source.patterns.last().map(Narrowing::label).unwrap_or_default()
     }

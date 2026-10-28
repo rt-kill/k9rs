@@ -14,7 +14,7 @@
 //! - Live inside their context's [`ContextLocals`] slice, resolved through
 //!   [`LocalRegistry`] (on `SessionSharedState`) so they're shared across
 //!   every TUI session attached to that context.
-//! - Background work (a port-forward's kubectl child, an exec source's
+//! - Background work (a port-forward's tunnel task, an exec source's
 //!   poll) runs as a supervised [`supervise::LocalOperator`] — restart with
 //!   backoff for crash-shaped work, fixed interval for poll-shaped work —
 //!   torn down by dropping its [`supervise::OperatorGuard`].
@@ -148,9 +148,9 @@ pub trait LocalResourceSource: Send + Sync + 'static {
 
     /// Apply a new YAML representation for an entry. Mirrors `kubectl apply
     /// -f`. Implementations parse the YAML, diff against the current entry,
-    /// and reconcile (in PortForwardSource: stop the existing kubectl
-    /// subprocess and create a new one with the new ports). Returns the
-    /// user-facing message on success, or an error string on failure.
+    /// and reconcile (in `PortForwardSource`: `stop(id)` then `create` with
+    /// the new ports). Returns the user-facing message on success, or an
+    /// error string on failure.
     fn apply_yaml(&self, name: &str, yaml: &str) -> Result<String, String>;
 
     /// This source's keep-warm gate, or `None` if subscription-level grace

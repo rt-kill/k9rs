@@ -63,7 +63,7 @@ impl Widget for ConfirmDialogWidget<'_> {
             let gap = 4u16;
             let total = cancel_text.len() as u16 + action_text.len() as u16 + gap;
             let bx = content.x + content.width.saturating_sub(total) / 2;
-            let (cs, as_) = if dialog.action_focused {
+            let (cs, as_) = if dialog.action_focused() {
                 (theme.dialog_button_inactive, theme.dialog_button_active)
             } else {
                 (theme.dialog_button_active, theme.dialog_button_inactive)
@@ -110,28 +110,24 @@ impl Widget for FormDialogWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let label_w = self.dialog.fields.iter()
             .map(|f| f.label.width() as u16).max().unwrap_or(0);
-        let n = self.dialog.fields.len() as u16;
-        let h = n + 9;
 
-        // Only show arrow-key hints if the form has Select fields.
-        let has_select = self.dialog.fields.iter().any(|f| matches!(f.kind, FormFieldKind::Select { .. }));
-        let mut hint_spans = vec![
-            Span::styled("<Tab>", self.theme.status_bar_key),
-            Span::styled(" next  ", self.theme.help_desc),
-        ];
-        if has_select {
-            hint_spans.push(Span::styled("<\u{2190}/\u{2192}>", self.theme.status_bar_key));
-            hint_spans.push(Span::styled(" select  ", self.theme.help_desc));
-        }
-        hint_spans.push(Span::styled("<Enter>", self.theme.status_bar_key));
-        hint_spans.push(Span::styled(" confirm  ", self.theme.help_desc));
-        hint_spans.push(Span::styled("<Esc>", self.theme.status_bar_key));
-        hint_spans.push(Span::styled(" cancel", self.theme.help_desc));
+        // The hint bar and the box it has to fit in, both from
+        // `k9rs_app::geometry` — the same place `Element::extent` asks. The
+        // widget used to build this line itself and size the box from it,
+        // while the extent sized the FLOAT from a hardcoded 38/52; the
+        // measured line is 41/55, so the float came out narrower than the
+        // widget wanted and `<Esc> cancel` was clipped to `<Esc> cance`.
+        let hint_spans: Vec<Span> = k9rs_app::form_hints(self.dialog)
+            .into_iter()
+            .flat_map(|(key, label)| {
+                [
+                    Span::styled(key, self.theme.status_bar_key),
+                    Span::styled(label, self.theme.help_desc),
+                ]
+            })
+            .collect();
         let hints = Line::from(hint_spans);
-
-        // Size dialog to fit hints + content, with room for padding.
-        let hint_width = hints.width() as u16 + 8; // +8 for padding
-        let w = (label_w + 30).max(50).max(hint_width);
+        let (w, h) = k9rs_app::form_dialog_size(self.dialog);
 
         let theme = self.theme;
         let dialog = self.dialog;

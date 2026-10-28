@@ -87,27 +87,8 @@ pub async fn run_daemon() -> anyhow::Result<()> {
             if UnixStream::connect(&path).await.is_ok() {
                 anyhow::bail!("Daemon already running at {}", path.display());
             }
-            // Refuse to remove anything that isn't a Unix socket owned by
-            // the current uid. A regular file or symlink at this path is
-            // a planted attack and we should bail rather than unlink it.
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::{FileTypeExt, MetadataExt};
-                let md = std::fs::symlink_metadata(&path)?;
-                if !md.file_type().is_socket() {
-                    anyhow::bail!(
-                        "Refusing to remove {} — not a Unix socket (file type: {:?})",
-                        path.display(), md.file_type(),
-                    );
-                }
-                let our_uid = unsafe { libc::getuid() };
-                if md.uid() != our_uid {
-                    anyhow::bail!(
-                        "Refusing to remove {} — owned by uid {}, not us ({})",
-                        path.display(), md.uid(), our_uid,
-                    );
-                }
-            }
+            check_stale_socket_is_ours(&path, unsafe { libc::getuid() })?;
             std::fs::remove_file(&path)?;
             UnixListener::bind(&path)?
         }
@@ -212,6 +193,42 @@ pub async fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuse to unlink anything at the socket path that is not a stale Unix
+/// socket belonging to `our_uid`.
+///
+/// Socket startup is TOCTOU-prone: `bind` fails if a file is already there,
+/// but blindly removing and retrying opens a window for a symlink attack on
+/// `/tmp/k9rs-<uid>.sock`, whose parent is world-traversable. So a regular
+/// file, a symlink — `symlink_metadata` does not follow, which is the point
+/// — or a socket someone else owns is treated as planted and the daemon
+/// refuses to start rather than deleting it.
+///
+/// A free function, taking the uid, because the check was inline in
+/// `run_daemon`: the one security decision in that function, and untestable
+/// there, since reaching it means standing up a daemon. Passing the uid in
+/// is also the only way to exercise the not-ours arm without another user.
+#[cfg(unix)]
+fn check_stale_socket_is_ours(path: &std::path::Path, our_uid: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let md = std::fs::symlink_metadata(path)?;
+    if !md.file_type().is_socket() {
+        anyhow::bail!(
+            "Refusing to remove {} — not a Unix socket (file type: {:?})",
+            path.display(),
+            md.file_type(),
+        );
+    }
+    if md.uid() != our_uid {
+        anyhow::bail!(
+            "Refusing to remove {} — owned by uid {}, not us ({})",
+            path.display(),
+            md.uid(),
+            our_uid,
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Daemon state
 // ---------------------------------------------------------------------------
@@ -242,10 +259,17 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
 
-    // First byte: connection type discriminator.
+    // First byte: connection type discriminator. Deadlined — a peer that
+    // connects and then says nothing would otherwise park this task and
+    // its fd for the daemon's whole life (see `HANDSHAKE_TIMEOUT`).
     let mut conn_type = [0u8; 1];
     let mut peek_stream = stream;
-    peek_stream.read_exact(&mut conn_type).await?;
+    tokio::time::timeout(
+        protocol::HANDSHAKE_TIMEOUT,
+        peek_stream.read_exact(&mut conn_type),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("peer did not send a connection-type byte"))??;
 
     match conn_type[0] {
         // Yamux-multiplexed TUI session.
@@ -264,12 +288,24 @@ async fn handle_connection(
             let (reader, writer) = peek_stream.into_split();
             let mut reader = BufReader::with_capacity(protocol::IO_BUFFER_SIZE, reader);
             let mut writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, writer);
-            protocol::write_handshake(&mut writer).await?;
-            if let Err(e) = protocol::read_handshake(&mut reader).await {
-                warn!("management connection version mismatch: {e:#}");
-                return Ok(());
-            }
-            let first_cmd: SessionCommand = protocol::read_bincode(&mut reader).await?;
+            // Preamble + first command under one deadline: `k9rs ctl` writes
+            // all of it immediately, so anything slower here is a peer that
+            // has stopped talking, and the handler is the only thing holding
+            // the fd.
+            let first_cmd = tokio::time::timeout(protocol::HANDSHAKE_TIMEOUT, async {
+                protocol::write_handshake(&mut writer).await?;
+                if let Err(e) = protocol::read_handshake(&mut reader).await {
+                    warn!("management connection version mismatch: {e:#}");
+                    return Ok(None);
+                }
+                let first_cmd: SessionCommand = protocol::read_bincode(&mut reader).await?;
+                Ok::<_, anyhow::Error>(Some(first_cmd))
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("management peer did not finish its handshake"))??;
+            // A version mismatch is already reported inside the block and is
+            // not an error to propagate: `None` is "nothing left to serve".
+            let Some(first_cmd) = first_cmd else { return Ok(()) };
             handle_management_command(first_cmd, &mut writer, &state).await?;
         }
 
@@ -372,8 +408,13 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("daemon not running (socket {:?}): {}", path, e))?;
         stream.write_all(&[CONN_TYPE_MANAGEMENT]).await?;
         let (read_half, write_half) = stream.into_split();
-        let mut reader = BufReader::new(read_half);
-        let mut writer = BufWriter::new(write_half);
+        // `IO_BUFFER_SIZE` like every other framing site in the crate: a
+        // `ctl status` reply carries one `CacheStats` per watcher and per
+        // context, which on a many-cluster daemon is the one management
+        // frame that outgrows tokio's 8 KiB default and pays for the
+        // refills.
+        let mut reader = BufReader::with_capacity(protocol::IO_BUFFER_SIZE, read_half);
+        let mut writer = BufWriter::with_capacity(protocol::IO_BUFFER_SIZE, write_half);
         protocol::write_handshake(&mut writer).await?;
         protocol::read_handshake(&mut reader).await?;
         Ok(Self { reader, writer })
@@ -392,3 +433,7 @@ impl DaemonClient {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/daemon.rs"]
+mod tests;

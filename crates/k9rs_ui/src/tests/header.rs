@@ -49,3 +49,23 @@ fn a_hint_bar_fits_or_admits_it() {
         }
     }
 }
+
+/// Only the classes that DRAW a bar declare labels for one.
+///
+/// `render_keybinding_bar` is called from exactly three places — the yaml,
+/// describe and log views, i.e. the Detail and Log classes. The Dialog class
+/// declared two `bar_label`s anyway, so `bar_hints` returned a bar that
+/// nothing renders, the test above measured its width, and `keymap.rs`'s own
+/// note ("Declaring one there would be a label nothing renders") was false
+/// of the file it is written in.
+#[test]
+fn only_the_views_with_a_bar_declare_hints_for_one() {
+    for &class in ViewClass::ALL {
+        let declared = !bar_hints(class).is_empty();
+        let draws = matches!(class, ViewClass::Detail | ViewClass::Log);
+        assert_eq!(
+            declared, draws,
+            "{class:?}: declares bar hints = {declared}, draws a bar = {draws}",
+        );
+    }
+}

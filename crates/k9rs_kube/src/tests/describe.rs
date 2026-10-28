@@ -127,3 +127,90 @@ fn cleaning_a_line_cannot_slide_its_key_off_the_colon() {
         );
     }
 }
+
+/// A field line's `key_end` indexes the text it ships with, even when the
+/// cluster put an escape in the key.
+///
+/// `classified`'s doc explains why cleaning and indexing must be ONE step —
+/// clean afterwards and the index slides off its colon — and then named
+/// `field_line` as a path that still did it in the wrong order.
+/// `field_line`'s input is label and annotation keys and values, which are
+/// arbitrary cluster-supplied UTF-8.
+#[test]
+fn a_field_lines_key_end_indexes_its_own_cleaned_text() {
+    // An escape sequence before the colon. Cleaning shortens the string, so
+    // an index taken before it would land past the colon.
+    let line = super::field_line("Labels\u{1b}[31m:  app=web".to_string());
+    assert!(
+        !line.text.contains('\u{1b}'),
+        "the shipped text is cleaned: {:?}",
+        line.text,
+    );
+    let DescribeLineKind::Field { key_end } = line.kind else {
+        panic!("field_line builds a Field: {:?}", line.kind)
+    };
+    assert!(
+        key_end <= line.text.len() && line.text.is_char_boundary(key_end),
+        "key_end {key_end} must index the cleaned text {:?}",
+        line.text,
+    );
+    assert_eq!(
+        &line.text[..key_end],
+        "Labels",
+        "and it lands ON the colon, not past it: {:?}",
+        line.text,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The one BuiltInKind -> ApiResource mapping
+// ---------------------------------------------------------------------------
+
+/// `api_version` follows K8s' rule for EVERY built-in kind: the version
+/// alone for the core group, `group/version` otherwise.
+///
+/// Over all kinds, not a sample, because the rule had been re-spelled by
+/// hand in the daemon's scale handler — a third copy of a mapping already
+/// reduced to one, and the kind of copy that agrees until a kind moves
+/// groups. The check is a property rather than the formula again: writing
+/// the formula in the test would be a fourth copy that could only fail
+/// together with the third.
+#[test]
+fn every_built_in_kinds_api_version_follows_the_group_rule() {
+    for &kind in k9rs_proto::resource_def::BuiltInKind::ALL {
+        let (ar, scope) = crate::describe::built_in_api_resource(kind);
+        let gvr = kind.def().gvr();
+        assert_eq!(ar.plural, gvr.plural, "{kind:?}");
+        assert_eq!(ar.kind, gvr.kind, "{kind:?}");
+        assert_eq!(scope, gvr.scope, "{kind:?}: the scope rides along");
+        if ar.group.is_empty() {
+            assert_eq!(
+                ar.api_version, ar.version,
+                "{kind:?}: a core-group kind's apiVersion is its version alone",
+            );
+        } else {
+            assert_eq!(
+                ar.api_version,
+                format!("{}/{}", ar.group, ar.version),
+                "{kind:?}: a grouped kind's apiVersion carries its group",
+            );
+            assert!(
+                ar.api_version.contains('/'),
+                "{kind:?}: …and is therefore not a bare version",
+            );
+        }
+    }
+}
+
+/// Pods are the core-group case and Deployments the grouped one — spelled
+/// out so the rule above is anchored to something a reader can check.
+#[test]
+fn the_two_api_version_shapes_read_as_expected() {
+    use k9rs_proto::resource_def::BuiltInKind;
+    let (pod, _) = crate::describe::built_in_api_resource(BuiltInKind::Pod);
+    assert_eq!(pod.api_version, "v1");
+    assert_eq!(pod.plural, "pods");
+    let (dep, _) = crate::describe::built_in_api_resource(BuiltInKind::Deployment);
+    assert_eq!(dep.api_version, "apps/v1");
+    assert_eq!(dep.plural, "deployments");
+}

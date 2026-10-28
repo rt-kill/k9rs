@@ -226,3 +226,47 @@ fn a_caret_past_the_last_character_is_still_on_screen() {
     assert_eq!(shown, "ghij", "the window follows the caret to the end");
     assert_eq!(col, 4, "and the caret is the last column, not past it");
 }
+
+/// The caret stays on a GRAPHEME boundary after an insert, including the one
+/// case where a byte-length step does not.
+///
+/// `insert` advanced by `c.len_utf8()`. That agrees with the grapheme
+/// boundary unless what FOLLOWS the caret is a combining mark: the inserted
+/// base character and that mark are then one cluster, and a byte step lands
+/// inside it. The module doc claims "every mutator below preserves it, so no
+/// caller can construct a bad one" — this was the exception.
+#[test]
+fn inserting_before_a_combining_mark_leaves_the_caret_on_a_boundary() {
+    // A value that BEGINS with a combining acute accent. Odd, but typeable:
+    // paste a stray mark, then type in front of it.
+    let mut input = TextInput::seeded("\u{0301}x");
+    input.home();
+    assert_eq!(input.cursor(), 0);
+
+    input.insert('e');
+    // `e` + U+0301 is one cluster ("é"), so the caret belongs AFTER it —
+    // byte 3 — not after the `e` alone at byte 1.
+    assert_eq!(input.value(), "e\u{0301}x");
+    assert_eq!(
+        input.cursor(),
+        3,
+        "the caret must clear the whole cluster, not sit between a letter and its accent",
+    );
+
+    // And the invariant holds the way the rest of the module relies on it:
+    // the value slices there, and one Backspace removes the whole cluster.
+    let _ = &input.value()[..input.cursor()];
+    input.backspace();
+    assert_eq!(input.value(), "x", "one grapheme deleted, not half of one");
+}
+
+/// The ordinary case is untouched: typing into plain text advances one
+/// character at a time.
+#[test]
+fn inserting_into_plain_text_advances_one_character() {
+    let mut input = TextInput::seeded("bc");
+    input.home();
+    input.insert('a');
+    assert_eq!(input.value(), "abc");
+    assert_eq!(input.cursor(), 1);
+}

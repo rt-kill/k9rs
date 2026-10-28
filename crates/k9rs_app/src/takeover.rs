@@ -1,18 +1,41 @@
 //! Everything that takes the screen, or part of it, away from the view.
 //!
-//! The `:` prompt, a confirm dialog, a form, a container picker, `$EDITOR`,
-//! a shell — [`Modal`] is ONE slot, so two-modals-at-once is unrepresentable.
-//! It replaced four mutually-exclusive `Option` fields that 53 write sites
-//! had to clear in concert, and any path that forgot left a modal buried
-//! under another, invisible until the top one closed.
+//! The `:` prompt and the screen takeovers (`$EDITOR`, a shell) — [`Modal`]
+//! is ONE slot, so two of THOSE at once is unrepresentable. It replaced four
+//! mutually-exclusive `Option` fields that 53 write sites had to clear in
+//! concert, and any path that forgot left a modal buried under another,
+//! invisible until the top one closed.
+//!
+//! The list used to name six things, including the confirm dialog, the form
+//! and the container picker. Those are nav-stack elements now (see the
+//! comments inside [`Modal`]), so the slot's exclusion covers two of the six
+//! states it was claiming: `Modal::Command` alongside an `Element::Confirm`
+//! IS representable. Nothing reaches it today, but what prevents it is the
+//! INPUT ROUTER, not this slot, and from both directions:
+//!
+//! - `:` under a dialog never opens the prompt. A modal element skips the
+//!   globals, so `:` reaches the confirm box's own keymap and lands on its
+//!   dismiss-on-any-key arm (pinned by
+//!   `a_colon_under_a_dialog_cancels_it_rather_than_opening_the_prompt`).
+//! - A submitted command cannot push a dialog UNDER the prompt: the bar
+//!   closes before the command runs, and no command word pushes a confirm
+//!   box anyway.
+//!
+//! If either changed, the prompt would swallow the dialog's keys —
+//! `edit_command_key` consumes everything whenever `command_input` is
+//! `Some`, whatever is on the nav stack — and the box would be unanswerable.
 //!
 //! [`TempFile`] and its `Drop` are here because the edit flow owns a file on
 //! disk for exactly as long as the takeover exists.
 
 use k9rs_proto::protocol::ObjectRef;
-/// Everything that can be modal over the current view — the `:` prompt, a
-/// confirm dialog, a form, or an overlay (help / container picker / edit /
-/// shell).
+/// Everything that can be modal over the current view: the `:` prompt, or a
+/// screen takeover (`$EDITOR` / a shell).
+///
+/// Three variants. The confirm dialog, the form, the container picker and
+/// help all left for the nav stack — see the comments on the variants below
+/// — and this doc went on listing them, which made the exclusion it claims
+/// sound broader than it is.
 ///
 /// These were four independent fields (`input_mode`, `confirm_dialog`,
 /// `form_dialog`, `overlay`) that were mutually exclusive *by intent*: every
@@ -20,8 +43,10 @@ use k9rs_proto::protocol::ObjectRef;
 /// `begin_context_switch` cleared all four in a row. Any path that forgot
 /// left a modal buried under another, invisible until the top one closed.
 ///
-/// One field makes that impossible: opening a modal is an assignment, and an
-/// assignment displaces whatever was there.
+/// One field makes that impossible FOR THESE THREE: opening a modal is an
+/// assignment, and an assignment displaces whatever was there. A modal
+/// co-existing with a dialog ELEMENT is a different question, answered by
+/// the input router rather than here.
 pub enum Modal {
     /// Nothing modal — keys go to the view.
     None,
@@ -318,14 +343,54 @@ pub enum PendingAction {
     BatchForceKill(Vec<ObjectRef>),
 }
 
+/// Which of a confirm box's two buttons has focus.
+///
+/// It was a `bool` named `action_focused`, with its meaning in prose —
+/// "True = action button focused, false = cancel focused (safe default)" —
+/// read in the key handler, flipped in the action layer and branched on in
+/// the widget, each of which had to remember the polarity. Its sibling five
+/// declarations away, [`crate::FormFocus`], exists precisely because a bare
+/// index "is why there was exactly one button": two dialogs in one file with
+/// two models of focus.
+///
+/// Named, the safe default is `Cancel` by NAME rather than by `false`, and
+/// `focus_next` is a cycle rather than a flip — so a third button would be
+/// expressible, which `!action_focused` could never be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfirmFocus {
+    /// The Cancel button. The default, and the safe direction.
+    #[default]
+    Cancel,
+    /// The action button — Delete, Restart, Force Kill.
+    Action,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfirmDialog {
     pub message: String,
     /// Label for the action button (e.g. "Delete", "Restart", "Force Kill").
     pub action_label: String,
     pub pending: PendingAction,
-    /// True = action button focused, false = cancel focused (safe default).
-    pub action_focused: bool,
+    /// Which button has focus. Opens on [`ConfirmFocus::Cancel`].
+    pub focused: ConfirmFocus,
+}
+
+impl ConfirmDialog {
+    /// The next button in the cycle. ONE function owns the order, as
+    /// [`crate::FormDialog::focus_next`] does for the form's — so the two
+    /// buttons cannot be reachable in one direction and not the other, and
+    /// a third would join the cycle here and nowhere else.
+    pub fn focus_next(&mut self) {
+        self.focused = match self.focused {
+            ConfirmFocus::Cancel => ConfirmFocus::Action,
+            ConfirmFocus::Action => ConfirmFocus::Cancel,
+        };
+    }
+
+    /// Whether the ACTION button is the one Enter would activate.
+    pub fn action_focused(&self) -> bool {
+        matches!(self.focused, ConfirmFocus::Action)
+    }
 }
 
 /// "Which container?" — a pick-one list floating over the view that asked.

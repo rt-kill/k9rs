@@ -46,20 +46,95 @@ pub fn confirm_dialog_size(dialog: &crate::ConfirmDialog) -> (u16, u16) {
     (msg_len.max(button_width + 8).clamp(36, 72), 9 + extra_lines)
 }
 
+/// The hint bar a container picker shows, as `(key, label)` pairs.
+///
+/// Here, beside the size that has to fit it, for the reason [`form_hints`]
+/// is: the picker's box was sized from its CHOICES alone, so when it moved
+/// onto the shared `ModalOverlay` path — which spends `DIALOG_MARGIN` and
+/// the block's own padding — a one-choice picker came out 30 columns wide,
+/// 24 of them usable, and `<Esc> back` rendered as `<Esc> b`. Caught by a
+/// test before it shipped; the same failure as the form's, found the same
+/// way.
+pub fn picker_hints() -> [(&'static str, &'static str); 2] {
+    [("<Enter>", " select  "), ("<Esc>", " back")]
+}
+
+/// The columns [`picker_hints`] occupies.
+pub fn picker_hints_width() -> u16 {
+    picker_hints()
+        .iter()
+        .map(|(key, label)| (key.width() + label.width()) as u16)
+        .sum()
+}
+
+/// The columns a dialog spends on its own chrome before any content: the
+/// border, and the horizontal padding `ModalOverlay` gives its block.
+///
+/// Named because two sizes have to subtract it and the widget has to spend
+/// it — the arithmetic that cancels, which `DIALOG_MARGIN`'s own doc warns
+/// must not live in two files.
+pub const DIALOG_CHROME: u16 = 2 + 4;
+
 /// The box a container picker needs, in cells — the same computation the
 /// renderer uses, so the float and the drawing agree on one rect.
 pub(crate) fn container_picker_size(p: &crate::ContainerPicker) -> (u16, u16) {
-    let widest = p.choices.iter().map(|c| c.label.len()).max().unwrap_or(10) as u16;
-    ((widest + 6).clamp(30, 60), p.choices.len() as u16 + 4)
+    let widest = p.choices.iter().map(|c| c.label.width()).max().unwrap_or(10) as u16;
+    let for_choices = (widest + DIALOG_CHROME).clamp(30, 60);
+    (
+        for_choices.max(picker_hints_width() + DIALOG_CHROME),
+        p.choices.len() as u16 + 4,
+    )
 }
 
-/// The box a form needs, in cells — one computation for the widget that
+/// The hint bar a form dialog shows under its fields, as `(key, label)`
+/// pairs for the widget to style.
+///
+/// Here rather than in the widget because the BOX has to be wide enough for
+/// it, and that width was arrived at twice: `form_dialog_size` below
+/// hardcoded `if has_select { 52 } else { 38 }` while the widget measured
+/// the line it actually built. Measured, those lines are **41** and **55** —
+/// so the model was three columns short either way, and on a port-forward
+/// form (a Select plus a 14-column label) the box came out one cell under
+/// what the hint needs and `<Esc> cancel` rendered as `<Esc> cance`. Losing
+/// the key that gets you out is the specific failure `header::fit_bar`
+/// exists to prevent.
+///
+/// The arrow hints appear only when a Select field is present, which is the
+/// whole reason the width is conditional.
+pub fn form_hints(dialog: &crate::FormDialog) -> Vec<(&'static str, &'static str)> {
+    let mut hints = vec![("<Tab>", " next  ")];
+    if dialog.fields.iter().any(|f| matches!(f.kind, FormFieldKind::Select { .. })) {
+        hints.push(("<\u{2190}/\u{2192}>", " select  "));
+    }
+    hints.push(("<Enter>", " confirm  "));
+    hints.push(("<Esc>", " cancel"));
+    hints
+}
+
+/// The columns [`form_hints`] occupies.
+pub fn form_hints_width(dialog: &crate::FormDialog) -> u16 {
+    form_hints(dialog)
+        .iter()
+        .map(|(key, label)| (key.width() + label.width()) as u16)
+        .sum()
+}
+
+/// The box a form needs, in cells — ONE computation, for the widget that
 /// draws it and the extent that reserves space for it.
-pub(crate) fn form_dialog_size(dialog: &crate::FormDialog) -> (u16, u16) {
+///
+/// `pub`, like [`confirm_dialog_size`], because the widget has to be able to
+/// consult it. The module doc's claim that each of these is "consulted by the
+/// widget that draws it" was true only of the confirm: this was
+/// `pub(crate)`, so `k9rs_ui` could not reach it and had its own copy of the
+/// arithmetic.
+pub fn form_dialog_size(dialog: &crate::FormDialog) -> (u16, u16) {
     let label_w = dialog.fields.iter().map(|f| f.label.width() as u16).max().unwrap_or(0);
-    let has_select = dialog.fields.iter().any(|f| matches!(f.kind, FormFieldKind::Select { .. }));
-    // Mirrors the hint line the widget builds below; the arrow hints only
-    // appear when a Select field is present, and they widen the box.
-    let hint_width = if has_select { 52u16 } else { 38 } + 8;
+    // `DIALOG_CHROME` plus two columns of slack, which the hint line has
+    // always had and the clipping report measured against.
+    let hint_width = form_hints_width(dialog) + DIALOG_CHROME + 2;
     ((label_w + 30).max(50).max(hint_width), dialog.fields.len() as u16 + 9)
 }
+
+#[cfg(test)]
+#[path = "tests/geometry.rs"]
+mod tests;

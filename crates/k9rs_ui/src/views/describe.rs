@@ -157,6 +157,15 @@ pub(crate) fn draw_describe(f: &mut Frame, app: &mut App, area: Rect) {
             f.render_widget(paragraph, inner);
         }
 
+        // Ratatui's `Scrollbar` draws ON the block's right border, so it
+        // costs no content column — unlike the log and YAML viewers, which
+        // RESERVE one. Two policies, and the difference is deliberate: those
+        // two measure wrapped or clipped text against the width, so whether
+        // a scrollbar is needed would depend on the width that depends on
+        // the scrollbar (`log_view` spells that circularity out). A
+        // `Paragraph` has no such loop. There was briefly a third policy —
+        // the YAML viewer SHARED its scrollbar column with the text, which
+        // is a bug and not a policy.
         let inner = Block::bordered().inner(content_area);
         if total_lines > inner.height as usize {
             let max_scroll = total_lines.saturating_sub(inner.height as usize);

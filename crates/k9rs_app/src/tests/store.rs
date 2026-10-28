@@ -816,3 +816,268 @@ fn a_tagged_line_exports_with_its_source_as_a_prefix() {
     };
     assert_eq!(StoredLine::from(tagged).flat_text(), "[pod-b] hello");
 }
+
+// ---------------------------------------------------------------------------
+// DeltaTracker — row-change detection. Moved here with the type it tests:
+// these lived in `tests/state.rs` under a banner reading "Connection — the
+// unified link/reconnect lifecycle", whose tests had already gone to
+// `tests/connection.rs`.
+//
+// In their own `mod`, which is where their four spaces of indentation came
+// from in the first place — the wrapper had been deleted around them and the
+// indentation left behind. It is load-bearing: this file's `row` and `key`
+// helpers are different functions with different arities.
+// ---------------------------------------------------------------------------
+mod delta_tracker {
+    use crate::store::*;
+
+    use k9rs_proto::protocol::{ObjectKey, RowChange};
+    use k9rs_proto::row::{CellValue, ResourceRow};
+
+    fn row(name: &str, val: &str) -> ResourceRow {
+        ResourceRow {
+            name: name.into(),
+            namespace: Some("ns".into()),
+            cells: vec![CellValue::Text(val.into())],
+            ..Default::default()
+        }
+    }
+    fn key(name: &str) -> ObjectKey {
+        ObjectKey::new("ns".to_string(), name.to_string())
+    }
+
+    /// E4: a metadata-only upsert (identical cells) must NOT flash — kube
+    /// heartbeat churn would otherwise light the table permanently. A real
+    /// change flashes; an insert doesn't (matches the baseline path);
+    /// removes clear their state.
+    #[test]
+    fn apply_changes_flashes_only_genuine_changes() {
+        let mut d = DeltaTracker::new();
+        d.rebaseline(&[row("a", "1")]);
+        assert!(d.changed_rows().is_empty(), "baseline seeds hashes, no flash");
+
+        d.apply_changes(&[RowChange::Upsert(row("a", "1"))]); // heartbeat
+        assert!(d.changed_rows().is_empty(), "identical cells: no flash");
+
+        d.apply_changes(&[RowChange::Upsert(row("a", "2"))]); // real change
+        assert!(d.changed_rows().contains_key(&key("a")));
+
+        d.apply_changes(&[RowChange::Upsert(row("new", "1"))]); // insert
+        assert!(!d.changed_rows().contains_key(&key("new")), "inserts don't flash");
+
+        d.apply_changes(&[RowChange::Remove(key("a"))]);
+        assert!(!d.changed_rows().contains_key(&key("a")), "remove clears state");
+    }
+
+    /// Cross-recovery continuity: hashes survive a re-baseline, so a row
+    /// that changed while a watcher was down flashes after the recovery
+    /// baseline — and unchanged rows do NOT mass-flash.
+    #[test]
+    fn rebaseline_keeps_continuity_without_mass_flash() {
+        let mut d = DeltaTracker::new();
+        d.rebaseline(&[row("a", "1"), row("b", "1")]);
+        d.rebaseline(&[row("a", "1"), row("b", "2")]); // recovery baseline
+        assert!(!d.changed_rows().contains_key(&key("a")), "unchanged: quiet");
+        assert!(d.changed_rows().contains_key(&key("b")), "changed-during-gap: flash");
+    }
+}
+
+/// Every resource that DECLARES itself core has an app-level store, and the
+/// counters and the staleness banner read the same set.
+///
+/// "Which stores are core" had three independently-maintained answers:
+/// `is_core()` per resource ({Namespace, Node}), `store_for`'s match
+/// ({Namespace, Node, CustomResourceDefinition}), and two hand-written
+/// `[&namespaces, &nodes, &crds]` arrays. Two consequences, both live:
+///
+/// 1. `stale_reason` walked three stores while `core_resource_stats` counted
+///    two. `crds` has no subscription — its staleness clears only on a
+///    non-empty `Discovery`, an eager apiserver poll slower than the
+///    subscription baselines — so the `⚠ STALE` banner outlived the
+///    staleness of every number it labelled, and would have stuck forever
+///    on any connect where the CRD list came back empty.
+/// 2. `store_for`'s `_ => None` is read by `open_streams` and
+///    `core_resource_stats` as `else { continue }`. Marking a def
+///    `is_core() -> true` without adding an arm bought no subscription, no
+///    stat, no warning and no compile error.
+#[test]
+fn every_core_resource_has_a_store() {
+    let app = crate::App::new_for_test();
+
+    let declared: Vec<&'static str> = k9rs_proto::resource_def::all_defs()
+        .filter(|def| def.is_core())
+        .map(|def| def.gvr().plural)
+        .collect();
+    assert!(
+        declared.len() >= 2,
+        "sanity: some resources declare themselves core: {declared:?}",
+    );
+
+    // (2) Nothing that declares itself core falls into `_ => None`.
+    for def in k9rs_proto::resource_def::all_defs().filter(|d| d.is_core()) {
+        let kind = def
+            .resource_id()
+            .built_in_kind()
+            .unwrap_or_else(|| panic!("{} is a built-in", def.gvr().plural));
+        assert!(
+            app.core.store_for(kind).is_some(),
+            "{} declares `is_core()` but `store_for` has no arm — it would \
+             get no subscription and no counter, silently",
+            def.gvr().plural,
+        );
+    }
+
+    // (1) The banner's set IS the counters' set.
+    let counted = app.core.counted_stores().count();
+    assert_eq!(
+        counted,
+        declared.len(),
+        "one store per core declaration: {declared:?}",
+    );
+    assert_eq!(
+        counted,
+        app.core_resource_stats().len(),
+        "and the Overview counts exactly those",
+    );
+}
+
+/// A store with no counter cannot raise the counters' staleness banner.
+///
+/// The concrete shape of the bug above: `crds` is parked and marked stale
+/// with its siblings on a context switch, but clears on a different, slower
+/// event — so it alone kept the banner up over numbers that were already
+/// live again.
+#[test]
+fn a_store_with_no_counter_does_not_raise_the_counter_banner() {
+    let app = crate::App::new_for_test();
+
+    // `mark_stale` only acts on a READY store, so each one has to have
+    // received a baseline first — otherwise both halves below pass while
+    // asserting nothing.
+    let ready = |store: &crate::store::RowStore, kind: k9rs_proto::resource_def::BuiltInKind| {
+        store.apply(
+            1,
+            crate::StorePayload::Baseline(k9rs_proto::protocol::TableBaseline {
+                resource: kind.to_resource_id(),
+                headers: vec!["NAME".into()],
+                rows: Vec::new(),
+            }),
+        );
+        assert!(
+            matches!(store.with_read(|i| i.state.clone()), crate::TableDataState::Ready),
+            "the store is Ready, so `mark_stale` will take",
+        );
+    };
+    ready(&app.core.crds, k9rs_proto::resource_def::BuiltInKind::CustomResourceDefinition);
+    ready(&app.core.namespaces, k9rs_proto::resource_def::BuiltInKind::Namespace);
+    assert!(app.core.stale_reason().is_none(), "sanity: nothing stale yet");
+
+    // `crds` feeds completion and the picker, not a counter.
+    app.core.crds.mark_stale("from your previous visit — refreshing");
+    assert!(
+        app.core.stale_reason().is_none(),
+        "the CRD store has no counter, so its staleness is not the \
+         counters' staleness",
+    );
+
+    // A counted store's staleness IS.
+    app.core.namespaces.mark_stale("from your previous visit — refreshing");
+    assert!(
+        app.core.stale_reason().is_some(),
+        "a store behind a counter raises the banner",
+    );
+}
+
+/// Every edge `TableDataState`'s doc lists is reachable, and lands where it
+/// says.
+///
+/// That list is prose: `state` is written by eight bare assignments in this
+/// file with no `transition()` to route them through, so nothing stops the
+/// code and the doc parting ways — and they HAD parted ways. Four edges were
+/// missing from it, including `Failed → Ready`, the self-heal, which is the
+/// most valuable one in the table. This drives each listed edge through the
+/// store and asserts the landing, so the doc is checked rather than merely
+/// written.
+///
+/// A new VARIANT is already caught (`liveness.rs` matches exhaustively); a
+/// new EDGE is what this is for.
+#[test]
+fn every_documented_state_edge_lands_where_the_doc_says() {
+    use crate::TableDataState as S;
+
+    let pods = k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id();
+    let baseline = || {
+        crate::StorePayload::Baseline(k9rs_proto::protocol::TableBaseline {
+            resource: pods.clone(),
+            headers: vec!["NAME".into()],
+            rows: Vec::new(),
+        })
+    };
+    let state = |s: &crate::store::RowStore| s.with_read(|i| i.state.clone());
+    // A fresh store, plus the steps needed to park it in `from`.
+    let at = |from: &S| -> std::sync::Arc<crate::store::RowStore> {
+        let s = crate::store::RowStore::new("pods");
+        match from {
+            S::Initializing => {}
+            S::Ready => s.apply(1, baseline()),
+            S::Failed(_) => s.apply(1, crate::StorePayload::Failed("boom".into())),
+            S::Stale(_) => {
+                s.apply(1, baseline());
+                s.mark_stale("frozen");
+            }
+        }
+        s
+    };
+
+    // (from, how, to) — one row per edge the doc lists.
+    #[allow(clippy::type_complexity)]
+    let edges: Vec<(S, &str, Box<dyn Fn(&crate::store::RowStore)>, fn(&S) -> bool)> = vec![
+        (S::Initializing, "a baseline arrives",
+         Box::new(move |s: &crate::store::RowStore| s.apply(2, baseline())),
+         |s| matches!(s, S::Ready)),
+        (S::Initializing, "the subscription fails first",
+         Box::new(|s: &crate::store::RowStore| s.apply(2, crate::StorePayload::Failed("x".into()))),
+         |s| matches!(s, S::Failed(_))),
+        (S::Ready, "the store is cleared",
+         Box::new(|s: &crate::store::RowStore| s.clear()),
+         |s| matches!(s, S::Initializing)),
+        (S::Ready, "an error arrives",
+         Box::new(|s: &crate::store::RowStore| s.apply(2, crate::StorePayload::Failed("x".into()))),
+         |s| matches!(s, S::Failed(_))),
+        (S::Ready, "the watch stops feeding",
+         Box::new(|s: &crate::store::RowStore| s.mark_stale("frozen")),
+         |s| matches!(s, S::Stale(_))),
+        // The self-heal, and the edge the doc had been missing.
+        (S::Failed("boom".into()), "a baseline arrives",
+         Box::new(move |s: &crate::store::RowStore| s.apply(2, baseline())),
+         |s| matches!(s, S::Ready)),
+        (S::Failed("boom".into()), "it is re-initialized",
+         Box::new(|s: &crate::store::RowStore| s.mark_reinitializing()),
+         |s| matches!(s, S::Initializing)),
+        (S::Stale("frozen".into()), "data arrives",
+         Box::new(move |s: &crate::store::RowStore| s.apply(2, baseline())),
+         |s| matches!(s, S::Ready)),
+        (S::Stale("frozen".into()), "an error arrives",
+         Box::new(|s: &crate::store::RowStore| s.apply(2, crate::StorePayload::Failed("x".into()))),
+         |s| matches!(s, S::Failed(_))),
+        (S::Stale("frozen".into()), "it is re-initialized",
+         Box::new(|s: &crate::store::RowStore| s.mark_reinitializing()),
+         |s| matches!(s, S::Initializing)),
+    ];
+
+    for (from, how, step, lands) in edges {
+        let store = at(&from);
+        assert!(
+            std::mem::discriminant(&state(&store)) == std::mem::discriminant(&from),
+            "fixture: the store should start in {from:?}, got {:?}",
+            state(&store),
+        );
+        step(&store);
+        let got = state(&store);
+        assert!(
+            lands(&got),
+            "{from:?} + ({how}) landed in {got:?}, which is not what the \
+             transition table says",
+        );
+    }
+}

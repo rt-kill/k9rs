@@ -43,8 +43,8 @@ pub fn context_label(at: &Attachment) -> String {
         // one. Saying "connecting…" here is the same lie the connecting screen
         // exists to stop telling.
         Attachment::NoContext => "none — press Enter to select".to_string(),
-        Attachment::Live { context, .. } => context.to_string(),
-        Attachment::Connecting { context, .. } => format!("{} (connecting…)", context),
+        Attachment::Live(a) => a.context().to_string(),
+        Attachment::Connecting(a) => format!("{} (connecting…)", a.context()),
         Attachment::Opening => "connecting...".to_string(),
     }
 }
@@ -56,6 +56,38 @@ pub fn context_label(at: &Attachment) -> String {
 pub const UNKNOWN_FIELD: &str = "n/a";
 
 /// k9rs logo on the right. No key hints — those live in the ? help dialog.
+/// The four identity fields, each value elided from the LEFT to fit
+/// `value_w` columns.
+///
+/// ONE projection for the header and the overview. Both already start from
+/// `app.attachment()` — that half was unified after the header named one
+/// context above another's cluster — but they then FITTED the values
+/// independently. Elision has to go leftward here: these are identifiers
+/// whose distinguishing part is at the END, and `aws eks update-kubeconfig`
+/// without `--alias` writes a context of
+/// `arn:aws:eks:us-west-2:123456789012:cluster/prod-usw2`, where every
+/// column before `prod-usw2` is shared with every other context you have.
+/// The overview handed its raw strings to a centred `Line`, which clips on
+/// the RIGHT — so the landing page showed four copies of one ARN prefix,
+/// which is precisely the bug `the_header_keeps_the_telling_end_of_an_arn`
+/// pins for the header.
+///
+/// Field NAMES, not formatted labels: the header pads them into a column and
+/// the overview centres each line, so the padding is the caller's.
+pub fn identity_fields(
+    at: &k9rs_app::Attachment,
+    value_w: usize,
+) -> [(&'static str, String); 4] {
+    let id = at.identity();
+    let elide = |v: &str| k9rs_util::width::truncate_left(v, value_w).into_owned();
+    [
+        ("Context", elide(&context_label(at))),
+        ("Cluster", elide(id.cluster().unwrap_or(UNKNOWN_FIELD))),
+        ("User", elide(id.user().unwrap_or(UNKNOWN_FIELD))),
+        ("K8s", elide(id.k8s_version().unwrap_or(UNKNOWN_FIELD))),
+    ]
+}
+
 pub fn draw_header(
     f: &mut Frame,
     app: &App,
@@ -69,11 +101,6 @@ pub fn draw_header(
     // ONE resolution, so the name and the three lines beneath it cannot come
     // from different arms of different matches.
     let at = app.attachment();
-    let ctx = context_label(&at);
-    let id = at.identity();
-    let cluster = id.cluster().unwrap_or(UNKNOWN_FIELD);
-    let user = id.user().unwrap_or(UNKNOWN_FIELD);
-    let k8s_ver = id.k8s_version().unwrap_or(UNKNOWN_FIELD);
 
     let logo_width = LOGO.iter().map(|l| l.len()).max().unwrap_or(0) as u16 + 2;
     let cols = Layout::horizontal([
@@ -83,35 +110,23 @@ pub fn draw_header(
 
     // Left: context / cluster / user / k8s version stacked vertically.
     //
-    // Each value is elided from the LEFT, because these are identifiers whose
-    // distinguishing part is at the END: `aws eks update-kubeconfig` without
-    // `--alias` writes a context of
-    // `arn:aws:eks:us-west-2:123456789012:cluster/prod-usw2`, where every
-    // column before `prod-usw2` is boilerplate shared with every other
-    // context you have. The `Paragraph` clipped it on the right instead, so
-    // below ~80 columns the four lines read as four copies of the same ARN
-    // prefix — same reasoning as the nav breadcrumb, which is also a path.
+    // Values elided from the left — see `identity_fields`, which the
+    // overview shares.
     let label_w = " Context: ".width();
     let value_w = (cols[0].width as usize).saturating_sub(label_w);
-    let elide = |v: &str| k9rs_util::width::truncate_left(v, value_w).into_owned();
-    let info = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(" Context: ", theme.info_label),
-            Span::styled(elide(&ctx), theme.info_value),
-        ]),
-        Line::from(vec![
-            Span::styled(" Cluster: ", theme.info_label),
-            Span::styled(elide(cluster), theme.info_value),
-        ]),
-        Line::from(vec![
-            Span::styled(" User:    ", theme.info_label),
-            Span::styled(elide(user), theme.info_value),
-        ]),
-        Line::from(vec![
-            Span::styled(" K8s:     ", theme.info_label),
-            Span::styled(elide(k8s_ver), theme.info_value),
-        ]),
-    ]);
+    let info = Paragraph::new(
+        identity_fields(&at, value_w)
+            .into_iter()
+            .map(|(field, value)| {
+                // Padded into a column: ` Context: `, ` User:    `.
+                let label = format!(" {field}:{:width$}", "", width = 8 - field.len() - 1);
+                Line::from(vec![
+                    Span::styled(label, theme.info_label),
+                    Span::styled(value, theme.info_value),
+                ])
+            })
+            .collect::<Vec<_>>(),
+    );
     f.render_widget(info, cols[0]);
 
     // Right: k9rs logo.

@@ -4,11 +4,14 @@
 //! `Ki`/`Mi`/`Gi`-or-bytes, and an age is a timestamp the user wants as
 //! `3d`. One place, so two columns of the same kind cannot round differently.
 
-use chrono::{DateTime, Utc};
-
 /// Formats a total-seconds count into the `2d3h`/`5m10s`/`30s` age string.
-/// Shared backend for [`format_age`] (timestamp-based) and
-/// [`format_age_duration`] (`Duration`-based).
+///
+/// Called directly by the row converters, and by [`format_age_duration`] for
+/// locally-timed things. There was a third wrapper, `format_age`, taking an
+/// `Option<DateTime<Utc>>` and answering `"<unknown>"` for `None`: no
+/// production caller, and that `"<unknown>"` is decided again — for real —
+/// by `CellValue::Age(None)`'s `Display`. Two spellings of one string, one
+/// of them reachable only from a test.
 pub fn format_age_secs(total_secs: i64) -> String {
     if total_secs < 0 {
         return "0s".to_string();
@@ -41,18 +44,8 @@ pub fn format_age_secs(total_secs: i64) -> String {
     }
 }
 
-/// Formats a Kubernetes timestamp into a human-readable age string like "2d3h", "5m", "10s".
-/// Returns `"<unknown>"` if the timestamp is None.
-pub fn format_age(timestamp: Option<DateTime<Utc>>) -> String {
-    let ts = match timestamp {
-        Some(t) => t,
-        None => return "<unknown>".to_string(),
-    };
-    let now = Utc::now();
-    format_age_secs(now.signed_duration_since(ts).num_seconds())
-}
 
-/// Like [`format_age`] but takes a `Duration` directly — for locally-timed
+/// Like [`format_age_secs`] but takes a `Duration` directly — for locally-timed
 /// work (port-forward uptime, etc.) that doesn't have a kube timestamp.
 pub fn format_age_duration(d: std::time::Duration) -> String {
     format_age_secs(d.as_secs() as i64)

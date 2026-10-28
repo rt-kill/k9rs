@@ -16,7 +16,8 @@
 //! ([`RowSource`] Arcs), and forget. An element never knows it was
 //! derived; references only ever point backward, so strong Arcs are
 //! leak-free by construction. Pop = drop: a [`ResourceList`]'s
-//! [`SubscriptionStream`] aborts its bridge, RST closes the substream,
+//! [`SubscriptionStream`](crate::client::SubscriptionStream) aborts its
+//! bridge, RST closes the substream,
 //! the daemon's end tears down.
 
 use std::collections::HashSet;
@@ -31,7 +32,7 @@ use crate::store::{
 };
 use crate::table::TableDataState;
 use crate::state::ItemCounts;
-use crate::view::DerivedViewKind;
+use k9rs_proto::row::DerivedViewKind;
 use crate::ColumnLevel;
 use k9rs_proto::protocol::{Namespace, ObjectKey, ObjectRef, ResourceId};
 use k9rs_proto::row::ResourceRow;
@@ -525,6 +526,9 @@ impl Element {
     /// bar labels itself with. [`Self::log_patterns`] is the highlight set and
     /// additionally carries the uncommitted draft, so the two are not
     /// interchangeable.
+    /// Test-only: the renderer reads `log_chain()`, which carries the
+    /// per-step counts this drops.
+    #[cfg(any(test, feature = "testing"))]
     pub fn log_committed_patterns(&self) -> Vec<String> {
         match self {
             Element::LogFilter(e) => e.source.patterns.iter().map(Narrowing::label).collect(),
@@ -792,12 +796,22 @@ impl Element {
                 return Some(Arc::clone(v));
             }
         }
-        let draft = view
-            .draft
-            .as_ref()
-            .map(|d| d.value())
-            .filter(|d| !d.is_empty())
-            .map(SearchPattern::new);
+        // The draft's SENSE, through the same `sense_of` the COMMIT uses.
+        //
+        // This compiled the raw draft: `!error` searched for the literal
+        // `!error` — zero lines, every time — and `\!urgent` handed `\!` to
+        // the vim translator, which refuses it by name. So typing an
+        // excluding grep previewed a blank view and then committed a working
+        // one. Two answers to "what does this draft do", and only the commit
+        // path asked `sense_of`.
+        //
+        // Emptiness is tested on the TEXT, not the raw draft: `!` alone is a
+        // sense with nothing to say yet, and must preview as the unfiltered
+        // view rather than as "drop everything".
+        let draft = view.draft.as_ref().map(|d| d.value()).and_then(|raw| {
+            let (sense, text) = crate::element::sense_of(raw);
+            (!text.is_empty()).then(|| (sense, SearchPattern::new(text)))
+        });
         let indices = store.with_read(|inner| {
             // The DRAFT only. Committed patterns were applied by the drain
             // when these lines were retained, so re-testing them here would
@@ -805,12 +819,19 @@ impl Element {
             // exactly what this used to do.
             match &draft {
                 None => (0..inner.lines.len()).collect::<Vec<usize>>(),
-                Some(d) => (0..inner.lines.len())
+                Some((sense, d)) => (0..inner.lines.len())
                     .filter(|&i| {
-                        inner.lines[i]
+                        let hit = inner.lines[i]
                             .segments()
                             .filter(|(role, ..)| role.searchable())
-                            .any(|(_, text, _)| d.is_match(text))
+                            .any(|(_, text, _)| d.is_match(text));
+                        // An excluding draft shows its effect by what
+                        // DISAPPEARS — the same rule `Narrowing` applies on
+                        // commit, so the preview and the commit agree.
+                        match sense {
+                            Sense::Keep => hit,
+                            Sense::Drop => !hit,
+                        }
                     })
                     .collect(),
             }
@@ -916,6 +937,13 @@ impl Element {
     /// Whether this element's rows are seeded in-process rather than fed by
     /// a daemon subscription. Derived kinds inherit the answer from the
     /// source they ride.
+    ///
+    /// Wildcard-free, because [`Self::liveness`] branches on it: a kind that
+    /// answered `false` wrongly would have its view blanked exactly when the
+    /// daemon is unreachable, which is the bug the contexts list exists to
+    /// survive. `_ => false` conflated "has no client-owned store" with "is
+    /// a kind nobody has decided about yet", and the second is what a new
+    /// variant is.
     pub fn is_client_owned(&self) -> bool {
         match self {
             Element::ResourceList(e) => e.query.is_client_owned(),
@@ -923,7 +951,15 @@ impl Element {
             // independent of the connection.
             Element::RowFilter(e) => e.source.is_client_owned(),
             Element::DerivedRows(e) => e.source.is_client_owned(),
-            _ => false,
+            // Daemon-fed content and logs; and the dialog kinds, which hold
+            // no rows at all and so have no store to be independent of.
+            Element::Overview(_)
+            | Element::ContentView(_)
+            | Element::LogSession(_)
+            | Element::LogFilter(_)
+            | Element::Confirm(_)
+            | Element::Picker(_)
+            | Element::Form(_) => false,
         }
     }
 

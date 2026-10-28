@@ -82,7 +82,15 @@ impl TextInput {
     /// Insert at the caret and step over it.
     pub fn insert(&mut self, c: char) {
         self.value.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
+        // Re-derived, not advanced by `c.len_utf8()`. The two agree unless
+        // the character that FOLLOWS the caret is a combining mark, in which
+        // case the inserted base character and that mark are now one
+        // grapheme and a byte-length step lands inside it — breaking the
+        // invariant this module's doc says every mutator preserves. (No
+        // panic: it is still a char boundary and both `prev_boundary` and
+        // `next_boundary` recover. It is still the one mutator that did not
+        // uphold the rule.)
+        self.cursor = self.next_boundary().unwrap_or(self.value.len());
     }
 
     /// Delete the grapheme BEFORE the caret (Backspace).

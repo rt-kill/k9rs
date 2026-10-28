@@ -1,7 +1,20 @@
 //! `WatcherCache` as `ctl status` sees it.
 
 use super::*;
-use k9rs_proto::protocol::{ContextId, ContextName, Namespace, ResourceId};
+
+// Named explicitly rather than inherited through `super::*`. These used to
+// arrive for free from the one 1088-line `live_query.rs`'s own `use` lines;
+// splitting it into `watcher` + `cache` left `mod.rs` holding only the doc
+// and the re-exports, which is the right shape and makes this file say what
+// it actually depends on.
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use kube::runtime::watcher::{self, Event as WatcherEvent};
+use k9rs_proto::protocol::{
+    ContextId, ContextName, Namespace, ResourceId, RowChange, TableDelta,
+};
+use k9rs_proto::row::ResourceRow;
 use k9rs_proto::resource_def::BuiltInKind;
 
 fn key(ctx: &str, resource: BuiltInKind) -> QueryKey {
@@ -185,6 +198,114 @@ async fn asking_what_the_daemon_holds_does_not_change_it() {
             // InitDone flushes immediately.
             let _ = self.next_delta().await;
         }
+    }
+
+    impl Harness {
+        /// The next `WatcherMsg::Health`, skipping deltas, or `None` if the
+        /// window closes without one. Deltas are not the question here, and
+        /// a failing relist can still flush pending changes.
+        async fn next_health(&mut self, window: Duration) -> Option<WatchHealth> {
+            let deadline = tokio::time::Instant::now() + window;
+            loop {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                match tokio::time::timeout(left, self.delta_rx.recv()).await {
+                    Ok(Ok(msg)) => match &*msg {
+                        WatcherMsg::Health(h) => return Some(h.clone()),
+                        WatcherMsg::Delta(_) => continue,
+                        WatcherMsg::Dead(r) => panic!("unexpected Dead({r})"),
+                    },
+                    Ok(Err(_)) => return None,
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
+
+    /// A relist that keeps failing is eventually reported STALE.
+    ///
+    /// kube-runtime yields `Ok(Event::Init)` BEFORE it issues the list
+    /// (`watcher.rs`, `State::Empty`) and returns to `State::Empty` when the
+    /// list fails, so a permanently failing relist — RBAC revoked, CRD
+    /// deleted, API group gone — emits `Err`, `Init`, `Err`, `Init`, … for
+    /// as long as it lasts. The staleness clock was reset by `Init` as well
+    /// as by real progress, so it only ever measured ONE list request: it
+    /// never reached `DEGRADE_AFTER` and never reached `max_elapsed_ms`, and
+    /// the watcher span at maximum backoff forever with frozen rows and no
+    /// banner. That is the liveness-gate class the health signal exists for.
+    ///
+    /// Driven on a paused clock, which is why `first_failure` rides the
+    /// runtime clock: the decision is a ten-second one and a test that
+    /// actually waited would be ten seconds of nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_relist_that_keeps_failing_is_reported_stale() {
+        let mut h = spawn_harness();
+        h.init_steady(vec![cm("ns", "a", "1")]).await;
+
+        // Failure one. The clock starts here.
+        h.fail_stream();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        // The retry's `Init` — the event that used to restart the clock.
+        h.send(WatcherEvent::Init);
+        tokio::time::advance(Duration::from_millis(200)).await;
+
+        // Past DEGRADE_AFTER (10s), still well inside max_elapsed (120s).
+        tokio::time::advance(Duration::from_secs(11)).await;
+        h.fail_stream();
+
+        let health = h.next_health(Duration::from_secs(2)).await;
+        assert!(
+            matches!(health, Some(WatchHealth::Degraded(_))),
+            "eleven seconds of continuous failure must report frozen rows, got \
+             {health:?} — an `Init` between two errors is not progress",
+        );
+    }
+
+    /// A resource quiet for longer than the give-up window survives its
+    /// first blip.
+    ///
+    /// The same clock was reset only by events, so a resource with no
+    /// traffic — configmaps, secrets, nodes, roles, storageclasses, most of
+    /// the list — had last touched it at `InitDone`. Its FIRST transient
+    /// error was therefore already "two minutes of failures", and the
+    /// watcher died: the bridge resubscribed with a full re-LIST and a full
+    /// baseline resend, which is exactly the cost the delta machinery exists
+    /// to avoid, on an ordinary watch restart.
+    ///
+    /// This one could NOT have been written against the old implementation,
+    /// and that is worth knowing: its clock was a `std::time::Instant`,
+    /// which `tokio::time::advance` cannot move, so the five minutes below
+    /// were zero microseconds and the regime was unreachable from a test at
+    /// all. Moving the clock onto the runtime is what makes the decision
+    /// observable; this pins it from here on rather than reproducing a
+    /// failure.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_resource_survives_its_first_watch_error() {
+        let mut h = spawn_harness();
+        h.init_steady(vec![cm("ns", "a", "1")]).await;
+
+        // Five minutes of nothing at all — the steady state of a quiet
+        // resource, which yields no events (bookmarks and watch recycling
+        // never surface as yielded events).
+        tokio::time::advance(Duration::from_secs(300)).await;
+
+        h.fail_stream();
+        tokio::time::advance(Duration::from_millis(200)).await;
+
+        // Alive: no Dead, and not even Degraded off one error.
+        let health = h.next_health(Duration::from_millis(500)).await;
+        assert!(
+            health.is_none(),
+            "one error after a quiet spell is a watch restart, not death: got {health:?}",
+        );
+        // And it still serves — the store was never torn down.
+        h.send(WatcherEvent::Init);
+        h.send(WatcherEvent::InitApply(cm("ns", "a", "2")));
+        h.send(WatcherEvent::InitDone);
+        let baseline = h.ask(false).await.expect("the watcher is still alive");
+        assert_eq!(baseline.baseline.rows.len(), 1);
     }
 
     fn keys_of(delta: &TableDelta) -> (Vec<String>, Vec<String>) {

@@ -96,7 +96,10 @@ fn a_matching_candidate_supplies_the_identity() {
     assert_eq!(at.context(), Some(&ctx("staging")));
     assert_eq!(at.identity().cluster(), Some("staging-eks"));
     assert_eq!(at.identity().user(), Some("staging-admin"));
-    assert!(!at.is_confirmed(), "a candidate is not a handshake");
+    assert!(
+        matches!(at, Attachment::Connecting(_)),
+        "a candidate is not a handshake: {at:?}",
+    );
 }
 
 /// A plain reconnect — no switch — pairs the last-confirmed context with the
@@ -109,7 +112,7 @@ fn a_reconnect_keeps_describing_the_context_it_is_returning_to() {
     let at = app.attachment();
     assert_eq!(at.context(), Some(&ctx("prod")));
     assert_eq!(at.identity().cluster(), Some("prod-eks"));
-    assert!(!at.is_confirmed());
+    assert!(matches!(at, Attachment::Connecting(_)), "not confirmed: {at:?}");
 }
 
 /// Confirmed means confirmed: the daemon's identity, which is the only one
@@ -117,7 +120,7 @@ fn a_reconnect_keeps_describing_the_context_it_is_returning_to() {
 #[test]
 fn a_live_link_reports_what_the_daemon_confirmed() {
     let at = on_prod().attachment();
-    assert!(at.is_confirmed());
+    assert!(matches!(at, Attachment::Live(_)), "the daemon confirmed: {at:?}");
     assert_eq!(at.context(), Some(&ctx("prod")));
     assert_eq!(at.identity().cluster(), Some("prod-eks"));
 }
@@ -150,7 +153,7 @@ fn a_candidate_does_not_displace_a_confirmed_context() {
         },
     );
     let at = app.attachment();
-    assert!(at.is_confirmed());
+    assert!(matches!(at, Attachment::Live(_)), "still confirmed: {at:?}");
     assert_eq!(at.context(), Some(&ctx("prod")), "still attached to prod: {at:?}");
     assert_eq!(at.identity().cluster(), Some("prod-eks"));
 }

@@ -196,3 +196,57 @@ fn buttons_are_not_fields() {
     assert!(f.focused_field().is_none());
     assert!(f.cancel_focused() && !f.ok_focused());
 }
+
+/// Every field a schema declares is a field the submit dispatcher looks up.
+///
+/// The schemas and `build_command` are supposed to share one set of names,
+/// and both docs said so — but the schemas held bare literals
+/// (`name: "container_port"`), so the two agreed only by eye. Renaming a
+/// schema field compiled and surfaced as `Err("Missing field: …")` at the
+/// moment the user pressed OK, which is the outcome the doc called
+/// impossible. They spell the names with `form_field_name` now; this drives
+/// the pairing from the SCHEMA so a literal creeping back is caught here as
+/// well as by the compiler.
+#[test]
+fn every_schema_field_is_one_the_dispatcher_looks_up() {
+    use k9rs_proto::protocol::{FormFieldSchemaKind, OperationKind};
+
+    let mut checked = 0usize;
+    for op in [OperationKind::Scale, OperationKind::PortForward] {
+        let Some(schema) = op.form_schema() else {
+            panic!("{op:?} is a form operation and must have a schema")
+        };
+        let submit = FormSubmit::from_operation(op.clone())
+            .unwrap_or_else(|| panic!("{op:?} has a schema, so it has a submit"));
+
+        // Build the field states straight off the schema, with a value each
+        // kind will accept. The NAMES are the schema's.
+        let fields: Vec<FormFieldState> = schema
+            .fields
+            .iter()
+            .map(|f| FormFieldState {
+                name: f.name.to_string(),
+                label: f.label.to_string(),
+                kind: match f.kind {
+                    FormFieldSchemaKind::Number { min, max, .. } => {
+                        FormFieldKind::Number { min, max }
+                    }
+                    FormFieldSchemaKind::Port
+                    | FormFieldSchemaKind::DynamicSelect { .. } => FormFieldKind::Port,
+                },
+                value: "2".to_string().into(),
+            })
+            .collect();
+        assert!(!fields.is_empty(), "{op:?}'s schema declares fields");
+
+        let built = submit.build_command(&pod_target(), &fields);
+        assert!(
+            built.is_ok(),
+            "{op:?}: the dispatcher could not find a field the schema declares \
+             — the two name sets have drifted: {:?}",
+            built.err(),
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 2, "both form operations exercised");
+}

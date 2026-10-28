@@ -12,6 +12,21 @@ pub(crate) mod ctl;
 use anyhow::Result;
 use clap::Subcommand;
 
+/// How `ctl` prints its answer.
+///
+/// A typed `ValueEnum` rather than a `String` compared against `"json"`.
+/// With the string, `--output jsom` parsed fine, `output == "json"` was
+/// false, and you got human output and exit 0 — a typo in a script read as
+/// success. clap refuses an unknown value here and names the ones that
+/// exist, which is what asking for a format should cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// Aligned columns, for reading.
+    Human,
+    /// One JSON document, for scripts.
+    Json,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Run the cache daemon (foreground, stays alive until killed)
@@ -19,9 +34,9 @@ pub enum Command {
 
     /// Daemon management commands
     Ctl {
-        /// Output format: "human" (default) or "json"
-        #[arg(long, default_value = "human")]
-        output: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
         #[command(subcommand)]
         cmd: ctl::CtlCommand,
     },
@@ -57,10 +72,14 @@ pub async fn dispatch(cmd: Command) -> Result<()> {
             std::process::exit(if result.is_ok() { 0 } else { 1 });
         }
         Command::Ctl { output, cmd } => {
-            ctl::run(cmd, output == "json").await
+            ctl::run(cmd, output == OutputFormat::Json).await
         }
         Command::Contexts => {
             contexts::run()
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/lib.rs"]
+mod tests;

@@ -206,30 +206,41 @@ impl ServerSession {
     /// `Namespace::All` on a target that's supposed to be a specific object
     /// means the row lacked a namespace string — usually data corruption.
     /// Falling through would silently run the operation in the default
-    /// namespace, mutating the wrong resource. All mutating handlers call
-    /// this first, same pattern as `reject_if_readonly`.
+    /// namespace, mutating the wrong resource.
     ///
-    /// Cluster-scoped resources (Node, CRD, ClusterRole) legitimately have
-    /// `Namespace::All`, so this helper only applies to namespaced targets.
-    /// Handlers opt in by checking their own scope first.
+    /// The PERMISSIVE half of the pair: cluster-scoped resources (Node, CRD,
+    /// ClusterRole) legitimately have `Namespace::All`, so they pass here —
+    /// where [`Self::resolve_namespace_or_reject`] refuses them, because it
+    /// exists to hand back a namespace STRING and a cluster-scoped target
+    /// has none. Which handler may use which is not a free choice, and
+    /// nothing records it: picking the permissive one for an operation that
+    /// needs a namespace is how `:pf` came to have no gate at all.
+    ///
+    /// Callers, counted rather than claimed: `Apply`, `Delete`, `Scale`,
+    /// `Restart`. Its strict sibling serves `ForceKill`, `DecodeSecret` and
+    /// the two CronJob ops; `handle_port_forward` has its own typed guard.
+    /// This doc used to say "all mutating handlers call this first, same
+    /// pattern as `reject_if_readonly`" — of eleven mutating handlers four
+    /// call it, and `reject_if_readonly` has never existed (the readonly
+    /// gate is one `is_mutating` check in `handle_command`).
     pub(super) fn reject_if_namespace_unresolved(
         &mut self,
         op: protocol::OperationKind,
         target: &protocol::ObjectRef,
         action: &str,
     ) -> bool {
-        // Cluster-scoped targets are legitimately Namespace::All.
+        // Cluster-scoped targets are legitimately Namespace::All — and this
+        // one line IS the difference between the two gates.
         if target.resource.is_cluster_scoped() {
             return false;
         }
-        if target.namespace.as_option().is_none() {
-            self.reject_async(op, target, format!(
-                "{} refused: {} has no resolved namespace",
-                action, target.kubectl_target(),
-            ));
-            return true;
+        match namespace_for_op(target, action) {
+            Ok(_) => false,
+            Err(message) => {
+                self.reject_async(op, target, message);
+                true
+            }
         }
-        false
     }
 
     /// Resolve the target's namespace for an op that NEEDS the string
@@ -244,24 +255,13 @@ impl ServerSession {
         target: &protocol::ObjectRef,
         action: &str,
     ) -> Option<String> {
-        // Cluster-scoped targets don't belong in handlers that need a
-        // namespace (force-kill, decode, cron trigger/toggle) — surface
-        // a specific message rather than "no resolved namespace".
-        if target.resource.is_cluster_scoped() {
-            self.reject_async(op.clone(), target, format!(
-                "{} refused: {} is cluster-scoped",
-                action, target.kubectl_target(),
-            ));
-            return None;
+        match namespace_for_op(target, action) {
+            Ok(n) => Some(n.to_string()),
+            Err(message) => {
+                self.reject_async(op, target, message);
+                None
+            }
         }
-        let protocol::Namespace::Named(n) = &target.namespace else {
-            self.reject_async(op, target, format!(
-                "{} refused: {} has no resolved namespace",
-                action, target.kubectl_target(),
-            ));
-            return None;
-        };
-        Some(n.clone())
     }
 
     /// Spawn a fire-and-forget task that emits a failing `OpResult` for
@@ -275,6 +275,30 @@ impl ServerSession {
     ) {
         let tx = self.event_tx.clone();
         let event = reject(op, target, message);
+        self.track_task(async move {
+            let _ = tx.send(event).await;
+        });
+    }
+
+    /// The `Ok` twin of [`Self::reject_async`]: a succeeding `OpResult` for
+    /// a handler whose work is already done (or already handed to an owner
+    /// that will report its own state).
+    ///
+    /// The asynchronous handlers build their own `OpResult` inside the task
+    /// that does the work, because that is where the outcome is known. This
+    /// is for the synchronous ones, which had no way to answer at all.
+    pub(super) fn ack_async(
+        &mut self,
+        op: protocol::OperationKind,
+        target: &protocol::ObjectRef,
+        message: String,
+    ) {
+        let tx = self.event_tx.clone();
+        let event = SessionEvent::OpResult {
+            op,
+            target: target.clone(),
+            result: Ok(message),
+        };
         self.track_task(async move {
             let _ = tx.send(event).await;
         });
@@ -294,23 +318,28 @@ impl ServerSession {
     /// Capability gate: extracts the target's [`BuiltInKind`] and asserts
     /// it supports the given [`k9rs_proto::protocol::OperationKind`]. On failure, emits a typed
     /// rejection and returns `None` so the caller can `return` cleanly.
-    /// Shared between scale/restart/decode-secret/trigger/toggle handlers.
+    ///
+    /// Called by `handle_scale_async`, `handle_toggle_suspend_cronjob_async`
+    /// and `handle_port_forward`. This doc used to claim "scale / restart /
+    /// decode-secret / trigger / toggle" — five handlers, of which two
+    /// actually called it, and port-forward (which did not) was the one with
+    /// no capability check at all. Anything NOT in the list above reaches
+    /// the API server and is refused there, or by a typed kind check inside
+    /// the handler; a list is only worth writing if it is checked, so grep
+    /// before trusting this one.
     pub(super) fn require_capability(
         &mut self,
         target: &protocol::ObjectRef,
         required_op: protocol::OperationKind,
         action: &str,
     ) -> Option<BuiltInKind> {
-        let Some(kind) = target.resource.built_in_kind() else {
-            self.reject_async(required_op.clone(), target, format!("{} not supported on {}", action, target.resource.plural()));
-            return None;
-        };
-        let def = kind.def();
-        if !def.operations().contains(&required_op) {
-            self.reject_async(required_op, target, format!("{} not supported on {}", action, def.gvr().plural));
-            return None;
+        match capability_check(target, &required_op, action) {
+            Ok(kind) => Some(kind),
+            Err(message) => {
+                self.reject_async(required_op, target, message);
+                None
+            }
         }
-        Some(kind)
     }
 
     pub(super) fn handle_delete_async(&mut self, target: &protocol::ObjectRef) {
@@ -387,18 +416,13 @@ impl ServerSession {
             // Use the /scale subresource (same as kubectl scale / k9s).
             // This doesn't interact with SSA field management — no field
             // ownership is claimed on spec.replicas.
-            let gvr = kind.def().gvr();
-            let ar = kube::api::ApiResource {
-                group: gvr.group.to_string(),
-                version: gvr.version.to_string(),
-                kind: gvr.kind.to_string(),
-                api_version: if gvr.group.is_empty() {
-                    gvr.version.to_string()
-                } else {
-                    format!("{}/{}", gvr.group, gvr.version)
-                },
-                plural: gvr.plural.to_string(),
-            };
+            // The one `BuiltInKind -> ApiResource` mapping, in the crate
+            // that owns it. This was hand-rolled here, re-spelling the
+            // `api_version` rule (`version` alone for core, `group/version`
+            // otherwise) that `ApiResource::from_gvk_with_plural` already
+            // implements — a third copy of a mapping that had just been
+            // reduced from three to one everywhere else.
+            let (ar, _scope) = k9rs_kube::describe::built_in_api_resource(kind);
             let api: kube::Api<kube::api::DynamicObject> = match &namespace {
                 protocol::Namespace::Named(ns) => kube::Api::namespaced_with(client, ns, &ar),
                 protocol::Namespace::All => kube::Api::all_with(client, &ar),
@@ -490,39 +514,35 @@ impl ServerSession {
     // Secret decode
     // -----------------------------------------------------------------------
 
-    pub(super) fn handle_decode_secret_async(&mut self, target: &protocol::ObjectRef) {
-        // Typed gate: only built-ins can be `SecretLike` — non-Secret resources
-        // get a friendly rejection in the describe panel.
-        let target_owned = target.clone();
-        let Some(kind) = target.resource.built_in_kind() else {
-            let tx = self.event_tx.clone();
-            let plural = target.resource.plural().to_string();
-            self.track_task(async move {
-                let _ = tx.send(SessionEvent::DescribeResult {
-                    target: target_owned,
-                    lines: k9rs_kube::describe::describe_lines_from_text(
-                        &format!("Decode not supported on {}", plural),
-                    ),
-                }).await;
-            });
-            return;
-        };
-        let def = kind.def();
-        if !def.operations().contains(&protocol::OperationKind::DecodeSecret) {
-            let tx = self.event_tx.clone();
-            let plural = def.gvr().plural;
-            self.track_task(async move {
-                let _ = tx.send(SessionEvent::DescribeResult {
-                    target: target_owned,
-                    lines: k9rs_kube::describe::describe_lines_from_text(
-                        &format!("{} is not a secret-like resource", plural),
-                    ),
-                }).await;
-            });
-            return;
-        }
+    /// Answer a decode — success or refusal — in the shape the command's
+    /// own success has: lines in the describe panel.
+    ///
+    /// Every exit from `handle_decode_secret_async` goes through here or
+    /// through the same event below it, because the client opens a content
+    /// view on `DecodeSecret` and that view's ONLY exit is a
+    /// `DescribeResult` for its target. An `OpResult` refusal is not an
+    /// answer to it: the panel stays on "Loading…" while a flash goes by
+    /// somewhere else. Two of the three refusals already knew this; the
+    /// namespace one went through the general `OpResult` gate.
+    fn answer_decode(&mut self, target: &protocol::ObjectRef, text: String) {
+        let tx = self.event_tx.clone();
+        let target = target.clone();
+        self.track_task(async move {
+            let _ = tx.send(SessionEvent::DescribeResult {
+                target,
+                lines: k9rs_kube::describe::describe_lines_from_text(&text),
+            }).await;
+        });
+    }
 
-        let Some(ns) = self.resolve_namespace_or_reject(protocol::OperationKind::DecodeSecret, target, "Decode") else { return; };
+    pub(super) fn handle_decode_secret_async(&mut self, target: &protocol::ObjectRef) {
+        let ns = match plan_decode(target) {
+            // Every refusal, in the panel. There is exactly one other exit
+            // from this handler and it sends the same event.
+            DecodePlan::Refused(text) => return self.answer_decode(target, text),
+            DecodePlan::Fetch { namespace } => namespace,
+        };
+        let target_owned = target.clone();
         let client = self.client.clone();
         let tx = self.event_tx.clone();
         let n = target.name.clone();
@@ -641,8 +661,40 @@ impl ServerSession {
         local_port: u16,
         container_port: u16,
     ) {
-        if self.reject_if_namespace_unresolved(protocol::OperationKind::PortForward, target, "Port-forward") { return; }
+        // The namespace guard, in the form the request's type asks for.
+        //
+        // Not `reject_if_namespace_unresolved` like its siblings: that helper
+        // exempts cluster-scoped targets, which a port-forward target never
+        // is, and it answers with a `bool` while
+        // `k9rs_kube::local::port_forward::PodNamespace` needs the VALUE. One
+        // guard that produces what the request needs beats a guard followed
+        // by an unwrap of the same question.
+        let Some(namespace) =
+            k9rs_kube::local::port_forward::PodNamespace::of(&target.namespace)
+        else {
+            self.reject_async(
+                protocol::OperationKind::PortForward,
+                target,
+                format!(
+                    "Port-forward refused: {} has no resolved namespace",
+                    target.kubectl_target(),
+                ),
+            );
+            return;
+        };
+        // The capability gate every other mutating handler has. Without it
+        // `:pf` on a kind that declares no `PortForward` — a configmap, a
+        // namespace — was accepted, and the forward then failed somewhere
+        // inside the tunnel with nothing said on the wire.
+        if self
+            .require_capability(target, protocol::OperationKind::PortForward, "Port-forward")
+            .is_none()
+        {
+            return;
+        }
         let kubectl_target = target.kubectl_target();
+        // Kept for the acknowledgement below; the request takes ownership.
+        let display = kubectl_target.clone();
 
         // The per-context PortForwardSource, owned by this session's
         // ContextLocals slice (shared with any sibling session on the same
@@ -658,7 +710,7 @@ impl ServerSession {
                 // source is per `ContextId`, which excludes the name.
                 context: self.context.name.clone(),
                 kubectl_target,
-                namespace: target.namespace.clone(),
+                namespace,
                 local_port,
                 remote_port: container_port,
                 // The session's client: the native tunnel resolves and
@@ -667,25 +719,52 @@ impl ServerSession {
                 client: self.client.clone(),
             },
         );
+
+        // Say so. This handler sent NOTHING back — no `OpResult`, success or
+        // failure — so a `:pf` the daemon accepted was indistinguishable
+        // from one it dropped on the floor, and the TUI's only recourse was
+        // for the user to go and look at the port-forwards table.
+        //
+        // Deliberately "starting", not "forwarding": `create` returns as
+        // soon as the entry exists in `PortForwardState::Starting`, and the
+        // tunnel's real outcome arrives as that entry's state. Claiming
+        // success here would be the fake-success class.
+        self.ack_async(
+            protocol::OperationKind::PortForward,
+            target,
+            format!(
+                "Port-forward starting: localhost:{} -> {}:{}",
+                local_port, display, container_port
+            ),
+        );
     }
+}
+
+/// Whether `target`'s kind declares `required_op` — the whole of the
+/// capability gate's DECISION, with none of its emitting.
+///
+/// Split out so it can be tested: the gate itself needs a live
+/// `ServerSession` (an authenticated kube client, an event channel), which
+/// is exactly what a unit test must not have, so the rule it enforces had no
+/// test — and `handle_port_forward` went without the gate entirely.
+fn capability_check(
+    target: &protocol::ObjectRef,
+    required_op: &protocol::OperationKind,
+    action: &str,
+) -> Result<BuiltInKind, String> {
+    let Some(kind) = target.resource.built_in_kind() else {
+        return Err(format!("{} not supported on {}", action, target.resource.plural()));
+    };
+    let def = kind.def();
+    if !def.operations().contains(required_op) {
+        return Err(format!("{} not supported on {}", action, def.gvr().plural));
+    }
+    Ok(kind)
 }
 
 /// Shorthand for a failing `OpResult` event for the given target.
 fn reject(op: protocol::OperationKind, target: &protocol::ObjectRef, message: String) -> SessionEvent {
     SessionEvent::OpResult { op, target: target.clone(), result: Err(message) }
-}
-
-/// Build the `kube::api::ApiResource` for a built-in kind directly from the
-/// def's `&'static Gvr` — no discovery HTTP roundtrip, no string allocations.
-/// All mutating handlers go through this so the typed `BuiltInKind` is the
-/// single source of truth for how to talk to the K8s API.
-fn built_in_api_resource(
-    kind: k9rs_proto::resource_def::BuiltInKind,
-) -> (kube::api::ApiResource, k9rs_proto::protocol::ResourceScope) {
-    let g = kind.def().gvr();
-    let gvk = kube::api::GroupVersionKind::gvk(g.group, g.version, g.kind);
-    let ar = kube::api::ApiResource::from_gvk_with_plural(&gvk, g.plural);
-    (ar, g.scope)
 }
 
 /// Build a `DynamicObject` API for a built-in kind in a given namespace.
@@ -697,7 +776,7 @@ fn dynamic_api_for_kind(
     kind: k9rs_proto::resource_def::BuiltInKind,
     namespace: &k9rs_proto::protocol::Namespace,
 ) -> kube::Api<kube::api::DynamicObject> {
-    let (ar, scope) = built_in_api_resource(kind);
+    let (ar, scope) = k9rs_kube::describe::built_in_api_resource(kind);
     k9rs_kube::describe::dynamic_api_for(client, &ar, scope, namespace)
 }
 
@@ -797,3 +876,77 @@ struct SuspendPatch { spec: SuspendSpec }
 #[derive(Debug, serde::Serialize)]
 struct SuspendSpec { suspend: bool }
 
+/// What a `DecodeSecret` should do: fetch, or refuse with this text.
+///
+/// Three gates, extracted so the property that matters is checkable without
+/// a live session — that EVERY refusal is one shape, the describe panel the
+/// client already opened (see [`ServerSession::answer_decode`]). As three
+/// inline early-returns it was not: two answered in the panel and the
+/// namespace one took the general `OpResult` path, so a secret whose row had
+/// lost its namespace left the panel loading for ever.
+enum DecodePlan {
+    Refused(String),
+    Fetch { namespace: String },
+}
+
+fn plan_decode(target: &protocol::ObjectRef) -> DecodePlan {
+    // Typed gate: only built-ins can be secret-like.
+    let Some(kind) = target.resource.built_in_kind() else {
+        return DecodePlan::Refused(format!(
+            "Decode not supported on {}",
+            target.resource.plural(),
+        ));
+    };
+    let def = kind.def();
+    if !def.operations().contains(&protocol::OperationKind::DecodeSecret) {
+        return DecodePlan::Refused(format!(
+            "{} is not a secret-like resource",
+            def.gvr().plural,
+        ));
+    }
+    match namespace_for_op(target, "Decode") {
+        Ok(namespace) => DecodePlan::Fetch { namespace: namespace.to_string() },
+        Err(message) => DecodePlan::Refused(message),
+    }
+}
+
+/// The namespace a namespace-needing operation may use, or the refusal to
+/// report — the DECISION, with no answer shape attached.
+///
+/// Pure and shared because the rule is one thing and the reply is another.
+/// Three answer shapes want this same rule: most handlers refuse with an
+/// `OpResult`, [`ServerSession::handle_decode_secret_async`] has to refuse
+/// into the describe panel the client already opened for it, and
+/// `handle_port_forward` wants a typed `PodNamespace`. The wording was
+/// written out four times, so a fix to one refusal did not reach the others
+/// — and `DecodeSecret` had drifted all the way to a different EVENT type.
+///
+/// (`handle_port_forward` keeps its own guard: `PodNamespace::of` produces
+/// the value its request type needs, and routing through here would add an
+/// impossible `else` for a case a pod target cannot be in. Its sentence is
+/// deliberately the same one.)
+fn namespace_for_op<'a>(
+    target: &'a protocol::ObjectRef,
+    action: &str,
+) -> Result<&'a str, String> {
+    // Cluster-scoped targets don't belong in handlers that need a namespace
+    // (force-kill, decode, cron trigger/toggle) — a specific message rather
+    // than "no resolved namespace", which would be true but misleading.
+    if target.resource.is_cluster_scoped() {
+        return Err(format!(
+            "{action} refused: {} is cluster-scoped",
+            target.kubectl_target(),
+        ));
+    }
+    let protocol::Namespace::Named(n) = &target.namespace else {
+        return Err(format!(
+            "{action} refused: {} has no resolved namespace",
+            target.kubectl_target(),
+        ));
+    };
+    Ok(n)
+}
+
+#[cfg(test)]
+#[path = "../tests/ops.rs"]
+mod tests;

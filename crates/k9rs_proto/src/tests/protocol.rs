@@ -230,7 +230,7 @@ fn envelope_wire_tags_are_stable() {
     });
     assert_eq!(&bincode::serialize(&sub).unwrap()[..4], 0u32.to_le_bytes());
     let log_sub = SubstreamInit::Log(LogInit {
-        target: LogTarget::One(String::new()),
+        target: LogTarget::one(""),
         namespace: Namespace::All,
         container: LogContainer::Default,
         follow: false,
@@ -339,7 +339,7 @@ fn stream_event_ref_tags_match() {
 /// declaration-index). Appending is safe; reorder/insert is a break.
 #[test]
 fn stream_wire_tags_are_stable() {
-    assert_eq!(WIRE_FORMAT_REVISION, 16);
+    assert_eq!(WIRE_FORMAT_REVISION, 18);
     let b = bincode::serialize(&StreamEvent::Error("x".into())).unwrap();
     assert_eq!(&b[..4], 2u32.to_le_bytes()); // Baseline=0, Delta=1, Error=2
     // Stale/Live APPENDED for v11 — Resolved=3 keeps its tag.
@@ -347,32 +347,86 @@ fn stream_wire_tags_are_stable() {
     assert_eq!(&bincode::serialize(&StreamEvent::Live).unwrap()[..4], 5u32.to_le_bytes());
     let r = bincode::serialize(&RowChange::Remove(ObjectKey::new(String::new(), String::new()))).unwrap();
     assert_eq!(&r[..4], 1u32.to_le_bytes()); // Upsert=0, Remove=1
-    // LogTarget: One=0 is what every pre-fan-out call site produces, so a
-    // reorder would silently turn "this pod" into "these pods" / "this
-    // selector". (v14 replaced `Many` with `Union` in place — a same-tag
-    // shape change, which is exactly what the version gate exists for.)
-    assert_eq!(&bincode::serialize(&LogTarget::One(String::new())).unwrap()[..4], 0u32.to_le_bytes());
+    // LogTarget: `Leaf=0` is what every single-pod call site produces, so a
+    // reorder would silently turn "this pod" into "these pods". (v14 replaced
+    // `Many` with `Union` in place; v17 moved the shapes down into `LogLeaf`
+    // to kill the recursion — both are tag changes, which is exactly what the
+    // build gate exists for.)
+    assert_eq!(
+        &bincode::serialize(&LogTarget::Leaf(LogLeaf::One(String::new()))).unwrap()[..4],
+        0u32.to_le_bytes(),
+    );
     assert_eq!(
         &bincode::serialize(&LogTarget::Union { targets: vec![], label: String::new() })
             .unwrap()[..4],
         1u32.to_le_bytes(),
     );
+    // And the leaf's own tags, which ride inside both of the above.
+    assert_eq!(&bincode::serialize(&LogLeaf::One(String::new())).unwrap()[..4], 0u32.to_le_bytes());
     assert_eq!(
-        &bincode::serialize(&LogTarget::Selector {
+        &bincode::serialize(&LogLeaf::Selector {
             labels: Default::default(),
             label: String::new(),
         }).unwrap()[..4],
-        2u32.to_le_bytes(),
+        1u32.to_le_bytes(),
     );
     assert_eq!(
-        &bincode::serialize(&LogTarget::Owner { uid: String::new(), label: String::new() })
+        &bincode::serialize(&LogLeaf::Owner { uid: String::new(), label: String::new() })
             .unwrap()[..4],
-        3u32.to_le_bytes(),
+        2u32.to_le_bytes(),
     );
     // Handshake preamble: magic then `build_id`, BE. The magic is pinned
     // because it doubles as a poison frame-length for a peer that speaks no
     // preamble; the id deliberately is NOT pinned, because it is derived.
     assert_eq!(PROTOCOL_MAGIC.to_be_bytes(), [0x4B, 0x39, 0x52, 0x53]);
+}
+
+/// A log target decodes in BOUNDED STACK, whatever the payload says.
+///
+/// `LogTarget::Union` used to hold `Vec<LogTarget>`, so the derived
+/// `Deserialize` recursed once per nesting level with nothing to stop it.
+/// At ~20 bytes of wire per level against a 64 MiB message cap, **200 KB
+/// from any client overflowed the stack and aborted the daemon process** —
+/// taking every other session on that daemon with it, since one daemon
+/// serves a whole context. Measured before the fix: depth 5,000 decoded,
+/// depth 10,000 aborted on a 2 MiB stack.
+///
+/// The fix is the type, not a counter: `Union` holds [`LogLeaf`], which has
+/// no union variant, so there is no deeper call to make. This feeds it the
+/// OLD recursive encoding — exactly what a stale peer or a hostile one would
+/// send — on a deliberately small stack, and the point is simply that the
+/// call RETURNS. A regression here does not fail an assertion; it aborts the
+/// test binary, which is the loudest signal available and the honest one.
+#[test]
+fn a_log_target_decodes_in_bounded_stack() {
+    /// The pre-flattening encoding: `Union { targets: [ Union { .. } ] }`
+    /// nested `depth` deep, hand-rolled so neither construction nor
+    /// serialization (both also recursive) can be what dies.
+    fn old_nested_bytes(depth: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        for _ in 0..depth {
+            b.extend_from_slice(&1u32.to_le_bytes()); // old tag: Union
+            b.extend_from_slice(&1u64.to_le_bytes()); // targets: Vec len 1
+        }
+        b.extend_from_slice(&0u32.to_le_bytes()); // old tag: One
+        b.extend_from_slice(&0u64.to_le_bytes()); // its String len 0
+        for _ in 0..depth {
+            b.extend_from_slice(&0u64.to_le_bytes()); // each Union's label
+        }
+        b
+    }
+
+    // 10,000 levels is the depth that aborted a 2 MiB stack before the fix;
+    // 128 KiB here is a stack no recursive decode of it could survive.
+    let bytes = old_nested_bytes(10_000);
+    assert!(bytes.len() > 100_000, "the payload has to be the big one: {}", bytes.len());
+    let decoded = std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(move || bincode::deserialize::<LogTarget>(&bytes).is_ok())
+        .expect("spawn")
+        .join()
+        .expect("the decode must RETURN, not unwind and not abort");
+    assert!(!decoded, "nested unions are no longer a shape the wire can express");
 }
 
 /// `ClusterIdentity` is total: nothing can construct a field that is present
@@ -759,5 +813,313 @@ async fn a_different_build_is_refused() {
         !msg.contains("version"),
         "the advice must not talk about versions — there is no ordering \
          between two build ids: {msg}",
+    );
+}
+
+/// A namespace selection that names nothing is refused at DECODE.
+///
+/// Both constructors map an empty string to `All`, so `Named("")` was
+/// unreachable from inside the process — and reachable from the wire, where
+/// the derived `Deserialize` took it. That mattered because the daemon's
+/// mutating guards refuse `Namespace::All`: `Named("")` is not `All`, so it
+/// passed the guard, and `as_option()` then answered `Some("")`, which goes
+/// into the API request path as the namespace.
+///
+/// The valid encoding of "every namespace" is the `All` variant, and there
+/// is exactly one of it.
+#[test]
+fn an_empty_named_namespace_is_refused_on_the_wire() {
+    // Round-trips that must keep working, byte-for-byte: the wire form has
+    // the same variants in the same order, so the tags cannot have moved.
+    for ns in [Namespace::All, Namespace::Named("kube-system".to_string())] {
+        let bytes = bincode::serialize(&ns).expect("encode");
+        let back: Namespace = bincode::deserialize(&bytes).expect("decode");
+        assert_eq!(back, ns, "round trip");
+    }
+    assert_eq!(
+        &bincode::serialize(&Namespace::All).unwrap()[..4],
+        0u32.to_le_bytes(),
+        "All stays tag 0",
+    );
+    assert_eq!(
+        &bincode::serialize(&Namespace::Named(String::new())).unwrap()[..4],
+        1u32.to_le_bytes(),
+        "Named stays tag 1",
+    );
+
+    // And the value that used to slip through now does not. Encoded through
+    // `Namespace` itself, so this is exactly the byte sequence a peer sends.
+    let hostile = bincode::serialize(&Namespace::Named(String::new())).expect("encode");
+    let err = bincode::deserialize::<Namespace>(&hostile)
+        .expect_err("an empty namespace name is not a namespace");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("names nothing"),
+        "the refusal says what is wrong: {msg}",
+    );
+
+    // The guard it was defeating: `All` is refused by a mutating handler,
+    // and `Named("")` is not `All`.
+    assert!(Namespace::All.is_all());
+    assert!(!Namespace::Named(String::new()).is_all(), "which is the whole problem");
+    assert_eq!(Namespace::from_row(""), Namespace::All, "the constructor's rule");
+    assert_eq!(Namespace::from_user_command(""), Namespace::All);
+}
+
+// ---------------------------------------------------------------------------
+// What a command may say about itself in a log
+// ---------------------------------------------------------------------------
+
+fn secret_ref() -> ObjectRef {
+    ObjectRef::new(
+        ResourceId::BuiltIn(crate::resource_def::BuiltInKind::Secret),
+        "db-creds",
+        Namespace::Named("prod".into()),
+    )
+}
+
+/// `Init` carries the session's whole kubeconfig and env. Neither may reach
+/// a log line, and `Init` has no subject to name either — so the summary is
+/// the bare kind.
+#[test]
+fn an_init_summary_carries_neither_kubeconfig_nor_env() {
+    let cmd = SessionCommand::Init {
+        context: None,
+        namespace: Namespace::All,
+        readonly: false,
+        kubeconfig_yaml: "client-key-data: LS0tLS1CRUdJTi1QUklWQVRFLUtFWS0t".to_string(),
+        env_vars: HashMap::from([("AWS_SESSION_TOKEN".to_string(), "FwoGZXIvYXdz".to_string())]),
+        identity: ClusterIdentity::default(),
+    };
+    let said = cmd.log_summary();
+    assert_eq!(said, "Init");
+    assert!(!said.contains("client-key-data"), "the kubeconfig must not be loggable");
+    assert!(!said.contains("FwoGZXIvYXdz"), "nor a forwarded credential");
+}
+
+/// `Apply` on a Secret carries that Secret's DECODED yaml. The subject is
+/// loggable and worth logging; the body is not.
+#[test]
+fn an_apply_summary_names_its_target_and_not_its_body() {
+    let cmd = SessionCommand::Apply {
+        target: secret_ref(),
+        yaml: "stringData:\n  password: hunter2\n".to_string(),
+    };
+    let said = cmd.log_summary();
+    assert_eq!(said, "Apply secrets/db-creds");
+    assert!(!said.contains("hunter2"), "the applied body must not be loggable");
+}
+
+/// The harmless scalars ARE worth logging — a log that cannot say what the
+/// command did to what is not worth keeping.
+#[test]
+fn a_summary_names_the_harmless_scalars() {
+    let scale = SessionCommand::Scale {
+        target: ObjectRef::new(
+            ResourceId::BuiltIn(crate::resource_def::BuiltInKind::Deployment),
+            "api",
+            Namespace::Named("prod".into()),
+        ),
+        replicas: 3,
+    };
+    assert_eq!(scale.log_summary(), "Scale deployments/api to 3");
+
+    let pf = SessionCommand::PortForward {
+        target: ObjectRef::new(
+            ResourceId::BuiltIn(crate::resource_def::BuiltInKind::Pod),
+            "api-7d9f",
+            Namespace::Named("prod".into()),
+        ),
+        local_port: 8080,
+        container_port: 80,
+    };
+    assert_eq!(pf.log_summary(), "PortForward pods/api-7d9f 8080:80");
+}
+
+/// Every command names its kind, so no log line is anonymous.
+#[test]
+fn every_summary_starts_with_the_kind() {
+    let target = secret_ref();
+    let all = [
+        SessionCommand::Describe(target.clone()),
+        SessionCommand::Yaml(target.clone()),
+        SessionCommand::Delete(target.clone()),
+        SessionCommand::ForceKill(target.clone()),
+        SessionCommand::Restart(target.clone()),
+        SessionCommand::DecodeSecret(target.clone()),
+        SessionCommand::TriggerCronJob(target.clone()),
+        SessionCommand::ToggleSuspendCronJob(target.clone()),
+        SessionCommand::GetDiscovery,
+        SessionCommand::Ping,
+        SessionCommand::Status,
+        SessionCommand::Shutdown,
+        SessionCommand::Clear { context: None },
+    ];
+    for cmd in all {
+        let said = cmd.log_summary();
+        assert!(
+            said.starts_with(cmd.kind_name()),
+            "{said:?} must begin with {:?}",
+            cmd.kind_name(),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Log windows: one declaration, two projections (v18)
+// ---------------------------------------------------------------------------
+
+/// kubectl's own duration grammar, written out HERE as the oracle. It is
+/// what `--since` would have computed from a label back when the label was
+/// what went on the wire — so this test says the labels the UI shows really
+/// are the windows the daemon asks for.
+fn kubectl_duration_seconds(s: &str) -> Option<u32> {
+    for (suffix, mult) in [("s", 1u32), ("m", 60), ("h", 3600), ("d", 86400)] {
+        if let Some(val) = s.strip_suffix(suffix) {
+            return val.parse::<u32>().ok().map(|v| v * mult);
+        }
+    }
+    None
+}
+
+/// Every window's label and its duration agree. They are written on one line
+/// of the declaration precisely so this CAN'T drift, but the pair itself can
+/// still be mistyped, and `30m => 300` would be a silent five-minute window
+/// behind a label reading thirty.
+#[test]
+fn every_log_window_label_matches_its_seconds() {
+    for &since in LogSince::ALL {
+        assert_eq!(
+            kubectl_duration_seconds(since.label()),
+            Some(since.seconds()),
+            "{:?}: the label {:?} is not {} seconds",
+            since,
+            since.label(),
+            since.seconds(),
+        );
+    }
+}
+
+/// The windows are distinct and ordered — the number keys walk this list, so
+/// a duplicate would be a key that does nothing new and a mis-ordering would
+/// put `24h` on `3`.
+#[test]
+fn the_log_windows_ascend_without_repeats() {
+    let secs: Vec<u32> = LogSince::ALL.iter().map(|s| s.seconds()).collect();
+    assert!(
+        secs.windows(2).all(|w| w[0] < w[1]),
+        "the ladder must ascend: {secs:?}",
+    );
+    assert_eq!(secs, vec![60, 300, 900, 1800, 3600, 86400]);
+}
+
+/// The window survives the wire, and `None` still means "everything" —
+/// the state a duration cannot express.
+#[test]
+fn a_log_window_round_trips_and_absence_still_means_everything() {
+    for &since in LogSince::ALL {
+        let init = LogInit {
+            target: LogTarget::one("api-7d9f"),
+            namespace: Namespace::Named("prod".into()),
+            container: LogContainer::Default,
+            follow: true,
+            tail: None,
+            since: Some(since),
+            previous: false,
+        };
+        let bytes = bincode::serialize(&init).expect("serialize");
+        let back: LogInit = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(back.since, Some(since));
+    }
+
+    let everything = LogInit {
+        target: LogTarget::one("api-7d9f"),
+        namespace: Namespace::All,
+        container: LogContainer::Default,
+        follow: false,
+        tail: None,
+        since: None,
+        previous: false,
+    };
+    let back: LogInit =
+        bincode::deserialize(&bincode::serialize(&everything).expect("serialize")).expect("de");
+    assert_eq!(back.since, None);
+    assert_eq!(back.tail, None, "both absent IS the whole history");
+}
+
+// ---------------------------------------------------------------------------
+// `BUILT_IN` is generated, and this is what generated means
+// ---------------------------------------------------------------------------
+
+operation_kinds! {
+    // The macro emits `pub`, which inside a test module is an unreachable
+    // `pub` — the lint is armed workspace-wide and it is right. Allowed
+    // here rather than parameterising the macro's visibility for one toy.
+    #[allow(unreachable_pub)]
+    /// A stand-in for [`OperationKind`], with the same shape: unit variants
+    /// interleaved with a payload-carrying one.
+    ///
+    /// Testing the MACRO rather than its one real use, because the property
+    /// is about the macro: a new unit variant joins the list without anyone
+    /// touching the list. On `OperationKind` itself that cannot be asserted
+    /// — adding a variant to measure it is a source edit, and sixteen
+    /// exhaustive matches across four crates refuse to compile until it is
+    /// handled, which is the other half of the guarantee.
+    pub enum ToyOperation {
+        First,
+        Second,
+        /// Carries a payload, so it is not in the list.
+        Open(String),
+        /// Declared AFTER the payload variant, the way `Apply` is — the
+        /// order is the wire's and the macro must not reorder it.
+        Last,
+    }
+}
+
+/// Every unit variant is in the list, in declaration order, and the
+/// payload-carrying one is not.
+#[test]
+fn the_macro_lists_every_unit_variant_in_order() {
+    assert_eq!(
+        ToyOperation::BUILT_IN,
+        &[ToyOperation::First, ToyOperation::Second, ToyOperation::Last],
+        "unit variants only, and `Last` keeps its place after the payload one",
+    );
+}
+
+/// The payload variant keeps its declared TAG, which is why the macro
+/// munches in order instead of emitting two groups: `Custom` sits between
+/// `ToggleSuspendCronJob` and `Apply` on the real enum, and moving it would
+/// be a protocol break.
+#[test]
+fn the_macro_preserves_wire_tag_order() {
+    let tag = |v: &ToyOperation| {
+        u32::from_le_bytes(
+            bincode::serialize(v).expect("serialize")[..4]
+                .try_into()
+                .expect("four bytes"),
+        )
+    };
+    assert_eq!(tag(&ToyOperation::First), 0);
+    assert_eq!(tag(&ToyOperation::Second), 1);
+    assert_eq!(tag(&ToyOperation::Open(String::new())), 2);
+    assert_eq!(tag(&ToyOperation::Last), 3, "declared fourth, tagged fourth");
+}
+
+/// And the real list is what the generated one must be: sixteen operations,
+/// `Custom` excluded, `Apply` last.
+#[test]
+fn the_real_built_in_list_is_the_generated_one() {
+    assert_eq!(OperationKind::BUILT_IN.len(), 16);
+    assert_eq!(OperationKind::BUILT_IN[0], OperationKind::Describe);
+    assert_eq!(
+        *OperationKind::BUILT_IN.last().expect("non-empty"),
+        OperationKind::Apply,
+    );
+    assert!(
+        !OperationKind::BUILT_IN
+            .iter()
+            .any(|op| matches!(op, OperationKind::Custom(_))),
+        "an unbounded, overlay-declared operation has no place in a fixed list",
     );
 }

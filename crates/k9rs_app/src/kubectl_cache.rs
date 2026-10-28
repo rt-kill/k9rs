@@ -21,6 +21,23 @@ pub enum ContentKind {
 
 /// Key for the kubectl output cache. Typed end-to-end: keyed on the full
 /// `ObjectRef` so two CRDs sharing a Kind name across groups never collide.
+///
+/// **It carries no CLUSTER.** An `ObjectRef` is `(resource, name,
+/// namespace)`, so `pod/api -n default` on one cluster and the
+/// identically-named pod on another are ONE key. What stands between that
+/// and showing one cluster's YAML as another's is
+/// `KubectlCache::clear`, called at the session-replacement choke point in
+/// `k9rs_session` — the one every reconnect AND context switch passes
+/// through, which its own comment says it is. Traced; it does fire, so this
+/// is latent rather than live.
+///
+/// It is still manual policy where ownership would do: putting the context
+/// in the key would make a cross-cluster hit unrepresentable and demote
+/// every `clear()` to an optimisation. Not done, because the context would
+/// have to be threaded through `get`/`insert` at every call site, and the
+/// guard that exists is one documented place rather than a scattering.
+/// `the_key_does_not_distinguish_two_clusters` pins the current shape so
+/// that changing it is a visible decision.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CacheKey {
     pub target: ObjectRef,
@@ -137,4 +154,6 @@ impl KubectlCache {
     }
 }
 
-
+#[cfg(test)]
+#[path = "tests/kubectl_cache.rs"]
+mod tests;

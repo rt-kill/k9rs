@@ -12,8 +12,14 @@ use tokio::time::Instant;
 
 use crate::daemon_config;
 
-/// How long a *watcher* (or exec-backed local source) stays warm after its
-/// last subscriber drops.
+/// How long a *watcher* stays warm after its last subscriber drops.
+///
+/// Three consumers, not the two this used to name: `WatcherCache`,
+/// `local::exec_source`, and `shared_poller` — where a shared metrics or
+/// discovery poller takes the watcher's window despite costing one
+/// metrics-server list per interval rather than a row store plus an
+/// apiserver watch. `spawn_grace`'s own doc below enumerates all four
+/// kept-alive kinds correctly, so the two lists in this file disagreed.
 ///
 /// 60s: long enough that quick nav-away/back (Esc then re-enter, tab cycling)
 /// reuses the warm watcher; short enough that a linear sweep through many

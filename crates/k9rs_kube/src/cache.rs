@@ -13,7 +13,28 @@ use k9rs_proto::protocol::{ContextId, ContextName, CrdRef};
 // is the daemon's own cache plus `cached_crd_from_k8s`, the only part that
 // needed the Kubernetes client.
 pub use k9rs_proto::crd_cache::{CachedCrd, PrinterColumn, PrinterColumnType};
-use k9rs_proto::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
+
+/// The version of a CRD that we should talk to: the first SERVED one, or the
+/// first listed if none says so.
+///
+/// ONE rule. There were two, and they disagreed: this one, and
+/// `ConvertToRow<CustomResourceDefinition>`'s plain `versions.first()`. For a
+/// CRD whose first listed version is `served: false` — the ordinary
+/// deprecation shape, `v1alpha1` kept for storage while `v1` is served — the
+/// two paths produced DIFFERENT rows for one object, and the watcher's row
+/// carried a `DrillTarget::BrowseCrd` pointing at an unserved version, which
+/// is a watch the apiserver refuses.
+///
+/// Still array-order within the served set, not Kubernetes version priority
+/// (GA > beta > alpha, higher number first) the way discovery and kubectl
+/// order it. That is a second, smaller heuristic and it is shared now rather
+/// than duplicated, which is the part that was biting.
+pub fn served_version(
+    spec: &k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinitionSpec,
+) -> Option<&k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinitionVersion>
+{
+    spec.versions.iter().find(|v| v.served).or(spec.versions.first())
+}
 
 /// Parse a live `CustomResourceDefinition` into cache form. THE single
 /// parser for CRD presentation metadata — the bulk discovery poll and
@@ -24,7 +45,7 @@ pub fn cached_crd_from_k8s(
 ) -> Option<CachedCrd> {
     let name = crd.metadata.name.clone()?;
     let spec = &crd.spec;
-    let served = spec.versions.iter().find(|v| v.served).or(spec.versions.first());
+    let served = served_version(spec);
     let version = served.map(|v| v.name.clone()).unwrap_or_default();
     let printer_columns: Vec<PrinterColumn> = served
         .and_then(|v| v.additional_printer_columns.as_ref())
@@ -50,41 +71,6 @@ pub fn cached_crd_from_k8s(
         ),
         printer_columns,
     })
-}
-
-pub fn cached_crds_to_rows(cached: &[CachedCrd]) -> Vec<ResourceRow> {
-    cached
-        .iter()
-        .map(|c| {
-            // crd_info is now a type alias for CrdRef — clone the ref directly.
-            let crd_info = Some(c.gvr.clone());
-            // Drill target wraps the same CrdRef: pressing Enter on a CRD
-            // definition pushes a `ResourceId::Crd(...)` view onto the nav
-            // stack — handler does `ResourceId::Crd(crd_ref)` from this.
-            let drill_target = Some(DrillTarget::BrowseCrd(c.gvr.clone()));
-            let scope_label = c.gvr.scope.k8s_label();
-            let cells: Vec<CellValue> = vec![
-                CellValue::Text(c.name.clone()),
-                CellValue::Text(c.gvr.group.clone()),
-                CellValue::Text(c.gvr.version.clone()),
-                CellValue::Text(c.gvr.kind.clone()),
-                CellValue::Text(scope_label.to_string()),
-                CellValue::Age(None), // no age from cache
-            ];            ResourceRow {
-                name: c.name.clone(),
-                namespace: None,
-                containers: Vec::new(),
-                owner_refs: Vec::new(),
-                pf_ports: Vec::new(),
-                node: None,
-                health: RowHealth::Normal,
-                crd_info,
-                drill_target,
-                cells,
-                ..Default::default()
-            }
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -314,38 +300,6 @@ impl DiscoveryCache {
     }
 }
 
-/// Convert cached namespace names to unified ResourceRow format.
-pub fn cached_namespaces_to_rows(names: &[String]) -> Vec<k9rs_proto::row::ResourceRow> {
-    names
-        .iter()
-        .map(|name| {
-            let cells: Vec<CellValue> = vec![
-                CellValue::Text(name.clone()),
-                CellValue::Status { text: "Active".to_string(), health: RowHealth::Normal },
-                CellValue::Age(None), // no age from cache
-            ];            k9rs_proto::row::ResourceRow {
-                name: name.clone(),
-                namespace: None,
-                containers: Vec::new(),
-                owner_refs: Vec::new(),
-                pf_ports: Vec::new(),
-                node: None,
-                health: RowHealth::Normal,
-                crd_info: None,
-                // Namespace name comes from the K8s API's NamespaceList — it's
-                // a real identifier, never the literal string "all". Use the
-                // typed `Named` constructor directly: routing this through
-                // `from_user_command` would silently switch into all-namespaces
-                // mode if a cluster ever had a namespace literally named `all`.
-                drill_target: Some(DrillTarget::PodsInNamespace(
-                    k9rs_proto::protocol::Namespace::Named(name.clone()),
-                )),
-                cells,
-                ..Default::default()
-            }
-        })
-        .collect()
-}
 
 #[cfg(test)]
 #[path = "tests/cache_discovery_ttl.rs"]

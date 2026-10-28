@@ -38,13 +38,61 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct KeyCombo {
-    pub ctrl: bool,
-    pub ch: char,
+    /// Private, with [`Self::ctrl`] the only way to set it, because the
+    /// invariant below is not expressible in the type: a Ctrl chord's
+    /// character must be lowercase. The fields were `pub` and the only
+    /// constructor was `plain`, so `KeyCombo::ctrl('L')` was
+    /// constructible — a chord no key event can produce, against which every
+    /// comparison in the app is exact equality.
+    ctrl: bool,
+    ch: char,
 }
 
 impl KeyCombo {
+    /// An unmodified chord. Shift rides in the character's own case, which
+    /// is how `Shift-F` and `C` are expressed.
     pub const fn plain(ch: char) -> Self {
         Self { ctrl: false, ch }
+    }
+
+    /// A Ctrl chord. LOWERCASES its character, because the terminal delivers
+    /// Ctrl chords as lowercase (legacy keyboard protocol) — the rule the
+    /// config parser already applied and nothing else did.
+    pub const fn ctrl(ch: char) -> Self {
+        Self { ctrl: true, ch: ch.to_ascii_lowercase() }
+    }
+
+    /// The chord a key event is, or `None` when it is not one.
+    ///
+    /// Alt is never a binding: an unclaimed Alt chord must not alias to its
+    /// bare character (that is how `Alt-q` came to quit). A non-character
+    /// key is not a configurable chord at all.
+    ///
+    /// Here rather than in the key handler so that this and
+    /// [`Self::as_key_event`] — the two halves of the correspondence between
+    /// a chord and an event — sit together and uphold the lowercase rule
+    /// once. The handler's version built the struct directly, so a terminal
+    /// delivering `Ctrl-Shift-L` as `Char('L')` + CONTROL produced a combo
+    /// no config spec could equal.
+    pub fn of_event(key: &crossterm::event::KeyEvent) -> Option<Self> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let KeyCode::Char(c) = key.code else { return None };
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return None;
+        }
+        Some(if key.modifiers.contains(KeyModifiers::CONTROL) {
+            Self::ctrl(c)
+        } else {
+            Self::plain(c)
+        })
+    }
+
+    /// The key event this chord corresponds to — the inverse of
+    /// [`Self::of_event`].
+    pub fn as_key_event(&self) -> crossterm::event::KeyEvent {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mods = if self.ctrl { KeyModifiers::CONTROL } else { KeyModifiers::NONE };
+        KeyEvent::new(KeyCode::Char(self.ch), mods)
     }
 
     /// Display label for hints/help ("l", "Shift-l", "Ctrl-l").
@@ -88,7 +136,7 @@ impl TryFrom<String> for KeyCombo {
                 // lowercase chars (legacy keyboard protocol), so an
                 // uppercase spec like "Ctrl-L" would parse into a chord
                 // no key event can ever produce.
-                return Ok(Self { ctrl: true, ch: c.to_ascii_lowercase() });
+                return Ok(Self::ctrl(c));
             }
         }
         Err(format!(
@@ -114,6 +162,13 @@ impl TryFrom<String> for KeyCombo {
 ///   (structural default `0`); set it (e.g. `namespaceAll: ")"` for
 ///   Shift-0) to restore the action after `colFirst: "0"` shadowed
 ///   the `0` key.
+/// - In a LOG view the `0`–`7` range ladder is answered BEFORE these,
+///   so `colFirst: "0"` shadows the table's `0` and not the log's.
+///   The ladder is the only way to reach a range and the hint bar
+///   advertises it as `<0-7> range`, where column panning also has
+///   the structural `^` / `$`. All four column chords work in a log
+///   view (`configured_column_action` is one lookup for both views);
+///   only the digits are reserved there.
 ///
 /// TakeoverOp-defined (`Custom`) operations bind through the overlay
 /// config, never here.
@@ -213,31 +268,47 @@ impl KeysConfig {
     /// win, invisibly). Runs in the LOUD config-load path so a rejected
     /// binding is a startup error, not a mystery.
     pub fn validate(&self) -> Result<(), String> {
-        // Chords an earlier dispatch layer always consumes before
-        // bindings are consulted. Ctrl-K is capability-dependent at
-        // dispatch (force-kill views only) — reserved anyway, because a
-        // binding that works on configmaps but dies on pods is worse
-        // than a rejected one.
-        const RESERVED: &[(KeyCombo, &str)] = &[
-            (KeyCombo { ctrl: true, ch: 'c' }, "quit"),
-            (KeyCombo { ctrl: true, ch: 'r' }, "refresh"),
-            (KeyCombo { ctrl: true, ch: 'e' }, "toggle header"),
-            (KeyCombo { ctrl: true, ch: 's' }, "save table/logs"),
-            (KeyCombo { ctrl: true, ch: 'a' }, "aliases"),
-            (KeyCombo { ctrl: true, ch: 'w' }, "wide columns"),
-            (KeyCombo { ctrl: true, ch: 'z' }, "fault filter"),
-            (KeyCombo { ctrl: true, ch: ' ' }, "span-mark"),
-            (KeyCombo { ctrl: true, ch: '\\' }, "clear marks"),
-            (KeyCombo { ctrl: true, ch: 'd' }, "delete"),
-            (KeyCombo { ctrl: true, ch: 'k' }, "force-kill"),
-            (KeyCombo { ctrl: false, ch: ':' }, "command mode"),
-            (KeyCombo { ctrl: false, ch: '/' }, "filter"),
-            (KeyCombo { ctrl: false, ch: '?' }, "help"),
+        // The app's OWN chords: consumed by a dispatch layer above the
+        // bindings, and not derivable from anything, so they are a list.
+        const GLOBAL: &[(KeyCombo, &str)] = &[
+            (KeyCombo::ctrl('c'), "quit"),
+            (KeyCombo::ctrl('r'), "refresh"),
+            (KeyCombo::ctrl('e'), "toggle header"),
+            (KeyCombo::ctrl('s'), "save table/logs"),
+            (KeyCombo::ctrl('a'), "aliases"),
+            (KeyCombo::ctrl('w'), "wide columns"),
+            (KeyCombo::ctrl('z'), "fault filter"),
+            (KeyCombo::ctrl(' '), "span-mark"),
+            (KeyCombo::ctrl('\\'), "clear marks"),
+            (KeyCombo::plain(':'), "command mode"),
+            (KeyCombo::plain('/'), "filter"),
+            (KeyCombo::plain('?'), "help"),
+            // A log-view key checked ahead of the configured chords, same as
+            // the structural ones below — `C` clears the buffer.
+            (KeyCombo::plain('C'), "clear logs"),
         ];
+        // The STRUCTURAL chords, derived. These were two literals here
+        // — `ctrl-d` and `ctrl-k` — against a `structural_chord` that
+        // declares THREE, and the missing one was `Shift-F`. The structural
+        // loop runs first in `handle_resource_view_keys`, ahead of every
+        // config lookup, so `keys: { describe: "F" }` validated clean and
+        // then, on each resource declaring `PortForward` (pods, deployments,
+        // services), `F` port-forwarded while `d` no longer described —
+        // describe unreachable there and working on a configmap. Exactly the
+        // asymmetry the comment above reserves Ctrl-K to avoid.
+        let structural = k9rs_proto::protocol::OperationKind::BUILT_IN
+            .iter()
+            .filter_map(|op| {
+                crate::keymap::structural_chord(op)
+                    .map(|chord| (chord, op.descriptor().label))
+            });
+        let reserved: Vec<(KeyCombo, &str)> =
+            GLOBAL.iter().copied().chain(structural).collect();
+
         let mut seen: std::collections::HashMap<KeyCombo, &'static str> =
             std::collections::HashMap::new();
         for (name, combo) in self.entries() {
-            if let Some((_, what)) = RESERVED.iter().find(|(r, _)| *r == combo) {
+            if let Some((_, what)) = reserved.iter().find(|(r, _)| *r == combo) {
                 return Err(format!(
                     "keys.{name}: '{}' is reserved ({what}) — the binding could never fire",
                     combo.label(),
@@ -361,6 +432,25 @@ impl LogConfig {
     /// next press takes the timestamp away anyway.
     pub fn initial_shed(&self) -> usize {
         self.default_fields.shed()
+    }
+
+    /// Whether a freshly opened log stream should follow its tail.
+    ///
+    /// THE reader of `default_follow`, which had none: the key parsed, passed
+    /// the strict loader, and was discarded, while its two siblings in this
+    /// struct — `default_wrap` and `default_fields` — were read in the same
+    /// constructor. Every `LogInit` built `follow: true` or `follow:
+    /// !previous` by hand, so `defaultFollow: false` was a documented
+    /// setting (README: "auto-scroll logs") that did nothing. That is the
+    /// exact failure this module's header says it exists to avoid — loud
+    /// about typos, silent about a correctly-spelled key nobody reads.
+    ///
+    /// `previous` overrides the preference rather than being ANDed with it by
+    /// each caller: a terminated container's log is finite, so there is
+    /// nothing to follow and following would pin the view to a bottom that
+    /// never moves.
+    pub fn follows(&self, previous: bool) -> bool {
+        self.default_follow && !previous
     }
 }
 

@@ -44,8 +44,29 @@ pub struct ConnectionParams {
     /// Initial namespace selection for the session. Typed so we don't
     /// flatten-and-reparse at the boundary.
     pub namespace: protocol::Namespace,
+    /// Refuse mutations DAEMON-side. Must be [`ConnectionParams::read_only`]
+    /// of the same inputs that produced [`crate::App::read_only`] — see
+    /// there for what went wrong when it was not.
     pub readonly: bool,
     pub no_daemon: bool,
+}
+
+impl ConnectionParams {
+    /// Whether this session refuses mutations: the `--readonly` flag OR the
+    /// config's `readOnly`.
+    ///
+    /// ONE expression, because the answer arms TWO gates — `App::read_only`,
+    /// where the client refuses the action, and this struct's `readonly`,
+    /// where the daemon refuses the operation. The entry point used to pass
+    /// a bare `cli.readonly` to the second while `App::new` took
+    /// `config.read_only` for the first, so `readOnly: true` in the config
+    /// armed the client and left the daemon wide open. Worse, the RECONNECT
+    /// path sends `app.read_only`, which does include the config — so the
+    /// daemon-side gate came on only after you lost your connection, and a
+    /// config-only read-only session was enforced on one side until then.
+    pub fn read_only(cli_flag: bool, config: &crate::AppConfig) -> bool {
+        cli_flag || config.read_only
+    }
 }
 
 /// Output of a single kubeconfig read. Built once by the manager task and
@@ -336,6 +357,17 @@ static NEXT_STREAM_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub enum Supersedes<'a> {
     /// A first subscription against this store — there is no predecessor.
     Nothing,
+    /// A store whose predecessors were already retired by being DROPPED
+    /// (`SubscriptionStream::Drop` aborts), so there is nothing left for
+    /// this call to abort.
+    ///
+    /// Distinct from [`Supersedes::Nothing`] because it is a different
+    /// claim: "no predecessor existed" versus "a predecessor existed and
+    /// something else retired it". The second was being spelled `Nothing`
+    /// plus a three-line comment at the call site re-arguing
+    /// abort-before-mint — which is precisely the comment this parameter
+    /// was introduced to delete.
+    RetiredByDrop,
     /// The stream being replaced. Aborted before the successor's epoch is
     /// minted.
     Stream(&'a SubscriptionStream),
@@ -368,12 +400,21 @@ impl Supersedes<'_> {
     /// order, as ONE step.
     ///
     /// Fused deliberately. Two calls in the right order is a rule someone has
-    /// to keep; one call is a rule nobody can break. There is no way to reach
-    /// the epoch counter from outside this function, so "minted before the
-    /// predecessor was stopped" is not a state a caller can express.
+    /// to keep; one call is a rule nobody can break — for the CALLERS of this
+    /// function, which is what it is for.
+    ///
+    /// It is not the whole story, and this doc used to claim it was ("there
+    /// is no way to reach the epoch counter from outside this function").
+    /// `NEXT_STREAM_EPOCH` is a module-level static and the subscribe
+    /// bridge's retry loop mints from it directly, which is the exact hazard
+    /// the type's own doc names. What bounds THAT path is different and
+    /// unstated until now: `abort()` plus the predecessor's task reaching an
+    /// await point before it can send anything, so its fresh epoch never
+    /// becomes an event. A real argument, but an argument — not a thing the
+    /// type forbids.
     fn retire_and_mint(self, store: &dyn EpochFloor) -> u64 {
         match self {
-            Supersedes::Nothing => {}
+            Supersedes::Nothing | Supersedes::RetiredByDrop => {}
             Supersedes::Stream(s) => s.abort(),
             Supersedes::LogStream(s) => s.abort(),
         }
@@ -995,6 +1036,14 @@ impl ClientSession {
                 // paths can stamp their `Failed` payload with it (the
                 // store's floor gates a superseded stream's failure away
                 // from its successor's state).
+                //
+                // The SECOND place an epoch is minted, and the one
+                // `Supersedes`'s doc describes as the hazard: a retry here
+                // after a successor was minted would out-floor the
+                // successor's baseline permanently. Safe because this task
+                // has been `abort()`ed by then and cannot reach another
+                // await to send anything — not because the counter is
+                // unreachable, which `retire_and_mint` used to claim.
                 let epoch = first_epoch.take().unwrap_or_else(|| {
                     NEXT_STREAM_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 });

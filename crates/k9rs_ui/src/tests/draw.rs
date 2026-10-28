@@ -204,7 +204,7 @@ fn a_dead_link_hides_the_frozen_log_tail() {
     // across the gap. The view kept advertising a tail that had stopped.
     let mut app = App::new_for_test();
     app.conn.established();
-    let session = LogSession::for_test(k9rs_proto::protocol::LogTarget::One("canarypod".to_string()), LogContainer::Named("app".to_string(),
+    let session = LogSession::for_test(k9rs_proto::protocol::LogTarget::one("canarypod".to_string()), LogContainer::Named("app".to_string(),
     ));
     session.store().push(
         0,
@@ -294,7 +294,7 @@ fn the_reconnect_gap_does_not_eat_the_log_scroll_position() {
     // back from a blip scrolled to the top of a long buffer.
     let mut app = App::new_for_test();
     app.conn.established();
-    let session = LogSession::for_test(k9rs_proto::protocol::LogTarget::One("canarypod".to_string()), LogContainer::Named("app".to_string(),
+    let session = LogSession::for_test(k9rs_proto::protocol::LogTarget::one("canarypod".to_string()), LogContainer::Named("app".to_string(),
     ));
     for i in 0..200 {
         session.store().push(0, LogLine { source: None, timestamp: None, content: format!("line {}", i) });
@@ -549,7 +549,7 @@ fn the_light_palette_actually_reaches_the_screen() {
 
 /// A log element with `lines` already in its store, ready to push.
 fn log_session_with(lines: &[&str]) -> Element {
-    let session = LogSession::for_test(k9rs_proto::protocol::LogTarget::One("canarypod".to_string()), LogContainer::Named("app".to_string(),
+    let session = LogSession::for_test(k9rs_proto::protocol::LogTarget::one("canarypod".to_string()), LogContainer::Named("app".to_string(),
     ));
     for content in lines {
         session
@@ -687,7 +687,7 @@ fn help_documents_the_view_you_pressed_it_in() {
     );
 
     // Now stand in a log view.
-    app.nav.push(Element::LogSession(Box::new(LogSession::for_test(k9rs_proto::protocol::LogTarget::One("canarypod".to_string()), LogContainer::Named("app".to_string(),
+    app.nav.push(Element::LogSession(Box::new(LogSession::for_test(k9rs_proto::protocol::LogTarget::one("canarypod".to_string()), LogContainer::Named("app".to_string(),
     )))));
     let log_help = help_rows(&mut app).join("\n");
     assert!(
@@ -709,7 +709,7 @@ fn a_following_log_view_tracks_the_tail_as_lines_arrive() {
     // lines occupy.
     let mut app = App::new_for_test();
     app.conn.established();
-    let session = LogSession::for_test(k9rs_proto::protocol::LogTarget::One("canarypod".to_string()), LogContainer::Named("app".to_string(),
+    let session = LogSession::for_test(k9rs_proto::protocol::LogTarget::one("canarypod".to_string()), LogContainer::Named("app".to_string(),
     ));
     for i in 0..200 {
         session.store().push(0, LogLine { source: None, timestamp: None, content: format!("line-{i}") });
@@ -769,7 +769,7 @@ fn eviction_under_a_parked_view_does_not_move_it() {
     let mut app = App::new_for_test();
     app.conn.established();
     let session = LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("canarypod".to_string()),
+        k9rs_proto::protocol::LogTarget::one("canarypod".to_string()),
         LogContainer::Named("app".to_string()),
     );
     // Fill the ring exactly, so the next arrival is the first eviction.
@@ -813,7 +813,7 @@ fn toggling_wrap_keeps_the_line_you_were_reading() {
     let mut app = App::new_for_test();
     app.conn.established();
     let session = LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("canarypod".to_string()),
+        k9rs_proto::protocol::LogTarget::one("canarypod".to_string()),
         LogContainer::Named("app".to_string()),
     );
     // Three physical rows per line in a 100-column terminal, and the marker
@@ -863,7 +863,7 @@ fn a_grep_that_momentarily_matches_nothing_keeps_your_scroll_position() {
     // by hand; "no matching lines" was not.
     let mut app = App::new_for_test();
     app.conn.established();
-    let session = LogSession::for_test(k9rs_proto::protocol::LogTarget::One("canarypod".to_string()), LogContainer::Named("app".to_string(),
+    let session = LogSession::for_test(k9rs_proto::protocol::LogTarget::one("canarypod".to_string()), LogContainer::Named("app".to_string(),
     ));
     for i in 0..500 {
         session.store().push(0, LogLine { source: None, timestamp: None, content: format!("line-{i}") });
@@ -940,7 +940,7 @@ fn a_case_sensitive_grep_says_so() {
     let mut app = App::new_for_test();
     app.conn.established();
     let session = LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("canarypod".to_string()),
+        k9rs_proto::protocol::LogTarget::one("canarypod".to_string()),
         LogContainer::Named("app".to_string()),
     );
     for i in 0..20 {
@@ -996,7 +996,7 @@ fn a_confirm_dialog_floats_over_the_view_that_raised_it() {
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             ),
         },
-        action_focused: false,
+        focused: k9rs_app::ConfirmFocus::Cancel,
     })));
 
     // Content-sized, not a percentage of somebody's terminal.
@@ -1108,7 +1108,7 @@ fn every_dialog_kind_paints_itself_over_its_parent() {
                     op: k9rs_app::SingleOp::Delete,
                     target: target.clone(),
                 },
-                action_focused: false,
+                focused: k9rs_app::ConfirmFocus::Cancel,
             })),
             "Delete pod/canary?",
         ),
@@ -1197,7 +1197,7 @@ fn a_full_frame_takeover_erases_the_frame_not_the_float_over_it() {
                 k9rs_proto::protocol::Namespace::Named("default".to_string()),
             ),
         },
-        action_focused: false,
+        focused: k9rs_app::ConfirmFocus::Cancel,
     })));
     app.ui.open(k9rs_app::Modal::Takeover(k9rs_app::TakeoverOp::Shell(Box::new(
         k9rs_app::ShellState {
@@ -1265,7 +1265,6 @@ fn only_a_grouping_column_collapses_its_repeats() {
             offset,
             selected_col: 0,
             col_offset: 0,
-            filtered_count: 0,
             visible_height: 0,
         };
         ResourceTable::new(headers.clone(), &rows, "t", &theme)
@@ -1377,7 +1376,7 @@ fn the_log_hint_bar_reaches_its_last_hint_on_screen() {
         let mut app = App::new_for_test();
         app.conn.established();
         app.nav.push(Element::LogSession(Box::new(LogSession::for_test(
-            k9rs_proto::protocol::LogTarget::One("canarypod".to_string()),
+            k9rs_proto::protocol::LogTarget::one("canarypod".to_string()),
             LogContainer::Named("app".to_string()),
         ))));
 
@@ -1555,7 +1554,7 @@ fn a_one_line_surface_that_overflows_marks_the_cut() {
         let mut app = App::new_for_test();
         app.conn.established();
         app.nav.push(Element::LogSession(Box::new(LogSession::for_test(
-            k9rs_proto::protocol::LogTarget::One("canarypod".to_string()),
+            k9rs_proto::protocol::LogTarget::one("canarypod".to_string()),
             LogContainer::Named("app".to_string()),
         ))));
         let mut t = Terminal::new(TestBackend::new(width, 20)).expect("terminal");
@@ -1824,7 +1823,7 @@ fn a_long_input_keeps_its_caret_and_its_tail_on_screen() {
     let mut app = App::new_for_test();
     app.conn.established();
     app.nav.push(Element::LogSession(Box::new(LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("canarypod".to_string()),
+        k9rs_proto::protocol::LogTarget::one("canarypod".to_string()),
         LogContainer::Named("app".to_string()),
     ))));
     for pat in ["alpha", "bravo", "charlie"] {
@@ -1850,6 +1849,74 @@ fn a_long_input_keeps_its_caret_and_its_tail_on_screen() {
     assert!(
         painted.contains('\u{2588}'),
         "and its caret block is drawn:\n{painted}",
+    );
+}
+
+/// The TABLE's filter bar keeps its caret and its tail on screen too.
+///
+/// A sibling of `a_long_input_keeps_its_caret_and_its_tail_on_screen`, which
+/// covered the `:` prompt and the log grep and therefore passed while this
+/// bar had no windowing at all: it appended the block cursor after the whole
+/// pattern and let `set_line` clip, so `/` and `~` on a resource table
+/// clipped at the right edge with the caret outside it — you typed blind —
+/// and after `Left`/`Home` the block was drawn at the END while the
+/// keystrokes landed mid-pattern. The handler wiring it even comments that
+/// "the caret behaves here exactly as it does in the log grep and the
+/// command prompt"; it did not.
+///
+/// Sixth member of a class that was supposed to be closed, and the tell was
+/// `FilterInputState::caret_col` — doc: "Caret position for the renderer, in
+/// columns" — having no callers anywhere in the workspace.
+#[test]
+fn the_table_filter_bar_keeps_its_caret_and_its_tail_on_screen() {
+    let typed = "a-very-long-filter-pattern-being-typed-right-now";
+
+    // Caret at the END: the tail is what you just typed.
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "a-row");
+    {
+        let fi = app.nav.top_mut().filter_input_mut().expect("a table filters");
+        fi.start();
+        *fi.input_mut() = k9rs_app::TextInput::seeded(typed);
+    }
+    let mut t = Terminal::new(TestBackend::new(40, 16)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+    let tail = &typed[typed.len() - 10..];
+    assert!(
+        painted.contains(tail),
+        "the end of what you typed must be visible: {tail:?}\n{painted}",
+    );
+    assert!(painted.contains('\u{2588}'), "and its caret block is drawn:\n{painted}");
+    // The counter is the tail that must never be pushed off: it is the only
+    // thing saying whether the pattern matches anything.
+    assert!(painted.contains("[0/1]"), "the match counter survives:\n{painted}");
+
+    // Caret at the START, after Home: the block belongs at the beginning,
+    // and the HEAD of the pattern is what is on screen.
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "a-row");
+    {
+        let fi = app.nav.top_mut().filter_input_mut().expect("a table filters");
+        fi.start();
+        *fi.input_mut() = k9rs_app::TextInput::seeded(typed);
+        fi.input_mut().home();
+    }
+    let mut t = Terminal::new(TestBackend::new(40, 16)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+    let bar = row_with(&t, "a-very-long");
+    let caret_at = bar.find('\u{2588}').expect("the caret block is drawn");
+    let head_at = bar.find("a-very-long").expect("the head of the pattern shows");
+    assert!(
+        caret_at < head_at,
+        "with the caret home, the block sits BEFORE the pattern, not after \
+         it: {bar:?}",
+    );
+    assert!(
+        !painted.contains(tail),
+        "and the window followed the caret to the head, so the tail is off \
+         screen:\n{painted}",
     );
 }
 
@@ -1911,7 +1978,7 @@ fn a_dialogs_box_reserves_exactly_the_chrome_its_widget_spends() {
             op: k9rs_app::SingleOp::Delete,
             target,
         },
-        action_focused: false,
+        focused: k9rs_app::ConfirmFocus::Cancel,
     })));
 
     let k9rs_app::ViewExtent::Dialog { width, height } =
@@ -1951,7 +2018,7 @@ fn the_grep_bar_counts_every_step_of_the_chain() {
     let mut app = App::new_for_test();
     app.conn.established();
     let session = LogSession::for_test(
-        k9rs_proto::protocol::LogTarget::One("canarypod".to_string()),
+        k9rs_proto::protocol::LogTarget::one("canarypod".to_string()),
         LogContainer::Default,
     );
     for text in ["alpha one", "alpha two", "beta three"] {
@@ -2196,5 +2263,380 @@ fn g_on_a_freshly_opened_describe_reaches_the_bottom_at_once() {
     assert!(
         !painted.contains("line-000"),
         "…and the top must be gone, not merely scrolled past:\n{painted}",
+    );
+}
+
+/// A float paints inside its box, and a short terminal is not a crash.
+///
+/// `? help` was stamped with a direct `Buffer::set_string`, which clips at
+/// the buffer edge and not at the area it was given. When the element floats,
+/// the breadcrumb chunk is `Constraint::Length(0)` and ratatui puts a
+/// trailing zero-length chunk's `y` at `area.bottom()` — one row PAST the
+/// box. So:
+///   - at a terminal height of 6 or less that row was outside the buffer
+///     entirely, and `Buffer`'s index is a hard `panic!` rather than a
+///     debug assert, so pressing `?` killed the TUI;
+///   - at any taller height the hint was painted one row BELOW the help box,
+///     over the view the float is supposed to leave intact.
+///
+/// Both are the same missing guard. Heights 1..=8 straddle the old panic
+/// boundary (it was exactly 1..=6).
+#[test]
+fn a_float_paints_inside_its_box_at_every_terminal_height() {
+    for h in 1u16..=8 {
+        let mut app = App::new_for_test();
+        seed_row(&app, "api-7d9f");
+        push_help(&mut app);
+        let mut t = Terminal::new(TestBackend::new(60, h)).expect("terminal");
+        // The assertion IS that this returns.
+        let _ = paint(&mut t, &mut app);
+    }
+
+    // Tall enough for the float to have a visible box with room under it.
+    let mut app = App::new_for_test();
+    seed_row(&app, "api-7d9f");
+    push_help(&mut app);
+    let mut t = Terminal::new(TestBackend::new(80, 20)).expect("terminal");
+    let _ = paint(&mut t, &mut app);
+
+    let buf = t.backend().buffer();
+    let width = buf.area.width as usize;
+    let rows: Vec<String> = buf
+        .content
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect::<Vec<_>>()
+        .chunks(width)
+        .map(|r| r.concat())
+        .collect();
+    let carrying: Vec<usize> =
+        rows.iter().enumerate().filter(|(_, r)| r.contains("? help")).map(|(i, _)| i).collect();
+    assert_eq!(
+        carrying,
+        vec![rows.len() - 2],
+        "exactly one `? help`, on the FRAME's breadcrumb row — a second one \
+         means the float stamped its own over the view underneath:\n{}",
+        rows.join("\n"),
+    );
+}
+
+/// The breadcrumb's right-hand hint and its `Esc back` suffix cannot
+/// overlap, because the path's budget is measured from the spans that are
+/// actually emitted.
+///
+/// The budget was a hand-written `suffix_w = 9` sitting beside a comment
+/// reading `" | Esc back"`. The spans emit `"| "` + `"Esc"` + `" back"` =
+/// ten cells, so a path that filled its budget put the right-aligned hint
+/// over the final `k` of `back`.
+///
+/// The collision needs the path to actually FILL its budget, which is why
+/// the narrow widths are here: the breadcrumb below is ~15 cells, so from
+/// about 40 columns up there is slack and the stray cell lands on a space.
+/// Measured against the old arithmetic, width 26 is where it bit:
+/// `" … > ctx | Esc bac ? help "`.
+#[test]
+fn a_drilled_breadcrumb_keeps_both_its_hint_and_its_back_key() {
+    for w in [26u16, 28, 30, 32, 34, 36, 40, 60, 120] {
+        let mut app = App::new_for_test();
+        seed_row(&app, "api-7d9f");
+        // `client_root_element` is the plain, non-floating resource list the
+        // contexts view uses — a real second element, so the view paints its
+        // `Esc back` suffix.
+        let rid = k9rs_proto::local_types::LocalResourceKind::Context.to_resource_id();
+        let drilled = app
+            .core
+            .client_root_element(&app.kube.metrics, &rid, k9rs_proto::protocol::Namespace::All)
+            .expect("contexts is a client-owned resource");
+        app.nav.push(drilled);
+        assert!(app.nav.is_drilled(), "sanity: drilled, so `Esc back` is emitted");
+
+        let mut t = Terminal::new(TestBackend::new(w, 20)).expect("terminal");
+        let _ = paint(&mut t, &mut app);
+        let row = row_with(&t, "? help");
+        assert!(
+            row.contains("Esc back"),
+            "at width {w} the hint ate the back key: {row:?}",
+        );
+    }
+}
+
+/// A FORM's box reserves exactly the chrome its widget spends — including
+/// its hint bar, which is the thing that was one cell short.
+///
+/// Sibling of `a_dialogs_box_reserves_exactly_the_chrome_its_widget_spends`,
+/// which covers the confirm only and so passed throughout: `confirm_dialog_size`
+/// was exported and the confirm widget consulted it, while `form_dialog_size`
+/// was `pub(crate)` — unreachable from `k9rs_ui` — so the widget sized the box
+/// from the hint line it built and the float sized it from a hardcoded
+/// `if has_select { 52 } else { 38 }`. Measured, those lines are 41 and 55.
+///
+/// The fixture is the port-forward form, because that is where the three-column
+/// error bit: a Select plus a 14-column label ("Container port") put the box
+/// one cell under the hint's width and `<Esc> cancel` rendered `<Esc> cance`.
+/// Losing the key that gets you out of a modal is the specific failure
+/// `header::fit_bar` exists to prevent.
+#[test]
+fn a_forms_box_fits_the_hint_bar_that_names_its_exit() {
+    let (mw, mh) = k9rs_app::DIALOG_MARGIN;
+    let target = k9rs_proto::protocol::ObjectRef::new(
+        BuiltInKind::Pod.to_resource_id(),
+        "api-7d9f".to_string(),
+        k9rs_proto::protocol::Namespace::Named("default".to_string()),
+    );
+
+    // The port-forward shape: a Select (so the arrow hints appear) beside the
+    // longest label the form has.
+    let port_forward = || {
+        k9rs_app::FormDialog {
+            submit: k9rs_app::FormSubmit::PortForward,
+            title: "Port-forward pod/api-7d9f".to_string(),
+            subtitle: "namespace: default".to_string(),
+            target: target.clone(),
+            fields: vec![
+                k9rs_app::FormFieldState {
+                    name: "container_port".to_string(),
+                    label: "Container port".to_string(),
+                    kind: k9rs_app::FormFieldKind::Select {
+                        options: vec![
+                            k9rs_app::SelectOption::new("80", "80"),
+                            k9rs_app::SelectOption::new("8080", "8080"),
+                        ],
+                        selected: 0,
+                    },
+                    value: k9rs_app::TextInput::seeded("80"),
+                },
+                k9rs_app::FormFieldState {
+                    name: "local_port".to_string(),
+                    label: "Local port".to_string(),
+                    kind: k9rs_app::FormFieldKind::Port,
+                    value: k9rs_app::TextInput::seeded("8080"),
+                },
+            ],
+            focused: k9rs_app::FormFocus::Field(0),
+        }
+    };
+
+    // 1. The float reserves the widget's content plus exactly the chrome.
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "api-7d9f");
+    app.nav.push(Element::Form(Box::new(port_forward())));
+    let k9rs_app::ViewExtent::Dialog { width, height } =
+        app.nav.top().extent(ratatui::layout::Rect::new(0, 0, 200, 60))
+    else {
+        panic!("a form floats")
+    };
+    let k9rs_app::Element::Form(d) = app.nav.top() else { panic!() };
+    let (fw, fh) = k9rs_app::form_dialog_size(d);
+    assert_eq!(
+        (width, height),
+        (fw + mw, fh + mh),
+        "the box is the widget's content plus exactly the chrome it spends",
+    );
+
+    // 2. And the hint bar it declares actually fits: the box's inner width
+    // has to hold it, which is the arithmetic that disagreed.
+    let hints_w = k9rs_app::form_hints_width(d);
+    assert!(
+        hints_w + mw <= width,
+        "the hint bar is {hints_w} columns and the box is {width} — the exit \
+         key gets clipped",
+    );
+
+    // 3. Painted, end to end: `cancel` survives whole.
+    let mut t = term();
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        painted.contains("Container port"),
+        "the form draws its longest label:\n{painted}",
+    );
+    let bar = row_with(&t, "<Esc>");
+    assert!(
+        bar.contains("<Esc> cancel"),
+        "the exit key is named in full, not clipped to `cance`: {bar:?}",
+    );
+    assert!(
+        bar.contains("select"),
+        "and the Select field's arrow hint is there too: {bar:?}",
+    );
+}
+
+/// The YAML viewer paints inside its content area, matched or not.
+///
+/// This widget had no paint test at all, and three branches that disagreed
+/// about where a line ends. The two search-highlight branches used
+/// `buf.set_string`, which clips at the BUFFER edge rather than the area's,
+/// so a long matched line painted across the right border and over the
+/// scrollbar — while the identical line one keystroke earlier, unmatched,
+/// went through `set_line(.., content_width)` and clipped correctly.
+///
+/// And `content_width` subtracted only the gutter and its separator while the
+/// scrollbar painted at `inner.width - 1` AFTER the text, so the last column
+/// of every long line was overwritten once the document outgrew one screen.
+/// That is verbatim the bug `log_view` documents fixing — "the last character
+/// of every line disappeared the moment a log grew past one screen" — in the
+/// sibling that never got the fix.
+#[test]
+fn the_yaml_viewer_paints_inside_its_content_area() {
+    // Lines wider than the viewport, and more of them than fit, so both the
+    // horizontal clip and the scrollbar are in play.
+    let long = "a".repeat(200);
+    let body: String = (0..120)
+        .map(|i| format!("key{i:03}: {long}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let paint_yaml = |search: Option<&str>| -> Terminal<TestBackend> {
+        let mut app = App::new_for_test();
+        app.conn.established();
+        let mut state = k9rs_app::ContentViewState::default();
+        state.set_content(body.clone());
+        if let Some(pattern) = search {
+            // `update_search` reads `search`, not `search_input` — the
+            // committed term, not the draft.
+            state.search = Some(pattern.to_string());
+            state.update_search();
+            assert!(!state.search_matches.is_empty(), "the fixture must MATCH");
+        }
+        app.nav.push(Element::ContentView(k9rs_app::ContentView::new(
+            k9rs_app::ContentSpec::Yaml(k9rs_proto::protocol::ObjectRef::new(
+                BuiltInKind::Pod.to_resource_id(),
+                "canary".to_string(),
+                k9rs_proto::protocol::Namespace::Named("default".to_string()),
+            )),
+            state,
+            k9rs_app::ContentPhase::Ready,
+        )));
+        let mut t = Terminal::new(TestBackend::new(60, 16)).expect("terminal");
+        let _ = paint(&mut t, &mut app);
+        t
+    };
+
+    /// For each row that holds YAML content, the column its LAST `│` sits in
+    /// — the block's right border, which nothing inside may paint over.
+    /// Chrome rows (the search bar, the borders themselves) are excluded by
+    /// requiring the content marker.
+    fn content_row_borders(term: &Terminal<TestBackend>) -> Vec<usize> {
+        let buf = term.backend().buffer();
+        let w = buf.area.width as usize;
+        buf.content
+            .chunks(w)
+            .filter_map(|row| {
+                let text: String = row.iter().map(|c| c.symbol()).collect();
+                if !text.contains("key0") {
+                    return None;
+                }
+                row.iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.symbol() == "│")
+                    .map(|(i, _)| i)
+                    .next_back()
+            })
+            .collect()
+    }
+
+    let plain = paint_yaml(None);
+    let borders = content_row_borders(&plain);
+    assert!(borders.len() > 4, "sanity: several content rows drew: {borders:?}");
+    assert!(
+        borders.iter().all(|&b| b == borders[0]),
+        "the right border is a straight line — a long line painted over it: {borders:?}",
+    );
+
+    // The same document with a search active: EVERY line matches `key`, so
+    // every content row takes the highlight branch. The border must not move.
+    let matched = paint_yaml(Some("key"));
+    assert_eq!(
+        content_row_borders(&matched),
+        borders,
+        "a matched line clips exactly where an unmatched one does — the \
+         highlight branches used to clip at the buffer edge instead",
+    );
+}
+
+/// The OVERVIEW keeps the telling end of an ARN too.
+///
+/// Sibling of `the_header_keeps_the_telling_end_of_an_arn`, which passed
+/// throughout: the two views already shared `app.attachment()` — unified
+/// after the header named one context above another's cluster — but each
+/// FITTED the values itself. The header elides from the left, because these
+/// are identifiers whose distinguishing part is at the end; the overview
+/// handed raw strings to a centred `Line`, which clips on the right. So the
+/// landing page, which is the first thing you see, showed four copies of one
+/// ARN prefix.
+#[test]
+fn the_overview_keeps_the_telling_end_of_an_arn() {
+    let arn = "arn:aws:eks:us-west-2:123456789012:cluster/prod-usw2";
+    let mut app = App::new_for_test();
+    app.kube.context = k9rs_proto::protocol::ContextName::new(arn);
+    app.conn.established();
+    // The overview is the landing page; make it the top element.
+    app.nav.reset(Element::Overview(Default::default()));
+    // The HEADER renders the same ARN correctly, one row away. Without this
+    // the assertion below passes on the header's row and says nothing about
+    // the view under test — the trap `row_with`'s own doc warns about.
+    app.ui.show_header = false;
+
+    // Narrow enough that the ARN cannot fit.
+    let mut t = Terminal::new(TestBackend::new(60, 20)).expect("terminal");
+    let painted = paint(&mut t, &mut app);
+    assert!(
+        painted.contains("prod-usw2"),
+        "the part that identifies the context must survive:\n{painted}",
+    );
+    let row = row_with(&t, "prod-usw2");
+    assert!(
+        row.contains('\u{2026}'),
+        "and the cut is MARKED, not silent: {row:?}",
+    );
+}
+
+/// The picker's box is the size its own geometry says, and it leaves the
+/// same outer gap as the other two dialogs.
+///
+/// It drew into `area` directly while `ModalOverlay::render` — which the
+/// confirm box and the form go through — is where `DIALOG_MARGIN` is SPENT.
+/// `Element::extent` adds that margin for all three, so the picker's border
+/// sat four columns and two rows wider than `container_picker_size`, making
+/// its documented `clamp(30, 60)` a 34..64 box in practice.
+#[test]
+fn the_picker_spends_the_dialog_margin_like_its_siblings() {
+    let mut app = App::new_for_test();
+    app.conn.established();
+    seed_row(&app, "canary-row-marker");
+    let mut t = term();
+    app.nav.push(Element::Picker(Box::new(k9rs_app::ContainerPicker {
+        target: k9rs_proto::protocol::ObjectRef::new(
+            BuiltInKind::Pod.to_resource_id(),
+            "canary-row-marker".to_string(),
+            k9rs_proto::protocol::Namespace::Named("default".to_string()),
+        ),
+        choices: vec![k9rs_app::ContainerChoice {
+            label: "web".into(),
+            container: k9rs_proto::protocol::LogContainer::Named("web".into()),
+        }],
+        selected: 0,
+        action: k9rs_app::ContainerAction::Logs,
+    })));
+
+    let painted = paint(&mut t, &mut app);
+    // The bottom border run is the box's width: `└` + n×`─` + `┘`.
+    let drawn = painted
+        .split('\u{2514}')
+        .nth(1)
+        .and_then(|rest| rest.split('\u{2518}').next())
+        .map(|run| run.chars().count() + 2)
+        .unwrap_or_else(|| panic!("the picker draws a box:\n{painted}"));
+    let expected = k9rs_app::picker_hints_width() + k9rs_app::DIALOG_CHROME;
+    assert_eq!(
+        drawn as u16,
+        expected.max(30),
+        "the picker's box must be what its geometry says, not that plus the margin:\n{painted}",
+    );
+    assert!(painted.contains("web"), "and the choice is still drawn");
+    // The hint fits ENTIRELY — the clipping this sizing exists to prevent.
+    assert!(
+        painted.contains("<Esc> back"),
+        "the hint row must not be clipped:\n{painted}",
     );
 }

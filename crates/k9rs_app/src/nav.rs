@@ -131,12 +131,6 @@ impl NavStack {
         self.items.push(new_root);
     }
 
-    /// Bottom→top walk for the crumb bar and indicator scans. Read-only:
-    /// nothing below the top can be interpreted, only labeled.
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Element> {
-        self.items.iter()
-    }
-
     /// RENDER-ONLY: lift the top element off so the view BENEATH it can be
     /// drawn, for a floating element ([`crate::element::ViewExtent`]).
     /// Returns `None` at depth 1 — a float over nothing is just a view.
@@ -158,6 +152,10 @@ impl NavStack {
         self.items.push(element);
     }
 
+    /// Test-only: production asks [`Self::is_drilled`], which is the
+    /// question it actually has. `pub` suppresses `dead_code`, so the raw
+    /// count needs the gate to say it is scaffolding.
+    #[cfg(any(test, feature = "testing"))]
     pub fn depth(&self) -> usize {
         self.items.len()
     }
@@ -271,12 +269,19 @@ impl NavStack {
     /// Walked from the top DOWN and stopped at the first non-filter, so a
     /// log view reached from inside another one reports its own chain rather
     /// than both.
-    pub fn log_chain(&self) -> Vec<(String, usize)> {
-        let mut out: Vec<(String, usize)> = Vec::new();
+    pub fn log_chain(&self) -> Vec<crate::element::ChainStep> {
+        let mut out: Vec<crate::element::ChainStep> = Vec::new();
         for element in self.items.iter().rev() {
             match element {
                 Element::LogFilter(f) => {
-                    out.push((f.own_label(), f.retained_len()));
+                    out.push(crate::element::ChainStep {
+                        label: f.own_label(),
+                        kept: f.retained_len(),
+                        // The step's own answer. The renderer used to
+                        // re-derive this from the label's leading `!`, which
+                        // an escaped `\!foo` makes a lie.
+                        sense: f.own_sense(),
+                    });
                 }
                 _ => break,
             }

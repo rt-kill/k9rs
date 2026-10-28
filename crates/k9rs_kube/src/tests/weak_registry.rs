@@ -92,19 +92,6 @@ fn replace_displaces_a_live_resource_without_invalidating_it() {
     assert!(Arc::ptr_eq(&now, &new), "the map points at the replacement");
 }
 
-/// `forget` drops the slot without touching the resource.
-#[test]
-fn forget_leaves_the_resource_alone_but_frees_the_key() {
-    let r = reg();
-    let (held, _) = r.get_or_create("k", |_| true, |_| Arc::new(Thing { id: 1, usable: true }));
-    r.forget(&"k");
-    assert_eq!(held.id, 1);
-
-    let (fresh, outcome) = r.get_or_create("k", |_| true, |_| Arc::new(Thing { id: 2, usable: true }));
-    assert_eq!(outcome, Outcome::Created, "the key is free again");
-    assert!(!Arc::ptr_eq(&held, &fresh));
-}
-
 /// Reporting must not mutate what it reports on — stated in prose at two
 /// status call sites before this was one function.
 #[test]
@@ -141,4 +128,84 @@ fn live_reports_the_holder_count() {
 
     drop(b);
     assert_eq!(r.live()[0].2, 1, "just `a`");
+}
+
+/// `replace` holds the slot for the WHOLE of build-and-insert, so a
+/// concurrent get-or-create cannot slip between the two halves.
+///
+/// `create` used to run BEFORE `entry()` was called, which left a window:
+/// a get-or-create for the same key took the lock first, built its own
+/// resource, inserted it, and handed it to its caller — and then `replace`
+/// overwrote the slot, so that caller was holding a resource nothing could
+/// reach. Two live resources for one key, one of them invisible. The doc
+/// said, in two places, that this could not happen.
+///
+/// Sequenced rather than hammered: the replacing thread parks INSIDE
+/// `create`, which is precisely when the lock must already be held, and the
+/// other thread then tries to get-or-create the same key. If the lock is
+/// held it waits and finds the replacement; if it is not, it builds its own
+/// and is stranded.
+#[test]
+fn replace_cannot_be_interleaved_with_a_get_or_create() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+
+    let r = Arc::new(reg());
+
+    let (inside_tx, inside_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+
+    let replacer = {
+        let r = Arc::clone(&r);
+        std::thread::spawn(move || {
+            r.replace("k", |_| {
+                // Inside `create`: the entry lock is held here, or the
+                // claim this test exists for is false.
+                inside_tx.send(()).expect("test thread alive");
+                go_rx.recv().expect("test thread alive");
+                Arc::new(Thing { id: 1, usable: true })
+            })
+        })
+    };
+
+    inside_rx.recv().expect("the replacer reached its `create`");
+
+    let joined_early = Arc::new(AtomicBool::new(false));
+    let getter = {
+        let r = Arc::clone(&r);
+        let joined_early = Arc::clone(&joined_early);
+        std::thread::spawn(move || {
+            let (arc, outcome) =
+                r.get_or_create("k", |t| t.usable, |_| Arc::new(Thing { id: 2, usable: true }));
+            joined_early.store(true, Ordering::SeqCst);
+            (arc, outcome)
+        })
+    };
+
+    // Long enough that a get-or-create which was NOT blocked would have
+    // finished. This is the only timing-shaped assertion here, and the
+    // outcome check below stands on its own.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let ran_while_locked = joined_early.load(Ordering::SeqCst);
+
+    go_tx.send(()).expect("the replacer is parked");
+    let replacement = replacer.join().expect("replacer");
+    let (got, outcome) = getter.join().expect("getter");
+
+    assert!(
+        !ran_while_locked,
+        "a get-or-create completed while `replace` was inside `create` — the \
+         slot was not held across build-and-insert",
+    );
+    assert_eq!(
+        outcome,
+        Outcome::Reused,
+        "the getter must find the replacement, not build a second resource",
+    );
+    assert!(
+        Arc::ptr_eq(&got, &replacement),
+        "and it must be the SAME resource the map points at (ids {} vs {})",
+        got.id,
+        replacement.id,
+    );
 }

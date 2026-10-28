@@ -1,4 +1,18 @@
 
+//! What `?` shows, projected from the keymap and the row's capabilities.
+//!
+//! Help is an ordinary resource now (`LocalResourceKind::Keybinding`), so
+//! this file produces TABLE ROWS and nothing else — no widget, no geometry.
+//! It is a projection, deliberately: every key it names comes from
+//! [`crate::keymap`]'s declaration or from the capability manifest, so a
+//! screen that describes a key the dispatcher does not answer is not
+//! something this file can express. It was ~250 hand-written entries once,
+//! and it showed `s` (follow, in logs) and `Ctrl-d` (half-page in detail,
+//! DELETE in a table) without saying which view it meant.
+//!
+//! The file had no module doc at all — the only one in its scope without
+//! one.
+
 /// A keybinding entry for the help overlay.
 struct HelpEntry {
     key: String,
@@ -294,3 +308,7 @@ impl HelpContent {
     }
 
 }
+
+#[cfg(test)]
+#[path = "tests/help.rs"]
+mod tests;

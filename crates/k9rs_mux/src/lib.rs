@@ -91,10 +91,66 @@ pub struct MuxHandle {
 /// `protocol::read_bincode` / `write_bincode` work on it without changes.
 ///
 /// Drop sends an RST frame on the substream automatically (handled inside
-/// `tokio_yamux::StreamHandle::Drop`). The peer's read returns EOF.
+/// `tokio_yamux::StreamHandle::Drop`), and the peer's next read fails with
+/// `ConnectionReset`.
+///
+/// NOT EOF — this said "returns EOF" until a test measured it. The
+/// difference does not reach any caller today, because every reader goes
+/// through `read_exact`, which answers `Err` for a clean end too, and every
+/// call site treats `Err` as "the stream is over". But an RST also discards
+/// whatever is still in flight, so `write_all` + `flush` + drop is not a
+/// delivery: the teardown path is fine with that because it drops when it
+/// has stopped caring, and nothing else should lean on it.
+/// See `dropping_a_substream_resets_it_rather_than_closing_it`.
 pub struct MuxedStream {
     inner: tokio_yamux::StreamHandle,
 }
+
+/// How much one substream may have in flight before yamux's flow control
+/// makes the sender wait.
+///
+/// At least `k9rs_proto::protocol::MAX_MESSAGE_SIZE`, or a message that the
+/// protocol considers legitimate — exactly at its cap — stalls here instead
+/// of moving, and the write timeout above eventually kills the substream for
+/// a frame nothing was wrong with.
+///
+/// Deliberately NOT imported from `k9rs_proto`: this crate has no protocol
+/// dependency, which is the whole reason it is a crate rather than part of
+/// the daemon. So the relationship between the two numbers is asserted from
+/// `k9rs_daemon`, which sees both.
+pub const MAX_STREAM_WINDOW: u32 = 64 * 1024 * 1024;
+
+/// How many substreams a PEER may have open on one connection. Outbound
+/// opens are not affected — yamux checks this only when an inbound `SYN`
+/// arrives — so this is a bound on what the other side can make us hold.
+///
+/// It is a *derived* number, because the count and the window are one
+/// decision and not two. yamux's default count of 65,535 was chosen
+/// against yamux's default 256 KiB window, which puts the product — how
+/// much a peer may make us buffer — at about 16 GiB.
+/// [`MAX_STREAM_WINDOW`] raises the window 256×; leaving the count at its
+/// default raises that product 256× with it, to roughly 4 TiB, which is
+/// not a decision anyone made. Dividing the count by the same factor
+/// keeps the product the library picked.
+///
+/// The value today is 255, and ~an order of magnitude above legitimate
+/// use: a session holds one control substream plus one per live
+/// subscription and one per log stream, so a deep nav stack with logs
+/// open is tens.
+pub const MAX_INBOUND_SUBSTREAMS: usize = (tokio_yamux::config::DEFAULT_MAX_STREAM_COUNT
+    * tokio_yamux::config::INITIAL_STREAM_WINDOW as usize)
+    / MAX_STREAM_WINDOW as usize;
+
+// The derivation above divides by the window, so a future window bump
+// shrinks the substream budget — silently, and quadratically if someone
+// raises the window to keep a big snapshot moving. A 1 GiB window would
+// leave 15 substreams, which a single session exceeds. Fail the build
+// instead: at that point the product is the thing to re-decide, in the
+// open, rather than to discover as "the TUI stops opening views".
+const _: () = assert!(
+    MAX_INBOUND_SUBSTREAMS >= 64,
+    "the derived substream budget has fallen below what one session uses — re-decide the window/count product",
+);
 
 /// Yamux configuration tuned for the k9rs workload. Large clusters (9k+
 /// pods) produce multi-MB snapshots per subscription. The default 256 KB
@@ -105,10 +161,12 @@ pub struct MuxedStream {
 ///
 /// We bump the window to 64 MB so a single large snapshot fits without
 /// flow-control pauses, and extend the write timeout so transient stalls
-/// on very large clusters don't kill the connection.
+/// on very large clusters don't kill the connection. Raising the window
+/// is half a decision: see [`MAX_INBOUND_SUBSTREAMS`] for the other half.
 fn mux_config() -> tokio_yamux::Config {
     tokio_yamux::Config {
-        max_stream_window_size: 64 * 1024 * 1024,
+        max_stream_window_size: MAX_STREAM_WINDOW,
+        max_stream_count: MAX_INBOUND_SUBSTREAMS,
         connection_write_timeout: std::time::Duration::from_secs(60),
         ..tokio_yamux::Config::default()
     }
@@ -239,3 +297,6 @@ impl AsyncWrite for MuxedStream {
     }
 }
 
+#[cfg(test)]
+#[path = "tests/lib.rs"]
+mod tests;

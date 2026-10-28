@@ -43,10 +43,33 @@ use crate::commands::{
 };
 
 /// Surface a data_source operation error as a flash message.
+/// Send to the daemon, flashing the error if it could not be sent.
+///
+/// **Evaluates to `true` when the command actually went.** It used to
+/// evaluate to `()`, so a caller could not tell — and two call sites
+/// followed it with an unconditional success flash. `app.ui.flash` is one
+/// slot and last write wins, so those two overwrote the error this had just
+/// set: `ClientSession::send_command` is a `try_send` on a bounded channel,
+/// and after the daemon dies EVERY call fails, so the user was told
+/// "Scale: nginx" while nothing was sent — with the form already popped off
+/// the stack, so nothing on screen contradicted it.
+///
+/// Four other sites opened a view or a takeover that can only be completed
+/// by a reply, and so spun on "Loading…" forever when the send failed. They
+/// gate on this too, opening in `ContentPhase::Failed` instead.
+///
+/// Ignoring the value is fine where the error flash IS the whole feedback —
+/// `delete`/`restart`/`force_kill` report through `OpResult`, and a failed
+/// send has nothing more to say.
 macro_rules! ds_try {
     ($app:expr, $expr:expr) => {
-        if let Err(e) = $expr {
-            $app.ui.flash = Some(k9rs_app::FlashMessage::error(format!("Connection error: {}", e)));
+        match $expr {
+            Ok(_) => true,
+            Err(e) => {
+                $app.ui.flash =
+                    Some(k9rs_app::FlashMessage::error(format!("Connection error: {}", e)));
+                false
+            }
         }
     };
 }
@@ -566,7 +589,6 @@ async fn run_editor_flow(
     let exit_status = match run_interactive_local(
         app, event_rx,
         terminal, &editor, &args,
-        crate::commands::InteractiveKind::Editor,
         input_suspend, input_suspend_ack, input_rx, replay,
     ).await {
         Ok(s) => s,
@@ -794,15 +816,9 @@ async fn run_shell_bridge(
     {
         use std::io::Write;
         let mut out = std::io::stdout();
-        let _ = out.write_all(concat!(
-            "\x1b[m",        // SGR 0: reset colors/bold/underline
-            "\x1b[r",        // DECSTBM: reset scroll region
-            "\x1b[?1000l",   // disable mouse tracking
-            "\x1b[?1006l",   // disable SGR mouse extension
-            "\x1b[?2004l",   // disable bracketed paste
-            "\x1b(B",        // select US-ASCII charset for G0
-            "\x1b[2J\x1b[H", // clear screen + cursor home
-        ).as_bytes());
+        let _ = out.write_all(TERM_MODE_RESET.as_bytes());
+        // Shell-only: a full-screen shell leaves its own frame behind.
+        let _ = out.write_all(b"\x1b[2J\x1b[H"); // clear screen + cursor home
         let _ = out.flush();
     }
 
@@ -1025,6 +1041,30 @@ fn try_handle_input_mode(
     // what, and be exhaustive so the next modal cannot skip the question.
     app.ui.modal_without_key_handler()
 }
+
+/// Escapes that undo every terminal MODE a subprocess may have left set.
+///
+/// ONE constant, consumed by both teardown paths — the shell bridge here and
+/// the `$EDITOR` takeover in [`crate::commands`]. They were two hand-written
+/// `concat!` blocks, with a comment on the editor one reading "Matches the
+/// shell bridge cleanup (session.rs)". It did not match, and `session.rs` has
+/// not existed since the crate split: the editor copy was missing `\x1b[m`
+/// (SGR reset) and `\x1b[r` (DECSTBM). So a subprocess that died leaving a
+/// scroll region set had it cleared on the shell path and left set on the
+/// editor path, and the restored TUI painted into a sub-region — ratatui does
+/// not reset DECSTBM itself.
+///
+/// Mode resets only. Clearing the screen is the shell path's own business: it
+/// hands the terminal back from a full-screen program, while an editor
+/// takeover returns to a frame the TUI is about to repaint anyway.
+pub(crate) const TERM_MODE_RESET: &str = concat!(
+    "\x1b[m",      // SGR 0: reset colors/bold/underline
+    "\x1b[r",      // DECSTBM: reset scroll region
+    "\x1b[?1000l", // disable mouse tracking
+    "\x1b[?1006l", // disable SGR mouse extension
+    "\x1b[?2004l", // disable bracketed paste
+    "\x1b(B",      // select US-ASCII charset for G0
+);
 
 /// Capture a keystroke into the log filter input draft (`/`-prompt within
 /// the logs view). Returns `true` if the key was consumed. Mirrors the

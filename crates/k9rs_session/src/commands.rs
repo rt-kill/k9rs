@@ -5,16 +5,6 @@ use tokio::sync::mpsc;
 use k9rs_app::App;
 use k9rs_proto::protocol::ResourceId;
 
-/// What kind of interactive command we're about to suspend the TUI for.
-/// Determines pre-launch UI (the "Connecting…" box for shells) and
-/// post-launch failure handling. Replaces the previous trick of inspecting
-/// `args.first() == "exec"` to guess the kind from argv.
-pub(crate) enum InteractiveKind {
-    /// `$EDITOR /tmp/k9rs-edit-...`. No connecting box, no flash on
-    /// non-zero exit (the edit flow surfaces its own errors).
-    Editor,
-}
-
 /// Await `work` while applying everything the daemon sends in the meantime.
 ///
 /// Extracted so the property can actually be tested: the TUI-suspension path
@@ -39,10 +29,16 @@ where
     }
 }
 
-/// Suspend the TUI and run an interactive command directly (with bash->sh
-/// fallback for shell). The caller hands in a typed `InteractiveKind` so
-/// this function doesn't have to inspect `args` to guess what it's about
-/// to launch.
+/// Suspend the TUI and run an interactive command directly.
+///
+/// One caller, one kind of command: the `$EDITOR` takeover. It used to take
+/// an `InteractiveKind` parameter, bound as `_kind` and never read, whose doc
+/// said it "determines pre-launch UI (the 'Connecting…' box for shells) and
+/// post-launch failure handling" — it determined nothing, and shells do not
+/// come through here at all (they go to `run_shell_bridge`). A one-variant
+/// enum constructed at its single call site draws no `dead_code` warning,
+/// which is how it survived. The bash→sh fallback the next paragraph used to
+/// promise is likewise not here; it is `SHELL_TEMPLATE`'s, on the exec path.
 ///
 /// # Why this drains `event_rx` while the subprocess runs
 ///
@@ -66,7 +62,6 @@ pub(crate) async fn run_interactive_local(
     terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend + std::io::Write>,
     command: &str,
     args: &[String],
-    _kind: InteractiveKind,
     input_suspend: &tokio::sync::watch::Sender<bool>,
     input_suspend_ack: &mut mpsc::Receiver<()>,
     input_rx: &mut mpsc::Receiver<crossterm::event::Event>,
@@ -106,18 +101,15 @@ pub(crate) async fn run_interactive_local(
         crossterm::cursor::Hide,
     )?;
 
-    // Reset terminal modes the subprocess may have changed. Matches the
-    // shell bridge cleanup (session.rs) — without this, stale terminal
-    // responses during the alt-screen transition can be parsed as key
-    // events (e.g. a spurious 'r' triggering the restart dialog).
+    // Reset terminal modes the subprocess may have changed — the same list
+    // the shell bridge uses, because it is now literally the same constant
+    // (`crate::TERM_MODE_RESET`; see there for the two entries this copy was
+    // missing). Without this, stale terminal responses during the alt-screen
+    // transition can be parsed as key events (e.g. a spurious 'r' triggering
+    // the restart dialog).
     {
         let backend = guard.terminal_mut().backend_mut();
-        let _ = std::io::Write::write_all(backend, concat!(
-            "\x1b[?1000l",  // disable mouse tracking
-            "\x1b[?1006l",  // disable SGR mouse extension
-            "\x1b[?2004l",  // disable bracketed paste
-            "\x1b(B",       // select US-ASCII charset for G0
-        ).as_bytes());
+        let _ = std::io::Write::write_all(backend, crate::TERM_MODE_RESET.as_bytes());
         let _ = std::io::Write::flush(backend);
     }
 
@@ -409,6 +401,8 @@ pub(crate) fn edit_command_key(app: &mut App, key: k9rs_app::TextKey) -> Command
         // the recall had got to.
         code @ (KeyCode::Backspace
         | KeyCode::Delete
+        | KeyCode::Left
+        | KeyCode::Right
         | KeyCode::Home
         | KeyCode::End
         | KeyCode::Char(_)) => {
@@ -428,6 +422,18 @@ pub(crate) fn edit_command_key(app: &mut App, key: k9rs_app::TextKey) -> Command
                     }
                     // Moving the caret is not an edit — the recalled command
                     // is still the recalled command.
+                    //
+                    // These two arms were UNREACHABLE: the or-pattern above
+                    // did not admit `Left`/`Right`, so they fell to the
+                    // outer `_ => {}`, were reported as consumed, and the
+                    // caret never moved. `unreachable_pattern` cannot see
+                    // it — `code` is a `KeyCode`, so the arms are
+                    // well-typed. The other text sinks all handle the
+                    // arrows (the form dialog in its own `Left | Right` arm
+                    // above, which is why ITS or-pattern omits them), so
+                    // this was the only box where they did nothing — and it
+                    // is the one whose renderer has dedicated caret
+                    // windowing, until now reachable only via Home/End.
                     KeyCode::Left => input.left(),
                     KeyCode::Right => input.right(),
                     KeyCode::Home => input.home(),
@@ -740,11 +746,15 @@ fn dispatch_form_submit(
     match dialog.submit.build_command(&dialog.target, &dialog.fields) {
         Ok(cmd) => {
             app.kube.kubectl_cache.clear();
-            ds_try!(app, data_source.send_command(cmd));
-            let label = dialog.submit.from_operation_label();
-            app.ui.flash = Some(k9rs_app::FlashMessage::info(
-                format!("{}: {}", label, dialog.target.name)
-            ));
+            // Gated for the reason `ds_try` gives: the form has already
+            // been popped, so an unconditional "Scale: nginx" over the
+            // connection error left nothing on screen to contradict it.
+            if ds_try!(app, data_source.send_command(cmd)) {
+                let label = dialog.submit.label();
+                app.ui.flash = Some(k9rs_app::FlashMessage::info(
+                    format!("{}: {}", label, dialog.target.name)
+                ));
+            }
         }
         Err(msg) => {
             app.ui.flash = Some(k9rs_app::FlashMessage::warn(msg));

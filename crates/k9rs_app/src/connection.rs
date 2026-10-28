@@ -32,9 +32,18 @@ use std::time::Duration;
 /// `ConnectionEstablished` (success) or `ConnectionFailed` (the target was
 /// unreachable) — both via [`settle`](Self::settle). There is deliberately
 /// no lingering `Failed` state: a resolved switch is `Stable` or it is still
-/// in flight, nothing in between, so "stuck InFlight" is unrepresentable.
-/// Attempting a new switch from Requested or InFlight is rejected at
-/// `begin_context_switch`.
+/// in flight, nothing in between. Attempting a new switch from Requested or
+/// InFlight is rejected at `begin_context_switch`.
+///
+/// `InFlight` is not bounded by the TYPE, and this doc used to say it was
+/// ("stuck InFlight is unrepresentable" — it names no construct, because
+/// there is none). `InFlight(name)` is constructible and nothing in the enum
+/// forces an exit; what closes the cycle is that [`settle`](Self::settle) is
+/// called on both outcomes, from two sites in two different crates. There is
+/// no timeout, so a connection attempt that reports NEITHER outcome leaves
+/// this in flight indefinitely — the same residual `App::pending_batch`
+/// documents for itself, and a wire correlation id plus a deadline would be
+/// the full fix for both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextSwitchState {
     Stable,

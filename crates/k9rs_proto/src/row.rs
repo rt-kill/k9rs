@@ -646,8 +646,13 @@ impl KubeResource for ResourceRow {
 }
 
 impl ResourceRow {
-    /// Mutate a cell in-place (e.g., for metrics overlay). No-op if `col`
-    /// is out of bounds.
+    /// Mutate a cell in-place. No-op if `col` is out of bounds.
+    ///
+    /// Test-only. The doc used to offer "e.g., for metrics overlay" as its
+    /// purpose, and the metrics overlay does not use it — it goes through
+    /// the lens at derive time, so no row is mutated in place at all.
+    /// Production rows are built whole by their converters.
+    #[cfg(test)]
     pub fn set_cell(&mut self, col: usize, value: CellValue) {
         if col < self.cells.len() {
             self.cells[col] = value;

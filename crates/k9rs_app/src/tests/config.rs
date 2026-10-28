@@ -192,12 +192,12 @@ fn parses_plain_ctrl_and_case() {
     assert_eq!(parse("L"), Ok(KeyCombo::plain('L')));
     assert_eq!(parse("-"), Ok(KeyCombo::plain('-')), "a lone dash is a character");
     assert_eq!(parse(" "), Ok(KeyCombo::plain(' ')), "space is a character");
-    assert_eq!(parse("ctrl-l"), Ok(KeyCombo { ctrl: true, ch: 'l' }));
+    assert_eq!(parse("ctrl-l"), Ok(KeyCombo::ctrl('l')));
     // Ctrl chords arrive lowercase from the terminal — an uppercase
     // spec is normalized so it can actually match.
-    assert_eq!(parse("Ctrl-L"), Ok(KeyCombo { ctrl: true, ch: 'l' }));
-    assert_eq!(parse("C-x"), Ok(KeyCombo { ctrl: true, ch: 'x' }));
-    assert_eq!(parse(" ctrl-l "), Ok(KeyCombo { ctrl: true, ch: 'l' }), "trimmed");
+    assert_eq!(parse("Ctrl-L"), Ok(KeyCombo::ctrl('l')));
+    assert_eq!(parse("C-x"), Ok(KeyCombo::ctrl('x')));
+    assert_eq!(parse(" ctrl-l "), Ok(KeyCombo::ctrl('l')), "trimmed");
 }
 
 #[test]
@@ -211,7 +211,7 @@ fn rejects_malformed_specs() {
 fn validate_rejects_reserved_and_duplicate_chords() {
     // Reserved: a binding an earlier dispatch layer always consumes.
     let keys = KeysConfig {
-        logs: Some(KeyCombo { ctrl: true, ch: 'r' }),
+        logs: Some(KeyCombo::ctrl('r')),
         ..Default::default()
     };
     let err = keys.validate().unwrap_err();
@@ -230,7 +230,7 @@ fn validate_rejects_reserved_and_duplicate_chords() {
     let keys = KeysConfig {
         col_left: Some(KeyCombo::plain('h')),
         col_right: Some(KeyCombo::plain('l')),
-        logs: Some(KeyCombo { ctrl: true, ch: 'l' }),
+        logs: Some(KeyCombo::ctrl('l')),
         ..Default::default()
     };
     assert!(keys.validate().is_ok());
@@ -243,8 +243,8 @@ fn op_key_override_replaces_default() {
     // Default: descriptor key as a plain chord.
     assert_eq!(keys.op_key(&Op::StreamLogs), Some(KeyCombo::plain('l')));
     // Override REPLACES it (the default char is no longer the binding).
-    keys.logs = Some(KeyCombo { ctrl: true, ch: 'l' });
-    assert_eq!(keys.op_key(&Op::StreamLogs), Some(KeyCombo { ctrl: true, ch: 'l' }));
+    keys.logs = Some(KeyCombo::ctrl('l'));
+    assert_eq!(keys.op_key(&Op::StreamLogs), Some(KeyCombo::ctrl('l')));
     // Structural-default ops have no chord unless the user adds one.
     assert_eq!(keys.op_key(&Op::Delete), None);
     keys.delete = Some(KeyCombo::plain('x'));
@@ -257,7 +257,7 @@ fn op_key_override_replaces_default() {
 fn labels_render_ctrl_and_shift() {
     assert_eq!(KeyCombo::plain('l').label(), "l");
     assert_eq!(KeyCombo::plain('L').label(), "Shift-l");
-    assert_eq!(KeyCombo { ctrl: true, ch: 'l' }.label(), "Ctrl-l");
+    assert_eq!(KeyCombo::ctrl('l').label(), "Ctrl-l");
 }
 
 /// Pins the documented config shape (what `load_section` hands to
@@ -277,7 +277,7 @@ fn app_config_parses_keys_section() {
     assert_eq!(cfg.keys.namespace_all, Some(KeyCombo::plain(')')));
     // `0` / `$` / `)` are not reserved chords, so the binding validates.
     assert!(cfg.keys.validate().is_ok(), "vim 0/$ column jumps + namespaceAll must validate");
-    assert_eq!(cfg.keys.logs, Some(KeyCombo { ctrl: true, ch: 'l' }));
+    assert_eq!(cfg.keys.logs, Some(KeyCombo::ctrl('l')));
     // A typo'd binding name is a load-time error (deny_unknown_fields),
     // not a silently ignored key.
     assert!(serde_yaml::from_str::<AppConfig>("keys:\n  colleft: h\n").is_err());
@@ -332,4 +332,212 @@ assert_eq!(
     documented.difference(&actual).collect::<Vec<_>>(),
     actual.difference(&documented).collect::<Vec<_>>(),
 );
+}
+
+/// The client gate and the daemon gate answer "read-only?" identically.
+///
+/// They were computed in two places from two different inputs: the entry
+/// point handed `ConnectionParams.readonly` a bare `--readonly` flag while
+/// `App::new` took `config.read_only`, so `readOnly: true` in config.yaml
+/// armed the client and left the DAEMON open — every mutation the TUI did
+/// not happen to refuse first went straight through. And because the
+/// reconnect path sends `app.read_only`, which does include the config, the
+/// daemon-side gate switched itself on after a dropped connection: one
+/// session, enforced differently before and after a reconnect.
+#[test]
+fn both_read_only_gates_resolve_the_same_answer() {
+    for (flag, in_config) in [(false, false), (false, true), (true, false), (true, true)] {
+        let cfg = crate::AppConfig { read_only: in_config, ..Default::default() };
+        assert_eq!(
+            crate::ConnectionParams::read_only(flag, &cfg),
+            flag || in_config,
+            "flag={flag} config={in_config}: either source arms the session",
+        );
+
+        // What `App` stores is the SAME function of the same config. `main`
+        // applies the flag on top of this, so both halves are checked.
+        let namespace = k9rs_proto::protocol::Namespace::All;
+        let metrics = crate::store::MetricsHub::new();
+        let root = crate::element::Element::ResourceList(
+            crate::element::ResourceList::open_for_test(
+                crate::element::QuerySpec {
+                    rid: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
+                    namespace: namespace.clone(),
+                    filter: None,
+                },
+                &metrics,
+                "pods".to_string(),
+            ),
+        );
+        let app = crate::App::new_with_root(
+            None,
+            namespace,
+            metrics,
+            root,
+            cfg.clone(),
+            k9rs_theme::term_bg::Appearance::Dark,
+        );
+        assert_eq!(
+            app.read_only,
+            crate::ConnectionParams::read_only(false, &cfg),
+            "config={in_config}: the client gate takes the config half \
+             through the same function the wire does",
+        );
+    }
+}
+
+/// EVERY structural chord is reserved, derived from the one declaration
+/// rather than re-spelled.
+///
+/// `Shift-F` was the missing one. The structural loop runs first in
+/// `handle_resource_view_keys`, ahead of every config lookup, so
+/// `keys: { describe: "F" }` validated clean and then on each resource
+/// declaring `PortForward` — pods, deployments, services — `F`
+/// port-forwarded while `d` no longer described: describe unreachable
+/// there, and still working on a configmap. That split is what the
+/// reserved list exists to prevent.
+#[test]
+fn every_structural_chord_is_reserved() {
+    use k9rs_proto::protocol::OperationKind;
+    let structural: Vec<(OperationKind, crate::config::KeyCombo)> = OperationKind::BUILT_IN
+        .iter()
+        .filter_map(|op| crate::keymap::structural_chord(op).map(|c| (op.clone(), c)))
+        .collect();
+    assert_eq!(structural.len(), 3, "three structural chords: {structural:?}");
+
+    for (op, chord) in structural {
+        // Bind `describe` to it — the operation whose default `d` the user
+        // loses when an override is accepted.
+        let keys = KeysConfig {
+            describe: Some(chord),
+            ..Default::default()
+        };
+        let err = keys.validate().unwrap_err();
+        assert!(
+            err.contains("keys.describe") && err.contains("reserved"),
+            "{op:?}'s chord {} must be refused: {err}",
+            chord.label(),
+        );
+        assert!(
+            err.contains(op.descriptor().label),
+            "…and the refusal must name what holds it: {err}",
+        );
+    }
+}
+
+/// The log view's `C` is reserved for the same reason: it is answered before
+/// the configured chords are consulted.
+#[test]
+fn the_log_views_clear_key_is_reserved() {
+    let keys = KeysConfig {
+        describe: Some(crate::config::KeyCombo::plain('C')),
+        ..Default::default()
+    };
+    let err = keys.validate().unwrap_err();
+    assert!(err.contains("reserved") && err.contains("clear logs"), "{err}");
+}
+
+/// `defaultFollow` is read, and `previous` overrides it.
+///
+/// It had NO reader: the key parsed, passed the strict loader and was
+/// discarded, while its two siblings in the same struct were read in the
+/// same constructor. `defaultFollow: false` was a documented setting
+/// ("auto-scroll logs" in the README) that did nothing.
+#[test]
+fn default_follow_decides_whether_a_fresh_log_follows() {
+    let mut cfg = crate::config::LogConfig::default();
+    assert!(cfg.default_follow, "the shipped default");
+    assert!(cfg.follows(false), "a live stream follows by default");
+
+    cfg.default_follow = false;
+    assert!(!cfg.follows(false), "…and the preference is honoured");
+}
+
+/// A terminated container's log is finite, so following it would pin the
+/// view to a bottom that never moves. `previous` wins over the preference
+/// in BOTH directions — which is why the rule is here and not ANDed by each
+/// of the five callers.
+#[test]
+fn a_previous_log_never_follows() {
+    let mut cfg = crate::config::LogConfig::default();
+    assert!(!cfg.follows(true), "even with the preference on");
+    cfg.default_follow = false;
+    assert!(!cfg.follows(true));
+}
+
+/// A Ctrl chord's character is lowercase whichever door it comes through.
+///
+/// The invariant was enforced only in the config parser: the fields were
+/// `pub`, so `KeyCombo { ctrl: true, ch: 'L' }` was constructible, and every
+/// comparison in the app is exact equality against what the terminal
+/// delivers — which for a Ctrl chord is lowercase (legacy keyboard
+/// protocol). The key handler built one directly, so a terminal reporting
+/// `Ctrl-Shift-L` as `Char('L')` + CONTROL produced a chord no config spec
+/// could ever equal.
+#[test]
+fn a_ctrl_chord_is_lowercase_through_every_door() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let lower = crate::config::KeyCombo::ctrl('l');
+    assert_eq!(crate::config::KeyCombo::ctrl('L'), lower, "the constructor lowercases");
+    assert_eq!(parse("Ctrl-L"), Ok(lower), "…and so does the parser");
+    assert_eq!(
+        crate::config::KeyCombo::of_event(&KeyEvent::new(
+            KeyCode::Char('L'),
+            KeyModifiers::CONTROL,
+        )),
+        Some(lower),
+        "…and so does the event reader, which used to build the struct raw",
+    );
+    assert_eq!(lower.label(), "Ctrl-l");
+}
+
+/// Shift is NOT lowercased: it rides in the character's own case, which is
+/// how `Shift-F` and `C` are expressed.
+#[test]
+fn shift_rides_in_the_characters_case() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let upper = crate::config::KeyCombo::plain('F');
+    assert_eq!(parse("F"), Ok(upper));
+    assert_eq!(
+        crate::config::KeyCombo::of_event(&KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT)),
+        Some(upper),
+    );
+    assert_ne!(upper, crate::config::KeyCombo::plain('f'), "two different bindings");
+    assert_eq!(upper.label(), "Shift-f");
+}
+
+/// A chord and its key event are inverses, so the two halves of the
+/// correspondence cannot drift.
+#[test]
+fn a_chord_round_trips_through_its_key_event() {
+    for combo in [
+        crate::config::KeyCombo::plain('l'),
+        crate::config::KeyCombo::plain('F'),
+        crate::config::KeyCombo::ctrl('d'),
+        crate::config::KeyCombo::ctrl('\\'),
+        crate::config::KeyCombo::plain(' '),
+    ] {
+        assert_eq!(
+            crate::config::KeyCombo::of_event(&combo.as_key_event()),
+            Some(combo),
+            "{} must survive the round trip",
+            combo.label(),
+        );
+    }
+}
+
+/// An Alt chord is not a binding at all — an unclaimed one must not alias to
+/// its bare character, which is how `Alt-q` came to quit the app.
+#[test]
+fn an_alt_chord_is_not_a_binding() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    assert_eq!(
+        crate::config::KeyCombo::of_event(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT)),
+        None,
+    );
+    assert_eq!(
+        crate::config::KeyCombo::of_event(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        None,
+        "nor is a non-character key",
+    );
 }

@@ -42,12 +42,13 @@ pub async fn execute_delete(
         ),
     }
 
-    // Fallback: kubectl delete.
-    let mut cmd = session_env.kubectl();
+    // Fallback: kubectl delete. Bounded — this is the one path a batch can
+    // fan out across, one subprocess per marked row (see
+    // `MAX_CONCURRENT_KUBECTL`).
+    let mut cmd = session_env.kubectl_once().await;
     cmd.arg("delete").arg(target.kubectl_target());
     if let Some(ns) = target.namespace.as_option() { cmd.arg("-n").arg(ns); }
     cmd.arg("--context").arg(context.as_str());
-    cmd.kill_on_drop(true);
     let output = cmd.output().await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

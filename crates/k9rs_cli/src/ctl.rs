@@ -190,7 +190,11 @@ async fn cmd_clear(context: Option<ContextName>, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn format_duration(secs: u64) -> String {
+/// `ctl`'s own duration format: spaced, and keeping the middle unit —
+/// `1d 1h 1m`, not `format_age_secs`'s column-shaped `1d1h`. Different
+/// audiences, so deliberately not shared; pinned by
+/// `the_ctl_duration_format_keeps_its_spaces_and_its_middle_unit`.
+pub(crate) fn format_duration(secs: u64) -> String {
     let days = secs / 86400;
     let hours = (secs % 86400) / 3600;
     let mins = (secs % 3600) / 60;

@@ -53,7 +53,7 @@ fn push_content_element(app: &mut App, yaml: bool) {
 /// Push a log-session element (parked stream) as the top view.
 fn push_log_element(app: &mut App) {
     app.nav.push(crate::element::Element::LogSession(Box::new(
-        crate::element::LogSession::for_test(k9rs_proto::protocol::LogTarget::One("test-pod".to_string()), k9rs_proto::protocol::LogContainer::Default),
+        crate::element::LogSession::for_test(k9rs_proto::protocol::LogTarget::one("test-pod".to_string()), k9rs_proto::protocol::LogContainer::Default),
     )));
 }
 
@@ -212,7 +212,7 @@ fn test_key_rebinding_moves_and_shadows() {
     use crate::KeyCombo;
     let mut app = make_resource_app();
     reset_to_kind(&mut app, k9rs_proto::resource_def::BuiltInKind::Pod);
-    app.config.keys.logs = Some(KeyCombo { ctrl: true, ch: 'l' });
+    app.config.keys.logs = Some(KeyCombo::ctrl('l'));
     app.config.keys.col_left = Some(KeyCombo::plain('h'));
     app.config.keys.col_right = Some(KeyCombo::plain('l'));
 
@@ -251,7 +251,7 @@ fn test_column_jump_bindings_shadow_defaults() {
     ));
     assert!(handle_key_event(&app, make_key(KeyCode::Char('$'))).is_none());
 
-    app.config.keys.col_first = Some(KeyCombo::plain('0'));
+    app.config.keys.col_first = Some(crate::KeyCombo::plain('0'));
     app.config.keys.col_last = Some(KeyCombo::plain('$'));
 
     // Now they move the column cursor, shadowing the all-namespaces default.
@@ -302,7 +302,7 @@ fn test_confirm_dialog_keys() {
             ),
         },
         action_label: "Delete".to_string(),
-        action_focused: false,
+        focused: crate::ConfirmFocus::Cancel,
     })));
 
     assert!(matches!(
@@ -947,3 +947,207 @@ fn form_element() -> crate::element::Element {
     }))
 }
 
+fn make_alt_key(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::ALT,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    }
+}
+
+/// No Alt chord is its bare character — in ANY view class.
+///
+/// `combo_of` refuses Alt with exactly this reasoning ("an Alt-modified key
+/// is a different chord, not its bare character"), but only the data-driven
+/// `keys.*` lookups go through it. The structural `match key.code` arms do
+/// not, and each view class guarded CONTROL only — so every Alt chord fell
+/// through to the literal arm for its bare letter. **`Alt-q` quit the app**,
+/// `Alt-g` jumped Home, `Alt-d` deleted.
+///
+/// Swept over every letter rather than spot-checked on `q`: the bug was one
+/// missing modifier in a guard, so any letter with a literal arm had it, and
+/// a fix that only taught `q` about Alt would leave the rest.
+#[test]
+fn an_alt_chord_is_never_its_bare_character() {
+    let mut app = make_resource_app();
+    for class in ["resource list", "overview"] {
+        let mut app = App::new_for_test();
+        if class == "overview" {
+            app.nav.reset(crate::element::Element::Overview(Default::default()));
+        }
+        for c in 'a'..='z' {
+            let alt = handle_key_event(&app, make_alt_key(KeyCode::Char(c)));
+            assert!(
+                alt.is_none(),
+                "{class}: Alt-{c:?} produced {alt:?} — a chord is not its bare character",
+            );
+        }
+        for code in [KeyCode::Enter, KeyCode::Home, KeyCode::End, KeyCode::Esc] {
+            let alt = handle_key_event(&app, make_alt_key(code));
+            assert!(alt.is_none(), "{class}: Alt-{code:?} produced {alt:?}");
+        }
+    }
+
+    // The sibling rule the four copies DID get right, kept here so a future
+    // consolidation cannot quietly drop one half of it. `Ctrl-d`/`Ctrl-u` are
+    // claimed in detail views, so this asks the resource list.
+    let _ = &mut app;
+    for c in ['q', 'g', 'd', 'y'] {
+        let ctrl = handle_key_event(&app, make_ctrl_key(KeyCode::Char(c)));
+        assert!(
+            ctrl.is_none() || !matches!(ctrl, Some(Action::Quit)),
+            "Ctrl-{c:?} produced {ctrl:?}",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The four column chords, and what a rebind may shadow
+// ---------------------------------------------------------------------------
+
+/// All FOUR configured column chords work in a log view, not three.
+///
+/// `colLast` was the missing one — `keys: { colLast: "e" }` jumped columns
+/// in a table and did nothing in a log, under a comment saying these are "a
+/// property of the ACTION rather than of one view".
+#[test]
+fn every_configured_column_chord_works_in_a_log_view() {
+    use crate::actions::Action;
+    let wanted = [
+        ('a', Action::ColLeft),
+        ('b', Action::ColRight),
+        ('c', Action::ColFirst),
+        ('e', Action::ColLast),
+    ];
+    for (ch, expected) in wanted {
+        let mut app = App::new_for_test();
+        push_log_element(&mut app);
+        app.config.keys.col_left = Some(crate::KeyCombo::plain('a'));
+        app.config.keys.col_right = Some(crate::KeyCombo::plain('b'));
+        app.config.keys.col_first = Some(crate::KeyCombo::plain('c'));
+        app.config.keys.col_last = Some(crate::KeyCombo::plain('e'));
+        assert_eq!(
+            handle_key_event(&app, make_key(KeyCode::Char(ch))),
+            Some(expected.clone()),
+            "`{ch}` must reach {expected:?} in a log view, as it does in a table",
+        );
+        // …and the same binding in a table, so this really is one decision.
+        let mut table = App::new_for_test();
+        table.config.keys.col_left = Some(crate::KeyCombo::plain('a'));
+        table.config.keys.col_right = Some(crate::KeyCombo::plain('b'));
+        table.config.keys.col_first = Some(crate::KeyCombo::plain('c'));
+        table.config.keys.col_last = Some(crate::KeyCombo::plain('e'));
+        assert_eq!(handle_key_event(&table, make_key(KeyCode::Char(ch))), Some(expected));
+    }
+}
+
+/// `colFirst: "0"` does NOT cost the log view its range ladder.
+///
+/// The ladder is advertised in the hint bar as `<0-7> range` and has no
+/// other key; column panning has `^` and `$`, which are structural. On a
+/// table the same rebind costs nothing, because switch-to-all-namespaces
+/// keeps its own `namespaceAll` escape hatch — so the digits win here and
+/// the table keeps its rebind.
+#[test]
+fn rebinding_col_first_to_zero_keeps_the_log_range_ladder() {
+    use crate::actions::{Action, LogRange};
+    let mut app = App::new_for_test();
+    push_log_element(&mut app);
+    app.config.keys.col_first = Some(crate::KeyCombo::plain('0'));
+
+    assert_eq!(
+        handle_key_event(&app, make_key(KeyCode::Char('0'))),
+        Some(Action::LogRange(LogRange::Tail)),
+        "`0` is the tail range, which nothing else reaches",
+    );
+    assert_eq!(
+        handle_key_event(&app, make_key(KeyCode::Char('7'))),
+        Some(Action::LogRange(LogRange::Head)),
+    );
+    // And the panning the rebind was for is still reachable structurally.
+    assert_eq!(handle_key_event(&app, make_key(KeyCode::Char('^'))), Some(Action::ColFirst));
+
+    // On a TABLE the rebind still takes effect — the asymmetry is deliberate
+    // and this is the half that says so.
+    let mut table = App::new_for_test();
+    table.config.keys.col_first = Some(crate::KeyCombo::plain('0'));
+    assert_eq!(handle_key_event(&table, make_key(KeyCode::Char('0'))), Some(Action::ColFirst));
+}
+
+/// A chord is not its bare character in a picker either.
+///
+/// The four per-class handlers got this guard when `Alt-q` was found
+/// quitting the app; the picker's was reached through `handle_dialog_keys`
+/// and was not among them, so `Ctrl-j` moved the selection and `Ctrl-q`
+/// left the picker.
+#[test]
+fn a_chord_is_not_its_bare_character_in_a_picker() {
+    use crossterm::event::KeyModifiers as M;
+    let mut app = App::new_for_test();
+    app.nav.push(crate::element::Element::Picker(Box::new(crate::ContainerPicker {
+        target: ObjectRef::new(
+            k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
+            "canary".to_string(),
+            Namespace::Named("default".to_string()),
+        ),
+        choices: vec![crate::ContainerChoice {
+            label: "web".into(),
+            container: k9rs_proto::protocol::LogContainer::Named("web".into()),
+        }],
+        selected: 0,
+        action: crate::ContainerAction::Logs,
+    })));
+
+    // The bare keys still work.
+    assert_eq!(
+        handle_key_event(&app, make_key(KeyCode::Char('j'))),
+        Some(crate::actions::Action::NextItem),
+    );
+    // The chords are nothing.
+    for (ch, mods) in [('j', M::CONTROL), ('k', M::CONTROL), ('q', M::CONTROL), ('q', M::ALT)] {
+        let key = KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert_eq!(
+            handle_key_event(&app, key),
+            None,
+            "{mods:?}-{ch} must not alias to the bare `{ch}`",
+        );
+    }
+}
+
+/// `:` under a dialog cancels it; it does NOT open the command prompt.
+///
+/// This is what keeps `Modal::Command` and `Element::Confirm` from
+/// co-existing — a state the types DO allow. If the prompt could open under
+/// a dialog, `edit_command_key` would consume every key while
+/// `command_input` is `Some`, whatever is on the nav stack, and the box
+/// would be unanswerable. The guarantee lives in the input router, so this
+/// is where it is checked.
+#[test]
+fn a_colon_under_a_dialog_cancels_it_rather_than_opening_the_prompt() {
+    let mut app = App::new_for_test();
+    app.nav.push(crate::element::Element::Confirm(Box::new(crate::ConfirmDialog {
+        message: "Delete pod/canary?".to_string(),
+        action_label: "Delete".to_string(),
+        pending: crate::PendingAction::Single {
+            op: crate::SingleOp::Delete,
+            target: ObjectRef::new(
+                k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
+                "canary".to_string(),
+                Namespace::Named("default".to_string()),
+            ),
+        },
+        focused: crate::ConfirmFocus::Cancel,
+    })));
+    assert!(app.ui.command_input().is_none(), "no prompt to begin with");
+    assert_eq!(
+        handle_key_event(&app, make_key(KeyCode::Char(':'))),
+        Some(crate::actions::Action::Cancel),
+        "`:` must reach the dialog's own keymap, not the global that opens the prompt",
+    );
+}

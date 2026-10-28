@@ -388,10 +388,10 @@ fn cluster_width_matches_what_ratatui_draws() {
         buf.set_stringn(0, 0, g, 16, ratatui::style::Style::default());
         let consumed = (0..16).take_while(|&x| buf[(x, 0)].symbol() != SENTINEL).count();
         assert_eq!(
-            super::cluster_width(g),
+            crate::widgets::log_measure::cluster_width(g),
             consumed,
             "we say {} columns for {g:?}; ratatui consumed {consumed}",
-            super::cluster_width(g),
+            crate::widgets::log_measure::cluster_width(g),
         );
     }
 }
@@ -435,8 +435,8 @@ fn the_extent_survives_a_filter_that_splits_a_cluster() {
 /// every Java stack trace.
 #[test]
 fn a_tab_is_measured_the_way_it_is_drawn() {
-    assert_eq!(super::cluster_width("\t"), 0, "ratatui draws nothing for it");
-    assert_eq!(super::cluster_width("\u{7}"), 0);
+    assert_eq!(crate::widgets::log_measure::cluster_width("\t"), 0, "ratatui draws nothing for it");
+    assert_eq!(crate::widgets::log_measure::cluster_width("\u{7}"), 0);
     let line = ll("\tabcdefgh");
     let mut st = state(true, None);
     let rows = render_rows(std::slice::from_ref(&line), &mut st, 9, 6);

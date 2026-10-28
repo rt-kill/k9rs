@@ -13,8 +13,9 @@
 //! - When the grace expires, the `Arc` drops and teardown cascades:
 //!   port-forward entries drop their
 //!   [`OperatorGuard`](super::supervise::OperatorGuard)s, aborting each
-//!   supervised loop, whose in-flight attempt drops its `kill_on_drop`
-//!   child. Drop *is* the cleanup at every level.
+//!   supervised loop, which drops its in-flight attempt — for a port-forward
+//!   that is the `Api::portforward` tunnel; for an exec source it is a
+//!   `kill_on_drop` child. Drop *is* the cleanup at every level.
 //!
 //! Within that bound, two deliberate ownership policies coexist — the
 //! strong-vs-`Weak` distinction is the vocabulary for it:
@@ -32,8 +33,8 @@
 //!
 //! This slice does NOT share the watcher grace window. A warm watcher costs
 //! a row store plus an apiserver watch and buys back a re-LIST; a port-forward
-//! costs one `kubectl` child, was created by an explicit user action, and
-//! buying it back means the user noticing it died. See
+//! costs one tunnel task and a bound local port, was created by an explicit
+//! user action, and buying it back means the user noticing it died. See
 //! `DEFAULT_LOCALS_GRACE_SECS`(crate::grace::DEFAULT_LOCALS_GRACE_SECS).
 //!
 //! The deadline-based grace this module used to implement by hand — so the
@@ -66,7 +67,7 @@ pub struct ContextLocals {
     /// Keep-alive window after the last session detaches. `None` = drop
     /// immediately (`--no-daemon`: the registry lives inside a single
     /// connection, so a post-session grace window could never be recovered
-    /// — it would only keep kubectl children alive pointlessly).
+    /// — it would only hold local ports bound pointlessly).
     ///
     /// The deadline-based behaviour this slice used to spell out by hand now
     /// lives in [`crate::grace::GraceGate`] and is shared by every kept-alive object.
@@ -174,7 +175,7 @@ impl Drop for ContextKeepalive {
         // watchers, pollers and local sources. `None` (`--no-daemon`) means
         // die with the attachment. When the task's Arc finally drops, if it
         // was the last strong ref the slice tears down: port-forward guards
-        // abort, kubectl children are reaped.
+        // abort, their tunnels close, and any exec child is reaped.
         crate::grace::spawn_grace(
             Arc::clone(&self.0),
             |_locals| false,

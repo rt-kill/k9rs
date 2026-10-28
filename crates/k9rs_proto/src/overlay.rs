@@ -572,6 +572,12 @@ impl ColumnRenderRules {
     /// only way in is still a `when` string that `parse_when` accepts.
     /// `None` if any string is malformed, so a typo in a test is a failure
     /// rather than a silently-dropped rule.
+    ///
+    /// Its only caller IS a test, in `k9rs_app`. Ungated, unlike the other
+    /// test-only accessors in this workspace, because gating it would mean
+    /// giving `k9rs_proto` a `testing` feature for one function — more knob
+    /// than the problem. Noted here so a dead-`pub` sweep, which cannot see
+    /// intent, reads this as answered rather than as a find.
     pub fn from_when_pairs(pairs: &[(&str, RowHealth)]) -> Option<Self> {
         pairs
             .iter()

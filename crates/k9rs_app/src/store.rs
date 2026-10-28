@@ -31,11 +31,12 @@
 //! old mutate-rows-then-re-overlay dance is gone).
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::table::TableDataState;
-use crate::state::DeltaTracker;
 use k9rs_proto::overlay::ColumnRenderRules;
 use k9rs_proto::protocol::{
     MetricsUsage, NodeName, ObjectKey, ResourceId, RowChange, TableBaseline, TableDelta,
@@ -947,15 +948,21 @@ pub(crate) fn derive_view(
     //    stringify the visible cells directly — hidden columns are never
     //    materialized at all.
     //
-    //    These two branches are EQUIVALENT because rows always carry a cell
-    //    for every schema column: converters emit metric columns as
-    //    `CellValue::Placeholder`, so `cells.len() == headers.len()` and no
-    //    visible index exceeds `eff[i]`'s length. If a converter ever emits
-    //    a SHORT row, the filtered branch would blank the out-of-range
-    //    visible cells (`get_mut` → None → "") while the unfiltered branch
-    //    would synthesize them via the metrics lens — so keep rows
-    //    full-width (the whole derive already assumes it: sort and
-    //    cell_style index `row.cells` directly).
+    //    These two branches are equivalent only while rows carry a cell for
+    //    every schema column, and nothing enforces that. BUILT-IN converters
+    //    do — they emit metric columns as `CellValue::Placeholder` — but
+    //    `convert_dynamic` emits `cells: Vec::new()` when a CRD object fails
+    //    to serialize, and says so in its own comment. The divergence
+    //    (filtered branch blanks the out-of-range cells via `get_mut` →
+    //    None → ""; unfiltered branch synthesizes them through the metrics
+    //    lens) is unreachable today for a second reason entirely:
+    //    `MetricsBinding::for_rid` needs a `built_in_kind()`, so the one
+    //    short-row producer always has `metrics == None` and both branches
+    //    blank. That is the real invariant, and it was nowhere written.
+    //
+    //    So: keep rows full-width where you can (sort and cell_style index
+    //    `row.cells` directly), and know that the CRD path's short rows are
+    //    safe by the metrics binding rather than by width.
     let rows: Vec<Vec<String>> = order
         .iter()
         .map(|&i| {
@@ -1340,8 +1347,21 @@ pub struct LineStoreInner {
     /// every line carries its tag), so assignment gives distinct colours up
     /// to the palette size by construction.
     ///
-    /// Bounded by `MAX_LOG_FANOUT`, so the linear scan below is over at most
-    /// twenty short strings.
+    /// NOT bounded here, and this used to claim it was "bounded by
+    /// `MAX_LOG_FANOUT`, so the linear scan below is over at most twenty
+    /// short strings". That cap is the daemon's and it bounds ONE stream's
+    /// plan; this list deliberately survives [`LineStore::clear`] so a range
+    /// restart does not repaint, which means it accumulates every distinct
+    /// tag the session has seen — and a workload whose pods are replaced by
+    /// a rollout keeps producing new ones.
+    ///
+    /// Left uncapped on purpose: `source_color`'s lookup is total only
+    /// because every tag a held line carries is in this list, and the
+    /// palette already wraps past its eight colours by design. Capping here
+    /// would trade an honest wrap for a lookup that can miss. The residual
+    /// is a linear scan over a list that grows with rollouts across one
+    /// session's lifetime; a per-target reset (rather than per-range) would
+    /// be the real bound.
     pub sources: Vec<String>,
     /// Whether the stream behind this store is still delivering (false
     /// once the daemon closed the log substream). Set by every arrival, so
@@ -1412,8 +1432,6 @@ impl LineStore {
         self.lock().retain = retain;
     }
 
-    /// Whether this store has stopped accepting lines because it is a full
-    /// `Head` store — i.e. it has the oldest N and there is more behind.
     /// Distinct source tags in first-seen order — the palette assignment.
     /// Deliberately NOT reset by `clear`: a range restart re-reads the same
     /// pods, and a pod changing colour because you pressed `5` would be the
@@ -1427,6 +1445,12 @@ impl LineStore {
         self.lock().ended
     }
 
+    /// Whether this store has stopped accepting lines because it is a full
+    /// `Head` store — i.e. it has the oldest N and there is more behind.
+    ///
+    /// (This paragraph was block-move residue sitting on `sources()` above,
+    /// which left this function undocumented and gave that one a summary
+    /// line about a different question entirely.)
     pub fn head_is_full(&self) -> bool {
         let inner = self.lock();
         inner.retain == Retain::Head && inner.lines.len() >= inner.max_lines
@@ -1555,6 +1579,129 @@ impl LineStore {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// DeltaTracker — atomic ownership of row-change detection state
+// ---------------------------------------------------------------------------
+
+/// Owns the two maps that must stay in sync for row-change flash
+/// highlights: per-row content hashes from the previous snapshot, and
+/// timestamps of recently-changed rows. The only mutation paths go through
+/// this struct's methods, so it is structurally impossible to update one map
+/// without the other.
+///
+/// Nothing clears it, and nothing needs to: it is a field of the store whose
+/// rows it tracks, so its lifetime is that store's and a context or
+/// namespace switch takes both away together. (The second half of this
+/// sentence used to read "or to forget to clear both on a context switch" —
+/// naming, as a thing made impossible, the exact call that did not exist.)
+///
+/// Replaces the prior pair of loose `prev_rows: HashMap<ObjectKey, u64>` +
+/// `changed_rows: HashMap<ObjectKey, Instant>` fields on `App`.
+#[derive(Debug)]
+pub struct DeltaTracker {
+    prev_hashes: HashMap<k9rs_proto::protocol::ObjectKey, u64>,
+    changed: HashMap<k9rs_proto::protocol::ObjectKey, Instant>,
+}
+
+impl Default for DeltaTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeltaTracker {
+    pub fn new() -> Self {
+        Self {
+            prev_hashes: HashMap::new(),
+            changed: HashMap::new(),
+        }
+    }
+
+    /// Baseline apply: compare incoming rows against the previous hashes.
+    /// Rows whose content hash changed get a fresh timestamp in `changed`.
+    /// The old hash map is replaced wholesale — rows that disappeared are
+    /// implicitly forgotten. `prev_hashes` surviving across baselines is
+    /// what gives cross-recovery highlight continuity (rows that changed
+    /// while a watcher was down still flash after the recovery baseline)
+    /// without mass-highlighting unchanged rows.
+    pub fn rebaseline(&mut self, rows: &[k9rs_proto::row::ResourceRow]) {
+        use k9rs_proto::protocol::ObjectKey;
+        let now = Instant::now();
+        let mut new_prev = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let key = ObjectKey::new(
+                row.namespace.clone().unwrap_or_default(),
+                row.name.clone(),
+            );
+            let new_hash = Self::hash_cells(row);
+            if let Some(prev_hash) = self.prev_hashes.get(&key) {
+                if *prev_hash != new_hash {
+                    self.changed.insert(key.clone(), now);
+                }
+            }
+            new_prev.insert(key, new_hash);
+        }
+        self.prev_hashes = new_prev;
+        // Prune change highlights for rows that no longer exist so stale
+        // entries don't accumulate between expire() ticks.
+        self.changed.retain(|k, _| self.prev_hashes.contains_key(k));
+    }
+
+    /// Delta apply: O(batch), replacing the per-snapshot full-store hash
+    /// pass. The hash comparison stays — kube watches deliver metadata-only
+    /// churn (heartbeats, resourceVersion bumps) as upserts with identical
+    /// cells, and those must NOT flash. New keys don't flash (matches the
+    /// baseline path's insert semantics); removes clear their state in
+    /// O(1) (replacing the old O(n) retain).
+    pub fn apply_changes(&mut self, changes: &[k9rs_proto::protocol::RowChange]) {
+        use k9rs_proto::protocol::RowChange;
+        let now = Instant::now();
+        for change in changes {
+            match change {
+                RowChange::Upsert(row) => {
+                    let key = change.key();
+                    let new_hash = Self::hash_cells(row);
+                    match self.prev_hashes.insert(key.clone(), new_hash) {
+                        Some(prev) if prev != new_hash => {
+                            self.changed.insert(key, now);
+                        }
+                        Some(_) => {} // metadata-only churn: no flash
+                        None => {}    // insert: no flash (matches baseline)
+                    }
+                }
+                RowChange::Remove(key) => {
+                    self.prev_hashes.remove(key);
+                    self.changed.remove(key);
+                }
+            }
+        }
+    }
+
+    fn hash_cells(row: &k9rs_proto::row::ResourceRow) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for cell in &row.cells {
+            cell.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Remove change highlights older than `max_age`. Returns `true` if
+    /// any entries were removed (signals the UI should redraw).
+    pub fn expire(&mut self, max_age: Duration) -> bool {
+        let now = Instant::now();
+        let before = self.changed.len();
+        self.changed.retain(|_, ts| now.duration_since(*ts) < max_age);
+        self.changed.len() != before
+    }
+
+    /// Borrow the changed-rows map for the table widget's flash-highlight
+    /// renderer. The map is keyed by `ObjectKey`; the widget looks up each
+    /// visible row to decide whether to apply the highlight style.
+    pub fn changed_rows(&self) -> &HashMap<k9rs_proto::protocol::ObjectKey, Instant> {
+        &self.changed
+    }
+}
 
 #[cfg(test)]
 #[path = "tests/store.rs"]

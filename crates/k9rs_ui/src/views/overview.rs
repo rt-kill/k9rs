@@ -82,19 +82,23 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     // two derivations of the identity is how the name came to describe the
     // context we were going to while the fields described the one we left.
     let at = app.attachment();
-    let ctx_label = header::context_label(&at);
-    let id = at.identity();
-    let info_fields: &[(&str, &str)] = &[
-        ("Context: ", ctx_label.as_str()),
-        ("Cluster: ", id.cluster().unwrap_or(header::UNKNOWN_FIELD)),
-        ("User: ", id.user().unwrap_or(header::UNKNOWN_FIELD)),
-        ("K8s: ", id.k8s_version().unwrap_or(header::UNKNOWN_FIELD)),
-    ];
-    for (label, value) in info_fields {
-        lines.push(Line::from(vec![
-            Span::styled(*label, theme.info_label),
-            Span::styled(*value, theme.info_value),
-        ]).alignment(Alignment::Center));
+    // ...and the same FITTING, which is the half that was still duplicated.
+    // These values were handed over raw to a centred `Line`, which clips on
+    // the RIGHT — so an `arn:aws:eks:…:cluster/prod-usw2` context lost the
+    // only part that identifies it and the landing page showed four copies
+    // of one prefix. `identity_fields` elides from the left; see there.
+    //
+    // The budget leaves room for the longest label plus the centring, so a
+    // narrow terminal shortens the values rather than cutting them off.
+    let value_w = (area.width as usize).saturating_sub("Cluster: ".len() + 2);
+    for (field, value) in header::identity_fields(&at, value_w) {
+        lines.push(
+            Line::from(vec![
+                Span::styled(format!("{field}: "), theme.info_label),
+                Span::styled(value, theme.info_value),
+            ])
+            .alignment(Alignment::Center),
+        );
     }
     lines.push(Line::from(""));
 

@@ -34,8 +34,5 @@ pub(crate) fn draw_shell(
     }
 
     let loading = anim.bar("Connecting...");
-    let line = Line::from(Span::styled(loading, theme.info_value));
-    let center_y = inner.y + inner.height / 2;
-    let center_x = inner.x + inner.width.saturating_sub(line.width() as u16) / 2;
-    f.render_widget(line, Rect::new(center_x, center_y, inner.width, 1));
+    crate::draw_centered_line(f, inner, Line::from(Span::styled(loading, theme.info_value)));
 }

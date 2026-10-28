@@ -10,6 +10,9 @@
 //!   and returns the kube `ApiResource` + scope. Used by the Apply /
 //!   Delete / YAML paths and by the subscribe path's CRD branch (it
 //!   handles the incomplete-CrdRef → discovery fallback internally).
+//! - [`built_in_api_resource`] — its synchronous half, for callers that
+//!   already hold a `BuiltInKind` and so need no discovery. The daemon had
+//!   a private copy of these four lines; this is the one.
 
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
 use kube::discovery::{self, Scope};
@@ -94,10 +97,10 @@ pub fn describe_lines_from_text(text: &str) -> Vec<DescribeLine> {
 ///
 /// Cleaning and classification are ONE step, not two: `key_end` is a byte
 /// index into this string, so cleaning afterwards — which is what the
-/// kubectl path used to do one layer up with `strip_ansi`, and what the
-/// client's ingest sanitizer still does for the typed path — can slide the
+/// kubectl path used to do one layer up with `strip_ansi` — can slide the
 /// index off its colon. Built together, the index and the string it indexes
-/// cannot disagree.
+/// cannot disagree. [`field_line`] now cleans first for the same reason;
+/// this paragraph used to name it as a live exception.
 ///
 /// The owning `into_owned` is free here: `DescribeLine.text` is a `String`,
 /// so the `&str` callers were allocating anyway.
@@ -109,7 +112,17 @@ fn classified(text: &str) -> DescribeLine {
 
 /// Build a `key: value` field line, locating the structural colon the producer
 /// just wrote (the label always precedes the value, so the first `:` is it).
+///
+/// Cleans FIRST, for the reason [`classified`] gives: `key_end` is a byte
+/// index into the string it ships with, so cleaning afterwards can slide the
+/// index off its colon. This path computed the index on raw text while its
+/// sibling's doc described that order as the defect — and the text here is
+/// label and annotation keys and values, i.e. arbitrary cluster-supplied
+/// UTF-8 that may carry escapes. The renderer guards the index, so the
+/// symptom was a mis-placed key/value split rather than a panic; the order
+/// is still the thing that makes the index meaningful.
 fn field_line(text: String) -> DescribeLine {
+    let text = k9rs_util::text::visible_text(&text).into_owned();
     let key_end = text.find(':').unwrap_or(text.len());
     DescribeLine::field(text, key_end)
 }
@@ -132,6 +145,26 @@ pub async fn fetch_yaml(
 // Typed API resource resolution
 // ---------------------------------------------------------------------------
 
+/// Build the kube `ApiResource` for a BUILT-IN kind, from the def's
+/// `&'static Gvr` — no discovery roundtrip, no string allocations.
+///
+/// Synchronous, which is why it is worth naming separately from
+/// [`api_resource_for`]: that one is `async` for the CRD-discovery fallback,
+/// and callers that already know the kind should not have to be. It was
+/// copied, byte for byte, into the daemon as a private
+/// `built_in_api_resource` whose doc said "all mutating handlers go through
+/// this so the typed `BuiltInKind` is the single source of truth" — it had
+/// one caller, which had one caller, and the Apply/Delete/YAML paths all
+/// came through here instead. One copy now, in the crate that owns the
+/// mapping.
+pub fn built_in_api_resource(
+    kind: k9rs_proto::resource_def::BuiltInKind,
+) -> (ApiResource, ResourceScope) {
+    let g = *kind.def().gvr();
+    let gvk = GroupVersionKind::gvk(g.group, g.version, g.kind);
+    (ApiResource::from_gvk_with_plural(&gvk, g.plural), g.scope)
+}
+
 /// Build the kube `ApiResource` for any `ResourceId`. Built-ins resolve
 /// through the registry's `&'static Gvr` with no allocation and no HTTP
 /// call. CRDs use their stored GVR if populated; only the incomplete-shape
@@ -144,11 +177,7 @@ pub async fn api_resource_for(
     rid: &ResourceId,
 ) -> anyhow::Result<(ApiResource, ResourceScope)> {
     match rid {
-        ResourceId::BuiltIn(kind) => {
-            let g = *kind.def().gvr();
-            let gvk = GroupVersionKind::gvk(g.group, g.version, g.kind);
-            Ok((ApiResource::from_gvk_with_plural(&gvk, g.plural), g.scope))
-        }
+        ResourceId::BuiltIn(kind) => Ok(built_in_api_resource(*kind)),
         ResourceId::Crd(crd_ref) => {
             let gvk = GroupVersionKind::gvk(&crd_ref.group, &crd_ref.version, &crd_ref.kind);
             Ok((ApiResource::from_gvk_with_plural(&gvk, &crd_ref.plural), crd_ref.scope))
@@ -342,11 +371,10 @@ fn format_describe(obj: &kube::api::DynamicObject) -> Vec<DescribeLine> {
 // ---------------------------------------------------------------------------
 
 async fn fetch_describe_via_kubectl(target: &ObjectRef, context: &k9rs_proto::protocol::ContextName, session_env: &SessionEnv) -> Vec<DescribeLine> {
-    let mut cmd = session_env.kubectl();
+    let mut cmd = session_env.kubectl_once().await;
     cmd.arg("describe").arg(target.kubectl_target());
     cmd.arg("--context").arg(context.as_str());
     if let Some(ns) = target.namespace.as_option() { cmd.arg("-n").arg(ns); }
-    cmd.kill_on_drop(true);
     // kubectl's output has no producer-side structure for us — classify each
     // line (same as the UI used to, now done once here).
     let text = match cmd.output().await {
@@ -358,11 +386,10 @@ async fn fetch_describe_via_kubectl(target: &ObjectRef, context: &k9rs_proto::pr
 }
 
 async fn fetch_yaml_via_kubectl(target: &ObjectRef, context: &k9rs_proto::protocol::ContextName, session_env: &SessionEnv) -> String {
-    let mut cmd = session_env.kubectl();
+    let mut cmd = session_env.kubectl_once().await;
     cmd.arg("get").arg(target.kubectl_target()).arg("-o").arg("yaml");
     cmd.arg("--context").arg(context.as_str());
     if let Some(ns) = target.namespace.as_option() { cmd.arg("-n").arg(ns); }
-    cmd.kill_on_drop(true);
     match cmd.output().await {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).to_string(),
         Ok(output) => format!("Error fetching YAML:\n{}", String::from_utf8_lossy(&output.stderr)),

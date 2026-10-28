@@ -264,3 +264,62 @@ fn a_text_key_types_into_the_filter_and_the_command_bar() {
     ));
     assert_eq!(app.ui.command_input().map(|(i, _)| i.to_string()), Some("g".to_string()));
 }
+
+/// Every text sink moves its caret on the arrows — the command bar
+/// included, which it did not.
+///
+/// `edit_command_key`'s or-pattern admitted `Backspace | Delete | Home |
+/// End | Char(_)` and not the arrows, so the `KeyCode::Left`/`Right` arms
+/// written inside it could never fire: the key fell to the outer `_ => {}`,
+/// was reported CONSUMED, and the caret stayed put. Nothing warned —
+/// `unreachable_pattern` cannot fire on a well-typed `KeyCode` arm — and the
+/// existing test typed only a `Char`.
+///
+/// Driven across the sinks together, because "all the text boxes behave the
+/// same way" is the actual claim and the command bar was the one exception.
+#[test]
+fn the_arrows_move_the_caret_in_every_text_sink() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use k9rs_app::TextKey;
+    let key = |code: KeyCode| {
+        TextKey::new(KeyEvent::new(code, KeyModifiers::NONE)).expect("a text key")
+    };
+
+    // --- the command bar ---
+    let mut app = App::new_for_test();
+    app.ui.open(k9rs_app::Modal::Command {
+        input: k9rs_app::TextInput::seeded("pods"),
+        history_index: None,
+    });
+    let caret = |app: &App| app.ui.command_text().expect("open").cursor_col();
+    assert_eq!(caret(&app), 4, "seeded with the caret at the end");
+
+    for _ in 0..2 {
+        assert!(matches!(edit_command_key(&mut app, key(KeyCode::Left)), CommandKey::Consumed));
+    }
+    assert_eq!(caret(&app), 2, "Left moved it — this is what was swallowed");
+    assert!(matches!(edit_command_key(&mut app, key(KeyCode::Right)), CommandKey::Consumed));
+    assert_eq!(caret(&app), 3, "and Right moves it back");
+
+    // Typing lands AT the caret, which is the point of having one.
+    assert!(matches!(edit_command_key(&mut app, key(KeyCode::Char('X'))), CommandKey::Consumed));
+    assert_eq!(
+        app.ui.command_text().map(|i| i.value().to_string()),
+        Some("podXs".to_string()),
+        "inserted mid-word, not appended",
+    );
+
+    // --- the table filter, which already worked: the same assertions, so
+    // the two cannot drift apart again without one of them failing.
+    let mut app = App::new_for_test();
+    {
+        let fi = app.nav.top_mut().filter_input_mut().expect("a table filters");
+        fi.start();
+        *fi.input_mut() = k9rs_app::TextInput::seeded("pods");
+    }
+    assert!(handle_filter_key(&mut app, key(KeyCode::Left)));
+    assert!(handle_filter_key(&mut app, key(KeyCode::Left)));
+    assert_eq!(app.nav.top().filter_input().caret_col(), 2);
+    assert!(handle_filter_key(&mut app, key(KeyCode::Char('X'))));
+    assert_eq!(app.nav.top().filter_input().text(), "poXds");
+}

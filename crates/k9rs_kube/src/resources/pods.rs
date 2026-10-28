@@ -495,11 +495,18 @@ impl ConvertToRow<Pod> for PodDef {
 /// not claimable — `U` says what it can see.
 pub fn referenceable_kinds() -> &'static [k9rs_proto::resource_def::BuiltInKind] {
     use k9rs_proto::resource_def::BuiltInKind;
-    // The closed set `pod_references` can emit, declared NEXT to it so the
-    // two cannot drift. `U` gates on this: without it, `U` on a Deployment,
-    // Node, Service or Namespace opened a view titled "Pods that reference
-    // deployments/api" containing nothing — reporting a miss as an answer,
-    // which is the exact failure the reverse lookup replaced.
+    // The closed set `pod_references` can emit. `U` gates on this: without
+    // it, `U` on a Deployment, Node, Service or Namespace opened a view
+    // titled "Pods that reference deployments/api" containing nothing —
+    // reporting a miss as an answer, which is the exact failure the reverse
+    // lookup replaced.
+    //
+    // Kept honest by `every_emittable_reference_kind_is_declared`, which
+    // runs a maximal pod spec through `pod_references` and asserts the two
+    // sets are equal, both directions. This comment used to say the list was
+    // "declared NEXT to it so the two cannot drift" — proximity is not a
+    // mechanism, and a fifth `push(…)` below would have compiled, passed
+    // every test, and been invisible to `U`.
     &[
         BuiltInKind::PersistentVolumeClaim,
         BuiltInKind::Secret,

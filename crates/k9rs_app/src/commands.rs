@@ -66,12 +66,20 @@ pub struct CommandDoc {
     pub arg: Option<&'static str>,
     pub label: &'static str,
     /// One input the parser must classify, and the check that it did.
+    ///
     /// Read only by `every_documented_command_word_is_one_the_parser_accepts`
-    /// — it exists to hold the declaration and the grammar together, which is
-    /// a test's job, so it is dead in a release build by design.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// — in `k9rs_session`, because that is where the parser lives — so it
+    /// exists to hold the declaration and the grammar together, which is a
+    /// test's job.
+    ///
+    /// No `cfg_attr(not(test), allow(dead_code))`, which these two carried:
+    /// the attribute was INERT. `COMMAND_WORDS` is re-exported from the
+    /// crate root, so these fields are publicly reachable and `dead_code`
+    /// has never been able to fire on them in any build. The justifying
+    /// comment described [`crate::keymap::Binding`]'s situation, where the
+    /// struct is `pub(crate)` and the attribute IS load-bearing — a copied
+    /// explanation that stopped being true of the thing it was copied onto.
     pub probe: &'static str,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub accepts: fn(&ParsedCommand) -> bool,
 }
 
@@ -129,3 +137,7 @@ pub const COMMAND_WORDS: &[CommandDoc] = &[
         accepts: |p| matches!(p, ParsedCommand::NamespaceSwitch(_)),
     },
 ];
+
+#[cfg(test)]
+#[path = "tests/commands.rs"]
+mod tests;

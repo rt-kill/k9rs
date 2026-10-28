@@ -14,8 +14,14 @@
 //!
 //! 1. **Reap.** Dead slots are a `K` clone plus a pointer and counter each;
 //!    a daemon that churns through distinct keys accumulates them forever.
-//! 2. **Optimistic `get`.** The common case is a hit, and `get` takes a
-//!    shard read lock rather than the entry's write lock.
+//!    It runs on every get-or-create, and `DashMap::retain` takes a WRITE
+//!    lock on every shard — so it is the step that costs, and step 2 below
+//!    is not the fast path its own wording suggests. Kept anyway because a
+//!    get-or-create happens per subscribe and these maps hold tens of
+//!    entries; it is the right trade at this size, not a free one.
+//! 2. **Optimistic `get`.** A hit answers from a shard READ lock rather than
+//!    the entry's write lock. (Which matters for the lock the entry would
+//!    hold across `create`, not for avoiding step 1's.)
 //! 3. **`entry()`, then check AGAIN.** Between 2 and 3 a concurrent caller
 //!    can have created the same key. Skipping this second check is how you
 //!    get two live resources for one identity — two apiserver watches, two
@@ -56,6 +62,16 @@ pub(crate) enum Outcome {
 }
 
 /// Resources shared by identity: `Arc` out, `Weak` held. See the module docs.
+///
+/// **What this asks of callers.** `create` and `alive` run while a DashMap
+/// SHARD lock is held — that is what makes get-or-create and
+/// [`WeakRegistry::replace`] atomic per key, and it is not free: neither
+/// closure may block, `.await`, or touch this registry again, because a
+/// second access to the same shard would deadlock against the lock it is
+/// already inside. In this codebase both are small and synchronous (spawn a
+/// task, check a flag), which is why the trade is worth making; a `create`
+/// that wanted to do I/O would have to be restructured rather than
+/// smuggled in.
 pub(crate) struct WeakRegistry<K, V> {
     entries: DashMap<K, Weak<V>>,
 }
@@ -126,31 +142,35 @@ where
 
     /// Create unconditionally, displacing whatever the slot held.
     ///
-    /// Under the entry lock — the same claim [`get_or_create`] takes — so a
-    /// concurrent get-or-create is serialized with this rather than the two
-    /// insertions interleaving and stranding a just-created resource
-    /// unreachable in the map. The displaced resource lives as long as anyone
-    /// still holds its `Arc`.
+    /// `create` runs UNDER the entry lock — the same claim [`get_or_create`]
+    /// takes — so a concurrent get-or-create for the same key is serialized
+    /// with this rather than the two insertions interleaving. The displaced
+    /// resource lives as long as anyone still holds its `Arc`.
+    ///
+    /// That claim was false when it was first written: `create` ran before
+    /// `entry()` was called, so a get-or-create could slip between the two,
+    /// build its own resource, insert it, and have this call overwrite the
+    /// slot a moment later — leaving the other caller holding a resource
+    /// that nothing could reach, which is the exact interleaving the doc
+    /// said could not happen. `create` is cheap and synchronous here (it
+    /// spawns, it does not block), which is what makes holding the shard
+    /// lock across it the right trade; see the type's own doc for the
+    /// constraint that puts on callers.
     ///
     /// [`get_or_create`]: Self::get_or_create
     pub(crate) fn replace(&self, key: K, create: impl FnOnce(&K) -> Arc<V>) -> Arc<V> {
-        let fresh = create(&key);
-        let weak = Arc::downgrade(&fresh);
         match self.entries.entry(key) {
             Entry::Occupied(mut e) => {
-                e.insert(weak);
+                let fresh = create(e.key());
+                e.insert(Arc::downgrade(&fresh));
+                fresh
             }
             Entry::Vacant(e) => {
-                e.insert(weak);
+                let fresh = create(e.key());
+                e.insert(Arc::downgrade(&fresh));
+                fresh
             }
         }
-        fresh
-    }
-
-    /// Forget the slot for `key`, so the next `get_or_create` builds fresh.
-    /// Whatever held the old `Arc` keeps it.
-    pub(crate) fn forget(&self, key: &K) {
-        self.entries.remove(key);
     }
 
     /// Record an externally-built resource under `key`. The registry keeps

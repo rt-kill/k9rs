@@ -1,6 +1,8 @@
+pub(crate) mod column_layout;
 pub(crate) mod dialog;
 pub(crate) mod filter;
 pub(crate) mod flash;
+pub(crate) mod log_measure;
 pub(crate) mod log_view;
 pub(crate) mod modal;
 pub(crate) mod table;

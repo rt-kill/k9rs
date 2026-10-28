@@ -915,3 +915,259 @@ fn an_untimestamped_line_leaves_its_batch_alone() {
     order_batch(&mut batch);
     assert_eq!(bodies(&batch), ["later", "unknown", "earlier"], "arrival order, untouched");
 }
+
+// ---------------------------------------------------------------------------
+// The capped line read. A workload can emit a line with no newline for
+// gigabytes, and `.next_line()` buffers the WHOLE line before yielding it —
+// so an uncapped read is a daemon OOM, which takes every session with it.
+//
+// The arithmetic lived twice, once per `AsyncBufRead` flavour (tokio's for
+// the kubectl path, `futures`'s for `Api::log_stream`), byte-identical but
+// for the `use` lines — and had no test, because testing it meant building a
+// reader. `capped_chunk_step` is the decision with no reader in it.
+// ---------------------------------------------------------------------------
+
+use super::{capped_chunk_step, read_capped_line_tokio, ChunkStep, LINE_TRUNCATED_MARKER};
+
+/// A chunk that ends the line, under the cap: take it all, step over the
+/// newline, nothing dropped.
+#[test]
+fn a_whole_line_under_the_cap_is_taken_entire() {
+    assert_eq!(
+        capped_chunk_step(b"hello\nrest", 0, 1024),
+        ChunkStep { keep: 5, advance: 6, ended: true, truncated: false },
+        "the newline is consumed but not kept",
+    );
+}
+
+/// A chunk with no newline: take it all, no advance past the end, line
+/// continues.
+#[test]
+fn a_chunk_with_no_newline_continues_the_line() {
+    assert_eq!(
+        capped_chunk_step(b"hello", 0, 1024),
+        ChunkStep { keep: 5, advance: 5, ended: false, truncated: false },
+    );
+}
+
+/// Over the cap: the overflow is DISCARDED rather than buffered — bounded
+/// memory is the whole point — and the drop is recorded.
+#[test]
+fn an_over_cap_chunk_discards_its_overflow() {
+    // 3 bytes already held, cap 5: two more fit, three are dropped.
+    assert_eq!(
+        capped_chunk_step(b"abcde", 3, 5),
+        ChunkStep { keep: 2, advance: 5, ended: false, truncated: true },
+        "advance covers the discarded bytes too, or the reader never moves",
+    );
+    // Already at the cap: nothing fits, everything is consumed anyway.
+    assert_eq!(
+        capped_chunk_step(b"abcde", 5, 5),
+        ChunkStep { keep: 0, advance: 5, ended: false, truncated: true },
+    );
+    // At the cap, and the newline arrives: the line ENDS, and the newline
+    // is not "truncated".
+    assert_eq!(
+        capped_chunk_step(b"\nxyz", 5, 5),
+        ChunkStep { keep: 0, advance: 1, ended: true, truncated: false },
+    );
+}
+
+/// End to end over the tokio reader: a gigantic line comes back capped and
+/// MARKED, and the lines after it are unaffected.
+#[tokio::test]
+async fn an_over_long_line_is_capped_marked_and_does_not_eat_the_next() {
+    let huge = "x".repeat(10_000);
+    let input = format!("{huge}\nshort\n");
+    let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+
+    let first = read_capped_line_tokio(&mut reader, 64)
+        .await
+        .expect("read")
+        .expect("a line");
+    assert!(first.ends_with(LINE_TRUNCATED_MARKER), "the cut is marked: {first:?}");
+    assert_eq!(
+        first.len(),
+        64 + LINE_TRUNCATED_MARKER.len(),
+        "exactly the cap, plus the marker",
+    );
+
+    let second = read_capped_line_tokio(&mut reader, 64)
+        .await
+        .expect("read")
+        .expect("a line");
+    assert_eq!(second, "short", "the discard stopped at the newline");
+
+    assert!(
+        read_capped_line_tokio(&mut reader, 64).await.expect("read").is_none(),
+        "EOF with nothing buffered",
+    );
+}
+
+/// A trailing CR is trimmed, matching `.lines()` — CRLF logs are common.
+#[tokio::test]
+async fn a_crlf_line_loses_only_its_carriage_return() {
+    let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(b"a\r\nb\n".to_vec()));
+    assert_eq!(
+        read_capped_line_tokio(&mut reader, 64).await.expect("read").expect("a line"),
+        "a",
+    );
+    assert_eq!(
+        read_capped_line_tokio(&mut reader, 64).await.expect("read").expect("a line"),
+        "b",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The two pure decisions in `daemon.rs` and `streaming.rs`, which had no
+// mirror between them. The rest of both files is a socket and an apiserver;
+// these are the parts that can be wrong without either.
+// ---------------------------------------------------------------------------
+
+/// The socket lives under `XDG_RUNTIME_DIR` when there is one, and is
+/// per-UID otherwise.
+///
+/// Per-UID matters: `/tmp/k9rs.sock` shared between users on one host would
+/// let one user's client reach another user's daemon — and that daemon holds
+/// authenticated kube clients. The `XDG_RUNTIME_DIR` branch is already
+/// per-user by construction.
+///
+/// Reads the ambient environment rather than setting it: mutating env vars
+/// from a test is process-wide and this suite runs its tests in threads.
+#[test]
+fn the_socket_path_is_per_user() {
+    let path = crate::daemon::socket_path();
+    let shown = path.display().to_string();
+    assert!(shown.ends_with(".sock"), "it is a socket: {shown}");
+
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) => {
+            let dir = std::path::PathBuf::from(dir);
+            assert_eq!(
+                path,
+                dir.join("k9rs.sock"),
+                "inside the runtime dir, which is already per-user",
+            );
+        }
+        None => {
+            let uid = unsafe { libc::getuid() };
+            assert_eq!(
+                shown,
+                format!("/tmp/k9rs-{uid}.sock"),
+                "without one, the UID is in the NAME — a shared \
+                 /tmp/k9rs.sock would let one user reach another user's \
+                 daemon, and that daemon holds authenticated kube clients",
+            );
+        }
+    }
+}
+
+/// A peer that completes the yamux handshake and then opens no substream is
+/// let go, rather than parked on forever.
+///
+/// The control substream is the session's handshake: `init_and_run_muxed`
+/// cannot do anything until it arrives. Waiting for it unbounded meant a
+/// peer could hold this task, the muxer's driver task and the socket's fd
+/// for the daemon's whole life, with only the "new session connection" log
+/// line to show it had ever happened. Time is paused, so the deadline is
+/// free here.
+#[tokio::test(start_paused = true)]
+async fn a_session_that_opens_no_control_substream_is_let_go() {
+    let (client_sock, daemon_sock) = tokio::io::duplex(1 << 16);
+    // Held, and deliberately silent: the transport stays up and the peer
+    // opens nothing. Dropping it would end `accept` with `None`, which was
+    // never the problem.
+    let _peer = MuxedConnection::client(client_sock);
+    let daemon_conn = MuxedConnection::server(daemon_sock);
+    let shared = Arc::new(super::SessionSharedState::new_single_session());
+
+    // No outer timeout: the point is that THIS returns. A missing deadline
+    // shows up as the test hanging, which is what it does in production.
+    super::ServerSession::init_and_run_muxed(daemon_conn, shared).await;
+}
+
+// ---------------------------------------------------------------------------
+// What a dying `kubectl logs` stream tells the reader
+// ---------------------------------------------------------------------------
+
+use super::log_epitaph;
+
+fn broke() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset by peer")
+}
+
+/// THE defect: a stream that broke AFTER delivering lines said nothing at
+/// all. The loop was `while let Ok(Some(..))`, so a reset read as EOF, and
+/// the only report was gated on having written nothing.
+#[test]
+fn a_stream_that_breaks_after_output_says_so() {
+    let said = log_epitaph(true, Some(&broke()), None)
+        .expect("a mid-stream failure must reach the reader");
+    assert!(said.contains("connection reset"), "got {said:?}");
+}
+
+/// A quiet follow stays silent — a pod that has simply logged nothing since
+/// the view opened must not grow a `k9rs:` line.
+#[test]
+fn a_clean_stream_that_said_something_adds_nothing() {
+    assert_eq!(log_epitaph(true, None, None), None);
+}
+
+/// kubectl's own words win over ours: its stderr names the actual refusal
+/// ("previous terminated container not found"), where our read error can
+/// only describe the pipe.
+#[test]
+fn kubectl_stderr_outranks_our_read_error() {
+    let said = log_epitaph(false, Some(&broke()), Some("  error: container not found  \n"))
+        .expect("a failed fetch must reach the reader");
+    assert_eq!(said, "error: container not found", "trimmed, and kubectl's, not ours");
+}
+
+/// Whitespace-only stderr is not an answer — fall through to the read error
+/// rather than reporting a blank line.
+#[test]
+fn blank_stderr_is_not_an_answer() {
+    let said = log_epitaph(false, Some(&broke()), Some("   \n"))
+        .expect("something must reach the reader");
+    assert!(said.contains("connection reset"), "got {said:?}");
+}
+
+/// A stream that produced nothing and broke in no way it can name: the
+/// honest answer is nothing, and the caller's `wrote_any == false` path
+/// (the API fallback) is what handles it.
+#[test]
+fn a_silent_stream_with_nothing_to_report_reports_nothing() {
+    assert_eq!(log_epitaph(false, None, None), None);
+}
+
+/// The resubscribe backoff's floor and its ceiling are one decision each,
+/// and the reset lands on the floor.
+///
+/// They were two unnamed `Duration::from_secs(5)` literals twelve hundred
+/// lines apart — the start and the reset — plus a bare `60` at the double.
+/// Nothing said they were the same number, so a reset to a different floor
+/// would have shown up only as "the view took a minute to come back".
+#[test]
+fn the_resubscribe_backoff_doubles_from_its_floor_to_its_ceiling() {
+    use super::{RESUB_BACKOFF_CEILING, RESUB_BACKOFF_FLOOR};
+    assert!(
+        RESUB_BACKOFF_FLOOR < RESUB_BACKOFF_CEILING,
+        "a floor above the ceiling would make `min` pin every retry at the floor",
+    );
+    // What the bridge does, in a line: double, clamp.
+    let mut d = RESUB_BACKOFF_FLOOR;
+    let mut seen = vec![d];
+    for _ in 0..8 {
+        d = (d * 2).min(RESUB_BACKOFF_CEILING);
+        seen.push(d);
+    }
+    assert!(
+        seen.windows(2).all(|w| w[1] >= w[0]),
+        "never gets faster while failing: {seen:?}",
+    );
+    assert_eq!(
+        *seen.last().expect("non-empty"),
+        RESUB_BACKOFF_CEILING,
+        "and arrives at the ceiling rather than past it",
+    );
+}

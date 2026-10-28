@@ -216,10 +216,11 @@ pub(crate) fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     "No matching lines."
                 };
-                let line = ratatui::text::Line::from(Span::styled(msg, theme.status_pending));
-                let cx = content_area.x + content_area.width.saturating_sub(msg.len() as u16) / 2;
-                let cy = content_area.y + content_area.height / 2;
-                f.render_widget(line, ratatui::layout::Rect::new(cx, cy, content_area.width, 1));
+                crate::draw_centered_line(
+                    f,
+                    content_area,
+                    ratatui::text::Line::from(Span::styled(msg, theme.status_pending)),
+                );
             }
         });
     }

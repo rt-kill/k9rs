@@ -77,16 +77,6 @@ impl LocalRegistry {
         }
     }
 
-    /// Attach to a context's local-resource slice, creating it on first
-    /// attach. The returned keepalive is the caller's strong hold — clone
-    /// it per holder; when the last clone drops, the slice's grace window
-    /// begins.
-    ///
-    /// Upgrade-or-insert runs under the DashMap entry lock (the same slow
-    /// path as `WatcherCache::subscribe_with`): two sessions racing a dead
-    /// `Weak` must never build two live slices for one `ContextId` — that
-    /// would mean two `PortForwardSource`s spawning duplicate kubectl
-    /// children onto the same local ports.
     /// Every context with a LIVE local slice, for `ctl status`. Skips dead
     /// `Weak`s rather than reaping them — reporting must not mutate what it
     /// reports on.
@@ -103,6 +93,20 @@ impl LocalRegistry {
             .collect()
     }
 
+    /// Attach to a context's local-resource slice, creating it on first
+    /// attach. The returned keepalive is the caller's strong hold — clone
+    /// it per holder; when the last clone drops, the slice's grace window
+    /// begins.
+    ///
+    /// Upgrade-or-insert runs under the DashMap entry lock (the same slow
+    /// path as `WatcherCache::subscribe_with`): two sessions racing a dead
+    /// `Weak` must never build two live slices for one `ContextId` — that
+    /// would mean two `PortForwardSource`s racing to bind the same local
+    /// ports.
+    ///
+    /// (These two paragraphs were sitting above `stats()`, which is migration
+    /// residue, not a claim about `stats` — and left `attach`, the function
+    /// they describe, undocumented.)
     pub fn attach(&self, context: &ContextId) -> ContextKeepalive {
         let configs = Arc::clone(&self.exec_configs);
         let grace = self.grace;

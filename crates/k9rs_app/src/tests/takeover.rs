@@ -67,3 +67,45 @@ mod modal {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The confirm box's focus
+// ---------------------------------------------------------------------------
+
+fn confirm() -> crate::ConfirmDialog {
+    crate::ConfirmDialog {
+        message: "Delete pod/canary?".to_string(),
+        action_label: "Delete".to_string(),
+        pending: crate::PendingAction::Single {
+            op: crate::SingleOp::Delete,
+            target: k9rs_proto::protocol::ObjectRef::new(
+                k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
+                "canary".to_string(),
+                k9rs_proto::protocol::Namespace::Named("default".to_string()),
+            ),
+        },
+        focused: crate::ConfirmFocus::default(),
+    }
+}
+
+/// A confirm box opens on Cancel, by NAME. It was a `bool` whose safe
+/// default was `false`, with the polarity in prose and re-read at three
+/// sites — the key handler, the action layer and the widget.
+#[test]
+fn a_confirm_box_opens_on_cancel() {
+    let d = confirm();
+    assert_eq!(d.focused, crate::ConfirmFocus::Cancel);
+    assert!(!d.action_focused(), "…so Enter cancels until you move focus");
+}
+
+/// The cycle reaches both buttons and comes back — ONE function owns the
+/// order, so neither can be reachable in one direction only.
+#[test]
+fn the_focus_cycle_reaches_both_buttons_and_returns() {
+    let mut d = confirm();
+    d.focus_next();
+    assert_eq!(d.focused, crate::ConfirmFocus::Action);
+    assert!(d.action_focused(), "…and now Enter confirms");
+    d.focus_next();
+    assert_eq!(d.focused, crate::ConfirmFocus::Cancel, "and round again");
+}

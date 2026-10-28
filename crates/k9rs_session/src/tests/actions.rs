@@ -77,7 +77,7 @@ fn a_selection_that_matches_nothing_copies_nothing() {
 // What `Ctrl-L` is OVER (v13 `LogTarget`)
 // ---------------------------------------------------------------------------
 
-use k9rs_proto::protocol::{LogContainer, LogTarget};
+use k9rs_proto::protocol::{LogContainer, LogLeaf, LogTarget};
 use k9rs_proto::row::{ContainerInfo, DrillTarget};
 
 fn pod_row(name: &str, ns: &str, containers: usize) -> ResourceRow {
@@ -136,7 +136,7 @@ fn a_workload_logs_every_pod_its_drill_target_names() {
     let app = app_with_row(row);
 
     let target = workload_log_target(&app, &selected_ref(&app));
-    assert_eq!(target, LogTarget::Selector { labels, label: "pods/my-app".into() });
+    assert_eq!(target, LogLeaf::Selector { labels, label: "pods/my-app".into() }.into());
     assert!(target.is_fanout(), "a selector can name more than one pod");
 }
 
@@ -154,7 +154,7 @@ fn an_owner_drilled_workload_logs_its_owned_pods() {
 
     assert_eq!(
         workload_log_target(&app, &selected_ref(&app)),
-        LogTarget::Owner { uid: "uid-1".into(), label: "pods/my-job".into() },
+        LogLeaf::Owner { uid: "uid-1".into(), label: "pods/my-job".into() }.into(),
     );
 }
 
@@ -165,7 +165,7 @@ fn an_owner_drilled_workload_logs_its_owned_pods() {
 fn an_unresolvable_workload_falls_back_to_the_kubectl_ref() {
     let app = app_with_row(pod_row("mystery", "ns", 0));
     let target = workload_log_target(&app, &selected_ref(&app));
-    assert_eq!(target, LogTarget::One("pods/mystery".into()));
+    assert_eq!(target, LogTarget::one("pods/mystery"));
     assert!(!target.is_fanout(), "one ref, one source, lines stay untagged");
 }
 
@@ -188,11 +188,11 @@ fn a_marked_selection_logs_exactly_those_pods() {
     }
     let _ = &mut app;
 
-    let spec = batch_log_spec(&app, 100).expect("three single-container pods in one namespace");
+    let spec = batch_log_spec(&app).expect("three single-container pods in one namespace");
     assert_eq!(
         spec.target,
         LogTarget::Union {
-            targets: vec![LogTarget::One("a".into()), LogTarget::One("c".into())],
+            targets: vec![LogLeaf::One("a".into()), LogLeaf::One("c".into())],
             label: "2 pods".into(),
         },
     );
@@ -218,10 +218,10 @@ fn the_container_stance_follows_the_marked_pods() {
         }),
     );
     store.toggle_mark(&ObjectKey::new("ns".to_string(), "solo".to_string()));
-    assert_eq!(batch_log_spec(&app, 100).unwrap().container, LogContainer::Default);
+    assert_eq!(batch_log_spec(&app).unwrap().container, LogContainer::Default);
 
     store.toggle_mark(&ObjectKey::new("ns".to_string(), "sidecar".to_string()));
-    assert_eq!(batch_log_spec(&app, 100).unwrap().container, LogContainer::All);
+    assert_eq!(batch_log_spec(&app).unwrap().container, LogContainer::All);
     let _ = &mut app;
 }
 
@@ -262,13 +262,13 @@ fn a_marked_set_of_workloads_unions_their_pod_sources() {
     }
     let _ = &mut app;
 
-    let spec = batch_log_spec(&app, 100).expect("two workloads in one namespace");
+    let spec = batch_log_spec(&app).expect("two workloads in one namespace");
     let LogTarget::Union { targets, .. } = &spec.target else {
         panic!("a selection is a union, got {:?}", spec.target)
     };
     assert_eq!(targets.len(), 2);
     assert!(
-        targets.iter().all(|t| matches!(t, LogTarget::Selector { .. })),
+        targets.iter().all(|t| matches!(t, LogLeaf::Selector { .. })),
         "each workload contributes the selector its drill target names: {targets:?}",
     );
     assert_eq!(
@@ -287,7 +287,7 @@ fn a_mixed_selection_carries_each_rows_own_shape() {
 
     // A pod: it lists containers, so it is its own target.
     let pod = pod_row("api-7d9f", "ns", 1);
-    assert_eq!(row_log_target(&pod, &rid), Some(LogTarget::One("api-7d9f".into())));
+    assert_eq!(row_log_target(&pod, &rid), Some(LogLeaf::One("api-7d9f".into())));
 
     // A job: no containers, pods found by ownerReference.
     let mut job = pod_row("nightly", "ns", 0);
@@ -298,7 +298,7 @@ fn a_mixed_selection_carries_each_rows_own_shape() {
     });
     assert_eq!(
         row_log_target(&job, &rid),
-        Some(LogTarget::Owner { uid: "uid-9".into(), label: "deployments/nightly".into() }),
+        Some(LogLeaf::Owner { uid: "uid-9".into(), label: "deployments/nightly".into() }),
     );
 
     // A row with no logs at all earns no place in the union.
@@ -323,7 +323,7 @@ fn a_selection_spanning_namespaces_is_refused() {
     );
     store.toggle_mark(&ObjectKey::new("ns-a".to_string(), "here".to_string()));
     store.toggle_mark(&ObjectKey::new("ns-b".to_string(), "there".to_string()));
-    let err = batch_log_spec(&app, 100).expect_err("two namespaces, one stream");
+    let err = batch_log_spec(&app).expect_err("two namespaces, one stream");
     assert!(err.contains("namespace"), "{err}");
     let _ = &mut app;
 }
@@ -335,14 +335,14 @@ fn the_header_names_the_thing_not_the_selector() {
     let mut labels = std::collections::BTreeMap::new();
     labels.insert("app".to_string(), "api".to_string());
     assert_eq!(
-        LogTarget::Selector { labels, label: "deploy/api".into() }.display(),
+        LogLeaf::Selector { labels, label: "deploy/api".into() }.display(),
         "deploy/api",
     );
     assert_eq!(
         LogTarget::Union { targets: vec![], label: "2 pods".into() }.display(),
         "2 pods",
     );
-    assert_eq!(LogTarget::One("pod-x".into()).display(), "pod-x");
+    assert_eq!(LogTarget::one("pod-x").display(), "pod-x");
 }
 
 /// A multi-container pod's logs used to be unreachable as a WHOLE:
@@ -414,8 +414,8 @@ fn a_marked_set_of_containers_streams_exactly_those() {
     derived.toggle_mark();
     app.nav.push(derived);
 
-    let spec = batch_log_spec(&app, 100).expect("two marked containers of one pod");
-    assert_eq!(spec.target, LogTarget::One("web-0".into()), "one pod, named once");
+    let spec = batch_log_spec(&app).expect("two marked containers of one pod");
+    assert_eq!(spec.target, LogTarget::one("web-0"), "one pod, named once");
     assert_eq!(
         spec.container,
         LogContainer::Set(vec!["c0".into(), "c2".into()]),
@@ -691,3 +691,145 @@ fn the_identity_never_describes_the_context_being_left() {
     assert_eq!(at.identity().user(), Some("staging-admin"));
 }
 
+/// `ds_try!` says whether the command went, and a gated success flash
+/// cannot bury its error.
+///
+/// `app.ui.flash` is ONE slot and last write wins. The macro evaluated to
+/// `()`, so two call sites followed it with an unconditional
+/// `FlashMessage::info(..)` that overwrote the error it had just set.
+/// `send_command` is a `try_send` on a bounded channel — after the daemon
+/// dies every call fails — so the user was told "Scale: nginx" while nothing
+/// had been sent, with the form already popped off the stack so nothing on
+/// screen contradicted it.
+///
+/// Driven on the MACRO rather than through a `ClientSession`, which has no
+/// test constructor: the defect was never in the sending, it was in not
+/// being able to ask whether it happened.
+#[test]
+fn a_gated_success_flash_cannot_bury_a_send_failure() {
+    use k9rs_app::FlashLevel;
+
+    // The happy path: reports true, says nothing.
+    let mut app = App::new_for_test();
+    let sent: anyhow::Result<()> = Ok(());
+    assert!(crate::ds_try!(app, sent), "a successful send reports true");
+    assert!(app.ui.flash.is_none(), "and flashes nothing of its own");
+
+    // The failure: reports false, and names the cause.
+    let mut app = App::new_for_test();
+    let failed: anyhow::Result<()> = Err(anyhow::anyhow!("Daemon writer task closed"));
+    assert!(!crate::ds_try!(app, failed), "a failed send reports false");
+    let flash = app.ui.flash.as_ref().expect("the failure is flashed");
+    assert_eq!(flash.level, FlashLevel::Error);
+    assert!(
+        flash.message.contains("Daemon writer task closed"),
+        "and says what went wrong: {:?}",
+        flash.message,
+    );
+
+    // The shape every call site now uses. The error must survive it.
+    let failed: anyhow::Result<()> = Err(anyhow::anyhow!("command queue full"));
+    if crate::ds_try!(app, failed) {
+        app.ui.flash = Some(k9rs_app::FlashMessage::info("Scale: nginx"));
+    }
+    let flash = app.ui.flash.as_ref().expect("still flashed");
+    assert_eq!(
+        flash.level,
+        FlashLevel::Error,
+        "an ungated success flash here is the bug: {:?}",
+        flash.message,
+    );
+    assert!(flash.message.contains("command queue full"));
+}
+
+/// A flag and its value are never separated, even when the value is absent.
+///
+/// `SHELL_TEMPLATE` spelled the namespace as `Literal("-n")` beside
+/// `Placeholder(Namespace)`, and `ConditionalPair` — the variant built to
+/// bind a flag to its value — is what every other pair in either template
+/// uses. Two different failures came out of that:
+///
+/// - With a pod target, `resolve_placeholder` answers `Some(namespace)` even
+///   when it is empty, so the invocation carried `-n ""` — an explicit empty
+///   `--namespace` rather than none at all. Measured: `["exec", "-it", "-n",
+///   "", "api-7d9f", "--", …]`.
+/// - With a MISMATCHED target it answers `None`, `build_exec_init` skips the
+///   placeholder and keeps the literal, and the dangling `-n` takes the next
+///   argument as its value — shifting everything after it.
+///
+/// The second needs an op paired with the wrong target variant, which none
+/// of the four `ActionResult::Exec` constructions does. That is why it is
+/// worth a type and a test rather than a reading.
+#[test]
+fn a_shell_invocation_never_separates_a_flag_from_its_value() {
+    use crate::ExecTarget;
+    use k9rs_proto::protocol::OperationKind;
+
+    let template = OperationKind::Shell
+        .exec_template()
+        .expect("Shell has a template");
+
+    // The ordinary case: namespace present.
+    let (init, _title) = crate::build_exec_init(
+        template,
+        &ExecTarget::Pod {
+            namespace: "default".to_string(),
+            pod: "api-7d9f".to_string(),
+            container: String::new(),
+        },
+    );
+    let flat = init.kubectl_args.join(" ");
+    assert!(flat.contains("-n default"), "the namespace rides its flag: {flat}");
+    assert!(flat.contains("api-7d9f"), "and the pod is a positional: {flat}");
+
+    // The case that bit: no namespace at all.
+    let (init, _title) = crate::build_exec_init(
+        template,
+        &ExecTarget::Pod {
+            namespace: String::new(),
+            pod: "api-7d9f".to_string(),
+            container: String::new(),
+        },
+    );
+    let args = &init.kubectl_args;
+    assert!(
+        !args.iter().any(|a| a == "-n"),
+        "no value, no flag — a dangling `-n` eats the next argument: {args:?}",
+    );
+    // And the pod is still the pod, not something's namespace.
+    let pod_at = args.iter().position(|a| a == "api-7d9f").expect("the pod is there");
+    assert!(
+        pod_at == 0 || args[pod_at - 1] != "-n",
+        "the pod must not be sitting where a namespace goes: {args:?}",
+    );
+}
+
+/// The config reaches a batch log spec. `batch_log_spec` hardcoded
+/// `follow: true`, so `defaultFollow: false` was discarded here as well as
+/// everywhere else.
+#[test]
+fn a_batch_log_spec_honours_default_follow() {
+    let mut app = App::new_for_test();
+    let store = std::sync::Arc::clone(app.nav.top().data_store().unwrap());
+    store.apply(
+        1,
+        StorePayload::Baseline(TableBaseline {
+            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
+            headers: vec!["NAME".into()],
+            rows: vec![pod_row("a", "ns", 1), pod_row("b", "ns", 1)],
+        }),
+    );
+    for name in ["a", "b"] {
+        store.toggle_mark(&ObjectKey::new("ns".to_string(), name.to_string()));
+    }
+    assert!(
+        batch_log_spec(&app).expect("two pods in one namespace").follow,
+        "the shipped default follows",
+    );
+
+    app.config.ui.logs.default_follow = false;
+    assert!(
+        !batch_log_spec(&app).expect("two pods in one namespace").follow,
+        "and a user who turned it off gets a spec that does not follow",
+    );
+}

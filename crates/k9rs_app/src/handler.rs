@@ -9,14 +9,25 @@ use super::keymap::ViewClass;
 /// Shift riding in the character's case, Alt chords excluded — an
 /// Alt-modified key is a different chord, not its bare character).
 fn combo_of(key: &KeyEvent) -> Option<crate::KeyCombo> {
-    let KeyCode::Char(c) = key.code else { return None };
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        return None;
-    }
-    Some(crate::KeyCombo {
-        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
-        ch: c,
-    })
+    crate::KeyCombo::of_event(key)
+}
+
+/// Whether these modifiers make the event a DIFFERENT CHORD from its bare
+/// character. Ctrl or Alt — never Shift, which rides in the character's own
+/// case and is how `Shift-F` and `C` are expressed.
+///
+/// The per-class handlers below match on `key.code` alone, so an unclaimed
+/// chord falls straight through to the literal arm for its bare character:
+/// `Alt-q` reached `KeyCode::Char('q')` and QUIT THE APP. [`combo_of`]
+/// already refuses both modifiers for the data-driven lookups — but only the
+/// lookups go through it, and the structural arms do not.
+///
+/// This replaces four hand-written copies of the rule, one per view class,
+/// each of which named CONTROL and none of which named ALT. The same
+/// modifier set, asked as a different question ("is this text?"), is
+/// `TextKey::new`'s first guard in `text_input.rs`.
+fn carries_chord_modifier(key: &KeyEvent) -> bool {
+    key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 /// Map a key press to an action via the resource's declared operations.
@@ -57,9 +68,6 @@ fn lookup_overlay_key(app: &App, key: char) -> Option<Action> {
 /// handles normal and confirmation-dialog key mappings.
 pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
     // -----------------------------------------------------------------------
-    // Confirmation dialog: only y/n/Enter/Esc.
-    // -----------------------------------------------------------------------
-    // -----------------------------------------------------------------------
     // Overlays first. Checked BEFORE global keys so `:q`, Ctrl-C, etc.
     // can't leak through during the edit flow or a shell connect.
     // -----------------------------------------------------------------------
@@ -87,21 +95,26 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(Action::SearchStart);
     }
 
-    // A MODAL element owns every key, globals included — see
-    // `Element::captures_all_input`. Checked here rather than inside each
-    // global binding because the rule is about the element, not about `:`.
-    if app.nav.top().captures_all_input() {
-        return match super::keymap::ViewClass::of(app.nav.top()) {
-            ViewClass::Dialog => handle_dialog_keys(app, key),
-            _ => None,
-        };
-    }
-
     // -----------------------------------------------------------------------
-    // Global keys (available in every view).
+    // Global keys (available in every view) — EXCEPT under a modal element,
+    // which owns every key, globals included. See
+    // `Element::captures_all_input`; the rule is about the element, not
+    // about `:`, which is why it is one check here and not a condition in
+    // each global binding.
+    //
+    // Modality only SKIPS the globals. Dispatch always goes through the one
+    // per-class match below. This used to re-dispatch here, with a
+    // `ViewClass::Dialog => … , _ => None` of its own: unreachable today
+    // only because `captures_all_input` and `ViewClass::of` happen to agree
+    // about which class is modal — two independent matches, in two files. A
+    // modal element of any other class would have fallen into that `_` and
+    // become a black hole, Esc included, while the exhaustive match twenty
+    // lines down would have dispatched it correctly.
     // -----------------------------------------------------------------------
-    if let Some(action) = handle_global_keys(app, key) {
-        return Some(action);
+    if !app.nav.top().captures_all_input() {
+        if let Some(action) = handle_global_keys(app, key) {
+            return Some(action);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -116,7 +129,14 @@ pub fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
         ViewClass::Table => handle_resource_view_keys(app, key),
         ViewClass::Detail => handle_detail_view_keys(key),
         ViewClass::Log => handle_log_view_keys(app, key),
-        ViewClass::Dialog => handle_dialog_keys(app, key),
+        // Three keymaps, three arms — `handle_dialog_keys`'s inner match
+        // over `Element` is gone with them. It had to re-derive which dialog
+        // this was, after `ViewClass::of` had already decided, and its
+        // `_ => handle_confirm_dialog` arm meant a fourth dialog kind would
+        // have been dismissed by any key.
+        ViewClass::Confirm => handle_confirm_dialog(app, key),
+        ViewClass::Form => handle_form_keys(app, key),
+        ViewClass::Picker => handle_container_select_keys(key),
     }
 }
 
@@ -130,7 +150,7 @@ fn handle_confirm_dialog(app: &App, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Enter => {
             // Confirm or cancel based on which button is selected
-            if matches!(app.nav.top(), Element::Confirm(d) if d.action_focused) {
+            if matches!(app.nav.top(), Element::Confirm(d) if d.action_focused()) {
                 Some(Action::Confirm)
             } else {
                 Some(Action::Cancel)
@@ -243,23 +263,14 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
     // Configured column-cursor bindings (exact chord). Checked before the
     // operation lookup so a user binding `colRight: l` shadows an `l`
     // operation default. Arrows below are structural and always work.
+    if let Some(action) = configured_column_action(app, &key) {
+        return Some(action);
+    }
+    // Rebound switch-to-all-namespaces (structural default `0`). Checked
+    // before the `Char('0')` structural arm below, so a user who bound
+    // `colFirst: "0"` can still reach the action on another key (e.g.
+    // `namespaceAll: ")"`).
     if let Some(combo) = combo_of(&key) {
-        if app.config.keys.col_left == Some(combo) {
-            return Some(Action::ColLeft);
-        }
-        if app.config.keys.col_right == Some(combo) {
-            return Some(Action::ColRight);
-        }
-        if app.config.keys.col_first == Some(combo) {
-            return Some(Action::ColFirst);
-        }
-        if app.config.keys.col_last == Some(combo) {
-            return Some(Action::ColLast);
-        }
-        // Rebound switch-to-all-namespaces (structural default `0`).
-        // Checked here, before the `Char('0')` structural arm below, so a
-        // user who bound `colFirst: "0"` can still reach the action on
-        // another key (e.g. `namespaceAll: ")"`).
         if app.config.keys.namespace_all == Some(combo) {
             return Some(Action::SwitchNamespace(k9rs_proto::protocol::Namespace::All));
         }
@@ -273,11 +284,11 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         return Some(action);
     }
 
-    // An UNMATCHED Ctrl chord stops here: the structural arms below
-    // match on `key.code` alone and would silently alias it to its bare
-    // character (Ctrl-Q → quit, Ctrl-G → Home, Ctrl-Y → the overlay 'y'
-    // binding). A chord either means something as a chord or nothing.
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
+    // An UNMATCHED chord stops here: the structural arms below match on
+    // `key.code` alone and would silently alias it to its bare character
+    // (Ctrl-Q → quit, Ctrl-G → Home, Ctrl-Y → the overlay 'y' binding, and
+    // Alt-q → quit). A chord either means something as a chord or nothing.
+    if carries_chord_modifier(&key) {
         return None;
     }
 
@@ -386,14 +397,19 @@ fn handle_resource_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
 // ---------------------------------------------------------------------------
 
 fn handle_detail_view_keys(key: KeyEvent) -> Option<Action> {
-    // Ctrl-d / Ctrl-u for half-page scroll (vim-style). Any other Ctrl
-    // chord is nothing — never its bare character.
+    // Ctrl-d / Ctrl-u for half-page scroll (vim-style). This view is the one
+    // that CLAIMS Ctrl, so its chord guard comes after the claim rather than
+    // before it; what is left to refuse is Alt.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('d') => Some(Action::PageDown),
             KeyCode::Char('u') => Some(Action::PageUp),
             _ => None,
         };
+    }
+    // Any other chord is nothing — never its bare character.
+    if carries_chord_modifier(&key) {
+        return None;
     }
 
     match key.code {
@@ -423,32 +439,89 @@ fn handle_detail_view_keys(key: KeyEvent) -> Option<Action> {
 // Log view
 // ---------------------------------------------------------------------------
 
+/// The configured column-cursor action this key is, if any — for BOTH the
+/// table and the log view.
+///
+/// One lookup, because the four column actions are a property of the ACTION
+/// and not of one view, which is what the log view's own comment claimed
+/// while checking three of them: `keys: { colLast: "e" }` jumped columns in
+/// a table and did nothing in a log. Two copies of a four-way list is how
+/// one of them comes to be three-way.
+fn configured_column_action(app: &App, key: &KeyEvent) -> Option<Action> {
+    let combo = combo_of(key)?;
+    let keys = &app.config.keys;
+    // Named rather than looped, because each one names its own action.
+    if keys.col_left == Some(combo) {
+        return Some(Action::ColLeft);
+    }
+    if keys.col_right == Some(combo) {
+        return Some(Action::ColRight);
+    }
+    if keys.col_first == Some(combo) {
+        return Some(Action::ColFirst);
+    }
+    if keys.col_last == Some(combo) {
+        return Some(Action::ColLast);
+    }
+    None
+}
+
+/// The log range a bare digit selects: `0` the tail, `1`–`6` the windows of
+/// `LogSince::ALL` in its declared order, `7` everything there is.
+///
+/// Indexing `ALL` is what keeps this ladder and the keymap's labelled rows
+/// from drifting — they read one list, and that they agree is pinned by
+/// `every_documented_view_key_dispatches_to_the_action_it_claims`. `7` is
+/// its own arm because "from the beginning" is not a duration, which is why
+/// the old `Option<String>` payload could not hold it and the oldest logs
+/// were unreachable past 24h.
+fn log_range_for_digit(key: &KeyEvent) -> Option<Action> {
+    let KeyCode::Char(c) = key.code else { return None };
+    let range = match c {
+        '0' => LogRange::Tail,
+        '7' => LogRange::Head,
+        '1'..='6' => {
+            // `'1'` is index 0. The slice's length is asserted at the build
+            // in `keymap.rs`, so this cannot be out of range.
+            let idx = (c as u8 - b'1') as usize;
+            LogRange::Since(k9rs_proto::protocol::LogSince::ALL[idx])
+        }
+        _ => return None,
+    };
+    Some(Action::LogRange(range))
+}
+
 fn handle_log_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
     // Shift-C: clear logs.
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Char('C') {
         return Some(Action::ClearLogs);
     }
 
-    // Unmatched Ctrl chords are nothing — never their bare character
-    // (Ctrl-Q would otherwise alias to 'q' → Back, etc.).
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
+    // Unmatched chords are nothing — never their bare character
+    // (Ctrl-Q and Alt-q would otherwise both alias to 'q' → Back).
+    if carries_chord_modifier(&key) {
         return None;
+    }
+
+    // The range ladder FIRST, ahead of the configured column chords — the
+    // one place this view does not let a rebind shadow a literal.
+    //
+    // `colFirst: "0"` is a documented, validating shape, and on a table it
+    // costs nothing: switch-to-all-namespaces keeps its own `namespaceAll`
+    // rebind. Here it cost the whole `0`–`7` ladder, which the hint bar goes
+    // on advertising as `<0-7> range` and which has no other key. Column
+    // panning does: `^` and `$` are structural and always work. So the
+    // digits win, and a user who rebinds `colFirst` keeps both.
+    if let Some(action) = log_range_for_digit(&key) {
+        return Some(action);
     }
 
     // Configured column bindings, same chords the table honours — this is
     // what makes `colLeft`/`colRight` a property of the ACTION rather than
-    // of one view. Checked before the literals below so a rebind shadows
-    // them, exactly as it does on a table.
-    if let Some(combo) = combo_of(&key) {
-        if app.config.keys.col_left == Some(combo) {
-            return Some(Action::ColLeft);
-        }
-        if app.config.keys.col_right == Some(combo) {
-            return Some(Action::ColRight);
-        }
-        if app.config.keys.col_first == Some(combo) {
-            return Some(Action::ColFirst);
-        }
+    // of one view. Checked before the remaining literals so a rebind
+    // shadows them, exactly as it does on a table.
+    if let Some(action) = configured_column_action(app, &key) {
+        return Some(action);
     }
 
     match key.code {
@@ -491,33 +564,17 @@ fn handle_log_view_keys(app: &App, key: KeyEvent) -> Option<Action> {
         // Copy.
         KeyCode::Char('c') => Some(Action::Copy),
 
-        // Digits 0-6: log time range selection.
-        KeyCode::Char('0') => Some(Action::LogRange(LogRange::Tail)),
-        KeyCode::Char('1') => Some(Action::LogRange(LogRange::Since("1m".to_string()))),
-        KeyCode::Char('2') => Some(Action::LogRange(LogRange::Since("5m".to_string()))),
-        KeyCode::Char('3') => Some(Action::LogRange(LogRange::Since("15m".to_string()))),
-        KeyCode::Char('4') => Some(Action::LogRange(LogRange::Since("30m".to_string()))),
-        KeyCode::Char('5') => Some(Action::LogRange(LogRange::Since("1h".to_string()))),
-        KeyCode::Char('6') => Some(Action::LogRange(LogRange::Since("24h".to_string()))),
-        // `7` extends the lookback ladder to its end: everything there is.
-        // Not a duration, which is why `Option<String>` could not hold it —
-        // and why the oldest logs were unreachable past 24h.
-        KeyCode::Char('7') => Some(Action::LogRange(LogRange::Head)),
-
         _ => None,
     }
 }
 
 // ---------------------------------------------------------------------------
-// Help view
-
-// ---------------------------------------------------------------------------
-// Context selector
+// Overview (the landing page)
 // ---------------------------------------------------------------------------
 
 fn handle_overview_keys(key: KeyEvent) -> Option<Action> {
-    // Unmatched Ctrl chords are nothing — never their bare character.
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
+    // Unmatched chords are nothing — never their bare character.
+    if carries_chord_modifier(&key) {
         return None;
     }
     match key.code {
@@ -530,19 +587,9 @@ fn handle_overview_keys(key: KeyEvent) -> Option<Action> {
 }
 
 // ---------------------------------------------------------------------------
-// Container select view
+// Dialog-class elements: confirm, picker, form
 // ---------------------------------------------------------------------------
 
-/// Dialog keys, routed by WHICH dialog is on top. Both are
-/// `ElementClass::Dialog`, so they share the modality rule and the keymap
-/// class; what differs is the question being asked.
-fn handle_dialog_keys(app: &App, key: KeyEvent) -> Option<Action> {
-    match app.nav.top() {
-        Element::Picker(_) => handle_container_select_keys(key),
-        Element::Form(_) => handle_form_keys(app, key),
-        _ => handle_confirm_dialog(app, key),
-    }
-}
 
 /// The ways OUT of a form, and only those.
 ///
@@ -552,6 +599,11 @@ fn handle_dialog_keys(app: &App, key: KeyEvent) -> Option<Action> {
 /// them in both places is what let Esc be "handled" by a call that cleared
 /// the modal slot a form does not live in.
 fn handle_form_keys(app: &App, key: KeyEvent) -> Option<Action> {
+    // Same guard, same reason: a form's Esc and Enter are bare keys, and a
+    // chord that happens to carry one of their codes is not them.
+    if carries_chord_modifier(&key) {
+        return None;
+    }
     let cancel_focused = app.nav.top().form_dialog().is_some_and(|d| d.cancel_focused());
     match key.code {
         KeyCode::Esc => Some(Action::Back),
@@ -561,6 +613,13 @@ fn handle_form_keys(app: &App, key: KeyEvent) -> Option<Action> {
 }
 
 fn handle_container_select_keys(key: KeyEvent) -> Option<Action> {
+    // Unmatched chords are nothing — never their bare character. The four
+    // per-class handlers got this guard when `Alt-q` was found quitting;
+    // this one was reached through `handle_dialog_keys` and was not among
+    // them, so `Ctrl-j` scrolled the picker and `Ctrl-q` left it.
+    if carries_chord_modifier(&key) {
+        return None;
+    }
     match key.code {
         // `q` or Esc in container select goes back.
         KeyCode::Char('q') | KeyCode::Esc => Some(Action::Back),

@@ -36,7 +36,6 @@ pub(crate) mod text_input;
 pub(crate) mod table;
 pub(crate) mod takeover;
 pub(crate) mod viewport;
-pub(crate) mod view;
 
 // ---------------------------------------------------------------------------
 // THE API
@@ -54,18 +53,23 @@ pub(crate) mod view;
 // reported ZERO while the modules were public, and found a dead 102-line widget
 // the moment they were not.
 //
-// Flat rather than module-qualified because these are 40 distinctly-named types
+// Flat rather than module-qualified because these are distinctly-named types
 // and functions; where a module name supplies a missing noun instead, as in
 // `k9rs_util::width::truncate`, the module stays in the path.
+//
+// No count here on purpose. This said "40" and the surface was 91 — a number
+// written once, never measured again, and quoted back as current two days
+// later. `unreachable_pub` is the thing that actually holds this line, and it
+// needs no number to do it.
 pub use actions::{Action, LogRange, SortTarget};
 pub use anim::{Anim, FRAME_INTERVAL};
-pub use attachment::Attachment;
+pub use attachment::{Attached, Attachment};
 pub use batch::BatchTracker;
 pub use client::{ClientSession, ConnectionParams};
 pub use commands::{ParsedCommand, COMMAND_WORDS};
 pub use config::{load as load_config, AppConfig, KeyCombo, KeysConfig, LogConfig, LogFields};
 pub use connection::{Connection, ContextSwitchState, LinkState};
-pub use element::{
+pub use element::{ChainStep, 
     sense_of, ContentPhase, ContentSpec, ContentView, Element, ElementClass, LogInteraction,
     LogSession, MarkOutcome, Overview, QuerySpec, ResourceList, Sense, SpanOutcome, ViewExtent,
 };
@@ -74,7 +78,10 @@ pub use form::{
     ContentViewState, FormDialog, FormFieldKind, FormFieldState, FormFocus, FormSubmit,
     SelectOption,
 };
-pub use geometry::{confirm_dialog_size, DIALOG_MARGIN};
+pub use geometry::{
+    confirm_dialog_size, form_dialog_size, form_hints, form_hints_width, picker_hints,
+    picker_hints_width, DIALOG_CHROME, DIALOG_MARGIN,
+};
 pub use handler::handle_key_event;
 pub use help::HelpContent;
 pub use keymap::{bar_hints, ViewClass};
@@ -86,11 +93,12 @@ pub use state::{CrdInfo, FlashLevel, FlashMessage, ItemCounts, KubeState, UiStat
 pub use store::{row_key, PreparedView, RowPredicate, StorePayload, StoredLine};
 pub use table::TableDataState;
 pub use takeover::{
-    ConfirmDialog, ContainerAction, ContainerChoice, ContainerPicker, EditState, Modal,
+    ConfirmDialog, ConfirmFocus, ContainerAction, ContainerChoice, ContainerPicker, EditState,
+    Modal,
     PendingAction, ShellConnectState, ShellState, SingleOp, TakeoverOp, TempFile,
 };
 pub use text_input::{handle_search_key, SearchInputResult, TextInput, TextKey};
-pub use view::DerivedViewKind;
+pub use k9rs_proto::row::DerivedViewKind;
 pub use viewport::{LineAnchor, Viewport};
 
 use std::time::Duration;
@@ -294,6 +302,26 @@ impl CoreData {
     /// the seed.
     const SEED_EPOCH: u64 = 0;
 
+    /// The app-level store for `kind`, if it has one.
+    ///
+    /// Three stores, and they answer TWO different questions — which is how
+    /// "which stores are core" came to have three answers that disagreed:
+    ///
+    /// - `namespaces` and `nodes` are core RESOURCES: `is_core()` is true for
+    ///   them, so `open_streams` subscribes them and the Overview counts
+    ///   them. [`Self::counted_stores`] is that set, derived from the
+    ///   declaration rather than restated.
+    /// - `crds` is a core STORE with no subscription and no counter. It is
+    ///   seeded from `AppEvent::Discovery` and feeds completion and the
+    ///   resource picker.
+    ///
+    /// All three are parked and restored together by
+    /// [`Self::switch_context`], because that is about the slice.
+    ///
+    /// The `_ => None` is a real "this kind has no app-level store", not a
+    /// default: `every_core_resource_has_a_store` asserts that nothing
+    /// `is_core()` falls into it, which is the case that used to be silent
+    /// (no subscription, no stat, no warning, no compile error).
     pub fn store_for(
         &self,
         kind: k9rs_proto::resource_def::BuiltInKind,
@@ -305,6 +333,15 @@ impl CoreData {
             K::CustomResourceDefinition => Some(&self.crds),
             _ => None,
         }
+    }
+
+    /// The stores behind the Overview's counters, from the per-resource
+    /// `is_core()` declaration — one derivation, not a hand-written list.
+    pub fn counted_stores(&self) -> impl Iterator<Item = &std::sync::Arc<store::RowStore>> {
+        k9rs_proto::resource_def::all_defs()
+            .filter(|def| def.is_core())
+            .filter_map(|def| def.resource_id().built_in_kind())
+            .filter_map(|kind| self.store_for(kind))
     }
 
     /// Seed a core store from cached data (connection handshake,
@@ -340,10 +377,10 @@ impl CoreData {
                 continue;
             };
             self.streams.push(session.subscribe_stream(
-                // `clear()` above already dropped every predecessor, and
-                // `SubscriptionStream::Drop` aborts — so they are retired
-                // before any epoch below is minted.
-                crate::client::Supersedes::Nothing,
+                // Said in the type, not in a comment: `clear()` above
+                // dropped every predecessor and `SubscriptionStream::Drop`
+                // aborts, so they are already retired.
+                crate::client::Supersedes::RetiredByDrop,
                 rid,
                 k9rs_proto::protocol::Namespace::All,
                 None,
@@ -377,15 +414,24 @@ impl CoreData {
     /// store behind it. Without this the `mark_stale` in `switch_context` had
     /// no reader at all: A→B→A restored the parked rows and painted the
     /// previous visit's counts byte-identically to live ones.
+    ///
+    /// EXACTLY [`Self::counted_stores`], because this sentence labels those
+    /// counters. It used to walk a hand-written `[namespaces, nodes, crds]`,
+    /// and `crds` feeds no counter and has no subscription — its staleness
+    /// clears only when `AppEvent::Discovery` arrives with a NON-EMPTY list,
+    /// which is an eager two-LIST apiserver poll and strictly slower than
+    /// the subscription baselines that clear the other two. So the banner
+    /// reliably outlived the staleness of every number it was labelling, and
+    /// would have become permanent on any later connect where the CRD list
+    /// came back empty (lost permission, or a failed list behind
+    /// `unwrap_or_default`).
     pub fn stale_reason(&self) -> Option<String> {
-        for store in [&self.namespaces, &self.nodes, &self.crds] {
-            if let crate::TableDataState::Stale(reason) =
-                store.with_read(|i| i.state.clone())
-            {
-                return Some(reason);
+        self.counted_stores().find_map(|store| {
+            match store.with_read(|i| i.state.clone()) {
+                crate::TableDataState::Stale(reason) => Some(reason),
+                _ => None,
             }
-        }
-        None
+        })
     }
 
     /// A root element for a client-owned resource, or `None` if `rid` names
@@ -584,6 +630,9 @@ pub struct App {
     /// When true, Ctrl-C does not quit the application (`noExitOnCtrlC` config).
     pub no_exit_on_ctrl_c: bool,
     /// When true, destructive actions (delete, edit, scale, restart, force-kill, shell) are disabled.
+    /// Refuse mutations CLIENT-side. Resolved by
+    /// [`ConnectionParams::read_only`], which the daemon-side gate must use
+    /// too — the two were computed separately and disagreed.
     pub read_only: bool,
 
     /// User config loaded from ~/.config/k9rs/config.yaml.
@@ -611,10 +660,9 @@ impl App {
         match Liveness::of_link(&self.conn) {
             Liveness::NoContext => Attachment::NoContext,
             live if live.shows_data() => match &self.kube.context {
-                Some(context) => Attachment::Live {
-                    context: context.clone(),
-                    identity: self.kube.identity.clone(),
-                },
+                Some(context) => {
+                    Attachment::live(context.clone(), self.kube.identity.clone())
+                }
                 // Linked but nothing confirmed yet: the initial handshake.
                 None => Attachment::Opening,
             },
@@ -634,25 +682,23 @@ impl App {
                 // fell through to `kube.identity`, which describes the context
                 // being LEFT; and an A→B→C switch would have shown B's
                 // cluster under C's name.
-                (Some(target), candidate, _) => Attachment::Connecting {
-                    identity: candidate
+                (Some(target), candidate, _) => Attachment::connecting(
+                    target.clone(),
+                    candidate
                         .filter(|(name, _)| name == target)
                         .map(|(_, identity)| identity.clone())
                         .unwrap_or_default(),
-                    context: target.clone(),
-                },
+                ),
                 // The session's own candidate from disk: name and identity
                 // come from the same kubeconfig entry, so they agree.
-                (None, Some((context, identity)), _) => Attachment::Connecting {
-                    context: context.clone(),
-                    identity: identity.clone(),
-                },
+                (None, Some((context, identity)), _) => {
+                    Attachment::connecting(context.clone(), identity.clone())
+                }
                 // Reconnecting to the last-confirmed context: its identity is
                 // the confirmed one, which is the same context.
-                (None, None, Some(context)) => Attachment::Connecting {
-                    context: context.clone(),
-                    identity: self.kube.identity.clone(),
-                },
+                (None, None, Some(context)) => {
+                    Attachment::connecting(context.clone(), self.kube.identity.clone())
+                }
                 (None, None, None) => Attachment::Opening,
             },
         }
@@ -744,7 +790,7 @@ impl App {
             pinned_resources: default_pinned_resources(),
             command_history: Vec::new(),
             no_exit_on_ctrl_c: config.no_exit_on_ctrl_c,
-            read_only: config.read_only,
+            read_only: crate::ConnectionParams::read_only(false, &config),
             conn: Connection::new(),
             pending_batch: None,
             config,
@@ -761,10 +807,6 @@ impl App {
         }
     }
 
-    /// Construct a ROOT list element for `rid` scoped by `namespace` —
-    /// the one construction site where the ambient selector is a
-    /// legitimate input (roots are built FROM the selector; drills carry
-    /// their own intrinsic scope).
     /// Whether a DAEMON-backed resource view can be opened at all.
     ///
     /// False with no context: such a root subscribes against a session that
@@ -783,10 +825,19 @@ impl App {
             )
     }
 
-    /// Build a root list element for `rid`. Routes on where the rows come
-    /// from: a client-owned resource (the kubeconfig's contexts) reads a
-    /// store the app already holds and opens no subscription, so it works
-    /// with no daemon at all; everything else subscribes as usual.
+    /// Build a root list element for `rid`, scoped by `namespace`.
+    ///
+    /// The one construction site where the ambient selector is a legitimate
+    /// input: roots are built FROM the selector, while drills carry their own
+    /// intrinsic scope. (That paragraph was sitting on
+    /// [`Self::can_open_resource_view`] above, 25 lines from the function it
+    /// describes, which made that function's rustdoc summary line a sentence
+    /// about constructing an element.)
+    ///
+    /// Routes on where the rows come from: a client-owned resource (the
+    /// kubeconfig's contexts) reads a store the app already holds and opens
+    /// no subscription, so it works with no daemon at all; everything else
+    /// subscribes as usual.
     pub fn root_list_element(
         session: &crate::client::ClientSession,
         metrics: &std::sync::Arc<store::MetricsHub>,
