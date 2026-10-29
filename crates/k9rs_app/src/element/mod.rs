@@ -157,6 +157,17 @@ pub enum ElementClass {
 ///
 /// # When an accessor may use `_ =>`, and when it may not
 ///
+/// CLASSIFIED 2026-10-29, which is what the standing audit item asked for.
+/// Of the 44 code wildcards on this enum, three were weighed as possible
+/// guesses and two were answers after all: `scope_label`'s `_ => ""` shows
+/// no scope for a kind that has none, and `is_fault_filter`'s `_ => false`
+/// cannot be wrong because a fault filter IS a `RowFilter` by construction.
+/// The third, [`Self::log_lost_history`], was a real guess and is now
+/// exhaustive: every other bare default here OMITS something visible (no
+/// highlight, no flash, no scope) while that one ASSERTS completeness, and
+/// a new derived log kind would have inherited the claim that nothing was
+/// lost. The direction of the wrongness is the test, not the arm count.
+///
 /// A 2026-09 audit counted "~28 `_ =>` accessors" as a hazard; it is now 44
 /// and most of them are correct. The distinction, triaged 2026-10-14, is
 /// whether the wildcard is an ANSWER or a GUESS:
@@ -169,11 +180,15 @@ pub enum ElementClass {
 ///   `label`, `capabilities` to `rid`'s, `marked_count` to the data store's.
 ///   The default is the composition, not a shrug.
 /// - **A GUESS, and therefore banned.** A bare default that a new kind would
-///   silently inherit AND be wrong about. Two such existed and are now
-///   exhaustive: [`Self::is_live`] (`_ => true` is what suppresses the stale
-///   banner, so a new kind with a dead stream claimed to be tracking the
-///   cluster) and [`Self::abort_data_stream`] (`_ => {}` leaks a new kind's
-///   stream straight past the choke point that exists to abort it).
+///   silently inherit AND be wrong about. `Self::abort_data_stream` is
+///   the case: `_ => {}` leaks a new kind's stream straight past the choke
+///   point that exists to abort it.
+///
+///   This named a second, `is_live`, whose `_ => true` "suppresses the stale
+///   banner". It does not: nothing read that method, and the banner is
+///   decided by the nav walk asking the QUERY. The method is gone; a
+///   conformance rule whose answer has no reader forces a decision that
+///   cannot be wrong.
 ///
 /// The test is not "is there a wildcard" but "would a new variant be WRONG
 /// under it". Adding a kind should force a decision exactly where a wrong
@@ -338,10 +353,29 @@ impl Element {
 
     /// Whether this element lost matches to its parent's eviction before it
     /// could collect them — the honest answer to "is this the whole story".
+    ///
+    /// EXHAUSTIVE, by the rule this module's own doc states: `_ => false`
+    /// is a GUESS here, not an answer. Every other bare default on this
+    /// enum omits something visible (no scope shown, no highlight, no
+    /// flash); this one ASSERTS completeness, which is the one direction a
+    /// new kind must not inherit silently. A future derived log view that
+    /// could lose lines to its parent would have claimed it had the whole
+    /// story — the exact dishonesty the accessor exists to prevent.
     pub fn log_lost_history(&self) -> bool {
         match self {
             Element::LogFilter(e) => e.lost_history(),
-            _ => false,
+            // No parent to lose anything TO. A session owns its store, so
+            // its own eviction is reported by the store's counters, not by
+            // this; the rest hold no log lines at all.
+            Element::LogSession(_)
+            | Element::ResourceList(_)
+            | Element::RowFilter(_)
+            | Element::DerivedRows(_)
+            | Element::ContentView(_)
+            | Element::Overview(_)
+            | Element::Confirm(_)
+            | Element::Picker(_)
+            | Element::Form(_) => false,
         }
     }
 
@@ -385,7 +419,7 @@ impl Element {
     }
 
     /// Capabilities for the help footer / key gating on non-table kinds.
-    pub fn is_table(&self) -> bool {
+    pub(crate) fn is_table(&self) -> bool {
         matches!(self.class(), ElementClass::Table)
     }
 
@@ -529,8 +563,12 @@ impl Element {
     /// interchangeable.
     /// Test-only: the renderer reads `log_chain()`, which carries the
     /// per-step counts this drops.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn log_committed_patterns(&self) -> Vec<String> {
+    ///
+    /// `cfg(test)` rather than `any(test, feature = "testing")` — only this
+    /// crate's own tests call it, and the wider gate made it dead code in a
+    /// `--features testing` lib build. See `KeyCombo::as_key_event`.
+    #[cfg(test)]
+    pub(crate) fn log_committed_patterns(&self) -> Vec<String> {
         match self {
             Element::LogFilter(e) => e.source.patterns.iter().map(Narrowing::label).collect(),
             _ => Vec::new(),
@@ -865,7 +903,7 @@ impl Element {
 
     /// Whether this element is a fault-filter refinement (Ctrl-Z pops it
     /// when it is the top).
-    pub fn is_fault_filter(&self) -> bool {
+    pub(crate) fn is_fault_filter(&self) -> bool {
         match self {
             Element::RowFilter(e) => {
                 matches!(e.source.predicates().last().map(AsRef::as_ref), Some(RowPredicate::Fault))
@@ -898,7 +936,7 @@ impl Element {
     /// The row output this element hands to a derived child (the model's
     /// "handed references"): the source INCLUDING this element's own
     /// predicates.
-    pub fn output_source(&self) -> Option<&RowSource> {
+    pub(crate) fn output_source(&self) -> Option<&RowSource> {
         match self {
             Element::ResourceList(e) => Some(&e.source),
             Element::RowFilter(e) => Some(&e.source),
@@ -945,7 +983,7 @@ impl Element {
     /// survive. `_ => false` conflated "has no client-owned store" with "is
     /// a kind nobody has decided about yet", and the second is what a new
     /// variant is.
-    pub fn is_client_owned(&self) -> bool {
+    pub(crate) fn is_client_owned(&self) -> bool {
         match self {
             Element::ResourceList(e) => e.query.is_client_owned(),
             // A filter/projection over a client-owned store is equally
@@ -969,7 +1007,7 @@ impl Element {
     /// (filter / projection) kinds own no stream — they ride an ancestor's —
     /// so this is a no-op for them (the ancestor is aborted on its own turn in
     /// the walk). Overview / context / content kinds own no subscription.
-    pub fn abort_data_stream(&self) {
+    pub(crate) fn abort_data_stream(&self) {
         match self {
             Element::ResourceList(e) => e.query().abort(),
             Element::LogSession(s) => s.abort(),
@@ -1119,7 +1157,7 @@ impl Element {
     }
 
     /// Lifecycle state for the loading/error chrome.
-    pub fn data_state(&self) -> TableDataState {
+    pub(crate) fn data_state(&self) -> TableDataState {
         match self.data_store() {
             Some(store) => store.with_read(|i| i.state.clone()),
             None => TableDataState::Ready,
@@ -1703,40 +1741,26 @@ impl Element {
         true
     }
 
-    pub fn toggle_sort(&mut self) {
+    pub(crate) fn toggle_sort(&mut self) {
         let Some(col) = self.table_interaction().map(|i| i.sort.col) else { return };
         let _ = self.sort_by(crate::SortTarget::Column(col));
     }
 
     // -- Liveness ----------------------------------------------------------------
 
-    /// Whether this element OWNS a live subscription right now. Elements
-    /// without their own stream (filters, projections) report `true` —
-    /// their data rides an ancestor's stream, revived by the stack's
-    /// owner walk.
-    pub fn is_live(&self) -> bool {
-        match self {
-            Element::ResourceList(e) => e.query.is_live(),
-            // EXHAUSTIVE, and the arms are grouped by WHY they are live, not
-            // lumped under a `_ => true`. "Assume live" is the unsafe
-            // default: it is what suppresses the stale banner, so a new kind
-            // that owned a stream would have claimed to be tracking the
-            // cluster while its subscription was dead.
-            //
-            // Riding an ancestor's stream — revived by the stack's owner
-            // walk, so liveness is the ancestor's to report.
-            Element::RowFilter(_) | Element::DerivedRows(_) | Element::LogFilter(_) => true,
-            // Nothing to be stale ABOUT: a one-shot fetch carries its own
-            // phase (`ContentPhase`), a log session's liveness is the link's
-            // (`Liveness::of_link`), and the rest are chrome or dialogs.
-            Element::ContentView(_)
-            | Element::LogSession(_)
-            | Element::Overview(_)
-            | Element::Confirm(_)
-            | Element::Picker(_)
-            | Element::Form(_) => true,
-        }
-    }
+    // `is_live` lived here: a 24-line exhaustive match over every element
+    // kind, documented as one of two wildcards that HAD to be exhaustive
+    // because "`_ => true` is what suppresses the stale banner". Nothing
+    // read it. The stale banner is decided by `NavStack`'s owner walk
+    // asking `list.query().is_live()` — the QUERY's liveness, which only
+    // the one kind that owns a stream has — so the hazard the doc named
+    // could not occur through this method, and the conformance it forced
+    // was a decision with no consequence.
+    //
+    // Invisible until `k9rs_app`'s surface was narrowed: `pub` on a
+    // re-exported type suppresses `dead_code`, so three methods here had
+    // no caller and no warning. Its sibling `abort_data_stream` is the
+    // real case and keeps its exhaustive match.
 }
 
 /// Build the committed predicate for the filter input's current state.

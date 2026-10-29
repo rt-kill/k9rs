@@ -798,7 +798,7 @@ impl ClientSession {
     /// Takes a fully-built `LogInit` so callers can't mistakenly pass an
     /// untyped namespace string and round-trip it through `Namespace::from_row`
     /// (the parameter list used to be 7 strings/options long).
-    pub fn stream_log_substream(
+    pub(crate) fn stream_log_substream(
         &self,
         supersedes: Supersedes<'_>,
         log_init: protocol::LogInit,

@@ -53,11 +53,21 @@ fn every_view_class_has_help_to_show() {
 
         assert!(!sheet.sections.is_empty());
         for (title, table) in &sheet.sections {
-            assert_eq!(table.headers, vec!["KEY", "DESCRIPTION"]);
+            // One section is not a group of keys but ALL of them, so it
+            // keeps the flat sheet's SECTION column — that is what makes
+            // `/` inside it search everything.
+            let flat = title == crate::help::ALL_KEYS;
+            let want: Vec<&str> = if flat {
+                vec!["SECTION", "KEY", "DESCRIPTION"]
+            } else {
+                vec!["KEY", "DESCRIPTION"]
+            };
+            assert_eq!(table.headers, want, "{class:?}: section {title:?}");
             assert!(!table.rows.is_empty(), "{class:?}: section {title:?} is empty");
             for row in &table.rows {
-                assert_eq!(row.cells.len(), 2, "{class:?}: {row:?}");
-                assert!(!cell(row, 1).is_empty(), "{class:?}: a row with no description");
+                assert_eq!(row.cells.len(), want.len(), "{class:?}: {row:?}");
+                let desc = cell(row, want.len() - 1);
+                assert!(!desc.is_empty(), "{class:?}: a row with no description");
             }
         }
     }
@@ -259,10 +269,18 @@ fn a_press_captures_every_section_the_index_names() {
             other => panic!("KEYS is a count, got {other:?}"),
         };
         assert_eq!(rows.len(), advertised, "{title}: the count must be the truth");
-        assert!(
-            rows.iter().all(|r| r.name.starts_with(title.as_str())),
-            "{title}: a section holds its OWN rows",
-        );
+        if title == crate::help::ALL_KEYS {
+            // Its rows ARE the other sections' rows, names included — that
+            // is the point, and it is why they stay unique.
+            let distinct: std::collections::HashSet<&String> =
+                rows.iter().map(|r| &r.name).collect();
+            assert_eq!(distinct.len(), rows.len(), "{title}: names must stay unique");
+        } else {
+            assert!(
+                rows.iter().all(|r| r.name.starts_with(title.as_str())),
+                "{title}: a section holds its OWN rows",
+            );
+        }
     }
 
     // A second press REPLACES the capture — contextual content and shared
@@ -294,4 +312,59 @@ fn a_press_captures_every_section_the_index_names() {
         "…and the table view's section is gone, not left to be opened under \
          the log view's breadcrumb",
     );
+}
+
+/// One `/` still searches every key — the thing the index took away.
+///
+/// The flat sheet's real virtue was grep: 61 rows, and `/ctrl-z` found the
+/// key without your knowing which group it was in. An index of five rows
+/// greps section names and summaries instead, so finding a half-remembered
+/// chord became a guess. The flat sheet is a SECTION now, so the grep is
+/// one Enter away and searches the same text it always did.
+#[test]
+fn the_all_keys_section_holds_every_row_of_every_other() {
+    use k9rs_proto::row::CellValue;
+
+    for &class in crate::keymap::ViewClass::ALL {
+        let sheet = sheet_for(class);
+        let (all_title, all) = sheet
+            .sections
+            .last()
+            .expect("sections are never empty");
+        assert_eq!(all_title, crate::help::ALL_KEYS, "it comes LAST, after the groups");
+
+        // Every (section, key, description) from every other section, with
+        // nothing added and nothing dropped.
+        let grouped: Vec<(String, String, String)> = sheet
+            .sections
+            .iter()
+            .filter(|(t, _)| t != crate::help::ALL_KEYS)
+            .flat_map(|(t, table)| {
+                table.rows.iter().map(move |r| (t.clone(), cell(r, 0), cell(r, 1)))
+            })
+            .collect();
+        let flat: Vec<(String, String, String)> = all
+            .rows
+            .iter()
+            .map(|r| (cell(r, 0), cell(r, 1), cell(r, 2)))
+            .collect();
+        assert_eq!(flat, grouped, "{class:?}: the flat section IS the other sections");
+
+        // And the index advertises the total, so you can see it is the
+        // whole thing before opening it.
+        let row = sheet
+            .index
+            .rows
+            .iter()
+            .find(|r| cell(r, 0) == crate::help::ALL_KEYS)
+            .expect("the index lists it");
+        assert_eq!(row.cells[1], CellValue::Count(grouped.len() as i64));
+
+        // A key that lives in exactly one group is findable here, which is
+        // the grep this restores.
+        assert!(
+            flat.iter().any(|(_, k, _)| k == "Ctrl-z"),
+            "{class:?}: a global chord must be greppable from one place",
+        );
+    }
 }

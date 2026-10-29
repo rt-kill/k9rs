@@ -161,7 +161,7 @@ fn no_context_lands_in_the_picker_and_stops_trying() {
         app.nav.pop().is_none(),
         "Esc must not escape the picker — there is nowhere to go back to",
     );
-    assert_eq!(app.conn.link(), crate::LinkState::NoContext);
+    assert_eq!(app.conn.link(), crate::connection::LinkState::NoContext);
     assert!(
         !app.conn.rebuild_due(std::time::Instant::now()),
         "retrying against a target that doesn't exist is just a loop",

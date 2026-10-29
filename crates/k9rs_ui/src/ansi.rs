@@ -42,7 +42,7 @@ fn push_ansi_text<'a>(
 ///
 /// The application is the authority on its own output coloring — we
 /// preserve it faithfully instead of stripping and re-guessing.
-pub fn parse_ansi_line<'a>(line: &'a str, base: ratatui::style::Style) -> Vec<ratatui::text::Span<'a>> {
+pub(crate) fn parse_ansi_line<'a>(line: &'a str, base: ratatui::style::Style) -> Vec<ratatui::text::Span<'a>> {
     let mut spans = Vec::new();
     let mut style = base;
     let bytes = line.as_bytes();

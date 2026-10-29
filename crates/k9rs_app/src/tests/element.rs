@@ -1959,30 +1959,29 @@ fn a_log_range_can_ask_for_everything_from_the_beginning() {
 ///
 /// A 2026-09 audit counted the `_ =>` arms as one hazard; most are answers
 /// (an `Option` for "the kinds that have one", or delegation to the general
-/// case). Two were guesses a new kind would silently inherit and be wrong
-/// about, and those are the ones pinned here — adding an element kind must
-/// force a decision about its liveness and its stream, and nowhere else.
+/// case). ONE is a guess a new kind would silently inherit and be wrong
+/// about, and that is what is pinned here.
+///
+/// It pinned two. The other, `is_live`, turned out to have no reader at all
+/// — the stale banner is decided by the nav walk asking the QUERY — so its
+/// exhaustive match forced a decision that could not be wrong. Deleted, and
+/// these assertions went with it.
 #[test]
-fn a_new_element_kind_must_declare_liveness_and_stream_ownership() {
+fn a_new_element_kind_must_declare_stream_ownership() {
     // This test is a STATEMENT, checked by the compiler rather than by
-    // asserting: `is_live` and `abort_data_stream` both match every variant
-    // by name, so adding one breaks the build in those two arms. What the
-    // assertions pin is the ANSWERS, because an exhaustive match that
-    // answered wrongly would still compile.
+    // asserting: `abort_data_stream` matches every variant by name, so
+    // adding a kind breaks the build in that arm. What the assertions pin
+    // is the ANSWERS, because an exhaustive match that answered wrongly
+    // would still compile.
     let app = crate::App::new_for_test();
 
-    // A table with a live query reports its query's liveness — not a
-    // blanket `true`, which is what suppressed the stale banner.
-    assert!(app.nav.top().is_live(), "a fresh list is live");
-
-    // A derived kind rides its ancestor's stream, so it reports live and
-    // owns nothing to abort. Both are deliberate, not defaults.
+    // A derived kind rides its ancestor's stream, so it owns nothing to
+    // abort. Deliberate, not a default.
     let filter = crate::element::Element::derive_filter(
         app.nav.top(),
         crate::store::RowPredicate::Grep(k9rs_util::CompiledGrep::new("x")),
     )
     .expect("a table can be filtered");
-    assert!(filter.is_live(), "a filter's liveness is its ancestor's");
     // Aborting a stream it does not own is a no-op, not a panic: the
     // ancestor is aborted on its own turn in the walk.
     filter.abort_data_stream();
@@ -2001,7 +2000,6 @@ fn a_new_element_kind_must_declare_liveness_and_stream_ownership() {
         },
         focused: crate::ConfirmFocus::Cancel,
     }));
-    assert!(confirm.is_live());
     confirm.abort_data_stream();
 }
 

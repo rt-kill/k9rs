@@ -130,7 +130,7 @@ impl Default for SessionSharedState {
 impl SessionSharedState {
     /// A snapshot of every `Weak`-keyed cache, for `ctl status`. Read-only:
     /// nothing here reaps, so asking what the daemon holds cannot change it.
-    pub fn cache_stats(&self) -> protocol::CacheStats {
+    pub(crate) fn cache_stats(&self) -> protocol::CacheStats {
         protocol::CacheStats {
             watchers: self.watcher_cache.stats(),
             contexts: self.local_registry.stats(),

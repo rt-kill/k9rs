@@ -86,7 +86,7 @@ pub struct Viewport {
 
 impl Viewport {
     /// A viewport that starts pinned to the bottom (logs tail by default).
-    pub fn tailing() -> Self {
+    pub(crate) fn tailing() -> Self {
         Self { follow: true, ..Self::default() }
     }
 
@@ -123,7 +123,7 @@ impl Viewport {
 
     /// The published viewport height. Used as the page size and (by the table)
     /// as the cursor's page step. Never guessed from `terminal::size()`.
-    pub fn viewport_rows(&self) -> usize {
+    pub(crate) fn viewport_rows(&self) -> usize {
         self.viewport_rows
     }
 
@@ -266,7 +266,7 @@ impl Viewport {
 
     /// Center the viewport on a row (content-view search "next/prev match").
     /// Clears follow — the user jumped somewhere specific.
-    pub fn center_on(&mut self, row: usize) {
+    pub(crate) fn center_on(&mut self, row: usize) {
         self.follow = false;
         let half = self.viewport_rows / 2;
         self.move_to(row.saturating_sub(half).min(self.max_scroll()));

@@ -99,7 +99,7 @@ impl KubectlCache {
 
     /// Cache a structured describe by its typed lines. The flat `content` is
     /// derived so the text-keyed `get` keeps working for this entry too.
-    pub fn insert_describe(
+    pub(crate) fn insert_describe(
         &mut self,
         target: ObjectRef,
         lines: Vec<k9rs_proto::protocol::DescribeLine>,

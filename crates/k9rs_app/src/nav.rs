@@ -415,7 +415,7 @@ impl NavStack {
     /// to rekey). Refinements carry a VALUE COPY of the rid, so they
     /// update alongside their lists — an `ObjectRef` built from a
     /// filter-on-top must never carry the stale pre-resolution identity.
-    pub fn apply_resolved(&mut self, original: &ResourceId, resolved: &ResourceId) {
+    pub(crate) fn apply_resolved(&mut self, original: &ResourceId, resolved: &ResourceId) {
         for element in self.items.iter_mut() {
             match element {
                 Element::ResourceList(list) => {

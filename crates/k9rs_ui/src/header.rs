@@ -14,7 +14,7 @@ use k9rs_theme::Theme;
 // k9rs ASCII art logo (rendered in orange)
 // ---------------------------------------------------------------------------
 
-pub const LOGO: &[&str] = &[
+pub(crate) const LOGO: &[&str] = &[
     r" _     ___            ",
     r"| | __/ _ \ _ __ ___  ",
     r"| |/ / (_) | '__/ __| ",
@@ -53,7 +53,7 @@ pub fn context_label(at: &Attachment) -> String {
 /// field reads. Same word the table side uses — `CellValue::Placeholder`
 /// renders exactly this — so a context with no `user:` says the same thing
 /// wherever you look at it.
-pub const UNKNOWN_FIELD: &str = "n/a";
+pub(crate) const UNKNOWN_FIELD: &str = "n/a";
 
 /// k9rs logo on the right. No key hints — those live in the ? help dialog.
 /// The four identity fields, each value elided from the LEFT to fit
@@ -74,7 +74,7 @@ pub const UNKNOWN_FIELD: &str = "n/a";
 ///
 /// Field NAMES, not formatted labels: the header pads them into a column and
 /// the overview centres each line, so the padding is the caller's.
-pub fn identity_fields(
+pub(crate) fn identity_fields(
     at: &k9rs_app::Attachment,
     value_w: usize,
 ) -> [(&'static str, String); 4] {
@@ -88,7 +88,7 @@ pub fn identity_fields(
     ]
 }
 
-pub fn draw_header(
+pub(crate) fn draw_header(
     f: &mut Frame,
     app: &App,
     area: Rect,
@@ -151,7 +151,7 @@ pub fn draw_header(
 /// the key that gets you out — and the log STATUS bar could lose `Since` and
 /// `Pan` the same way at 80. Each surface measuring its own content was how
 /// one of them got a fix and the other did not.
-pub fn fit_bar(groups: Vec<Vec<Span<'static>>>, width: u16, theme: &Theme) -> Line<'static> {
+pub(crate) fn fit_bar(groups: Vec<Vec<Span<'static>>>, width: u16, theme: &Theme) -> Line<'static> {
     let width = width as usize;
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
@@ -175,7 +175,7 @@ pub fn fit_bar(groups: Vec<Vec<Span<'static>>>, width: u16, theme: &Theme) -> Li
 
 /// Build a keybinding bar `Line` from a list of `(key, description)` pairs.
 /// Used by describe, yaml, log, and context views for their bottom status bars.
-pub fn render_keybinding_bar(
+pub(crate) fn render_keybinding_bar(
     hints: &[(impl AsRef<str>, impl AsRef<str>)],
     width: u16,
     theme: &Theme,

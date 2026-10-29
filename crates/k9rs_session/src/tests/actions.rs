@@ -661,7 +661,7 @@ fn the_identity_never_describes_the_context_being_left() {
     // BEFORE the new session reports. The window the bug lived in: the label
     // already names staging, so the identity must not still be prod's.
     let at = app.attachment();
-    let label = k9rs_ui::header::context_label(&at);
+    let label = k9rs_ui::context_label(&at);
     assert!(label.contains("staging"), "names what we're connecting to: {label}");
     assert_eq!(
         at.identity().cluster(),
@@ -676,7 +676,7 @@ fn the_identity_never_describes_the_context_being_left() {
         current_identity: ClusterIdentity::new("staging-eks".into(), "staging-admin".into()),
     });
     let at = app.attachment();
-    let label = k9rs_ui::header::context_label(&at);
+    let label = k9rs_ui::context_label(&at);
     assert!(label.contains("staging"), "still names the target: {label}");
     assert_eq!(at.identity().cluster(), Some("staging-eks"), "…and the cluster line agrees");
     assert_eq!(at.identity().user(), Some("staging-admin"));

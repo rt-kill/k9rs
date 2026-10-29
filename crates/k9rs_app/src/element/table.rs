@@ -43,7 +43,7 @@ pub struct ColumnPolicy {
 }
 
 impl ColumnPolicy {
-    pub fn for_query(rid: ResourceId, scope: &Namespace) -> Self {
+    pub(crate) fn for_query(rid: ResourceId, scope: &Namespace) -> Self {
         Self { include_namespace: scope.is_all(), rid: Some(rid) }
     }
 
@@ -184,7 +184,7 @@ impl TableInteraction {
     /// where the parent's eye was), draft input starts fresh, and the
     /// child's sort is its OWN from here on (sorting a refinement no
     /// longer re-sorts the parent underneath).
-    pub fn seeded_from(parent: &TableInteraction) -> Self {
+    pub(crate) fn seeded_from(parent: &TableInteraction) -> Self {
         Self {
             selected: parent.selected,
             selected_col: parent.selected_col,
@@ -201,7 +201,7 @@ impl TableInteraction {
     /// Drop the memoized view (called when the element is covered — the
     /// ephemeral view is fully re-derivable, so retaining O(depth) of
     /// them buys nothing).
-    pub fn drop_cache(&mut self) {
+    pub(crate) fn drop_cache(&mut self) {
         self.cache = None;
     }
 
@@ -330,14 +330,14 @@ impl LiveQuery {
     /// answers "is there a stream to manage", the store answers "do these
     /// rows depend on the connection". Keeping the second on the store is
     /// what lets a `/` filter over the contexts list inherit it for free.
-    pub fn is_client_owned(&self) -> bool {
+    pub(crate) fn is_client_owned(&self) -> bool {
         self.store.is_client_owned()
     }
 
     /// Whether the bridge task behind this subscription is still running.
     /// A client-owned query is always live: there is no bridge that could
     /// die, and nothing to re-subscribe if it did.
-    pub fn is_live(&self) -> bool {
+    pub(crate) fn is_live(&self) -> bool {
         match &self.origin {
             QueryOrigin::Daemon(stream) => stream.is_alive(),
             QueryOrigin::Client => true,
@@ -409,7 +409,7 @@ impl LiveQuery {
     /// The server resolved our rid to its true identity (`:nodeclaims` →
     /// karpenter's NodeClaim). The element updates its own spec — there
     /// are no global maps to rekey.
-    pub fn resolve_rid(&mut self, resolved: ResourceId) {
+    pub(crate) fn resolve_rid(&mut self, resolved: ResourceId) {
         self.spec.rid = resolved;
     }
 }
@@ -528,7 +528,7 @@ impl ResourceList {
 
     /// Same, but seed the child cursor/sort from the element being
     /// covered (cross-resource drills keep visual continuity).
-    pub fn open_from(
+    pub(crate) fn open_from(
         session: &ClientSession,
         spec: QuerySpec,
         hub: &Arc<MetricsHub>,
@@ -572,7 +572,7 @@ impl ResourceList {
         &self.query
     }
 
-    pub fn query_mut(&mut self) -> &mut LiveQuery {
+    pub(crate) fn query_mut(&mut self) -> &mut LiveQuery {
         &mut self.query
     }
 
@@ -582,7 +582,7 @@ impl ResourceList {
 
     /// Server resolve: update spec, label, and title in place (the
     /// element IS the identity — nothing else to rekey).
-    pub fn apply_resolved(&mut self, resolved: ResourceId) {
+    pub(crate) fn apply_resolved(&mut self, resolved: ResourceId) {
         let short = resolved.short_label().to_lowercase();
         if self.label == self.query.spec().rid.short_label().to_lowercase() {
             self.label = short.clone();

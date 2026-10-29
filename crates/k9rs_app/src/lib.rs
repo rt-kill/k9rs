@@ -63,12 +63,19 @@ pub(crate) mod viewport;
 // needs no number to do it.
 pub use actions::{Action, LogRange, SortTarget};
 pub use anim::{Anim, FRAME_INTERVAL};
+// `Attached`, `ItemCounts`, `KubeState` and `MetricsHub` are exported for a
+// STRUCTURAL reason, not because a consumer names them: each appears in a
+// public signature (`Attachment::Live(Attached)`, `App::kube`,
+// `active_table_items_count`, `client_root_element`). A measurement of "is
+// this name mentioned outside the crate" counts them as dead, and they are
+// not — `rustc`'s `private_interfaces` is the arbiter, and it says a type
+// reachable through the API is part of it.
 pub use attachment::{Attached, Attachment};
 pub use batch::BatchTracker;
 pub use client::{ClientSession, ConnectionParams};
 pub use commands::{ParsedCommand, COMMAND_WORDS};
-pub use config::{load as load_config, AppConfig, KeyCombo, KeysConfig, LogConfig, LogFields};
-pub use connection::{Connection, ContextSwitchState, LinkState};
+pub use config::{load as load_config, AppConfig, KeyCombo, KeysConfig};
+pub use connection::{Connection, ContextSwitchState};
 pub use element::{ChainStep, 
     sense_of, ContentPhase, ContentSpec, ContentView, Element, ElementClass, LogInteraction,
     LogSession, MarkOutcome, Overview, QuerySpec, ResourceList, Sense, SpanOutcome, ViewExtent,
@@ -90,13 +97,24 @@ pub use handler::handle_key_event;
 // `unreachable_pub` — the dead-`pub` class — so it goes when its last
 // caller does.
 pub use keymap::{bar_hints, ViewClass};
-pub use kubectl_cache::{ContentKind, KubectlCache};
+pub use kubectl_cache::ContentKind;
 pub use liveness::Liveness;
 pub use nav::{K8sFieldSelector, RootSpec};
 pub use select_gate::{gate_action, Gated};
 pub use state::{CrdInfo, FlashLevel, FlashMessage, ItemCounts, KubeState, UiState};
 pub use store::{row_key, PreparedView, RowPredicate, StorePayload, StoredLine};
-pub use table::TableDataState;
+// Reachable at the crate root for this crate's OWN modules, which name
+// several of these as `crate::X`, without being part of the facade. Each
+// was `pub use` and had no cross-crate reader — the dead-export class, and
+// `unreachable_pub` cannot see a dead `pub use` because it is not an item.
+pub(crate) use config::LogConfig;
+pub(crate) use kubectl_cache::KubectlCache;
+pub(crate) use table::TableDataState;
+
+// `TableDataState` is NOT re-exported: nothing outside this crate names it.
+// The renderer asks `Liveness` instead, which is the one authority over
+// "what does the frame say about this data" — exactly as that type's own
+// doc says. Exporting the raw state invited a second opinion.
 pub use takeover::{
     ConfirmDialog, ConfirmFocus, ContainerAction, ContainerChoice, ContainerPicker, EditState,
     Modal,
@@ -123,7 +141,7 @@ pub use k9rs_kube::kubeconfig::KubeContext;
 /// The default ordered list of pinned resources for Tab/BackTab cycling.
 /// Uses declaration order from `BuiltInKind`, which is where the resource
 /// table now lives — the watcher registry no longer holds the defs.
-pub fn default_pinned_resources() -> Vec<ResourceId> {
+pub(crate) fn default_pinned_resources() -> Vec<ResourceId> {
     k9rs_proto::resource_def::all_defs()
         .map(|def| def.resource_id())
         .collect()
@@ -201,13 +219,13 @@ fn seed_aliases(store: &store::RowStore, config: &AppConfig) {
 /// resource's `headers()` — the contexts view is an ordinary table, so grep,
 /// column filter, sort and column movement all work without knowing that
 /// these rows came from a file rather than a cluster.
-pub fn context_headers() -> Vec<String> {
+pub(crate) fn context_headers() -> Vec<String> {
     vec!["NAME".into(), "CLUSTER".into(), "USER".into(), "ACTIVE".into()]
 }
 
 /// Project the kubeconfig's contexts into rows. Enter rides on the row as a
 /// [`k9rs_proto::row::DrillTarget`], so switching needs no special case in the key handler.
-pub fn context_rows(contexts: &[KubeContext]) -> Vec<k9rs_proto::row::ResourceRow> {
+pub(crate) fn context_rows(contexts: &[KubeContext]) -> Vec<k9rs_proto::row::ResourceRow> {
     use k9rs_proto::row::{CellValue, DrillTarget, ResourceRow, RowHealth};
     contexts
         .iter()
@@ -351,7 +369,7 @@ impl CoreData {
     ///
     /// - `namespaces` and `nodes` are core RESOURCES: `is_core()` is true for
     ///   them, so `open_streams` subscribes them and the Overview counts
-    ///   them. [`Self::counted_stores`] is that set, derived from the
+    ///   them. `Self::counted_stores` is that set, derived from the
     ///   declaration rather than restated.
     /// - `crds` is a core STORE with no subscription and no counter. It is
     ///   seeded from `AppEvent::Discovery` and feeds completion and the
@@ -364,7 +382,7 @@ impl CoreData {
     /// default: `every_core_resource_has_a_store` asserts that nothing
     /// `is_core()` falls into it, which is the case that used to be silent
     /// (no subscription, no stat, no warning, no compile error).
-    pub fn store_for(
+    pub(crate) fn store_for(
         &self,
         kind: k9rs_proto::resource_def::BuiltInKind,
     ) -> Option<&std::sync::Arc<store::RowStore>> {
@@ -379,7 +397,7 @@ impl CoreData {
 
     /// The stores behind the Overview's counters, from the per-resource
     /// `is_core()` declaration — one derivation, not a hand-written list.
-    pub fn counted_stores(&self) -> impl Iterator<Item = &std::sync::Arc<store::RowStore>> {
+    pub(crate) fn counted_stores(&self) -> impl Iterator<Item = &std::sync::Arc<store::RowStore>> {
         k9rs_proto::resource_def::all_defs()
             .filter(|def| def.is_core())
             .filter_map(|def| def.resource_id().built_in_kind())
@@ -436,7 +454,7 @@ impl CoreData {
     /// `root_list_element` can route without every call site learning which
     /// resources happen to be local — and adding another client-owned
     /// resource later is one arm here, not a new special case everywhere.
-    pub fn client_store(&self, rid: &ResourceId) -> Option<&std::sync::Arc<store::RowStore>> {
+    pub(crate) fn client_store(&self, rid: &ResourceId) -> Option<&std::sync::Arc<store::RowStore>> {
         match rid {
             ResourceId::Local(k9rs_proto::local_types::LocalResourceKind::Context) => {
                 Some(&self.contexts)
@@ -456,7 +474,7 @@ impl CoreData {
     /// no reader at all: A→B→A restored the parked rows and painted the
     /// previous visit's counts byte-identically to live ones.
     ///
-    /// EXACTLY [`Self::counted_stores`], because this sentence labels those
+    /// EXACTLY `Self::counted_stores`, because this sentence labels those
     /// counters. It used to walk a hand-written `[namespaces, nodes, crds]`,
     /// and `crds` feeds no counter and has no subscription — its staleness
     /// clears only when `AppEvent::Discovery` arrives with a NON-EMPTY list,
@@ -497,7 +515,7 @@ impl CoreData {
     /// Re-seed the contexts table from a fresh kubeconfig read. Not a
     /// subscription: the rows come from the client's own disk, so this is
     /// the only writer, and it re-runs whenever the kubeconfig is re-read.
-    pub fn seed_contexts(&self, contexts: &[KubeContext]) {
+    pub(crate) fn seed_contexts(&self, contexts: &[KubeContext]) {
         self.contexts.apply(
             Self::SEED_EPOCH,
             store::StorePayload::Baseline(k9rs_proto::protocol::TableBaseline {
@@ -645,7 +663,7 @@ impl CoreData {
     }
 
     /// Namespace names, for completion and the picker.
-    pub fn namespace_names(&self) -> Vec<String> {
+    pub(crate) fn namespace_names(&self) -> Vec<String> {
         self.namespaces.with_read(|i| i.rows.iter().map(|r| r.name.clone()).collect())
     }
 }
@@ -1101,7 +1119,7 @@ impl App {
     }
 
     /// Build completion candidates dynamically based on command input.
-    pub fn command_completions(&self) -> Vec<String> {
+    pub(crate) fn command_completions(&self) -> Vec<String> {
         let Some((cmd_input, _)) = self.ui.command_input() else { return Vec::new() };
         complete_command(cmd_input, &self.core)
     }

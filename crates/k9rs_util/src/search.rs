@@ -30,7 +30,7 @@ pub struct SearchPattern {
 /// that simply isn't matching anything, and "no lines match" is the least
 /// useful thing you can say about `a\{2,3}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MatchMode {
+pub(crate) enum MatchMode {
     /// Compiled; matching as a regex.
     Regex,
     /// Matching the raw pattern text as a plain substring, because it

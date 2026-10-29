@@ -108,7 +108,7 @@ impl LogInteraction {
         }
     }
 
-    pub fn drop_cache(&mut self) {
+    pub(crate) fn drop_cache(&mut self) {
         self.cache = None;
     }
 
@@ -355,7 +355,7 @@ impl LogSession {
     /// stream (`out.send(..).is_err()`), so the kubelet read stops with no
     /// wire change. Without this we keep receiving — and discarding — every
     /// line behind the window, which is most of them.
-    pub fn stop_if_head_complete(&mut self) -> bool {
+    pub(crate) fn stop_if_head_complete(&mut self) -> bool {
         if self.store.head_is_full() && self.stream.is_alive() {
             self.stream.abort();
             self.store.mark_ended(u64::MAX);
@@ -374,7 +374,7 @@ impl LogSession {
     ///
     /// `is_alive() == false` stands for three different things: the transport
     /// died under us, the log legitimately ended (the container exited), or
-    /// we stopped it ourselves ([`Self::stop_if_head_complete`]). The first
+    /// we stopped it ourselves (`Self::stop_if_head_complete`). The first
     /// wants recovery; the other two emphatically do not, and `restart_range`
     /// begins by CLEARING the store — so reviving a finished stream threw
     /// away a completed log and refetched a 100-line tail, and reviving a
@@ -403,7 +403,7 @@ impl LogSession {
     /// The range this stream is currently over, recovered from the two wire
     /// fields it was built from. The spec is the authority for what we asked
     /// the daemon for, so there is no second copy to drift.
-    pub fn current_range(&self) -> crate::actions::LogRange {
+    pub(crate) fn current_range(&self) -> crate::actions::LogRange {
         use crate::actions::LogRange;
         match (&self.spec.since, &self.spec.tail) {
             (Some(since), _) => LogRange::Since(*since),
@@ -415,11 +415,11 @@ impl LogSession {
     /// The decision behind [`Self::revive_if_dead`], named so it can be
     /// tested without a live session: the stream is gone and it did NOT end
     /// in an orderly way. Both orderly endings — EOF, and our own
-    /// [`Self::stop_if_head_complete`] — run `mark_ended`, which sets a
+    /// `Self::stop_if_head_complete` — run `mark_ended`, which sets a
     /// STICKY flag. It has to be sticky: `live` is re-set by every arrival,
     /// and a stopped stream keeps delivering for a moment, so asking `live`
     /// meant the first straggler undid the decision.
-    pub fn needs_revival(&self) -> bool {
+    pub(crate) fn needs_revival(&self) -> bool {
         !self.stream.is_alive() && !self.store.has_ended()
     }
 
@@ -500,16 +500,16 @@ impl LogFilter {
     /// leading `!` to pick its colour and so painted an escaped literal in
     /// the excluding colour, with no string it could have been given that
     /// would say otherwise.
-    pub fn own_sense(&self) -> Sense {
+    pub(crate) fn own_sense(&self) -> Sense {
         self.source.patterns.last().map(|n| n.sense).unwrap_or(Sense::Keep)
     }
 
-    pub fn own_label(&self) -> String {
+    pub(crate) fn own_label(&self) -> String {
         self.source.patterns.last().map(Narrowing::label).unwrap_or_default()
     }
 
     /// How many lines this step retained.
-    pub fn retained_len(&self) -> usize {
+    pub(crate) fn retained_len(&self) -> usize {
         self.retained.with_read(|i| i.lines.len())
     }
 
@@ -575,7 +575,7 @@ impl LogFilter {
     /// onto the old range's. A reconnect under a grep therefore duplicated
     /// every retained match, and the duplicates evicted real history to make
     /// room for themselves.
-    pub fn restarted_from_parent(&mut self) {
+    pub(crate) fn restarted_from_parent(&mut self) {
         self.retained.clear();
         self.cursor = self.source.store().with_read(|i| i.evicted);
         self.lost_history = false;
@@ -583,11 +583,11 @@ impl LogFilter {
 
     /// The store this filter DERIVES from (the session's), not the one it
     /// owns — the identity a restart is announced by.
-    pub fn source_store(&self) -> &Arc<LineStore> {
+    pub(crate) fn source_store(&self) -> &Arc<LineStore> {
         self.source.store()
     }
 
-    pub fn lost_history(&self) -> bool {
+    pub(crate) fn lost_history(&self) -> bool {
         self.lost_history
     }
 
@@ -599,7 +599,7 @@ impl LogFilter {
     /// report `lost_history` for lines it could have had. Draining every
     /// frame costs O(lines arrived) per element and keeps a covered filter
     /// exactly as complete as a visible one.
-    pub fn keep_up(&mut self) {
+    pub(crate) fn keep_up(&mut self) {
         self.drain_from_parent();
     }
 }

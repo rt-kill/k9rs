@@ -89,7 +89,7 @@ impl Liveness {
     /// `LiveQuery::client`). Asking `of` here would
     /// let a dead daemon hide the kubeconfig's own contexts, which is
     /// precisely the screen you need when the daemon can't be reached.
-    pub fn of_store(state: TableDataState) -> Self {
+    pub(crate) fn of_store(state: TableDataState) -> Self {
         match state {
             TableDataState::Ready => Liveness::Live,
             TableDataState::Initializing => Liveness::Loading,

@@ -52,6 +52,10 @@ pub(crate) struct HelpSheet {
     pub(crate) sections: Vec<(String, HelpTable)>,
 }
 
+/// The flat-sheet section's title — the one section that is not a group of
+/// keys but all of them, so `/` has something to search.
+pub(crate) const ALL_KEYS: &str = "All keys (one table)";
+
 /// One table's worth of help: its headers and its rows.
 ///
 /// Named rather than a `(Vec<String>, Vec<ResourceRow>)` tuple — both
@@ -160,6 +164,57 @@ impl HelpContent {
                 },
             ));
         }
+
+        // The whole sheet as ONE section, last — the flat view the index
+        // replaced, kept as something you can open.
+        //
+        // The index trades away a real thing: `/` over 61 flat rows was the
+        // fastest way to find a half-remembered key, and `/` over an index
+        // searches section names and summaries instead. Guessing which
+        // section holds `Ctrl-z` is worse than grepping for it. So the flat
+        // sheet is still here, with its SECTION column, and one `/` inside
+        // it searches everything exactly as before.
+        //
+        // Built from the sections already collected rather than from a
+        // second `sections()` walk — a second walk could disagree, and this
+        // row's count would then lie about what opening it shows.
+        let every: Vec<ResourceRow> = sections
+            .iter()
+            .flat_map(|(title, table)| {
+                table.rows.iter().map(move |r| ResourceRow {
+                    cells: vec![
+                        CellValue::Text(title.clone()),
+                        r.cells[0].clone(),
+                        r.cells[1].clone(),
+                    ],
+                    name: r.name.clone(),
+                    namespace: None,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        index_rows.push(ResourceRow {
+            cells: vec![
+                CellValue::Text(ALL_KEYS.to_string()),
+                CellValue::Count(every.len() as i64),
+                CellValue::Text("Every row above, in one table — grep this one".to_string()),
+            ],
+            name: ALL_KEYS.to_string(),
+            namespace: None,
+            drill_target: Some(DrillTarget::HelpSection(ALL_KEYS.to_string())),
+            ..Default::default()
+        });
+        sections.push((
+            ALL_KEYS.to_string(),
+            HelpTable {
+                headers: vec![
+                    "SECTION".to_string(),
+                    "KEY".to_string(),
+                    "DESCRIPTION".to_string(),
+                ],
+                rows: every,
+            },
+        ));
 
         HelpSheet {
             index: HelpTable {

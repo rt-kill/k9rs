@@ -215,7 +215,7 @@ impl RowStore {
     /// Whether these rows are seeded in-process. Read by the render layer
     /// through `Element::liveness`: a dead daemon says nothing about rows
     /// that never came from it.
-    pub fn is_client_owned(&self) -> bool {
+    pub(crate) fn is_client_owned(&self) -> bool {
         self.client_owned
     }
 
@@ -263,7 +263,7 @@ impl RowStore {
     /// stream's handle is returned — from that instant, every event of a
     /// superseded stream is rejected, closing the "stale delta flickers
     /// back after Ctrl-R" window.
-    pub fn expect_epoch(&self, epoch: u64) {
+    pub(crate) fn expect_epoch(&self, epoch: u64) {
         self.lock().epoch.raise(epoch);
     }
 
@@ -283,7 +283,7 @@ impl RowStore {
     /// the stale, no-longer-live rows. Generation is deliberately NOT bumped:
     /// no row DATA changed, the render gate keys off `state` (not the view),
     /// and the recovery Baseline bumps generation when it lands.
-    pub fn mark_reinitializing(&self) {
+    pub(crate) fn mark_reinitializing(&self) {
         self.lock().state = TableDataState::Initializing;
     }
 
@@ -481,7 +481,7 @@ impl RowStore {
     /// Mark every key (span-mark: the element computes the span from its
     /// own derived order and hands us identities). Keys naming no present
     /// row are dropped — same stale-frame guard as [`Self::toggle_mark`].
-    pub fn mark_keys(&self, keys: impl IntoIterator<Item = ObjectKey>) {
+    pub(crate) fn mark_keys(&self, keys: impl IntoIterator<Item = ObjectKey>) {
         let mut inner = self.lock();
         let inner = &mut *inner;
         let present: HashSet<ObjectKey> = inner.rows.iter().map(row_key).collect();
@@ -489,7 +489,7 @@ impl RowStore {
     }
 
     /// Unmark every key (span-unmark of a contiguous marked block).
-    pub fn unmark_keys<'k>(&self, keys: impl IntoIterator<Item = &'k ObjectKey>) {
+    pub(crate) fn unmark_keys<'k>(&self, keys: impl IntoIterator<Item = &'k ObjectKey>) {
         let mut inner = self.lock();
         for key in keys {
             inner.marked.remove(key);
@@ -514,7 +514,7 @@ impl RowStore {
     /// Drop flash entries older than `max_age`; returns whether anything
     /// expired (a repaint signal). Called by the tick for the TOP store
     /// only — covered stores expire lazily on their next tick-as-top.
-    pub fn expire_flash(&self, max_age: std::time::Duration) -> bool {
+    pub(crate) fn expire_flash(&self, max_age: std::time::Duration) -> bool {
         self.lock().flash.expire(max_age)
     }
 }
@@ -592,7 +592,7 @@ impl RowStoreInner {
 /// predicate. Children hold clones; references only ever point backward,
 /// so strong Arcs are leak-free by construction.
 #[derive(Debug, Clone)]
-pub struct RowSource {
+pub(crate) struct RowSource {
     store: Arc<RowStore>,
     predicates: Vec<Arc<RowPredicate>>,
     metrics: Option<MetricsBinding>,
@@ -601,40 +601,35 @@ pub struct RowSource {
 impl RowSource {
     /// An unfiltered source over `store`. `metrics` is resolved once, at
     /// query construction, and inherited by every narrowed child.
-    pub fn new(store: Arc<RowStore>, metrics: Option<MetricsBinding>) -> Self {
+    pub(crate) fn new(store: Arc<RowStore>, metrics: Option<MetricsBinding>) -> Self {
         Self { store, predicates: Vec::new(), metrics }
     }
 
     /// The entire derivation handoff: this source plus one predicate.
-    pub fn narrowed(&self, predicate: Arc<RowPredicate>) -> Self {
+    pub(crate) fn narrowed(&self, predicate: Arc<RowPredicate>) -> Self {
         let mut child = self.clone();
         child.predicates.push(predicate);
         child
     }
 
-    pub fn store(&self) -> &Arc<RowStore> {
+    pub(crate) fn store(&self) -> &Arc<RowStore> {
         &self.store
     }
 
     /// Inherited from the store this source (and every narrowing of it)
     /// reads.
-    pub fn is_client_owned(&self) -> bool {
+    pub(crate) fn is_client_owned(&self) -> bool {
         self.store.is_client_owned()
     }
 
-    pub fn predicates(&self) -> &[Arc<RowPredicate>] {
+    pub(crate) fn predicates(&self) -> &[Arc<RowPredicate>] {
         &self.predicates
     }
 
-    pub fn metrics(&self) -> Option<&MetricsBinding> {
+    pub(crate) fn metrics(&self) -> Option<&MetricsBinding> {
         self.metrics.as_ref()
     }
 
-    /// Data version of the backing store (metrics version is a separate
-    /// cache-key component — see the element layer's derive key).
-    pub fn generation(&self) -> u64 {
-        self.store.generation()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -674,7 +669,7 @@ impl MetricsHub {
         self.version.load(Ordering::Acquire)
     }
 
-    pub fn set_pods(&self, usage: HashMap<ObjectKey, MetricsUsage>) {
+    pub(crate) fn set_pods(&self, usage: HashMap<ObjectKey, MetricsUsage>) {
         let mut slot = self.pods.lock();
         // Skip the version bump when the map is unchanged: the bump
         // invalidates every pods-table view memo, forcing a full
@@ -688,7 +683,7 @@ impl MetricsHub {
         self.version.fetch_add(1, Ordering::Release);
     }
 
-    pub fn set_nodes(&self, usage: HashMap<NodeName, MetricsUsage>) {
+    pub(crate) fn set_nodes(&self, usage: HashMap<NodeName, MetricsUsage>) {
         let mut slot = self.nodes.lock();
         if slot.as_ref() == Some(&usage) {
             return;
@@ -737,7 +732,7 @@ enum MetricsCols {
 /// and which data columns are metric columns. Rides the [`RowSource`],
 /// assigned at query construction, inherited by narrowed children.
 #[derive(Debug, Clone)]
-pub struct MetricsBinding {
+pub(crate) struct MetricsBinding {
     hub: Arc<MetricsHub>,
     cols: MetricsCols,
 }
@@ -746,7 +741,7 @@ impl MetricsBinding {
     /// Resolve the binding for a resource, if it has metrics columns.
     /// (Only built-ins do; the registry's typed `ColumnDef.metrics` tags
     /// are the single source for column positions.)
-    pub fn for_rid(rid: &ResourceId, hub: &Arc<MetricsHub>) -> Option<Self> {
+    pub(crate) fn for_rid(rid: &ResourceId, hub: &Arc<MetricsHub>) -> Option<Self> {
         use k9rs_proto::resource_def::{MetricsColumn as MC, MetricsKind};
         let def = rid.built_in_kind()?.def();
         let kind = def.metrics_kind()?;
@@ -773,14 +768,14 @@ impl MetricsBinding {
     }
 
     /// Hub data version (derive-cache key component).
-    pub fn version(&self) -> u64 {
+    pub(crate) fn version(&self) -> u64 {
         self.hub.version()
     }
 
     /// Lock the relevant hub map for one derive. Same single-task
     /// convention as `RowStore`: never contended, never held across
     /// anything that could re-enter.
-    pub fn lens(&self) -> MetricsLens<'_> {
+    pub(crate) fn lens(&self) -> MetricsLens<'_> {
         match self.cols {
             MetricsCols::Pod(cols) => MetricsLens(LensInner::Pods {
                 map: self.hub.pods.lock(),
@@ -795,7 +790,7 @@ impl MetricsBinding {
 }
 
 /// A locked, column-resolved view of the hub for one derive pass.
-pub struct MetricsLens<'a>(LensInner<'a>);
+pub(crate) struct MetricsLens<'a>(LensInner<'a>);
 
 enum LensInner<'a> {
     Pods {
@@ -949,7 +944,7 @@ pub struct PreparedView {
     /// the client actually CONVERT between the spaces, so three wrappers
     /// would have added ~35 `.0`s across the widget and the interaction
     /// state to guard two lines. Instead the conversions are named — see
-    /// [`Self::data_col`] and [`Self::visible_col`] — so no caller hand-rolls
+    /// `Self::data_col` and [`Self::visible_col`] — so no caller hand-rolls
     /// a `position()` or a `get()` and the direction is readable at the call
     /// site. Revisit if a third space ever meets these two in one struct.
     pub visible_cols: Vec<usize>,
@@ -965,7 +960,7 @@ impl PreparedView {
     /// shrinks under a column-level change while `selected_col` is still the
     /// old one, and display-time clamping is the established rule here (the
     /// stored cursor is not written back).
-    pub fn data_col(&self, visible: usize) -> Option<(usize, String)> {
+    pub(crate) fn data_col(&self, visible: usize) -> Option<(usize, String)> {
         if self.visible_cols.is_empty() {
             return None;
         }
@@ -1375,7 +1370,7 @@ pub struct LineStore {
 /// them — the client keeps the NEWEST N of a range asked for precisely to
 /// see the oldest. Asking for more history made it strictly worse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Retain {
+pub(crate) enum Retain {
     /// Drop from the front; keep the newest. Follows and plain tails.
     Tail,
     /// Drop arrivals once full; keep the oldest. History requests.
@@ -1513,7 +1508,7 @@ impl LineStore {
     /// oldest N with a `Tail` child keeping the newest N matches of them.
     /// The caller used to write `LineStore::new(store.max_lines())` and get
     /// the default `Retain::Tail` silently.
-    pub fn derived_from(source: &LineStore) -> Arc<Self> {
+    pub(crate) fn derived_from(source: &LineStore) -> Arc<Self> {
         let (max_lines, retain) = source.with_read(|i| (i.max_lines, i.retain));
         let store = Self::new(max_lines);
         store.set_retain(retain);
@@ -1540,7 +1535,7 @@ impl LineStore {
 
     /// Choose which end to keep. Set by the element when it opens or
     /// restarts a stream, before any line can arrive.
-    pub fn set_retain(&self, retain: Retain) {
+    pub(crate) fn set_retain(&self, retain: Retain) {
         self.lock().retain = retain;
     }
 
@@ -1553,7 +1548,7 @@ impl LineStore {
     }
 
     /// Whether this stream reached an orderly end — see `ended`.
-    pub fn has_ended(&self) -> bool {
+    pub(crate) fn has_ended(&self) -> bool {
         self.lock().ended
     }
 
@@ -1563,7 +1558,7 @@ impl LineStore {
     /// (This paragraph was block-move residue sitting on `sources()` above,
     /// which left this function undocumented and gave that one a summary
     /// line about a different question entirely.)
-    pub fn head_is_full(&self) -> bool {
+    pub(crate) fn head_is_full(&self) -> bool {
         let inner = self.lock();
         inner.retain == Retain::Head && inner.lines.len() >= inner.max_lines
     }
@@ -1577,7 +1572,7 @@ impl LineStore {
     /// `LogRange::Since` session — keep the OLDEST N — had a `/pattern`
     /// child keeping the NEWEST N matches: the exact inversion `Retain`
     /// exists to fix, one level down.
-    pub fn extend_derived(&self, lines: impl IntoIterator<Item = StoredLine>) {
+    pub(crate) fn extend_derived(&self, lines: impl IntoIterator<Item = StoredLine>) {
         let mut inner = self.lock();
         let mut touched = false;
         for line in lines {
@@ -1604,7 +1599,7 @@ impl LineStore {
 
     /// Mirror the source stream's liveness onto a derived store, so the
     /// "Waiting for logs…" / "No logs." branches read the same either way.
-    pub fn set_live(&self, live: bool) {
+    pub(crate) fn set_live(&self, live: bool) {
         let mut inner = self.lock();
         if inner.live != live {
             inner.live = live;
@@ -1619,7 +1614,7 @@ impl LineStore {
 
     /// Raise the epoch floor — called by the log-subscribe path BEFORE the
     /// new stream's handle is returned (restart succession).
-    pub fn expect_epoch(&self, epoch: u64) {
+    pub(crate) fn expect_epoch(&self, epoch: u64) {
         self.lock().epoch.raise(epoch);
     }
 
@@ -1653,7 +1648,7 @@ impl LineStore {
     }
 
     /// The stream behind this store ended (daemon closed the substream).
-    pub fn mark_ended(&self, epoch: u64) {
+    pub(crate) fn mark_ended(&self, epoch: u64) {
         let mut inner = self.lock();
         if !inner.accepts(epoch) {
             return;
@@ -1734,7 +1729,7 @@ impl DeltaTracker {
     /// what gives cross-recovery highlight continuity (rows that changed
     /// while a watcher was down still flash after the recovery baseline)
     /// without mass-highlighting unchanged rows.
-    pub fn rebaseline(&mut self, rows: &[k9rs_proto::row::ResourceRow]) {
+    pub(crate) fn rebaseline(&mut self, rows: &[k9rs_proto::row::ResourceRow]) {
         let now = Instant::now();
         let mut new_prev = HashMap::with_capacity(rows.len());
         for row in rows {
@@ -1764,7 +1759,7 @@ impl DeltaTracker {
     /// cells, and those must NOT flash. New keys don't flash (matches the
     /// baseline path's insert semantics); removes clear their state in
     /// O(1) (replacing the old O(n) retain).
-    pub fn apply_changes(&mut self, changes: &[k9rs_proto::protocol::RowChange]) {
+    pub(crate) fn apply_changes(&mut self, changes: &[k9rs_proto::protocol::RowChange]) {
         use k9rs_proto::protocol::RowChange;
         let now = Instant::now();
         for change in changes {

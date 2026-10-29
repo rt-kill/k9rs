@@ -112,7 +112,7 @@ for op in Op::BUILT_IN {
 #[test]
 fn the_log_view_starts_on_source_and_message() {
 let cfg = crate::LogConfig::default();
-assert_eq!(cfg.default_fields, crate::LogFields::Source);
+assert_eq!(cfg.default_fields, crate::config::LogFields::Source);
 assert_eq!(cfg.initial_shed(), 1);
 use k9rs_proto::protocol::Role;
 assert!(!Role::Timestamp.shown(cfg.initial_shed()), "the stamp is shed first");
@@ -125,7 +125,7 @@ assert!(Role::Source.shown(cfg.initial_shed()), "attribution survives it");
 /// list of the roles.
 #[test]
 fn log_fields_covers_every_shed_level() {
-use crate::LogFields;
+use crate::config::LogFields;
 use k9rs_proto::protocol::Role;
 let named = [LogFields::All, LogFields::Source, LogFields::Message];
 assert_eq!(

@@ -15,7 +15,7 @@
 /// save table) so we never dump predictable filenames into world-writable
 /// `/tmp`. Files written into this dir use `O_CREAT | O_EXCL` so a symlink
 /// planted in advance can't divert the write — see [`safe_create_temp`].
-pub fn process_temp_dir() -> std::io::Result<std::path::PathBuf> {
+pub(crate) fn process_temp_dir() -> std::io::Result<std::path::PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
     let dir = std::env::temp_dir().join(format!("k9rs-{}", std::process::id()));
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
@@ -94,7 +94,7 @@ fn verify_owned_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 /// its path + an open `File` handle. Refuses to follow symlinks or
 /// overwrite an existing entry. Caller is responsible for writing content
 /// and dropping the handle.
-pub fn safe_create_temp(filename: &str) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+pub(crate) fn safe_create_temp(filename: &str) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = process_temp_dir()?;
     let path = dir.join(filename);

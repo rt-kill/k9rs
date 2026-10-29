@@ -28,6 +28,6 @@ pub mod units;
 pub mod width;
 
 pub use atomic_option::AtomicOption;
-pub use search::{CompiledGrep, MatchMode, SearchPattern};
+pub use search::{CompiledGrep, SearchPattern};
 pub use task::AbortOnDrop;
 pub use temp::TempDirGuard;

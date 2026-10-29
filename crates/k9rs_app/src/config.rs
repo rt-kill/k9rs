@@ -69,12 +69,12 @@ impl KeyCombo {
     /// key is not a configurable chord at all.
     ///
     /// Here rather than in the key handler so that this and
-    /// [`Self::as_key_event`] — the two halves of the correspondence between
+    /// `Self::as_key_event` — the two halves of the correspondence between
     /// a chord and an event — sit together and uphold the lowercase rule
     /// once. The handler's version built the struct directly, so a terminal
     /// delivering `Ctrl-Shift-L` as `Char('L')` + CONTROL produced a combo
     /// no config spec could equal.
-    pub fn of_event(key: &crossterm::event::KeyEvent) -> Option<Self> {
+    pub(crate) fn of_event(key: &crossterm::event::KeyEvent) -> Option<Self> {
         use crossterm::event::{KeyCode, KeyModifiers};
         let KeyCode::Char(c) = key.code else { return None };
         if key.modifiers.contains(KeyModifiers::ALT) {
@@ -89,7 +89,20 @@ impl KeyCombo {
 
     /// The key event this chord corresponds to — the inverse of
     /// [`Self::of_event`].
-    pub fn as_key_event(&self) -> crossterm::event::KeyEvent {
+    ///
+    /// TEST-ONLY: nothing in production needs the inverse (events come FROM
+    /// the terminal), and two of this crate's tests use it to check the
+    /// correspondence both ways. Added ungated in the same session as the
+    /// chord work, which `dead_code` could not report while the type was
+    /// `pub` in a re-exported module.
+    ///
+    /// `cfg(test)`, NOT `cfg(any(test, feature = "testing"))`: the feature
+    /// exists so OTHER crates' tests can reach in, and an item only this
+    /// crate's tests use is dead in a `--features testing` lib build —
+    /// where the item compiles but the tests that use it do not. That build
+    /// is in the verification set, and it is what reported this.
+    #[cfg(test)]
+    pub(crate) fn as_key_event(&self) -> crossterm::event::KeyEvent {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mods = if self.ctrl { KeyModifiers::CONTROL } else { KeyModifiers::NONE };
         KeyEvent::new(KeyCode::Char(self.ch), mods)
@@ -244,7 +257,7 @@ impl KeysConfig {
     /// The EFFECTIVE chord for an operation: the user override, or the
     /// descriptor's default key as a plain chord. `None` = only bound
     /// structurally (Ctrl-D / Ctrl-K / Shift-F) or not at all.
-    pub fn op_key(&self, op: &k9rs_proto::protocol::OperationKind) -> Option<KeyCombo> {
+    pub(crate) fn op_key(&self, op: &k9rs_proto::protocol::OperationKind) -> Option<KeyCombo> {
         self.op_override(op)
             .or_else(|| op.descriptor().default_key.map(KeyCombo::plain))
     }
@@ -446,7 +459,7 @@ impl LogConfig {
     /// asking for the one combination the cycle cannot express — a timestamp
     /// without a source tag — resolves to showing both, since the cycle's
     /// next press takes the timestamp away anyway.
-    pub fn initial_shed(&self) -> usize {
+    pub(crate) fn initial_shed(&self) -> usize {
         self.default_fields.shed()
     }
 

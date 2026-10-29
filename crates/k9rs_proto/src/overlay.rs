@@ -4,6 +4,38 @@
 //! definitions: custom key bindings, extra columns (JSONPath), and
 //! declarative cell coloring rules. They're loaded at startup by both the
 //! daemon (for columns/coloring) and the TUI (for key bindings).
+//!
+//! # Why this WARNS where the main config REFUSES
+//!
+//! A standing question since the 2026-09-14 audit, which counted the warn
+//! sites (9 then, 11 now) against `AppConfig::validate`'s hard `Err` and
+//! asked whether the two should agree. They should not, and the answer is
+//! the shape of the input rather than a preference:
+//!
+//! - The main config is ONE file describing the whole app. A key it cannot
+//!   make sense of means the user's intent is unknown, and carrying on with
+//!   defaults would silently do something they did not ask for. Refusing at
+//!   startup is right, and `deny_unknown_fields` makes a typo loud.
+//! - Overlays are N independent per-resource files. One malformed file must
+//!   not take the others down — the same rule `ExecSourceConfig::usable`
+//!   keeps for exec sources, and for the same reason: a daemon is
+//!   long-lived and one bad line is not an emergency.
+//!
+//! What makes warning ACCEPTABLE here is not the severity but the
+//! reporting: every `warn!` below also pushes to the `problems` list that
+//! the entry point surfaces as a startup flash (there is a test for that
+//! path, not just for serde), and each message names the CONSEQUENCE — "the
+//! rules will never apply", "column will have no data", "jsonpath is
+//! ignored". A dropped overlay the user never hears about would be the
+//! defect; being told precisely which part is inert while the rest of the
+//! file works is better than discarding the file for one bad coloring rule.
+//!
+//! Granularity, for the record: an unreadable or unparseable file is SKIPPED
+//! whole (the two sites at the bottom); everything else warns that one part
+//! is inert and keeps the remainder.
+//!
+//! Recorded here rather than left as an audit question, so the next sweep
+//! reads a decision instead of re-deriving one.
 
 use std::collections::HashMap;
 use std::path::Path;

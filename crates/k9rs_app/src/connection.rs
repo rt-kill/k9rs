@@ -186,14 +186,14 @@ impl Connection {
     /// There is no context to connect to. Terminal until a switch is
     /// requested: no plan, so the main loop never rebuilds — a retry with
     /// nothing to retry against would just be a loop.
-    pub fn no_context(&mut self) {
+    pub(crate) fn no_context(&mut self) {
         self.link = LinkState::NoContext;
         self.plan = ReconnectPlan::Idle;
     }
 
     /// Whether any session EVER connected — distinguishes a fatal initial
     /// failure from a retryable reconnect failure.
-    pub fn has_ever_connected(&self) -> bool {
+    pub(crate) fn has_ever_connected(&self) -> bool {
         self.has_connected
     }
 
@@ -247,13 +247,13 @@ impl Connection {
     /// A context SWITCH failed and we're falling back to the previous
     /// context: reconnect immediately (the daemon is up — the TARGET was
     /// unreachable — so no backoff).
-    pub fn switch_failed_fallback(&mut self) {
+    pub(crate) fn switch_failed_fallback(&mut self) {
         self.plan = ReconnectPlan::Now;
     }
 
     /// A steady-state RECONNECT attempt failed: schedule the next one a
     /// backoff out, and double the backoff (clamped).
-    pub fn reconnect_failed_backoff(&mut self, now: std::time::Instant) {
+    pub(crate) fn reconnect_failed_backoff(&mut self, now: std::time::Instant) {
         self.plan = ReconnectPlan::At(now + self.backoff);
         self.backoff = (self.backoff * 2).min(Self::MAX_BACKOFF);
     }

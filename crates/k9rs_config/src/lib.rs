@@ -13,7 +13,7 @@
 //! config through the DAEMON's module, and the path lived in the crate least
 //! entitled to decide it. Down here, neither layer owns it.
 //!
-//! The I/O is separated from the parse on purpose. [`section_of`] is pure, so
+//! The I/O is separated from the parse on purpose. `section_of` is pure, so
 //! the contract below is testable; [`load_section`] is the only function in
 //! the tree that knows the path. Before the split there was no test of the
 //! `Ok(None)`-versus-`Err` distinction at all, because the only way to reach
@@ -38,7 +38,7 @@ pub fn path() -> Option<PathBuf> {
 ///   to a sink without `--log-file`.
 ///
 /// `section` is `""` for the `k9rs` root itself, or a key beneath it.
-pub fn section_of<T: serde::de::DeserializeOwned>(
+pub(crate) fn section_of<T: serde::de::DeserializeOwned>(
     yaml: &str,
     section: &str,
     // Named only so errors can say WHICH file; this function reads nothing.
@@ -61,7 +61,7 @@ pub fn section_of<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// Read [`path`] and hand the requested section to [`section_of`].
+/// Read [`path`] and hand the requested section to `section_of`.
 ///
 /// A missing file is `Ok(None)`, same as a missing section — there is nothing
 /// to reject. An unreadable one is an `Err`: it exists and we cannot honour

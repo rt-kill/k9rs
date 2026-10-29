@@ -895,7 +895,7 @@ impl Theme {
     /// `Result`, not `Option`: every failure here is a thing the user wants
     /// to be told. Each `Skin*` struct carries `deny_unknown_fields`, so one
     /// typo discards the whole file, and a bad colour name does the same.
-    pub fn from_skin_file(path: &Path, appearance: Appearance) -> Result<Self, String> {
+    pub(crate) fn from_skin_file(path: &Path, appearance: Appearance) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let yaml: serde_yaml::Value =

@@ -1,10 +1,21 @@
-pub mod header;
+// NARROWED. The whole cross-crate surface of this crate is `draw` plus one
+// function a `k9rs_session` agreement test calls — measured, not assumed.
+// While these were `pub mod`, `unreachable_pub` could not see a single item
+// inside them, which is why eleven `pub` items here had no reader anywhere:
+// a `pub` item in a `pub` module is reachable by definition, so the lint has
+// nothing to say. `widgets` was already moved for exactly this reason, and
+// `k9rs_util::width`'s own doc records what it caught.
+pub(crate) mod header;
 pub(crate) mod views;
-pub mod ansi;
+pub(crate) mod ansi;
 pub(crate) mod widgets;
 
+/// The header's context label, for `k9rs_session`'s agreement test — the
+/// one thing outside this crate that reads anything but [`draw`].
+pub use header::context_label;
+
 /// Header panel height in rows (context/cluster/user + logo).
-pub const HEADER_HEIGHT: u16 = 5;
+pub(crate) const HEADER_HEIGHT: u16 = 5;
 
 
 /// Fill a rectangular area with the theme's dialog background
@@ -13,7 +24,7 @@ pub const HEADER_HEIGHT: u16 = 5;
 /// `dialog_bg: default` can't render dialogs invisible against the terminal.
 /// It follows the palette rather than being a const, so a light theme gets a
 /// light dialog instead of a near-black hole.
-pub fn fill_dialog_bg(
+pub(crate) fn fill_dialog_bg(
     buf: &mut ratatui::buffer::Buffer,
     area: ratatui::layout::Rect,
     theme: &k9rs_theme::Theme,
@@ -34,7 +45,7 @@ pub fn fill_dialog_bg(
 }
 
 /// Center a rectangle of given dimensions within an outer area.
-pub fn centered_rect(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
+pub(crate) fn centered_rect(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
     use ratatui::layout::{Constraint, Layout};
     let vert = Layout::vertical([
         Constraint::Fill(1), Constraint::Length(height), Constraint::Fill(1),
@@ -54,7 +65,7 @@ pub fn centered_rect(area: ratatui::layout::Rect, width: u16, height: u16) -> ra
 /// moment the text is not ASCII, and a mis-measured width OFFSETS the line
 /// rather than clipping it — so the symptom is a message that is simply not
 /// in the middle, which reads as a layout bug rather than a measurement one.
-pub fn draw_centered_line(
+pub(crate) fn draw_centered_line(
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     line: ratatui::text::Line<'_>,
@@ -70,7 +81,7 @@ pub fn draw_centered_line(
 
 /// Render a centered loading spinner+text inside an area. Used by yaml,
 /// describe, resource, and log views when awaiting initial data.
-pub fn draw_centered_loading(
+pub(crate) fn draw_centered_loading(
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     message: &str,
@@ -89,7 +100,7 @@ pub fn draw_centered_loading(
 /// NO spinner and no animation liveness — for terminal states (a failed
 /// fetch, honest emptiness) where animated chrome would falsely promise
 /// that something is still in flight.
-pub fn draw_centered_message(
+pub(crate) fn draw_centered_message(
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     message: &str,
@@ -103,7 +114,7 @@ pub fn draw_centered_message(
 }
 
 /// Fill a single-row area with a background style without allocating a string.
-pub fn fill_line_bg(f: &mut ratatui::Frame, area: ratatui::layout::Rect, style: ratatui::style::Style) {
+pub(crate) fn fill_line_bg(f: &mut ratatui::Frame, area: ratatui::layout::Rect, style: ratatui::style::Style) {
     let buf = f.buffer_mut();
     // Clipped for the reason `fill_dialog_bg` gives — and the HEIGHT has to
     // be checked too, which is the half an `x`-only clip misses: an
