@@ -256,8 +256,42 @@ fn op_key_override_replaces_default() {
 #[test]
 fn labels_render_ctrl_and_shift() {
     assert_eq!(KeyCombo::plain('l').label(), "l");
-    assert_eq!(KeyCombo::plain('L').label(), "Shift-l");
+    assert_eq!(KeyCombo::plain('L').label(), "L", "the capital, not `Shift-l`");
     assert_eq!(KeyCombo::ctrl('l').label(), "Ctrl-l");
+}
+
+/// A label is also a config SPEC: what `?` shows you is what you type under
+/// `keys:` to move it.
+///
+/// It was not. `label()` rendered an uppercase char as `Shift-f` while
+/// `TryFrom<String>` accepts only a single character or `ctrl-<char>`, so a
+/// user who read `Shift-f  Port forward` off the help sheet and wrote
+/// `portForward: Shift-f` got `invalid key spec 'Shift-f'` at startup —
+/// help advertising an input its own parser refuses. The same sheet wrote
+/// nine other shifted letters as bare capitals, so `F` and `Shift-f` also
+/// appeared as two rows for one chord.
+///
+/// Over every chord the config can express, both directions.
+#[test]
+fn every_label_parses_back_to_its_own_chord() {
+    let mut chords: Vec<KeyCombo> = Vec::new();
+    for c in ('a'..='z').chain('A'..='Z').chain('0'..='9') {
+        chords.push(KeyCombo::plain(c));
+        chords.push(KeyCombo::ctrl(c));
+    }
+    for c in ['-', ' ', '/', ':', '~', '?', '\\', '|', '='] {
+        chords.push(KeyCombo::plain(c));
+    }
+
+    for combo in chords {
+        let label = combo.label();
+        let back = KeyCombo::try_from(label.clone());
+        assert_eq!(
+            back,
+            Ok(combo),
+            "`{label}` is shown in help but does not parse back as a `keys:` spec",
+        );
+    }
 }
 
 /// Pins the documented config shape (what `load_section` hands to
@@ -503,7 +537,7 @@ fn shift_rides_in_the_characters_case() {
         Some(upper),
     );
     assert_ne!(upper, crate::config::KeyCombo::plain('f'), "two different bindings");
-    assert_eq!(upper.label(), "Shift-f");
+    assert_eq!(upper.label(), "F", "the capital IS the spec — see `label`");
 }
 
 /// A chord and its key event are inverses, so the two halves of the

@@ -632,6 +632,20 @@ pub enum DrillTarget {
     /// needs no special case in the key handler: the ROW says what Enter
     /// does, exactly as it does for a namespace or a CRD.
     SwitchContext(crate::protocol::ContextName),
+    /// Open one SECTION of the `?` sheet, named here.
+    ///
+    /// `?` lists its sections now and Enter drills into one, rather than
+    /// showing all 61 rows flat. The section name rides the row for the same
+    /// reason [`Self::SwitchContext`] carries its context: the alternative
+    /// is a branch in the key handler that knows help is special, which is
+    /// precisely the bespoke-view shape the nav model exists to avoid.
+    ///
+    /// APPENDED, and decode-safe even for a peer that predates it: only the
+    /// CLIENT produces this tag, from rows it seeds in-process, so nothing
+    /// ever puts tag 9 on the wire. It still bumps the revision, because
+    /// this enum is wire-frozen and the bump is what makes the next author
+    /// re-read the pinned tags.
+    HelpSection(String),
 }
 
 /// The row contract the derivation machinery reads through: cells, name,

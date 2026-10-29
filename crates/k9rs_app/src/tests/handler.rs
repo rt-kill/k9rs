@@ -1151,3 +1151,47 @@ fn a_colon_under_a_dialog_cancels_it_rather_than_opening_the_prompt() {
         "`:` must reach the dialog's own keymap, not the global that opens the prompt",
     );
 }
+
+/// `?` closes the help you are reading, however many greps deep you are.
+///
+/// `is_keybindings_view` answers on the RID on purpose, so a `/` over help
+/// derives a `RowFilter` that is STILL help — that is what keeps the float
+/// floating and the grep working. The toggle popped once, so one grep made
+/// `?` close the filter and leave help open: two presses to undo one.
+#[test]
+fn the_help_toggle_closes_every_narrowing_over_help() {
+    let mut app = App::new_for_test();
+    let depth = |a: &App| a.nav.depth();
+    let before = depth(&app);
+
+    push_help_element(&mut app);
+    assert_eq!(depth(&app), before + 1);
+
+    // Two greps, as a user narrowing a long sheet would.
+    for pat in ["log", "ctrl"] {
+        let predicate = crate::store::RowPredicate::Grep(
+            k9rs_util::CompiledGrep::new(pat.to_string()),
+        );
+        let filtered = crate::element::Element::derive_filter(app.nav.top(), predicate)
+            .expect("help is a table, so it can be narrowed");
+        app.nav.push(filtered);
+        assert!(
+            app.nav.top().is_keybindings_view(),
+            "a narrowing of help is still help — that is what floats it",
+        );
+    }
+    assert_eq!(depth(&app), before + 3, "help plus two narrowings");
+
+    assert!(app.nav.pop_keybindings(), "it had something to close");
+    assert_eq!(
+        depth(&app),
+        before,
+        "one `?` returns you to where you pressed it, not to a half-closed help",
+    );
+    assert!(!app.nav.top().is_keybindings_view());
+
+    // And it is a no-op where there is no help to close, so the toggle's
+    // other branch stays reachable.
+    assert!(!app.nav.pop_keybindings());
+    assert_eq!(depth(&app), before);
+}

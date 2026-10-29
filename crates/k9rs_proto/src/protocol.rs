@@ -817,77 +817,8 @@ pub struct MetricsUsage {
 // etc.). The schema describes how to *gather* the values for that command;
 // it doesn't dispatch generically.
 
-/// Declare [`OperationKind`] and generate `BUILT_IN` from the same list.
-///
-/// `BUILT_IN` is "every operation the app itself defines", and it used to be
-/// a second hand-written array beside the enum. Nothing asserted it was
-/// complete — and nothing could, because iterating a list can only check
-/// the entries it has. A variant missing from it still compiled arms in
-/// `descriptor`, `config_key`, `op_override`, `batch_support`,
-/// `structural_chord` and `From<&OperationKind> for Action`, so it looked
-/// thoroughly handled while escaping every check that derives its universe
-/// from `BUILT_IN`: the reserved-chord check and the duplicate-chord check
-/// in `KeysConfig::validate` (whose stated purpose is "a startup error, not
-/// a mystery"), the stale guard, and the batch-support manifest.
-///
-/// Why a token muncher rather than two groups: the declaration ORDER is the
-/// wire's tag order, and `Custom` sits between `ToggleSuspendCronJob` and
-/// `Apply`. Emitting the unit variants and then the payload one would swap
-/// two tags, which is a protocol break for a cosmetic gain. So the entries
-/// are consumed one at a time, in order, and only the unit ones are
-/// collected into the list.
-///
-/// Same intent as `built_in_kinds!` and `view_classes!`; this is the third
-/// list in this codebase that Rust cannot enumerate for itself.
-macro_rules! operation_kinds {
-    ($(#[$m:meta])* pub enum $name:ident { $($entries:tt)* }) => {
-        operation_kinds!(@collect $name [$(#[$m])*] [] [] $($entries)*);
-    };
-
-    // A variant WITH a payload: declared, but not a member of `BUILT_IN` —
-    // it is overlay-declared and unbounded, so there is no list to put it in.
-    // Matched before the unit arm because it is the more specific shape.
-    (@collect $name:ident [$($m:tt)*] [$($decl:tt)*] [$($list:tt)*]
-        $(#[$vm:meta])* $v:ident ( $t:ty ) , $($rest:tt)*
-    ) => {
-        operation_kinds!(@collect $name [$($m)*]
-            [$($decl)* $(#[$vm])* $v($t),]
-            [$($list)*]
-            $($rest)*);
-    };
-
-    // A unit variant: declared AND listed.
-    (@collect $name:ident [$($m:tt)*] [$($decl:tt)*] [$($list:tt)*]
-        $(#[$vm:meta])* $v:ident , $($rest:tt)*
-    ) => {
-        operation_kinds!(@collect $name [$($m)*]
-            [$($decl)* $(#[$vm])* $v,]
-            [$($list)* $name::$v,]
-            $($rest)*);
-    };
-
-    (@collect $name:ident [$($m:tt)*] [$($decl:tt)*] [$($list:tt)*]) => {
-        $($m)*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        pub enum $name { $($decl)* }
-
-        // The enum takes its allow from the invocation's attributes; this
-        // block cannot, so the allow lives here. It is inert for the real
-        // `OperationKind` (`pub` in a `pub` module with cross-crate
-        // callers) and load-bearing for the toy enum the macro's own test
-        // declares inside a test module.
-        #[allow(unreachable_pub)]
-        impl $name {
-            /// Every operation the app itself defines, in wire-tag order.
-            /// Generated from the enum's own declaration, so it cannot be
-            /// missing one. `Custom` is absent because it carries a payload
-            /// — see the macro's doc.
-            pub const BUILT_IN: &'static [$name] = &[$($list)*];
-        }
-    };
-}
-
-operation_kinds! {
+variant_list! {
+    list = BUILT_IN;
     /// One specific operation the user might want to perform on a row. Each kind
     /// corresponds to either a `SessionCommand` variant or a purely client-side
     /// action that nonetheless requires server-known facts (like "this row is a
@@ -1924,7 +1855,40 @@ log_windows! {
 /// `LogInit` could mean "the last ninety minutes" or "everything" depending
 /// on which backend served it, invisibly. Both paths now derive from
 /// [`LogSince::seconds`].
-pub const WIRE_FORMAT_REVISION: u32 = 19;
+///
+/// v19: two DELETIONS, which is the rarer kind of break.
+/// - [`TableBaseline`] loses `resource: ResourceId`. Every producer wrote
+///   it; no consumer read it. A baseline reaches its store by substream and
+///   subscription id, never by inspecting its own payload, so a second
+///   unconsulted spelling of the stream's identity could only ever disagree
+///   with the first — and on the legacy `Local(ExecResource)` path it
+///   already did, because `context_locals` resolved that id to the FIRST
+///   configured exec source and stamped the baseline `Custom(name)` while
+///   the subscription was `ExecResource`.
+/// - [`crate::local_types::LocalResourceKind`] loses
+///   `ExecResource`, which **re-tags `Custom`, `Context`, `Keybinding` and
+///   `Alias`** — the one wire change here that moves existing tags rather
+///   than adding or removing a field. It was typeable (`:exec`) and the
+///   daemon answered it with `exec_configs.first()`, so with two sources
+///   configured the second was unreachable by any keystroke and the first
+///   was labelled `EXEC`. "Whichever is first" is not a resource; each
+///   source answers to its own name, and those names are listed in the
+///   alias view now. Safe to re-tag because bincode here is wire-only —
+///   nothing persists these bytes to disk — and the [`build_id`] handshake
+///   refuses a peer from a different build regardless.
+///
+/// v20: [`DrillTarget::HelpSection`](crate::row::DrillTarget::HelpSection)
+/// appended at tag 9. `?` lists its SECTIONS now and Enter drills into one,
+/// instead of showing every row of every section flat — 61 of them for a
+/// table view, against a float budget of 17 rows at 80x24. The section name
+/// rides the ROW because the alternative is a branch in the key handler that
+/// knows help is special, which is the bespoke-view shape the nav model
+/// exists to avoid; `SwitchContext` carries its context for the same reason.
+///
+/// Decode-safe for a peer that predates it — only the client produces this
+/// tag, from rows it seeds in-process, so tag 9 never reaches the wire. The
+/// bump is for the tripwire, not for compatibility.
+pub const WIRE_FORMAT_REVISION: u32 = 20;
 
 /// This build's identity — what the handshake actually compares.
 ///

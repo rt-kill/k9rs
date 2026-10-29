@@ -26,7 +26,41 @@ struct HelpEntry {
 /// A section of keybindings.
 struct HelpSection {
     title: &'static str,
+    /// One line saying what this section is for — the only thing the index
+    /// shows besides the name and the count, and the reason the index is
+    /// worth having rather than just a list of titles.
+    summary: &'static str,
     entries: Vec<HelpEntry>,
+}
+
+/// The `?` sheet at both of its levels, from ONE projection.
+///
+/// `?` used to be 61 flat rows for a table view — against a float budget of
+/// 17 content rows at 80x24, so it always scrolled, and reaching
+/// `Everywhere` meant scrolling past 41 keys. It is an INDEX of sections
+/// now, and Enter on a row opens that section.
+///
+/// Both halves come out of one `sections()` walk on purpose: the index can
+/// then only name sections that exist, and every section the sheet has is
+/// reachable from it. Two projections could disagree, and the disagreement
+/// would be a row whose Enter goes nowhere.
+pub(crate) struct HelpSheet {
+    /// The index: one row per section, each carrying
+    /// [`k9rs_proto::row::DrillTarget::HelpSection`].
+    pub(crate) index: HelpTable,
+    /// Each section's own rows, by title — in the index's order.
+    pub(crate) sections: Vec<(String, HelpTable)>,
+}
+
+/// One table's worth of help: its headers and its rows.
+///
+/// Named rather than a `(Vec<String>, Vec<ResourceRow>)` tuple — both
+/// levels of the sheet are this shape, and nested in a `Vec` the tuple was
+/// a type clippy declined to read, which is a fair summary of the reader's
+/// position too.
+pub(crate) struct HelpTable {
+    pub(crate) headers: Vec<String>,
+    pub(crate) rows: Vec<k9rs_proto::row::ResourceRow>,
 }
 
 /// Help overlay widget.
@@ -35,7 +69,7 @@ struct HelpSection {
 /// table is seeded from. The `Widget` impl and the dialog geometry that used
 /// to live here were dead after that move and invisible to clippy, because a
 /// trait impl is never dead-code-linted.
-pub struct HelpContent {
+pub(crate) struct HelpContent {
     caps: Option<k9rs_proto::protocol::ResourceCapabilities>,
     /// User key rebindings — help shows EFFECTIVE bindings, not defaults.
     keys: crate::KeysConfig,
@@ -60,50 +94,84 @@ impl HelpContent {
     /// omitted `J`/`U`/`~` entirely, and advertised a `Ctrl-l` feature that had
     /// been deleted. Now help shows the keys for the view you are actually in,
     /// and `keymap`'s agreement test makes each one true.
-    /// The help content as TABLE ROWS — the projection that lets help be an
-    /// ordinary resource instead of a bespoke overlay.
+    /// The sheet at both levels — see [`HelpSheet`].
     ///
-    /// The grouping that used to be section headers becomes a SECTION
-    /// column, which is strictly more useful: it filters and sorts like any
-    /// other, so `/log` narrows to the log keys and `S` on SECTION regroups.
-    /// The content itself is unchanged — same `keymap`, same capabilities,
-    /// same effective bindings — because the thing being replaced was the
-    /// rendering, not the knowledge.
-    pub fn rows(
+    /// The grouping that used to be section headers became a SECTION
+    /// column, and then 61 rows of it. It is an index now: one row per
+    /// section, with its name, how many keys it holds, and a line on what
+    /// it is for. Enter opens the section, Esc comes back — the ordinary
+    /// nav pair, because the row carries a `DrillTarget` exactly as a
+    /// namespace or a context row does.
+    ///
+    /// The content itself is still unchanged — same `keymap`, same
+    /// capabilities, same effective bindings — because what was wrong was
+    /// the shape, not the knowledge.
+    pub(crate) fn sheet(
         caps: Option<k9rs_proto::protocol::ResourceCapabilities>,
         keys: crate::KeysConfig,
         class: crate::keymap::ViewClass,
         markable: bool,
-    ) -> (Vec<String>, Vec<k9rs_proto::row::ResourceRow>) {
-        use k9rs_proto::row::{CellValue, ResourceRow};
+    ) -> HelpSheet {
+        use k9rs_proto::row::{CellValue, DrillTarget, ResourceRow};
         let tmp = HelpContent { caps, keys, class, markable };
-        let mut rows = Vec::new();
+
+        let mut index_rows = Vec::new();
+        let mut sections = Vec::new();
         for section in tmp.sections() {
-            for entry in section.entries {
-                // A key-less line is prose belonging to its section (e.g.
-                // "every other single-row key is disabled"); it keeps its
-                // row so the statement is not lost, with an empty KEY.
-                rows.push(ResourceRow {
+            index_rows.push(ResourceRow {
+                cells: vec![
+                    CellValue::Text(section.title.to_string()),
+                    // A COUNT, so it sorts as a number and says how deep
+                    // the section goes before you commit to opening it.
+                    CellValue::Count(section.entries.len() as i64),
+                    CellValue::Text(section.summary.to_string()),
+                ],
+                name: section.title.to_string(),
+                namespace: None,
+                // The row says what Enter does. No branch in the key
+                // handler knows help is special — the thing that made the
+                // old contexts view a bespoke case.
+                drill_target: Some(DrillTarget::HelpSection(section.title.to_string())),
+                ..Default::default()
+            });
+
+            let rows: Vec<ResourceRow> = section
+                .entries
+                .iter()
+                .map(|entry| ResourceRow {
+                    // A key-less line is prose belonging to its section
+                    // (e.g. "every other single-row key is disabled"); it
+                    // keeps its row so the statement is not lost, with an
+                    // empty KEY.
                     cells: vec![
-                        // SECTION first: the table's default sort is the
-                        // first column, so the grouping the old sheet drew
-                        // with headers survives as the default ORDER — and
-                        // `S` on KEY regroups it the other way, which the
-                        // headers could never do.
-                        CellValue::Text(section.title.to_string()),
                         CellValue::Text(entry.key.clone()),
-                        CellValue::Text(entry.description.into_owned()),
+                        CellValue::Text(entry.description.to_string()),
                     ],
                     name: format!("{}/{}", section.title, entry.key),
                     namespace: None,
                     ..Default::default()
-                });
-            }
+                })
+                .collect();
+            sections.push((
+                section.title.to_string(),
+                HelpTable {
+                    headers: vec!["KEY".to_string(), "DESCRIPTION".to_string()],
+                    rows,
+                },
+            ));
         }
-        (
-            vec!["SECTION".to_string(), "KEY".to_string(), "DESCRIPTION".to_string()],
-            rows,
-        )
+
+        HelpSheet {
+            index: HelpTable {
+                headers: vec![
+                    "SECTION".to_string(),
+                    "KEYS".to_string(),
+                    "DESCRIPTION".to_string(),
+                ],
+                rows: index_rows,
+            },
+            sections,
+        }
     }
 
     fn sections(&self) -> Vec<HelpSection> {
@@ -121,6 +189,7 @@ impl HelpContent {
 
         let mut sections = vec![HelpSection {
             title: self.class.title(),
+            summary: "Moving, drilling and acting inside the view you are in",
             entries: to_entries(keymap::for_class(self.class)),
         }];
 
@@ -166,12 +235,14 @@ impl HelpContent {
             });
             sections.push(HelpSection {
                 title: "Select mode (while rows are marked)",
+                summary: "What CHANGES once rows are marked — the rest goes dead",
                 entries,
             });
         }
 
         sections.push(HelpSection {
             title: "Everywhere",
+            summary: "Keys that mean the same thing in every view",
             entries: to_entries(keymap::global()),
         });
 
@@ -180,6 +251,7 @@ impl HelpContent {
         // not a choice between two words, in vim as much as here.
         sections.push(HelpSection {
             title: "Search & filter syntax (vim magic)",
+            summary: "What `/` and `~` accept — not keys, but the rules for them",
             entries: vec![
                 HelpEntry {
                     key: r"foo\|bar".into(),
@@ -303,6 +375,7 @@ impl HelpContent {
 
         HelpSection {
             title: "Resource Actions",
+            summary: "What you can do TO the row under the cursor",
             entries,
         }
     }

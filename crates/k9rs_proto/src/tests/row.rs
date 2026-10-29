@@ -40,6 +40,18 @@ fn drill_wire_tags_are_stable() {
         6u32.to_le_bytes()
     );
     assert_eq!(tag(&DrillTarget::Derived(DerivedViewKind::Containers)), 7u32.to_le_bytes());
+    // 8 and 9 were pinned in `remaining_wire_enum_tags_are_stable` over in
+    // `tests/protocol.rs` — a SECOND place pinning this enum, which is the
+    // split that let `LocalResourceKind` drift today: the copy is the one
+    // that disagrees. Every tag lives here now, so the next append comes
+    // here too.
+    assert_eq!(
+        tag(&DrillTarget::SwitchContext(
+            crate::protocol::ContextName::new("c").expect("a real name")
+        )),
+        8u32.to_le_bytes(),
+    );
+    assert_eq!(tag(&DrillTarget::HelpSection(String::new())), 9u32.to_le_bytes());
 
     // Embedded enums, same treatment.
     let sel_tag = |s: &K8sFieldSelector| bincode::serialize(s).unwrap()[..4].to_vec();

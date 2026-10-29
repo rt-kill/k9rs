@@ -20,6 +20,11 @@
 //! below names no Kubernetes crate, so the transitive dependency cannot come
 //! back without an edit here that says so out loud.
 
+// FIRST, and `#[macro_use]`: `macro_rules!` is textually scoped, so a macro
+// used by `local_types` (declared next) has to be declared before it.
+#[macro_use]
+mod variant_list;
+
 pub mod crd_cache;
 pub mod local_types;
 pub mod overlay;

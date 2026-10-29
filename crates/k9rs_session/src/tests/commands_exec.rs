@@ -30,7 +30,7 @@ fn parse_in(app: &App, input: &str) -> ParsedCommand {
 ///
 /// The README documents `name: pod-metrics  # unique name (navigate via
 /// :pod-metrics)`. It didn't work: `ResourceId::from_alias` consults the
-/// built-in registry and `LocalResourceKind::all()`, and a `Custom` kind is in
+/// built-in registry and `LocalResourceKind::ALL`, and a `Custom` kind is in
 /// neither — it is built at runtime from daemon config, and `Custom(_)`
 /// has no aliases by construction. So the name fell through to the CRD
 /// fallback and the daemon replied "Unknown resource".

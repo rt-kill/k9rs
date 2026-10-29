@@ -291,3 +291,6 @@ fn an_exec_free_config_adds_no_exec_rows() {
         "nothing configured, nothing advertised",
     );
 }
+
+
+

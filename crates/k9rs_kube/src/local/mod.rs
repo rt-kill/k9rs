@@ -53,8 +53,12 @@
 //!
 //! 1. Add a variant to [`LocalResourceKind`] — every `fn` accessor
 //!    becomes a compile error on the missing arm; fill in name, version,
-//!    kind_str, plural, scope, aliases, short_label, and add the variant
-//!    to [`LocalResourceKind::all`].
+//!    kind_str, plural, scope, aliases, short_label. Nothing to add to a
+//!    LIST: [`LocalResourceKind::ALL`] is generated from the declaration.
+//!    This step used to end "and add the variant to `all()`", which is the
+//!    shape of the problem — the one thing the compiler could not demand
+//!    was written here as a thing to remember, and forgetting it made the
+//!    new kind unreachable by alias and absent from the alias view.
 //! 2. Implement [`LocalResourceSource`] on a new struct with a
 //!    `for_context(...)` constructor. If it has background work, model
 //!    each unit as a [`supervise::LocalOperator`] and hold its
@@ -86,7 +90,7 @@
 //!
 //! [`find_by_alias`]: k9rs_proto::local_types::find_by_alias
 //! [`LocalResourceKind`]: k9rs_proto::local_types::LocalResourceKind
-//! [`LocalResourceKind::all`]: k9rs_proto::local_types::LocalResourceKind::all
+//! [`LocalResourceKind::ALL`]: k9rs_proto::local_types::LocalResourceKind::ALL
 //! [`LocalResourceKind::Context`]: k9rs_proto::local_types::LocalResourceKind::Context
 
 pub mod context_locals;

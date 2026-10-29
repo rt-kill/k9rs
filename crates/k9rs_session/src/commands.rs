@@ -186,7 +186,7 @@ pub(crate) fn parse_command_input(raw_cmd: &str, cmd: &str, app: &App) -> Parsed
     // 4b. A user-configured exec resource, by its own name (`:node-costs`).
     //
     // These cannot go through `ResourceId::from_alias`: that consults the
-    // built-in registry and `LocalResourceKind::all()`, and a `Custom` kind
+    // built-in registry and `LocalResourceKind::ALL`, and a `Custom` kind
     // is in neither — it is created at runtime from daemon config, and
     // `Custom(_).aliases()` is empty by construction. So `:node-costs` fell
     // through to the CRD fallback below and the daemon answered "Unknown

@@ -8,8 +8,26 @@
 
 use super::*;
 
-fn rows_for(class: crate::keymap::ViewClass) -> (Vec<String>, Vec<k9rs_proto::row::ResourceRow>) {
-    HelpContent::rows(None, crate::KeysConfig::default(), class, false)
+fn sheet_for(class: crate::keymap::ViewClass) -> crate::help::HelpSheet {
+    HelpContent::sheet(None, crate::KeysConfig::default(), class, false)
+}
+
+/// The sheet flattened back to `(section, key, description)` — what the
+/// single-table version used to be. The content claims below are about the
+/// content, so they are asked of every row at both levels; only the SHAPE
+/// changed when `?` became an index.
+fn flat_for(class: crate::keymap::ViewClass) -> Vec<(String, String, String)> {
+    flatten(&sheet_for(class))
+}
+
+fn flatten(sheet: &crate::help::HelpSheet) -> Vec<(String, String, String)> {
+    sheet
+        .sections
+        .iter()
+        .flat_map(|(title, table)| {
+            table.rows.iter().map(move |r| (title.clone(), cell(r, 0), cell(r, 1)))
+        })
+        .collect()
 }
 
 fn cell(row: &k9rs_proto::row::ResourceRow, i: usize) -> String {
@@ -19,17 +37,88 @@ fn cell(row: &k9rs_proto::row::ResourceRow, i: usize) -> String {
     }
 }
 
-/// Every class produces rows, with the three columns the table declares.
+/// Every class produces an index and sections behind it, with the columns
+/// each level declares.
 #[test]
 fn every_view_class_has_help_to_show() {
     for &class in crate::keymap::ViewClass::ALL {
-        let (headers, rows) = rows_for(class);
-        assert_eq!(headers, vec!["SECTION", "KEY", "DESCRIPTION"]);
-        assert!(!rows.is_empty(), "{class:?}: `?` must say something");
-        for row in &rows {
+        let sheet = sheet_for(class);
+        let (headers, index) = (&sheet.index.headers, &sheet.index.rows);
+        assert_eq!(headers, &vec!["SECTION", "KEYS", "DESCRIPTION"]);
+        assert!(!index.is_empty(), "{class:?}: `?` must say something");
+        for row in index {
             assert_eq!(row.cells.len(), 3, "{class:?}: {row:?}");
-            assert!(!cell(row, 2).is_empty(), "{class:?}: a row with no description");
+            assert!(!cell(row, 2).is_empty(), "{class:?}: a section with no summary");
         }
+
+        assert!(!sheet.sections.is_empty());
+        for (title, table) in &sheet.sections {
+            assert_eq!(table.headers, vec!["KEY", "DESCRIPTION"]);
+            assert!(!table.rows.is_empty(), "{class:?}: section {title:?} is empty");
+            for row in &table.rows {
+                assert_eq!(row.cells.len(), 2, "{class:?}: {row:?}");
+                assert!(!cell(row, 1).is_empty(), "{class:?}: a row with no description");
+            }
+        }
+    }
+}
+
+/// The index names exactly the sections that exist, each with its real
+/// count, and every index row carries the drill that opens it.
+///
+/// Both halves come from one `sections()` walk precisely so this holds: a
+/// second projection could name a section that was never built, and that
+/// row's Enter would go nowhere.
+#[test]
+fn the_index_and_the_sections_are_the_same_list() {
+    use k9rs_proto::row::{CellValue, DrillTarget};
+    for &class in crate::keymap::ViewClass::ALL {
+        let sheet = sheet_for(class);
+        let index = &sheet.index.rows;
+
+        let listed: Vec<String> = index.iter().map(|r| cell(r, 0)).collect();
+        let built: Vec<String> = sheet.sections.iter().map(|(t, _)| t.clone()).collect();
+        assert_eq!(listed, built, "{class:?}: the index and the sections disagree");
+
+        for (row, (title, table)) in index.iter().zip(&sheet.sections) {
+            assert_eq!(
+                row.drill_target,
+                Some(DrillTarget::HelpSection(title.clone())),
+                "{class:?}: the row must say what Enter does",
+            );
+            assert_eq!(row.name, *title, "the row's identity is its section");
+            assert_eq!(
+                row.cells[1],
+                CellValue::Count(table.rows.len() as i64),
+                "{class:?}: section {title:?} advertises the wrong count",
+            );
+        }
+    }
+}
+
+/// The index fits a terminal the flat sheet never could.
+///
+/// That was the whole complaint: 61 rows for a table view against a float
+/// budget of `floor(h * 0.85) - 3` — 17 content rows at 80x24. No grouping
+/// or trimming crossed that; an index does, because the number of SECTIONS
+/// does not grow with the number of keys.
+#[test]
+fn the_index_fits_a_small_terminal() {
+    for &class in crate::keymap::ViewClass::ALL {
+        let sheet = sheet_for(class);
+        let sections = sheet.index.rows.len();
+        let flat = flatten(&sheet).len();
+        let budget_at_80x24 = (24.0 * 0.85) as usize - 3;
+        assert!(
+            sections <= budget_at_80x24,
+            "{class:?}: the index is {sections} rows, over the {budget_at_80x24} an \
+             80x24 float can show",
+        );
+        assert!(
+            flat > budget_at_80x24,
+            "{class:?}: the flat sheet was only {flat} rows — if it now fits, this \
+             test is measuring the wrong thing and the index is not what fixed it",
+        );
     }
 }
 
@@ -39,12 +128,11 @@ fn every_view_class_has_help_to_show() {
 #[test]
 fn help_leads_with_the_class_the_user_pressed_it_in() {
     for &class in crate::keymap::ViewClass::ALL {
-        let (_, rows) = rows_for(class);
-        let first = cell(&rows[0], 0);
+        let index = sheet_for(class).index.rows;
         assert_eq!(
-            first,
+            cell(&index[0], 0),
             class.title(),
-            "{class:?}: the first section must be this view's",
+            "{class:?}: the index must LEAD with this view's section",
         );
     }
 }
@@ -67,14 +155,11 @@ fn every_projected_help_key_comes_from_the_keymap() {
             .chain(crate::keymap::global().iter())
             .map(|b| b.display_keys(&cfg))
             .collect();
-        let (_, rows) = rows_for(class);
         let mut checked = 0;
-        for row in &rows {
-            let section = cell(row, 0);
+        for (section, key, _) in flat_for(class) {
             if section != class.title() && section != "Everywhere" {
                 continue;
             }
-            let key = cell(row, 1);
             // A key-less line is prose belonging to its section, and keeps
             // its row so the statement is not lost.
             if key.is_empty() {
@@ -99,8 +184,8 @@ fn help_shows_the_users_own_bindings() {
         col_right: Some(crate::KeyCombo::plain('l')),
         ..Default::default()
     };
-    let (_, rows) = HelpContent::rows(None, keys, crate::keymap::ViewClass::Table, false);
-    let shown: Vec<String> = rows.iter().map(|r| cell(r, 1)).collect();
+    let sheet = HelpContent::sheet(None, keys, crate::keymap::ViewClass::Table, false);
+    let shown: Vec<String> = flatten(&sheet).into_iter().map(|(_, k, _)| k).collect();
     assert!(
         shown.iter().any(|k| k.contains("h / l")),
         "the configured column chords must appear: {shown:?}",
@@ -113,12 +198,96 @@ fn help_shows_the_users_own_bindings() {
 #[test]
 fn help_rows_have_distinct_identities() {
     for &class in crate::keymap::ViewClass::ALL {
-        let (_, rows) = rows_for(class);
-        let names: std::collections::HashSet<&String> = rows.iter().map(|r| &r.name).collect();
-        assert_eq!(
-            names.len(),
-            rows.len(),
-            "{class:?}: two help rows share a name, so the store sees one",
+        let sheet = sheet_for(class);
+        // Per STORE, since each level is its own store: the index, and each
+        // section.
+        let mut stores: Vec<Vec<String>> =
+            vec![sheet.index.rows.iter().map(|r| r.name.clone()).collect()];
+        stores.extend(
+            sheet.sections.iter().map(|(_, table)| {
+                table.rows.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+            }),
+        );
+        for names in stores {
+            let distinct: std::collections::HashSet<&String> = names.iter().collect();
+            assert_eq!(
+                distinct.len(),
+                names.len(),
+                "{class:?}: two rows of one help store share a name, so it sees one",
+            );
+        }
+    }
+}
+
+/// Pressing `?` captures the whole sheet, so every section the index names
+/// can be opened — and the stores hold that section's own rows.
+///
+/// Captured at the press rather than re-derived on Enter because help is
+/// CONTEXTUAL: by the time Enter lands, the top of the stack is help, so
+/// `current_capabilities()` and `ViewClass::of` would answer about help
+/// instead of the view it documents. That is the bug this shape avoids, and
+/// it is invisible unless the capture is checked against the index.
+#[test]
+fn a_press_captures_every_section_the_index_names() {
+    use k9rs_proto::row::{CellValue, DrillTarget};
+
+    let mut app = crate::App::new_for_test();
+    let class = crate::keymap::ViewClass::of(app.nav.top());
+    let caps = Some(app.current_capabilities());
+    let markable = app.nav.top().markable();
+    let index = app.core.seed_keybindings(caps.clone(), app.config.keys, class, markable);
+
+    let index_rows = index.with_read(|i| i.rows.clone());
+    assert!(!index_rows.is_empty(), "`?` listed nothing");
+
+    for row in &index_rows {
+        let Some(DrillTarget::HelpSection(title)) = &row.drill_target else {
+            panic!("every index row must say what Enter does: {row:?}");
+        };
+        let store = app
+            .core
+            .keybinding_section(title)
+            .unwrap_or_else(|| panic!("the index names {title:?} but nothing captured it"));
+
+        let rows = store.with_read(|i| i.rows.clone());
+        let advertised = match &row.cells[1] {
+            CellValue::Count(n) => *n as usize,
+            other => panic!("KEYS is a count, got {other:?}"),
+        };
+        assert_eq!(rows.len(), advertised, "{title}: the count must be the truth");
+        assert!(
+            rows.iter().all(|r| r.name.starts_with(title.as_str())),
+            "{title}: a section holds its OWN rows",
         );
     }
+
+    // A second press REPLACES the capture — contextual content and shared
+    // storage cannot both be true, which is the rule `seed_keybindings`
+    // already kept for the index store.
+    let before = app.core.keybinding_section(
+        &match &index_rows[0].drill_target {
+            Some(DrillTarget::HelpSection(t)) => t.clone(),
+            other => panic!("{other:?}"),
+        },
+    );
+    let _ = app.core.seed_keybindings(caps, app.config.keys, crate::keymap::ViewClass::Log, false);
+    let log_sections: Vec<String> = app
+        .core
+        .keybinding_section(crate::keymap::ViewClass::Log.title())
+        .map(|_| vec![crate::keymap::ViewClass::Log.title().to_string()])
+        .unwrap_or_default();
+    assert_eq!(
+        log_sections,
+        vec![crate::keymap::ViewClass::Log.title().to_string()],
+        "the second press captured the LOG view's sections",
+    );
+    assert!(
+        before.is_some(),
+        "sanity: the first press had captured its own leading section",
+    );
+    assert!(
+        app.core.keybinding_section(class.title()).is_none(),
+        "…and the table view's section is gone, not left to be opened under \
+         the log view's breadcrumb",
+    );
 }

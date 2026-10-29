@@ -102,11 +102,27 @@ impl KeyCombo {
     /// on one row and `C-h` on the next for the same kind of thing. Display
     /// only: nothing parses this back (the config reader has its own
     /// `TryFrom`, which already accepts `ctrl-x`).
+    /// How this chord is WRITTEN — in help, and in a config file.
+    ///
+    /// Those are one answer on purpose: the label's whole job in `?` is to
+    /// tell you which key to press and, if you want it somewhere else, what
+    /// to type under `keys:`. An uppercase char is therefore the bare
+    /// capital, not `Shift-f`, for three reasons that agree:
+    ///
+    /// - `Shift-f` is not a valid spec. [`KeyCombo::try_from`] takes a
+    ///   single character or `ctrl-<char>` and nothing else, so a user who
+    ///   read `Shift-f  Port forward` off the help sheet and wrote
+    ///   `portForward: Shift-f` got `invalid key spec` at startup. Help was
+    ///   advertising an input its own parser refuses —
+    ///   `every_label_parses_back_to_its_own_chord` is the pin.
+    /// - the same sheet already wrote nine shifted letters as capitals
+    ///   (`G`, `J`, `U`, `E`, `N`, `A`, `O`, `S`, and `F` itself in the
+    ///   keymap rows), so `F` and `Shift-f` appeared as two rows for one
+    ///   chord and a tenth spelling, `Shift-C`, existed in the log view.
+    /// - it is how the keyboard works.
     pub fn label(&self) -> String {
         if self.ctrl {
             format!("Ctrl-{}", self.ch)
-        } else if self.ch.is_uppercase() {
-            format!("Shift-{}", self.ch.to_lowercase())
         } else {
             self.ch.to_string()
         }

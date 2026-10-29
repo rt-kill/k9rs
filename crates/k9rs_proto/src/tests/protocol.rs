@@ -334,10 +334,11 @@ fn stream_event_ref_tags_match() {
 /// change it was. v19 removed `TableBaseline.resource` — a `ResourceId`
 /// every producer wrote and no consumer read, which could only ever
 /// disagree with the subscription that routed the baseline, and did on the
-/// legacy exec-source path.
+/// legacy exec-source path. v20 appended `DrillTarget::HelpSection`, so `?`
+/// can list its sections and Enter can drill into one.
 #[test]
 fn stream_wire_tags_are_stable() {
-    assert_eq!(WIRE_FORMAT_REVISION, 19);
+    assert_eq!(WIRE_FORMAT_REVISION, 20);
     let b = bincode::serialize(&StreamEvent::Error("x".into())).unwrap();
     assert_eq!(&b[..4], 2u32.to_le_bytes()); // Baseline=0, Delta=1, Error=2
     // Stale/Live APPENDED for v11 — Resolved=3 keeps its tag.
@@ -573,13 +574,11 @@ fn remaining_wire_enum_tags_are_stable() {
     // line failed while the authoritative test passed. See
     // `local_resource_kind_wire_tags_are_stable` in `tests/local_types.rs`.
 
-    // DrillTarget: SwitchContext appended at 8.
-    assert_eq!(
-        tag(bincode::serialize(&crate::row::DrillTarget::SwitchContext(
-            ContextName::new("c").unwrap()
-        )).unwrap()),
-        8,
-    );
+    // DrillTarget is NOT pinned here. It was — `SwitchContext` alone — and
+    // that is the second-copy shape: `drill_wire_tags_are_stable` in
+    // `tests/row.rs` pins every tag of it, so a copy here could only ever be
+    // the one left behind. (It was: appending `HelpSection` for v20 touched
+    // the dedicated test and this one would have sat unchanged.)
 }
 
 /// `BuiltInKind` is a WIRE enum (rides inside `ResourceId::BuiltIn` and
@@ -1050,20 +1049,23 @@ fn a_log_window_round_trips_and_absence_still_means_everything() {
 // `BUILT_IN` is generated, and this is what generated means
 // ---------------------------------------------------------------------------
 
-operation_kinds! {
+variant_list! {
+    list = BUILT_IN;
     // The macro emits `pub`, which inside a test module is an unreachable
     // `pub` — the lint is armed workspace-wide and it is right. Allowed
     // here rather than parameterising the macro's visibility for one toy.
     #[allow(unreachable_pub)]
-    /// A stand-in for [`OperationKind`], with the same shape: unit variants
-    /// interleaved with a payload-carrying one.
+    /// A stand-in for the two real enums `variant_list!` declares, with the
+    /// shape they share: unit variants interleaved with a payload-carrying
+    /// one.
     ///
-    /// Testing the MACRO rather than its one real use, because the property
+    /// Testing the MACRO rather than either real use, because the property
     /// is about the macro: a new unit variant joins the list without anyone
-    /// touching the list. On `OperationKind` itself that cannot be asserted
-    /// — adding a variant to measure it is a source edit, and sixteen
-    /// exhaustive matches across four crates refuse to compile until it is
-    /// handled, which is the other half of the guarantee.
+    /// touching the list. On `OperationKind` or `LocalResourceKind` that
+    /// cannot be asserted — adding a variant to measure it is a source
+    /// edit, and the exhaustive matches across four crates refuse to
+    /// compile until it is handled, which is the other half of the
+    /// guarantee.
     pub enum ToyOperation {
         First,
         Second,

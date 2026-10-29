@@ -247,12 +247,26 @@ fn col_move_label(keys: &crate::KeysConfig) -> String {
 /// The unbound display carries `<…>`, which marks it as prose rather than a
 /// chord for the reverse pin; a `doc` row is unprobed, which is the other
 /// half of saying "this is not a key today".
+///
+/// `<unbound>`, not `<bind colFirst / colLast>`: help's KEY column caps at
+/// 16 cells and that string is 25, so the ONE row in the sheet that gets
+/// clipped was the row whose entire job is to name what to bind — it read
+/// `<bind colFirst` and the second half, the part you need, was gone. The
+/// names moved into the DESCRIPTION column, which had 29 cells spare.
+///
+/// All four arms use the short placeholder, including the half-bound ones.
+/// I first left those as `0 / <bind colLast>` on the grounds that
+/// `<bind colLast>` is only 14 — measuring the PART rather than the
+/// rendered row, which is 18. The width assertion in
+/// `the_column_jump_is_documented_bound_or_not` caught it; position says
+/// which half is missing, and the description names both keys.
 fn col_jump_label(keys: &crate::KeysConfig) -> String {
+    const UNBOUND: &str = "<unbound>";
     match (keys.col_first, keys.col_last) {
-        (None, None) => "<bind colFirst / colLast>".to_string(),
+        (None, None) => UNBOUND.to_string(),
         (Some(f), Some(l)) => format!("{} / {}", f.label(), l.label()),
-        (Some(f), None) => format!("{} / <bind colLast>", f.label()),
-        (None, Some(l)) => format!("<bind colFirst> / {}", l.label()),
+        (Some(f), None) => format!("{} / {UNBOUND}", f.label()),
+        (None, Some(l)) => format!("{UNBOUND} / {}", l.label()),
     }
 }
 
@@ -332,7 +346,7 @@ pub(crate) fn for_class(class: ViewClass) -> Vec<Binding> {
             },
             Binding {
                 effective_label: Some(col_jump_label),
-                ..doc("<bind colFirst / colLast>", "Jump to the first / last column")
+                ..doc("<unbound>", "Jump to the first / last column — bind colFirst / colLast")
             },
             b("Enter", "Drill down", code(KeyCode::Enter), Action::Enter),
             doc("q / Esc", "Back / clear filter"),
@@ -445,7 +459,10 @@ pub(crate) fn for_class(class: ViewClass) -> Vec<Binding> {
             b("h / l / \u{2190} / \u{2192}", "Pan one column left / right", plain('h'), Action::ColLeft),
             b("H / L", "Pan a stride left / right", plain('H'), Action::PageLeft),
             b("^ / $", "Pan to the left margin / far edge", plain('^'), Action::ColFirst),
-            b("Shift-C", "Clear logs", KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT), Action::ClearLogs),
+            // `C`, not `Shift-C`: every other shifted letter in this file
+            // is written as its capital, and that spelling is also what a
+            // `keys:` entry would take — see `KeyCombo::label`.
+            b("C", "Clear logs", KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT), Action::ClearLogs),
             b(
                 "/",
                 "Grep — stacks; `!pat` EXCLUDES, `\\!` for a literal `!`",

@@ -100,7 +100,8 @@ pub(crate) fn handle_action(
             // no bespoke key path to remember, which is what let every modal
             // lose its Esc when a routing guard was added upstream of them.
             if app.nav.top().is_keybindings_view() {
-                app.nav.pop();
+                // Pops every narrowing too — see `NavStack::pop_keybindings`.
+                app.nav.pop_keybindings();
             } else {
                 let class = k9rs_app::ViewClass::of(app.nav.top());
                 let caps = Some(app.current_capabilities());
@@ -1804,6 +1805,38 @@ pub(crate) fn handle_enter(
     match row.drill_target.clone() {
         Some(DrillTarget::PodsInNamespace(ns)) => {
             drill_to_pods_in_namespace(app, data_source, ns);
+        }
+        Some(DrillTarget::HelpSection(title)) => {
+            // `?` lists sections; this opens one. The rows were captured at
+            // the press (help is contextual — see
+            // `CoreData::keybinding_sections`), so there is nothing to
+            // re-derive and nothing here that knows WHICH section it is.
+            match app.core.keybinding_section(&title) {
+                Some(store) => {
+                    let rid = k9rs_proto::local_types::LocalResourceKind::Keybinding
+                        .to_resource_id();
+                    app.nav.push(k9rs_app::Element::ResourceList(
+                        k9rs_app::ResourceList::client(
+                            k9rs_app::QuerySpec {
+                                rid,
+                                namespace: k9rs_proto::protocol::Namespace::All,
+                                filter: None,
+                            },
+                            store,
+                            &app.kube.metrics,
+                            title,
+                        ),
+                    ));
+                }
+                // Unreachable by construction: index rows and section
+                // stores are built in one pass. A tripwire rather than a
+                // flash, because a user can do nothing about it.
+                None => debug_assert!(
+                    false,
+                    "a help index row named section {title:?}, which the same \
+                     press did not capture",
+                ),
+            }
         }
         Some(DrillTarget::SwitchContext(name)) => {
             // Not a drill: the nav stack below belongs to the context we

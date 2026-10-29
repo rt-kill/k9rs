@@ -83,7 +83,12 @@ pub use geometry::{
     picker_hints_width, DIALOG_CHROME, DIALOG_MARGIN,
 };
 pub use handler::handle_key_event;
-pub use help::HelpContent;
+// `HelpContent` is NOT re-exported. It was, and had zero users outside this
+// crate once `?` became an index: the one cross-crate caller read the flat
+// sheet directly, and now goes through `CoreData::seed_keybindings` like the
+// real `?` path does. A `pub use` whose only reader left is invisible to
+// `unreachable_pub` — the dead-`pub` class — so it goes when its last
+// caller does.
 pub use keymap::{bar_hints, ViewClass};
 pub use kubectl_cache::{ContentKind, KubectlCache};
 pub use liveness::Liveness;
@@ -161,7 +166,7 @@ fn seed_aliases(store: &store::RowStore, config: &AppConfig) {
     for def in k9rs_proto::resource_def::all_defs() {
         push("resource", def.aliases().join(" / "), def.gvr().kind.to_string());
     }
-    for kind in k9rs_proto::local_types::LocalResourceKind::all() {
+    for kind in k9rs_proto::local_types::LocalResourceKind::ALL {
         // A kind with no alias is deliberately not typeable (`?` is not a
         // noun you browse); listing it would advertise a word that does
         // nothing.
@@ -258,6 +263,20 @@ fn label_cell(label: Option<&str>) -> k9rs_proto::row::CellValue {
 /// other resource (the daemon's watcher cache dedupes the upstream
 /// watch); these exist for the chrome, not for views.
 pub struct CoreData {
+    /// The `?` sheet's SECTION stores, by title, replaced on every press.
+    ///
+    /// Held rather than re-derived at drill time because help is
+    /// CONTEXTUAL: its rows depend on the view `?` was pressed in and on
+    /// that resource's capabilities — and by the time Enter lands on a
+    /// section row, the top of the stack IS help, so
+    /// [`App::current_capabilities`] and `ViewClass::of` would answer about
+    /// help instead of about the view it documents. Captured once, at the
+    /// press, in the same pass that builds the index.
+    ///
+    /// Replaced wholesale per press, for the reason `seed_keybindings`
+    /// gives at length: contextual content and shared storage cannot both
+    /// be true.
+    keybinding_sections: Vec<(String, std::sync::Arc<store::RowStore>)>,
     pub namespaces: std::sync::Arc<store::RowStore>,
     pub nodes: std::sync::Arc<store::RowStore>,
     pub crds: std::sync::Arc<store::RowStore>,
@@ -291,6 +310,7 @@ impl CoreData {
     /// because the exec resources a `:` prompt accepts are declared there.
     fn new(config: &AppConfig) -> Self {
         Self {
+            keybinding_sections: Vec::new(),
             namespaces: store::RowStore::new("namespaces"),
             nodes: store::RowStore::new("nodes"),
             crds: store::RowStore::new("customresourcedefinitions"),
@@ -495,7 +515,7 @@ impl CoreData {
     /// `seed_contexts` — the rows come from this process, so there is no
     /// subscription and no epoch race.
     pub fn seed_keybindings(
-        &self,
+        &mut self,
         caps: Option<k9rs_proto::protocol::ResourceCapabilities>,
         keys: crate::KeysConfig,
         class: crate::keymap::ViewClass,
@@ -510,16 +530,49 @@ impl CoreData {
         // is now showing the second one's keys under the first one's
         // breadcrumb. Contextual content and shared storage cannot both be
         // true.
+        let sheet = crate::help::HelpContent::sheet(caps, keys, class, markable);
+
+        // Every section gets its store here, in the SAME pass that builds
+        // the index pointing at them — so a section the index names is
+        // always openable, and one `?` press captures the whole contextual
+        // sheet rather than half of it.
+        self.keybinding_sections = sheet
+            .sections
+            .into_iter()
+            .map(|(title, table)| {
+                let store = store::RowStore::client("keybindings");
+                store.apply(
+                    Self::SEED_EPOCH,
+                    store::StorePayload::Baseline(k9rs_proto::protocol::TableBaseline {
+                        headers: table.headers,
+                        rows: table.rows,
+                    }),
+                );
+                (title, store)
+            })
+            .collect();
+
         let store = store::RowStore::client("keybindings");
-        let (headers, rows) = crate::help::HelpContent::rows(caps, keys, class, markable);
         store.apply(
             Self::SEED_EPOCH,
             store::StorePayload::Baseline(k9rs_proto::protocol::TableBaseline {
-                headers,
-                rows,
+                headers: sheet.index.headers,
+                rows: sheet.index.rows,
             }),
         );
         store
+    }
+
+    /// One section's rows, as captured by the last [`Self::seed_keybindings`].
+    ///
+    /// `None` means no `?` press has captured a sheet naming this section —
+    /// which a row carrying `DrillTarget::HelpSection` cannot cause, since
+    /// the index rows and these stores are built in one pass.
+    pub fn keybinding_section(&self, title: &str) -> Option<std::sync::Arc<store::RowStore>> {
+        self.keybinding_sections
+            .iter()
+            .find(|(t, _)| t == title)
+            .map(|(_, s)| std::sync::Arc::clone(s))
     }
 
     /// Context switch: set the OUTGOING context's core stores aside and
@@ -1143,7 +1196,7 @@ fn resource_commands() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = k9rs_proto::resource_def::all_defs()
         .flat_map(|def| def.aliases().iter().copied())
         .collect();
-    for kind in &k9rs_proto::local_types::LocalResourceKind::all() {
+    for kind in k9rs_proto::local_types::LocalResourceKind::ALL {
         v.extend(kind.aliases().iter().copied());
     }
     // `["alias", "aliases", "a"]` used to be appended by hand here, because

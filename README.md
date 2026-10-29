@@ -85,7 +85,7 @@ Resource-specific keys (shown in `?` help when available):
 - `l` — Logs
 - `s` — Shell / Scale (context-dependent)
 - `r` — Restart
-- `Shift-F` — Port forward
+- `F` — Port forward
 - `o` — Show node
 
 In a **log view** (`l`):
@@ -102,7 +102,7 @@ In a **log view** (`l`):
 | `/!pat` | Grep the other way: EXCLUDE lines matching `pat` (`\!` for a literal `!`) |
 | `0`–`6` | Time range: tail, 1m, 5m, 15m, 30m, 1h, 24h |
 | `7` | Everything, oldest first — stops once the buffer is full |
-| `Shift-C` | Clear the buffer |
+| `C` | Clear the buffer |
 | `Ctrl-s` | Save to a file |
 
 Marking rows with `Space` enters **select mode**: single-row keys go
@@ -122,7 +122,7 @@ k9rs:
 
   # Key rebindings. An operation entry MOVES that operation's binding (its
   # default key stops working) — except for delete, forceKill and portForward,
-  # whose real chords (Ctrl-D / Ctrl-K / Shift-F) are structural, so rebinding
+  # whose real chords (Ctrl-d / Ctrl-k / F) are structural, so rebinding
   # those ADDS a second key rather than moving the first. The col* entries ADD
   # chords for column
   # movement (arrows always work) and win over an operation bound to the
@@ -148,7 +148,13 @@ k9rs:
                                #   overrides this for one run.
     skin: dracula              # skin name (loads from skins/ directory);
                                #   layers on top of the chosen theme
-    maxColumnWidth: 64         # max column width before truncation
+    maxColumnWidth: 64         # max column width before truncation — a cap, not a
+                               #   switch, so `0` is refused at startup (as are
+                               #   `cacheCapacity: 0` and `logs.maxLines: 0`).
+                               #   Their siblings DO take 0: `flash.*Secs` means
+                               #   "do not linger", `searchContextLines` "no
+                               #   context", `commandHistorySize` "no history",
+                               #   and `logs.tailLines` is kubectl's `--tail=0`.
     commandHistorySize: 50     # max : command history entries
     changeHighlightSecs: 5     # row change highlight duration
     cacheCapacity: 100         # describe/yaml cache entries
@@ -194,6 +200,15 @@ k9rs:
 
 All fields are optional — omitting them uses the defaults shown above.
 Typos in field names produce an error (strict validation via `deny_unknown_fields`).
+
+A `0` is refused for the knobs where it is not a quantity but a malfunction
+— `watcherPageSize`, `discoveryRefreshSecs`, `fanoutRing`, `pollIntervalSecs`
+and `backoff.initialMs` / `maxMs` — because each one breaks something
+quietly: `discoveryRefreshSecs: 0` is a busy loop in a long-lived daemon, and
+`initialMs: 0` makes the doubling `(0 * 2).min(max)` a fixed point, so the
+ceiling is never reached and retries spin. `watcherGraceSecs`,
+`localsGraceSecs` and `backoff.maxElapsedMs` DO take `0`, meaning "do not
+keep it warm" and "give up on the first failure".
 
 ## Overlays
 

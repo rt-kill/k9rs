@@ -649,23 +649,42 @@ fn help_documents_the_view_you_pressed_it_in() {
     // a table now, so the paint shows one scrolled window of it — which is
     // the point (you grep it), but makes "does this key appear" a question
     // about the data, not the pixels.
+    /// Every row of the sheet, both levels — reached the way Enter reaches
+    /// them: walk the INDEX, and pull each section by the title its row
+    /// carries. So this also drives the capture path end to end (an index
+    /// row names a section; `keybinding_section` has it).
     fn help_rows(app: &mut App) -> Vec<String> {
         let class = k9rs_app::ViewClass::of(app.nav.top());
         let caps = Some(app.current_capabilities());
-        let store = app.core.seed_keybindings(
+        let index = app.core.seed_keybindings(
             caps,
             app.config.keys,
             class,
             app.nav.top().markable(),
         );
-        store.with_read(|i| {
-            i.rows
-                .iter()
-                .map(|r| {
-                    r.cells.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" | ")
-                })
+        // `RowStore` is not in `k9rs_app`'s facade, so it cannot be NAMED
+        // here — only used. Hence `with_read` inline rather than a helper
+        // taking one.
+        let index_rows: Vec<k9rs_proto::row::ResourceRow> =
+            index.with_read(|i| i.rows.clone());
+        let join = |rows: &[k9rs_proto::row::ResourceRow]| -> Vec<String> {
+            rows.iter()
+                .map(|r| r.cells.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" | "))
                 .collect()
-        })
+        };
+        let mut out = join(&index_rows);
+        for row in &index_rows {
+            let title = match &row.cells[0] {
+                k9rs_proto::row::CellValue::Text(t) => t.clone(),
+                other => panic!("SECTION is text, got {other:?}"),
+            };
+            let section = app
+                .core
+                .keybinding_section(&title)
+                .unwrap_or_else(|| panic!("the index named {title:?}, so it must be openable"));
+            out.extend(join(&section.with_read(|i| i.rows.clone())));
+        }
+        out
     }
 
 
@@ -2168,47 +2187,52 @@ fn no_resource_column_collapses_whichever_one_is_sorted() {
     }
 }
 
-/// …and help's SECTION still collapses, which is what the feature was FOR.
+/// A SECTION column still collapses its repeated values when sorted on.
 ///
-/// The fix narrowed collapsing to columns that declare it. The other half of
-/// "re-check next run" was whether the case that motivated it still works.
+/// This used to be asked of `?`, which was the feature's first customer: 61
+/// rows with "Everywhere" repeated fourteen times down the left edge. `?` is
+/// an INDEX now — one row per section — so it has no run left to collapse,
+/// and asking it would assert nothing. The live case is the ALIAS view,
+/// whose SECTION column repeats "resource" across every registry entry.
+///
+/// Kept rather than deleted: `groups()` is opt-in per column precisely
+/// because the wrong column collapsing reads as MISSING DATA (it blanked
+/// eighteen AGE cells once), so the behaviour needs a customer that proves
+/// it still works.
 #[test]
-fn help_section_still_collapses_after_the_narrowing() {
+fn a_section_column_still_collapses_its_repeated_values() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
     let mut app = App::new_for_test();
-    push_help(&mut app);
+    app.conn.established();
+    let rid = k9rs_proto::local_types::LocalResourceKind::Alias.to_resource_id();
+    app.nav.reset(
+        app.core
+            .client_root_element(&app.kube.metrics, &rid, k9rs_proto::protocol::Namespace::All)
+            .expect("aliases is client-owned"),
+    );
 
-    // Tall enough for EVERY help row: help opens on the section for the view
-    // you came from, so `Everywhere` sits well below the fold on a normal
-    // frame and a short terminal would prove nothing either way.
+    // Tall enough for every alias row, so the run is on screen entire.
     let mut t = Terminal::new(TestBackend::new(200, 90)).expect("terminal");
     let painted = paint(&mut t, &mut app);
 
-    // Help opens sorted on SECTION, and `Everywhere` has many rows — so if
-    // it collapses, the label appears far fewer times than its row count.
-    let (_, rows) = k9rs_app::HelpContent::rows(
-        Some(app.current_capabilities()),
-        app.config.keys,
-        k9rs_app::ViewClass::Table,
-        app.nav.top().markable(),
-    );
-    let everywhere_rows = rows
-        .iter()
-        .filter(|r| {
-            matches!(&r.cells[0], k9rs_proto::row::CellValue::Text(t)
-                if t == "Everywhere")
-        })
-        .count();
-    assert!(everywhere_rows > 3, "the fixture really has a run to collapse");
+    let resource_rows = app.core.aliases.with_read(|i| {
+        i.rows
+            .iter()
+            .filter(|r| {
+                matches!(&r.cells[0], k9rs_proto::row::CellValue::Text(t) if t == "resource")
+            })
+            .count()
+    });
+    assert!(resource_rows > 3, "the fixture really has a run to collapse");
 
-    let drawn = painted.matches("Everywhere").count();
+    let drawn = painted.matches("resource").count();
     assert!(
-        drawn < everywhere_rows,
+        drawn < resource_rows,
         "SECTION must still collapse — it is the category the rows were \
          gathered under, and this is the case the feature exists for \
-         ({drawn} drawn vs {everywhere_rows} rows):\n{painted}",
+         ({drawn} drawn vs {resource_rows} rows):\n{painted}",
     );
     assert!(drawn >= 1, "…but the group is still labelled once");
 }

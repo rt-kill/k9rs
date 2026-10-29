@@ -55,11 +55,17 @@ fn local_resource_kind_wire_tags_are_stable() {
     // short THREE TIMES: `Context`, `Keybinding` and `Alias`, each time with
     // the explanation sitting directly above it. Asserting the COUNT is what
     // makes the next append fail here instead of being silently unpinned.
+    //
+    // It counts `ALL`, which is now GENERATED from the enum's declaration.
+    // While it was a hand-written `vec![…]` this assertion could not catch
+    // the worse mistake: a variant left out of that list left the length
+    // unchanged, so `len() + 1` still matched and the new kind was simply
+    // unreachable — `find_by_alias` and the alias view both walk this list.
     assert_eq!(
-        LocalResourceKind::all().len() + 1,
+        LocalResourceKind::ALL.len() + 1,
         5,
         "a variant was added without pinning its wire tag above \
-         (`all()` omits `Custom`, hence the +1)",
+         (`ALL` omits `Custom`, hence the +1)",
     );
 }
 

@@ -367,8 +367,18 @@ fn tokens_of(display: &str) -> Option<Vec<String>> {
                     assert!(cs.next().is_none(), "unparsed Ctrl chord in {display:?}");
                     format!("ctrl-{}", c.to_ascii_lowercase())
                 } else if let Some(rest) = t.strip_prefix("Shift-") {
-                    assert_eq!(rest.chars().count(), 1, "unparsed Shift chord in {display:?}");
-                    rest.to_string()
+                    // A TRIPWIRE now, not a parser. No display string in the
+                    // keymap spells a shifted letter this way any more:
+                    // `KeyCombo::label` emits the bare capital because that
+                    // is also the valid `keys:` spec (`Shift-f` is not one,
+                    // and help used to advertise it), and the one
+                    // hand-written `Shift-C` row was the odd one out.
+                    panic!(
+                        "{display:?} spells a shifted key as `Shift-{rest}` — write it as \
+                         the capital `{}`, which is what `label()` emits and what a \
+                         `keys:` entry takes",
+                        rest.to_uppercase(),
+                    );
                 } else {
                     let mut cs = t.chars();
                     let c = cs.next().unwrap_or_else(|| panic!("empty token in {display:?}"));
@@ -493,23 +503,55 @@ fn a_half_bound_column_pair_still_names_its_chord() {
 /// The first/last-column jump appears in help whether or not it is bound —
 /// it has no structural key in a table, so without a row the action was
 /// invisible, and a user could not learn that `colFirst` existed from `?`.
+///
+/// Unbound, the row still has to SAY how, and it has to say it somewhere the
+/// sheet will actually render. The key read `<bind colFirst / colLast>` —
+/// 25 cells against help's 16-cell KEY cap, so the one row whose whole job
+/// is to name what to bind was the one row clipped, to `<bind colFirst`.
+/// The names live in the DESCRIPTION now, and this checks both halves: the
+/// row names them, and the key fits.
 #[test]
 fn the_column_jump_is_documented_bound_or_not() {
     use crate::KeyCombo;
-    let row = |keys: &crate::KeysConfig| {
-        for_class(ViewClass::Table)
+    let binding = |keys: &crate::KeysConfig| {
+        let b = for_class(ViewClass::Table)
             .into_iter()
-            .find(|b| b.label == "Jump to the first / last column")
-            .expect("the jump row is declared")
-            .display_keys(keys)
+            .find(|b| b.label.starts_with("Jump to the first / last column"))
+            .expect("the jump row is declared");
+        (b.display_keys(keys), b.label)
     };
     let none = crate::KeysConfig::default();
-    assert!(row(&none).contains("colFirst"), "unbound, it says how: {:?}", row(&none));
+    let (key, label) = binding(&none);
+    assert!(
+        format!("{key} {label}").contains("colFirst"),
+        "unbound, the row must say how: {key:?} / {label:?}",
+    );
+
+    // …and the KEY has to fit the column help declares for it, or the
+    // instruction is truncated away. Cap read from the declaration so the
+    // two cannot drift.
+    let cap = k9rs_proto::local_types::LocalResourceKind::Keybinding
+        .column_defs()
+        .iter()
+        .find(|c| c.header == "KEY")
+        .and_then(|c| c.max_width)
+        .expect("help declares a KEY column with a ceiling");
+    for keys in [
+        none,
+        crate::KeysConfig { col_first: Some(KeyCombo::plain('0')), ..none },
+        crate::KeysConfig { col_last: Some(KeyCombo::plain('$')), ..none },
+    ] {
+        let (key, _) = binding(&keys);
+        assert!(
+            unicode_width::UnicodeWidthStr::width(key.as_str()) <= usize::from(cap),
+            "the jump row's key {key:?} is wider than help's {cap}-cell KEY column,              so it renders clipped",
+        );
+    }
 
     let bound = crate::KeysConfig {
         col_first: Some(KeyCombo::plain('0')),
         col_last: Some(KeyCombo::plain('$')),
         ..none
     };
-    assert_eq!(row(&bound), "0 / $");
+    assert_eq!(binding(&bound).0, "0 / $");
 }

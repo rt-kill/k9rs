@@ -1,20 +1,29 @@
 //! Metadata for local resource types — lives directly on the closed
-//! [`LocalResourceKind`] enum as exhaustive-match `fn` accessors.
-//! No parallel static table: adding a variant forces a compile error
-//! in every method arm until you fill it in.
-
-use serde::{Deserialize, Serialize};
+//! [`LocalResourceKind`] enum as exhaustive-match `fn` accessors, so adding
+//! a variant is a compile error in every one of them until it is filled in.
+//!
+//! The one thing a match could not cover is the LIST of variants, which is
+//! what decides reachability: `find_by_alias` and the client's alias view
+//! both walk it, so a kind missing from it is a resource that exists and
+//! cannot be reached or seen. This module doc said "no parallel static
+//! table" while `all()` was exactly that — a hand-written `vec![…]` beside
+//! the enum, which I edited by hand the day I deleted a variant from it.
+//! It is `variant_list!`-generated now; see [`LocalResourceKind::ALL`].
 
 use crate::protocol::{ResourceId, ResourceScope};
 
-/// Closed enum of every local resource type the daemon serves. All
-/// metadata lives on the enum itself via `fn` accessors — no
-/// parallel metadata table to keep in sync. Dispatch is compile-time
-/// checked: adding a variant forces an update to every exhaustive
-/// match below, and any call site that branches on `LocalResourceKind`
-/// will equally fail to compile until the new arm is covered.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum LocalResourceKind {
+variant_list! {
+    list = ALL;
+    /// Closed enum of every local resource type the daemon serves. All
+    /// metadata lives on the enum itself via `fn` accessors — no parallel
+    /// metadata table to keep in sync. Dispatch is compile-time checked:
+    /// adding a variant forces an update to every exhaustive match below,
+    /// and any call site that branches on `LocalResourceKind` will equally
+    /// fail to compile until the new arm is covered.
+    ///
+    /// [`Self::ALL`] is generated from THIS declaration, which the matches
+    /// could not do for it — see the module doc.
+    pub enum LocalResourceKind {
     PortForward,
     /// One exec source from the daemon config, named exactly as the config
     /// names it.
@@ -65,21 +74,10 @@ pub enum LocalResourceKind {
     ///
     /// APPENDED for the same wire-tag reason as `Context` above.
     Alias,
+    }
 }
 
 impl LocalResourceKind {
-    /// The well-known (non-Custom) variants. Custom kinds are registered
-    /// at runtime and are not part of this list — callers that need to
-    /// enumerate customs maintain their own registry.
-    pub fn all() -> Vec<Self> {
-        vec![
-            Self::PortForward,
-            Self::Context,
-            Self::Keybinding,
-            Self::Alias,
-        ]
-    }
-
     /// Canonical singular name (e.g. `"portforward"`).
     pub fn name(&self) -> &str {
         match self {
@@ -204,6 +202,12 @@ impl LocalResourceKind {
                     // per row is noise. Every resource column leaves this
                     // off — see `ColumnDef::groups`.
                     ColumnDef::new("SECTION").max_width(36).groups(),
+                    // The index level's count. `def_for` matches by header
+                    // NAME, so one declaration serves both of help's
+                    // levels: the index emits SECTION/KEYS/DESCRIPTION and
+                    // a section emits KEY/DESCRIPTION, each picking up the
+                    // ceilings for the names it uses.
+                    ColumnDef::new("KEYS").max_width(6),
                     ColumnDef::new("KEY").max_width(16),
                     ColumnDef::new("DESCRIPTION").max_width(60),
                 ];
@@ -270,9 +274,10 @@ impl LocalResourceKind {
 /// Look up a local resource kind by any alias (case-insensitive).
 pub fn find_by_alias(alias: &str) -> Option<LocalResourceKind> {
     let lower = alias.to_lowercase();
-    LocalResourceKind::all().into_iter().find(|k| {
-        k.aliases().iter().any(|a| a.eq_ignore_ascii_case(&lower))
-    })
+    LocalResourceKind::ALL
+        .iter()
+        .find(|k| k.aliases().iter().any(|a| a.eq_ignore_ascii_case(&lower)))
+        .cloned()
 }
 
 #[cfg(test)]

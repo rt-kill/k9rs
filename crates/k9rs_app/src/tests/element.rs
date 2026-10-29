@@ -1240,13 +1240,20 @@ fn help_opens_on_the_section_for_the_view_you_came_from() {
         "help must open on the keys for the view it documents, not on the alphabet",
     );
 
-    // …and the grouping still holds: every row of that section is contiguous.
-    let n = view.rows.iter().take_while(|r| r[0] == first_section).count();
-    assert!(n > 1, "the contextual section has more than one key");
-    assert!(
-        view.rows.iter().skip(n).all(|r| r[0] != first_section),
-        "a section must not be split across the table",
+    // …and each section appears exactly once, because the index level is one
+    // row per section. The contiguity this used to assert was about a
+    // 61-row flat sheet where "Everywhere" had fourteen rows in a run;
+    // there is no run left to break, and
+    // `the_index_and_the_sections_are_the_same_list` holds the index
+    // against the sections it points at.
+    let listed: Vec<&String> = view.rows.iter().map(|r| &r[0]).collect();
+    let distinct: std::collections::HashSet<&&String> = listed.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        listed.len(),
+        "the index names each section once: {listed:?}",
     );
+    assert!(listed.len() >= 4, "a table view has several sections: {listed:?}");
 }
 
 /// The straggler that defeated the first version of this fix.
@@ -1444,6 +1451,48 @@ fn a_grep_matches_across_a_colour_boundary() {
     assert_eq!(f.log_visible().unwrap().len(), 2, "committed greps see the same text");
 }
 
+/// `?`'s whole sheet as `(section, key, description)` triples.
+///
+/// `?` is an index with the sections behind it now, so a test about CONTENT
+/// — which key appears where, and saying what — flattens both levels. Only
+/// the shape changed.
+fn help_triples(
+    caps: Option<k9rs_proto::protocol::ResourceCapabilities>,
+    keys: crate::KeysConfig,
+    class: crate::keymap::ViewClass,
+    markable: bool,
+) -> Vec<(String, String, String)> {
+    let text = |c: &k9rs_proto::row::CellValue| match c {
+        k9rs_proto::row::CellValue::Text(t) => t.clone(),
+        other => format!("{other:?}"),
+    };
+    crate::help::HelpContent::sheet(caps, keys, class, markable)
+        .sections
+        .into_iter()
+        .flat_map(|(title, table)| {
+            table
+                .rows
+                .into_iter()
+                .map(move |r| (title.clone(), text(&r.cells[0]), text(&r.cells[1])))
+        })
+        .collect()
+}
+
+/// Which SECTIONS `?` lists for this element — the index level.
+fn help_sections(
+    caps: Option<k9rs_proto::protocol::ResourceCapabilities>,
+    keys: crate::KeysConfig,
+    class: crate::keymap::ViewClass,
+    markable: bool,
+) -> Vec<String> {
+    crate::help::HelpContent::sheet(caps, keys, class, markable)
+        .sections
+        .into_iter()
+        .map(|(title, _)| title)
+        .collect()
+}
+
+
 /// Help must document select mode exactly where select mode exists.
 ///
 /// Marking is a per-ELEMENT answer: `Element::markable` is false for a
@@ -1463,18 +1512,9 @@ fn help_documents_select_mode_exactly_where_marking_works() {
 
     let documents_select_mode = |el: &crate::element::Element| -> bool {
         let class = crate::keymap::ViewClass::of(el);
-        let (_, rows) = crate::help::HelpContent::rows(
-            Some(el.capabilities()),
-            app.config.keys,
-            class,
-            el.markable(),
-        );
-        rows.iter().any(|r| {
-            matches!(
-                &r.cells[0],
-                k9rs_proto::row::CellValue::Text(t) if t == section
-            )
-        })
+        help_sections(Some(el.capabilities()), app.config.keys, class, el.markable())
+            .iter()
+            .any(|t| t == section)
     };
 
     let contexts = app
@@ -1608,20 +1648,9 @@ fn rebinding_delete_does_not_hide_the_chord_that_still_deletes() {
     );
 
     let keys_of = |cfg: crate::KeysConfig| -> Vec<String> {
-        let (_, rows) = crate::help::HelpContent::rows(
-            caps.clone(),
-            cfg,
-            crate::keymap::ViewClass::Table,
-            app.nav.top().markable(),
-        );
-        rows.iter()
-            .filter_map(|r| match (&r.cells[1], &r.cells[2]) {
-                (
-                    k9rs_proto::row::CellValue::Text(k),
-                    k9rs_proto::row::CellValue::Text(d),
-                ) if d == "Delete" => Some(k.clone()),
-                _ => None,
-            })
+        help_triples(caps.clone(), cfg, crate::keymap::ViewClass::Table, app.nav.top().markable())
+            .into_iter()
+            .filter_map(|(_, key, desc)| (desc == "Delete").then_some(key))
             .collect()
     };
 
@@ -1704,23 +1733,16 @@ fn completion_offers_every_word_something_else_declares() {
 /// what contextual help is for.
 #[test]
 fn help_repeats_a_key_only_to_say_something_new_about_it() {
-    use k9rs_proto::row::CellValue;
-
     let app = crate::App::new_for_test();
-    let (_, rows) = crate::help::HelpContent::rows(
+    let triples = help_triples(
         Some(app.current_capabilities()),
         app.config.keys,
         crate::keymap::ViewClass::Table,
         app.nav.top().markable(),
     );
-    let text = |c: &CellValue| match c {
-        CellValue::Text(t) => t.clone(),
-        other => format!("{other:?}"),
-    };
 
     let mut seen: Vec<(String, String, String)> = Vec::new();
-    for r in &rows {
-        let (section, key, desc) = (text(&r.cells[0]), text(&r.cells[1]), text(&r.cells[2]));
+    for (section, key, desc) in triples {
         if key.is_empty() {
             continue; // prose lines belonging to a section
         }
@@ -1755,7 +1777,7 @@ fn a_structural_chord_fires_only_where_its_operation_is_declared() {
     // The declaration, and nothing else, decides the chord.
     assert_eq!(
         crate::keymap::structural_chord(&OperationKind::PortForward).map(|c| c.label()),
-        Some("Shift-f".to_string()),
+        Some("F".to_string()),
     );
     assert_eq!(
         crate::keymap::structural_chord(&OperationKind::Delete).map(|c| c.label()),

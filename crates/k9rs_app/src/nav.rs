@@ -121,6 +121,28 @@ impl NavStack {
         }
     }
 
+    /// Close the help sheet, however many narrowings are stacked on it.
+    ///
+    /// `?` is a toggle, and its claim is "closes the help you are reading".
+    /// One `pop` did not keep that: `/` over help derives a `RowFilter`
+    /// which [`Element::is_keybindings_view`] deliberately still calls help
+    /// (so the float stays floating and the grep works), so after one grep
+    /// `?` popped the filter and left you in help — a second `?` to close
+    /// what one had opened.
+    ///
+    /// A method rather than a loop at the call site because the call site is
+    /// in `k9rs_session`, where `Action::Help` needs a live `ClientSession`
+    /// to dispatch and the behaviour cannot be driven by a test.
+    ///
+    /// Returns whether anything was popped.
+    pub fn pop_keybindings(&mut self) -> bool {
+        let mut popped = false;
+        while self.top().is_keybindings_view() && self.pop().is_some() {
+            popped = true;
+        }
+        popped
+    }
+
     /// Replace the whole stack with a fresh root (`:cmd`, tab cycling,
     /// namespace/context switch). Records the outgoing ROOT's recipe for
     /// `-`, then drains the old stack **top to bottom** — children release
