@@ -340,7 +340,7 @@ fn load_overlays_reporting(problems: &mut Vec<String>) -> HashMap<String, Resour
 /// parallel. The earlier test for a refused coloring rule could only check
 /// serde in isolation; what matters to the user is that the refusal reaches
 /// the startup flash, and that is this function's output.
-pub fn load_overlays_from(
+pub(crate) fn load_overlays_from(
     dir: &Path,
     problems: &mut Vec<String>,
 ) -> HashMap<String, ResourceOverlay> {

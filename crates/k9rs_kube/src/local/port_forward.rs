@@ -1,9 +1,9 @@
 //! Port-forward source — the first implementation of [`LocalResourceSource`],
-//! and the first [`LocalOperator`].
+//! and the first `LocalOperator`.
 //!
 //! Each forward is one supervised **native websocket tunnel**
 //! (`Api::portforward` — no kubectl subprocess): an attempt resolves the
-//! target to a ready pod (see [`super::pf_resolve`]), binds the local
+//! target to a ready pod (see `super::pf_resolve`), binds the local
 //! listener, opens a canary stream to the pod as the liveness signal, and
 //! serves each accepted connection over its own tunnel. When the canary
 //! drops (suspend/resume, network blip, pod death), the supervisor
@@ -74,7 +74,7 @@ impl PortForwardState {
 
 /// A single active port-forward, as known to the daemon.
 #[derive(Debug, Clone, Serialize)]
-pub struct PortForwardEntry {
+pub(crate) struct PortForwardEntry {
     pub id: u64,
     /// The original K8s `ObjectRef` this forward was created for. Purely
     /// informational — resolution parses `kubectl_target` below.
@@ -736,7 +736,7 @@ pub fn headers() -> Vec<String> {
 }
 
 /// Convert a [`PortForwardEntry`] to a [`ResourceRow`]. Pure function, easy to test.
-pub fn pf_to_row(entry: &PortForwardEntry) -> ResourceRow {
+pub(crate) fn pf_to_row(entry: &PortForwardEntry) -> ResourceRow {
     let age = k9rs_util::units::format_age_duration(entry.started_at.elapsed());
     let row_name = format!("pf-{}", entry.id);
     // Exhaustive on purpose (no `_` arm): adding a `PortForwardState`

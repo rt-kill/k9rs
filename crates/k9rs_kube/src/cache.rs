@@ -29,7 +29,7 @@ pub use k9rs_proto::crd_cache::{CachedCrd, PrinterColumn, PrinterColumnType};
 /// (GA > beta > alpha, higher number first) the way discovery and kubectl
 /// order it. That is a second, smaller heuristic and it is shared now rather
 /// than duplicated, which is the part that was biting.
-pub fn served_version(
+pub(crate) fn served_version(
     spec: &k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinitionSpec,
 ) -> Option<&k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinitionVersion>
 {
@@ -108,7 +108,7 @@ fn now_secs() -> u64 {
 /// concurrent-safe peek — is cheap (an Arc refcount bump, not a deep clone
 /// of the inner Vec).
 #[derive(Default)]
-pub struct PerContext {
+pub(crate) struct PerContext {
     pub namespaces: AtomicOption<Arc<[String]>>,
     /// CRD list. A `Mutex` (not the lock-free `AtomicOption`) because
     /// `merge_crd` is a read-modify-write: the lock-free peek can return a
@@ -153,7 +153,7 @@ impl PerContext {
 /// share one entry).
 ///
 /// One entry per context, each field swappable independently. See
-/// [`PerContext`] for the per-field guarantees.
+/// `PerContext` for the per-field guarantees.
 #[derive(Default)]
 pub struct DiscoveryCache {
     entries: DashMap<ContextId, Arc<PerContext>>,
@@ -211,7 +211,7 @@ impl DiscoveryCache {
     /// its knowledge so the next subscribe hits warm. Atomic swap like
     /// `set_crds`; a concurrent bulk refresh simply wins (it contains
     /// this CRD anyway).
-    pub fn merge_crd(&self, ctx: ContextId, crd: CachedCrd) {
+    pub(crate) fn merge_crd(&self, ctx: ContextId, crd: CachedCrd) {
         let entry = self.entry_for(&ctx);
         // Whole read-modify-write under ONE lock: no concurrent merge can
         // interleave (lost update), and the read can't spuriously see an
@@ -248,7 +248,7 @@ impl DiscoveryCache {
     /// Find the printer-columns list for a specific CRD under a context.
     /// Avoids exposing the cache structure to call sites that only want one
     /// CRD's columns.
-    pub fn printer_columns_for(
+    pub(crate) fn printer_columns_for(
         &self,
         ctx: &ContextId,
         group: &str,

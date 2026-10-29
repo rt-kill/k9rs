@@ -6,7 +6,7 @@
 //! [`crate::live_query::WatcherCache`]. This module factors the *same*
 //! ownership model (a `weak_registry::WeakRegistry`, an `Arc`
 //! keepalive per subscriber, `watch`-channel fan-out, and
-//! [`crate::grace::spawn_grace`] reaping on last-drop) into one generic
+//! `crate::grace::spawn_grace` reaping on last-drop) into one generic
 //! skeleton so a cluster is polled once regardless of how many sessions watch
 //! it. The registry itself is now shared with `WatcherCache` and the two
 //! `local` registries, which is where the `Weak`-map dance lives.
@@ -86,7 +86,7 @@ impl<S: Clone + Send + Sync + 'static> PollerSub<S> {
 impl<S: Clone + Send + Sync + 'static> Drop for PollerSub<S> {
     fn drop(&mut self) {
         // Same grace dance as a watcher `Subscription` (see
-        // [`crate::grace::spawn_grace`]): keep the poller warm for the grace
+        // `crate::grace::spawn_grace`): keep the poller warm for the grace
         // window after the last session leaves, so a quick reconnect reuses it.
         // The poll task never self-finishes, so `is_finished` is effectively
         // always false here — the skeleton stays uniform with the watcher path.

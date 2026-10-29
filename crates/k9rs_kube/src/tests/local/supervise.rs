@@ -41,7 +41,7 @@ fn recording_sink() -> (impl Fn(OperatorEvent) + Send + Sync + 'static, Arc<Mute
         let name = match ev {
             OperatorEvent::Starting => "starting".to_string(),
             OperatorEvent::Active => "active".to_string(),
-            OperatorEvent::Retrying { attempt, error } => format!("retrying:{attempt}:{error}"),
+            OperatorEvent::Retrying { error } => format!("retrying:{error}"),
             OperatorEvent::Fatal { error } => format!("fatal:{error}"),
         };
         log2.lock().unwrap().push(name);
@@ -115,7 +115,12 @@ async fn gone_exits_silently() {
 async fn backoff_mode_narrates_the_lifecycle() {
     // Script is popped from the END: run1 fails, run2 reaches active
     // then ends, run3 is fatal. Expected single-writer sequence:
-    // starting → retrying:2 → active → retrying:3 → fatal.
+    // starting → retrying → active → retrying → fatal.
+    //
+    // `retrying` carried its attempt NUMBER here, and this was the only
+    // reader of it anywhere: the production consumer matched
+    // `Retrying { error, .. }`. What the test is for is the ORDER and the
+    // single writer, which the sequence still pins.
     let (op, _runs) = Scripted::new(vec![
         (false, OperatorExit::Fatal("end".into())), // run 3
         (true, OperatorExit::Continue("died".into())), // run 2
@@ -128,7 +133,7 @@ async fn backoff_mode_narrates_the_lifecycle() {
     let events = log.lock().unwrap().clone();
     assert_eq!(
         events,
-        vec!["starting", "retrying:2:bind", "active", "retrying:3:died", "fatal:end"],
+        vec!["starting", "retrying:bind", "active", "retrying:died", "fatal:end"],
     );
 }
 

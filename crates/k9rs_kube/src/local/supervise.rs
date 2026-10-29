@@ -59,7 +59,7 @@ use std::time::Duration;
 use k9rs_util::AbortOnDrop;
 
 /// How one attempt of a supervised operation ended.
-pub enum OperatorExit {
+pub(crate) enum OperatorExit {
     /// The attempt ran its course; keep supervising. Under
     /// [`RunDelay::Backoff`] the payload is the failure detail shown while
     /// reconnecting; under [`RunDelay::Schedule`] a completed run is normal
@@ -76,15 +76,23 @@ pub enum OperatorExit {
 }
 
 /// Lifecycle events, emitted only by the supervisor (see module docs).
-pub enum OperatorEvent {
+pub(crate) enum OperatorEvent {
     /// The first attempt is beginning (Backoff mode only).
     Starting,
     /// The current attempt reached healthy steady-state (routed through
     /// [`AttemptHandle::active`]).
     Active,
-    /// The previous attempt ended; attempt `attempt` runs after the backoff
-    /// delay (Backoff mode only).
-    Retrying { attempt: u32, error: String },
+    /// The previous attempt ended; the next runs after the backoff delay
+    /// (Backoff mode only).
+    ///
+    /// Carried an `attempt: u32` that the supervisor counted and the only
+    /// production consumer discarded (`Retrying { error, .. }` in
+    /// `port_forward`) — a test was the sole reader. Both the field and its
+    /// counter are gone. If the `:pf` row should ever say which attempt it
+    /// is on (flapping reads differently from a blip), the loop can count
+    /// again in one line; what it must not do is carry the number because
+    /// something might want it.
+    Retrying { error: String },
     /// Permanent failure; the supervisor has parked.
     Fatal { error: String },
 }
@@ -92,7 +100,7 @@ pub enum OperatorEvent {
 /// The one channel through which an operator may speak mid-attempt: it can
 /// signal `active()` — nothing else. Cloned per attempt by the supervisor.
 #[derive(Clone)]
-pub struct AttemptHandle {
+pub(crate) struct AttemptHandle {
     sink: Arc<dyn Fn(OperatorEvent) + Send + Sync>,
     active_seen: Arc<AtomicBool>,
 }
@@ -101,7 +109,7 @@ impl AttemptHandle {
     /// Signal that this attempt reached healthy steady-state. Publishes
     /// [`OperatorEvent::Active`] and marks the attempt healthy so the
     /// supervisor resets its backoff.
-    pub fn active(&self) {
+    pub(crate) fn active(&self) {
         self.active_seen.store(true, Ordering::Release);
         (self.sink)(OperatorEvent::Active);
     }
@@ -121,27 +129,27 @@ impl AttemptHandle {
 /// `ExecPollOp`, which reads its command line and folds rows back in). The
 /// rule that matters is the pairing: a source with a lifecycle-state writer
 /// hands its operator one of these.
-pub struct SourceLiveness<T> {
+pub(crate) struct SourceLiveness<T> {
     weak: std::sync::Weak<T>,
 }
 
 impl<T> SourceLiveness<T> {
     /// Build one from the source's own `Weak`. Called where the source
     /// constructs its operator.
-    pub fn new(weak: std::sync::Weak<T>) -> Self {
+    pub(crate) fn new(weak: std::sync::Weak<T>) -> Self {
         Self { weak }
     }
 
     /// True once nothing holds the source any more — the attempt has
     /// nothing left to serve and should report [`OperatorExit::Gone`].
-    pub fn gone(&self) -> bool {
+    pub(crate) fn gone(&self) -> bool {
         self.weak.strong_count() == 0
     }
 }
 
 /// One supervised operation. See the module docs for the ownership
 /// contract `run_once` must uphold.
-pub trait LocalOperator: Send + Sync + 'static {
+pub(crate) trait LocalOperator: Send + Sync + 'static {
     /// Perform one attempt to completion. Everything the attempt owns
     /// (children, sockets) must live inside the returned future so an
     /// abort tears it down.
@@ -153,14 +161,14 @@ pub trait LocalOperator: Send + Sync + 'static {
 
 /// Exponential backoff between failed attempts. `next()` yields the current
 /// delay and doubles it (clamped to `max`); `reset()` returns to `min`.
-pub struct Backoff {
+pub(crate) struct Backoff {
     min: Duration,
     max: Duration,
     next: Duration,
 }
 
 impl Backoff {
-    pub fn new(min: Duration, max: Duration) -> Self {
+    pub(crate) fn new(min: Duration, max: Duration) -> Self {
         Self { min, max, next: min }
     }
 
@@ -176,7 +184,7 @@ impl Backoff {
 }
 
 /// When to run the operator again after an attempt ends.
-pub enum RunDelay {
+pub(crate) enum RunDelay {
     /// A poller: re-run after a fixed interval. Re-running is the normal
     /// path — no failure-flavored events are emitted.
     Schedule(Duration),
@@ -188,7 +196,7 @@ pub enum RunDelay {
 /// RAII handle to a supervised operator. Dropping it aborts the loop and,
 /// with it, whatever the in-flight attempt owns (`kill_on_drop` children,
 /// listeners). Hold it exactly as long as the operator should live.
-pub struct OperatorGuard {
+pub(crate) struct OperatorGuard {
     _abort: AbortOnDrop,
 }
 
@@ -198,10 +206,10 @@ pub struct OperatorGuard {
 /// the [`OperatorGuard`] → `arm()`. A guard dropped before `arm()` aborts
 /// the parked task and the operator never runs; an `arm()` after the guard
 /// died is a no-op.
-pub struct StartGate(tokio::sync::oneshot::Sender<()>);
+pub(crate) struct StartGate(tokio::sync::oneshot::Sender<()>);
 
 impl StartGate {
-    pub fn arm(self) {
+    pub(crate) fn arm(self) {
         let _ = self.0.send(());
     }
 }
@@ -212,7 +220,7 @@ impl StartGate {
 /// delay policy and re-run; on `Fatal` emit and park; on `Gone` exit
 /// silently. Aborting (dropping the [`OperatorGuard`]) cancels whichever
 /// of those it is mid-way through.
-pub fn supervise<O: LocalOperator>(
+pub(crate) fn supervise<O: LocalOperator>(
     op: O,
     mut delay: RunDelay,
     on_event: impl Fn(OperatorEvent) + Send + Sync + 'static,
@@ -232,7 +240,6 @@ pub fn supervise<O: LocalOperator>(
         if matches!(delay, RunDelay::Backoff(_)) {
             (sink)(OperatorEvent::Starting);
         }
-        let mut attempt: u32 = 1;
         loop {
             active_seen.store(false, Ordering::Release);
             let exit = op.run_once(handle_proto.clone()).await;
@@ -244,7 +251,6 @@ pub fn supervise<O: LocalOperator>(
                     return;
                 }
                 OperatorExit::Continue(error) => {
-                    attempt = attempt.saturating_add(1);
                     let wait = match &mut delay {
                         RunDelay::Schedule(d) => *d,
                         RunDelay::Backoff(b) => {
@@ -255,7 +261,7 @@ pub fn supervise<O: LocalOperator>(
                                 b.reset();
                             }
                             let w = b.next();
-                            (sink)(OperatorEvent::Retrying { attempt, error });
+                            (sink)(OperatorEvent::Retrying { error });
                             w
                         }
                     };

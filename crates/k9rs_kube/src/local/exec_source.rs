@@ -1,14 +1,14 @@
 //! Exec-backed local resource source — periodically runs an external
 //! command, parses its JSON stdout into rows, and publishes snapshots.
 //!
-//! The poll loop is a supervised [`LocalOperator`] on a
-//! [`RunDelay::Schedule`] — the second operator after port-forward, and the
+//! The poll loop is a supervised `LocalOperator` on a
+//! `RunDelay::Schedule` — the second operator after port-forward, and the
 //! schedule-shaped one: re-running after the interval is the *normal* path,
 //! so no failure-flavored lifecycle events are emitted (a failed poll warns
 //! and keeps the last-known rows, exactly as before). Demand-driven
 //! lifetime: subscribers hold the strong refs (its
 //! [`GraceGate`](crate::grace::GraceGate) keeps it warm past the last drop),
-//! and the source's drop aborts the poll via its [`OperatorGuard`].
+//! and the source's drop aborts the poll via its `OperatorGuard`.
 
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;

@@ -42,38 +42,38 @@ pub(crate) mod k8s_const {
 }
 
 pub mod pods;
-pub mod deployments;
-pub mod services;
-pub mod statefulsets;
-pub mod daemonsets;
-pub mod jobs;
-pub mod cronjobs;
-pub mod replicasets;
-pub mod nodes;
-pub mod configmaps;
-pub mod secrets;
-pub mod ingresses;
-pub mod networkpolicies;
-pub mod serviceaccounts;
+pub(crate) mod deployments;
+pub(crate) mod services;
+pub(crate) mod statefulsets;
+pub(crate) mod daemonsets;
+pub(crate) mod jobs;
+pub(crate) mod cronjobs;
+pub(crate) mod replicasets;
+pub(crate) mod nodes;
+pub(crate) mod configmaps;
+pub(crate) mod secrets;
+pub(crate) mod ingresses;
+pub(crate) mod networkpolicies;
+pub(crate) mod serviceaccounts;
 pub mod namespaces;
-pub mod pvs;
-pub mod pvcs;
-pub mod storageclasses;
-pub mod events;
-pub mod roles;
-pub mod clusterroles;
-pub mod rolebindings;
-pub mod clusterrolebindings;
-pub mod hpa;
-pub mod endpoints;
-pub mod limitranges;
-pub mod resourcequotas;
-pub mod pdb;
+pub(crate) mod pvs;
+pub(crate) mod pvcs;
+pub(crate) mod storageclasses;
+pub(crate) mod events;
+pub(crate) mod roles;
+pub(crate) mod clusterroles;
+pub(crate) mod rolebindings;
+pub(crate) mod clusterrolebindings;
+pub(crate) mod hpa;
+pub(crate) mod endpoints;
+pub(crate) mod limitranges;
+pub(crate) mod resourcequotas;
+pub(crate) mod pdb;
 pub mod crds;
-pub mod endpointslices;
-pub mod leases;
-pub mod priorityclasses;
-pub mod webhooks;
+pub(crate) mod endpointslices;
+pub(crate) mod leases;
+pub(crate) mod priorityclasses;
+pub(crate) mod webhooks;
 
 /// Converts a strongly-typed K8s API object into a [`k9rs_proto::row::ResourceRow`].
 ///
@@ -93,7 +93,7 @@ pub trait ConvertToRow<K> {
     fn convert(obj: K) -> k9rs_proto::row::ResourceRow;
 }
 
-pub fn access_mode_short(mode: &str) -> &str {
+pub(crate) fn access_mode_short(mode: &str) -> &str {
     match mode {
         "ReadWriteOnce" => "RWO",
         "ReadOnlyMany" => "ROX",

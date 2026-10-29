@@ -155,7 +155,7 @@ fn usage(
 /// on a large cluster can carry it, and the alternative is a silent 0.
 ///
 /// [K8s Quantity]: https://kubernetes.io/docs/reference/kubernetes-api/common-definitions/quantity/
-pub fn parse_cpu_to_nano(s: &str) -> u64 {
+pub(crate) fn parse_cpu_to_nano(s: &str) -> u64 {
     const NANO: u64 = 1;
     const MICRO: u64 = 1_000;
     const MILLI: u64 = 1_000_000;
@@ -181,7 +181,7 @@ fn scale_quantity(val: &str, mult: u64) -> u64 {
     (val.trim().parse::<f64>().unwrap_or(0.0).max(0.0) * mult as f64) as u64
 }
 
-pub fn parse_mem_to_bytes(s: &str) -> u64 {
+pub(crate) fn parse_mem_to_bytes(s: &str) -> u64 {
     // K8s Quantity permits BOTH binary (Ki/Mi/Gi/Ti, base-1024) AND
     // decimal (K/M/G/T, base-1000) suffixes. Older code only handled the
     // binary ones, so decimal payloads fell through and silently rendered

@@ -946,7 +946,29 @@ pub struct PreparedView {
     /// state to guard two lines. Instead the conversions are named — see
     /// `Self::data_col` and [`Self::visible_col`] — so no caller hand-rolls
     /// a `position()` or a `get()` and the direction is readable at the call
-    /// site. Revisit if a third space ever meets these two in one struct.
+    /// site.
+    ///
+    /// **Re-measured 2026-10-29, and the trigger rewritten.** It said
+    /// "revisit if a third space ever meets these two in one struct", which
+    /// could never fire: the paragraph above already says `TableInteraction`
+    /// holds one of each, so the condition was true the day it was written.
+    /// A revisit condition that is already satisfied is not a condition.
+    ///
+    /// What actually holds today, measured rather than assumed:
+    ///
+    /// - still exactly TWO production conversions —
+    ///   `element/mod.rs`'s `data_col(selected_col)` and
+    ///   `views/resource.rs`'s `visible_col(sort.col)`;
+    /// - ZERO hand-rolled conversions outside the two named functions (the
+    ///   real hazard, since an inline `visible_cols.iter().position(…)`
+    ///   would bypass the naming that replaces the types);
+    /// - ZERO functions anywhere in the workspace taking two index-space
+    ///   `usize`s as adjacent parameters, which is the shape where a swap
+    ///   is silent and a newtype would have caught it.
+    ///
+    /// Revisit when any of those three numbers moves — each is one grep, and
+    /// the round-trip is pinned by
+    /// `the_two_column_spaces_convert_in_one_place` in `tests/store.rs`.
     pub visible_cols: Vec<usize>,
     /// Headers of the visible columns (parallel to `visible_cols`).
     pub headers: Vec<String>,

@@ -134,7 +134,7 @@ impl ColumnDef {
     // `new`/`extra`. Age columns are rendered from `CellValue::Age` in the
     // row's cells, not from any `ColumnDef` flag, so the level is all that
     // mattered; `ColumnSortKind` that once distinguished them is long gone.)
-    pub const fn with_metrics(self, m: MetricsColumn) -> Self {
+    pub(crate) const fn with_metrics(self, m: MetricsColumn) -> Self {
         Self { metrics: Some(m), ..self }
     }
 

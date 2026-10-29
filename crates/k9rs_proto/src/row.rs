@@ -58,8 +58,8 @@ pub enum CellValue {
 /// hand-written overlay YAML keyed by header STRING, so `CPU%` instead of
 /// `%CPU` silently coloured nothing, and every new percent column started
 /// out the same way.
-pub const UTILIZATION_WARN_PCT: u64 = 75;
-pub const UTILIZATION_CRIT_PCT: u64 = 90;
+pub(crate) const UTILIZATION_WARN_PCT: u64 = 75;
+pub(crate) const UTILIZATION_CRIT_PCT: u64 = 90;
 
 impl CellValue {
     /// Threshold health for a utilization percentage, or `None` for any
@@ -301,7 +301,7 @@ pub struct ResourceRow {
 /// using one type means converters/consumers can hand the value straight
 /// to anything that takes a `CrdRef` (e.g. `ResourceId::Crd(CrdRef)` for
 /// nav drill-downs).
-pub type CrdRowInfo = crate::protocol::CrdRef;
+pub(crate) type CrdRowInfo = crate::protocol::CrdRef;
 
 /// Container info for pods — used by shell, logs, port-forward.
 ///
@@ -695,7 +695,7 @@ impl ResourceRow {
     /// the lens at derive time, so no row is mutated in place at all.
     /// Production rows are built whole by their converters.
     #[cfg(test)]
-    pub fn set_cell(&mut self, col: usize, value: CellValue) {
+    pub(crate) fn set_cell(&mut self, col: usize, value: CellValue) {
         if col < self.cells.len() {
             self.cells[col] = value;
         }

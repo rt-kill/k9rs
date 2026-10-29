@@ -26,13 +26,13 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, ListParams};
 
 /// The concrete tunnel endpoint an attempt connects to.
-pub struct PodTarget {
+pub(crate) struct PodTarget {
     pub pod: String,
     pub port: u16,
 }
 
 /// How resolution failed, typed by the supervisor's correct reaction.
-pub enum ResolveError {
+pub(crate) enum ResolveError {
     /// The cluster may heal this (object not found yet, no ready pods,
     /// transient API error) — back off and re-resolve.
     Retry(String),
@@ -42,7 +42,7 @@ pub enum ResolveError {
 }
 
 /// Resolve a kubectl-style `plural/name` target to a `(pod, port)`.
-pub async fn resolve(
+pub(crate) async fn resolve(
     client: &kube::Client,
     ns: &str,
     target: &str,

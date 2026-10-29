@@ -910,7 +910,7 @@ impl FormSchema {
     };
 
     /// The `PortForward` dialog — likewise statically known.
-    pub const PORT_FORWARD: FormSchema = FormSchema {
+    pub(crate) const PORT_FORWARD: FormSchema = FormSchema {
     title_template: "Port forward: {{kind}}/{{name}}",
     fields: &[
         FormFieldSchema {
@@ -1765,7 +1765,7 @@ log_windows! {
 /// in for a mechanism, which is the same shape as a doc claiming a guarantee
 /// nothing enforces.
 ///
-/// The handshake now exchanges [`build_id`], which is derived and therefore
+/// The handshake now exchanges `build_id`, which is derived and therefore
 /// cannot be forgotten. This number stays for the two jobs it is actually
 /// good at, neither of which is gating a connection:
 ///
@@ -1874,7 +1874,7 @@ log_windows! {
 ///   was labelled `EXEC`. "Whichever is first" is not a resource; each
 ///   source answers to its own name, and those names are listed in the
 ///   alias view now. Safe to re-tag because bincode here is wire-only —
-///   nothing persists these bytes to disk — and the [`build_id`] handshake
+///   nothing persists these bytes to disk — and the `build_id` handshake
 ///   refuses a peer from a different build regardless.
 ///
 /// v20: [`DrillTarget::HelpSection`](crate::row::DrillTarget::HelpSection)
@@ -1888,7 +1888,7 @@ log_windows! {
 /// Decode-safe for a peer that predates it as long as no server-side
 /// converter emits it, which is a measured fact rather than a guaranteed
 /// one — see the variant's own doc. The bump is for the tripwire.
-pub const WIRE_FORMAT_REVISION: u32 = 20;
+pub(crate) const WIRE_FORMAT_REVISION: u32 = 20;
 
 /// This build's identity — what the handshake actually compares.
 ///
@@ -1913,7 +1913,7 @@ pub const WIRE_FORMAT_REVISION: u32 = 20;
 /// Falls back to [`WIRE_FORMAT_REVISION`] if the executable cannot be
 /// stat'ed, which keeps the handshake meaningful rather than making every
 /// peer look identical.
-pub fn build_id() -> u64 {
+pub(crate) fn build_id() -> u64 {
     static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *ID.get_or_init(|| {
         use std::hash::{Hash, Hasher};
@@ -1938,7 +1938,7 @@ pub fn build_id() -> u64 {
 /// length where the magic should be and reports the mismatch.
 pub const PROTOCOL_MAGIC: u32 = 0x4B39_5253;
 
-/// Write the 12-byte connection preamble: MAGIC then [`build_id`], both
+/// Write the 12-byte connection preamble: MAGIC then `build_id`, both
 /// big-endian (matching the hand-rolled frame-length convention). The
 /// client writes first; the server replies with its own preamble.
 pub async fn write_handshake<W: AsyncWriteExt + Unpin>(writer: &mut W) -> anyhow::Result<()> {
@@ -2657,7 +2657,7 @@ mod tests;
 /// field is inserted/removed — a daemon and a TUI built from different revisions
 /// would then silently misread each other's frames (bincode is positional;
 /// nothing self-describing is on the wire — the only thing standing between
-/// that and a corrupt decode is the [`build_id`] preamble, which refuses the
+/// that and a corrupt decode is the `build_id` preamble, which refuses the
 /// connection outright).
 ///
 /// These tests freeze the exact bytes. If one fails you changed an on-wire

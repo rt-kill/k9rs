@@ -163,7 +163,7 @@ impl GraceGate {
 ///    and drop immediately; dying now is correct.
 /// 5. Otherwise spawn the one task, which waits out the (movable) deadline,
 ///    releases the claim, and drops.
-pub fn spawn_grace<A>(
+pub(crate) fn spawn_grace<A>(
     arc: A,
     finished: impl FnOnce(&A) -> bool,
     gate: impl Fn(&A) -> Option<&GraceGate> + Send + 'static,

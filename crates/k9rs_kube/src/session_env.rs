@@ -39,7 +39,7 @@ use std::sync::Arc;
 /// three hundred still completes, eight at a time. Refusing instead would
 /// strand the client's batch tracker, which waits for one result per
 /// target.
-pub const MAX_CONCURRENT_KUBECTL: usize = 8;
+pub(crate) const MAX_CONCURRENT_KUBECTL: usize = 8;
 
 /// A TUI session's environment variables, owned by the session. Never written
 /// to the daemon's process env.
@@ -52,7 +52,7 @@ pub struct SessionEnv {
     vars: Arc<HashMap<String, String>>,
     /// This session's `kubectl` budget, shared by every clone — the clones
     /// are one session's several holders, not several sessions. See
-    /// [`MAX_CONCURRENT_KUBECTL`] and [`SessionEnv::kubectl_once`].
+    /// `MAX_CONCURRENT_KUBECTL` and [`SessionEnv::kubectl_once`].
     slots: Arc<tokio::sync::Semaphore>,
 }
 
@@ -79,7 +79,7 @@ impl SessionEnv {
     }
 
     /// A `kubectl` invocation that runs to completion, holding one of this
-    /// session's [`MAX_CONCURRENT_KUBECTL`] slots from here until its
+    /// session's `MAX_CONCURRENT_KUBECTL` slots from here until its
     /// [`output`] returns. Awaits a free slot, so the caller queues rather
     /// than being refused.
     ///
@@ -92,7 +92,7 @@ impl SessionEnv {
     /// slot, and `kill_on_drop` is set here rather than at each site.
     ///
     /// [`output`]: KubectlOnce::output
-    pub async fn kubectl_once(&self) -> KubectlOnce {
+    pub(crate) async fn kubectl_once(&self) -> KubectlOnce {
         // `acquire_owned` can only fail on a closed semaphore, and nothing
         // closes this one — it is owned by the `SessionEnv` and dies with it.
         let slot = Arc::clone(&self.slots)
@@ -109,7 +109,7 @@ impl SessionEnv {
     /// invocation that streams for as long as the client watches it
     /// (`logs -f`).
     ///
-    /// Deliberately NOT counted against [`MAX_CONCURRENT_KUBECTL`]: its
+    /// Deliberately NOT counted against `MAX_CONCURRENT_KUBECTL`: its
     /// lifetime is the user's, not the work's, and a slot held open for the
     /// minutes a log view stays up would starve the bounded calls — eight
     /// open log views and no describe would ever run again. What bounds
@@ -125,7 +125,7 @@ impl SessionEnv {
     /// readable number for "is this session saturated". Reported by
     /// [`SessionEnv`]'s `Debug` and asserted by the tests; nothing branches
     /// on it, because a branch on a free-slot count races the slot.
-    pub fn free_kubectl_slots(&self) -> usize {
+    pub(crate) fn free_kubectl_slots(&self) -> usize {
         self.slots.available_permits()
     }
 }
@@ -138,19 +138,19 @@ impl SessionEnv {
 /// `output` on purpose: `output` takes `self`, so the slot is held for
 /// exactly the subprocess's life, and there is no door (`spawn`,
 /// `DerefMut`) through which a child could outlive it.
-pub struct KubectlOnce {
+pub(crate) struct KubectlOnce {
     cmd: tokio::process::Command,
     _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl KubectlOnce {
-    pub fn arg<S: AsRef<std::ffi::OsStr>>(&mut self, arg: S) -> &mut Self {
+    pub(crate) fn arg<S: AsRef<std::ffi::OsStr>>(&mut self, arg: S) -> &mut Self {
         self.cmd.arg(arg);
         self
     }
 
     /// Run to completion, then release the slot.
-    pub async fn output(mut self) -> std::io::Result<std::process::Output> {
+    pub(crate) async fn output(mut self) -> std::io::Result<std::process::Output> {
         self.cmd.output().await
     }
 }

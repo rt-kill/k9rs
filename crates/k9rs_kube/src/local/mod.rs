@@ -15,9 +15,9 @@
 //!   [`LocalRegistry`] (on `SessionSharedState`) so they're shared across
 //!   every TUI session attached to that context.
 //! - Background work (a port-forward's tunnel task, an exec source's
-//!   poll) runs as a supervised [`supervise::LocalOperator`] — restart with
+//!   poll) runs as a supervised `supervise::LocalOperator` — restart with
 //!   backoff for crash-shaped work, fixed interval for poll-shaped work —
-//!   torn down by dropping its [`supervise::OperatorGuard`].
+//!   torn down by dropping its `supervise::OperatorGuard`.
 //!
 //! # Identity
 //!
@@ -33,7 +33,7 @@
 //! resources live in its [`ContextLocals`] slice, held `Weak` by the
 //! registry and kept alive by the sessions attached to that context (with
 //! a grace window after the last one leaves — see
-//! [`context_locals`]'s module docs). Context teardown drops the slice and
+//! `context_locals`'s module docs). Context teardown drops the slice and
 //! everything in it.
 //!
 //! Within that bound, two deliberate ownership policies coexist, expressed
@@ -61,8 +61,8 @@
 //!    new kind unreachable by alias and absent from the alias view.
 //! 2. Implement [`LocalResourceSource`] on a new struct with a
 //!    `for_context(...)` constructor. If it has background work, model
-//!    each unit as a [`supervise::LocalOperator`] and hold its
-//!    [`supervise::OperatorGuard`] where the unit's lifetime lives.
+//!    each unit as a `supervise::LocalOperator` and hold its
+//!    `supervise::OperatorGuard` where the unit's lifetime lives.
 //! 3. Write a converter `*_to_row` next to the source that turns entries
 //!    into [`k9rs_proto::row::ResourceRow`].
 //! 4. Add a field on [`context_locals::ContextLocals`] (strong for
@@ -93,13 +93,13 @@
 //! [`LocalResourceKind::ALL`]: k9rs_proto::local_types::LocalResourceKind::ALL
 //! [`LocalResourceKind::Context`]: k9rs_proto::local_types::LocalResourceKind::Context
 
-pub mod context_locals;
+pub(crate) mod context_locals;
 pub mod exec_source;
-pub mod pf_resolve;
+pub(crate) mod pf_resolve;
 pub mod port_forward;
-pub mod registry;
-pub mod subscription;
-pub mod supervise;
+pub(crate) mod registry;
+pub(crate) mod subscription;
+pub(crate) mod supervise;
 pub use k9rs_proto::local_types as types;
 
 pub use context_locals::{ContextKeepalive, ContextLocals};
@@ -174,4 +174,4 @@ pub trait LocalResourceSource: Send + Sync + 'static {
 pub use port_forward::PortForwardSource;
 
 /// Helper wrapper for `Arc<dyn LocalResourceSource>`.
-pub type SharedLocalSource = Arc<dyn LocalResourceSource>;
+pub(crate) type SharedLocalSource = Arc<dyn LocalResourceSource>;
