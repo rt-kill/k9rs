@@ -640,11 +640,17 @@ pub enum DrillTarget {
     /// is a branch in the key handler that knows help is special, which is
     /// precisely the bespoke-view shape the nav model exists to avoid.
     ///
-    /// APPENDED, and decode-safe even for a peer that predates it: only the
-    /// CLIENT produces this tag, from rows it seeds in-process, so nothing
-    /// ever puts tag 9 on the wire. It still bumps the revision, because
-    /// this enum is wire-frozen and the bump is what makes the next author
-    /// re-read the pinned tags.
+    /// APPENDED. Decode-safe for a peer that predates it only because no
+    /// server-side converter emits it — which is a GREP, not a type fact:
+    /// `DrillTarget` lives in this crate and `k9rs_kube`/`k9rs_daemon`
+    /// depend on it, so one of them could construct this variant and
+    /// nothing here would stop it. Measured 2026-10-29: zero occurrences
+    /// outside `k9rs_app`, `k9rs_session` and this file. If that ever
+    /// changes, tag 9 reaches an older peer and fails to decode — which is
+    /// what the revision bump exists to make loud.
+    ///
+    /// (Written first as "nothing ever puts tag 9 on the wire", which is a
+    /// guarantee this enum does not offer.)
     HelpSection(String),
 }
 

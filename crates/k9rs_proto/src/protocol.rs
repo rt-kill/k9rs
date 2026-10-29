@@ -1885,9 +1885,9 @@ log_windows! {
 /// knows help is special, which is the bespoke-view shape the nav model
 /// exists to avoid; `SwitchContext` carries its context for the same reason.
 ///
-/// Decode-safe for a peer that predates it — only the client produces this
-/// tag, from rows it seeds in-process, so tag 9 never reaches the wire. The
-/// bump is for the tripwire, not for compatibility.
+/// Decode-safe for a peer that predates it as long as no server-side
+/// converter emits it, which is a measured fact rather than a guaranteed
+/// one — see the variant's own doc. The bump is for the tripwire.
 pub const WIRE_FORMAT_REVISION: u32 = 20;
 
 /// This build's identity — what the handshake actually compares.

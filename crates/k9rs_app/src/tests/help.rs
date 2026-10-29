@@ -96,28 +96,32 @@ fn the_index_and_the_sections_are_the_same_list() {
     }
 }
 
-/// The index fits a terminal the flat sheet never could.
+/// The index is a handful of rows where the flat sheet was dozens — and it
+/// does not grow with the number of keys, which is the property that made
+/// this fix cross a threshold sectioning and trimming could not.
 ///
-/// That was the whole complaint: 61 rows for a table view against a float
-/// budget of `floor(h * 0.85) - 3` — 17 content rows at 80x24. No grouping
-/// or trimming crossed that; an index does, because the number of SECTIONS
-/// does not grow with the number of keys.
+/// A PROJECTION fact, deliberately: no terminal arithmetic here. The first
+/// version of this test asserted "fits 80x24" by writing
+/// `(24.0 * 0.85) as usize - 3` — restating the float's allowance and the
+/// table's chrome, both of which live in `element::Element::extent` and
+/// `table_content_size`. Had either moved, this would have gone on passing
+/// while its claim stopped being about anything.
+/// `the_help_float_is_tall_enough_for_its_index` asks the real geometry.
 #[test]
-fn the_index_fits_a_small_terminal() {
+fn the_index_is_far_shorter_than_the_sheet_behind_it() {
     for &class in crate::keymap::ViewClass::ALL {
         let sheet = sheet_for(class);
         let sections = sheet.index.rows.len();
         let flat = flatten(&sheet).len();
-        let budget_at_80x24 = (24.0 * 0.85) as usize - 3;
         assert!(
-            sections <= budget_at_80x24,
-            "{class:?}: the index is {sections} rows, over the {budget_at_80x24} an \
-             80x24 float can show",
+            sections <= 8,
+            "{class:?}: the index is {sections} rows — it is supposed to be one \
+             per section, not one per key",
         );
         assert!(
-            flat > budget_at_80x24,
-            "{class:?}: the flat sheet was only {flat} rows — if it now fits, this \
-             test is measuring the wrong thing and the index is not what fixed it",
+            flat >= sections * 3,
+            "{class:?}: the index is {sections} rows against {flat} behind it — if \
+             those are close, the index is not buying anything",
         );
     }
 }

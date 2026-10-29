@@ -2222,3 +2222,60 @@ fn an_escaped_literal_is_a_narrowing_step_in_the_chain() {
     assert_eq!(chain2[0].label, "!urgent", "the same label...");
     assert_eq!(chain2[0].sense, crate::element::Sense::Drop, "...the other sense");
 }
+
+/// At a small terminal the help float is tall enough to show every row of
+/// its index — asked of the REAL geometry, not of a restatement of it.
+///
+/// This is the claim the redesign rests on: the flat sheet was 61 rows for
+/// a table view and the float takes a percentage of the frame, so help
+/// always scrolled. An index of five rows does not. Both halves come from
+/// `Element::extent`, so a change to the allowance or to the table's chrome
+/// moves this test rather than sliding past it.
+#[test]
+fn the_help_float_is_tall_enough_for_its_index() {
+    use crate::element::ViewExtent;
+    use ratatui::layout::Rect;
+
+    for (w, h) in [(80u16, 24u16), (100, 30), (120, 40)] {
+        let mut app = crate::App::new_for_test();
+        let class = crate::keymap::ViewClass::of(app.nav.top());
+        let store = app.core.seed_keybindings(
+            Some(app.current_capabilities()),
+            app.config.keys,
+            class,
+            app.nav.top().markable(),
+        );
+        let index_rows = store.with_read(|i| i.rows.len());
+        let rid = k9rs_proto::local_types::LocalResourceKind::Keybinding.to_resource_id();
+        app.nav.push(crate::element::Element::ResourceList(
+            crate::element::ResourceList::client(
+                crate::element::QuerySpec {
+                    rid,
+                    namespace: k9rs_proto::protocol::Namespace::All,
+                    filter: None,
+                },
+                store,
+                &app.kube.metrics,
+                "keys".to_string(),
+            ),
+        ));
+
+        let frame = Rect::new(0, 0, w, h);
+        // The memo has to exist for `extent` to measure content.
+        app.nav.top_mut().ensure_view_cached(app.ui.column_level, 200);
+        let ViewExtent::Dialog { height, .. } = app.nav.top().extent(frame) else {
+            panic!("help floats");
+        };
+
+        // `table_content_size` asks for `rows + 3` (header + two borders),
+        // and `extent` hands back the smaller of that and its allowance. So
+        // "nothing is cut" is: the box is as tall as the content needed.
+        let needed = index_rows as u16 + 3;
+        assert_eq!(
+            height, needed,
+            "{w}x{h}: the index needs {needed} lines and the float gave {height} — \
+             at that size help is scrolling again, which is the whole thing this \
+             shape was for",
+        );
+    }
+}

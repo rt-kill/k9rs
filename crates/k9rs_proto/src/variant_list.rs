@@ -88,3 +88,7 @@ macro_rules! variant_list {
         }
     };
 }
+
+#[cfg(test)]
+#[path = "tests/variant_list.rs"]
+mod tests;
