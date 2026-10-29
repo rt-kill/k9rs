@@ -23,30 +23,28 @@ impl ConvertToRow<PodDisruptionBudget> for PodDisruptionBudgetDef {
     fn convert(pdb: PodDisruptionBudget) -> ResourceRow {
         let meta = CommonMeta::from_k8s(pdb.metadata);
         let spec = pdb.spec;
-        let min_available = spec.as_ref()
-            .and_then(|s| s.min_available.as_ref())
-            .map(int_or_string_display)
-            .unwrap_or_else(|| "N/A".to_string());
-        let max_unavailable = spec.as_ref()
-            .and_then(|s| s.max_unavailable.as_ref())
-            .map(int_or_string_display)
-            .unwrap_or_else(|| "N/A".to_string());
+        // A PDB sets exactly one of these two, so the other really is
+        // absent. `Placeholder` rather than `Text("N/A")`: `Placeholder`
+        // renders `n/a` — the word the header and every other absent cell
+        // already use — so the same concept was spelled two ways differing
+        // only in case, and `Text` also sorts absent BEFORE every real
+        // value instead of past it.
+        let cell = |v: Option<&k8s_openapi::apimachinery::pkg::util::intstr::IntOrString>| {
+            match v {
+                Some(v) => CellValue::Text(int_or_string_display(v)),
+                None => CellValue::Placeholder,
+            }
+        };
+        let min_available = cell(spec.as_ref().and_then(|s| s.min_available.as_ref()));
+        let max_unavailable = cell(spec.as_ref().and_then(|s| s.max_unavailable.as_ref()));
+        // Straight to `i64`. These were built as `String` and parsed back
+        // three lines later, and the strings were never displayed — the
+        // cells are `Count`. Residue of the `Status`→`Count` fix below.
         let status = pdb.status.as_ref();
-        let allowed_disruptions = status
-            .map(|s| s.disruptions_allowed.to_string())
-            .unwrap_or_else(|| "0".to_string());
-        let current_healthy = status
-            .map(|s| s.current_healthy.to_string())
-            .unwrap_or_else(|| "0".to_string());
-        let desired_healthy = status
-            .map(|s| s.desired_healthy.to_string())
-            .unwrap_or_else(|| "0".to_string());
-        let expected_pods = status
-            .map(|s| s.expected_pods)
-            .unwrap_or(0);
-        let allowed = allowed_disruptions.parse::<i64>().unwrap_or(0);
-        let current = current_healthy.parse::<i64>().unwrap_or(0);
-        let desired = desired_healthy.parse::<i64>().unwrap_or(0);
+        let allowed = status.map(|s| i64::from(s.disruptions_allowed)).unwrap_or(0);
+        let current = status.map(|s| i64::from(s.current_healthy)).unwrap_or(0);
+        let desired = status.map(|s| i64::from(s.desired_healthy)).unwrap_or(0);
+        let expected_pods = status.map(|s| s.expected_pods).unwrap_or(0);
 
         // `currentHealthy < desiredHealthy` is the breach: the budget is not
         // being met and a disruption would take you further below it.
@@ -70,8 +68,8 @@ impl ConvertToRow<PodDisruptionBudget> for PodDisruptionBudgetDef {
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.namespace.clone()),
             CellValue::Text(meta.name.clone()),
-            CellValue::Text(min_available),
-            CellValue::Text(max_unavailable),
+            min_available,
+            max_unavailable,
             // `Count`, not `Status`: wrapping a number in `Status` sorts the
             // column as TEXT (`row.rs`'s `Status` arm compares strings), so
             // `O` on it gave 9, 8, 7, 3, 20, 12, 10, 1. The row health is the

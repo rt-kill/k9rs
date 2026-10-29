@@ -35,9 +35,11 @@ fn parse_in(app: &App, input: &str) -> ParsedCommand {
 /// has no aliases by construction. So the name fell through to the CRD
 /// fallback and the daemon replied "Unknown resource".
 ///
-/// The only way in was `:exec`, which resolves to `exec_configs.first()` — so
-/// a SECOND configured source was unreachable by any keystroke at all. That
-/// second one is the point of this test.
+/// The only other way in was `:exec`, which the daemon answered with
+/// `exec_configs.first()` — so a SECOND configured source was unreachable by
+/// any keystroke at all. That second one is the point of this test. `:exec`
+/// itself is gone as of wire v19: "whichever is first" was not a resource,
+/// and the names are listed in the alias view now.
 #[test]
 fn every_configured_exec_resource_is_reachable_by_name() {
     use k9rs_proto::local_types::LocalResourceKind;

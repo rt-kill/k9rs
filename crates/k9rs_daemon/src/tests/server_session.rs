@@ -135,7 +135,6 @@ fn pod_rid() -> ResourceId {
 
 fn baseline_of(names: &[&str]) -> TableBaseline {
     TableBaseline {
-        resource: pod_rid(),
         headers: vec!["NAME".into()],
         rows: names
             .iter()

@@ -1019,7 +1019,15 @@ impl ClientSession {
             // force a fresh full LIST each reconnect. Drop it after the
             // first successful init write.
             let mut force = force;
-            let mut retry_backoff = std::time::Duration::from_secs(2);
+            // The policy as ONE value. It was six assignments of the floor,
+            // two copied jitter+sleep+double blocks and the ceiling spelled
+            // twice — and the five resets live in `match` arms over
+            // `StreamEvent`, where the one arm that must not reset was
+            // distinguished only by a missing line.
+            let mut retry_backoff = k9rs_util::task::Backoff::new(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(30),
+            );
             let bridge_start = std::time::Instant::now();
             // Consecutive `StreamEvent::Error`s since the last healthy snapshot,
             // plus the last error we actually flashed — together they drive the
@@ -1081,10 +1089,7 @@ impl ClientSession {
                             return;
                         }
                         tracing::warn!("subscription bridge reopen failed for {}: {}", rid.plural(), e);
-                        let jitter = k9rs_util::task::retry_jitter(rid.plural().as_bytes(), retry_backoff.as_millis() as u64);
-                        let jittered = retry_backoff.mul_f64(jitter);
-                        tokio::time::sleep(jittered).await;
-                        retry_backoff = (retry_backoff * 2).min(std::time::Duration::from_secs(30));
+                        retry_backoff.sleep_and_double(rid.plural().as_bytes()).await;
                         continue;
                     }
                 };
@@ -1143,6 +1148,13 @@ impl ClientSession {
                     }
                     ever_received_data = true;
 
+                    // ONE reset, asked of the event itself. The arms below
+                    // used to each assign the floor, and `Error` — the only
+                    // one that must not — said so by omission.
+                    if event.resets_backoff() {
+                        retry_backoff.reset();
+                    }
+
                     let app_event = match event {
                         protocol::StreamEvent::Baseline(baseline) => {
                             // Healthy data: the subscription works. Clear the
@@ -1150,7 +1162,6 @@ impl ClientSession {
                             // so a *later* failure surfaces fresh.
                             consecutive_errors = 0;
                             last_flashed_error = None;
-                            retry_backoff = std::time::Duration::from_secs(2);
                             AppEvent::Store(crate::event::StoreEvent {
                                 store: store.clone(),
                                 epoch,
@@ -1160,7 +1171,6 @@ impl ClientSession {
                         protocol::StreamEvent::Delta(delta) => {
                             consecutive_errors = 0;
                             last_flashed_error = None;
-                            retry_backoff = std::time::Duration::from_secs(2);
                             AppEvent::Store(crate::event::StoreEvent {
                                 store: store.clone(),
                                 epoch,
@@ -1172,7 +1182,6 @@ impl ClientSession {
                             // rid — progress for backoff purposes, but not a
                             // healthy snapshot, so it does NOT clear the ceiling.
                             current_rid = resolved.clone();
-                            retry_backoff = std::time::Duration::from_secs(2);
                             AppEvent::ResourceResolved { original, resolved }
                         }
                         protocol::StreamEvent::Stale(reason) => {
@@ -1191,7 +1200,6 @@ impl ClientSession {
                             // opposite of a healthy snapshot, so (like
                             // `Resolved`) it does not clear the error ceiling.
                             // Reconnecting the substream would not help.
-                            retry_backoff = std::time::Duration::from_secs(2);
                             AppEvent::Store(crate::event::StoreEvent {
                                 store: store.clone(),
                                 epoch,
@@ -1201,7 +1209,6 @@ impl ClientSession {
                         protocol::StreamEvent::Live => {
                             consecutive_errors = 0;
                             last_flashed_error = None;
-                            retry_backoff = std::time::Duration::from_secs(2);
                             AppEvent::Store(crate::event::StoreEvent {
                                 store: store.clone(),
                                 epoch,
@@ -1278,11 +1285,12 @@ impl ClientSession {
                 // Transient failure after prior success — retry with
                 // jittered backoff. Session death naturally exits on the
                 // next open() or event_tx.send().
-                let jitter = k9rs_util::task::retry_jitter(rid.plural().as_bytes(), retry_backoff.as_millis() as u64);
-                let jittered = retry_backoff.mul_f64(jitter);
-                tracing::info!("subscription bridge retrying for {} in {:?}", rid.plural(), jittered);
-                tokio::time::sleep(jittered).await;
-                retry_backoff = (retry_backoff * 2).min(std::time::Duration::from_secs(30));
+                tracing::info!(
+                    "subscription bridge retrying for {} in {:?}",
+                    rid.plural(),
+                    retry_backoff.peek(rid.plural().as_bytes()),
+                );
+                retry_backoff.sleep_and_double(rid.plural().as_bytes()).await;
             }
             });
             let result: Result<(), Box<dyn std::any::Any + Send>> = futures::FutureExt::catch_unwind(result).await;

@@ -23,7 +23,6 @@ fn seeded_app(marked: &[&str]) -> App {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "STATUS".into()],
             rows: vec![row("a"), row("b"), row("c")],
         }),
@@ -107,7 +106,6 @@ fn app_with_row(row: ResourceRow) -> App {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![row],
         }),
@@ -178,7 +176,6 @@ fn a_marked_selection_logs_exactly_those_pods() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![pod_row("a", "ns", 1), pod_row("b", "ns", 1), pod_row("c", "ns", 1)],
         }),
@@ -212,7 +209,6 @@ fn the_container_stance_follows_the_marked_pods() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![pod_row("solo", "ns", 1), pod_row("sidecar", "ns", 2)],
         }),
@@ -252,7 +248,6 @@ fn a_marked_set_of_workloads_unions_their_pod_sources() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_proto::resource_def::BuiltInKind::Deployment.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![workload("api", "api"), workload("web", "web")],
         }),
@@ -316,7 +311,6 @@ fn a_selection_spanning_namespaces_is_refused() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![pod_row("here", "ns-a", 1), pod_row("there", "ns-b", 1)],
         }),
@@ -399,7 +393,6 @@ fn a_marked_set_of_containers_streams_exactly_those() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![pod.clone()],
         }),
@@ -491,7 +484,6 @@ fn test_batch_capture_is_empty_during_refresh_window() {
     };
     let baseline = |rows: Vec<ResourceRow>| {
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows,
         })
@@ -538,7 +530,6 @@ fn test_second_batch_refused_while_one_outstanding() {
     let mut app = App::new_for_test();
     let store = std::sync::Arc::clone(app.nav.top().data_store().unwrap());
     store.apply(1, StorePayload::Baseline(TableBaseline {
-        resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
         headers: vec!["NAME".into()],
         rows: vec![row("a")],
     }));
@@ -814,7 +805,6 @@ fn a_batch_log_spec_honours_default_follow() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into()],
             rows: vec![pod_row("a", "ns", 1), pod_row("b", "ns", 1)],
         }),
@@ -832,4 +822,134 @@ fn a_batch_log_spec_honours_default_follow() {
         !batch_log_spec(&app).expect("two pods in one namespace").follow,
         "and a user who turned it off gets a spec that does not follow",
     );
+}
+
+// ---------------------------------------------------------------------------
+// One answer to "what namespace does this shell use"
+// ---------------------------------------------------------------------------
+
+fn pod_ref(name: &str, ns: k9rs_proto::protocol::Namespace) -> k9rs_proto::protocol::ObjectRef {
+    k9rs_proto::protocol::ObjectRef::new(
+        k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
+        name.to_string(),
+        ns,
+    )
+}
+
+/// A named namespace is the answer; `All` and empty are refused BY NAME.
+///
+/// This was three call sites with three arities. The picker's was
+/// `namespace.display().to_string()` with no guard at all — and
+/// `Namespace::All` displays as the literal `"all"`, so `All` would have
+/// become a namespace NAME, reintroducing by stringification the magic
+/// string the derived path's comment brags about having removed.
+#[test]
+fn an_exec_namespace_is_a_real_name_or_a_refusal() {
+    use k9rs_proto::protocol::Namespace;
+    assert_eq!(
+        exec_namespace(&pod_ref("api", Namespace::Named("prod".into()))),
+        Ok("prod".to_string()),
+    );
+
+    let err = exec_namespace(&pod_ref("api", Namespace::All)).expect_err("All is not a namespace");
+    assert!(err.contains("pods/api"), "the refusal names the target: {err}");
+    assert!(!err.contains("\"all\""), "and does not treat `all` as a name: {err}");
+
+    assert!(exec_namespace(&pod_ref("api", Namespace::Named(String::new()))).is_err());
+}
+
+/// A namespace literally CALLED "all" still works — the old magic-string
+/// guard (`ns != "all"`) wrongly rejected it, which is why the typed
+/// `Namespace` exists.
+#[test]
+fn a_namespace_named_all_is_a_real_namespace() {
+    use k9rs_proto::protocol::Namespace;
+    assert_eq!(
+        exec_namespace(&pod_ref("api", Namespace::Named("all".into()))),
+        Ok("all".to_string()),
+    );
+}
+
+/// Both batch projections read ONE intersection, so they cannot disagree
+/// about which rows are marked-and-present.
+///
+/// `batch_log_spec` had its own `with_read` closure over the same rows and
+/// the same `marked()`, under a copy of `marked_rows`'s doc paragraph — and
+/// without its `has_marks` short-circuit. The Ctrl-R window, which both docs
+/// call load-bearing, had to be got right twice.
+#[test]
+fn the_two_batch_projections_read_one_marked_set() {
+    let mut app = App::new_for_test();
+    let store = std::sync::Arc::clone(app.nav.top().data_store().unwrap());
+    store.apply(
+        1,
+        StorePayload::Baseline(TableBaseline {
+            headers: vec!["NAME".into()],
+            rows: vec![pod_row("a", "ns", 1), pod_row("b", "ns", 1), pod_row("c", "ns", 1)],
+        }),
+    );
+    for name in ["a", "c"] {
+        store.toggle_mark(&ObjectKey::new("ns".to_string(), name.to_string()));
+    }
+    let _ = &mut app;
+
+    let rows = marked_rows(&app);
+    let refs = get_marked_resource_infos(&app);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        refs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        "same rows, same order — store order, which both rely on",
+    );
+}
+
+/// With no marks, BOTH are empty — the short-circuit the inline copy
+/// lacked, and the honest answer during the Ctrl-R window.
+#[test]
+fn an_unmarked_view_yields_no_batch_targets() {
+    let app = App::new_for_test();
+    assert!(marked_rows(&app).is_empty());
+    assert!(get_marked_resource_infos(&app).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Saved-dump filenames
+// ---------------------------------------------------------------------------
+
+/// The parts are sanitized and the stamp is appended — one builder for the
+/// three sites that each had their own copy of the closure, and three
+/// copies of the strftime format.
+#[test]
+fn a_dump_filename_sanitizes_its_parts() {
+    let name = dump_filename(&["logs", "pods/api-7d9f", "web:8080"], "log");
+    assert!(name.starts_with("logs-pods-api-7d9f-web-8080-"), "got {name}");
+    assert!(name.ends_with(".log"), "got {name}");
+    assert!(
+        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.'),
+        "nothing a path can mean survives: {name}",
+    );
+}
+
+/// The stamp is there and is a UTC `YYYYmmdd-HHMMSS`, so two saves in one
+/// session do not collide and the file sorts by time.
+#[test]
+fn a_dump_filename_carries_a_sortable_stamp() {
+    let name = dump_filename(&["logs"], "log");
+    let stamp = name
+        .strip_prefix("logs-")
+        .and_then(|r| r.strip_suffix(".log"))
+        .expect("the stamp is between the parts and the extension");
+    let (date, time) = stamp.split_once('-').expect("date-time");
+    assert_eq!(date.len(), 8, "YYYYmmdd: {stamp}");
+    assert_eq!(time.len(), 6, "HHMMSS: {stamp}");
+    assert!(date.chars().all(|c| c.is_ascii_digit()), "{stamp}");
+    assert!(time.chars().all(|c| c.is_ascii_digit()), "{stamp}");
+}
+
+/// An empty part list is still a valid filename — the stamp alone.
+#[test]
+fn a_dump_filename_with_no_parts_is_still_a_name() {
+    let name = dump_filename(&[], "txt");
+    assert!(name.ends_with(".txt"));
+    assert!(!name.starts_with('.'), "not a hidden file: {name}");
 }

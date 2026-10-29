@@ -190,7 +190,7 @@ fn the_window_always_contains_the_caret() {
                     "{value:?} w={width}: window {shown:?} is wider than {width}",
                 );
                 assert!(
-                    col <= width.saturating_sub(1).max(0) || width == 0,
+                    col <= width.saturating_sub(1) || width == 0,
                     "{value:?} w={width}: caret column {col} is off the right edge",
                 );
                 // The window is a real slice of the value, not a rebuild.

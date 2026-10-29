@@ -37,8 +37,22 @@ impl PodStatus {
 /// Classify a bare status reason string into a typed health. This is the
 /// SOURCE-OF-TRUTH classifier for K8s container/pod state strings, which
 /// come in from the API as an open-ended set (custom controllers can add
-/// new reasons). Used only during `compute_pod_status` — callers never
-/// re-classify a display string afterwards.
+/// new reasons).
+///
+/// Its input is always a RAW reason — a string the apiserver wrote — and
+/// never one of the display forms this module composes (`Init:…`,
+/// `ExitCode:N`, `Signal:N`). All three callers keep that separation on
+/// purpose: `compute_pod_status` classifies an init container's `reason`
+/// and formats `Init:{reason}` as two steps, settles the `ExitCode:` and
+/// `Signal:` forms in their own arms before reaching here, and
+/// [`container_health`] hands over a `ContainerStatus` reason untouched. A
+/// composed form fed back in would fall to the `_` arm and come out
+/// Pending, so `Init:ImagePullBackOff` would lose its red — which is what
+/// `a_composed_display_form_never_reaches_the_classifier` holds.
+///
+/// This said "used only during `compute_pod_status`", which
+/// [`container_health`] had contradicted since the day it was written —
+/// and its own doc, one screen down, says so.
 fn classify_pod_reason(reason: &str) -> RowHealth {
     match reason {
         PHASE_RUNNING | PHASE_SUCCEEDED | PHASE_COMPLETED => RowHealth::Normal,
@@ -213,9 +227,11 @@ impl ConvertToRow<Pod> for PodDef {
         .collect();
     let deletion_timestamp = metadata.deletion_timestamp.take();
     let meta = crate::resources::CommonMeta::from_k8s(metadata);
+    // The LABELS cell is built before the struct is picked apart, so this
+    // converter reads the same `labels_cell` as the other eleven.
+    let labels = meta.labels_cell();
     let namespace = meta.namespace;
     let name = meta.name;
-    let labels_str = meta.labels_str;
     let age = meta.age;
 
     let spec = pod.spec.unwrap_or_default();
@@ -224,20 +240,6 @@ impl ConvertToRow<Pod> for PodDef {
     // difference between "not a pod" and "pod waiting for a node".
     let node: Option<String> = spec.node_name.clone();
     let node_display: String = node.clone().unwrap_or_default();
-
-    // Build a map of container name -> ports from the spec (for port-forward).
-    let spec_ports: std::collections::HashMap<String, Vec<u16>> = spec
-        .containers
-        .iter()
-        .map(|c| {
-            let ports = c
-                .ports
-                .as_ref()
-                .map(|ps| ps.iter().map(|p| p.container_port as u16).collect())
-                .unwrap_or_default();
-            (c.name.clone(), ports)
-        })
-        .collect();
 
     let init_containers_spec = spec.init_containers.as_deref().unwrap_or(&[]);
     let status = pod.status.unwrap_or_default();
@@ -323,14 +325,14 @@ impl ConvertToRow<Pod> for PodDef {
     let mut containers_vec = init_containers;
     containers_vec.extend(regular_containers);
 
-    // All container ports across all containers — used by port-forward dialog.
-    // Drawn directly from the spec (`spec_ports`) since `ContainerInfo` no
-    // longer carries a per-container port list (it was wire-shipped only to
-    // be re-flattened here, dead bytes for every other consumer).
-    let pf_ports: Vec<u16> = container_statuses
-        .iter()
-        .flat_map(|cs| spec_ports.get(&cs.name).cloned().unwrap_or_default())
-        .collect();
+    // All forwardable container ports — see `resources::forwardable_ports`,
+    // which every other PortForward-capable converter reads through
+    // `WorkloadContainers`. This built its own: no protocol filter, so a
+    // UDP-only port was offered and the forward then looped
+    // `Reconnecting`; and keyed off `container_statuses`, so a PENDING pod
+    // offered nothing and the form fell back to a free-text 8080 — while
+    // the very same pod's Deployment offered the real ports.
+    let pf_ports: Vec<u16> = super::forwardable_ports(&spec);
 
     // QOS class — a closed k8s set. An unexpected value shows "?" rather than
     // silently masquerading as BestEffort (which `_ => "BE"` used to do).
@@ -450,17 +452,21 @@ impl ConvertToRow<Pod> for PodDef {
         CellValue::Placeholder,                                     // MEM (metrics overlay)
         CellValue::Percentage(None),                                // %MEM/R (metrics overlay)
         CellValue::Percentage(None),                                // %MEM/L (metrics overlay)
-        if has_cpu_req { CellValue::Quantity { value: cpu_req_milli, unit: QuantityUnit::Millicores } } else { CellValue::Text(String::new()) },
-        if has_cpu_lim { CellValue::Quantity { value: cpu_lim_milli, unit: QuantityUnit::Millicores } } else { CellValue::Text(String::new()) },
-        if has_mem_req { CellValue::Quantity { value: mem_req_bytes, unit: QuantityUnit::Bytes } } else { CellValue::Text(String::new()) },
-        if has_mem_lim { CellValue::Quantity { value: mem_lim_bytes, unit: QuantityUnit::Bytes } } else { CellValue::Text(String::new()) },
+        // Absent reads and SORTS the same here as in the `CPU`/`MEM` and
+        // `%` columns above — see `CellValue::quantity_or_absent`. These
+        // four were `Text(String::new())`, which sorts before every real
+        // value, so one row answered "no number" three different ways.
+        CellValue::quantity_or_absent(has_cpu_req.then_some(cpu_req_milli), QuantityUnit::Millicores),
+        CellValue::quantity_or_absent(has_cpu_lim.then_some(cpu_lim_milli), QuantityUnit::Millicores),
+        CellValue::quantity_or_absent(has_mem_req.then_some(mem_req_bytes), QuantityUnit::Bytes),
+        CellValue::quantity_or_absent(has_mem_lim.then_some(mem_lim_bytes), QuantityUnit::Bytes),
         CellValue::Text(pod_ip),
         CellValue::Text(node_display),
         CellValue::Text(nominated_node),
         CellValue::Text(qos_short.to_string()),
         CellValue::Text(service_account),
         CellValue::Text(readiness_gates),
-        CellValue::from_comma_str(&labels_str),
+        labels,
         CellValue::Age(age.map(|t| t.timestamp())),
     ];
     ResourceRow {

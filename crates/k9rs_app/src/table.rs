@@ -1,6 +1,19 @@
-// ---------------------------------------------------------------------------
-// TableDataState — lifecycle state for table data
-// ---------------------------------------------------------------------------
+//! A data source's lifecycle state.
+//!
+//! One type, and one file, because the state is read by three layers that
+//! must not each decide for themselves what "no rows yet" means: the store
+//! writes it, `liveness.rs` turns it into what the frame says, and the
+//! table view picks a spinner, an error or rows from it.
+//!
+//! No test mirror, deliberately: there is nothing here to exercise but the
+//! enum, and every TRANSITION its doc lists is driven and asserted from
+//! `tests/store.rs` — against the store that performs them, which is the
+//! only place they exist. A mirror here would assert the enum against
+//! itself.
+//!
+//! The file opened on a bare banner comment with no `//!` at all, the only
+//! one in its crate that did.
+
 
 /// Lifecycle state of a data source. Replaces the prior triple of
 /// `has_data: bool` + `loading: bool` + `error: Option<String>` — same

@@ -85,13 +85,20 @@ impl ConvertToRow<Job> for JobDef {
             CellValue::Text(duration),
             CellValue::from_comma_str(&containers.names),
             CellValue::from_comma_str(&containers.images),
-            CellValue::from_comma_str(&meta.labels_str),
+            meta.labels_cell(),
             CellValue::Age(meta.age.map(|t| t.timestamp())),
         ];
         ResourceRow {
             cells,
             name: meta.name,
             namespace: Some(meta.namespace),
+            // `JobDef` declares `PortForward`, and every other
+            // PortForward-capable converter sets this — a Job did not, so
+            // `Shift-F` on one reached the form with an EMPTY port list,
+            // which seeds the container-port field with a free-text 8080
+            // instead of the real port. The containers were already
+            // computed above, ports and all.
+            pf_ports: containers.tcp_ports,
             health,
             drill_target,
             ..Default::default()

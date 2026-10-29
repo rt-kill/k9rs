@@ -1475,8 +1475,12 @@ pub struct WatcherStat {
 pub struct ContextStat {
     pub context: ContextName,
     pub server_url: String,
-    /// Forwards currently running for this context. These outlive any view
-    /// of them, so this is the only place they are countable.
+    /// Forward ENTRIES held for this context, failed and still-starting ones
+    /// included — see `PortForwardSource::entry_count`. Not "currently
+    /// running", which is what this said: an entry survives its own failure
+    /// so the `:pf` table can explain itself, and a failed forward still
+    /// holds the local port it was given. These outlive any view of them, so
+    /// this is the only place they are countable.
     pub port_forwards: usize,
     /// Sessions attached, plus an in-flight grace task if the last one left.
     pub holders: usize,
@@ -1622,6 +1626,35 @@ pub enum StreamEvent {
     /// the watch was down so no data event would otherwise be sent — and
     /// the client would stay marked stale over rows that are live.
     Live,
+}
+
+impl StreamEvent {
+    /// Whether receiving this event means the subscription made PROGRESS, so
+    /// a retry backoff should return to its floor.
+    ///
+    /// Exhaustive, and here rather than in the client's `match` arms, because
+    /// five of the six arms assigned the floor and the sixth — [`Self::Error`]
+    /// — was distinguished only by the ABSENCE of that line. A new variant
+    /// therefore joined the minority policy silently, and the minority policy
+    /// is "keep backing off": the view takes longer and longer to come back,
+    /// for a reason nothing states.
+    ///
+    /// `Stale` and `Resolved` count as progress even though neither is a
+    /// healthy snapshot — the SUBSTREAM delivered a frame, which is what this
+    /// backoff is about, and reconnecting it would not help a broken cluster
+    /// hop. `Error` is terminal (the daemon closes the substream after it),
+    /// so the bridge's next attempt is a genuine retry and must not start
+    /// over at the floor.
+    pub fn resets_backoff(&self) -> bool {
+        match self {
+            StreamEvent::Baseline(_)
+            | StreamEvent::Delta(_)
+            | StreamEvent::Resolved { .. }
+            | StreamEvent::Stale(_)
+            | StreamEvent::Live => true,
+            StreamEvent::Error(_) => false,
+        }
+    }
 }
 
 /// Borrowed mirror of [`StreamEvent`] for ZERO-COPY serialization on the
@@ -1891,7 +1924,7 @@ log_windows! {
 /// `LogInit` could mean "the last ninety minutes" or "everything" depending
 /// on which backend served it, invisibly. Both paths now derive from
 /// [`LogSince::seconds`].
-pub const WIRE_FORMAT_REVISION: u32 = 18;
+pub const WIRE_FORMAT_REVISION: u32 = 19;
 
 /// This build's identity — what the handshake actually compares.
 ///
@@ -1993,9 +2026,19 @@ pub async fn read_handshake<R: AsyncReadExt + Unpin>(reader: &mut R) -> anyhow::
 /// the receiver REPLACES everything it holds for this stream. Row order is
 /// unspecified — the client owns sorting. Headers ride only here (a
 /// header-changing event on the daemon always produces a fresh baseline).
+///
+/// WHICH resource is not in here. It was — a `resource: ResourceId` written
+/// by all three producers (the watcher and both local sources) and read by
+/// nobody: a baseline reaches its store by substream and subscription id,
+/// never by inspecting its own payload. A second, unconsulted spelling of
+/// the stream's identity can only ever disagree with the first, and on the
+/// legacy `Local(ExecResource)` path it already did — `context_locals`
+/// resolves that id to the FIRST configured exec source, so the baseline
+/// was stamped `Custom(name)` while the subscription was `ExecResource`.
+/// Deleted rather than corrected: the correction would have been a rule to
+/// keep, and there is nothing to keep now.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableBaseline {
-    pub resource: ResourceId,
     pub headers: Vec<String>,
     pub rows: Vec<crate::row::ResourceRow>,
 }
@@ -2355,6 +2398,30 @@ pub enum Role {
 }
 
 impl Role {
+    /// Every role, in DISPLAY order — the order a line's parts appear in.
+    ///
+    /// Distinct from [`Self::SHED_ORDER`], which is the order they are given
+    /// UP in and holds only the hideable ones. Both exist because they are
+    /// different questions; `shown` is what joins them.
+    pub const ALL: [Role; 3] = [Role::Timestamp, Role::Source, Role::Body];
+
+    /// What the field indicator calls this role.
+    ///
+    /// Here rather than in the renderer because the renderer's version had a
+    /// `Role::Body => "message"` arm that `SHED_ORDER` could never reach,
+    /// plus an `if fields.is_empty() { "message" }` fallback and a
+    /// `format!("{}+message", …)` — three places encoding "the body is
+    /// always shown", which is a fact about `shown()` and not about the bar.
+    /// Adding a role to `SHED_ORDER` was supposed to extend the cycle with
+    /// no other change; the indicator was the other change.
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Timestamp => "time",
+            Role::Source => "source",
+            Role::Body => "message",
+        }
+    }
+
     /// Whether a grep runs over this part. The body and the source tag are
     /// content; the timestamp is chrome, and matching it would make `/2026`
     /// select every line. Previously an unstated choice duplicated in
@@ -2584,6 +2651,35 @@ pub enum SessionEvent {
     /// `DescribeResult`/`YamlResult`. Appended after `DaemonStatus` so
     /// every pre-existing tag keeps its position.
     OpResult { op: OperationKind, target: ObjectRef, result: Result<String, String> },
+}
+
+impl SessionEvent {
+    /// This event's variant name, and nothing else.
+    ///
+    /// The twin of [`SessionCommand::kind_name`], and for the same reason: a
+    /// `{:?}` of an event is not safe to print. `DescribeResult` carries
+    /// describe lines, which for a `DecodeSecret` reply are the DECODED
+    /// secret; `YamlResult` carries a whole object body. The one place that
+    /// needed to name an unexpected event — `ctl status`, reporting a daemon
+    /// that answered the wrong thing — would have Debug-dumped it to the
+    /// user's terminal.
+    ///
+    /// Exhaustive, so a new variant cannot be reported as some other
+    /// variant's name.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            SessionEvent::Ready { .. } => "Ready",
+            SessionEvent::SessionError(_) => "SessionError",
+            SessionEvent::DescribeResult { .. } => "DescribeResult",
+            SessionEvent::YamlResult { .. } => "YamlResult",
+            SessionEvent::CommandResult(_) => "CommandResult",
+            SessionEvent::Discovery { .. } => "Discovery",
+            SessionEvent::PodMetrics(_) => "PodMetrics",
+            SessionEvent::NodeMetrics(_) => "NodeMetrics",
+            SessionEvent::DaemonStatus(_) => "DaemonStatus",
+            SessionEvent::OpResult { .. } => "OpResult",
+        }
+    }
 }
 
 #[cfg(test)]

@@ -100,3 +100,55 @@ fn absent_completions_means_one() {
     assert_eq!(r.cells[COMPLETIONS], CellValue::Ratio { num: 1, denom: 1 });
     assert_eq!(r.health, RowHealth::Normal);
 }
+
+/// A Job's row carries its forwardable ports.
+///
+/// `JobDef` declares `PortForward` and every other PortForward-capable
+/// converter sets `pf_ports` — a Job did not, so `Shift-F` on one reached
+/// the form with an empty list, which seeds the container-port field with a
+/// free-text 8080 instead of the port the Job actually declares. The
+/// containers (ports and all) were already computed in the converter.
+#[test]
+fn a_job_row_carries_its_forwardable_ports() {
+    use k8s_openapi::api::core::v1::{Container, ContainerPort, PodSpec};
+    let job = Job {
+        metadata: ObjectMeta {
+            name: Some("import".to_string()),
+            namespace: Some("prod".to_string()),
+            ..Default::default()
+        },
+        spec: Some(JobSpec {
+            completions: Some(1),
+            template: PodTemplateSpec {
+                spec: Some(PodSpec {
+                    containers: vec![Container {
+                        name: "worker".to_string(),
+                        ports: Some(vec![
+                            ContainerPort {
+                                container_port: 9000,
+                                protocol: Some("TCP".to_string()),
+                                ..Default::default()
+                            },
+                            ContainerPort {
+                                container_port: 5353,
+                                protocol: Some("UDP".to_string()),
+                                ..Default::default()
+                            },
+                        ]),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        status: Some(JobStatus::default()),
+    };
+    let row = JobDef::convert(job);
+    assert_eq!(
+        row.pf_ports,
+        vec![9000],
+        "the declared TCP port, and not the UDP one",
+    );
+}

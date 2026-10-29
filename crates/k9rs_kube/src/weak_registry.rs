@@ -48,7 +48,18 @@ use std::sync::{Arc, Weak};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
-/// What [`WeakRegistry::get_or_create`] did, for callers that log or count.
+/// What [`WeakRegistry::get_or_create`] did.
+///
+/// One production reader — `WatcherCache`'s three `tracing::debug!` lines;
+/// the other three call sites discard it, each having nothing to say about
+/// the difference. That made it look like a three-variant enum whose only
+/// observable effect was a debug string, which is how it was reported. It is
+/// also the only thing that makes step 3 of the module docs CHECKABLE from
+/// outside: `concurrent_callers_for_one_absent_key_build_exactly_one_resource`
+/// asserts exactly one `Created` among N racing callers, and
+/// `the_entry_recheck_hands_back_what_a_racing_caller_created` asserts the
+/// `Reused` that only the re-check can return. Delete this and the re-check
+/// goes back to being unpinnable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// An existing live resource was handed back. `create` never ran.

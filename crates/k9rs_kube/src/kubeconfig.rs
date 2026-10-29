@@ -54,10 +54,19 @@ pub struct Kubeconfig {
 impl Kubeconfig {
     /// Read and parse the kubeconfig, preferring `requested` (the `--context`
     /// flag) over the file's own `current-context`.
+    ///
+    /// The I/O half, and all of it: the projection below is pure, which is
+    /// what lets the rules this module exists for — the empty
+    /// `current-context`, the nameless entry — be driven from a test
+    /// instead of from the developer's own `~/.kube/config`.
     pub fn read(requested: Option<&ContextName>) -> Result<Self> {
         let raw = kube::config::Kubeconfig::read()
             .map_err(|e| anyhow::anyhow!("Failed to read kubeconfig: {}", e))?;
+        Self::project(raw, requested)
+    }
 
+    /// Everything `read` does once the bytes are in hand.
+    fn project(raw: kube::config::Kubeconfig, requested: Option<&ContextName>) -> Result<Self> {
         let current = requested
             .cloned()
             .or_else(|| raw.current_context.clone().and_then(ContextName::new));
@@ -101,3 +110,7 @@ impl Kubeconfig {
             .unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+#[path = "tests/kubeconfig.rs"]
+mod tests;

@@ -61,6 +61,86 @@ pub struct ExecSourceConfig {
     pub json_field_keys: Vec<String>,
 }
 
+impl ExecSourceConfig {
+    /// Why this entry cannot serve a resource, or `Ok(())`.
+    ///
+    /// ONE validation, because the same config had TWO readers with
+    /// different arity: the daemon applied five guards in a `filter`
+    /// closure, and the client's `exec_resource_by_name` applied none — so
+    /// an entry the daemon had skipped was still typeable and came back as
+    /// `Unknown local resource: …` with no reason given.
+    ///
+    /// The ALIAS guard is new. `:`-command resolution tries
+    /// `ResourceId::from_alias` first and exec-by-name fourth, so an entry
+    /// named `pods`, `po`, `deploy`, `pf`, `ctx` or `a` could never be
+    /// reached at all: its poll never started, nothing was ever shown, and
+    /// nothing said why. That is the opposite of a shadow — the collision
+    /// loses rather than wins — which is exactly why it was invisible.
+    ///
+    /// Duplicate names are NOT checked here: that is a property of the list,
+    /// not of an entry. See [`Self::usable`].
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.is_empty() {
+            return Err("has an empty name".to_string());
+        }
+        if let Some(existing) = k9rs_proto::protocol::ResourceId::from_alias(&self.name) {
+            return Err(format!(
+                "name '{}' is already a built-in alias for {} — `:{}` would never \
+                 reach this resource",
+                self.name,
+                existing.plural(),
+                self.name,
+            ));
+        }
+        if self.command.is_empty() {
+            return Err(format!("'{}' has an empty command", self.name));
+        }
+        if self.headers.is_empty() {
+            return Err(format!("'{}' has no headers", self.name));
+        }
+        // The converter zips headers with json_field_keys positionally; a
+        // length mismatch would silently drop columns or misalign data.
+        if self.headers.len() != self.json_field_keys.len() {
+            return Err(format!(
+                "'{}' has {} headers but {} jsonFieldKeys — they must match in \
+                 length and order",
+                self.name,
+                self.headers.len(),
+                self.json_field_keys.len(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The entries that can actually serve a resource, warning once per
+    /// rejection.
+    ///
+    /// A malformed entry is skipped rather than fatal — one bad line should
+    /// not take the others down, and a daemon is long-lived. Duplicate names
+    /// are resolved first-wins, which is the only order a reader could
+    /// predict.
+    pub fn usable(configs: Vec<Self>) -> Vec<Self> {
+        let mut seen = std::collections::HashSet::new();
+        configs
+            .into_iter()
+            .filter(|c| {
+                if let Err(why) = c.validate() {
+                    tracing::warn!("exec resource config {why} — skipping");
+                    return false;
+                }
+                if !seen.insert(c.name.clone()) {
+                    tracing::warn!(
+                        "exec resource config has duplicate name '{}' — skipping",
+                        c.name,
+                    );
+                    return false;
+                }
+                true
+            })
+            .collect()
+    }
+}
+
 fn default_poll_interval() -> std::num::NonZeroU64 {
     std::num::NonZeroU64::new(30).expect("30 is not zero")
 }
@@ -149,7 +229,6 @@ impl ExecSource {
         let rid = super::types::LocalResourceKind::Custom(config.name.clone()).to_resource_id();
         let headers = config.headers.clone();
         let empty = k9rs_proto::protocol::TableBaseline {
-            resource: rid.clone(),
             headers,
             rows: Vec::new(),
         };
@@ -288,7 +367,6 @@ impl ExecSource {
             .collect();
         rows.sort_by(|a, b| a.name.cmp(&b.name));
         let _ = self.tx.send(k9rs_proto::protocol::TableBaseline {
-            resource: self.rid.clone(),
             headers: self.config.headers.clone(),
             rows,
         });

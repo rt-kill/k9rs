@@ -212,7 +212,6 @@ impl PortForwardSource {
     pub fn for_context() -> Arc<Self> {
         let id = super::types::LocalResourceKind::PortForward.to_resource_id();
         let empty = k9rs_proto::protocol::TableBaseline {
-            resource: id.clone(),
             headers: headers(),
             rows: Vec::new(),
         };
@@ -244,10 +243,21 @@ impl PortForwardSource {
             .expect("self_weak must upgrade while a method is running on this source")
     }
 
-    /// How many forwards this source is currently running. Forwards outlive
-    /// any view of them, so `ctl status` is the only way to count them
-    /// without opening the `:pf` table.
-    pub fn live_count(&self) -> usize {
+    /// How many forward ENTRIES this source holds — including the ones
+    /// still starting and the ones that have failed.
+    ///
+    /// Not "currently running", which is what this said while it was called
+    /// `live_count`: the number is `entries.len()`, and an entry survives
+    /// its own failure so the `:pf` table can show why.
+    /// `ContextStat.port_forwards` inherited the overclaim from the doc, and
+    /// the NAME still made it after the doc was corrected — the other
+    /// `live_count` in this crate ([`crate::shared_poller`]) counts
+    /// upgradable `Weak`s, so one name meant two things.
+    ///
+    /// Entries are what `ctl status` wants to count anyway: forwards outlive
+    /// any view of them, and a failed one is still occupying a local port's
+    /// worth of the user's attention.
+    pub fn entry_count(&self) -> usize {
         self.entries.len()
     }
 
@@ -285,7 +295,7 @@ impl PortForwardSource {
         // straddle an `.await`, which is the old `with_live` guarantee held
         // structurally.
         let op = PortForwardOp {
-            weak: Arc::downgrade(self),
+            live: super::supervise::SourceLiveness::new(Arc::downgrade(self)),
             req,
         };
         // Single state writer: the supervisor narrates the lifecycle through
@@ -358,7 +368,6 @@ impl PortForwardSource {
             .collect();
         rows.sort_by(|a, b| a.name.cmp(&b.name));
         let _ = self.tx.send(k9rs_proto::protocol::TableBaseline {
-            resource: self.id.clone(),
             headers: headers(),
             rows,
         });
@@ -369,13 +378,17 @@ impl PortForwardSource {
 /// local listener → open a canary tunnel to the pod (the liveness signal) →
 /// serve accepted connections, each over its own tunnel. The supervisor
 /// around it owns retry, backoff, and all state narration; this only
-/// classifies how the attempt ended. Holds `Weak<PortForwardSource>` purely
-/// for the gone-check — per the operator contract it never touches source
-/// state (the sink does). Everything an attempt owns (listener, canary,
-/// pump tasks in the `JoinSet`) lives inside `run_once`'s future, so an
-/// abort tears the whole attempt down.
+/// classifies how the attempt ended. Everything an attempt owns (listener,
+/// canary, pump tasks in the `JoinSet`) lives inside `run_once`'s future, so
+/// an abort tears the whole attempt down.
+///
+/// It holds a [`SourceLiveness`](super::supervise::SourceLiveness), not a
+/// `Weak<PortForwardSource>`: the gone-check is the only question it asks,
+/// and a `Weak` would also hand it `upgrade()` and with it the private
+/// `set_state` two hundred lines up this same file. The operator contract
+/// said it "never touches source state"; now it cannot.
 struct PortForwardOp {
-    weak: Weak<PortForwardSource>,
+    live: super::supervise::SourceLiveness<PortForwardSource>,
     req: PortForwardRequest,
 }
 
@@ -403,7 +416,7 @@ impl LocalOperator for PortForwardOp {
         };
 
         // Source gone during resolution? Nothing left to forward for.
-        if self.weak.strong_count() == 0 {
+        if self.live.gone() {
             return OperatorExit::Gone;
         }
 

@@ -10,6 +10,53 @@ use k9rs_app::RowPredicate;
 use crate::{ds_try, ActionResult};
 
 
+/// A root list element for `rid`, opened in `namespace`.
+///
+/// [`App::root_list_element`]'s first three arguments are always the same
+/// three things — this session, the app's metrics hub, the app-level core —
+/// and the five-argument recipe appeared at TEN sites across two files. A
+/// reader had to check each one to see whether any of them differed; the two
+/// that actually vary are the ones left here.
+pub(crate) fn root_for(
+    app: &App,
+    data_source: &ClientSession,
+    rid: protocol::ResourceId,
+    namespace: protocol::Namespace,
+) -> Element {
+    App::root_list_element(data_source, &app.kube.metrics, &app.core, rid, namespace)
+}
+
+// ---------------------------------------------------------------------------
+// The refusals a user reads more than once
+// ---------------------------------------------------------------------------
+//
+// Named because they are the user's VOCABULARY, not strings. Each of these
+// was written out two or three times, so the same situation could come to
+// read two ways — and a refusal the user half-recognises is worse than one
+// they have seen before. They live here rather than at each site for the
+// same reason the keymap's labels do.
+
+/// Marks are a table's feature; a detail, log or dialog view has no rows.
+pub(crate) const NO_MARKING_HERE: &str = "Marking isn't available in this view";
+
+/// The top element names no resource to stream logs from.
+pub(crate) const NOTHING_TO_LOG: &str = "Nothing here to log";
+
+/// Marks survive a `clear()` but rows do not, so during the Ctrl-R window
+/// the marked-and-present set is honestly empty.
+pub(crate) const NO_MARKED_ROWS_PRESENT: &str = "No marked rows present (still refreshing?)";
+
+/// The contexts view is reachable before a context is chosen.
+pub(crate) const SELECT_A_CONTEXT_FIRST: &str = "Select a context first";
+
+/// A port-forward needs a row.
+pub(crate) const NO_PORT_FORWARD_TARGET: &str = "No target found for port-forward";
+
+/// How a failed write to a temp file reads, wherever it is reported from.
+pub(crate) fn save_failed(e: impl std::fmt::Display) -> String {
+    format!("Save failed: {e}")
+}
+
 // ---------------------------------------------------------------------------
 // Main dispatcher — thin routing table, delegates to focused sub-functions
 // ---------------------------------------------------------------------------
@@ -90,22 +137,18 @@ pub(crate) fn handle_action(
             ) =>
         {
             app.ui.flash = Some(k9rs_app::FlashMessage::warn(
-                "Select a context first".to_string(),
+                SELECT_A_CONTEXT_FIRST.to_string(),
             ));
         }
         Action::NextTab => {
             let new_rid = app.next_tab();
-            let root = App::root_list_element(
-                data_source, &app.kube.metrics,
-                &app.core, new_rid, app.kube.selected_ns.clone(),
+            let root = root_for(app, data_source, new_rid, app.kube.selected_ns.clone(),
             );
             app.nav.reset(root);
         }
         Action::PrevTab => {
             let new_rid = app.prev_tab();
-            let root = App::root_list_element(
-                data_source, &app.kube.metrics,
-                &app.core, new_rid, app.kube.selected_ns.clone(),
+            let root = root_for(app, data_source, new_rid, app.kube.selected_ns.clone(),
             );
             app.nav.reset(root);
         }
@@ -201,7 +244,7 @@ pub(crate) fn handle_action(
             }
             k9rs_app::MarkOutcome::Unsupported => {
                 app.ui.flash = Some(k9rs_app::FlashMessage::info(
-                    "Marking isn't available in this view".to_string(),
+                    NO_MARKING_HERE.to_string(),
                 ));
             }
         },
@@ -214,22 +257,20 @@ pub(crate) fn handle_action(
             }
             k9rs_app::SpanOutcome::Unsupported => {
                 app.ui.flash = Some(k9rs_app::FlashMessage::info(
-                    "Marking isn't available in this view".to_string(),
+                    NO_MARKING_HERE.to_string(),
                 ));
             }
         },
         Action::ClearMarks => {
             if !app.clear_marks() {
                 app.ui.flash = Some(k9rs_app::FlashMessage::info(
-                    "Marking isn't available in this view".to_string(),
+                    NO_MARKING_HERE.to_string(),
                 ));
             }
         }
         Action::ToggleLastView => {
             if let Some(k9rs_app::RootSpec::Resource(last_rid)) = app.nav.prev_root().cloned() {
-                let root = App::root_list_element(
-                    data_source, &app.kube.metrics,
-                &app.core, last_rid, app.kube.selected_ns.clone(),
+                let root = root_for(app, data_source, last_rid, app.kube.selected_ns.clone(),
                 );
                 app.nav.reset(root);
             }
@@ -251,12 +292,12 @@ pub(crate) fn handle_action(
                     app.nav.push(k9rs_app::Element::Form(Box::new(dialog)));
                 } else {
                     app.ui.flash = Some(k9rs_app::FlashMessage::error(
-                        "No target found for port-forward".to_string()
+                        NO_PORT_FORWARD_TARGET.to_string()
                     ));
                 }
             } else {
                 app.ui.flash = Some(k9rs_app::FlashMessage::error(
-                    "No target found for port-forward".to_string()
+                    NO_PORT_FORWARD_TARGET.to_string()
                 ));
             }
         }
@@ -381,45 +422,54 @@ fn handle_resource_op(
                 if app.nav.top().derived_kind().is_some() {
                     let origin = app.nav.top().origin().cloned();
                     let item = app.nav.top().selected_row();
-                    if let (Some(origin), Some(item)) = (origin, item) {
-                        // Only a Named namespace can be shelled into; `All` is
-                        // structurally excluded (and a namespace literally named
-                        // "all" is `Named("all")`, so it works correctly — the
-                        // old `ns != "all"` magic-string guard wrongly rejected it).
-                        if let k9rs_proto::protocol::Namespace::Named(ns) = &origin.namespace {
-                            return ActionResult::Exec {
-                                op: k9rs_proto::protocol::OperationKind::Shell,
-                                target: crate::ExecTarget::Pod {
-                                    pod: origin.name.clone(),
-                                    namespace: ns.clone(),
-                                    container: item.name.clone(),
-                                },
-                            };
-                        }
-                    }
-                    return ActionResult::None;
-                }
-                let Some(current_rid) = app.nav.resource_id().cloned() else { return ActionResult::None; };
-                if let Some(row) = app.nav.top().selected_row() {
-                    let Some(pod_ns) = row.namespace.clone() else {
+                    let (Some(origin), Some(item)) = (origin, item) else {
                         app.ui.flash = Some(k9rs_app::FlashMessage::error(
-                            format!("Shell refused: pod/{} has no resolved namespace", row.name)
+                            "Shell refused: no container selected".to_string(),
                         ));
                         return ActionResult::None;
                     };
-                    if pod_ns.is_empty() {
-                        app.ui.flash = Some(k9rs_app::FlashMessage::error(
-                            format!("Shell refused: pod/{} has empty namespace", row.name)
-                        ));
-                        return ActionResult::None;
-                    }
+                    // Through `exec_namespace`, so the same refusal the
+                    // non-derived path flashes is flashed here. This arm
+                    // used to `return ActionResult::None` with no message —
+                    // the key looked broken.
+                    let namespace = match exec_namespace(&origin) {
+                        Ok(ns) => ns,
+                        Err(why) => {
+                            app.ui.flash = Some(k9rs_app::FlashMessage::error(why));
+                            return ActionResult::None;
+                        }
+                    };
+                    return ActionResult::Exec {
+                        op: k9rs_proto::protocol::OperationKind::Shell,
+                        target: crate::ExecTarget::Pod {
+                            pod: origin.name.clone(),
+                            namespace,
+                            container: item.name.clone(),
+                        },
+                    };
+                }
+                let Some(current_rid) = app.nav.resource_id().cloned() else { return ActionResult::None; };
+                if let Some(row) = app.nav.top().selected_row() {
                     let pod_name = row.name.clone();
                     let containers = &row.containers;
                     let target = k9rs_proto::protocol::ObjectRef::new(
                         current_rid,
                         pod_name.clone(),
-                        k9rs_proto::protocol::Namespace::from_row(&pod_ns),
+                        // `from_row` maps both absent and empty to `All`,
+                        // which `exec_namespace` refuses — one guard where
+                        // there were two, whose two messages ("no resolved"
+                        // vs "empty") described one state of the data.
+                        k9rs_proto::protocol::Namespace::from_row(
+                            row.namespace.as_deref().unwrap_or_default(),
+                        ),
                     );
+                    let namespace = match exec_namespace(&target) {
+                        Ok(ns) => ns,
+                        Err(why) => {
+                            app.ui.flash = Some(k9rs_app::FlashMessage::error(why));
+                            return ActionResult::None;
+                        }
+                    };
                     if containers.len() > 1 {
                         app.ui.close_modal();
                         let action = k9rs_app::ContainerAction::Shell;
@@ -433,7 +483,7 @@ fn handle_resource_op(
                         let container = containers.first().map(|c| c.name.clone()).unwrap_or_default();
                         return ActionResult::Exec { op: k9rs_proto::protocol::OperationKind::Shell, target: crate::ExecTarget::Pod {
                             pod: pod_name,
-                            namespace: pod_ns,
+                            namespace,
                             container,
                         } };
                     }
@@ -549,7 +599,24 @@ fn handle_resource_op(
                 ds_try!(app, data_source.toggle_suspend_cronjob(&info));
             }
         }
-        _ => {}
+        // An action routed here that this function does not handle is a
+        // SILENT no-op — the key looks broken and nothing says why. The
+        // outer `handle_action` match is exhaustive, so a new `Action` has
+        // to be routed somewhere; what is NOT checked is that the group it
+        // joins actually handles it, because `a` is the whole `Action` enum
+        // here and the compiler cannot narrow it.
+        //
+        // Loud in a DEBUG RUN, a no-op in release. Not in the suite: these
+        // sub-dispatchers take a live `ClientSession`, which has no test
+        // constructor (and must not get one that opens a socket — tests
+        // never touch a daemon), so nothing here can drive a misroute past
+        // this arm. The tripwire is for whoever runs the debug binary next.
+        //
+        // The full fix is a per-group enum, so the parameter itself is
+        // narrow and the compiler refuses: seven new types, deliberately
+        // not taken for a hazard that is latent — all seven groups cover
+        // their routed sets today, counted.
+        other => debug_assert!(false, "{other:?} was routed to handle_resource_op and not handled"),
     }
     ActionResult::None
 }
@@ -582,7 +649,7 @@ pub(crate) fn handle_batch_op(app: &mut App, action: k9rs_app::Action) {
     let targets = get_marked_resource_infos(app);
     if targets.is_empty() {
         app.ui.flash = Some(k9rs_app::FlashMessage::warn(
-            "No marked rows present (still refreshing?)".to_string(),
+            NO_MARKED_ROWS_PRESENT.to_string(),
         ));
         return;
     }
@@ -642,7 +709,6 @@ fn batch_confirm_message(verb: &str, targets: &[k9rs_proto::protocol::ObjectRef]
 /// while this collapses to a single `LogInit` the daemon fans out and merges
 /// back. N log views would answer a question nobody asked.
 ///
-/// Two things it refuses rather than guesses:
 /// Each marked row resolves through the SAME `row_log_target` a single
 /// `Ctrl-L` uses, so a hovered deployment and a marked one can't disagree
 /// about which pods they mean; the union is what lets a mixed selection —
@@ -650,7 +716,7 @@ fn batch_confirm_message(verb: &str, targets: &[k9rs_proto::protocol::ObjectRef]
 /// container projection the selection lands on the other axis instead
 /// (see [`batch_container_log_spec`]).
 ///
-/// Two things it still refuses rather than guesses:
+/// Two things it refuses rather than guesses:
 /// - **A selection spanning namespaces.** One stream carries one namespace
 ///   (`LogInit.namespace`), which is the same constraint `kubectl logs` has.
 /// - **Rows with no logs at all** — a namespace, a configmap. A row earns a
@@ -678,27 +744,17 @@ pub(crate) fn batch_log_spec(app: &App) -> Result<protocol::LogInit, String> {
         };
     }
 
-    let Some(store) = app.nav.top().data_store() else {
-        return Err("Nothing here to log".to_string());
-    };
     let Some(rid) = app.nav.top().rid().cloned() else {
-        return Err("Nothing here to log".to_string());
+        return Err(NOTHING_TO_LOG.to_string());
     };
 
-    // Marks ∩ present rows, read once — same honesty as `handle_batch_op`:
-    // during the Ctrl-R window marks survive but rows don't, so this is
-    // empty rather than acting on identities the store can't vouch for.
-    let marked: Vec<k9rs_proto::row::ResourceRow> = store.with_read(|inner| {
-        inner
-            .rows
-            .iter()
-            .filter(|row| inner.marked().contains(&k9rs_app::row_key(row)))
-            .cloned()
-            .collect()
-    });
+    // Marks ∩ present rows — see `marked_rows`, which is also what the
+    // mutating batch ops read, so the two cannot disagree about the Ctrl-R
+    // window.
+    let marked = marked_rows(app);
 
     if marked.is_empty() {
-        return Err("No marked rows present (still refreshing?)".to_string());
+        return Err(NO_MARKED_ROWS_PRESENT.to_string());
     }
     let ns = marked[0].namespace.clone().unwrap_or_default();
     if marked.iter().any(|r| r.namespace.clone().unwrap_or_default() != ns) {
@@ -761,7 +817,7 @@ pub(crate) fn batch_log_spec(app: &App) -> Result<protocol::LogInit, String> {
 /// three of the eight.
 fn batch_container_log_spec(app: &App) -> Result<protocol::LogInit, String> {
     let Some(origin) = app.nav.top().origin().cloned() else {
-        return Err("Nothing here to log".to_string());
+        return Err(NOTHING_TO_LOG.to_string());
     };
     // `marked_keys` is already intersected with the live projection, and
     // returns them in VIEW order so the header reads the way the table did.
@@ -901,6 +957,18 @@ fn handle_confirm_action(
 // Filter & search
 // ---------------------------------------------------------------------------
 
+/// Start a grep draft on the top element if it is a log view.
+///
+/// Named because TWO actions reach it — `/` arrives as `Filter` in a table
+/// and as `SearchStart` in a detail or log view, and in a log view both mean
+/// the same thing. Poking `view.draft` at both sites is how "begin a grep"
+/// comes to have two definitions the first time it grows a second step.
+fn begin_log_grep(app: &mut App) -> bool {
+    let Some(view) = app.nav.top_mut().log_view_mut() else { return false };
+    view.draft = Some(k9rs_app::TextInput::new());
+    true
+}
+
 fn handle_filter_search(
     app: &mut App,
     action: k9rs_app::Action,
@@ -910,10 +978,10 @@ fn handle_filter_search(
 
     match action {
         Action::Filter(_) => {
-            if let Some(view) = app.nav.top_mut().log_view_mut() {
-                view.draft = Some(k9rs_app::TextInput::new());
-            } else if let Some(fi) = app.nav.top_mut().filter_input_mut() {
-                fi.start();
+            if !begin_log_grep(app) {
+                if let Some(fi) = app.nav.top_mut().filter_input_mut() {
+                    fi.start();
+                }
             }
         }
         Action::ColumnFilter => {
@@ -975,10 +1043,8 @@ fn handle_filter_search(
                     cv.state.search_input_active = true;
                     cv.state.search_input.clear();
                 }
-                el => {
-                    if let Some(view) = el.log_view_mut() {
-                        view.draft = Some(k9rs_app::TextInput::new());
-                    }
+                _ => {
+                    begin_log_grep(app);
                 }
             }
         }
@@ -1009,7 +1075,24 @@ fn handle_filter_search(
             }
             // Log views: committed filters are elements — cleared via Esc.
         }
-        _ => {}
+        // An action routed here that this function does not handle is a
+        // SILENT no-op — the key looks broken and nothing says why. The
+        // outer `handle_action` match is exhaustive, so a new `Action` has
+        // to be routed somewhere; what is NOT checked is that the group it
+        // joins actually handles it, because `a` is the whole `Action` enum
+        // here and the compiler cannot narrow it.
+        //
+        // Loud in a DEBUG RUN, a no-op in release. Not in the suite: these
+        // sub-dispatchers take a live `ClientSession`, which has no test
+        // constructor (and must not get one that opens a socket — tests
+        // never touch a daemon), so nothing here can drive a misroute past
+        // this arm. The tripwire is for whoever runs the debug binary next.
+        //
+        // The full fix is a per-group enum, so the parameter itself is
+        // narrow and the compiler refuses: seven new types, deliberately
+        // not taken for a hazard that is latent — all seven groups cover
+        // their routed sets today, counted.
+        other => debug_assert!(false, "{other:?} was routed to handle_filter_search and not handled"),
     }
 }
 
@@ -1105,12 +1188,7 @@ fn handle_log_action(
                 return;
             };
             let (what, container, _) = s.header();
-            let safe = |x: &str| x.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
-            let filename = format!(
-                "logs-{}-{}-{}.log",
-                safe(&what), safe(&container),
-                chrono::Utc::now().format("%Y%m%d-%H%M%S"),
-            );
+            let filename = dump_filename(&["logs", &what, &container], "log");
             let content: String = s.store().with_read(|i| {
                 i.lines.iter()
                     .map(|l| l.flat_text())
@@ -1119,7 +1197,24 @@ fn handle_log_action(
             });
             write_log_file(app, &filename, &content);
         }
-        _ => {}
+        // An action routed here that this function does not handle is a
+        // SILENT no-op — the key looks broken and nothing says why. The
+        // outer `handle_action` match is exhaustive, so a new `Action` has
+        // to be routed somewhere; what is NOT checked is that the group it
+        // joins actually handles it, because `a` is the whole `Action` enum
+        // here and the compiler cannot narrow it.
+        //
+        // Loud in a DEBUG RUN, a no-op in release. Not in the suite: these
+        // sub-dispatchers take a live `ClientSession`, which has no test
+        // constructor (and must not get one that opens a socket — tests
+        // never touch a daemon), so nothing here can drive a misroute past
+        // this arm. The tripwire is for whoever runs the debug binary next.
+        //
+        // The full fix is a per-group enum, so the parameter itself is
+        // narrow and the compiler refuses: seven new types, deliberately
+        // not taken for a hazard that is latent — all seven groups cover
+        // their routed sets today, counted.
+        other => debug_assert!(false, "{other:?} was routed to handle_log_action and not handled"),
     }
 }
 
@@ -1134,8 +1229,35 @@ fn save_visible_logs(app: &mut App) {
             .collect::<Vec<_>>()
             .join("\n")
     });
-    let filename = format!("logs-filtered-{}.log", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    let filename = dump_filename(&["logs", "filtered"], "log");
     write_log_file(app, &filename, &content);
+}
+
+/// A filename for a saved dump: the parts, sanitized, plus a UTC stamp.
+///
+/// The sanitizing closure was written out twice, verbatim, and the
+/// `"%Y%m%d-%H%M%S"` format three times. A saved file's name is the one
+/// thing the user has to find it by afterwards, so the three sites agreeing
+/// matters more than their being short.
+///
+/// Non-alphanumeric ASCII becomes `-`, which is deliberately aggressive:
+/// these parts come from a resource title and a container name, and the file
+/// lands in a temp directory by path.
+fn dump_filename(parts: &[&str], extension: &str) -> String {
+    let safe = |x: &str| {
+        x.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+    };
+    let mut name = String::new();
+    for part in parts {
+        name.push_str(&safe(part));
+        name.push('-');
+    }
+    name.push_str(&chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string());
+    name.push('.');
+    name.push_str(extension);
+    name
 }
 
 fn write_log_file(app: &mut App, filename: &str, content: &str) {
@@ -1148,7 +1270,7 @@ fn write_log_file(app: &mut App, filename: &str, content: &str) {
         }
         Err(e) => {
             app.ui.flash = Some(k9rs_app::FlashMessage::error(
-                format!("Save failed: {}", e)
+                save_failed(e)
             ));
         }
     }
@@ -1339,7 +1461,24 @@ fn handle_drill(
                 }
             }
         }
-        _ => {}
+        // An action routed here that this function does not handle is a
+        // SILENT no-op — the key looks broken and nothing says why. The
+        // outer `handle_action` match is exhaustive, so a new `Action` has
+        // to be routed somewhere; what is NOT checked is that the group it
+        // joins actually handles it, because `a` is the whole `Action` enum
+        // here and the compiler cannot narrow it.
+        //
+        // Loud in a DEBUG RUN, a no-op in release. Not in the suite: these
+        // sub-dispatchers take a live `ClientSession`, which has no test
+        // constructor (and must not get one that opens a socket — tests
+        // never touch a daemon), so nothing here can drive a misroute past
+        // this arm. The tripwire is for whoever runs the debug binary next.
+        //
+        // The full fix is a per-group enum, so the parameter itself is
+        // narrow and the compiler refuses: seven new types, deliberately
+        // not taken for a hazard that is latent — all seven groups cover
+        // their routed sets today, counted.
+        other => debug_assert!(false, "{other:?} was routed to handle_drill and not handled"),
     }
     ActionResult::None
 }
@@ -1413,12 +1552,7 @@ fn handle_io(
             send_to_clipboard(data_source, event_tx, text, label);
         }
         Action::SaveTable => {
-            let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
-            let filename = format!(
-                "{}-{}.txt",
-                safe(app.nav.top().title()),
-                chrono::Utc::now().format("%Y%m%d-%H%M%S")
-            );
+            let filename = dump_filename(&[app.nav.top().title()], "txt");
             let content = build_table_dump(app);
             let tx = event_tx.clone();
             data_source.track_task(async move {
@@ -1430,15 +1564,32 @@ fn handle_io(
                         let _ = tx.send(AppEvent::Flash(k9rs_app::FlashMessage::info(format!("Saved to {}", path.display())))).await;
                     }
                     Ok(Err(e)) => {
-                        let _ = tx.send(AppEvent::Flash(k9rs_app::FlashMessage::error(format!("Save failed: {}", e)))).await;
+                        let _ = tx.send(AppEvent::Flash(k9rs_app::FlashMessage::error(save_failed(e)))).await;
                     }
                     Err(e) => {
-                        let _ = tx.send(AppEvent::Flash(k9rs_app::FlashMessage::error(format!("Save failed: {}", e)))).await;
+                        let _ = tx.send(AppEvent::Flash(k9rs_app::FlashMessage::error(save_failed(e)))).await;
                     }
                 }
             });
         }
-        _ => {}
+        // An action routed here that this function does not handle is a
+        // SILENT no-op — the key looks broken and nothing says why. The
+        // outer `handle_action` match is exhaustive, so a new `Action` has
+        // to be routed somewhere; what is NOT checked is that the group it
+        // joins actually handles it, because `a` is the whole `Action` enum
+        // here and the compiler cannot narrow it.
+        //
+        // Loud in a DEBUG RUN, a no-op in release. Not in the suite: these
+        // sub-dispatchers take a live `ClientSession`, which has no test
+        // constructor (and must not get one that opens a socket — tests
+        // never touch a daemon), so nothing here can drive a misroute past
+        // this arm. The tripwire is for whoever runs the debug binary next.
+        //
+        // The full fix is a per-group enum, so the parameter itself is
+        // narrow and the compiler refuses: seven new types, deliberately
+        // not taken for a hazard that is latent — all seven groups cover
+        // their routed sets today, counted.
+        other => debug_assert!(false, "{other:?} was routed to handle_io and not handled"),
     }
 }
 
@@ -1508,13 +1659,7 @@ fn handle_show_aliases(app: &mut App, data_source: &k9rs_app::ClientSession) {
     // reason every root-level resource command does: this is a reference
     // view you go TO, not a sheet you consult about where you are.
     let rid = k9rs_proto::local_types::LocalResourceKind::Alias.to_resource_id();
-    app.nav.reset(k9rs_app::App::root_list_element(
-        data_source,
-        &app.kube.metrics,
-        &app.core,
-        rid,
-        protocol::Namespace::All,
-    ));
+    app.nav.reset(root_for(app, data_source, rid, protocol::Namespace::All));
 }
 
 // ===========================================================================
@@ -1522,6 +1667,39 @@ fn handle_show_aliases(app: &mut App, data_source: &k9rs_app::ClientSession) {
 // ===========================================================================
 
 /// Map a container name string from a row to the typed `LogContainer`.
+/// The namespace an exec/shell may run in, or why it may not — the one
+/// answer to a question three call sites asked three ways.
+///
+/// They were: the non-derived shell path (refused `None` AND empty, each
+/// with a precise flash), the DERIVED path (`if let Namespace::Named(ns)`,
+/// falling through to a bare `return` with **no flash at all** — press `s`
+/// in a container table on an all-namespaces view and nothing happened and
+/// nothing was said, against this file's own doctrine that "a miss must say
+/// so, not silently swallow the key"), and the container picker
+/// (`namespace.display().to_string()`, unguarded — and `Namespace::All`
+/// displays as the literal `"all"`, so `All` became a namespace NAME,
+/// reintroducing by stringification the magic string the comment above the
+/// derived path brags about having removed).
+///
+/// The picker was safe only because its one producer sits downstream of the
+/// non-derived guards — safe by a guard two functions away, not by
+/// construction.
+fn exec_namespace(target: &protocol::ObjectRef) -> Result<String, String> {
+    let protocol::Namespace::Named(ns) = &target.namespace else {
+        return Err(format!(
+            "Shell refused: {} has no resolved namespace",
+            target.kubectl_target(),
+        ));
+    };
+    if ns.is_empty() {
+        return Err(format!(
+            "Shell refused: {} has empty namespace",
+            target.kubectl_target(),
+        ));
+    }
+    Ok(ns.clone())
+}
+
 /// Empty -> `Default` (let kubectl pick); a real container name -> `Named`.
 fn log_container_from_str(name: &str) -> protocol::LogContainer {
     if name.is_empty() {
@@ -1556,12 +1734,12 @@ pub(crate) fn handle_enter(
         _ => None,
     };
     if let Some((target, picked, selected, action)) = pick {
-        let pod_ns_str = target.namespace.display().to_string();
         // The dialog captured its choices at construction.
         let Some(picked) = picked else {
-            app.ui.flash = Some(k9rs_app::FlashMessage::error(
-                format!("Pod {}/{} no longer has a container at index {}", pod_ns_str, target.name, selected)
-            ));
+            app.ui.flash = Some(k9rs_app::FlashMessage::error(format!(
+                "{} no longer has a container at index {selected}",
+                target.kubectl_target(),
+            )));
             app.ui.close_modal();
             return ActionResult::None;
         };
@@ -1577,9 +1755,22 @@ pub(crate) fn handle_enter(
                 ));
                 return ActionResult::None;
             };
+            // Through `exec_namespace` like the other two. This was
+            // `target.namespace.display().to_string()` with no guard, and
+            // `Namespace::All` displays as the literal "all" — so `All`
+            // would have become a namespace NAME. It was safe only because
+            // the one producer of a Shell picker sits downstream of the
+            // non-derived guards, two functions away.
+            let namespace = match exec_namespace(&target) {
+                Ok(ns) => ns,
+                Err(why) => {
+                    app.ui.flash = Some(k9rs_app::FlashMessage::error(why));
+                    return ActionResult::None;
+                }
+            };
             return ActionResult::Exec { op: k9rs_proto::protocol::OperationKind::Shell, target: crate::ExecTarget::Pod {
                 pod: target.name,
-                namespace: pod_ns_str,
+                namespace,
                 container,
             } };
         }
@@ -2158,8 +2349,8 @@ pub(crate) fn get_selected_resource_info(app: &App) -> Option<ObjectRef> {
     ))
 }
 
-/// Resource refs for all marked rows on the top element's data,
-/// intersected with the rows PRESENT in the store at read time.
+/// The marked rows on the top element's data, intersected with the rows
+/// PRESENT in the store at read time.
 ///
 /// Marks are IDENTITY-keyed on the shared store, so this is the marked
 /// set as data — deliberately independent of the current refinement (a
@@ -2172,10 +2363,13 @@ pub(crate) fn get_selected_resource_info(app: &App) -> Option<ObjectRef> {
 /// unknown — it is honestly empty, so nothing can operate on an
 /// identity the store cannot vouch for. Iterating rows also gives the
 /// output a stable (store) order.
-pub(crate) fn get_marked_resource_infos(app: &App) -> Vec<ObjectRef> {
-    use k9rs_proto::protocol::Namespace;
-
-    let Some(current_rid) = app.nav.top().rid().cloned() else { return Vec::new(); };
+///
+/// ONE implementation. `batch_log_spec` had its own `with_read` closure
+/// walking the same rows against the same `marked()`, under a copy of this
+/// paragraph — differing only in what it projected, and missing the
+/// `has_marks` short-circuit. A change to the intersection semantics, which
+/// both docs call load-bearing for the Ctrl-R window, had to be made twice.
+pub(crate) fn marked_rows(app: &App) -> Vec<k9rs_proto::row::ResourceRow> {
     if !app.nav.top().has_marks() {
         return Vec::new();
     }
@@ -2184,17 +2378,27 @@ pub(crate) fn get_marked_resource_infos(app: &App) -> Vec<ObjectRef> {
         inner
             .rows
             .iter()
-            .map(k9rs_app::row_key)
-            .filter(|k| inner.marked().contains(k))
-            .map(|key| {
-                ObjectRef::new(
-                    current_rid.clone(),
-                    key.name,
-                    Namespace::from_row(&key.namespace),
-                )
-            })
+            .filter(|row| inner.marked().contains(&k9rs_app::row_key(row)))
+            .cloned()
             .collect()
     })
+}
+
+/// [`marked_rows`] as wire refs — the projection the mutating batch ops
+/// need.
+pub(crate) fn get_marked_resource_infos(app: &App) -> Vec<ObjectRef> {
+    use k9rs_proto::protocol::Namespace;
+    let Some(current_rid) = app.nav.top().rid().cloned() else { return Vec::new(); };
+    marked_rows(app)
+        .into_iter()
+        .map(|row| {
+            ObjectRef::new(
+                current_rid.clone(),
+                row.name,
+                Namespace::from_row(row.namespace.as_deref().unwrap_or_default()),
+            )
+        })
+        .collect()
 }
 
 // ===========================================================================
@@ -2390,8 +2594,7 @@ pub(crate) fn do_switch_namespace(
         Some(k9rs_app::RootSpec::Resource(r)) => r,
         None => BuiltInKind::Pod.to_resource_id(),
     };
-    let root = App::root_list_element(data_source, &app.kube.metrics,
-                &app.core, root_rid, ns.clone());
+    let root = root_for(app, data_source, root_rid, ns.clone());
     app.nav.reset(root);
 
     app.ui.flash = Some(k9rs_app::FlashMessage::info(format!(

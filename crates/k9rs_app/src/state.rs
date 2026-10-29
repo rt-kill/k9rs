@@ -134,14 +134,6 @@ impl UiState {
         }
     }
 
-    /// The `:` prompt's buffer itself, for the renderer — which needs the
-    /// CARET, not just the text, to window a long command around it.
-    pub fn command_text(&self) -> Option<&crate::text_input::TextInput> {
-        match &self.modal {
-            Modal::Command { input, .. } => Some(input),
-            _ => None,
-        }
-    }
 
     /// Mutable access to the `:` prompt's buffer, for the editing keys.
     pub fn command_input_mut(
@@ -192,11 +184,20 @@ impl UiState {
 
 impl UiState {
 
-    /// The `:` prompt's rendered prefix, or `""` when it isn't open.
-    pub fn command_prompt(&self) -> &'static str {
+    /// The `:` prompt's rendered prefix and its buffer, if it is the open
+    /// modal. The buffer carries the CARET, which a renderer needs to
+    /// window a long command around.
+    ///
+    /// One accessor, because a renderer wants both or neither. There were
+    /// three on this one variant — `command_input`, `command_text`, and a
+    /// `command_prompt` that spelled absence `""` while its two siblings
+    /// spelled it `None`. Both renderers then asked twice each and carried
+    /// a `None` fallback neither could reach, since both are called only
+    /// when the prompt is open.
+    pub fn command_prompt(&self) -> Option<(&'static str, &crate::text_input::TextInput)> {
         match &self.modal {
-            Modal::Command { .. } => ":",
-            _ => "",
+            Modal::Command { input, .. } => Some((":", input)),
+            _ => None,
         }
     }
 

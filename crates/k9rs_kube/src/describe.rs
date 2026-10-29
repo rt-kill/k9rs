@@ -72,7 +72,7 @@ pub async fn fetch_describe(
 /// producer side — for text whose structure isn't otherwise known, inference is
 /// legitimate (nothing the producer knows is being discarded). Structured
 /// producers like `format_describe` tag precisely instead of calling this.
-pub fn classify_describe_line(text: &str) -> DescribeLineKind {
+fn classify_describe_line(text: &str) -> DescribeLineKind {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         DescribeLineKind::Plain
@@ -125,6 +125,21 @@ fn field_line(text: String) -> DescribeLine {
     let text = k9rs_util::text::visible_text(&text).into_owned();
     let key_end = text.find(':').unwrap_or(text.len());
     DescribeLine::field(text, key_end)
+}
+
+/// A structureless line, cleaned.
+///
+/// `DescribeLine::plain` does not clean — it is the wire type's plain
+/// constructor and has no business knowing about terminals — so the two
+/// callers in [`format_describe`] that used it directly shipped
+/// cluster-supplied text straight through. Both are CONTINUATION lines: the
+/// second and later label and annotation entries, whose keys and values are
+/// arbitrary UTF-8 from the object. The first entry of each went through
+/// `field_line` and was cleaned, so one label was safe and the rest were
+/// not, which is the kind of split a test over the first line alone cannot
+/// see. Found by testing this path at all.
+fn plain_line(text: String) -> DescribeLine {
+    DescribeLine::plain(k9rs_util::text::visible_text(&text).into_owned())
 }
 
 /// Fetch YAML for a resource. Tries the kube API first (fast, no subprocess),
@@ -282,7 +297,12 @@ fn format_describe(obj: &kube::api::DynamicObject) -> Vec<DescribeLine> {
 
     // Header
     let kind = obj.types.as_ref().map(|t| t.kind.as_str()).unwrap_or("Resource");
-    lines.push(field_line(format!("Name:         {}", meta.name.as_deref().unwrap_or(""))));
+    // `<none>` for both: two consecutive lines spelled absent two ways —
+    // an empty value for a missing name and `<none>` for a missing
+    // namespace — so the one case that reads as a rendering bug (a field
+    // with nothing after the colon) was the one where the object really had
+    // no name. Every other "absent" in this function is `<none>`.
+    lines.push(field_line(format!("Name:         {}", meta.name.as_deref().unwrap_or("<none>"))));
     lines.push(field_line(format!("Namespace:    {}", meta.namespace.as_deref().unwrap_or("<none>"))));
     if let Some(uid) = &meta.uid {
         lines.push(field_line(format!("UID:          {}", uid)));
@@ -301,8 +321,9 @@ fn format_describe(obj: &kube::api::DynamicObject) -> Vec<DescribeLine> {
                 if i == 0 {
                     lines.push(field_line(format!("Labels:       {}={}", k, v)));
                 } else {
-                    // Continuation value — no structural key.
-                    lines.push(DescribeLine::plain(format!("              {}={}", k, v)));
+                    // Continuation value — no structural key, and cleaned
+                    // for the same reason the first entry is.
+                    lines.push(plain_line(format!("              {}={}", k, v)));
                 }
             }
         }
@@ -323,7 +344,7 @@ fn format_describe(obj: &kube::api::DynamicObject) -> Vec<DescribeLine> {
                 if i == 0 {
                     lines.push(field_line(format!("Annotations:  {}={}", k, display_v)));
                 } else {
-                    lines.push(DescribeLine::plain(format!("              {}={}", k, display_v)));
+                    lines.push(plain_line(format!("              {}={}", k, display_v)));
                 }
             }
         }

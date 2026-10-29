@@ -54,7 +54,7 @@ impl ConvertToRow<StatefulSet> for StatefulSetDef {
             CellValue::Text(service_name),
             CellValue::from_comma_str(&containers.names),
             CellValue::from_comma_str(&containers.images),
-            CellValue::from_comma_str(&meta.labels_str),
+            meta.labels_cell(),
             CellValue::Age(meta.age.map(|t| t.timestamp())),
         ];
         ResourceRow {

@@ -490,7 +490,48 @@ pub fn load() -> Result<AppConfig, String> {
     // empty section name.
     let config = k9rs_config::load_section::<AppConfig>("")?.unwrap_or_default();
     config.keys.validate()?;
+    config.validate()?;
     Ok(config)
+}
+
+impl AppConfig {
+    /// Refuse a numeric value whose behaviour contradicts its own name.
+    ///
+    /// `load` validated `keys` and nothing else, so the three settings below
+    /// were accepted at zero and then did something other than what they
+    /// say. That is the silent fallback this module's header says it exists
+    /// to refuse — it is loud about a misspelled key and was quiet about a
+    /// correctly-spelled one with a meaningless value.
+    ///
+    /// Only these three. Several siblings have a perfectly good zero and are
+    /// deliberately not checked: `flash.*Secs: 0` is "do not linger",
+    /// `searchContextLines: 0` is "no context", `commandHistorySize: 0` is
+    /// "no history" (and the trim loop handles it exactly), and
+    /// `logs.tailLines: 0` is kubectl's `--tail=0`, i.e. follow without
+    /// backfill. Refusing those would be strictness for its own sake.
+    fn validate(&self) -> Result<(), String> {
+        if self.ui.max_column_width == 0 {
+            return Err(
+                "ui.maxColumnWidth: 0 truncates every column to nothing — it is a cap, \
+                 not a switch"
+                    .to_string(),
+            );
+        }
+        if self.ui.logs.max_lines == 0 {
+            return Err(
+                "ui.logs.maxLines: 0 keeps no log lines at all — it is a cap, not a switch"
+                    .to_string(),
+            );
+        }
+        if self.ui.cache_capacity == 0 {
+            return Err(
+                "ui.cacheCapacity: 0 does not disable the cache — the eviction is one entry \
+                 per insert, so it behaves as 1. Say 1."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

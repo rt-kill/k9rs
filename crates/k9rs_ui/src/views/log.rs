@@ -265,17 +265,16 @@ pub(crate) fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     let wrap_state = if wrap { "On" } else { "Off" };
     // ONE indicator for the whole cycle, naming what is showing rather than
     // one On/Off per role — which is the same collapse the key went through.
-    let fields: Vec<&str> = k9rs_proto::protocol::Role::SHED_ORDER
+    // Over ALL the roles, asking each whether it shows — so the body is in
+    // the list because `shown()` says so, not because the renderer appends
+    // it. This was `SHED_ORDER` (which cannot contain `Body`) with a dead
+    // `Body` arm, an `is_empty` fallback and a hardcoded `+message`.
+    let fields: Vec<&str> = k9rs_proto::protocol::Role::ALL
         .iter()
         .filter(|r| r.shown(shed))
-        .map(|r| match r {
-            k9rs_proto::protocol::Role::Timestamp => "time",
-            k9rs_proto::protocol::Role::Source => "source",
-            k9rs_proto::protocol::Role::Body => "message",
-        })
+        .map(|r| r.label())
         .collect();
-    let fields_state =
-        if fields.is_empty() { "message".to_string() } else { format!("{}+message", fields.join("+")) };
+    let fields_state = fields.join("+");
 
     // GROUPS, not a flat span list: a bar that does not fit drops whole
     // indicators from the right and says so (`crate::header::fit_bar`),

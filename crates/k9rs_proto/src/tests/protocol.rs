@@ -59,7 +59,6 @@ fn test_resource_row_bincode_roundtrip_with_metrics_fields() {
 
 #[test]
 fn test_resource_update_rows_bincode_roundtrip() {
-    let rid = ResourceId::BuiltIn(BuiltInKind::Pod);
     let row = ResourceRow {
         cells: vec![
             CellValue::Text("default".into()),
@@ -77,21 +76,17 @@ fn test_resource_update_rows_bincode_roundtrip() {
         ..Default::default()
     };
     let baseline = TableBaseline {
-        resource: rid.clone(),
         headers: vec!["NAMESPACE".into(), "NAME".into()],
         rows: vec![row],
     };
     let bytes = bincode::serialize(&baseline).unwrap();
     let decoded: TableBaseline = bincode::deserialize(&bytes).unwrap();
-    assert_eq!(decoded.resource, ResourceId::BuiltIn(BuiltInKind::Pod));
-    assert_eq!(decoded.resource.plural(), "pods");
     assert_eq!(decoded.headers.len(), 2);
     assert_eq!(decoded.rows.len(), 1);
 }
 
 #[test]
 fn test_stream_event_baseline_delta_roundtrip() {
-    let rid = ResourceId::BuiltIn(BuiltInKind::Deployment);
     let row = ResourceRow {
         cells: vec![
             CellValue::Text("prod".into()),
@@ -103,7 +98,6 @@ fn test_stream_event_baseline_delta_roundtrip() {
         ..Default::default()
     };
     let baseline = StreamEvent::Baseline(TableBaseline {
-        resource: rid,
         headers: vec!["NAMESPACE".into(), "NAME".into(), "READY".into()],
         rows: vec![row.clone()],
     });
@@ -254,9 +248,7 @@ fn envelope_wire_tags_are_stable() {
         name: String::new(),
     };
     let stream_events: Vec<StreamEvent> = vec![
-        StreamEvent::Baseline(TableBaseline {
-            resource: obj.resource.clone(), headers: vec![], rows: vec![],
-        }),
+        StreamEvent::Baseline(TableBaseline { headers: vec![], rows: vec![] }),
         StreamEvent::Delta(TableDelta { changes: vec![] }),
         StreamEvent::Error(String::new()),
         StreamEvent::Resolved { original: obj.resource.clone(), resolved: obj.resource.clone() },
@@ -295,7 +287,6 @@ fn envelope_wire_tags_are_stable() {
 #[test]
 fn stream_event_ref_tags_match() {
     let baseline = TableBaseline {
-        resource: ResourceId::BuiltIn(crate::resource_def::BuiltInKind::Pod),
         headers: vec!["NAME".into()],
         rows: vec![],
     };
@@ -337,9 +328,16 @@ fn stream_event_ref_tags_match() {
 
 /// Wire-tag stability for the stream enums (bincode u32 LE
 /// declaration-index). Appending is safe; reorder/insert is a break.
+///
+/// The revision assertion is the gate: no wire shape changes without this
+/// test being edited, and editing it is what makes the author say which
+/// change it was. v19 removed `TableBaseline.resource` — a `ResourceId`
+/// every producer wrote and no consumer read, which could only ever
+/// disagree with the subscription that routed the baseline, and did on the
+/// legacy exec-source path.
 #[test]
 fn stream_wire_tags_are_stable() {
-    assert_eq!(WIRE_FORMAT_REVISION, 18);
+    assert_eq!(WIRE_FORMAT_REVISION, 19);
     let b = bincode::serialize(&StreamEvent::Error("x".into())).unwrap();
     assert_eq!(&b[..4], 2u32.to_le_bytes()); // Baseline=0, Delta=1, Error=2
     // Stale/Live APPENDED for v11 — Resolved=3 keeps its tag.
@@ -567,12 +565,13 @@ fn remaining_wire_enum_tags_are_stable() {
     assert_eq!(tag(bincode::serialize(&ContainerKind::Regular).unwrap()), 0);
     assert_eq!(tag(bincode::serialize(&ContainerKind::Init).unwrap()), 1);
 
-    // LocalResourceKind: Context was APPENDED after Custom (tag 3), which the
-    // pre-existing pin stops one short of.
-    assert_eq!(
-        tag(bincode::serialize(&crate::local_types::LocalResourceKind::Context).unwrap()),
-        3,
-    );
+    // LocalResourceKind is NOT pinned here. It was — one variant of it,
+    // `Context`, because the dedicated pin used to stop short of the
+    // appended variants. That pin covers every variant and asserts the
+    // COUNT now, so a second copy here could only ever be the one that
+    // disagreed: removing `ExecResource` for v19 shifted the tags and this
+    // line failed while the authoritative test passed. See
+    // `local_resource_kind_wire_tags_are_stable` in `tests/local_types.rs`.
 
     // DrillTarget: SwitchContext appended at 8.
     assert_eq!(
@@ -1122,4 +1121,103 @@ fn the_real_built_in_list_is_the_generated_one() {
             .any(|op| matches!(op, OperationKind::Custom(_))),
         "an unbounded, overlay-declared operation has no place in a fixed list",
     );
+}
+
+/// An event names its variant and nothing else.
+///
+/// The twin of `SessionCommand::log_summary`'s rule: `DescribeResult`
+/// carries describe lines, which for a `DecodeSecret` reply ARE the decoded
+/// secret, and `YamlResult` carries a whole object body. `ctl status` had to
+/// name an unexpected event and would have Debug-dumped it to the terminal.
+#[test]
+fn an_events_kind_name_carries_no_payload() {
+    let target = secret_ref();
+    let cases = [
+        (
+            SessionEvent::DescribeResult {
+                target: target.clone(),
+                lines: vec![DescribeLine::plain("password:  hunter2")],
+            },
+            "DescribeResult",
+        ),
+        (
+            SessionEvent::YamlResult {
+                target: target.clone(),
+                content: "stringData:\n  password: hunter2\n".to_string(),
+            },
+            "YamlResult",
+        ),
+        (SessionEvent::SessionError("hunter2".to_string()), "SessionError"),
+        (SessionEvent::CommandResult(Ok("hunter2".to_string())), "CommandResult"),
+    ];
+    for (event, expected) in cases {
+        let named = event.kind_name();
+        assert_eq!(named, expected);
+        assert!(!named.contains("hunter2"), "a name is not a payload: {named}");
+    }
+}
+
+/// Exactly one stream event does NOT reset the backoff, and it is the
+/// terminal one.
+///
+/// This was five `retry_backoff = Duration::from_secs(2)` assignments in
+/// five `match` arms, with `Error` distinguished only by the ABSENCE of a
+/// sixth. A new variant therefore joined the minority policy — keep backing
+/// off — silently.
+#[test]
+fn only_the_terminal_stream_event_keeps_the_backoff_growing() {
+    let rid = ResourceId::BuiltIn(crate::resource_def::BuiltInKind::Pod);
+    let progress = [
+        StreamEvent::Baseline(TableBaseline {
+            headers: vec![],
+            rows: vec![],
+        }),
+        StreamEvent::Delta(TableDelta { changes: vec![] }),
+        StreamEvent::Resolved { original: rid.clone(), resolved: rid.clone() },
+        StreamEvent::Stale("watch died".into()),
+        StreamEvent::Live,
+    ];
+    for event in progress {
+        assert!(
+            event.resets_backoff(),
+            "{event:?} is a delivered frame, so the substream made progress",
+        );
+    }
+    assert!(
+        !StreamEvent::Error("rbac denied".into()).resets_backoff(),
+        "Error is terminal — the next attempt is a real retry",
+    );
+}
+
+/// Every role has a label and declares whether it shows — so the field
+/// indicator is a projection of the roles, not a second list.
+///
+/// The renderer had a `Role::Body => "message"` arm that `SHED_ORDER` can
+/// never reach, plus an `is_empty` fallback and a hardcoded `+message`:
+/// three places encoding "the body is always shown", which is a fact about
+/// `shown()`. `SHED_ORDER`'s own doc promises that adding a role "extends
+/// the cycle — no new binding, no new boolean"; the indicator was the thing
+/// that would also have needed changing.
+#[test]
+fn the_field_indicator_is_a_projection_of_the_roles() {
+    use crate::protocol::Role;
+    // Shed 0: everything shows, body last in display order.
+    let shown = |shed: usize| -> Vec<&'static str> {
+        Role::ALL.iter().filter(|r| r.shown(shed)).map(|r| r.label()).collect()
+    };
+    assert_eq!(shown(0), vec!["time", "source", "message"]);
+    assert_eq!(shown(1), vec!["source", "message"], "the timestamp goes first");
+    assert_eq!(shown(2), vec!["message"], "then the source tag");
+    assert_eq!(
+        shown(99),
+        vec!["message"],
+        "and the body is never shed — it is not in SHED_ORDER at all",
+    );
+
+    // `ALL` holds every role, including the ones `SHED_ORDER` does not.
+    assert_eq!(Role::ALL.len(), 3);
+    for role in Role::SHED_ORDER {
+        assert!(Role::ALL.contains(&role), "{role:?} is sheddable but not listed");
+    }
+    assert!(!Role::SHED_ORDER.contains(&Role::Body));
 }

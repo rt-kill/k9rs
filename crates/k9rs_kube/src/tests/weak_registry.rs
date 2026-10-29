@@ -209,3 +209,134 @@ fn replace_cannot_be_interleaved_with_a_get_or_create() {
         replacement.id,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Step 3 of the module doc — the re-check after `entry()`
+//
+// "Skipping this second check is how you get two live resources for one
+// identity — two apiserver watches, two row stores — with one of them
+// unreachable in the map." It was the one step no test pinned: deleting it
+// left all nine green, because the optimistic `get` already answers the
+// sequential case. Two tests, because the two ways into the Occupied branch
+// need different instruments.
+// ---------------------------------------------------------------------------
+
+/// The re-check's own `Reused` return, driven deterministically.
+///
+/// It is reachable only when the optimistic `get` did NOT find a usable
+/// resource but the entry does a moment later — which is a race, and
+/// unreachable single-threaded through the map alone. It IS reachable
+/// through `alive`, which is the one input that can legitimately answer
+/// differently to two calls: a real one reads a task's `is_finished`, and
+/// the whole point of step 3 is that between the two looks a concurrent
+/// caller replaced a dead resource with a live one. A predicate that says
+/// "dead, then live" puts the code in exactly that state.
+#[test]
+fn the_entry_recheck_hands_back_what_a_racing_caller_created() {
+    let r = reg();
+    let seed = {
+        let (arc, outcome) = r.get_or_create("k", |_| true, |_| Arc::new(Thing { id: 1, usable: true }));
+        assert_eq!(outcome, Outcome::Created);
+        arc
+    };
+
+    // "Dead at the optimistic look, live by the re-check" — the race, held
+    // still. The first call is the fast path's, the second the re-check's.
+    let looks = AtomicUsize::new(0);
+    let builds = AtomicUsize::new(0);
+    let (got, outcome) = r.get_or_create(
+        "k",
+        |_| looks.fetch_add(1, Ordering::SeqCst) > 0,
+        |_| {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Arc::new(Thing { id: 2, usable: true })
+        },
+    );
+
+    assert_eq!(looks.load(Ordering::SeqCst), 2, "both looks happened");
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        0,
+        "the re-check found a usable resource, so nothing was built — \
+         without it this call creates a SECOND live resource for one key",
+    );
+    assert_eq!(outcome, Outcome::Reused);
+    assert!(
+        Arc::ptr_eq(&got, &seed),
+        "and it is the one the map points at (ids {} vs {})",
+        got.id,
+        seed.id,
+    );
+}
+
+/// And the window the re-check actually guards: N callers whose optimistic
+/// `get` all miss, then all contend on `entry()` for the same absent key.
+///
+/// Exactly one must build. Hammered rather than sequenced, because the loser
+/// blocks INSIDE `entry()` by design — there is no point to park it at. Each
+/// round gets its own registry so every round races the create path, and
+/// every thread keeps its `Arc` so nothing can die mid-round and make a
+/// second build legitimate.
+///
+/// Probabilistic, so it is worth saying how probable: with step 3's `Reused`
+/// return deleted and nothing else changed, five consecutive runs all failed
+/// on **round 0**, reporting 5–8 resources for the one key. The eight tests
+/// that existed before this one all stayed green under the same deletion.
+///
+/// A first version of this also printed how many rounds "joined the race",
+/// counted as `Reused < THREADS - 1` — which is not that number, because the
+/// fast path and the re-check both answer `Reused`. It read 0/150 while the
+/// window was in fact being hit every round. Removed rather than fixed: the
+/// deletion measurement above is the real one.
+#[test]
+fn concurrent_callers_for_one_absent_key_build_exactly_one_resource() {
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 150;
+
+    for round in 0..ROUNDS {
+        let r = Arc::new(reg());
+        let builds = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let r = Arc::clone(&r);
+                let builds = Arc::clone(&builds);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    r.get_or_create(
+                        "k",
+                        |thing| thing.usable,
+                        |_| {
+                            builds.fetch_add(1, Ordering::SeqCst);
+                            Arc::new(Thing { id: t, usable: true })
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("worker thread"))
+            .collect();
+
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "round {round}: {} resources for one key — the losers' `entry()` \
+             re-check did not find the winner's",
+            builds.load(Ordering::SeqCst),
+        );
+        let (first, _) = &results[0];
+        for (arc, _) in &results {
+            assert!(
+                Arc::ptr_eq(arc, first),
+                "round {round}: a caller got a resource the map does not point at",
+            );
+        }
+        let created = results.iter().filter(|(_, o)| *o == Outcome::Created).count();
+        assert_eq!(created, 1, "round {round}: exactly one caller created");
+    }
+}

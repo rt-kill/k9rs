@@ -30,7 +30,6 @@ fn seed(el: &Element, headers: &[&str], rows: Vec<ResourceRow>) {
     el.data_store().expect("table element").apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: pod_rid(),
             headers: headers.iter().map(|h| (*h).to_string()).collect(),
             rows,
         }),
@@ -1361,7 +1360,6 @@ fn a_bare_grep_scans_only_the_displayed_columns() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             // Only the first two are shown at the default level; the test
             // rows put the needle in the third.
             headers: vec!["NAME".into(), "READY".into(), "IMAGES".into()],

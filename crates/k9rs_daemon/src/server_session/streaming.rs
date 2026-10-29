@@ -22,7 +22,7 @@ use super::{ServerSession, SessionSharedState};
 /// balance between catching new namespaces / CRDs promptly and not hammering
 /// the API server — discovery is cheap but not free (two full-cluster lists).
 fn discovery_refresh_interval() -> Duration {
-    Duration::from_secs(k9rs_kube::daemon_config::daemon_config().discovery_refresh_secs)
+    Duration::from_secs(k9rs_kube::daemon_config::daemon_config().discovery_refresh_secs.get())
 }
 
 impl ServerSession {

@@ -15,13 +15,22 @@
 //!
 //! The supervisor is the ONLY writer of lifecycle state: it emits every
 //! [`OperatorEvent`] through the one `on_event` sink given to [`supervise`].
-//! The operator cannot publish state on its own — the sole thing it may
-//! signal is "this attempt reached healthy steady-state", and only through
-//! the narrow [`AttemptHandle`] the supervisor lends it. An operator that
-//! forgets to signal merely stays in its previous (still truthful) state;
-//! it cannot invent one. `on_event` is a required parameter, not a
-//! defaulted hook — an operator with no state display passes an explicit
-//! no-op, visibly.
+//! The sole thing an operator may signal is "this attempt reached healthy
+//! steady-state", and only through the narrow [`AttemptHandle`] the
+//! supervisor lends it. An operator that forgets to signal merely stays in
+//! its previous (still truthful) state; it cannot invent one. `on_event` is
+//! a required parameter, not a defaulted hook — an operator with no state
+//! display passes an explicit no-op, visibly.
+//!
+//! "The operator cannot publish state on its own" is what this said, and
+//! for the one operator that had state to publish it was convention:
+//! `PortForwardOp` is declared in the same module as the private
+//! `set_state`, and held a `Weak<PortForwardSource>` it could upgrade. It
+//! holds a [`SourceLiveness`] now — whose field this module keeps — so the
+//! source is genuinely out of reach and the claim is the type's. An
+//! operator over a source with NO lifecycle state keeps its own `Weak`
+//! (`ExecPollOp` reads its command line and folds rows back in); there is
+//! nothing there to publish. That pairing is the rule to keep.
 //!
 //! # Delay policy: a schedule is not a failure
 //!
@@ -95,6 +104,38 @@ impl AttemptHandle {
     pub fn active(&self) {
         self.active_seen.store(true, Ordering::Release);
         (self.sink)(OperatorEvent::Active);
+    }
+}
+
+/// An operator's handle to the source it serves, narrowed to the one
+/// question it has any business asking: has everyone let go?
+///
+/// `PortForwardOp` held a `Weak<PortForwardSource>` for exactly this check
+/// — and a `Weak` carries `upgrade()`, which carries every method on the
+/// source, the private `set_state` included, because the operator is
+/// declared in the same module. The field here is private to THIS module,
+/// which no operator is in, so there is no upgrade to make: the "single
+/// state writer" rule stops being a thing to remember.
+///
+/// An operator that legitimately needs its own source keeps a `Weak` (see
+/// `ExecPollOp`, which reads its command line and folds rows back in). The
+/// rule that matters is the pairing: a source with a lifecycle-state writer
+/// hands its operator one of these.
+pub struct SourceLiveness<T> {
+    weak: std::sync::Weak<T>,
+}
+
+impl<T> SourceLiveness<T> {
+    /// Build one from the source's own `Weak`. Called where the source
+    /// constructs its operator.
+    pub fn new(weak: std::sync::Weak<T>) -> Self {
+        Self { weak }
+    }
+
+    /// True once nothing holds the source any more — the attempt has
+    /// nothing left to serve and should report [`OperatorExit::Gone`].
+    pub fn gone(&self) -> bool {
+        self.weak.strong_count() == 0
     }
 }
 

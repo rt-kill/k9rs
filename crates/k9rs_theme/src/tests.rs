@@ -117,3 +117,114 @@ fn skin_overrides_layer_over_the_selected_palette() {
 // test-constructed `App` is pinned dark. Both assert how the APP consumes a
 // theme, from the theme crate's own mirror — which would make
 // `cargo test -p k9rs_theme` build the whole TUI.
+
+// ---------------------------------------------------------------------------
+// A broken skin is reported, not swallowed
+// ---------------------------------------------------------------------------
+
+/// A directory that removes itself — four tests do not earn a dependency.
+struct TempSkins(std::path::PathBuf);
+
+impl TempSkins {
+    fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("k9rs-skin-test-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        Self(dir)
+    }
+    fn write(&self, name: &str, body: &str) -> std::path::PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, body).expect("write skin");
+        path
+    }
+}
+
+impl Drop for TempSkins {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `Theme` has no `Debug`, so `expect_err` is unavailable — and a theme is
+/// not a thing worth printing anyway.
+fn skin_error(path: &std::path::Path, why: &str) -> String {
+    match Theme::from_skin_file(path, Appearance::Dark) {
+        Err(e) => e,
+        Ok(_) => panic!("{why}"),
+    }
+}
+
+/// ONE mistyped key discards the whole skin — and now says which.
+///
+/// Every `Skin*` struct carries `deny_unknown_fields`, so `fgcolor` for
+/// `fgColor` fails the deserialize, which used to become `None` and then the
+/// default palette with no output anywhere. The user saw stock colours and
+/// no reason, from the same config directory whose three sibling loaders
+/// refuse to "silently collapse into use-defaults".
+#[test]
+fn a_mistyped_skin_key_is_reported_rather_than_discarded() {
+    let dir = TempSkins::new("typo");
+    let path = dir.write("bad.yaml", "k9s:\n  body:\n    fgcolor: red\n");
+    let err = skin_error(&path, "a typo must not be silently accepted");
+    assert!(
+        err.contains("fgcolor"),
+        "the refusal must name the key it did not know: {err}",
+    );
+}
+
+/// The other three ways a skin file can fail each say what happened.
+#[test]
+fn every_skin_failure_names_itself() {
+    let dir = TempSkins::new("shapes");
+
+    let not_yaml = dir.write("a.yaml", "k9s:\n  body: [unclosed\n");
+    let err = skin_error(&not_yaml, "invalid YAML");
+    assert!(err.contains("YAML"), "{err}");
+
+    let no_section = dir.write("b.yaml", "something_else:\n  body: {}\n");
+    let err = skin_error(&no_section, "no k9s section");
+    assert!(err.contains("k9s"), "{err}");
+
+    let err = skin_error(&dir.0.join("nope.yaml"), "absent file");
+    assert!(err.contains("cannot read"), "{err}");
+}
+
+/// A VALID skin still loads, and still layers over the chosen palette —
+/// the fix must not turn a working skin into a complaint.
+#[test]
+fn a_valid_skin_loads_without_complaint() {
+    let dir = TempSkins::new("good");
+    // The same shape the layering test uses, so this asserts "it still
+    // works" against a mapping that is already known to hold.
+    let path = dir.write(
+        "ok.yaml",
+        "k9s:\n  frame:\n    border:\n      focusColor: \"#ff00ff\"\n",
+    );
+    let Ok(theme) = Theme::from_skin_file(&path, Appearance::Dark) else {
+        panic!("a valid skin loads");
+    };
+    assert_eq!(
+        theme.border_focused.fg,
+        Some(ratatui::style::Color::Rgb(0xff, 0x00, 0xff)),
+        "the override took effect, so `Result` did not break the happy path",
+    );
+}
+
+/// No skin configured is not a problem — the stock palette is the answer,
+/// and `load_reporting` says nothing.
+#[test]
+fn no_skin_configured_is_not_a_complaint() {
+    for name in [None, Some(""), Some("   ")] {
+        let (_, problem) = Theme::load_reporting(name, Appearance::Dark);
+        match name {
+            // A whitespace name is a NAMED skin that will not be found —
+            // the filter only drops the empty string.
+            Some(n) if !n.is_empty() => assert!(problem.is_some(), "{n:?}"),
+            _ => assert!(problem.is_none(), "{name:?} is not a skin request: {problem:?}"),
+        }
+    }
+}

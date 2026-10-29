@@ -17,7 +17,6 @@ impl ConvertToRow<HorizontalPodAutoscaler> for HpaDef {
         let spec = hpa.spec.unwrap_or_default();
         let reference = format!("{}/{}", spec.scale_target_ref.kind, spec.scale_target_ref.name);
         let min_replicas = spec.min_replicas.map(|v| v.to_string()).unwrap_or_else(|| "<unset>".to_string());
-        let _max_replicas = spec.max_replicas.to_string();
         let status = hpa.status.unwrap_or_default();
         let current_replicas = status.current_replicas.unwrap_or(0);
 

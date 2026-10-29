@@ -218,7 +218,14 @@ async fn main() -> Result<()> {
 
     // `None`: no context is confirmed until the daemon says so (or, with
     // nothing to connect to, until the user picks one in the contexts view).
-    let mut app = App::new(appearance, None, namespace, &data_source, config);
+    // The theme is loaded HERE, beside the appearance resolution it pairs
+    // with, so `App::new` stays I/O-free and a broken skin has somewhere to
+    // complain: `Theme::load_reporting` hands back a usable theme AND what
+    // went wrong, which the flash below carries along with the overlay and
+    // daemon-config problems.
+    let (theme, skin_problem) =
+        k9rs_theme::Theme::load_reporting(config.ui.skin.as_deref(), appearance);
+    let mut app = App::new(theme, namespace, config);
     // `App::new` resolves the CONFIG half; the flag is the other half of the
     // same answer, and both gates now carry the same `read_only`.
     app.read_only = read_only;
@@ -228,13 +235,22 @@ async fn main() -> Result<()> {
     // passed `--log-file`. A typo'd column, an unknown capability, a bad
     // jsonpath and a YAML parse error all looked identical to "working". Say
     // the first one out loud; the count tells them there are more to fix.
-    let overlay_problems = k9rs_proto::overlay::overlay_diagnostics();
-    if let Some(first) = overlay_problems.first() {
-        let more = overlay_problems.len() - 1;
+    // The daemon section's complaints ride the same surface. In `--no-daemon`
+    // the daemon runs in-process, so this IS the process that would have
+    // logged it; with a separate daemon the TUI is still the one place the
+    // user is looking. Either way it reaches them.
+    let problems: Vec<String> = k9rs_proto::overlay::overlay_diagnostics()
+        .iter()
+        .cloned()
+        .chain(k9rs_kube::daemon_config::load_problems().iter().cloned())
+        .chain(skin_problem)
+        .collect();
+    if let Some(first) = problems.first() {
+        let more = problems.len() - 1;
         app.ui.flash = Some(k9rs_app::FlashMessage::warn(if more == 0 {
             first.clone()
         } else {
-            format!("{first} (+{more} more overlay problem{})", if more == 1 { "" } else { "s" })
+            format!("{first} (+{more} more config problem{})", if more == 1 { "" } else { "s" })
         }));
     }
 

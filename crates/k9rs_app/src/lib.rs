@@ -136,10 +136,14 @@ pub fn default_pinned_resources() -> Vec<ResourceId> {
 /// grepped, sorted or scrolled, and it carried a hand-written copy of the
 /// keymap that had drifted. Keys belong to `?`.
 ///
-/// Known gap: a user-configured exec resource is reachable by its exact name
-/// (`:node-costs`) but is not listed, because its name comes from the
-/// DAEMON's config and the client never sees the list.
-fn seed_aliases(store: &store::RowStore) {
+/// The configured exec resources are listed too, under their own names.
+/// They used not to be, and the stated reason was that "its name comes from
+/// the DAEMON's config and the client never sees the list" — which
+/// `commands::exec_resource_by_name` contradicts on its first line: it
+/// resolves `:node-costs` by reading exactly that list out of `AppConfig`.
+/// Listing them is what made it safe to delete the generic `:exec` alias,
+/// whose answer was `exec_configs.first()`.
+fn seed_aliases(store: &store::RowStore, config: &AppConfig) {
     use k9rs_proto::row::{CellValue, ResourceRow};
     let mut rows: Vec<ResourceRow> = Vec::new();
     let mut push = |section: &str, alias: String, target: String| {
@@ -167,13 +171,21 @@ fn seed_aliases(store: &store::RowStore) {
         }
         push("resource", aliases.join(" / "), kind.kind_str().to_string());
     }
+    // Through the SAME validation `exec_resource_by_name` applies, so the
+    // view lists exactly what `:` accepts: an entry the daemon would skip
+    // is not typeable, and advertising it would promise a view that answers
+    // "Unknown local resource".
+    for cfg in config.daemon.iter().flat_map(|d| d.exec_resources.iter()) {
+        if cfg.validate().is_ok() {
+            push("resource", cfg.name.clone(), "ExecResource".to_string());
+        }
+    }
     for doc in crate::commands::COMMAND_WORDS {
         push("command", doc.display(), doc.label.to_string());
     }
     store.apply(
         CoreData::SEED_EPOCH,
         store::StorePayload::Baseline(k9rs_proto::protocol::TableBaseline {
-            resource: k9rs_proto::local_types::LocalResourceKind::Alias.to_resource_id(),
             headers: vec!["SECTION".into(), "ALIAS".into(), "TARGET".into()],
             rows,
         }),
@@ -274,24 +286,34 @@ struct ParkedCore {
     crds: std::sync::Arc<store::RowStore>,
 }
 
-impl Default for CoreData {
-    fn default() -> Self {
+impl CoreData {
+    /// The core stores, seeded from `config` — which the alias view needs,
+    /// because the exec resources a `:` prompt accepts are declared there.
+    fn new(config: &AppConfig) -> Self {
         Self {
             namespaces: store::RowStore::new("namespaces"),
             nodes: store::RowStore::new("nodes"),
             crds: store::RowStore::new("customresourcedefinitions"),
             contexts: store::RowStore::client("contexts"),
             aliases: {
-                // Static content — the registry and the command grammar are
-                // both compiled in — so it is seeded once here rather than
-                // re-derived per open. Pure computation; `new` stays I/O-free.
+                // Seeded once here rather than re-derived per open: the
+                // registry and the command grammar are compiled in and the
+                // config is already in hand. Pure computation; `new` stays
+                // I/O-free.
                 let store = store::RowStore::client("aliases");
-                seed_aliases(&store);
+                seed_aliases(&store, config);
                 store
             },
             streams: Vec::new(),
             parked: None,
         }
+    }
+}
+
+impl Default for CoreData {
+    /// The compiled-in default config, which declares no exec resources.
+    fn default() -> Self {
+        Self::new(&AppConfig::default())
     }
 }
 
@@ -357,7 +379,6 @@ impl CoreData {
         target.apply(
             Self::SEED_EPOCH,
             store::StorePayload::Baseline(k9rs_proto::protocol::TableBaseline {
-                resource: ResourceId::BuiltIn(kind),
                 headers: def.default_headers(),
                 rows,
             }),
@@ -460,7 +481,6 @@ impl CoreData {
         self.contexts.apply(
             Self::SEED_EPOCH,
             store::StorePayload::Baseline(k9rs_proto::protocol::TableBaseline {
-                resource: k9rs_proto::local_types::LocalResourceKind::Context.to_resource_id(),
                 headers: context_headers(),
                 rows: context_rows(contexts),
             }),
@@ -495,7 +515,6 @@ impl CoreData {
         store.apply(
             Self::SEED_EPOCH,
             store::StorePayload::Baseline(k9rs_proto::protocol::TableBaseline {
-                resource: k9rs_proto::local_types::LocalResourceKind::Keybinding.to_resource_id(),
                 headers,
                 rows,
             }),
@@ -708,20 +727,26 @@ impl App {
     /// TUI setup and threaded in — the App never reads the config file
     /// itself, so tests are hermetic by construction and a config error
     /// is a visible startup failure, not a silent default fallback.
+    /// The startup `App`.
+    ///
+    /// Three parameters, down from five. `session: &ClientSession` was
+    /// discarded on the first line (`let _ = session`) — the Overview root
+    /// opens no subscription — and `context` was passed `None`
+    /// unconditionally by the one caller, which is what `state.rs` already
+    /// documents as correct: the context is published by the connection
+    /// manager, not chosen at construction. A parameter that carries no
+    /// information is a reader's question with no answer.
     pub fn new(
-        appearance: k9rs_theme::term_bg::Appearance,
-        context: Option<k9rs_proto::protocol::ContextName>,
+        theme: k9rs_theme::Theme,
         namespace: k9rs_proto::protocol::Namespace,
-        session: &crate::client::ClientSession,
         config: AppConfig,
     ) -> Self {
-        let _ = session; // the Overview root opens no subscription
         let metrics = store::MetricsHub::new();
         // The startup root is the Overview landing page — no resource
         // watch opens until the user navigates to one (startup args or
         // `:cmd` reset to a resource root).
         let root = element::Element::Overview(element::Overview);
-        Self::new_with_root(context, namespace, metrics, root, config, appearance)
+        Self::new_with_root(None, namespace, metrics, root, config, theme)
     }
 
     /// Test-only: an App whose root element rides a parked stream — no
@@ -740,11 +765,14 @@ impl App {
     /// way, by ownership rather than by a parameter: `main` loads overlays
     /// and a test binary never does. See `kube::overlay::OVERLAYS`.
     ///
-    /// Theme is the remaining `$HOME` read on this path — `App::new` calls
-    /// `ui::theme::Theme::load`, which reads `$HOME/.config/k9rs/skins`. It
-    /// is inert here only because the default skin name is empty and `load`
-    /// early-returns on that, which is a fact about the default rather than
-    /// about construction. Not yet fixed; do not read this doc as covering it.
+    /// The theme was the remaining `$HOME` read on this path, and it is
+    /// gone: `App::new` took an `Appearance` and called `Theme::load`
+    /// itself, which reads `$HOME/.config/k9rs/skins`. It was inert here
+    /// only because the default skin name is empty and `load` early-returned
+    /// on that — a fact about the default, not about construction. `main`
+    /// loads the theme now and hands it in, the same hoist the appearance
+    /// resolution already had, and for the same reason: this constructor is
+    /// I/O-free, and a loaded skin's complaints have somewhere to go.
     #[cfg(any(test, feature = "testing"))]
     pub fn new_for_test() -> Self {
         let namespace = k9rs_proto::protocol::Namespace::All;
@@ -758,14 +786,15 @@ impl App {
             &metrics,
             "pods".to_string(),
         ));
-        // Pinned dark: a test must not depend on the developer's terminal.
+        // Pinned dark, and built rather than LOADED: a test must not depend
+        // on the developer's terminal, nor on their skins directory.
         Self::new_with_root(
             None,
             namespace,
             metrics,
             root,
             AppConfig::default(),
-            k9rs_theme::term_bg::Appearance::Dark,
+            k9rs_theme::Theme::for_appearance(k9rs_theme::term_bg::Appearance::Dark),
         )
     }
 
@@ -775,17 +804,18 @@ impl App {
         metrics: std::sync::Arc<store::MetricsHub>,
         root: element::Element,
         config: AppConfig,
-        // RESOLVED, never `ThemeMode::Auto`: resolving queries the terminal,
-        // and this constructor must stay free of I/O — `new_for_test` would
-        // otherwise open `/dev/tty` from the test suite.
-        appearance: k9rs_theme::term_bg::Appearance,
+        // BUILT by the caller, never loaded here: resolving the appearance
+        // queries the terminal and loading a skin reads `$HOME`, and this
+        // constructor must stay free of I/O — `new_for_test` would otherwise
+        // open `/dev/tty` and the developer's skins directory from the test
+        // suite.
+        theme: k9rs_theme::Theme,
     ) -> Self {
         let cache_capacity = config.ui.cache_capacity;
-        let skin_name = config.ui.skin.clone();
         Self {
             should_quit: false,
             exit_reason: None,
-            core: CoreData::default(),
+            core: CoreData::new(&config),
             nav: nav::NavStack::new(root),
             pinned_resources: default_pinned_resources(),
             command_history: Vec::new(),
@@ -794,7 +824,7 @@ impl App {
             conn: Connection::new(),
             pending_batch: None,
             config,
-            ui: UiState::new(k9rs_theme::Theme::load(skin_name.as_deref(), appearance)),
+            ui: UiState::new(theme),
             kube: KubeState {
                 context,
                 connecting: None,
@@ -881,24 +911,37 @@ impl App {
     // The TUI drives exactly one element: the TOP of the nav stack. The
     // contexts panel (chrome until the route fold-in) keeps its own arm.
 
-    pub fn next_tab(&mut self) -> ResourceId {
+    /// The pinned resource `step` places from the current one, wrapping.
+    ///
+    /// `&self`: neither direction mutates anything, and both took
+    /// `&mut self`, which forced every caller to hold a mutable borrow of
+    /// the whole `App` to ask a question. Seven of their eight lines were
+    /// identical and the `Pod` fallback was written twice.
+    ///
+    /// An unpinned current resource counts as position 0, so Tab from a
+    /// drilled-into view lands on the second pin rather than nowhere.
+    pub fn tab(&self, step: isize) -> ResourceId {
         let pinned = &self.pinned_resources;
-        if pinned.is_empty() {
+        let Some(len) = std::num::NonZeroUsize::new(pinned.len()) else {
             return k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id();
-        }
+        };
+        let len = len.get();
         let current = self.nav.resource_id();
         let idx = pinned.iter().position(|r| Some(r) == current).unwrap_or(0);
-        pinned[(idx + 1) % pinned.len()].clone()
+        // `rem_euclid` over `isize` so a negative step wraps without the
+        // `if idx == 0 { len - 1 }` special case each direction had.
+        let next = (idx as isize + step).rem_euclid(len as isize) as usize;
+        pinned[next].clone()
     }
 
-    pub fn prev_tab(&mut self) -> ResourceId {
-        let pinned = &self.pinned_resources;
-        if pinned.is_empty() {
-            return k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id();
-        }
-        let current = self.nav.resource_id();
-        let idx = pinned.iter().position(|r| Some(r) == current).unwrap_or(0);
-        pinned[if idx == 0 { pinned.len() - 1 } else { idx - 1 }].clone()
+    /// The next pinned resource.
+    pub fn next_tab(&self) -> ResourceId {
+        self.tab(1)
+    }
+
+    /// The previous pinned resource.
+    pub fn prev_tab(&self) -> ResourceId {
+        self.tab(-1)
     }
 
     pub fn col_left(&mut self) {
@@ -1264,3 +1307,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 #[path = "tests/theme_integration.rs"]
 mod theme_integration_tests;
+
+#[cfg(test)]
+#[path = "tests/lib.rs"]
+mod root_tests;

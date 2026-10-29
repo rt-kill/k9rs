@@ -291,7 +291,8 @@ fn the_arrows_move_the_caret_in_every_text_sink() {
         input: k9rs_app::TextInput::seeded("pods"),
         history_index: None,
     });
-    let caret = |app: &App| app.ui.command_text().expect("open").cursor_col();
+    let caret =
+        |app: &App| app.ui.command_prompt().expect("open").1.cursor_col();
     assert_eq!(caret(&app), 4, "seeded with the caret at the end");
 
     for _ in 0..2 {
@@ -304,7 +305,7 @@ fn the_arrows_move_the_caret_in_every_text_sink() {
     // Typing lands AT the caret, which is the point of having one.
     assert!(matches!(edit_command_key(&mut app, key(KeyCode::Char('X'))), CommandKey::Consumed));
     assert_eq!(
-        app.ui.command_text().map(|i| i.value().to_string()),
+        app.ui.command_prompt().map(|(_, t)| t.value().to_string()),
         Some("podXs".to_string()),
         "inserted mid-word, not appended",
     );

@@ -34,7 +34,7 @@ impl ConvertToRow<Ingress> for IngressDef {
             CellValue::Text(hosts),
             CellValue::Text(address),
             CellValue::Text(ports),
-            CellValue::Text(meta.labels_str),
+            meta.labels_cell(),
             CellValue::Age(meta.age.map(|t| t.timestamp())),
         ];        ResourceRow {
             name: meta.name,

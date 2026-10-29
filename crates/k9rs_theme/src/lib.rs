@@ -830,49 +830,86 @@ impl Theme {
         }
     }
 
-    /// Load the theme: the palette picked by `mode`, with the user's skin
-    /// (if any) overriding colors on top of it.
+    /// The theme — the palette `appearance` picks, with the user's skin (if
+    /// any) overriding colours on top of it — and what went wrong reading
+    /// that skin.
     ///
-    /// 1. `mode` selects the base palette — dark, light, or auto-detected
-    ///    from the terminal background.
-    /// 2. The skin name comes from AppConfig (already deserialized via
-    ///    serde); an empty/absent name means "stock palette, no overrides".
+    /// 1. `appearance` selects the base palette; `main` resolves it (dark,
+    ///    light, or detected from the terminal background) before calling.
+    /// 2. The skin name comes from `AppConfig`, already deserialized; an
+    ///    empty or absent name means "stock palette, no overrides".
     /// 3. `~/.config/k9rs/skins/<name>.yaml` is searched first, then
     ///    `~/.config/k9s/skins/<name>.yaml`.
-    /// 4. A missing or unparsable skin falls back to the bare palette.
-    pub fn load(skin_name: Option<&str>, appearance: Appearance) -> Self {
+    /// 4. A missing, unreadable or unparsable skin falls back to the bare
+    ///    palette — AND SAYS SO, through the second return value.
+    ///
+    /// Always returns a usable theme — a broken skin must not stop the TUI
+    /// starting — but the SECOND return value says so. It used to be
+    /// `.unwrap_or_else(|| Self::for_appearance(..))` at all three call
+    /// sites, so a present-but-invalid skin was thrown away in total
+    /// silence: one mistyped key (`fgcolor` for `fgColor`) fails
+    /// `deny_unknown_fields`, which failed the whole `from_value`, which
+    /// became `None`, which became the default palette. The user saw
+    /// default colours and no reason.
+    ///
+    /// That is the opposite policy from its three sibling loaders in the
+    /// same directory, whose own doc says callers "must never silently
+    /// collapse this into 'use defaults'".
+    pub fn load_reporting(
+        skin_name: Option<&str>,
+        appearance: Appearance,
+    ) -> (Self, Option<String>) {
+        let fallback = || Self::for_appearance(appearance);
         let Some(name) = skin_name.filter(|s| !s.is_empty()) else {
-            return Self::for_appearance(appearance);
+            return (fallback(), None);
         };
-        let home = match std::env::var("HOME") {
-            Ok(h) => h,
-            Err(_) => return Self::for_appearance(appearance),
+        let Ok(home) = std::env::var("HOME") else {
+            return (fallback(), Some(format!("skin {name:?}: $HOME is not set")));
         };
         // Try k9rs skins dir first, fall back to k9s.
-        let skin_file = format!("{}.yaml", name);
-        let k9rs_path = Path::new(&home).join(".config/k9rs/skins").join(&skin_file);
-        if k9rs_path.exists() {
-            return Self::from_skin_file(&k9rs_path, appearance).unwrap_or_else(|| Self::for_appearance(appearance));
+        let skin_file = format!("{name}.yaml");
+        for dir in [".config/k9rs/skins", ".config/k9s/skins"] {
+            let path = Path::new(&home).join(dir).join(&skin_file);
+            if !path.exists() {
+                continue;
+            }
+            return match Self::from_skin_file(&path, appearance) {
+                Ok(theme) => (theme, None),
+                Err(e) => (fallback(), Some(format!("skin {name:?}: {e} — using defaults"))),
+            };
         }
-        let k9s_path = Path::new(&home).join(".config/k9s/skins").join(&skin_file);
-        if k9s_path.exists() {
-            return Self::from_skin_file(&k9s_path, appearance).unwrap_or_else(|| Self::for_appearance(appearance));
-        }
-        Self::for_appearance(appearance)
+        // A NAMED skin that is nowhere is also worth saying: the user asked
+        // for it by name and got the default palette.
+        (
+            fallback(),
+            Some(format!(
+                "skin {name:?}: no {skin_file} in ~/.config/k9rs/skins or ~/.config/k9s/skins"
+            )),
+        )
     }
 
-    /// Load a skin YAML file (compatible with k9s skin format) and produce a
-    /// Theme with overridden colors, layered over `mode`'s palette. Returns
-    /// `None` if the file cannot be read or parsed.
-    pub fn from_skin_file(path: &Path, appearance: Appearance) -> Option<Self> {
-        let content = std::fs::read_to_string(path).ok()?;
-        let yaml: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
-        let k9s_val = yaml.get("k9s")?.clone();
-        let skin: SkinSchema = serde_yaml::from_value(k9s_val).ok()?;
+    /// Load a skin YAML file (compatible with the k9s skin format) and
+    /// produce a Theme with overridden colours, layered over `appearance`'s
+    /// palette.
+    ///
+    /// `Result`, not `Option`: every failure here is a thing the user wants
+    /// to be told. Each `Skin*` struct carries `deny_unknown_fields`, so one
+    /// typo discards the whole file, and a bad colour name does the same.
+    pub fn from_skin_file(path: &Path, appearance: Appearance) -> Result<Self, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&content).map_err(|e| format!("invalid YAML: {e}"))?;
+        let k9s_val = yaml
+            .get("k9s")
+            .ok_or_else(|| "no `k9s:` section".to_string())?
+            .clone();
+        let skin: SkinSchema =
+            serde_yaml::from_value(k9s_val).map_err(|e| format!("{e}"))?;
 
         let mut theme = Self::for_appearance(appearance);
         skin.apply_to(&mut theme);
-        Some(theme)
+        Ok(theme)
     }
 }
 

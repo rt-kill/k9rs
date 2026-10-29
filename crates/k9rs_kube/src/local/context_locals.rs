@@ -91,6 +91,11 @@ impl ContextLocals {
     }
 
     /// The context this slice belongs to.
+    ///
+    /// Read by `LocalRegistry::stats`, which used the map KEY instead and
+    /// so left this — and the private field behind it — dead. They are the
+    /// same value by construction; reading the slice is what makes that
+    /// checkable rather than assumed.
     pub fn context(&self) -> &ContextId {
         &self.context
     }
@@ -108,11 +113,6 @@ impl ContextLocals {
         match kind {
             LocalResourceKind::PortForward => {
                 Some(self.port_forwards() as SharedLocalSource)
-            }
-            LocalResourceKind::ExecResource => {
-                // Legacy variant — look up by the first exec config if any.
-                let name = self.exec_configs.first().map(|c| c.name.clone())?;
-                self.exec_source_for(&name).map(|arc| arc as SharedLocalSource)
             }
             // The daemon deliberately has no source for contexts. They are
             // the CLIENT's kubeconfig, seeded client-side, and a picker that

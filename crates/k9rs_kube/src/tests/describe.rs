@@ -214,3 +214,81 @@ fn the_two_api_version_shapes_read_as_expected() {
     assert_eq!(dep.api_version, "apps/v1");
     assert_eq!(dep.plural, "deployments");
 }
+
+// ---------------------------------------------------------------------------
+// `format_describe`, the API path — which the hostile-input test above
+// never reached
+// ---------------------------------------------------------------------------
+
+fn object_with(labels: std::collections::BTreeMap<String, String>) -> kube::api::DynamicObject {
+    kube::api::DynamicObject {
+        types: Some(kube::api::TypeMeta {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+        }),
+        metadata: kube::api::ObjectMeta {
+            name: Some("api-7d9f".to_string()),
+            namespace: Some("prod".to_string()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        data: serde_json::json!({}),
+    }
+}
+
+/// Every line the API path produces carries a `key_end` that indexes the
+/// text it ships with, even when a LABEL carries an escape.
+///
+/// The hostile-input test above covers `describe_lines_from_text` — the
+/// kubectl and secret-decode paths. This is the typed path, whose input is
+/// label and annotation keys and values, i.e. arbitrary cluster-supplied
+/// UTF-8, and it had no test of any kind.
+#[test]
+fn the_api_describe_path_ships_indices_that_match_its_text() {
+    let labels = std::collections::BTreeMap::from([
+        ("app\u{1b}[31m".to_string(), "web".to_string()),
+        ("tier".to_string(), "front\u{7}end".to_string()),
+    ]);
+    let lines = super::format_describe(&object_with(labels));
+    assert!(!lines.is_empty());
+    for line in &lines {
+        assert!(
+            !line.text.chars().any(|c| c.is_control() && c != '\t'),
+            "{:?} still carries a control char",
+            line.text,
+        );
+        if let DescribeLineKind::Field { key_end } = line.kind {
+            assert!(
+                key_end <= line.text.len() && line.text.is_char_boundary(key_end),
+                "key_end {key_end} does not index {:?}",
+                line.text,
+            );
+        }
+    }
+}
+
+/// "Absent" has ONE spelling. The name and namespace lines are consecutive
+/// and used to disagree — an empty value for a missing name, `<none>` for a
+/// missing namespace — so the one case that read as a rendering bug (a field
+/// with nothing after its colon) was the one where the object really had no
+/// name.
+#[test]
+fn the_api_describe_path_spells_absent_one_way() {
+    let bare = kube::api::DynamicObject {
+        types: None,
+        metadata: kube::api::ObjectMeta::default(),
+        data: serde_json::json!({}),
+    };
+    let lines = super::format_describe(&bare);
+    let text: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+    let name = text
+        .iter()
+        .find(|l| l.starts_with("Name:"))
+        .expect("a name line");
+    let namespace = text
+        .iter()
+        .find(|l| l.starts_with("Namespace:"))
+        .expect("a namespace line");
+    assert!(name.contains("<none>"), "got {name:?}");
+    assert!(namespace.contains("<none>"), "got {namespace:?}");
+}

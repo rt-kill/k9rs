@@ -234,9 +234,24 @@ impl<'a> ResourceTable<'a> {
         clipped_cols: Option<(usize, usize)>,
         width: u16,
     ) -> Line<'a> {
-        // Mandatory, whatever it costs.
-        let name = format!(" {}", self.title);
+        // Mandatory, whatever it costs — and the NAME is the one that gives
+        // way when both cannot fit.
+        //
+        // Nothing bounded `name`, and the title is emitted name-first into a
+        // space ratatui truncates from the RIGHT, so a long CRD
+        // (`prometheusrules.monitoring.coreos.com` is 37 cells) plus a long
+        // apiserver stale reason overran an 80-column budget and cut the
+        // WARNING in silence — the one part this function's doc says must
+        // never go. The breadcrumb row also names the view, so eliding the
+        // name here loses the least; the warning has nowhere else to appear.
         let warning = self.warning.map(|w| format!(" {}", w));
+        let warning_w = warning.as_deref().map_or(0, UnicodeWidthStr::width);
+        // One cell for the trailing space that closes the title.
+        let name_budget = usize::from(width).saturating_sub(warning_w).saturating_sub(1);
+        let name = format!(
+            " {}",
+            k9rs_util::width::truncate_left(self.title, name_budget.saturating_sub(1)),
+        );
 
         // Optional, in POSITION order.
         let namespace: Option<String> =
@@ -281,7 +296,7 @@ impl<'a> ResourceTable<'a> {
         const KEEP_ORDER: [usize; 4] = [1, 0, 2, 3];
         let mut budget = usize::from(width)
             .saturating_sub(name.width())
-            .saturating_sub(warning.as_deref().map_or(0, UnicodeWidthStr::width))
+            .saturating_sub(warning_w)
             // The trailing space that closes the title.
             .saturating_sub(1);
         let mut keep = [false; 4];
@@ -634,3 +649,7 @@ impl StatefulWidget for ResourceTable<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/widgets/table.rs"]
+mod tests;

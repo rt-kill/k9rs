@@ -12,9 +12,11 @@ pub(crate) mod k8s_const {
     pub(crate) const STATUS_TRUE: &str = "True";
 
     // -- Pod / namespace phases & reasons --
-        /// Event `type` — a two-valued field, both values named.
+    /// Event `type`. Only `Normal` is named: it is the one the row
+    /// BRANCHES on, and `Warning` was a constant whose only reader was an
+    /// arm producing the same value as the wildcard beside it. A named
+    /// constant with no decision behind it reads as one.
     pub(crate) const EVENT_TYPE_NORMAL: &str = "Normal";
-    pub(crate) const EVENT_TYPE_WARNING: &str = "Warning";
     /// ConditionStatus. `STATUS_TRUE` already lived here; its counterpart
     /// was re-spelled raw in `hpa.rs`.
     pub(crate) const STATUS_FALSE: &str = "False";
@@ -117,14 +119,33 @@ pub(crate) struct CommonMeta {
     pub name: String,
     pub uid: String,
     pub labels: std::collections::BTreeMap<String, String>,
-    /// Pre-joined `k=v,...` display string — a few converters want it in
-    /// their cells vec and we build it here once so they don't all repeat
-    /// the same `iter().map().join()` incantation.
+    /// Pre-joined `k=v,...` display string — built here once so twelve
+    /// converters don't each repeat the `iter().map().join()` incantation.
+    ///
+    /// For a LABELS cell use [`Self::labels_cell`], not this: the cell's
+    /// TYPE is a sort decision, and it was made at each call site.
     pub labels_str: String,
     pub age: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl CommonMeta {
+    /// The LABELS cell — a [`k9rs_proto::row::CellValue::List`], always.
+    ///
+    /// The type was chosen at each of the twelve converters that declare a
+    /// `LABELS` column: seven built a `List`, five a `Text`. Display is
+    /// identical (`List`'s `Display` re-joins on `,`, and `labels_str` is
+    /// already comma-joined), so the split was invisible until you SORTED:
+    /// `List`'s `Ord` compares length first and then the joined string,
+    /// `Text`'s compares the string. So `O` on LABELS meant "by label
+    /// count" in `:pods` and "alphabetically" in `:svc`, under one header.
+    ///
+    /// A list is the typed answer — labels are a set, and ordering by how
+    /// many a row has is a useful column to sort — and it is one answer now
+    /// because the cell is built here rather than there.
+    pub(crate) fn labels_cell(&self) -> k9rs_proto::row::CellValue {
+        k9rs_proto::row::CellValue::from_comma_str(&self.labels_str)
+    }
+
     pub(crate) fn from_k8s(
         meta: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
     ) -> Self {
@@ -164,13 +185,31 @@ impl WorkloadContainers {
         let images = ps.containers.iter()
             .map(|c| c.image.clone().unwrap_or_default())
             .collect::<Vec<_>>().join(",");
-        let tcp_ports = ps.containers.iter()
-            .flat_map(|c| c.ports.as_ref().into_iter().flatten())
-            .filter(|p| p.protocol.as_deref() != Some("UDP"))
-            .map(|p| p.container_port as u16)
-            .collect();
-        Self { names, images, tcp_ports }
+        Self { names, images, tcp_ports: forwardable_ports(ps) }
     }
+}
+
+/// The container ports a port-forward can actually use.
+///
+/// TCP only: the forward rides a websocket tunnel, so a UDP port loops
+/// `Reconnecting` for ever. There were THREE derivations of this question —
+/// this one (filtering UDP), `pods.rs` (no protocol filter, and keyed off
+/// `container_statuses`, so a Pending pod offered nothing at all), and
+/// `services.rs` (`spec.ports`, no filter). The visible consequences were a
+/// pair: `Shift-F` on a Pod offered a UDP-only port while `Shift-F` on its
+/// Deployment did not, and a Pending pod fell back to the form's free-text
+/// 8080 while its Deployment offered the real ports.
+///
+/// Reads the SPEC, never the status. A port is a declaration; whether the
+/// container has started yet is a different question, and the one that made
+/// the two disagree.
+pub(crate) fn forwardable_ports(spec: &k8s_openapi::api::core::v1::PodSpec) -> Vec<u16> {
+    spec.containers
+        .iter()
+        .flat_map(|c| c.ports.as_ref().into_iter().flatten())
+        .filter(|p| p.protocol.as_deref() != Some("UDP"))
+        .map(|p| p.container_port as u16)
+        .collect()
 }
 
 /// The replica counts a workload row's health is decided from — the one place

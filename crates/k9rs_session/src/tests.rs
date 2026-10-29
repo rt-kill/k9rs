@@ -358,3 +358,63 @@ fn a_modal_with_a_key_handler_is_not_swallowed_before_reaching_it() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The edit-retry comment stripper
+// ---------------------------------------------------------------------------
+
+/// Our own prepended block goes; the document starts where it starts.
+#[test]
+fn the_prepended_error_block_is_stripped() {
+    let edited = "# k9rs: apply failed: conflict\n#\n\napiVersion: v1\nkind: Pod\n";
+    assert_eq!(strip_leading_comments(edited), "apiVersion: v1\nkind: Pod\n");
+}
+
+/// A `#` comment that is NOT ours survives, even at the top — the stripper
+/// knows one prefix and stops at anything else.
+#[test]
+fn a_users_own_leading_comment_survives() {
+    let edited = "# note to self\napiVersion: v1\n";
+    assert_eq!(
+        strip_leading_comments(edited),
+        edited,
+        "a leading comment that is not ours is the document's first line",
+    );
+}
+
+/// And a comment in the middle is untouched, which is the whole reason the
+/// run has to be contiguous.
+#[test]
+fn a_comment_inside_the_yaml_is_untouched() {
+    let edited = "# k9rs: failed\napiVersion: v1\n# the user's note\nkind: Pod\n";
+    assert_eq!(strip_leading_comments(edited), "apiVersion: v1\n# the user's note\nkind: Pod\n");
+}
+
+/// THE assumption this depends on, asserted here because the function that
+/// upholds it is three crates away and exists for another reason: a server
+/// message reaching the writer is single-line, so the whole block it writes
+/// carries our prefix.
+///
+/// If `sanitize_terminal` ever preserved newlines, the unprefixed tail
+/// would survive this stripper, be sent back as part of the manifest, fail
+/// to parse, and accumulate another block on each retry.
+#[test]
+fn a_server_message_is_single_line_by_the_time_we_prepend_it() {
+    let hostile = "apply failed\nkind: Secret\nstringData:\n  password: hunter2";
+    let sanitized = k9rs_util::text::sanitize_terminal(hostile);
+    assert!(
+        !sanitized.contains('\n'),
+        "a multi-line message would leave unprefixed YAML above the document: {sanitized:?}",
+    );
+    // …and the block we build from it is therefore strippable in full.
+    let edited = format!("# k9rs: {sanitized}\n\napiVersion: v1\n");
+    assert_eq!(strip_leading_comments(&edited), "apiVersion: v1\n");
+}
+
+/// CRLF line endings are consumed with their `\r`, so an editor on Windows
+/// does not leave a stray carriage return as the document's first byte.
+#[test]
+fn the_stripper_handles_crlf() {
+    let edited = "# k9rs: failed\r\n\r\napiVersion: v1\r\n";
+    assert_eq!(strip_leading_comments(edited), "apiVersion: v1\r\n");
+}

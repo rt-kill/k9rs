@@ -78,6 +78,28 @@ impl CellValue {
         }
     }
 
+    /// A quantity cell, or [`CellValue::Placeholder`] when there is no
+    /// value — the ONE answer to "this row has no number here".
+    ///
+    /// The choice was made at each call site, and a pods row made it three
+    /// ways: `CPU`/`MEM` used `Placeholder`, the `%` columns
+    /// `Percentage(None)`, and `CPU/R`/`CPU/L`/`MEM/R`/`MEM/L`
+    /// `Text(String::new())`. `cell_discriminant` puts `Text` at 0 and
+    /// `Placeholder` at 9, and `Percentage(None)` sorts after `Some` — so in
+    /// ONE row, sorting by `CPU/R` put the no-request pods FIRST, by `CPU`
+    /// LAST, and by `%CPU/R` LAST. Three directions for one meaning.
+    ///
+    /// `Placeholder` is the answer because it is the only variant that MEANS
+    /// absent: it renders `n/a` (the word the header already uses) and sorts
+    /// past every real value, so "no limit set" collects at one end instead
+    /// of masquerading as the smallest number.
+    pub fn quantity_or_absent(value: Option<u64>, unit: QuantityUnit) -> Self {
+        match value {
+            Some(value) => CellValue::Quantity { value, unit },
+            None => CellValue::Placeholder,
+        }
+    }
+
     /// Build a `List` from a pre-joined comma-separated string.
     /// Returns an empty list if the input is empty.
     pub fn from_comma_str(s: &str) -> Self {

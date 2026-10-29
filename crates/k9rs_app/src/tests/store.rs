@@ -18,7 +18,6 @@ fn row(name: &str, ns: &str, cells: &[&str]) -> ResourceRow {
 
 fn baseline(rows: Vec<ResourceRow>) -> StorePayload {
     StorePayload::Baseline(TableBaseline {
-        resource: rid(),
         headers: vec!["NAME".into(), "STATUS".into()],
         rows,
     })
@@ -246,7 +245,6 @@ fn pod_metrics_overlay_display_and_sort() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: rid(),
             headers: (0..=cpu_col).map(|i| format!("H{i}")).collect(),
             rows: vec![mk_row("low"), mk_row("high")],
         }),
@@ -292,7 +290,6 @@ fn node_metrics_absent_vs_never_polled() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: node_rid.clone(),
             headers: (0..=cpu_col).map(|i| format!("H{i}")).collect(),
             rows: vec![r],
         }),
@@ -532,6 +529,57 @@ fn a_tail_store_still_keeps_the_newest() {
         assert_eq!(i.truncated, 0);
     });
     assert!(!store.head_is_full());
+}
+
+/// A derived store keeps the SAME end as the source it filters, and
+/// `extend_derived` honours it.
+///
+/// `extend_derived` had its own eviction copy that hardcoded the `Tail`
+/// branch, and the child was built with `LineStore::new(cap)` — capacity
+/// inherited, retain end not. So a `LogRange::Since` session, which keeps
+/// the oldest N precisely because the oldest is what was asked for, had a
+/// `/pattern` child keeping the NEWEST N matches of them: the exact
+/// inversion `Retain` exists to fix, one level down. Both halves now come
+/// from `LineStore::derived_from`, and both ends go through
+/// `LineStoreInner::make_room`.
+#[test]
+fn a_derived_store_keeps_the_same_end_as_its_source() {
+    use crate::store::{Retain, StoredLine};
+    use k9rs_proto::protocol::LogLine;
+
+    let source = LineStore::new(3);
+    source.set_retain(Retain::Head);
+
+    let child = LineStore::derived_from(&source);
+    assert_eq!(child.max_lines(), 3, "capacity came across");
+
+    // Ten matches drained into a three-deep HEAD child.
+    child.extend_derived(
+        (0..10).map(|i| StoredLine::from(LogLine::untagged(format!("match-{i}")))),
+    );
+    child.with_read(|i| {
+        let got: Vec<&str> = i.lines.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(
+            got,
+            ["match-0", "match-1", "match-2"],
+            "the oldest matches, like the parent's oldest lines",
+        );
+        assert_eq!(i.evicted, 0, "nothing evicted — arrivals were refused");
+        assert_eq!(i.truncated, 7, "and the refusals are counted here too");
+    });
+
+    // A tail source still gives a tail child.
+    let tail_source = LineStore::new(3);
+    let tail_child = LineStore::derived_from(&tail_source);
+    tail_child.extend_derived(
+        (0..10).map(|i| StoredLine::from(LogLine::untagged(format!("m{i}")))),
+    );
+    tail_child.with_read(|i| {
+        let got: Vec<&str> = i.lines.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(got, ["m7", "m8", "m9"], "a follow's filter keeps the newest");
+        assert_eq!(i.evicted, 7);
+        assert_eq!(i.truncated, 0);
+    });
 }
 
 /// The palette assignment is the STREAM's, recorded as lines arrive, and it
@@ -954,11 +1002,10 @@ fn a_store_with_no_counter_does_not_raise_the_counter_banner() {
     // `mark_stale` only acts on a READY store, so each one has to have
     // received a baseline first — otherwise both halves below pass while
     // asserting nothing.
-    let ready = |store: &crate::store::RowStore, kind: k9rs_proto::resource_def::BuiltInKind| {
+    let ready = |store: &crate::store::RowStore| {
         store.apply(
             1,
             crate::StorePayload::Baseline(k9rs_proto::protocol::TableBaseline {
-                resource: kind.to_resource_id(),
                 headers: vec!["NAME".into()],
                 rows: Vec::new(),
             }),
@@ -968,8 +1015,8 @@ fn a_store_with_no_counter_does_not_raise_the_counter_banner() {
             "the store is Ready, so `mark_stale` will take",
         );
     };
-    ready(&app.core.crds, k9rs_proto::resource_def::BuiltInKind::CustomResourceDefinition);
-    ready(&app.core.namespaces, k9rs_proto::resource_def::BuiltInKind::Namespace);
+    ready(&app.core.crds);
+    ready(&app.core.namespaces);
     assert!(app.core.stale_reason().is_none(), "sanity: nothing stale yet");
 
     // `crds` feeds completion and the picker, not a counter.
@@ -1005,10 +1052,8 @@ fn a_store_with_no_counter_does_not_raise_the_counter_banner() {
 fn every_documented_state_edge_lands_where_the_doc_says() {
     use crate::TableDataState as S;
 
-    let pods = k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id();
     let baseline = || {
         crate::StorePayload::Baseline(k9rs_proto::protocol::TableBaseline {
-            resource: pods.clone(),
             headers: vec!["NAME".into()],
             rows: Vec::new(),
         })
@@ -1080,4 +1125,164 @@ fn every_documented_state_edge_lands_where_the_doc_says() {
              transition table says",
         );
     }
+}
+
+/// `evicted` counts lines that were REALLY dropped, at every cap.
+///
+/// A zero cap degenerates to one — `lines.len() >= 0` is always true, so
+/// each push evicts then appends — and the first push had nothing to evict
+/// while still incrementing the counter. Elements self-heal their scroll by
+/// diffing against it, so that one phantom offset every element inherited
+/// forever. Five pushes drop four lines, not five.
+///
+/// (My first draft of this asserted `len == 0` and `evicted == 0`, which is
+/// what a zero cap sounds like and not what it does. Config refuses
+/// `maxLines: 0` now; the counter is correct for any cap, which is where
+/// the correctness belongs.)
+#[test]
+fn an_impossible_cap_counts_no_phantom_evictions() {
+    let store = crate::store::LineStore::new(0);
+    for i in 0..5 {
+        store.push(0, k9rs_proto::protocol::LogLine {
+            source: None,
+            timestamp: None,
+            content: format!("line {i}"),
+        });
+    }
+    store.with_read(|inner| {
+        assert_eq!(inner.lines.len(), 1, "a zero cap degenerates to one");
+        assert_eq!(
+            inner.evicted, 4,
+            "four lines were really dropped; the fifth count was the phantom",
+        );
+    });
+}
+
+/// A real cap still counts real evictions, which is what the healing needs.
+#[test]
+fn a_real_cap_counts_every_eviction() {
+    let store = crate::store::LineStore::new(2);
+    for i in 0..5 {
+        store.push(0, k9rs_proto::protocol::LogLine {
+            source: None,
+            timestamp: None,
+            content: format!("line {i}"),
+        });
+    }
+    store.with_read(|inner| {
+        assert_eq!(inner.lines.len(), 2);
+        assert_eq!(inner.evicted, 3, "five in, two kept");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The epoch gate itself — one rule, not five copies of it
+// ---------------------------------------------------------------------------
+
+/// The comparison, stated once. It had been written five times: three
+/// production guards, a test helper that stated it INVERTED, and a fifth
+/// copy in `LineStoreInner` whose own doc said "same question, same reason
+/// as `RowStoreInner::accepts`".
+#[test]
+fn the_epoch_gate_admits_its_own_epoch_and_everything_after() {
+    let mut gate = crate::store::EpochGate::default();
+    assert!(gate.accepts(0), "a fresh gate admits the first stream");
+    assert!(gate.accepts(7));
+
+    gate.raise(5);
+    assert!(!gate.accepts(4), "a superseded stream's straggler is refused");
+    assert!(gate.accepts(5), "the floor itself is the current stream");
+    assert!(gate.accepts(6));
+}
+
+/// `raise` is MONOTONIC: a late `expect_epoch` from a predecessor cannot
+/// lower the floor under its successor, which is the whole hazard the
+/// retire-and-mint ordering exists to prevent.
+#[test]
+fn raising_the_epoch_gate_never_lowers_it() {
+    let mut gate = crate::store::EpochGate::default();
+    gate.raise(9);
+    gate.raise(3);
+    assert!(!gate.accepts(8), "the later floor stands");
+    assert!(gate.accepts(9));
+}
+
+/// `rebase` is the one operation that can move the floor DOWN, and only a
+/// baseline does it — the stream declaring where its own history starts,
+/// which is a different statement from "no earlier than".
+#[test]
+fn only_a_rebase_can_move_the_floor_down() {
+    let mut gate = crate::store::EpochGate::default();
+    gate.raise(9);
+    gate.rebase(4);
+    assert!(gate.accepts(4), "the baseline's own epoch is now the floor");
+    assert!(!gate.accepts(3));
+}
+
+// ---------------------------------------------------------------------------
+// The generation counter is a DERIVE key, not an event log
+// ---------------------------------------------------------------------------
+
+/// A payload that moved only the state does not invalidate the derived view.
+///
+/// `DeriveKey` carries rows, metrics, sort and filter — not `state` (the
+/// render gate reads that directly) and not `flash` (the widget is handed it
+/// at paint time). `apply` bumped unconditionally, and `announce_health`
+/// fires on every watcher transition, every bridge backoff and every
+/// attach-time catch-up: one cluster-side outage re-derived the whole table
+/// once per retry. The same file already guards this twice
+/// (`MetricsHub::set_pods`, `LineStore::set_live`) and `mark_stale` reaches
+/// the identical `Ready → Stale` edge with no bump at all.
+#[test]
+fn a_state_only_payload_does_not_invalidate_the_derived_view() {
+    let store = crate::store::RowStore::new("pods");
+
+    // A baseline IS data.
+    let before_baseline = store.generation();
+    store.apply(1, baseline(vec![row("a", "ns", &["a", "Running"])]));
+    assert!(
+        store.generation() > before_baseline,
+        "rows changed, so the cached view must be dropped",
+    );
+
+    // Every state-only payload, from the state it actually acts on.
+    for (name, payload) in [
+        ("Stale", StorePayload::Stale("watch died".into())),
+        ("Live", StorePayload::Live),
+        ("Failed", StorePayload::Failed("boom".into())),
+    ] {
+        let before = store.generation();
+        store.apply(1, payload);
+        assert_eq!(
+            store.generation(),
+            before,
+            "{name}: the rows are untouched, so the derived view is still              correct",
+        );
+    }
+
+    // And a repeat of one the store cannot act on at all — the shape
+    // `announce_health` produces on every retry.
+    let before = store.generation();
+    for _ in 0..5 {
+        store.apply(1, StorePayload::Stale("still down".into()));
+    }
+    assert_eq!(store.generation(), before, "five retries, zero re-derives");
+}
+
+/// …but a delta that moves rows does, and an empty flush does not.
+#[test]
+fn a_delta_bumps_only_when_it_carries_changes() {
+    let store = crate::store::RowStore::new("pods");
+    store.apply(1, baseline(vec![row("a", "ns", &["a", "Running"])]));
+
+    let before = store.generation();
+    store.apply(1, delta(vec![]));
+    assert_eq!(
+        store.generation(),
+        before,
+        "a window where every change coalesced away moved no rows",
+    );
+
+    store.apply(1, delta(vec![RowChange::Remove(key("ns", "a"))]));
+    assert!(store.generation() > before, "a removal is a row change");
 }

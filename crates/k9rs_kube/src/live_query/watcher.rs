@@ -118,7 +118,10 @@ pub struct BaselineAsk {
 /// [`crate::daemon_config::DaemonConfig::fanout_ring`] for the
 /// memory-vs-lag-tolerance tradeoff.
 pub(super) fn fanout_ring() -> usize {
-    crate::daemon_config::daemon_config().fanout_ring.max(1)
+    // No `.max(1)`: the field is `NonZeroUsize`, so a `0` is refused where
+    // the config file is read rather than repaired here. This was the one
+    // of six knobs with a reader-side clamp — because this one PANICS.
+    crate::daemon_config::daemon_config().fanout_ring.get()
 }
 
 /// How many un-answered [`BaselineAsk`]s the watcher's inbox holds.
@@ -196,8 +199,8 @@ impl PendingChanges {
     }
 }
 
-pub(crate) fn watcher_page_size() -> u32 {
-    crate::daemon_config::daemon_config().watcher_page_size
+fn watcher_page_size() -> u32 {
+    crate::daemon_config::daemon_config().watcher_page_size.get()
 }
 
 
@@ -205,7 +208,7 @@ pub(crate) fn watcher_page_size() -> u32 {
 /// progressive-paint cadence during an initial LIST (no size gate: each
 /// row is sent exactly once, so total init bytes ≈ one full list at any
 /// cluster size — the old 2000-row cap is gone, dissolved not raised).
-pub(crate) const INIT_FLUSH_INTERVAL_MS: u64 = 200;
+const INIT_FLUSH_INTERVAL_MS: u64 = 200;
 // Staleness (a half-open TCP connection after suspend/network loss) is
 // detected by the TRANSPORT, not by this module: `client_build.rs` sets
 // `read_timeout: 300s` on the kube Config, and the watch request's server
@@ -224,16 +227,16 @@ pub(crate) const INIT_FLUSH_INTERVAL_MS: u64 = 200;
 /// and recovers inside a backoff step, and reporting each one would flicker
 /// a staleness banner across every open table on routine churn. Above it,
 /// nothing has moved for long enough that "live" is a lie.
-pub(crate) const DEGRADE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const DEGRADE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Backoff config — loaded from daemon config at runtime.
-pub(crate) fn initial_backoff_ms() -> u64 {
-    crate::daemon_config::daemon_config().backoff.initial_ms
+fn initial_backoff_ms() -> u64 {
+    crate::daemon_config::daemon_config().backoff.initial_ms.get()
 }
-pub(crate) fn max_backoff_ms() -> u64 {
-    crate::daemon_config::daemon_config().backoff.max_ms
+fn max_backoff_ms() -> u64 {
+    crate::daemon_config::daemon_config().backoff.max_ms.get()
 }
-pub(crate) fn max_elapsed_ms() -> u64 {
+fn max_elapsed_ms() -> u64 {
     crate::daemon_config::daemon_config().backoff.max_elapsed_ms
 }
 
@@ -389,7 +392,6 @@ pub(crate) async fn run_typed_watcher<K, C, D>(
     // usable while the loop below mutates it.
     let make_baseline = |store: &HashMap<ObjectKey, ResourceRow>, health: &WatchHealth| BaselineReply {
         baseline: TableBaseline {
-            resource: resource_id.clone(),
             headers: headers.clone(),
             rows: store.values().cloned().collect(),
         },

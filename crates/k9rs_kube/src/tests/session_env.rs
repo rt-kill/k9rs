@@ -112,3 +112,43 @@ async fn the_streaming_door_takes_no_slot() {
         "a streaming kubectl is bounded by the substream it rides, not by this",
     );
 }
+
+/// The `Debug` impl redacts VALUES, and nothing else in the type may leak
+/// them either.
+///
+/// This type exists for cross-tenant credential isolation: the vars it
+/// carries are a session's own `AWS_SECRET_ACCESS_KEY`,
+/// `AWS_SESSION_TOKEN`, `GOOGLE_APPLICATION_CREDENTIALS`. The redaction is
+/// a hand-written `fmt` with a comment saying why, and nothing pinned it —
+/// so a later `#[derive(Debug)]`, or one new `.field()`, would put a
+/// secret into the daemon log, and every `tracing` line that formats a
+/// session is a candidate.
+#[test]
+fn the_debug_impl_does_not_print_credential_values() {
+    let secret = "AKIA-not-a-real-key-0123456789";
+    let token = "FwoGZXIvYXdzE-not-a-real-token";
+    let env = SessionEnv::new(HashMap::from([
+        ("AWS_SECRET_ACCESS_KEY".to_string(), secret.to_string()),
+        ("AWS_SESSION_TOKEN".to_string(), token.to_string()),
+        ("KUBECONFIG".to_string(), "/home/someone/.kube/config".to_string()),
+    ]));
+
+    let printed = format!("{env:?}");
+    for leaked in [secret, token, "/home/someone/.kube/config"] {
+        assert!(
+            !printed.contains(leaked),
+            "a value reached the log: {printed}",
+        );
+    }
+    // The count is the whole point of printing it at all.
+    assert!(
+        printed.contains("var_count") && printed.contains('3'),
+        "it should still say HOW MANY, which is the diagnostic: {printed}",
+    );
+    // Names are not secrets, but they are not printed either — a name list
+    // is a fingerprint of the session's auth method, and nothing needs it.
+    assert!(
+        !printed.contains("AWS_SECRET_ACCESS_KEY"),
+        "not even the names: {printed}",
+    );
+}

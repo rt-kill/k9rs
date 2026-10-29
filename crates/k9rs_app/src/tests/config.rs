@@ -375,7 +375,7 @@ fn both_read_only_gates_resolve_the_same_answer() {
             metrics,
             root,
             cfg.clone(),
-            k9rs_theme::term_bg::Appearance::Dark,
+            k9rs_theme::Theme::for_appearance(k9rs_theme::term_bg::Appearance::Dark),
         );
         assert_eq!(
             app.read_only,
@@ -540,4 +540,59 @@ fn an_alt_chord_is_not_a_binding() {
         None,
         "nor is a non-character key",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Numeric settings: a zero that lies about itself
+// ---------------------------------------------------------------------------
+
+/// The three values whose zero does something other than what the name
+/// says are refused at load. `load()` validated `keys` and nothing else —
+/// loud about a misspelled key, silent about a correctly-spelled one with a
+/// meaningless value, which is the exact fallback this module exists to
+/// refuse.
+#[test]
+fn a_meaningless_zero_is_a_startup_error() {
+    let base = AppConfig::default();
+
+    let mut cfg = base.clone();
+    cfg.ui.max_column_width = 0;
+    let err = cfg.validate().expect_err("every column would be invisible");
+    assert!(err.contains("maxColumnWidth"), "{err}");
+
+    let mut cfg = base.clone();
+    cfg.ui.logs.max_lines = 0;
+    let err = cfg.validate().expect_err("no log line would be kept");
+    assert!(err.contains("maxLines"), "{err}");
+
+    let mut cfg = base.clone();
+    cfg.ui.cache_capacity = 0;
+    let err = cfg.validate().expect_err("0 is not off, it is 1");
+    assert!(err.contains("cacheCapacity"), "{err}");
+}
+
+/// The zeros that MEAN something are left alone. Strictness that refuses a
+/// legitimate value is as wrong as silence about an illegitimate one:
+/// `tailLines: 0` is kubectl's `--tail=0` (follow with no backfill), and
+/// the rest are ordinary "none".
+#[test]
+fn a_meaningful_zero_is_accepted() {
+    let mut cfg = AppConfig::default();
+    cfg.ui.logs.tail_lines = 0;
+    cfg.ui.search_context_lines = 0;
+    cfg.ui.command_history_size = 0;
+    cfg.ui.change_highlight_secs = 0;
+    cfg.ui.flash.info_secs = 0;
+    cfg.ui.flash.warn_secs = 0;
+    cfg.ui.flash.error_secs = 0;
+    assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+}
+
+/// The shipped defaults pass their own validation — the check cannot be one
+/// nobody could satisfy.
+#[test]
+fn the_default_config_validates() {
+    let cfg = AppConfig::default();
+    assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+    assert!(cfg.keys.validate().is_ok());
 }

@@ -101,7 +101,6 @@ fn ok_results_unmark_their_rows_through_the_weak_store() {
         ..Default::default()
     };
     store.apply(1, StorePayload::Baseline(TableBaseline {
-        resource: ResourceId::BuiltIn(BuiltInKind::Pod),
         headers: vec!["NAME".into()],
         rows: vec![row],
     }));
@@ -132,7 +131,6 @@ fn failed_results_keep_their_marks() {
         ..Default::default()
     };
     store.apply(1, StorePayload::Baseline(TableBaseline {
-        resource: ResourceId::BuiltIn(BuiltInKind::Pod),
         headers: vec!["NAME".into()],
         rows: vec![row],
     }));

@@ -380,7 +380,10 @@ pub(crate) fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &
         return;
     }
 
-    let input = app.ui.command_input().map_or("", |(i, _)| i);
+    // Prefix and buffer together: this is the open `:` prompt by the
+    // caller's own gate, so there is no absent case to invent one for.
+    let Some((prefix, text)) = app.ui.command_prompt() else { return };
+    let input = text.value();
     let ghost: String = app.best_completion()
         .and_then(|c| c.strip_prefix(input).map(str::to_string))
         .unwrap_or_default();
@@ -388,16 +391,12 @@ pub(crate) fn draw_command_prompt(f: &mut Frame, app: &App, area: Rect, theme: &
     // Fish-style rendering: typed text (bright) followed immediately by ghost
     // text (dim/italic) with no block cursor in between. The terminal cursor
     // is placed right after the typed text via set_cursor_position.
-    let prefix = app.ui.command_prompt();
     let prefix_len: u16 = prefix.width() as u16;
 
     // WINDOWED around the caret — same rule, same reason as
     // `ui::draw_command_overlay`, which this is the inline twin of.
     let avail = (inner.width as usize).saturating_sub(prefix_len as usize);
-    let (shown, caret_col) = match app.ui.command_text() {
-        Some(t) => t.window(avail),
-        None => (input, input.width()),
-    };
+    let (shown, caret_col) = text.window(avail);
 
     let mut spans = vec![
         Span::styled(prefix, theme.command.add_modifier(Modifier::BOLD)),

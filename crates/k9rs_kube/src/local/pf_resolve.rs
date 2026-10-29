@@ -157,16 +157,20 @@ async fn resolve_service(
     let spec = svc
         .spec
         .ok_or_else(|| ResolveError::Retry(format!("service {name} has no spec")))?;
-    let selector = spec.selector.filter(|s| !s.is_empty()).ok_or_else(|| {
-        // Selector-less services (ExternalName, manual Endpoints) have no
-        // pods of their own — not something a retry fixes.
-        ResolveError::Fatal(format!("service {name} has no pod selector"))
-    })?;
-    let sel_str = selector
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join(",");
+    // A service's `spec.selector` is an equality-only label selector, so it
+    // renders through the same grammar as a workload's `LabelSelector`
+    // rather than a `k=v` join of its own — which is what it was, 100 lines
+    // from `selector_to_string`'s identical `match_labels` arm.
+    //
+    // With no `match_expressions`, the only way that renderer can refuse is
+    // the empty selector, and that is the refusal this maps: selector-less
+    // services (ExternalName, manual Endpoints) have no pods of their own,
+    // which is not something a retry fixes.
+    let sel_str = selector_to_string(&LabelSelector {
+        match_labels: spec.selector,
+        match_expressions: None,
+    })
+    .map_err(|_| ResolveError::Fatal(format!("service {name} has no pod selector")))?;
     let pod = fetch_ready_pod(client, ns, &sel_str).await?;
 
     // kubectl's translateServicePortToTargetPort: the requested port must
@@ -174,8 +178,7 @@ async fn resolve_service(
     // what the pod actually listens on. Named targetPorts resolve against
     // the chosen pod's container ports.
     let port = service_target_port(spec.ports.as_deref().unwrap_or(&[]), remote_port, &pod)?;
-    let pod_name = pod.metadata.name.unwrap_or_default();
-    Ok(PodTarget { pod: pod_name, port })
+    Ok(PodTarget { pod: pod_name(&pod)?, port })
 }
 
 /// Map the requested service port to the pod's target port.
@@ -250,7 +253,7 @@ async fn pick_ready_pod_by_selector(
     selector: &str,
 ) -> Result<String, ResolveError> {
     let pod = fetch_ready_pod(client, ns, selector).await?;
-    Ok(pod.metadata.name.unwrap_or_default())
+    pod_name(&pod)
 }
 
 async fn fetch_ready_pod(
@@ -265,6 +268,21 @@ async fn fetch_ready_pod(
         .map_err(|e| ResolveError::Retry(format!("listing pods ({selector}): {e}")))?;
     pick_ready_pod(pods.items)
         .ok_or_else(|| ResolveError::Retry(format!("no ready pods match {selector}")))
+}
+
+/// A chosen pod's name, or a retryable refusal.
+///
+/// Both call sites were `pod.metadata.name.unwrap_or_default()`, so a pod
+/// the apiserver returned without a name produced a port-forward to pod
+/// `""` — `kubectl port-forward pod/ …`, which fails later and further away
+/// with nothing pointing back here. An unnamed pod is not a pod we can
+/// forward to; `Retry` because the list is worth re-reading.
+fn pod_name(pod: &Pod) -> Result<String, ResolveError> {
+    pod.metadata
+        .name
+        .clone()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| ResolveError::Retry("the chosen pod has no name".to_string()))
 }
 
 /// First pod that is running, not terminating, and Ready. `None` if no pod

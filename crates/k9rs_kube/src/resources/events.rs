@@ -3,7 +3,7 @@ use k8s_openapi::api::core::v1::Event;
 use super::ConvertToRow;
 use k9rs_proto::resource_def::events::EventDef;
 
-use crate::resources::k8s_const::{EVENT_TYPE_NORMAL, EVENT_TYPE_WARNING};
+use crate::resources::k8s_const::EVENT_TYPE_NORMAL;
 use crate::resources::CommonMeta;
 use k9rs_proto::row::{CellValue, ResourceRow, RowHealth};
 
@@ -55,10 +55,16 @@ impl ConvertToRow<Event> for EventDef {
         // `unwrap_or_default()` — so an event with no type rendered as an
         // empty cell coloured Normal. Anything unexpected is worth a look,
         // so it reads as Pending rather than as fine.
-        let health = match event_type.as_str() {
-            EVENT_TYPE_NORMAL => RowHealth::Normal,
-            EVENT_TYPE_WARNING => RowHealth::Pending,
-            _ => RowHealth::Pending,
+        // `Warning` is not named separately: it would be the SAME value as
+        // the wildcard, so the arm was inert — and an inert named arm reads
+        // as a decision that has been made. The decision is the one below:
+        // anything that is not `Normal` is worth a look. A future third
+        // `type` therefore reads as a warning ON PURPOSE rather than by
+        // falling through an arm that happens to agree.
+        let health = if event_type == EVENT_TYPE_NORMAL {
+            RowHealth::Normal
+        } else {
+            RowHealth::Pending
         };
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.namespace.clone()),

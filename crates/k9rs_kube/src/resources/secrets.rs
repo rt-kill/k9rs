@@ -21,7 +21,7 @@ impl ConvertToRow<Secret> for SecretDef {
             CellValue::Text(meta.name.clone()),
             CellValue::Text(secret_type),
             CellValue::Count(data_count as i64),
-            CellValue::Text(meta.labels_str),
+            meta.labels_cell(),
             CellValue::Age(meta.age.map(|t| t.timestamp())),
         ];        ResourceRow {
             name: meta.name,

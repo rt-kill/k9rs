@@ -190,9 +190,12 @@ pub(crate) fn parse_command_input(raw_cmd: &str, cmd: &str, app: &App) -> Parsed
     // is in neither — it is created at runtime from daemon config, and
     // `Custom(_).aliases()` is empty by construction. So `:node-costs` fell
     // through to the CRD fallback below and the daemon answered "Unknown
-    // resource", while the README promised the name would work. `:exec`
-    // resolved to `exec_configs.first()`, so a SECOND configured source was
-    // unreachable by any keystroke at all.
+    // resource", while the README promised the name would work. The only
+    // other way in was `:exec`, which the daemon answered with
+    // `exec_configs.first()`, so a SECOND configured source was unreachable
+    // by any keystroke at all. That generic alias is gone as of wire v19;
+    // this is the whole way in now, and `seed_aliases` lists these names so
+    // they stay discoverable.
     //
     // The client already has the answer: `AppConfig` parses the whole
     // `daemon:` section (it has to — `deny_unknown_fields` on the root would
@@ -235,7 +238,14 @@ pub(crate) fn parse_command_input(raw_cmd: &str, cmd: &str, app: &App) -> Parsed
 /// daemon-side — so the id the client sends is the id the daemon answers to.
 fn exec_resource_by_name(cmd: &str, app: &App) -> Option<ResourceId> {
     let configs = &app.config.daemon.as_ref()?.exec_resources;
-    let matched = configs.iter().find(|c| c.name.eq_ignore_ascii_case(cmd))?;
+    // Through the SAME validation the daemon applies
+    // (`ExecSourceConfig::validate`). This read applied none, so an entry
+    // the daemon had skipped was still typeable here and came back as
+    // `Unknown local resource: …` with no reason — two readers of one
+    // config with different arity.
+    let matched = configs
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(cmd) && c.validate().is_ok())?;
     Some(
         k9rs_proto::local_types::LocalResourceKind::Custom(matched.name.clone())
             .to_resource_id(),
@@ -510,7 +520,7 @@ fn handle_command_submit(
             // against a session that doesn't exist and `nav.reset`s the
             // picker away, stranding the user on an empty table.
             app.ui.flash = Some(k9rs_app::FlashMessage::warn(
-                "Select a context first".to_string(),
+                crate::actions::SELECT_A_CONTEXT_FIRST.to_string(),
             ));
         }
         ParsedCommand::Resource(rid) => {
@@ -519,16 +529,12 @@ fn handle_command_submit(
                 // query already carries the resolved scope).
                 app.kube.selected_ns = k9rs_proto::protocol::Namespace::All;
             }
-            let root = App::root_list_element(
-                data_source, &app.kube.metrics,
-                &app.core, rid, app.kube.selected_ns.clone(),
+            let root = crate::actions::root_for(app, data_source, rid, app.kube.selected_ns.clone(),
             );
             app.nav.reset(root);
         }
         ParsedCommand::ResourceFilter { rid, filter } => {
-            let root = App::root_list_element(
-                data_source, &app.kube.metrics,
-                &app.core, rid, app.kube.selected_ns.clone(),
+            let root = crate::actions::root_for(app, data_source, rid, app.kube.selected_ns.clone(),
             );
             app.nav.reset(root);
             let predicate = k9rs_app::RowPredicate::Grep(
@@ -542,9 +548,7 @@ fn handle_command_submit(
             // The element carries the requested namespace as its OWN
             // scope; the selector follows it (explicit selector write).
             app.kube.selected_ns = namespace.clone();
-            let root = App::root_list_element(
-                data_source, &app.kube.metrics,
-                &app.core, rid.clone(), namespace.clone(),
+            let root = crate::actions::root_for(app, data_source, rid.clone(), namespace.clone(),
             );
             app.nav.reset(root);
             app.ui.flash = Some(k9rs_app::FlashMessage::info(format!(
@@ -557,9 +561,7 @@ fn handle_command_submit(
                 crd.group.clone(), crd.version.clone(),
                 crd.kind.clone(), crd.plural.clone(), crd.scope,
             );
-            let root = App::root_list_element(
-                data_source, &app.kube.metrics,
-                &app.core, crd_rid, namespace.clone(),
+            let root = crate::actions::root_for(app, data_source, crd_rid, namespace.clone(),
             );
             app.nav.reset(root);
             app.ui.flash = Some(k9rs_app::FlashMessage::info(
@@ -588,9 +590,7 @@ fn handle_command_submit(
             if scope == k9rs_proto::protocol::ResourceScope::Cluster && !app.kube.selected_ns.is_all() {
                 app.kube.selected_ns = k9rs_proto::protocol::Namespace::All;
             }
-            let root = App::root_list_element(
-                data_source, &app.kube.metrics,
-                &app.core, crd_rid, app.kube.selected_ns.clone(),
+            let root = crate::actions::root_for(app, data_source, crd_rid, app.kube.selected_ns.clone(),
             );
             app.nav.reset(root);
             app.ui.flash = Some(k9rs_app::FlashMessage::info(format!("Browsing: {}", kind_label)));

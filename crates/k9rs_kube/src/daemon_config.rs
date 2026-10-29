@@ -37,20 +37,48 @@ static DEFAULTS: LazyLock<DaemonConfig> = LazyLock::new(DaemonConfig::default);
 /// comes from. Idempotent: a second call is ignored, because the first reader
 /// may already hold a `&'static` borrow.
 ///
-/// LENIENT on invalid config (warn + defaults): the TUI is the loud gate — it
-/// refuses to start on the same file's errors before ever spawning a daemon,
-/// so a long-running daemon whose config went bad after launch degrades
-/// rather than dying mid-flight.
+/// LENIENT on invalid config (keep going on defaults) because a daemon is a
+/// long-running process: one whose config file goes bad after launch should
+/// degrade, not die mid-flight with sessions attached.
+///
+/// This used to add "the TUI is the loud gate — it refuses to start on the
+/// same file's errors before ever spawning a daemon". Nothing spawns a
+/// daemon — `k9rs daemon` is a foreground command the user runs, possibly
+/// first, possibly on a box where the TUI never runs — and the TUI's own
+/// gate validates the `k9rs` section, not this one. There was no loud gate
+/// anywhere.
+///
+/// So the complaint is KEPT rather than logged, and
+/// [`load_problems`] hands it to whichever entry point called this, to
+/// report once its logging exists. It was a bare `tracing::warn!` called
+/// from `main` BEFORE any subscriber is installed — dropped on the floor,
+/// not even `--log-file` caught it. Overlays survive the same ordering
+/// because their warn macro also pushes to a `problems` list that `main`
+/// surfaces as a flash; this had no second destination. Same shape as the
+/// lost-daemon-diagnostics entry in the ledger.
 pub fn load_from_home() {
+    let mut problem = None;
     let _ = CONFIG.set(match k9rs_config::load_section::<DaemonConfig>("daemon") {
         Ok(Some(c)) => c,
         Ok(None) => DaemonConfig::default(),
         Err(e) => {
-            tracing::warn!("config: {e} — daemon using defaults");
+            problem = Some(format!("daemon config: {e} — using defaults"));
             DaemonConfig::default()
         }
     });
+    if let Some(p) = problem {
+        let _ = PROBLEMS.set(vec![p]);
+    }
 }
+
+/// What [`load_from_home`] had to say about the config file, for the entry
+/// point to report once it has somewhere to report to. Empty when the file
+/// was fine, absent, or never loaded.
+pub fn load_problems() -> &'static [String] {
+    PROBLEMS.get().map_or(&[], |p| p.as_slice())
+}
+
+static PROBLEMS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 /// Access the daemon config — the loaded one, or the defaults when nothing
 /// has been loaded.
@@ -59,11 +87,27 @@ pub fn daemon_config() -> &'static DaemonConfig {
 }
 
 /// Daemon-side tuning parameters.
+///
+/// The knobs for which zero is not a quantity but a malfunction are
+/// `NonZero`, so serde refuses them where the file is read and
+/// [`load_from_home`] reports it — the same shape `ExecSourceConfig`'s
+/// `pollIntervalSecs` already had. They used to be plain integers with a
+/// single `.max(1)` at one of the six readers: `fanoutRing: 0` PANICS
+/// (`broadcast::channel(0)`), which is why that one was guarded, while
+/// `discoveryRefreshSecs: 0` became a `sleep(0)` hot loop and
+/// `backoff.initialMs: 0` made `(0 * 2).min(max)` a fixed point — the
+/// documented ceiling unreachable and the retry loop spinning at
+/// `now + 0ms`. Clamping at the readers would have been the same decision
+/// written six times; a type states it once.
+///
+/// `watcherGraceSecs`, `localsGraceSecs` and `backoff.maxElapsedMs` stay
+/// plain: zero is a real answer for each ("do not keep it warm", "give up
+/// on the first failure"), and refusing it would take a choice away.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct DaemonConfig {
-    pub watcher_page_size: u32,
-    pub discovery_refresh_secs: u64,
+    pub watcher_page_size: std::num::NonZeroU32,
+    pub discovery_refresh_secs: std::num::NonZeroU64,
     /// Delta-broadcast ring depth per watcher (batches). A tokio broadcast
     /// ring retains each value until 63 newer ones overwrite it, so a
     /// larger ring both tolerates a slower subscriber before it must
@@ -72,7 +116,7 @@ pub struct DaemonConfig {
     /// never overwritten, so the whole dataset stays pinned. Lower this to
     /// cut daemon memory on big quiet resources; raise it if slow (SSH)
     /// clients re-baseline too often.
-    pub fanout_ring: usize,
+    pub fanout_ring: std::num::NonZeroUsize,
     /// How long a watcher stays warm after its last subscriber leaves. Bounds
     /// a row store plus an apiserver watch; see
     /// `DEFAULT_WATCHER_GRACE_SECS`.
@@ -92,9 +136,9 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            watcher_page_size: 1000,
-            discovery_refresh_secs: 300,
-            fanout_ring: 64,
+            watcher_page_size: nonzero_u32(1000),
+            discovery_refresh_secs: nonzero_u64(300),
+            fanout_ring: std::num::NonZeroUsize::new(64).expect("64 is nonzero"),
             watcher_grace_secs: crate::grace::DEFAULT_WATCHER_GRACE_SECS,
             locals_grace_secs: crate::grace::DEFAULT_LOCALS_GRACE_SECS,
             backoff: BackoffConfig::default(),
@@ -107,18 +151,40 @@ impl Default for DaemonConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct BackoffConfig {
-    pub initial_ms: u64,
-    pub max_ms: u64,
+    /// First retry delay. `NonZero` because the doubling is
+    /// `(current * 2).min(max)`, which has a fixed point at zero: a `0`
+    /// here made `max_ms` unreachable and the retry loop spin.
+    pub initial_ms: std::num::NonZeroU64,
+    /// Ceiling for the doubling.
+    pub max_ms: std::num::NonZeroU64,
+    /// How long a watch may keep failing before its rows are declared dead.
+    /// Zero is allowed and means "the first failure is fatal".
     pub max_elapsed_ms: u64,
 }
 
 impl Default for BackoffConfig {
     fn default() -> Self {
         Self {
-            initial_ms: 300,
-            max_ms: 30_000,
+            initial_ms: nonzero_u64(300),
+            max_ms: nonzero_u64(30_000),
             max_elapsed_ms: 120_000,
         }
+    }
+}
+
+/// The two `NonZero` constructors the defaults need, with the literal right
+/// next to the proof it is nonzero.
+const fn nonzero_u32(n: u32) -> std::num::NonZeroU32 {
+    match std::num::NonZeroU32::new(n) {
+        Some(v) => v,
+        None => panic!("a default must be nonzero"),
+    }
+}
+
+const fn nonzero_u64(n: u64) -> std::num::NonZeroU64 {
+    match std::num::NonZeroU64::new(n) {
+        Some(v) => v,
+        None => panic!("a default must be nonzero"),
     }
 }
 

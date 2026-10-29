@@ -55,6 +55,15 @@ pub async fn dispatch(cmd: Command) -> Result<()> {
                 .with_env_filter(filter)
                 .with_writer(std::io::stderr)
                 .init();
+            // What loading the config had to say, now that there is
+            // somewhere to say it. `main` loads it before any subscriber
+            // exists — deliberately, so one site serves every entry point —
+            // so the complaint is carried rather than logged, and this is
+            // the daemon's turn to report it. It went nowhere at all
+            // before: not even `--log-file` caught it.
+            for problem in k9rs_kube::daemon_config::load_problems() {
+                tracing::warn!("{problem}");
+            }
             let result = k9rs_daemon::daemon::run_daemon().await;
             // `ctl stop` must actually stop the process. Under `#[tokio::main]`
             // the runtime's Drop waits for every started blocking closure, and

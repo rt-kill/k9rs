@@ -187,7 +187,7 @@ pub struct RowStoreInner {
     /// superseded stream targeting this same store) and are dropped. An
     /// accepted Baseline sets the floor; [`RowStore::expect_epoch`] raises
     /// it eagerly the moment a successor stream exists.
-    epoch_floor: u64,
+    epoch: EpochGate,
     /// Marked rows, keyed by identity. DATA, not view state: marks are
     /// pruned atomically with the row mutation that invalidates them, and
     /// batch operations read identities. Shared by every element over
@@ -229,7 +229,7 @@ impl RowStore {
                 headers: Vec::new(),
                 column_rules: Vec::new(),
                 state: TableDataState::Initializing,
-                epoch_floor: 0,
+                epoch: EpochGate::default(),
                 marked: HashSet::new(),
                 flash: DeltaTracker::new(),
             }),
@@ -264,8 +264,7 @@ impl RowStore {
     /// superseded stream is rejected, closing the "stale delta flickers
     /// back after Ctrl-R" window.
     pub fn expect_epoch(&self, epoch: u64) {
-        let mut inner = self.lock();
-        inner.epoch_floor = inner.epoch_floor.max(epoch);
+        self.lock().epoch.raise(epoch);
     }
 
     /// Whether an event stamped `epoch` would be accepted rather than
@@ -304,14 +303,29 @@ impl RowStore {
 
     /// Sole stream-data write path. Epoch-gated; see [`StorePayload`] for
     /// the per-variant semantics.
+    ///
+    /// Bumps the generation only when the payload changed something the
+    /// DERIVED view is built from. `DeriveKey` carries rows (through this
+    /// counter), metrics, sort and filter — not `state`, which the render
+    /// gate reads directly, and not `flash`, which the widget is handed at
+    /// paint time. So a state-only payload needs no bump.
+    ///
+    /// It used to bump for all of them, which is the same question answered
+    /// three ways inside one file: `MetricsHub::set_pods` and
+    /// `LineStore::set_live` both skip the bump when the value is unchanged
+    /// (with a comment on the O(rows×cols) re-derive it saves), and
+    /// [`RowStore::mark_stale`] reaches this very `Ready → Stale` edge with
+    /// no bump at all. `announce_health` fires on every watcher transition,
+    /// every bridge backoff and every attach-time catch-up, so one
+    /// cluster-side outage re-derived the whole table once per retry.
     pub fn apply(&self, epoch: u64, payload: StorePayload) {
         let mut inner = self.lock();
         if !inner.accepts(epoch) {
             return; // stale stream: superseded before this event landed
         }
-        match payload {
+        let data_changed = match payload {
             StorePayload::Baseline(b) => {
-                inner.epoch_floor = epoch;
+                inner.epoch.rebase(epoch);
                 if inner.headers != b.headers {
                     inner.column_rules =
                         k9rs_proto::overlay::build_column_rules(&b.headers, &self.plural);
@@ -326,6 +340,7 @@ impl RowStore {
                 }
                 inner.rows = b.rows;
                 inner.state = TableDataState::Ready;
+                true
             }
             StorePayload::Delta(d) => {
                 // Plan-then-apply over a transient index (cannot drift —
@@ -389,9 +404,16 @@ impl RowStore {
                 if matches!(inner.state, TableDataState::Stale(_)) {
                     inner.state = TableDataState::Ready;
                 }
+                // An empty flush moved no rows — the daemon can send one
+                // when every change in a window coalesced away. It is still
+                // liveness, which is the state edge just above.
+                !d.changes.is_empty()
             }
             StorePayload::Failed(msg) => {
                 inner.state = TableDataState::Failed(msg);
+                // Rows stay resident; the view the error replaces is the
+                // one already derived.
+                false
             }
             StorePayload::Stale(reason) => {
                 // Only `Ready` can go stale. A store still `Initializing`
@@ -401,15 +423,19 @@ impl RowStore {
                 if matches!(inner.state, TableDataState::Ready) {
                     inner.state = TableDataState::Stale(reason);
                 }
+                false
             }
             StorePayload::Live => {
                 if matches!(inner.state, TableDataState::Stale(_)) {
                     inner.state = TableDataState::Ready;
                 }
+                false
             }
-        }
+        };
         drop(inner);
-        self.bump();
+        if data_changed {
+            self.bump();
+        }
     }
 
     /// Back to `Initializing` (Ctrl-R refresh, seeding a reused store).
@@ -493,17 +519,51 @@ impl RowStore {
     }
 }
 
-impl RowStoreInner {
-    /// Whether an event stamped `epoch` belongs to the CURRENT stream rather
-    /// than a superseded one.
-    ///
-    /// Named, because the comparison was written out four times — three
-    /// production guards and a test helper that stated it INVERTED
-    /// (`epoch >= floor` against their `epoch < floor`). An inverted fourth
-    /// copy is the worst kind: change the rule and the guard meant to catch
-    /// the change keeps passing, because it never read the rule.
+/// The stream-epoch floor, and the one comparison against it.
+///
+/// A store survives its stream: a `since`-range restart or a Ctrl-R
+/// replaces the stream and reuses the store, and the dead stream's queued
+/// events are still in flight. The floor is what keeps them out.
+///
+/// ONE type, because the comparison had been written five times — three
+/// production guards, a test helper that stated it INVERTED (`epoch >=
+/// floor` against the guards' `epoch < floor`), and then a fifth copy in
+/// `LineStoreInner` whose own doc said "same question, same reason as
+/// `RowStoreInner::accepts`". An inverted copy is the worst kind: change the
+/// rule and the guard meant to catch the change keeps passing, because it
+/// never read the rule. Naming the predicate was supposed to stop that and
+/// the next store did it again, so the FIELD is named now and not just the
+/// method.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct EpochGate {
+    floor: u64,
+}
+
+impl EpochGate {
+    /// Whether an event stamped `epoch` belongs to the CURRENT stream
+    /// rather than a superseded one.
     pub(crate) fn accepts(&self, epoch: u64) -> bool {
-        epoch >= self.epoch_floor
+        epoch >= self.floor
+    }
+
+    /// Raise the floor — monotonic, so a late `expect_epoch` from a
+    /// predecessor cannot lower it under its successor.
+    pub(crate) fn raise(&mut self, epoch: u64) {
+        self.floor = self.floor.max(epoch);
+    }
+
+    /// Set the floor to exactly `epoch`. Only a BASELINE does this: it is
+    /// the stream declaring where its own history starts, which is a
+    /// different statement from "no earlier than".
+    pub(crate) fn rebase(&mut self, epoch: u64) {
+        self.floor = epoch;
+    }
+}
+
+impl RowStoreInner {
+    /// See [`EpochGate::accepts`].
+    pub(crate) fn accepts(&self, epoch: u64) -> bool {
+        self.epoch.accepts(epoch)
     }
 
     pub fn is_marked(&self, key: &ObjectKey) -> bool {
@@ -1378,15 +1438,52 @@ pub struct LineStoreInner {
     /// and made a finished log look like a dead one — which
     /// `revive_if_dead` then "recovered" by clearing it.
     ended: bool,
-    epoch_floor: u64,
+    epoch: EpochGate,
 }
 
 impl LineStoreInner {
-    /// Same question, same reason as [`RowStoreInner::accepts`]: a
-    /// `since`-range restart replaces the stream but reuses the store, and
-    /// the floor is what keeps the dead stream's queued lines out.
+    /// See [`EpochGate::accepts`] — the same question, and now literally
+    /// the same code.
     fn accepts(&self, epoch: u64) -> bool {
-        epoch >= self.epoch_floor
+        self.epoch.accepts(epoch)
+    }
+
+    /// Make room for one arrival, or refuse it. `false` means the store is
+    /// full and KEEPING what it has, so the caller must drop the line — the
+    /// refusal is already counted in `truncated`.
+    ///
+    /// The one place [`Retain`] is honoured. [`LineStore::extend_derived`]
+    /// had a second copy that hardcoded the `Tail` branch, which is the
+    /// inversion `Retain` exists to prevent: a `LogRange::Since` session
+    /// keeps the oldest N, and its `/pattern` child would have kept the
+    /// newest N matches. Unreachable while a child's cap equals its
+    /// source's AND a full `Head` source refuses arrivals outright — two
+    /// facts in two other files, which is not a thing to rely on.
+    fn make_room(&mut self) -> bool {
+        if self.lines.len() < self.max_lines {
+            return true;
+        }
+        match self.retain {
+            // Counted only if something was ACTUALLY evicted. With
+            // `max_lines == 0` — which `config::load` used to accept — the
+            // guard above never passes and the deque is always empty, so
+            // every push counted a phantom eviction and nothing was ever
+            // stored. Elements self-heal their scroll by diffing against
+            // this counter, so the offset was permanent and grew with every
+            // line.
+            Retain::Tail => {
+                if self.lines.pop_front().is_some() {
+                    self.evicted += 1;
+                }
+                true
+            }
+            // Full and keeping the head: the oldest N are what was asked
+            // for, so the arrival is what goes.
+            Retain::Head => {
+                self.truncated += 1;
+                false
+            }
+        }
     }
 }
 
@@ -1403,9 +1500,24 @@ impl LineStore {
                 sources: Vec::new(),
                 live: true,
                 ended: false,
-                epoch_floor: 0,
+                epoch: EpochGate::default(),
             }),
         })
+    }
+
+    /// A derived store (a `/pattern` child) that mirrors its source's
+    /// window: the same capacity AND the same end kept.
+    ///
+    /// Both, in one call, because taking only the capacity is what
+    /// [`LineStoreInner::make_room`] describes — a `Head` parent keeping the
+    /// oldest N with a `Tail` child keeping the newest N matches of them.
+    /// The caller used to write `LineStore::new(store.max_lines())` and get
+    /// the default `Retain::Tail` silently.
+    pub fn derived_from(source: &LineStore) -> Arc<Self> {
+        let (max_lines, retain) = source.with_read(|i| (i.max_lines, i.retain));
+        let store = Self::new(max_lines);
+        store.set_retain(retain);
+        store
     }
 
     /// Same convention, same enforcement — see [`k9rs_util::one_task`].
@@ -1459,13 +1571,22 @@ impl LineStore {
     /// Append a batch of already-matched lines (a derived store's drain).
     /// Epoch-free: a derived store has exactly one producer, the element
     /// that owns it, so there is no succession to gate.
+    ///
+    /// Routes through the same [`LineStoreInner::make_room`] as
+    /// [`LineStore::push`]. It had its own copy that hardcoded `Tail`, so a
+    /// `LogRange::Since` session — keep the OLDEST N — had a `/pattern`
+    /// child keeping the NEWEST N matches: the exact inversion `Retain`
+    /// exists to fix, one level down.
     pub fn extend_derived(&self, lines: impl IntoIterator<Item = StoredLine>) {
         let mut inner = self.lock();
-        let mut added = false;
+        let mut touched = false;
         for line in lines {
-            if inner.lines.len() >= inner.max_lines {
-                inner.lines.pop_front();
-                inner.evicted += 1;
+            if !inner.make_room() {
+                // Full and keeping the head: the oldest matches are what
+                // was asked for, so the arrival is what goes — counted by
+                // `make_room`, exactly as a refused `push` is.
+                touched = true;
+                continue;
             }
             if let Some(src) = &line.source {
                 if !inner.sources.iter().any(|s| s == src) {
@@ -1473,10 +1594,10 @@ impl LineStore {
                 }
             }
             inner.lines.push_back(line);
-            added = true;
+            touched = true;
         }
         drop(inner);
-        if added {
+        if touched {
             self.bump();
         }
     }
@@ -1499,8 +1620,7 @@ impl LineStore {
     /// Raise the epoch floor — called by the log-subscribe path BEFORE the
     /// new stream's handle is returned (restart succession).
     pub fn expect_epoch(&self, epoch: u64) {
-        let mut inner = self.lock();
-        inner.epoch_floor = inner.epoch_floor.max(epoch);
+        self.lock().epoch.raise(epoch);
     }
 
     /// Append one line (epoch-gated). Evicts from the front past
@@ -1510,25 +1630,14 @@ impl LineStore {
         if !inner.accepts(epoch) {
             return;
         }
-        if inner.lines.len() >= inner.max_lines {
-            match inner.retain {
-                Retain::Tail => {
-                    inner.lines.pop_front();
-                    inner.evicted += 1;
-                }
-                // Full and keeping the head: the oldest N are what was
-                // asked for, so the arrival is what goes.
-                Retain::Head => {
-                    inner.truncated += 1;
-                    // Deliberately does NOT touch `live`: a refused arrival
-                    // says nothing about liveness that was not already true,
-                    // and asserting it here is what let a straggler
-                    // un-finish a stream we had just stopped.
-                    drop(inner);
-                    self.bump();
-                    return;
-                }
-            }
+        if !inner.make_room() {
+            // Deliberately does NOT touch `live`: a refused arrival says
+            // nothing about liveness that was not already true, and
+            // asserting it here is what let a straggler un-finish a stream
+            // we had just stopped.
+            drop(inner);
+            self.bump();
+            return;
         }
         if let Some(src) = &line.source {
             if !inner.sources.iter().any(|s| s == src) {
@@ -1626,14 +1735,15 @@ impl DeltaTracker {
     /// while a watcher was down still flash after the recovery baseline)
     /// without mass-highlighting unchanged rows.
     pub fn rebaseline(&mut self, rows: &[k9rs_proto::row::ResourceRow]) {
-        use k9rs_proto::protocol::ObjectKey;
         let now = Instant::now();
         let mut new_prev = HashMap::with_capacity(rows.len());
         for row in rows {
-            let key = ObjectKey::new(
-                row.namespace.clone().unwrap_or_default(),
-                row.name.clone(),
-            );
+            // The named mapping, not a second spelling of it: this tracker's
+            // keys must agree with the ones `apply` uses to retain marks and
+            // locate rows, which are `row_key`'s. It read
+            // `ObjectKey::new(ns.unwrap_or_default(), name)` by hand —
+            // byte-identical, and in a different file at the time.
+            let key = row_key(row);
             let new_hash = Self::hash_cells(row);
             if let Some(prev_hash) = self.prev_hashes.get(&key) {
                 if *prev_hash != new_hash {

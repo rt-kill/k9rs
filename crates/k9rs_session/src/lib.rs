@@ -155,14 +155,35 @@ pub(crate) async fn open_exec_overlay(
     Ok(())
 }
 
-/// Strip leading `#` comment lines from edited YAML. We prepend server
-/// error messages as `# ...` on re-open so the user can see what went
-/// wrong. These must be stripped before diffing or sending to the server.
-/// Only strips the contiguous comment block at the top — comments in the
-/// middle of the YAML are the user's and are left alone.
-/// Strip leading comment lines that WE prepended (error re-open).
-/// Only strips lines starting with `# k9rs:` or blank lines in the
-/// leading block. User's own `#` comments in the YAML are preserved.
+/// Strip the leading comment block that WE prepended, so an edit-retry
+/// sends the manifest and not our own error text.
+///
+/// Strips only a contiguous leading run of `# k9rs:` lines, bare `#`
+/// separators and blank lines. A `#` comment anywhere else in the YAML is
+/// the user's and is left alone; so is a leading `# anything else`.
+///
+/// (Two stacked doc comments lived here, and the first was wrong: it said
+/// "Strip leading `#` comment lines" and "User's own `#` comments … are
+/// preserved", neither of which matches the predicate below — a bare `#`
+/// separator line IS consumed, and a leading `# note to self` is NOT.)
+///
+/// # The coupling that keeps this correct, named
+///
+/// The writer prefixes only the FIRST line of the server's message
+/// (`format!("# k9rs: {}\n…", msg)`), so a multi-line message would leave
+/// unprefixed error text above the document — which this would not strip,
+/// which would then be sent back as part of the manifest, fail to parse, and
+/// accumulate another block on each retry.
+///
+/// It cannot happen, and the reason is three crates away:
+/// `k9rs_app::client`'s `sanitize_result` runs every `OpResult` message
+/// through `k9rs_util::text::sanitize_terminal`, which keeps only `\t`
+/// among control characters — so it strips `\n` and the message is
+/// single-line by the time it reaches the writer. That function exists for
+/// escape-injection defence, not for this; a future change making it
+/// newline-preserving would break the edit-retry path silently, with
+/// nothing at either end naming the dependency. This paragraph is the
+/// naming.
 fn strip_leading_comments(s: &str) -> &str {
     let mut pos = 0;
     for line in s.lines() {
@@ -178,6 +199,16 @@ fn strip_leading_comments(s: &str) -> &str {
         }
     }
     &s[pos.min(s.len())..]
+}
+
+/// The terminal's size, or the fallback a PTY has to be given anyway.
+///
+/// Named because the fallback is a DECISION and it was written twice: an 80×24
+/// PTY is what a remote shell gets when we cannot ask, and the two sites (the
+/// resize frame and the initial `ExecInit`) must agree or the first resize
+/// after connect reshapes a terminal that was already right.
+fn terminal_size_or_default() -> (u16, u16) {
+    crossterm::terminal::size().unwrap_or((80, 24))
 }
 
 /// The signals that mean "shut down", as ONE future.
@@ -706,7 +737,7 @@ async fn run_shell_bridge(
     let writer = &mut stream.writer;
 
     // Send resize with full terminal dimensions (no TUI borders during bridge).
-    let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (tw, th) = terminal_size_or_default();
     let _ = k9rs_proto::protocol::write_bincode(
         writer,
         &k9rs_proto::protocol::ExecFrame::Resize { width: tw, height: th },
@@ -850,7 +881,7 @@ fn build_exec_init(
     target: &ExecTarget,
 ) -> (k9rs_proto::protocol::ExecInit, String) {
     use k9rs_proto::protocol::ExecArg;
-    let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (tw, th) = terminal_size_or_default();
     let mut args = Vec::new();
     for arg in template.args {
         match arg {
@@ -955,9 +986,20 @@ fn dispatch_app_event(app: &mut App, data_source: &mut ClientSession, event: App
             // is a live path only if the daemon starts populating it.) A reconnect (was_switch == false, incl. the recovered
             // fallback after a FAILED switch, which already settled to
             // Stable) leaves core in place and revives streams below.
+            // NAMED, not `_`, for the reason the FAILURE edge spells out in
+            // `event.rs`: a future `Cancelling`/`Retrying` variant falling
+            // into a wildcard here would skip `core.switch_context` (so the
+            // stores never park or restore), skip the `selected_ns` reset,
+            // and skip `settle()` — leaving `is_stable()` false and every
+            // later `:context` refused. That is the 2026-07-30 context-lock
+            // bug, and `ContextSwitchState::target`'s own CAUTION says an
+            // outcome edge must match `InFlight` explicitly. The failure
+            // edge obeyed it; this one, the same shape with the same stakes,
+            // did not.
             let switch_target = match &app.kube.context_switch {
                 k9rs_app::ContextSwitchState::InFlight(t) => Some(t.clone()),
-                _ => None,
+                k9rs_app::ContextSwitchState::Stable
+                | k9rs_app::ContextSwitchState::Requested(_) => None,
             };
             let was_switch = switch_target.is_some();
             if let Some(target) = switch_target {
@@ -1350,9 +1392,23 @@ pub async fn session_main(
             // Clear the per-frame liveness flag; the spinner primitive
             // (`Anim::bar`) sets it again iff a spinner draws this frame.
             app.ui.anim.begin_frame();
-            terminal.draw(|f| {
+            // NOT `?`. The teardown block at the bottom of this function
+            // explains why its own calls stopped being `?`: "when the
+            // terminal had already gone away — which is one of the reasons
+            // we exit — every call failed with EIO/ENXIO and the error
+            // propagated INSTEAD of `app.exit_reason`, so the user got
+            // 'Input/output error' where the diagnosis should have been."
+            // These three, inside the loop, still were — so a draw against
+            // a vanished terminal returned past the teardown AND past the
+            // reason. Terminal state was fine (`TerminalGuard::drop`
+            // restores it); the diagnosis was the loss.
+            if let Err(e) = terminal.draw(|f| {
                 k9rs_ui::draw(f, &mut app);
-            })?;
+            }) {
+                app.exit_reason =
+                    Some(k9rs_app::ExitReason::Error(format!("draw failed: {e}")));
+                break;
+            }
 
             // Set cursor style based on input mode: bar for text input, block otherwise
             let view_has_text_input = match app.nav.top() {
@@ -1365,10 +1421,18 @@ pub async fn session_main(
                 })
                 || app.nav.top().filter_input().active()
                 || view_has_text_input;
-            if in_input_mode {
-                execute!(terminal.backend_mut(), SetCursorStyle::SteadyBar)?;
+            // Same reason as the draw above. A cursor shape is also the
+            // least important thing in the process: failing to set it must
+            // not become the message the user is left with.
+            let shape = if in_input_mode {
+                SetCursorStyle::SteadyBar
             } else {
-                execute!(terminal.backend_mut(), SetCursorStyle::SteadyBlock)?;
+                SetCursorStyle::SteadyBlock
+            };
+            if let Err(e) = execute!(terminal.backend_mut(), shape) {
+                app.exit_reason =
+                    Some(k9rs_app::ExitReason::Error(format!("terminal write failed: {e}")));
+                break;
             }
 
             repaint.painted();
@@ -1434,11 +1498,17 @@ pub async fn session_main(
                         break;
                     }
                 }
-                CtEvent::Resize(_, _) => {
-                    replayed_any = true;
-                    repaint.on_input();
-                }
-                _ => {}
+                // Keys ONLY. `replay` is filled solely by
+                // `drain_stale_input` → `debris_step`, which pushes an event
+                // only when its `code` is `Some(_)` — i.e. only a `Key` — and
+                // the sieve's own doc says so ("focus/resize churn … never
+                // replayed"). There was a `Resize` arm here, defending
+                // against the case its own verified doc says cannot occur,
+                // and a `_ => {}` behind it.
+                other => debug_assert!(
+                    false,
+                    "a non-key event reached the replay queue: {other:?}",
+                ),
             }
         }
         if replayed_any {

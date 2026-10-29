@@ -33,43 +33,12 @@ pub struct LocalRegistry {
 
 impl LocalRegistry {
     pub fn new(exec_configs: Vec<ExecSourceConfig>, grace: Option<Duration>) -> Self {
-        // Validate exec resource configs at startup. A malformed config is
-        // skipped (with a warning) rather than aborting the daemon — one bad
-        // entry shouldn't take down the others. Each guard rejects a state
-        // that would otherwise misrender or misalign columns at view time.
-        let mut seen_names = std::collections::HashSet::new();
-        let valid_configs: Vec<ExecSourceConfig> = exec_configs.into_iter()
-            .filter(|c| {
-                if c.name.is_empty() {
-                    tracing::warn!("exec resource config has empty name — skipping");
-                    return false;
-                }
-                if !seen_names.insert(c.name.clone()) {
-                    tracing::warn!("exec resource config has duplicate name '{}' — skipping", c.name);
-                    return false;
-                }
-                if c.command.is_empty() {
-                    tracing::warn!("exec resource config '{}' has empty command — skipping", c.name);
-                    return false;
-                }
-                if c.headers.is_empty() {
-                    tracing::warn!("exec resource config '{}' has no headers — skipping", c.name);
-                    return false;
-                }
-                // The converter zips headers with json_field_keys positionally;
-                // a length mismatch would silently drop columns or data, so
-                // reject it up front instead of misaligning the table.
-                if c.headers.len() != c.json_field_keys.len() {
-                    tracing::warn!(
-                        "exec resource config '{}' has {} headers but {} jsonFieldKeys \
-                         — they must match in length and order; skipping",
-                        c.name, c.headers.len(), c.json_field_keys.len()
-                    );
-                    return false;
-                }
-                true
-            })
-            .collect();
+        // Validated by `ExecSourceConfig::usable`, which the CLIENT's
+        // `:`-command lookup reads too — these guards used to be a `filter`
+        // closure here, applied by the daemon and by nobody else, so an
+        // entry skipped here was still typeable and came back as "Unknown
+        // local resource" with no reason.
+        let valid_configs = ExecSourceConfig::usable(exec_configs);
         Self {
             contexts: crate::weak_registry::WeakRegistry::new(),
             exec_configs: valid_configs.into(),
@@ -84,11 +53,20 @@ impl LocalRegistry {
         self.contexts
             .live()
             .into_iter()
-            .map(|(key, locals, holders)| k9rs_proto::protocol::ContextStat {
-                context: key.name.clone(),
-                server_url: key.server_url.clone(),
-                port_forwards: locals.port_forwards().live_count(),
-                holders,
+            // Identity from the SLICE, not the map key. They are the same
+            // value by construction (`get_or_create` hands the key to
+            // `ContextLocals::new`), and reading the slice is what makes
+            // that true rather than assumed — it was also the only reader
+            // `ContextLocals::context()` ever had, so the accessor and the
+            // field it wraps were both dead.
+            .map(|(_key, locals, holders)| {
+                let ctx = locals.context();
+                k9rs_proto::protocol::ContextStat {
+                    context: ctx.name.clone(),
+                    server_url: ctx.server_url.clone(),
+                    port_forwards: locals.port_forwards().entry_count(),
+                    holders,
+                }
             })
             .collect()
     }

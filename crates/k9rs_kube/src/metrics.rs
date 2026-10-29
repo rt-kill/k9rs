@@ -77,78 +77,100 @@ impl From<&serde_json::Value> for NodeMetricsData {
 pub fn parse_pod_metrics_usage(data: &serde_json::Value) -> k9rs_proto::protocol::MetricsUsage {
     let metrics = PodMetricsData::from(data);
 
-    let mut total_cpu_nano: u64 = 0;
-    let mut total_mem_bytes: u64 = 0;
+    // `None` until a container reports: a pod whose `containers` list is
+    // missing or empty has not been MEASURED, which is a different
+    // statement from "measured at zero". Summing into a `u64` started at 0
+    // could not tell them apart, so an unmeasured pod rendered `0m`/`0Mi`
+    // — indistinguishable from a genuinely idle one — while the node
+    // accessor twelve lines down rendered `n/a` for the same situation.
+    let mut cpu_nano: Option<u64> = None;
+    let mut mem_bytes: Option<u64> = None;
 
     for container in &metrics.containers {
         if let Some(ref cpu_str) = container.usage.cpu {
-            total_cpu_nano = total_cpu_nano.saturating_add(parse_cpu_to_nano(cpu_str));
+            let n = parse_cpu_to_nano(cpu_str);
+            cpu_nano = Some(cpu_nano.unwrap_or(0).saturating_add(n));
         }
         if let Some(ref mem_str) = container.usage.memory {
-            total_mem_bytes = total_mem_bytes.saturating_add(parse_mem_to_bytes(mem_str));
+            let n = parse_mem_to_bytes(mem_str);
+            mem_bytes = Some(mem_bytes.unwrap_or(0).saturating_add(n));
         }
     }
 
-    let cpu_milli = total_cpu_nano / 1_000_000;
-    let cpu = k9rs_util::units::format_cpu(&format!("{}n", total_cpu_nano));
-    let mem = k9rs_util::units::format_mem(&total_mem_bytes.to_string());
-    k9rs_proto::protocol::MetricsUsage { cpu, mem, cpu_milli, mem_bytes: total_mem_bytes }
+    usage(cpu_nano, mem_bytes)
 }
 
 /// Parse node metrics from a DynamicObject's data field.
 pub fn parse_node_metrics_usage(data: &serde_json::Value) -> k9rs_proto::protocol::MetricsUsage {
     let metrics = NodeMetricsData::from(data);
+    usage(
+        metrics.usage.cpu.as_deref().map(parse_cpu_to_nano),
+        metrics.usage.memory.as_deref().map(parse_mem_to_bytes),
+    )
+}
 
-    let cpu = metrics.usage.cpu
-        .as_deref()
-        .map(k9rs_util::units::format_cpu)
-        .unwrap_or_else(|| "n/a".to_string());
-
-    let mem = metrics.usage.memory
-        .as_deref()
-        .map(k9rs_util::units::format_mem)
-        .unwrap_or_else(|| "n/a".to_string());
-
-    let cpu_milli = metrics.usage.cpu.as_deref()
-        .map(|s| parse_cpu_to_nano(s) / 1_000_000)
-        .unwrap_or(0);
-    let mem_bytes = metrics.usage.memory.as_deref()
-        .map(parse_mem_to_bytes)
-        .unwrap_or(0);
-
-    k9rs_proto::protocol::MetricsUsage { cpu, mem, cpu_milli, mem_bytes }
+/// One rendering of a measurement, present or absent.
+///
+/// "Absent" had two spellings in two adjacent functions over the same
+/// `MetricsUsage` shape: `n/a` for a node with no `usage`, and a formatted
+/// ZERO for a pod with no containers. A table column that says `0m` for "we
+/// do not know" is worse than one that says nothing — it is a number, and
+/// it sorts like one.
+///
+/// The numeric fields stay `0` when absent, which is what the sort and the
+/// percentage columns already expect; it is the DISPLAY that distinguishes.
+fn usage(
+    cpu_nano: Option<u64>,
+    mem_bytes: Option<u64>,
+) -> k9rs_proto::protocol::MetricsUsage {
+    const ABSENT: &str = "n/a";
+    k9rs_proto::protocol::MetricsUsage {
+        cpu: cpu_nano
+            .map(|n| k9rs_util::units::format_cpu(&format!("{n}n")))
+            .unwrap_or_else(|| ABSENT.to_string()),
+        mem: mem_bytes
+            .map(|n| k9rs_util::units::format_mem(&n.to_string()))
+            .unwrap_or_else(|| ABSENT.to_string()),
+        cpu_milli: cpu_nano.unwrap_or(0) / 1_000_000,
+        mem_bytes: mem_bytes.unwrap_or(0),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Unit parsing helpers
 // ---------------------------------------------------------------------------
 
+/// A CPU [K8s Quantity] in nanocores.
+///
+/// Every branch goes through `scale_quantity` (private), which parses
+/// `f64`. The suffix branches used to `parse::<u64>()`, so a FRACTIONAL
+/// quantity —
+/// legal, and written by hand in real manifests — silently rendered 0:
+/// `1.5m` was 0 millicores, not 1.5. That is the same defect
+/// `scale_quantity`'s own doc records fixing in the memory sibling, left in
+/// place here; only the no-suffix branch ever accepted a fraction.
+///
+/// The decimal SI `k` is accepted for the same reason the memory parser
+/// accepts both `k` and `K`: it is in the Quantity grammar, a ResourceQuota
+/// on a large cluster can carry it, and the alternative is a silent 0.
+///
+/// [K8s Quantity]: https://kubernetes.io/docs/reference/kubernetes-api/common-definitions/quantity/
 pub fn parse_cpu_to_nano(s: &str) -> u64 {
+    const NANO: u64 = 1;
+    const MICRO: u64 = 1_000;
+    const MILLI: u64 = 1_000_000;
+    const CORE: u64 = 1_000_000_000;
+
     let s = s.trim();
-    // K8s Quantity (for CPU) accepts:
-    //   "500n"  → nanocores
-    //   "500u"  → microcores (n * 1000)
-    //   "500m"  → millicores (n * 1_000_000)
-    //   "0.5"   → cores       (n * 1_000_000_000)
-    // Older code missed the "u" suffix and silently rendered 0.
-    if let Some(nano_str) = s.strip_suffix('n') {
-        nano_str.parse::<u64>().unwrap_or(0)
-    } else if let Some(micro_str) = s.strip_suffix('u') {
-        micro_str.parse::<u64>().unwrap_or(0).saturating_mul(1_000)
-    } else if let Some(milli_str) = s.strip_suffix('m') {
-        milli_str.parse::<u64>().unwrap_or(0).saturating_mul(1_000_000)
-    } else if let Ok(cores) = s.parse::<f64>() {
-        // f64 → u64 saturating cast: out-of-range values clamp to u64::MAX
-        // (or 0 for negative). Avoids the panic-in-debug / wrap-in-release
-        // behavior of the older `as u64` form.
-        if cores.is_finite() && cores >= 0.0 {
-            (cores * 1_000_000_000.0).min(u64::MAX as f64) as u64
-        } else {
-            0
+    // Longest-first is not a concern here: the four suffixes are one char
+    // each and distinct, and `k`/`K` cannot prefix-collide with them.
+    for (suffix, mult) in [("n", NANO), ("u", MICRO), ("m", MILLI), ("k", CORE * 1_000), ("K", CORE * 1_000)] {
+        if let Some(val) = s.strip_suffix(suffix) {
+            return scale_quantity(val, mult);
         }
-    } else {
-        0
     }
+    // No suffix: whole cores.
+    scale_quantity(s, CORE)
 }
 
 /// Scale the (possibly fractional) numeric part of a memory quantity by `mult`.
@@ -163,8 +185,11 @@ pub fn parse_mem_to_bytes(s: &str) -> u64 {
     // K8s Quantity permits BOTH binary (Ki/Mi/Gi/Ti, base-1024) AND
     // decimal (K/M/G/T, base-1000) suffixes. Older code only handled the
     // binary ones, so decimal payloads fell through and silently rendered
-    // 0. Saturating multiply throughout — malformed giant values clamp to
-    // u64::MAX rather than wrapping.
+    // 0. Every branch goes through `scale_quantity`, whose saturating
+    // float→int cast clamps a malformed giant value to `u64::MAX` rather
+    // than wrapping. (This said "saturating multiply throughout"; there is
+    // no `saturating_mul` here — the product is `f64` and the CAST is what
+    // saturates, which is what `scale_quantity`'s own doc says.)
     let s = s.trim();
 
     // Two-char binary suffixes first (otherwise "Ti" would match the

@@ -75,6 +75,30 @@ fn pick_ready_pod_skips_terminating_and_unready() {
     assert!(pick_ready_pod(vec![]).is_none());
 }
 
+/// A pod the apiserver handed back without a usable name is refused, not
+/// forwarded to.
+///
+/// Both callers read it as `unwrap_or_default()`, which turned an unnamed
+/// pod into a forward to pod `""` — `kubectl port-forward pod/ …` — so the
+/// failure surfaced at tunnel time, far from the list that produced it.
+/// `Retry`, because re-reading the list is worth doing.
+#[test]
+fn an_unnamed_pod_is_not_a_forward_target() {
+    assert_eq!(pod_name(&pod_named("web-0")).ok().as_deref(), Some("web-0"));
+
+    assert!(
+        matches!(pod_name(&Pod::default()), Err(ResolveError::Retry(m)) if m.contains("no name")),
+        "a pod with no name at all must be refused, and say why",
+    );
+
+    // `Some("")` is the shape `unwrap_or_default` produced downstream, and
+    // is exactly as unforwardable as absence.
+    assert!(
+        matches!(pod_name(&pod_named("")), Err(ResolveError::Retry(m)) if m.contains("no name")),
+        "an empty name is absence spelled differently",
+    );
+}
+
 /// The API's label-selector grammar, including the set-based operators a
 /// `matchExpressions` selector can carry. An empty selector is an error
 /// rather than a query that matches everything.
@@ -104,6 +128,44 @@ fn selector_string_covers_labels_and_expressions() {
         "empty = error: a selector matching everything would forward to an \
          arbitrary pod in the namespace",
     );
+}
+
+/// An equality-only selector — which is all a Service's `spec.selector` is —
+/// has exactly ONE way to be refused: being empty.
+///
+/// `resolve_service` renders its map through this same function now instead
+/// of joining `k=v` itself, and maps the refusal to "service … has no pod
+/// selector". That rename is honest only while emptiness is the only
+/// reachable error for a selector with no `matchExpressions`; a new operator
+/// arm that could fail would otherwise be reported as a missing selector.
+#[test]
+fn an_equality_only_selector_is_refused_only_when_empty() {
+    let of = |pairs: &[(&str, &str)]| LabelSelector {
+        match_labels: Some(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        ),
+        match_expressions: None,
+    };
+
+    assert_eq!(selector_to_string(&of(&[("app", "web")])).as_deref(), Ok("app=web"));
+    assert_eq!(
+        selector_to_string(&of(&[("app", "web"), ("tier", "fe")])).as_deref(),
+        Ok("app=web,tier=fe"),
+        "sorted and comma-joined, exactly as the hand-rolled join produced",
+    );
+    // Values the grammar has no escape for still render — the apiserver
+    // rejects them, which is a better answer than a selector we invented.
+    assert!(selector_to_string(&of(&[("app", "")])).is_ok(), "an empty VALUE is a term");
+
+    for empty in [of(&[]), LabelSelector { match_labels: None, match_expressions: None }] {
+        assert!(
+            selector_to_string(&empty).is_err(),
+            "and emptiness is the one refusal `resolve_service` renames",
+        );
+    }
 }
 
 /// kubectl's `translateServicePortToTargetPort`: the asked-for port must be

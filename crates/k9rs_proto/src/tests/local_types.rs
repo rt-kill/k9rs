@@ -33,23 +33,31 @@ fn custom_kind_metadata() {
 /// Wire-tag stability for the local-resource identity enum (bincode encodes
 /// the variant as its u32 declaration-index, LE). Reordering/inserting
 /// remaps existing wire values; appending is safe.
+///
+/// v19 REMOVED the `ExecResource` variant at index 1, which shifted all four
+/// below it down by one. That is a wire break, taken deliberately: the
+/// variant was typeable (`:exec`) and the daemon answered it with
+/// `exec_configs.first()`, so a second configured exec source was
+/// unreachable through it and the first was mislabelled `EXEC`. Nothing
+/// persists these tags to disk — bincode here is wire-only, and the
+/// build-id handshake refuses a peer from a different build — so the cost
+/// is the restart `WIRE_FORMAT_REVISION` already demands.
 #[test]
 fn local_resource_kind_wire_tags_are_stable() {
     assert_eq!(bincode::serialize(&LocalResourceKind::PortForward).unwrap(), 0u32.to_le_bytes());
-    assert_eq!(bincode::serialize(&LocalResourceKind::ExecResource).unwrap(), 1u32.to_le_bytes());
     // Custom carries a payload; pin only its 4-byte tag.
     let custom = bincode::serialize(&LocalResourceKind::Custom("x".into())).unwrap();
-    assert_eq!(&custom[..4], 2u32.to_le_bytes());
-    assert_eq!(bincode::serialize(&LocalResourceKind::Context).unwrap(), 3u32.to_le_bytes());
-    assert_eq!(bincode::serialize(&LocalResourceKind::Keybinding).unwrap(), 4u32.to_le_bytes());
-    assert_eq!(bincode::serialize(&LocalResourceKind::Alias).unwrap(), 5u32.to_le_bytes());
+    assert_eq!(&custom[..4], 1u32.to_le_bytes());
+    assert_eq!(bincode::serialize(&LocalResourceKind::Context).unwrap(), 2u32.to_le_bytes());
+    assert_eq!(bincode::serialize(&LocalResourceKind::Keybinding).unwrap(), 3u32.to_le_bytes());
+    assert_eq!(bincode::serialize(&LocalResourceKind::Alias).unwrap(), 4u32.to_le_bytes());
     // EVERY variant, counted — not a prefix of them. This pin stopped one
     // short THREE TIMES: `Context`, `Keybinding` and `Alias`, each time with
     // the explanation sitting directly above it. Asserting the COUNT is what
     // makes the next append fail here instead of being silently unpinned.
     assert_eq!(
         LocalResourceKind::all().len() + 1,
-        6,
+        5,
         "a variant was added without pinning its wire tag above \
          (`all()` omits `Custom`, hence the +1)",
     );

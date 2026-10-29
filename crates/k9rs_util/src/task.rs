@@ -91,6 +91,56 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// An exponential backoff with a floor, a ceiling and jitter — the policy as
+/// one value instead of as scattered arithmetic.
+///
+/// It was six `retry_backoff = Duration::from_secs(2)` assignments, two
+/// copied jitter+sleep+double blocks and the ceiling spelled twice, inside
+/// one function in `k9rs_app::client`. The shape that matters: five of the
+/// six resets sit in `match` arms over a wire enum and the one arm that must
+/// NOT reset is distinguished only by the ABSENCE of a line, so a new
+/// variant silently joined the minority policy.
+///
+/// Floor and ceiling are per-caller on purpose — the client reopening a
+/// substream (2s → 30s) and the daemon resubscribing a watcher (5s → 60s)
+/// are different decisions about different things.
+#[derive(Debug, Clone, Copy)]
+pub struct Backoff {
+    floor: std::time::Duration,
+    ceiling: std::time::Duration,
+    current: std::time::Duration,
+}
+
+impl Backoff {
+    /// Starts AT the floor, so the first retry waits the floor's worth.
+    pub fn new(floor: std::time::Duration, ceiling: std::time::Duration) -> Self {
+        debug_assert!(floor <= ceiling, "a floor above the ceiling pins every retry at the floor");
+        Self { floor, ceiling, current: floor }
+    }
+
+    /// Back to the floor — progress happened.
+    pub fn reset(&mut self) {
+        self.current = self.floor;
+    }
+
+    /// The interval this attempt would wait, jittered by `seed` — for a
+    /// message that has to name it before sleeping.
+    pub fn peek(&self, seed: &[u8]) -> std::time::Duration {
+        let jitter = retry_jitter(seed, self.current.as_millis() as u64);
+        self.current.mul_f64(jitter)
+    }
+
+    /// Sleep the jittered interval, then double toward the ceiling.
+    ///
+    /// One call where the three steps were written out twice: a divergence
+    /// between them is a backoff that is jittered in one path and not the
+    /// other, which looks like nothing until a herd forms.
+    pub async fn sleep_and_double(&mut self, seed: &[u8]) {
+        tokio::time::sleep(self.peek(seed)).await;
+        self.current = (self.current * 2).min(self.ceiling);
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/task.rs"]
 mod tests;

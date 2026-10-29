@@ -14,8 +14,6 @@ use k9rs_proto::row::{CellValue, ResourceRow};
 impl ConvertToRow<PriorityClass> for PriorityClassDef {
     fn convert(pc: PriorityClass) -> ResourceRow {
         let meta = CommonMeta::from_k8s(pc.metadata);
-        let _value = pc.value.to_string();
-        let _global_default = if pc.global_default.unwrap_or(false) { "true" } else { "false" };
         let preemption = pc.preemption_policy.unwrap_or_else(|| "PreemptLowerPriority".to_string());
         let cells: Vec<CellValue> = vec![
             CellValue::Text(meta.name.clone()),

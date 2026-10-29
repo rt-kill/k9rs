@@ -342,7 +342,7 @@ pub(crate) fn unsupported_json_path(path: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn resolve_json_path(obj: &serde_json::Value, path: &str) -> String {
+fn resolve_json_path(obj: &serde_json::Value, path: &str) -> String {
     let mut current: Option<&serde_json::Value> = Some(obj);
     let mut remaining = path.trim_start_matches('.');
 

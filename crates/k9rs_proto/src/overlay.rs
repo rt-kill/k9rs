@@ -489,17 +489,16 @@ impl RenderPredicate {
     /// predicate. Returns `None` if the string is malformed.
     pub(crate) fn parse_when(s: &str) -> Option<Self> {
         let s = s.trim();
-        let (variant, threshold_str): (fn(f64) -> Self, &str) = if let Some(rest) = s.strip_prefix(">=") {
-            (Self::Gte, rest.trim())
-        } else if let Some(rest) = s.strip_prefix("<=") {
-            (Self::Lte, rest.trim())
-        } else if let Some(rest) = s.strip_prefix('>') {
-            (Self::Gt, rest.trim())
-        } else if let Some(rest) = s.strip_prefix('<') {
-            (Self::Lt, rest.trim())
-        } else {
-            return None;
-        };
+        // Two-character operators FIRST: `>=` must not match the `>` arm
+        // and leave an `=` in the number.
+        let (variant, threshold_str): (fn(f64) -> Self, &str) = [
+            (">=", Self::Gte as fn(f64) -> Self),
+            ("<=", Self::Lte as fn(f64) -> Self),
+            (">", Self::Gt as fn(f64) -> Self),
+            ("<", Self::Lt as fn(f64) -> Self),
+        ]
+        .into_iter()
+        .find_map(|(op, variant)| s.strip_prefix(op).map(|rest| (variant, rest.trim())))?;
         threshold_str.parse::<f64>().ok().map(variant)
     }
 

@@ -244,6 +244,14 @@ struct DaemonState {
 // Connection handler (unified binary protocol)
 // ---------------------------------------------------------------------------
 
+/// How long a management request waits for its reply.
+///
+/// `pub` and named because `ctl` has to SAY it: the one thing a caller can
+/// conclude from a timeout here is that the daemon is listening and not
+/// answering, and the message is only useful if it names the budget it
+/// waited out.
+pub const DAEMON_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Connection-type discriminator written by every client as the very
 /// first byte after connecting. The daemon reads it to decide whether
 /// to wrap the socket in yamux (TUI session) or speak plain bincode
@@ -424,7 +432,7 @@ impl DaemonClient {
     pub async fn request(&mut self, cmd: &SessionCommand) -> Option<SessionEvent> {
         protocol::write_bincode(&mut self.writer, cmd).await.ok()?;
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            DAEMON_REQUEST_TIMEOUT,
             protocol::read_bincode::<_, SessionEvent>(&mut self.reader),
         ).await;
         match result {

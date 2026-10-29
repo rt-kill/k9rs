@@ -3,10 +3,10 @@
     #[test]
     fn daemon_config_defaults() {
         let cfg = DaemonConfig::default();
-        assert_eq!(cfg.watcher_page_size, 1000);
-        assert_eq!(cfg.discovery_refresh_secs, 300);
-        assert_eq!(cfg.backoff.initial_ms, 300);
-        assert_eq!(cfg.backoff.max_ms, 30_000);
+        assert_eq!(cfg.watcher_page_size.get(), 1000);
+        assert_eq!(cfg.discovery_refresh_secs.get(), 300);
+        assert_eq!(cfg.backoff.initial_ms.get(), 300);
+        assert_eq!(cfg.backoff.max_ms.get(), 30_000);
         assert_eq!(cfg.backoff.max_elapsed_ms, 120_000);
     }
 
@@ -16,10 +16,10 @@
 watcherPageSize: 2000
 "#;
         let cfg: DaemonConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.watcher_page_size, 2000);
+        assert_eq!(cfg.watcher_page_size.get(), 2000);
         // Missing fields use defaults
-        assert_eq!(cfg.discovery_refresh_secs, 300);
-        assert_eq!(cfg.backoff.initial_ms, 300);
+        assert_eq!(cfg.discovery_refresh_secs.get(), 300);
+        assert_eq!(cfg.backoff.initial_ms.get(), 300);
     }
 
     #[test]
@@ -36,15 +36,15 @@ backoff:
   maxElapsedMs: 30000
 "#;
         let cfg: DaemonConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.watcher_page_size, 500);
-        assert_eq!(cfg.discovery_refresh_secs, 60);
-        assert_eq!(cfg.fanout_ring, 16);
+        assert_eq!(cfg.watcher_page_size.get(), 500);
+        assert_eq!(cfg.discovery_refresh_secs.get(), 60);
+        assert_eq!(cfg.fanout_ring.get(), 16);
         // The two grace windows are SEPARATE knobs on purpose — a watcher is a
         // cache, a port-forward is something the user asked for.
         assert_eq!(cfg.watcher_grace_secs, 30);
         assert_eq!(cfg.locals_grace_secs, 7200);
-        assert_eq!(cfg.backoff.initial_ms, 100);
-        assert_eq!(cfg.backoff.max_ms, 5000);
+        assert_eq!(cfg.backoff.initial_ms.get(), 100);
+        assert_eq!(cfg.backoff.max_ms.get(), 5000);
         assert_eq!(cfg.backoff.max_elapsed_ms, 30000);
     }
 
@@ -97,6 +97,52 @@ execResources:
         assert_eq!(ok.exec_resources[0].poll_interval_secs.get(), 15);
     }
 
+    /// Every knob whose zero is a malfunction is refused by the TYPE.
+    ///
+    /// Five of six were plain integers; only `fanoutRing` was guarded, at
+    /// its reader, because `broadcast::channel(0)` panics. The other four
+    /// failed quietly and differently: `discoveryRefreshSecs: 0` is a
+    /// `sleep(0)` hot loop in a long-lived daemon,
+    /// `backoff.initialMs: 0` makes the doubling `(0 * 2).min(max)` — a
+    /// fixed point, so `maxMs` is unreachable and the retry loop spins at
+    /// `now + 0ms` — and `watcherPageSize: 0` goes straight into the
+    /// watcher's `page_size`.
+    #[test]
+    fn a_zero_is_refused_for_every_knob_where_zero_is_a_malfunction() {
+        for line in [
+            "watcherPageSize: 0",
+            "discoveryRefreshSecs: 0",
+            "fanoutRing: 0",
+            "backoff:\n  initialMs: 0",
+            "backoff:\n  maxMs: 0",
+        ] {
+            let err = serde_yaml::from_str::<DaemonConfig>(line)
+                .expect_err(&format!("`{line}` must not parse"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("zero") || msg.contains("NonZero") || msg.contains("nonzero"),
+                "`{line}`: the error should name the problem, got {msg}",
+            );
+        }
+    }
+
+    /// …and the knobs for which zero IS an answer still take it: no grace
+    /// window at all, and give up on the first failure.
+    #[test]
+    fn a_zero_is_accepted_where_zero_means_something() {
+        let yaml = r#"
+watcherGraceSecs: 0
+localsGraceSecs: 0
+backoff:
+  maxElapsedMs: 0
+"#;
+        let cfg: DaemonConfig = serde_yaml::from_str(yaml)
+            .expect("zero is a real answer for these three");
+        assert_eq!(cfg.watcher_grace_secs, 0, "do not keep a watcher warm");
+        assert_eq!(cfg.locals_grace_secs, 0);
+        assert_eq!(cfg.backoff.max_elapsed_ms, 0, "the first failure is fatal");
+    }
+
 /// A process that never calls `load_from_home` reads the DEFAULTS, so the
 /// suite's results cannot depend on the developer's config file.
 ///
@@ -124,6 +170,26 @@ fn a_process_that_never_loads_its_config_uses_defaults() {
     );
     // And the reader agrees, so a future `get_or_init` cannot quietly make
     // the slot non-empty while still answering with defaults.
-    assert_eq!(daemon_config().watcher_page_size, DaemonConfig::default().watcher_page_size);
+    assert_eq!(
+        daemon_config().watcher_page_size,
+        DaemonConfig::default().watcher_page_size,
+    );
 }
 
+
+    /// The complaint survives the load instead of being logged into a void.
+    ///
+    /// It was a bare `tracing::warn!` inside `load_from_home`, which `main`
+    /// calls BEFORE installing any subscriber — so an unparseable `daemon:`
+    /// section produced no output anywhere, not even under `--log-file`.
+    /// The suite cannot call `load_from_home` (it would read the
+    /// developer's own `~/.config`), so what is checkable here is that the
+    /// reader exists, is empty when nothing was loaded, and is the one
+    /// place an entry point looks.
+    #[test]
+    fn the_load_problem_reader_is_empty_until_something_is_loaded() {
+        assert!(
+            load_problems().is_empty(),
+            "a test called `load_from_home` and the suite is no longer hermetic",
+        );
+    }

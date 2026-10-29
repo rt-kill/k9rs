@@ -4,7 +4,7 @@ use k8s_openapi::api::apps::v1::DaemonSet;
 use super::ConvertToRow;
 use k9rs_proto::resource_def::daemonsets::DaemonSetDef;
 
-use crate::resources::{AtZero, CommonMeta, WorkloadContainers, WorkloadTally};
+use crate::resources::{AtZero, CommonMeta, WorkloadTally};
 use k9rs_proto::row::{CellValue, DrillTarget, ResourceRow};
 
 // ---------------------------------------------------------------------------
@@ -20,7 +20,10 @@ impl ConvertToRow<DaemonSet> for DaemonSetDef {
             .and_then(|s| s.selector.match_labels.clone())
             .unwrap_or_default();
         let pod_spec = ds.spec.as_ref().and_then(|s| s.template.spec.as_ref());
-        let containers = WorkloadContainers::from_pod_spec(pod_spec);
+        // Only the port question, asked directly. A DaemonSet's table has no
+        // CONTAINERS or IMAGES column, so building a `WorkloadContainers`
+        // here joined the container list twice and threw both strings away.
+        let pf_ports = pod_spec.map(crate::resources::forwardable_ports).unwrap_or_default();
 
         let node_selector = pod_spec
             .and_then(|ps| ps.node_selector.as_ref())
@@ -69,14 +72,14 @@ impl ConvertToRow<DaemonSet> for DaemonSetDef {
             CellValue::Count(up_to_date as i64),
             CellValue::Count(available as i64),
             CellValue::Text(node_selector),
-            CellValue::from_comma_str(&meta.labels_str),
+            meta.labels_cell(),
             CellValue::Age(meta.age.map(|t| t.timestamp())),
         ];
         ResourceRow {
             cells,
             name: meta.name,
             namespace: Some(meta.namespace),
-            pf_ports: containers.tcp_ports,
+            pf_ports,
             health,
             drill_target,
             ..Default::default()

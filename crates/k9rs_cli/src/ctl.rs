@@ -128,14 +128,25 @@ async fn cmd_status(json: bool) -> Result<()> {
                 }
             }
         }
-        _ => {
-            if json {
-                println!("{}", serde_json::json!({"status": "not_running"}));
-            } else {
-                println!("Daemon: not running");
-                println!("Socket: {:?} (not found)", k9rs_daemon::daemon::socket_path());
-            }
-        }
+        // NOT "not running". `connect_or_bail` above already opened the
+        // socket and completed the version handshake, so by here the daemon
+        // exists — this arm is a 5-second timeout, a read error, or the
+        // wrong reply. It printed "Daemon: not running" and its own
+        // `socket_path()` tagged `(not found)`, for a path it had connected
+        // to seconds earlier, and exited 0. A wedged daemon is exactly when
+        // someone runs `ctl status`, and this was the one of the four
+        // subcommands that lied about it; the other three bail.
+        None => anyhow::bail!(
+            "daemon is listening but did not answer Status within {}s — \
+             it is wedged, not absent",
+            k9rs_daemon::daemon::DAEMON_REQUEST_TIMEOUT.as_secs(),
+        ),
+        // By NAME, not `{:?}`: a `DescribeResult` carries describe lines,
+        // which for a decoded Secret are the secret.
+        Some(other) => anyhow::bail!(
+            "daemon answered Status with {} — expected DaemonStatus",
+            other.kind_name(),
+        ),
     }
     Ok(())
 }

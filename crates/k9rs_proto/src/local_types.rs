@@ -16,8 +16,20 @@ use crate::protocol::{ResourceId, ResourceScope};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LocalResourceKind {
     PortForward,
-    ExecResource,
-    /// User-defined local resource from daemon config.
+    /// One exec source from the daemon config, named exactly as the config
+    /// names it.
+    ///
+    /// There used to be a generic `ExecResource` variant beside this one,
+    /// from before exec sources were named. It was still typeable —
+    /// `:exec`, `:execresource`, `:execresources` — and the daemon resolved
+    /// it by taking `exec_configs.first()`, so with two sources configured
+    /// it opened whichever happened to be first under the label `EXEC` and
+    /// gave no hint that the other existed. "Whichever is first" is not a
+    /// resource; each source answers to its own name, and with the variant
+    /// gone there is no id that means the other thing.
+    ///
+    /// Deleting it re-tagged this variant and the three below it, which is
+    /// why v19 is a wire break — see `WIRE_FORMAT_REVISION`.
     Custom(String),
     /// The kubeconfig's contexts. The one kind the daemon does NOT serve:
     /// the rows are a fact about the CLIENT's kubeconfig, and the whole
@@ -62,7 +74,6 @@ impl LocalResourceKind {
     pub fn all() -> Vec<Self> {
         vec![
             Self::PortForward,
-            Self::ExecResource,
             Self::Context,
             Self::Keybinding,
             Self::Alias,
@@ -73,7 +84,6 @@ impl LocalResourceKind {
     pub fn name(&self) -> &str {
         match self {
             Self::PortForward => "portforward",
-            Self::ExecResource => "execresource",
             Self::Context => "context",
             Self::Keybinding => "keybinding",
             Self::Alias => "alias",
@@ -86,7 +96,6 @@ impl LocalResourceKind {
     pub fn version(&self) -> &str {
         match self {
             Self::PortForward => "v1",
-            Self::ExecResource => "v1",
             Self::Context => "v1",
             Self::Keybinding => "v1",
             Self::Alias => "v1",
@@ -99,7 +108,6 @@ impl LocalResourceKind {
     pub fn kind_str(&self) -> &str {
         match self {
             Self::PortForward => "PortForward",
-            Self::ExecResource => "ExecResource",
             Self::Context => "Context",
             Self::Keybinding => "Keybinding",
             Self::Alias => "Alias",
@@ -113,7 +121,6 @@ impl LocalResourceKind {
     pub fn plural(&self) -> &str {
         match self {
             Self::PortForward => "portforwards",
-            Self::ExecResource => "execresources",
             Self::Context => "contexts",
             Self::Keybinding => "keybindings",
             Self::Alias => "aliases",
@@ -125,7 +132,6 @@ impl LocalResourceKind {
     pub fn scope(&self) -> ResourceScope {
         match self {
             Self::PortForward => ResourceScope::Cluster,
-            Self::ExecResource => ResourceScope::Cluster,
             Self::Context => ResourceScope::Cluster,
             Self::Keybinding => ResourceScope::Cluster,
             Self::Alias => ResourceScope::Cluster,
@@ -139,7 +145,6 @@ impl LocalResourceKind {
     pub fn aliases(&self) -> &'static [&'static str] {
         match self {
             Self::PortForward => &["pf", "portforward", "portforwards", "port-forwards"],
-            Self::ExecResource => &["exec", "execresource", "execresources"],
             Self::Context => &["ctx", "context", "contexts"],
             // DELIBERATELY EMPTY. Every other alias here is a noun you
             // browse; `?` is a sheet you consult ABOUT the view you are in,
@@ -164,7 +169,6 @@ impl LocalResourceKind {
     pub fn short_label(&self) -> &str {
         match self {
             Self::PortForward => "PF",
-            Self::ExecResource => "EXEC",
             Self::Context => "CTX",
             Self::Keybinding => "KEYS",
             Self::Alias => "ALIAS",
@@ -219,7 +223,7 @@ impl LocalResourceKind {
                 ];
                 COLS
             }
-            Self::PortForward | Self::ExecResource | Self::Custom(_) => &[],
+            Self::PortForward | Self::Custom(_) => &[],
         }
     }
 
@@ -242,13 +246,6 @@ impl LocalResourceKind {
                 OperationKind::Yaml,
                 OperationKind::Delete,
             ],
-            // Exec resource: describe (show raw JSON), yaml (show raw JSON
-            // as yaml), delete (remove entry from internal store).
-            // Exec-backed rows ARE a command's output: there is nothing to
-            // delete, and the next poll would put the row straight back. The
-            // source's `delete` refuses; not advertising it means the key is
-            // never offered in the first place.
-            Self::ExecResource => vec![OperationKind::Describe, OperationKind::Yaml],
             // A context is switched to (Enter, via `DrillTarget`), not
             // described or deleted — every other operation would have to ask
             // a daemon about the client's own kubeconfig.
@@ -260,7 +257,11 @@ impl LocalResourceKind {
             // `DrillTarget` from a cell, and the alias is already one
             // keystroke away at `:`.)
             Self::Alias => vec![],
-            // Same as `ExecResource` — a `Custom` kind IS an exec source.
+            // An exec source: describe (show the raw JSON), yaml (the same
+            // as yaml). Exec-backed rows ARE a command's output — there is
+            // nothing to delete, and the next poll would put the row
+            // straight back. The source's `delete` refuses; not advertising
+            // it means the key is never offered in the first place.
             Self::Custom(_) => vec![OperationKind::Describe, OperationKind::Yaml],
         }
     }

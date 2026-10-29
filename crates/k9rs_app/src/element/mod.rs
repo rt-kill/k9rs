@@ -492,13 +492,14 @@ impl Element {
         // Starts where the parent IS, not at zero: everything already
         // evicted from the parent is unreachable, and claiming otherwise
         // would be the silent-gap this design exists to remove.
-        let (cursor, cap) = {
-            let store = source.store();
-            (store.with_read(|i| i.evicted), store.max_lines())
-        };
+        let cursor = source.store().with_read(|i| i.evicted);
+        // Capacity AND retain end from the source, in one call: a child that
+        // keeps a different end from its parent inverts the window one level
+        // down — see `LineStore::derived_from`.
+        let retained = LineStore::derived_from(source.store());
         Ok(Element::LogFilter(LogFilter {
             source: source.narrowed(Arc::new(pattern), sense),
-            retained: LineStore::new(cap),
+            retained,
             cursor,
             lost_history: false,
             label,

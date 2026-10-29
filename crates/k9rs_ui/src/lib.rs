@@ -19,8 +19,15 @@ pub fn fill_dialog_bg(
     theme: &k9rs_theme::Theme,
 ) {
     let style = ratatui::style::Style::default().bg(theme.dialog_fill);
-    for row in area.y..area.y + area.height {
-        for col in area.x..area.x + area.width {
+    // CLIPPED. `Buffer`'s `Index` is a hard `panic!`, not a debug assert, so
+    // a rect reaching past the buffer kills the TUI — the same thing
+    // `set_string` did to `?` help at a seven-row terminal. Every current
+    // caller's rect comes from a `Layout` or a `Block::inner` inside the
+    // frame, so this is unreachable today; the function is `pub`, and "the
+    // caller must have got the rect from the frame" was stated nowhere.
+    let area = area.intersection(*buf.area());
+    for row in area.y..area.bottom() {
+        for col in area.x..area.right() {
             buf[(col, row)].set_style(style);
         }
     }
@@ -98,7 +105,17 @@ pub fn draw_centered_message(
 /// Fill a single-row area with a background style without allocating a string.
 pub fn fill_line_bg(f: &mut ratatui::Frame, area: ratatui::layout::Rect, style: ratatui::style::Style) {
     let buf = f.buffer_mut();
-    for x in area.x..area.x + area.width {
+    // Clipped for the reason `fill_dialog_bg` gives — and the HEIGHT has to
+    // be checked too, which is the half an `x`-only clip misses: an
+    // intersection that is empty vertically keeps its `y`, so writing at
+    // `area.y` across a non-empty `x` range still indexes a row that is not
+    // there. A float's `Constraint::Length(0)` chunk lands at exactly
+    // `area.bottom()`, which is that case.
+    let area = area.intersection(*buf.area());
+    if area.height == 0 {
+        return;
+    }
+    for x in area.x..area.right() {
         buf[(x, area.y)].set_style(style);
     }
 }
@@ -258,7 +275,15 @@ fn draw_top_element(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         }
         Element::ContentView(cv) => match cv.kind {
             k9rs_app::ContentSpec::Yaml(_) => views::yaml::draw_yaml(f, app, area),
-            _ => views::describe::draw_describe(f, app, area),
+            // NAMED, not `_`. A fourth content kind would have painted the
+            // describe view silently — under a title that says "Describe:",
+            // which is how `DecodedSecret` already renders. `describe.rs`
+            // matches this same enum exhaustively, so the renderer already
+            // had the pattern; the claim one level up ("exhaustive over
+            // element kinds") is true of elements and was false here.
+            k9rs_app::ContentSpec::Describe(_) | k9rs_app::ContentSpec::DecodedSecret(_) => {
+                views::describe::draw_describe(f, app, area)
+            }
         },
         Element::LogSession(_) | Element::LogFilter(_) => {
             views::log::draw_logs(f, app, area);
@@ -403,22 +428,34 @@ fn draw_container_select(
 }
 
 
+/// The 3-row box a bottom overlay draws into — cleared and ready — or
+/// `None` when the terminal is too short for one.
+///
+/// It sits above the last two rows (the indicator and the flash), which is
+/// why the floor is five. The guard, the offset and the box were written
+/// out twice, verbatim, in the two overlays below; three numbers that have
+/// to agree with each other and with the main layout's bottom rows.
+fn bottom_overlay_box(f: &mut Frame) -> Option<Rect> {
+    const RESERVED_BELOW: u16 = 2;
+    const BOX_HEIGHT: u16 = 3;
+    let area = f.area();
+    if area.height < BOX_HEIGHT + RESERVED_BELOW {
+        return None;
+    }
+    let y = area.y + area.height - (BOX_HEIGHT + RESERVED_BELOW);
+    let overlay = Rect::new(area.x, y, area.width, BOX_HEIGHT);
+    // Cleared here, so a caller cannot forget: these float over a view that
+    // has already painted.
+    Clear.render(overlay, f.buffer_mut());
+    Some(overlay)
+}
+
 /// Draw the command prompt as an overlay at the bottom of the screen.
 /// Used for sub-views (logs, describe, yaml) where the resource view's
 /// inline command prompt is not available.
 fn draw_command_overlay(f: &mut Frame, app: &App) {
-    let area = f.area();
-    if area.height < 5 {
-        return;
-    }
+    let Some(overlay_area) = bottom_overlay_box(f) else { return };
     let theme = &app.ui.theme;
-
-    // 3-line box at the bottom, above the last 2 lines (indicator/flash)
-    let overlay_y = area.y + area.height.saturating_sub(5);
-    let overlay_area = Rect::new(area.x, overlay_y, area.width, 3);
-
-    // Clear the area underneath
-    Clear.render(overlay_area, f.buffer_mut());
 
     let block = Block::bordered()
         .border_style(theme.border_focused);
@@ -429,21 +466,20 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
         return;
     }
 
-    let input = app.ui.command_input().map_or("", |(i, _)| i);
+    // Prefix and buffer together: this is the open `:` prompt by the
+    // caller's own gate, so there is no absent case to invent one for.
+    let Some((prefix, text)) = app.ui.command_prompt() else { return };
+    let input = text.value();
     let ghost: String = app.best_completion()
         .and_then(|c| c.strip_prefix(input).map(str::to_string))
         .unwrap_or_default();
 
-    let prefix = app.ui.command_prompt();
     let prefix_len: u16 = prefix.width() as u16;
 
     // WINDOWED around the caret: a command longer than the box used to clip
     // AND lose its caret (`if cursor_x < inner.width`), so you typed blind.
     let avail = (inner.width as usize).saturating_sub(prefix_len as usize);
-    let (shown, caret_col) = match app.ui.command_text() {
-        Some(t) => t.window(avail),
-        None => (input, input.width()),
-    };
+    let (shown, caret_col) = text.window(avail);
 
     let mut spans = vec![
         Span::styled(prefix, theme.command.add_modifier(Modifier::BOLD)),
@@ -471,16 +507,8 @@ fn draw_command_overlay(f: &mut Frame, app: &App) {
 /// Draw the filter bar as an overlay at the bottom of the screen.
 /// Used for sub-views where the resource view's inline filter bar is not available.
 fn draw_filter_overlay(f: &mut Frame, app: &App) {
-    let area = f.area();
-    if area.height < 5 {
-        return;
-    }
+    let Some(overlay_area) = bottom_overlay_box(f) else { return };
     let theme = &app.ui.theme;
-
-    let overlay_y = area.y + area.height.saturating_sub(5);
-    let overlay_area = Rect::new(area.x, overlay_y, area.width, 3);
-
-    Clear.render(overlay_area, f.buffer_mut());
 
     let counts = app.active_table_items_count();
     let match_count = if app.nav.top().filter_input().text().is_empty() { counts.total } else { counts.filtered };

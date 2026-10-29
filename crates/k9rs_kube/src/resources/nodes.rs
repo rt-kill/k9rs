@@ -156,7 +156,7 @@ impl ConvertToRow<Node> for NodeDef {
             CellValue::Text(internal_ip),                                                    // INTERNAL-IP
             CellValue::Text(external_ip),                                                    // EXTERNAL-IP
             CellValue::Text(arch),                                                           // ARCH
-            CellValue::Text(meta.labels_str),                                                // LABELS
+            meta.labels_cell(),                                                // LABELS
             CellValue::Age(meta.age.map(|t| t.timestamp())),                                 // AGE
         ];
         ResourceRow {

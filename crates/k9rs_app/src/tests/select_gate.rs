@@ -20,7 +20,6 @@ fn seeded_app(marked: &[&str]) -> App {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: k9rs_proto::resource_def::BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "STATUS".into()],
             rows: vec![row("a"), row("b"), row("c")],
         }),

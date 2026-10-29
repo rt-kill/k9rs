@@ -93,7 +93,6 @@ fn seed_row(app: &App, name: &str) {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "STATUS".into()],
             rows: vec![ResourceRow {
                 name: name.into(),
@@ -404,7 +403,6 @@ fn horizontal_scroll_never_lands_inside_a_column() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "B".into(), "C".into(), "D".into(), "E".into()],
             rows: vec![ResourceRow {
                 name: "row".into(),
@@ -1486,7 +1484,6 @@ fn a_table_says_when_its_columns_do_not_fit() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "NODE".into(), "AGE".into()],
             rows: vec![ResourceRow {
                 name: "canary-row-marker".into(),
@@ -1615,7 +1612,6 @@ fn a_crowded_title_keeps_the_warning_and_drops_the_hint() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: BuiltInKind::Pod.to_resource_id(),
             // Six node-name columns: ~270 wide, so clipped at every width a
             // terminal actually has — the pod table's real shape.
             headers: vec![
@@ -1698,7 +1694,6 @@ fn a_table_longer_than_its_window_says_where_you_are() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "STATUS".into()],
             rows,
         }),
@@ -2087,7 +2082,6 @@ fn a_pod_list_sorted_by_age_shows_every_age() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "AGE".into()],
             rows,
         }),
@@ -2148,7 +2142,6 @@ fn no_resource_column_collapses_whichever_one_is_sorted() {
     store.apply(
         1,
         StorePayload::Baseline(TableBaseline {
-            resource: BuiltInKind::Pod.to_resource_id(),
             headers: vec!["NAME".into(), "STATUS".into(), "NODE".into(), "AGE".into()],
             rows,
         }),
@@ -2639,4 +2632,161 @@ fn the_picker_spends_the_dialog_margin_like_its_siblings() {
         painted.contains("<Esc> back"),
         "the hint row must not be clipped:\n{painted}",
     );
+}
+
+/// The two background fillers CLIP rather than panic.
+///
+/// `Buffer`'s `Index` is a hard `panic!`, not a debug assert — the same
+/// thing that killed `?` help at a seven-row terminal through
+/// `set_string`. Both of these are `pub`, both indexed the buffer directly,
+/// and "the caller must have got the rect from the frame" was stated
+/// nowhere. Every current caller does; the contract did not say so.
+#[test]
+fn the_background_fillers_clip_outside_the_buffer() {
+    use ratatui::layout::Rect;
+    use ratatui::style::Style;
+    let theme = k9rs_theme::Theme::dark();
+    let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 4));
+
+    // Entirely outside, partly outside, and one row past the bottom — the
+    // float case, where a `Constraint::Length(0)` chunk lands at
+    // `area.bottom()`.
+    for rect in [
+        Rect::new(0, 0, 10, 4),
+        Rect::new(5, 2, 40, 40),
+        Rect::new(0, 4, 10, 1),
+        Rect::new(100, 100, 5, 5),
+        Rect::new(0, 0, 0, 0),
+    ] {
+        crate::fill_dialog_bg(&mut buf, rect, &theme);
+    }
+
+    // `fill_line_bg` takes a `Frame`, so it goes through a terminal.
+    let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(10, 4))
+        .expect("terminal");
+    t.draw(|f| {
+        for rect in [
+            Rect::new(0, 0, 10, 1),
+            Rect::new(0, 4, 10, 1),
+            Rect::new(8, 1, 40, 1),
+            Rect::new(100, 100, 5, 1),
+        ] {
+            crate::fill_line_bg(f, rect, Style::default());
+        }
+    })
+    .expect("draw");
+}
+
+/// EVERY float paints at a terminal smaller than its own chrome.
+///
+/// The reported crash was `?` help at a seven-row terminal: the floating
+/// view wrote past its box and panicked. Nothing drove a whole-frame paint
+/// at a short terminal — `a_dialog_fits_its_content_at_every_terminal_width`
+/// starts at 80×24, and the smallest terminal any other draw test used was
+/// 46×12, both above every size that failed.
+///
+/// A panic is the assertion: `paint` unwraps `Terminal::draw`, so an index
+/// past the buffer aborts this test. The cell count then says the frame was
+/// written whole rather than abandoned early.
+///
+/// This is a SYMPTOM guard, not a discriminator for any one fix, and it is
+/// worth saying what it does NOT reach. Measured twice: it still passes with
+/// both background fillers unclipped, and still passes with the container
+/// picker's `i >= content.height` guard removed — at these sizes the chrome
+/// collapses to a `content` rect already inside the frame, so neither
+/// unguarded write is reachable from here. Those two have their own direct
+/// cover (`the_background_fillers_clip_outside_the_buffer`, and the picker's
+/// own break). What this holds is the class: a float that asks for a box
+/// bigger than the frame renders something and returns, for every float
+/// kind — which is the thing the report said `?` did not do at seven rows.
+#[test]
+fn every_float_paints_at_a_terminal_smaller_than_its_chrome() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let target = k9rs_proto::protocol::ObjectRef::new(
+        BuiltInKind::Pod.to_resource_id(),
+        "canary".to_string(),
+        k9rs_proto::protocol::Namespace::Named("default".to_string()),
+    );
+    // Built per paint, because `Element` is not `Clone` — which is the point
+    // of it: an element owns a live stream handle.
+    type Build = Box<dyn Fn(&k9rs_proto::protocol::ObjectRef) -> Option<Element>>;
+    let floats: Vec<(&str, Build)> = vec![
+        ("help", Box::new(|_| None)),
+        (
+            "confirm",
+            Box::new(|target| Some(Element::Confirm(Box::new(k9rs_app::ConfirmDialog {
+                message: "Delete pod/canary?".to_string(),
+                action_label: "Delete".to_string(),
+                pending: k9rs_app::PendingAction::Single {
+                    op: k9rs_app::SingleOp::Delete,
+                    target: target.clone(),
+                },
+                focused: k9rs_app::ConfirmFocus::Cancel,
+            })))),
+        ),
+        (
+            "picker",
+            Box::new(|target| Some(Element::Picker(Box::new(k9rs_app::ContainerPicker {
+                target: target.clone(),
+                choices: vec![k9rs_app::ContainerChoice {
+                    label: "sidecar".into(),
+                    container: k9rs_proto::protocol::LogContainer::Named("sidecar".into()),
+                }],
+                selected: 0,
+                action: k9rs_app::ContainerAction::Logs,
+            })))),
+        ),
+        (
+            "form",
+            Box::new(|target| Some(Element::Form(Box::new(k9rs_app::FormDialog {
+                submit: k9rs_app::FormSubmit::Scale,
+                title: "Scale deploy/api".to_string(),
+                subtitle: "namespace: default".to_string(),
+                target: target.clone(),
+                fields: vec![k9rs_app::FormFieldState {
+                    name: "replicas".to_string(),
+                    label: "Replicas".to_string(),
+                    kind: k9rs_app::FormFieldKind::Number { min: 0, max: 100 },
+                    value: k9rs_app::TextInput::seeded("3"),
+                }],
+                focused: k9rs_app::FormFocus::Field(0),
+            })))),
+        ),
+    ];
+
+    for (what, build) in floats {
+    for (w, h) in [
+        (80u16, 7u16), // the reported size
+        (80, 6),
+        (80, 5),
+        (80, 4),
+        (80, 3),
+        (80, 2),
+        (80, 1),
+        (20, 4), // narrow AND short
+        (4, 4),
+        (1, 1),
+    ] {
+        let mut app = App::new_for_test();
+        app.conn.established();
+        seed_row(&app, "canary");
+        match build(&target) {
+            Some(el) => app.nav.push(el),
+            None => push_help(&mut app),
+        }
+        let mut t = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let painted = paint(&mut t, &mut app);
+        // `screen()` concatenates the rows, so the cell COUNT is the frame —
+        // one symbol per cell. (The first version of this counted `lines()`,
+        // which is a property of the helper, not of the paint: it is one
+        // line, because nothing joins the rows with newlines.)
+        assert_eq!(
+            painted.chars().count(),
+            usize::from(w) * usize::from(h),
+            "{what} at {w}x{h}: every cell of the frame was written",
+        );
+    }
+    }
 }
